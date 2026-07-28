@@ -64,6 +64,10 @@ src/
 
 支持的快捷键：**Cmd/Ctrl + Enter** 运行。
 
+代码里用到 `input()`（Python）/ `fmt.Scan`（Go）/ `Scanner`（Java）时，点「**+ 输入**」展开 stdin 框，按行写入喂给容器。
+- 不传 stdin：单个 `input()` 自动得到空字符串（不崩）
+- 多次 `input()`：必须显式传 stdin，每行一个值（`"10\n20"` 喂两次）
+
 ## Java 注意事项
 
 本平台要求 Java 示例**类名必须为 `Main`**（执行时会自动改写用户代码中的类名），且 `Main` 需声明为 `public`。
