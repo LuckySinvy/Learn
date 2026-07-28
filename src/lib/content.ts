@@ -30,14 +30,14 @@ export function getChapters(lang: Language): Chapter[] {
       const slug = file.replace(/\.mdx$/, '');
       const filePath = path.join(dir, file);
       const raw = fs.readFileSync(filePath, 'utf8');
-      const { data } = matter(raw);
+      const { data, content: body } = matter(raw);
       return {
         slug,
         title: (data.title as string) || slug,
         order: typeof data.order === 'number' ? data.order : 999,
         description: data.description as string | undefined,
         filePath,
-        raw,
+        raw: body,
       } satisfies Chapter;
     })
     .sort((a, b) => a.order - b.order || a.slug.localeCompare(b.slug));
