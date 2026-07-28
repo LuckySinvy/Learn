@@ -43,8 +43,17 @@ cp -R .next/static $STANDALONE/.next/
 cp -R public $STANDALONE/
 
 echo '--- stop old server ---'
-PID=\$(pgrep -f $STANDALONE/server.js || true)
-[[ -n \"\$PID\" ]] && kill \$PID && sleep 2
+# 排除当前 ssh/shell 命令本身（pgrep -f 会匹配命令行包含 "server.js" 的进程）
+PID=\$(pgrep -f '/opt/learn-app/.next/standalone/server\.js' | grep -v \"\$\$\" | head -1 || true)
+if [[ -n \"\$PID\" ]]; then
+  echo \"killing pid \$PID\"
+  kill \"\$PID\"
+  # 等旧进程释放端口
+  for i in 1 2 3 4 5; do
+    sleep 1
+    ss -tlnp 2>/dev/null | grep -q ':$PORT ' || break
+  done
+fi
 
 echo '--- start new server ---'
 cd $STANDALONE

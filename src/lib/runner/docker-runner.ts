@@ -67,8 +67,12 @@ export async function dockerRun(cfg: DockerRunConfig, code: string, stdin: strin
     }
   });
 
-  // 写 stdin 后立即 end —— 容器内 input() 第一次调用就会拿到 EOF/数据
-  const safeStdin = (stdin || '').slice(0, MAX_STDIN);
+  // 写 stdin 后立即 end —— 容器内 input() 第一次调用就会拿到 EOF/数据。
+  // Python 的 input() 行为：
+  //   - 拿到数据 + \n → 返回去掉换行的字符串
+  //   - 拿到 EOF 且无数据 → 抛 EOFError
+  // 所以当调用方没传 stdin 时，补一个 "\n"，让 input() 优雅返回空串。
+  const safeStdin = (stdin ?? '\n').slice(0, MAX_STDIN);
   proc.stdin.end(safeStdin);
 
   const killTimer = setTimeout(() => {
