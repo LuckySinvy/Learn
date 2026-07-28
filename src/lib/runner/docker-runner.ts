@@ -72,7 +72,8 @@ export async function dockerRun(cfg: DockerRunConfig, code: string, stdin: strin
   //   - 拿到数据 + \n → 返回去掉换行的字符串
   //   - 拿到 EOF 且无数据 → 抛 EOFError
   // 所以当调用方没传 stdin 时，补一个 "\n"，让 input() 优雅返回空串。
-  const safeStdin = (stdin ?? '\n').slice(0, MAX_STDIN);
+  // 注意用 || 而非 ??：API 传过来的 '' 也算"没传"，要回退到 \n
+  const safeStdin = (stdin || '\n').slice(0, MAX_STDIN);
   proc.stdin.end(safeStdin);
 
   const killTimer = setTimeout(() => {
