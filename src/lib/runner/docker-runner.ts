@@ -22,8 +22,9 @@ export type RunResult = {
 };
 
 const MAX_OUTPUT = 1_000_000;
+const MAX_STDIN = 10_000;
 
-export async function dockerRun(cfg: DockerRunConfig, code: string): Promise<RunResult> {
+export async function dockerRun(cfg: DockerRunConfig, code: string, stdin: string = ''): Promise<RunResult> {
   const tmpDir = await mkdtemp(join(tmpdir(), 'learn-'));
   const filePath = join(tmpDir, cfg.filename);
   await writeFile(filePath, code, { mode: 0o600 });
@@ -43,7 +44,9 @@ export async function dockerRun(cfg: DockerRunConfig, code: string): Promise<Run
   ];
 
   const start = Date.now();
-  const proc = spawn('docker', dockerArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // 用 pipe 而不是 ignore：这样 input() 至少能拿到 EOF（空 stdin）而不是
+  // 直接抛 EOFError。如果调用方传了 stdin，则喂进去。
+  const proc = spawn('docker', dockerArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
 
   let stdout = '';
   let stderr = '';
@@ -63,6 +66,10 @@ export async function dockerRun(cfg: DockerRunConfig, code: string): Promise<Run
       proc.kill('SIGKILL');
     }
   });
+
+  // 写 stdin 后立即 end —— 容器内 input() 第一次调用就会拿到 EOF/数据
+  const safeStdin = (stdin || '').slice(0, MAX_STDIN);
+  proc.stdin.end(safeStdin);
 
   const killTimer = setTimeout(() => {
     killed = true;

@@ -20,13 +20,15 @@ type Props = {
   code: string;
   title?: string;
   expectedOutput?: string;
+  stdin?: string;
   id?: string;
 };
 
 type Status = 'idle' | 'running' | 'success' | 'error' | 'timeout' | 'compile_error';
 
-export function Playground({ language, code: initialCode, title, expectedOutput, id }: Props) {
+export function Playground({ language, code: initialCode, title, expectedOutput, stdin: initialStdin, id }: Props) {
   const storageKey = id ? `learn:${id}` : null;
+  const stdinKey = id ? `learn:${id}:stdin` : null;
   const [code, setCode] = useState<string>(() => {
     if (typeof window !== 'undefined' && storageKey) {
       const saved = localStorage.getItem(storageKey);
@@ -34,6 +36,14 @@ export function Playground({ language, code: initialCode, title, expectedOutput,
     }
     return initialCode;
   });
+  const [stdin, setStdin] = useState<string>(() => {
+    if (typeof window !== 'undefined' && stdinKey) {
+      const saved = localStorage.getItem(stdinKey);
+      if (saved) return saved;
+    }
+    return initialStdin ?? '';
+  });
+  const [showStdin, setShowStdin] = useState<boolean>(Boolean(initialStdin));
   const [status, setStatus] = useState<Status>('idle');
   const [output, setOutput] = useState<{ stdout: string; stderr: string; exitCode: number | null; durationMs: number; message?: string } | null>(null);
   const meta = LANG_META[language];
@@ -41,6 +51,9 @@ export function Playground({ language, code: initialCode, title, expectedOutput,
   useEffect(() => {
     if (storageKey) localStorage.setItem(storageKey, code);
   }, [code, storageKey]);
+  useEffect(() => {
+    if (stdinKey) localStorage.setItem(stdinKey, stdin);
+  }, [stdin, stdinKey]);
 
   const run = useCallback(async () => {
     setStatus('running');
@@ -49,7 +62,7 @@ export function Playground({ language, code: initialCode, title, expectedOutput,
       const res = await fetch('/api/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ language, code }),
+        body: JSON.stringify({ language, code, stdin }),
       });
       const data: ExecuteResponse = await res.json();
       if (data.timedOut) setStatus('timeout');
@@ -67,13 +80,14 @@ export function Playground({ language, code: initialCode, title, expectedOutput,
       setStatus('error');
       setOutput({ stdout: '', stderr: '', exitCode: null, durationMs: 0, message: String(err) });
     }
-  }, [code, language]);
+  }, [code, language, stdin]);
 
   const reset = useCallback(() => {
     setCode(initialCode);
+    setStdin(initialStdin ?? '');
     setOutput(null);
     setStatus('idle');
-  }, [initialCode]);
+  }, [initialCode, initialStdin]);
 
   return (
     <div className="my-6 rounded-xl border border-gray-200 dark:border-gray-800 overflow-hidden bg-white dark:bg-bg-dark shadow-sm">
@@ -95,15 +109,46 @@ export function Playground({ language, code: initialCode, title, expectedOutput,
       <div className="relative">
         <EditorPane value={code} onChange={setCode} language={language} onCmdEnter={run} />
       </div>
+      {showStdin && (
+        <div className="border-t border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900/40 px-4 py-2">
+          <label className="flex items-center justify-between text-xs text-gray-500 mb-1">
+            <span>标准输入（每行作为一次 input() 的返回值）</span>
+            <button
+              onClick={() => setShowStdin(false)}
+              className="hover:text-gray-900 dark:hover:text-gray-200"
+            >
+              收起
+            </button>
+          </label>
+          <textarea
+            value={stdin}
+            onChange={(e) => setStdin(e.target.value)}
+            placeholder={"alice\n30"}
+            rows={3}
+            className="w-full font-mono text-xs px-2 py-1.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-bg-dark text-gray-800 dark:text-gray-200 focus:outline-none focus:border-primary-400"
+          />
+        </div>
+      )}
       <div className="flex items-center justify-between px-4 py-2 bg-surface dark:bg-surface-dark border-t border-gray-200 dark:border-gray-800">
-        <button
-          onClick={run}
-          disabled={status === 'running'}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary-600 hover:bg-primary-700 disabled:bg-primary-400 text-white text-sm font-medium transition-colors"
-        >
-          {status === 'running' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-          运行
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={run}
+            disabled={status === 'running'}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary-600 hover:bg-primary-700 disabled:bg-primary-400 text-white text-sm font-medium transition-colors"
+          >
+            {status === 'running' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+            运行
+          </button>
+          {!showStdin && (
+            <button
+              onClick={() => setShowStdin(true)}
+              className="text-xs text-gray-500 hover:text-gray-900 dark:hover:text-gray-200"
+              title="代码里用到 input() 时展开"
+            >
+              + 输入
+            </button>
+          )}
+        </div>
         <span className="text-xs text-gray-500 font-mono">
           {meta.label} · 超时 {language === 'python' ? '5s' : language === 'go' ? '15s' : '20s'}
         </span>

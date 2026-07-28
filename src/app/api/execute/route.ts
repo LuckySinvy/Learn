@@ -61,7 +61,7 @@ export async function POST(req: NextRequest) {
 
   inFlight++;
   try {
-    const result = await dockerRun(cfg, code);
+    const result = await dockerRun(cfg, code, body.stdin ?? '');
 
     let status: ExecuteResponse['status'] = 'success';
     if (result.timedOut) status = 'timeout';
