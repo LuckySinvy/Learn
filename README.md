@@ -79,30 +79,42 @@ src/
 
 **仅用于学习本地代码，请勿在公网部署。**（如需公网部署，参考下方「容器化部署」并加上 Nginx + SSL 反向代理。）
 
-## 现有服务器部署（不用 Docker 包 Web）
+## 部署（git pull，无需本地拷贝）
 
-适用于**服务器已经跑了 Nginx / 其他 Web 容器**、不想再起一个 Docker 容器挡端口的场景：直接把 Next.js 跑成 Node 进程，Nginx 反代到它。
+服务器 `/opt/learn-app` 已是 git 仓库，remote 指向 `git@github.com:LuckySinvy/Learn.git`。本地只负责 `git push`，服务器自动拉：
 
 ```bash
-# 1. 上传源码（排除 node_modules / .next / .deploy / *.tar.gz）
-rsync -az --exclude='node_modules' --exclude='.next' --exclude='.deploy' \
-  --exclude='*.tar.gz' --exclude='.idea' ./ user@server:/opt/learn-app/
+# 本地：写代码 → 提交 → 推送
+git add -A && git commit -m "feat: xxx" && git push origin main
 
-# 2. 服务器上安装 + 构建
-ssh user@server 'cd /opt/learn-app && npm install --no-audit --no-fund && npx next build && \
-  # 主要 magic：把 .next/static 和 public 拷到 standalone 目录
-  cp -R .next/static .next/standalone/.next/ && \
-  cp -R public .next/standalone/ && \
-  ./scripts/patch-standalone.sh'   # 补丁 pnpm 漏的模块（如用 npm 可跳过）
+# 本地或 CI：一键部署
+./scripts/deploy.sh tencent    # tencent 是 ~/.ssh/config 里的别名
+```
 
-# 3. 启动（3003 是为了避开某些已被占用的端口）
-ssh user@server 'cd /opt/learn-app/.next/standalone && \
-  setsid bash -c "PORT=3003 HOSTNAME=127.0.0.1 NODE_ENV=production \
-    nohup node server.js > /var/log/learn-app.log 2>&1 < /dev/null &"'
+`scripts/deploy.sh` 自动完成：stash 本地残留 → `git pull --ff-only` → `npm install` → `npx next build` → 拷 static 到 standalone → 停旧进程 → 启新进程 → 健康检查。
 
-# 4. Nginx 反代（30 行就够）
-#   upstream -> 127.0.0.1:3003
-#   proxy_read_timeout 60s;   # 沙箱最长 20s，留缓冲
+### Nginx 反代示例
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name learn.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/learn.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/learn.example.com/privkey.pem;
+
+    client_max_body_size 1m;
+    proxy_read_timeout 60s;   # /api/execute 最长 20s，留缓冲
+
+    location / {
+        proxy_pass         http://127.0.0.1:3003;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+}
 ```
 
 ### 已知坑：Next.js standalone + pnpm 输出不完整
