@@ -207,6 +207,11 @@ function OutputArea({
 {output.message}
         </pre>
       )}
+      {expectedOutput && (
+        <div className="px-4 py-2 text-xs text-gray-500 border-t border-gray-200 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/20">
+          预期输出：<span className="font-mono text-gray-700 dark:text-gray-300">{expectedOutput}</span>
+        </div>
+      )}
     </div>
   );
 }
