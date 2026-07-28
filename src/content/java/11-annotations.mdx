@@ -1,0 +1,263 @@
+---
+title: 注解
+order: 11
+description: 内置注解、自定义注解、@Target/@Retention、通过反射读取注解
+---
+
+# 注解
+
+**注解**（Annotation）是贴在代码上的**元数据标签**——它们本身不直接执行业务逻辑，但可以被编译器、框架、运行时读取，从而改变行为。
+
+```java
+@Override                          // 告诉编译器：这是重写
+@Deprecated(since = "2.0")         // 标记：已过时
+@SuppressWarnings("unchecked")     // 告诉编译器：忽略某种警告
+```
+
+## 1. Java 内置注解
+
+| 注解 | 作用 |
+|---|---|
+| `@Override` | 标记重写父类方法，编译期校验 |
+| `@Deprecated` | 标记已过时，使用时编译器会警告 |
+| `@SuppressWarnings` | 抑制编译器警告 |
+| `@FunctionalInterface` | 标记函数式接口（只能有一个抽象方法） |
+| `@SafeVarargs` | 泛型可变参数无堆污染 |
+
+<Playground
+  language="java"
+  id="java-11-builtin"
+  title="内置注解"
+  code={`public class Main {
+    static class Animal {
+        @Deprecated(since = "1.5", forRemoval = true)
+        void oldSpeak() { System.out.println("v1 叫"); }
+
+        void speak() { System.out.println("v2 叫"); }
+    }
+
+    static class Dog extends Animal {
+        @Override
+        void speak() { System.out.println("汪"); }
+    }
+
+    @SuppressWarnings("unchecked")
+    static void rawList() {
+        java.util.List list = new java.util.ArrayList();  // 原始类型：故意
+        list.add("x");
+        System.out.println("raw = " + list);
+    }
+
+    public static void main(String[] args) {
+        Dog d = new Dog();
+        d.speak();
+        rawList();
+    }
+}`}
+  expectedOutput={`汪\nraw = [x]`}
+/>
+
+<Callout type="tip" title="看到 @Deprecated 该怎么办">
+编译器只会**警告**，不会报错。但 IDE 会划删除线提示。生产代码应：
+1. 查 Javadoc 找替代方案
+2. 短期：继续用 + `@SuppressWarnings("deprecation")` 包住调用点
+3. 长期：迁移到新 API
+</Callout>
+
+## 2. 自定义注解
+
+用 `@interface` 声明。注解的「属性」通过无参方法定义。
+
+<Playground
+  language="java"
+  id="java-11-custom"
+  title="自定义注解"
+  code={`import java.lang.annotation.*;
+
+public class Main {
+    // 自定义注解
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.METHOD)
+    public @interface Test {
+        String name() default "test";
+        int priority() default 0;
+    }
+
+    static class MyTest {
+        @Test(name = "login test", priority = 1)
+        public void testLogin() {
+            System.out.println("running testLogin");
+        }
+
+        @Test(priority = 5)     // name 用默认值
+        public void testLogout() {
+            System.out.println("running testLogout");
+        }
+    }
+
+    public static void main(String[] args) {
+        MyTest t = new MyTest();
+        t.testLogin();
+        t.testLogout();
+    }
+}`}
+  expectedOutput={`running testLogin\nrunning testLogout`}
+/>
+
+## 3. 元注解：控制自定义注解的「作用域」
+
+`@Target` 决定能贴在哪里，`@Retention` 决定能活多久。
+
+| `@Target` 值 | 贴的位置 |
+|---|---|
+| `TYPE` | 类、接口、枚举 |
+| `FIELD` | 字段 |
+| `METHOD` | 方法 |
+| `PARAMETER` | 参数 |
+| `CONSTRUCTOR` | 构造器 |
+| `LOCAL_VARIABLE` | 局部变量 |
+| `TYPE_USE` | 任何类型使用处（Java 8+） |
+
+| `@Retention` 值 | 保留范围 |
+|---|---|
+| `SOURCE` | 只在源码，编译期丢弃（如 `@Override`） |
+| `CLASS` | 字节码有，默认值，但运行期不可读 |
+| `RUNTIME` | 运行期可被反射读取 |
+
+<Callout type="warn" title="默认值陷阱">
+如果不写 `@Retention`，默认是 `CLASS`——编译后还存在 class 文件里，但 `getAnnotation()` 拿不到！想要运行期读取，**必须**显式 `RUNTIME`。
+</Callout>
+
+## 4. 用反射读取注解
+
+`@Retention(RUNTIME)` 的注解可以在运行时通过反射拿到。这是 JUnit、Spring 等框架的基石。
+
+<Playground
+  language="java"
+  id="java-11-reflect"
+  title="反射读取注解"
+  code={`import java.lang.annotation.*;
+import java.lang.reflect.*;
+
+public class Main {
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.METHOD)
+    public @interface Role {
+        String value();
+    }
+
+    static class UserService {
+        @Role("admin")
+        public void deleteUser() { System.out.println("delete user"); }
+
+        @Role("user")
+        public void viewProfile() { System.out.println("view profile"); }
+
+        public void internalHelper() { /* 没有 @Role */ }
+    }
+
+    public static void main(String[] args) {
+        Class<?> cls = UserService.class;
+        for (Method m : cls.getDeclaredMethods()) {
+            Role r = m.getAnnotation(Role.class);
+            if (r != null) {
+                System.out.printf("%s -> role=%s%n", m.getName(), r.value());
+            }
+        }
+    }
+}`}
+  expectedOutput={`deleteUser -> role=admin\nviewProfile -> role=user`}
+/>
+
+## 5. 实战：迷你测试运行器
+
+我们用注解 + 反射实现一个**只有 30 行的 JUnit 雏形**：
+
+<Playground
+  language="java"
+  id="java-11-runner"
+  title="迷你测试运行器"
+  code={`import java.lang.annotation.*;
+import java.lang.reflect.*;
+
+public class Main {
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.METHOD)
+    public @interface Run { String value() default ""; }
+
+    @Run("测试登录")
+    static void testLogin()    { System.out.println("[ok] 登录成功"); }
+
+    @Run("测试登出")
+    static void testLogout()   { System.out.println("[ok] 登出成功"); }
+
+    @Run("测试注册")
+    static void testRegister() { System.out.println("[ok] 注册成功"); }
+
+    public static void main(String[] args) {
+        int total = 0, ok = 0;
+        for (Method m : Main.class.getDeclaredMethods()) {
+            Run r = m.getAnnotation(Run.class);
+            if (r == null) continue;
+            total++;
+            try {
+                m.setAccessible(true);
+                m.invoke(null);     // 静态方法，第一个参数传 null
+                ok++;
+            } catch (Exception e) {
+                System.out.println("[fail] " + r.value() + ": " + e.getCause());
+            }
+        }
+        System.out.printf("%n共 %d 个测试，通过 %d%n", total, ok);
+    }
+}`}
+  expectedOutput={`[ok] 登录成功\n[ok] 登出成功\n[ok] 注册成功\n\n共 3 个测试，通过 3`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-11-exercise"
+  title="路由注解"
+  code={`// 任务：定义一个 @Route 注解，运行时通过反射扫描类方法，
+// 打印出所有路由信息。期望输出：
+//   GET  /users    -> listUsers
+//   POST /users    -> createUser
+//   GET  /users/42 -> getUser
+
+import java.lang.annotation.*;
+
+public class Main {
+    // 补全：@Route 注解定义（含 value, method）
+    // @Retention(...)
+    // @Target(...)
+    // public @interface Route {
+    //     String value();
+    //     String method() default "GET";
+    // }
+
+    static class UserController {
+        // 补全：贴上 @Route 注解
+        public void listUsers()  { System.out.println("list"); }
+        public void createUser() { System.out.println("create"); }
+        public void getUser()    { System.out.println("get"); }
+    }
+
+    public static void main(String[] args) {
+        // 补全：扫描 UserController 的方法，打印所有路由
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ 注解是元数据，自身不执行业务逻辑
+- ✅ 内置：`@Override` / `@Deprecated` / `@SuppressWarnings` / `@FunctionalInterface`
+- ✅ 自定义用 `@interface`，属性是无参方法
+- ✅ 元注解：`@Target` 控位置、`@Retention` 控生命周期
+- ✅ `RUNTIME` + 反射 = 框架（JUnit、Spring、Jackson）的基础设施
+- ✅ 读注解：`clazz.getAnnotation(...)` / `method.getAnnotation(...)`
+
+下一章 **枚举进阶**：把一组常量写成「自带行为的类型」。

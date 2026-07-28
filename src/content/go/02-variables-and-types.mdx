@@ -1,0 +1,195 @@
+---
+title: 变量与类型
+order: 2
+description: Go 静态类型、var/:=、基本类型、常量、零值
+---
+
+# 变量与类型
+
+Go 是**静态类型**语言：变量类型在编译时确定，编译器会检查类型错误。
+
+## 1. 三种声明方式
+
+```go
+var name string = Alice  // 完整
+var age int                // 零值：0
+name2 := Bob             // 短声明（函数内）
+```
+
+<Playground
+  language="go"
+  id="go-02-var"
+  title="变量声明"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    var name string = "Alice"
+    var age int
+    city := "北京"
+
+    age = 30
+    fmt.Println(name, age, city)
+    fmt.Printf("%T %T %T\n", name, age, city)
+}`}
+  expectedOutput={`Alice 30 北京
+string int string`}
+/>
+
+<Callout type="tip" title={`:= 的限制`}>
+- 只能在**函数内部**使用
+- 左侧至少有一个新变量
+- 等价于 `var x = 表达式`（带类型推断）
+</Callout>
+
+## 2. 基本类型
+
+| 类型 | 说明 | 零值 |
+|---|---|---|
+| `bool` | 布尔 | `false` |
+| `string` | 字符串（不可变） | empty |
+| `int`, `int8/16/32/64` | 整数 | `0` |
+| `uint`, `uint8/16/32/64` | 无符号 | `0` |
+| `float32`, `float64` | 浮点 | `0.0` |
+| `byte` | `uint8` 别名 | `0` |
+| `rune` | `int32` 别名（Unicode 码点） | `0` |
+
+<Playground
+  language="go"
+  id="go-02-types"
+  title="类型零值"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    var b bool
+    var s string
+    var i int
+    var f float64
+    var by byte
+    var r rune
+
+    fmt.Printf("bool: %v\n", b)
+    fmt.Printf("string: %q\n", s)
+    fmt.Printf("int: %v\n", i)
+    fmt.Printf("float: %v\n", f)
+    fmt.Printf("byte: %v\n", by)
+    fmt.Printf("rune: %v\n", r)
+}`}
+  expectedOutput={`bool: false
+string: ""
+int: 0
+float: 0
+byte: 0
+rune: 0`}
+/>
+
+## 3. 常量 `const`
+
+常量不能用 `:=`，必须显式声明；可以是无类型常量（更灵活）。
+
+<Playground
+  language="go"
+  id="go-02-const"
+  title="常量与无类型常量"
+  code={`package main
+
+import "fmt"
+
+const Pi = 3.14159
+const (
+    StatusOK    = 200
+    StatusError = 500
+)
+
+func main() {
+    const x = 10
+    var i int = x
+    var f float64 = x
+    fmt.Println(i, f)
+    fmt.Println(StatusOK, StatusError)
+}`}
+  expectedOutput={`10 10
+200 500`}
+/>
+
+## 4. 类型转换（必须显式）
+
+Go 不做隐式类型转换，必须用 `T(v)`。
+
+<Playground
+  language="go"
+  id="go-02-cast"
+  title="类型转换"
+  code={`package main
+
+import (
+    "fmt"
+    "strconv"
+)
+
+func main() {
+    var i int = 42
+    f := float64(i)
+    s := strconv.Itoa(i)
+    n, _ := strconv.Atoi("123")
+
+    fmt.Printf("%T %v\n", f, f)
+    fmt.Printf("%T %v\n", s, s)
+    fmt.Printf("%T %v\n", n, n)
+}`}
+  expectedOutput={`float64 42
+string 42
+int 123`}
+/>
+
+## 5. 摄氏↔华氏
+
+<Playground
+  language="go"
+  id="go-02-cf"
+  title="温度转换"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    c := 25.0
+    f := c*9/5 + 32
+    fmt.Printf("%.1fC = %.1fF\n", c, f)
+}`}
+  expectedOutput={`25.0C = 77.0F`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-02-exercise"
+  title="圆面积"
+  code={`// 任务：输入半径 r，输出圆面积
+// 公式：Pi * r^2，保留 2 位
+// 期望：r=5 -> 78.54
+
+package main
+
+import "fmt"
+
+func main() {
+    var r int = 5
+    // 补全代码
+}
+`}
+/>
+
+## 小结
+
+- `var` 完整声明；`:=` 短声明（仅函数内）
+- 静态类型 + 显式转换
+- 零值机制：未初始化变量有默认值
+- `const` 声明常量，无类型常量更灵活
+- `strconv.Itoa/Atoi` 是字符串与 int 的常用桥
+
+下一章 **流程控制**。

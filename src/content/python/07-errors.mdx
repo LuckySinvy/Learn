@@ -1,0 +1,169 @@
+---
+title: 错误处理
+order: 7
+description: try/except/finally、常见异常类型、自定义异常
+---
+
+# 错误处理
+
+程序出错时不应该直接崩溃。Python 用 `try/except` 捕获并处理异常。
+
+## 1. 异常的代价
+
+```python
+print(1 / 0)
+# ZeroDivisionError: division by zero
+```
+
+<Callout type="info" title="什么是异常">
+异常（Exception）是程序运行时的错误事件。它会**中断当前执行流**，沿调用栈向上抛出，直到被 `try/except` 捕获或导致程序退出。
+</Callout>
+
+## 2. 基本 `try/except`
+
+<Playground
+  language="python"
+  id="py-07-try"
+  title="基本捕获"
+  code={`try:
+    n = int(input("请输入整数："))
+    print(10 / n)
+except ValueError:
+    print("这不是一个整数！")
+except ZeroDivisionError:
+    print("不能除以 0")`}
+/>
+
+## 3. `else` 与 `finally`
+
+- `else`：当**没有**异常时执行
+- `finally`：无论是否异常都执行（常用于释放资源）
+
+<Playground
+  language="python"
+  id="py-07-finally"
+  title="else 与 finally"
+  code={`def safe_div(a, b):
+    try:
+        r = a / b
+    except ZeroDivisionError:
+        return None
+    else:
+        return r          # 没出错才执行
+    finally:
+        print(f"  safe_div({a},{b}) 调用结束")
+
+print(safe_div(10, 2))
+print(safe_div(10, 0))`}
+  expectedOutput={`  safe_div(10,2) 调用结束\n5\n  safe_div(10,0) 调用结束\nNone`}/>
+/>
+
+## 4. 常见异常类型
+
+| 异常 | 触发场景 |
+|---|---|
+| `ValueError` | 类型对但值不合法，如 `int("abc")` |
+| `TypeError` | 类型错误，如 `"1" + 1` |
+| `ZeroDivisionError` | 除以 0 |
+| `IndexError` | 序列下标越界 |
+| `KeyError` | 字典键不存在 |
+| `FileNotFoundError` | 打开不存在的文件 |
+| `AttributeError` | 对象无此属性 |
+
+<Playground
+  language="python"
+  id="py-07-types"
+  title="常见异常"
+  code={`samples = [
+    ("int('abc')", lambda: int("abc")),
+    ("'1'+1",      lambda: "1" + 1),
+    ("[1,2][5]",   lambda: [1, 2][5]),
+    ("{}['x']",    lambda: {}["x"]),
+]
+for name, f in samples:
+    try:
+        f()
+    except Exception as e:
+        print(f"{name} -> {type(e).__name__}: {e}")`}
+  expectedOutput={"int('abc') -> ValueError: invalid literal for int() with base 10: 'abc'\n'1'+1 -> TypeError: can only concatenate str (not \"int\") to str\n[1,2][5] -> IndexError: list index out of range\n{}['x'] -> KeyError: 'x'"}
+/>
+
+## 5. 主动抛异常：`raise`
+
+<Playground
+  language="python"
+  id="py-07-raise"
+  title="raise 主动抛错"
+  code={`def set_age(age):
+    if age < 0 or age > 150:
+        raise ValueError(f"年龄不合理：{age}")
+    print(f"年龄已设置为 {age}")
+
+try:
+    set_age(200)
+except ValueError as e:
+    print("捕获：", e)`}
+  expectedOutput={`捕获： 年龄不合理：200`}
+/>
+
+## 6. 自定义异常
+
+<Playground
+  language="python"
+  id="py-07-custom"
+  title="自定义异常"
+  code={`class InsufficientFundsError(Exception):
+    """余额不足异常"""
+    def __init__(self, balance, amount):
+        super().__init__(f"余额 {balance}，尝试取出 {amount}")
+        self.balance = balance
+        self.amount = amount
+
+def withdraw(balance, amount):
+    if amount > balance:
+        raise InsufficientFundsError(balance, amount)
+    return balance - amount
+
+try:
+    withdraw(100, 200)
+except InsufficientFundsError as e:
+    print("操作失败：", e)`}
+  expectedOutput={`操作失败： 余额 100，尝试取出 200`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="python"
+  id="py-07-exercise"
+  title="健壮的输入解析"
+  code={`# 任务：写一个 safe_int 函数，反复要求用户输入直到给出合法整数
+# 捕获 ValueError；用户输入 q 时返回 None 退出
+# 期望效果：
+#   请输入：> abc
+#   无效，请重试
+#   请输入：> 42
+#   已接收：42
+
+def safe_int():
+    while True:
+        s = input("请输入：")
+        if s == "q":
+            return None
+        # 补全代码
+        pass
+
+print(safe_int())
+`}
+/>
+
+## 小结
+
+- ✅ `try/except` 捕获异常；`else` 无异常时执行；`finally` 总是执行
+- ✅ 多个 except 按顺序匹配
+- ✅ `raise` 主动抛异常
+- ✅ 自定义异常继承 `Exception`
+- ✅ 不要用 `except:` 吞掉所有异常（会包括 `KeyboardInterrupt` 等）
+- ✅ 异常信息（`e`）是宝贵的调试线索
+
+下一章 **文件 I/O**：读写文件与 JSON。

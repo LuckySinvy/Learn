@@ -1,0 +1,631 @@
+---
+title: 项目：Spring Boot REST API
+order: 17
+description: 项目结构、@RestController、依赖注入、单文件 HttpServer 演示
+---
+
+# 项目：Spring Boot REST API
+
+Spring Boot 是 Java 后端的事实标准。但它**需要 Maven/Gradle 与多文件**——Playground 跑不了。
+
+本章的做法：
+1. 先按 **真实项目结构** 拆文件展示（pom.xml、Application、Controller、Service、Model）
+2. 再用 **JDK 自带**的 `com.sun.net.httpserver.HttpServer` 写一个**单文件可运行**的极简 HTTP 服务，体验「注解 + 路由 + 依赖注入」的核心思想
+
+> 本章 Playground 不会发起真实网络请求（沙箱禁外网），全部用 `HttpClient` **访问本机**端口完成端到端演示。
+
+## 1. 真实 Spring Boot 项目结构
+
+```
+user-service/
+├── pom.xml
+└── src/
+    ├── main/
+    │   ├── java/com/example/userservice/
+    │   │   ├── UserServiceApplication.java     // 启动类
+    │   │   ├── controller/UserController.java   // REST 控制器
+    │   │   ├── service/UserService.java         // 业务逻辑
+    │   │   ├── model/User.java                  // 领域模型
+    │   │   └── dto/CreateUserRequest.java       // 入参 DTO
+    │   └── resources/
+    │       └── application.yml
+    └── test/
+        └── java/com/example/userservice/
+            └── UserControllerTest.java
+```
+
+### `pom.xml`
+
+```xml
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.0</version>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>user-service</artifactId>
+    <version>1.0.0</version>
+
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
+```
+
+### 启动类
+
+```java
+package com.example.userservice;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class UserServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(UserServiceApplication.class, args);
+    }
+}
+```
+
+### Controller
+
+```java
+package com.example.userservice.controller;
+
+import com.example.userservice.model.User;
+import com.example.userservice.service.UserService;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/users")
+public class UserController {
+    private final UserService service;
+
+    public UserController(UserService service) {   // 构造器注入
+        this.service = service;
+    }
+
+    @GetMapping
+    public List<User> list() {
+        return service.findAll();
+    }
+
+    @GetMapping("/{id}")
+    public User get(@PathVariable Long id) {
+        return service.findById(id);
+    }
+
+    @PostMapping
+    public User create(@RequestBody CreateUserRequest req) {
+        return service.create(req.name(), req.email());
+    }
+}
+```
+
+### Service
+
+```java
+package com.example.userservice.service;
+
+import com.example.userservice.model.User;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+@Service
+public class UserService {
+    private final Map<Long, User> store = new HashMap<>();
+    private final AtomicLong seq = new AtomicLong(0);
+
+    public List<User> findAll() {
+        return store.values().stream().toList();
+    }
+
+    public User findById(long id) {
+        User u = store.get(id);
+        if (u == null) throw new NoSuchElementException("user " + id);
+        return u;
+    }
+
+    public User create(String name, String email) {
+        long id = seq.incrementAndGet();
+        User u = new User(id, name, email);
+        store.put(id, u);
+        return u;
+    }
+}
+```
+
+### Model + DTO
+
+```java
+package com.example.userservice.model;
+
+public record User(long id, String name, String email) {}
+
+package com.example.userservice.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+
+public record CreateUserRequest(
+    @NotBlank String name,
+    @Email     String email
+) {}
+```
+
+### 启动后访问
+
+```bash
+$ mvn spring-boot:run
+
+$ curl http://localhost:8080/users
+[]
+$ curl -X POST -H "Content-Type: application/json" \
+       -d '{"name":"Alice","email":"a@x.com"}' \
+       http://localhost:8080/users
+{"id":1,"name":"Alice","email":"a@x.com"}
+$ curl http://localhost:8080/users/1
+{"id":1,"name":"Alice","email":"a@x.com"}
+```
+
+<Callout type="info" title="Spring Boot 关键注解">
+| 注解 | 作用 |
+|---|---|
+| `@SpringBootApplication` | 一键启用：自动配置 + 组件扫描 + 配置类 |
+| `@RestController` | `@Controller` + `@ResponseBody`：方法返回值直接写响应体（JSON） |
+| `@RequestMapping("/users")` | 类级别 URL 前缀 |
+| `@GetMapping / @PostMapping` | 等价于 `@RequestMapping(method = GET/POST)` |
+| `@PathVariable` | 取 URL 里的占位符 `/users/{id}` |
+| `@RequestBody` | 把请求体 JSON 反序列化为对象 |
+| `@Service / @Repository / @Component` | 把类注册成 Spring Bean |
+</Callout>
+
+## 2. 单文件 Playground：迷你 Spring
+
+为了在 Playground 里也能跑起来，我们用 JDK 自带的 `HttpServer` 写一个**只有 80 行的「迷你 Spring」**——保留 `@RestController` / `@GetMapping` / `@PostMapping` / `@RequestBody` / 依赖注入的概念：
+
+<Playground
+  language="java"
+  id="java-17-mini"
+  title="迷你 Spring：注解 + DI + 路由"
+  code={`import com.sun.net.httpserver.*;
+import java.io.*;
+import java.lang.annotation.*;
+import java.lang.reflect.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class Main {
+    // ====== 注解（同名于 Spring） ======
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE)
+    public @interface RestController {}
+    @Retention(RetentionPolicy.RUNTIME) @Target({ElementType.TYPE, ElementType.METHOD})
+    public @interface RequestMapping { String value() default ""; }
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface GetMapping { String value() default ""; }
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface PostMapping { String value() default ""; }
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.PARAMETER)
+    public @interface RequestBody {}
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.PARAMETER)
+    public @interface PathVariable {}
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface ResponseBody {}
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE)
+    public @interface Component {}
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.FIELD)
+    public @interface Autowired {}
+
+    // ====== 注解式 Controller（像 Spring 一样写） ======
+    @RestController
+    @RequestMapping("/users")
+    static class UserController {
+        @Autowired UserService service;   // 字段注入
+
+        @GetMapping
+        @ResponseBody
+        public List<String> list() { return service.findAll(); }
+
+        @GetMapping("/{id}")
+        @ResponseBody
+        public String get(@PathVariable("id") String id) {
+            return service.findById(id);
+        }
+
+        @PostMapping
+        @ResponseBody
+        public String create(@RequestBody String name) {
+            return service.create(name);
+        }
+    }
+
+    @Component
+    static class UserService {
+        private final Map<String, String> store = new ConcurrentHashMap<>();
+        public List<String> findAll() { return new ArrayList<>(store.values()); }
+        public String findById(String id) {
+            String u = store.get(id);
+            if (u == null) throw new NoSuchElementException("user " + id);
+            return u;
+        }
+        public String create(String name) {
+            String id = String.valueOf(store.size() + 1);
+            store.put(id, name);
+            return "user#" + id + "=" + name;
+        }
+    }
+
+    // ====== IoC 容器（依赖注入） ======
+    static class AppContext {
+        final Map<Class<?>, Object> beans = new HashMap<>();
+        AppContext(Class<?>... components) throws Exception {
+            // 1. 实例化所有 @Component / @RestController
+            for (Class<?> c : components) {
+                beans.put(c, c.getDeclaredConstructor().newInstance());
+            }
+            // 2. 注入 @Autowired 字段
+            for (Object bean : beans.values()) {
+                for (Field f : bean.getClass().getDeclaredFields()) {
+                    if (f.isAnnotationPresent(Autowired.class)) {
+                        f.setAccessible(true);
+                        f.set(bean, beans.get(f.getType()));
+                    }
+                }
+            }
+        }
+    }
+
+    // ====== 路由注册（注解扫描） ======
+    static class Router {
+        record Handler(Object bean, Method m, String path, String httpMethod) {}
+
+        void register(HttpServer server, AppContext ctx) {
+            for (Object bean : ctx.beans.values()) {
+                Class<?> c = bean.getClass();
+                String classPath = "";
+                if (c.isAnnotationPresent(RequestMapping.class)) {
+                    classPath = c.getAnnotation(RequestMapping.class).value();
+                }
+                for (Method m : c.getDeclaredMethods()) {
+                    String method = null, path = null;
+                    if (m.isAnnotationPresent(GetMapping.class)) {
+                        method = "GET";
+                        path = m.getAnnotation(GetMapping.class).value();
+                    } else if (m.isAnnotationPresent(PostMapping.class)) {
+                        method = "POST";
+                        path = m.getAnnotation(PostMapping.class).value();
+                    }
+                    if (method == null) continue;
+                    final String fullPath = classPath + path;
+                    Handler h = new Handler(bean, m, fullPath, method);
+                    server.createContext(fullPath, exchange -> handle(exchange, h));
+                }
+            }
+        }
+
+        void handle(HttpServer.Exchange exchange, Handler h) throws IOException {
+            try {
+                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                String path = exchange.getRequestURI().getPath();
+                String[] segments = path.replace(h.path, "").split("/", -1);
+                Object[] args = new Object[m(h).getParameterCount()];
+                Parameter[] ps = m(h).getParameters();
+                for (int i = 0; i < ps.length; i++) {
+                    if (ps[i].isAnnotationPresent(RequestBody.class)) args[i] = body;
+                    else if (ps[i].isAnnotationPresent(PathVariable.class)) {
+                        String name = ps[i].getAnnotation(PathVariable.class).value();
+                        args[i] = matchPathVar(h.path, path, name);
+                    } else args[i] = null;
+                }
+                Object result = m(h).invoke(h.bean, args);
+                byte[] out = (result == null ? "" : result.toString()).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, out.length);
+                exchange.getResponseBody().write(out);
+            } catch (InvocationTargetException e) {
+                String msg = e.getCause().getMessage();
+                byte[] out = ("ERR: " + msg).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(500, out.length);
+                exchange.getResponseBody().write(out);
+            } catch (Exception e) {
+                String msg = e.getMessage();
+                byte[] out = ("ERR: " + msg).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(500, out.length);
+                exchange.getResponseBody().write(out);
+            } finally {
+                exchange.close();
+            }
+        }
+
+        Method m(Handler h) { return h.m; }
+        String matchPathVar(String pattern, String actual, String name) {
+            // 简单实现：/users/{id} -> 取 actual 里除了 pattern 以外的第一段
+            String tail = actual.substring(pattern.length() + 1);
+            return tail.split("/")[0];
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // 1. 启动容器
+        AppContext ctx = new AppContext(UserController.class, UserService.class);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        new Router().register(server, ctx);
+        server.start();
+        int port = server.getAddress().getPort();
+        System.out.println("server up on http://127.0.0.1:" + port);
+
+        // 2. 用 Java 自带 HttpClient 模拟 curl
+        HttpClient client = HttpClient.newHttpClient();
+        // POST /users
+        HttpResponse<String> r1 = client.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/users"))
+                       .header("Content-Type", "text/plain")
+                       .POST(HttpRequest.BodyPublishers.ofString("Alice"))
+                       .build(),
+            HttpResponse.BodyHandlers.ofString());
+        System.out.println("POST /users        -> " + r1.statusCode() + " " + r1.body());
+
+        HttpResponse<String> r2 = client.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/users"))
+                       .header("Content-Type", "text/plain")
+                       .POST(HttpRequest.BodyPublishers.ofString("Bob"))
+                       .build(),
+            HttpResponse.BodyHandlers.ofString());
+        System.out.println("POST /users        -> " + r2.statusCode() + " " + r2.body());
+
+        // GET /users
+        HttpResponse<String> r3 = client.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/users"))
+                       .GET().build(),
+            HttpResponse.BodyHandlers.ofString());
+        System.out.println("GET  /users        -> " + r3.statusCode() + " " + r3.body());
+
+        // GET /users/1
+        HttpResponse<String> r4 = client.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/users/1"))
+                       .GET().build(),
+            HttpResponse.BodyHandlers.ofString());
+        System.out.println("GET  /users/1      -> " + r4.statusCode() + " " + r4.body());
+
+        // GET /users/999（业务异常）
+        HttpResponse<String> r5 = client.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/users/999"))
+                       .GET().build(),
+            HttpResponse.BodyHandlers.ofString());
+        System.out.println("GET  /users/999    -> " + r5.statusCode() + " " + r5.body());
+
+        // 3. 关闭服务
+        server.stop(0);
+        System.out.println("server stopped");
+    }
+}`}
+  expectedOutput={`server up on http://127.0.0.1:随机端口\nPOST /users        -> 200 user#1=Alice\nPOST /users        -> 200 user#2=Bob\nGET  /users        -> 200 [Alice, Bob]\nGET  /users/1      -> 200 Alice\nGET  /users/999    -> 500 ERR: user 999\nserver stopped`}
+/>
+
+<Callout type="tip" title="对照 Spring 看这个迷你实现">
+| Spring | 这里 |
+|---|---|
+| `@SpringBootApplication` 启动容器 | `new AppContext(...)` |
+| 组件扫描 `@Component` | 手动 `AppContext` 列出类 |
+| 字段注入 `@Autowired` | `AppContext` 反射写入字段 |
+| 路由映射 `@GetMapping` 等 | `Router.register` 扫注解 |
+| JSON 序列化 | `toString()`（真实用 Jackson/Gson） |
+| Tomcat 内嵌 | `com.sun.net.httpserver.HttpServer` |
+</Callout>
+
+## 3. 真实项目里的常见依赖注入方式
+
+Spring 推荐**构造器注入**——更利于测试：
+
+```java
+@Service
+public class OrderService {
+    private final UserService userService;
+    private final PaymentService paymentService;
+
+    public OrderService(UserService u, PaymentService p) {   // 构造器注入
+        this.userService = u;
+        this.paymentService = p;
+    }
+}
+```
+
+字段注入（上一节的 `@Autowired` 字段）虽然写法短，但**不利于单元测试**——无法在没有 Spring 容器时手动传 mock。
+
+## 4. 测试
+
+```java
+@WebMvcTest(UserController.class)
+class UserControllerTest {
+    @Autowired MockMvc mvc;
+    @MockBean  UserService service;
+
+    @Test
+    void get_returnsUser() throws Exception {
+        when(service.findById(1L)).thenReturn(new User(1L, "Alice", "a@x.com"));
+        mvc.perform(get("/users/1"))
+           .andExpect(status().isOk())
+           .andExpect(jsonPath("$.name").value("Alice"));
+    }
+}
+```
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-17-exercise"
+  title="补全路由"
+  code={`// 任务：在迷你 Spring 框架下，新增一个 TodoController
+// 包含 GET /todos（返回所有 todo）和 POST /todos（创建并返回 id）
+// 提示：参考 UserController 的写法，注意 RequestMapping 与 @Autowired
+// 期望输出：
+//   POST /todos       -> 200 todo#1=买牛奶
+//   GET  /todos       -> 200 [买牛奶, 写代码]
+//   POST /todos       -> 200 todo#2=写代码
+//   GET  /todos       -> 200 [买牛奶, 写代码]
+//   GET  /todos/1     -> 200 买牛奶
+
+import com.sun.net.httpserver.*;
+import java.io.*;
+import java.lang.annotation.*;
+import java.lang.reflect.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class Main {
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE)
+    public @interface RestController {}
+    @Retention(RetentionPolicy.RUNTIME) @Target({ElementType.TYPE, ElementType.METHOD})
+    public @interface RequestMapping { String value() default ""; }
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface GetMapping { String value() default ""; }
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface PostMapping { String value() default ""; }
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.PARAMETER)
+    public @interface RequestBody {}
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.PARAMETER)
+    public @interface PathVariable {}
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface ResponseBody {}
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE)
+    public @interface Component {}
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.FIELD)
+    public @interface Autowired {}
+
+    @Component
+    static class TodoService {
+        private final List<String> todos = new CopyOnWriteArrayList<>();
+        public List<String> findAll() { return todos; }
+        public String create(String text) {
+            todos.add(text);
+            return "todo#" + todos.size() + "=" + text;
+        }
+        public String findByIndex(int i) { return todos.get(i - 1); }
+    }
+
+    // 补全：TodoController（包含 @RestController、@RequestMapping("/todos"）、@Autowired）
+    // 提供 list() 和 create(@RequestBody String) 两个方法
+    static class TodoController {
+        // ...
+    }
+
+    // --- 容器 / 路由 / 启动（与前一节相同的模板） ---
+    static class AppContext {
+        final Map<Class<?>, Object> beans = new HashMap<>();
+        AppContext(Class<?>... cs) throws Exception {
+            for (Class<?> c : cs) beans.put(c, c.getDeclaredConstructor().newInstance());
+            for (Object bean : beans.values()) {
+                for (Field f : bean.getClass().getDeclaredFields()) {
+                    if (f.isAnnotationPresent(Autowired.class)) {
+                        f.setAccessible(true);
+                        f.set(bean, beans.get(f.getType()));
+                    }
+                }
+            }
+        }
+    }
+
+    static class Router {
+        void register(HttpServer server, AppContext ctx) {
+            for (Object bean : ctx.beans.values()) {
+                Class<?> c = bean.getClass();
+                String cls = c.isAnnotationPresent(RequestMapping.class)
+                    ? c.getAnnotation(RequestMapping.class).value() : "";
+                for (Method m : c.getDeclaredMethods()) {
+                    String method = null, path = "";
+                    if (m.isAnnotationPresent(GetMapping.class))  { method = "GET";  path = m.getAnnotation(GetMapping.class).value(); }
+                    if (m.isAnnotationPresent(PostMapping.class)) { method = "POST"; path = m.getAnnotation(PostMapping.class).value(); }
+                    if (method == null) continue;
+                    final String fp = cls + path;
+                    Method fm = m; Object fb = bean;
+                    server.createContext(fp, exchange -> {
+                        try {
+                            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                            String tail = exchange.getRequestURI().getPath().substring(fp.length() + 1);
+                            Object[] args = new Object[fm.getParameterCount()];
+                            Parameter[] ps = fm.getParameters();
+                            for (int i = 0; i < ps.length; i++) {
+                                if (ps[i].isAnnotationPresent(RequestBody.class)) args[i] = body;
+                                else if (ps[i].isAnnotationPresent(PathVariable.class)) args[i] = tail.split("/")[0];
+                            }
+                            Object r = fm.invoke(fb, args);
+                            byte[] out = (r == null ? "" : r.toString()).getBytes(StandardCharsets.UTF_8);
+                            exchange.sendResponseHeaders(200, out.length);
+                            exchange.getResponseBody().write(out);
+                        } catch (Exception e) {
+                            byte[] out = ("ERR: " + e.getCause().getMessage()).getBytes(StandardCharsets.UTF_8);
+                            exchange.sendResponseHeaders(500, out.length);
+                            exchange.getResponseBody().write(out);
+                        } finally { exchange.close(); }
+                    });
+                }
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        AppContext ctx = new AppContext(TodoController.class, TodoService.class);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        new Router().register(server, ctx);
+        server.start();
+        int p = server.getAddress().getPort();
+        System.out.println("up on " + p);
+
+        HttpClient c = HttpClient.newHttpClient();
+        System.out.println("POST /todos -> " + c.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+p+"/todos"))
+            .POST(HttpRequest.BodyPublishers.ofString("买牛奶")).build(),
+            HttpResponse.BodyHandlers.ofString()).body());
+        System.out.println("GET  /todos -> " + c.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+p+"/todos"))
+            .GET().build(), HttpResponse.BodyHandlers.ofString()).body());
+        System.out.println("POST /todos -> " + c.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+p+"/todos"))
+            .POST(HttpRequest.BodyPublishers.ofString("写代码")).build(),
+            HttpResponse.BodyHandlers.ofString()).body());
+        System.out.println("GET  /todos -> " + c.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+p+"/todos"))
+            .GET().build(), HttpResponse.BodyHandlers.ofString()).body());
+        System.out.println("GET  /todos/1 -> " + c.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+p+"/todos/1"))
+            .GET().build(), HttpResponse.BodyHandlers.ofString()).body());
+
+        server.stop(0);
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ Spring Boot 启动类标 `@SpringBootApplication`，`main` 一行启动
+- ✅ `@RestController` + `@GetMapping` / `@PostMapping` 把方法变成 HTTP 端点
+- ✅ `@RequestBody` 反序列化请求体；`@PathVariable` 取 URL 占位符
+- ✅ 推荐**构造器注入**依赖，而非字段注入
+- ✅ 没有 Spring 时也能用 `com.sun.net.httpserver` 写极简 HTTP 服务
+- ✅ 本章 Playground 演示了「注解扫描 + 依赖注入 + 路由」三件套是怎么工作的
+
+下一章 **项目：多线程下载器**——把并发与 Future 串起来。

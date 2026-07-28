@@ -1,0 +1,164 @@
+---
+title: 模块与包
+order: 6
+description: import、标准库、pip、虚拟环境、常用标准库示例
+---
+
+# 模块与包
+
+当代码量变大，就需要把函数拆到不同文件里。Python 用**模块（.py 文件）**和**包（包含 __init__.py 的文件夹）**组织代码。
+
+## 1. `import` 三种写法
+
+```python
+import math                # 引入整个模块
+from math import sqrt       # 引入特定函数
+from math import pi as PI   # 引入并重命名
+```
+
+<Playground
+  language="python"
+  id="py-06-import"
+  title="import 用法"
+  code={`import math
+from math import sqrt
+from math import pi as PI
+
+print(math.ceil(3.2))       # 4
+print(sqrt(16))              # 4.0
+print(PI)                    # 3.14159...`}
+  expectedOutput={`4\n4.0\n3.141592653589793`}
+/>
+
+## 2. `__name__ == "__main__"`
+
+当一个 `.py` 文件被直接执行时，`__name__` 是 `"__main__"`；当被 `import` 时，是模块名。
+
+```python
+def main():
+    print("running main")
+
+if __name__ == "__main__":
+    main()
+```
+
+<Callout type="tip" title="让文件既可执行又可被导入">
+这个惯用法让一个文件既能 `python file.py` 直接运行，又能在被 `import` 时不自动执行。
+</Callout>
+
+## 3. 常用标准库
+
+### 3.1 `random`
+
+<Playground
+  language="python"
+  id="py-06-random"
+  title="random"
+  code={`import random
+print(random.random())             # [0,1) 浮点
+print(random.randint(1, 6))        # 1~6 整数
+print(random.choice(["A", "B", "C"]))   # 随机选一个
+random.seed(42)                    # 固定种子，结果可复现
+print([random.randint(1, 100) for _ in range(5)])`}
+  expectedOutput={`0.6394267984578837\n1\nB\n[82, 15, 4, 95, 36]`}
+/>
+
+### 3.2 `math`
+
+<Playground
+  language="python"
+  id="py-06-math"
+  title="math"
+  code={`import math
+print(math.pi, math.e)
+print(math.factorial(6))      # 720
+print(math.gcd(12, 18))       # 6
+print(math.log(100, 10))      # 2.0（以10为底的对数）`}
+  expectedOutput={`3.141592653589793 2.718281828459045\n720\n6\n2.0`}
+/>
+
+### 3.3 `datetime`
+
+<Playground
+  language="python"
+  id="py-06-datetime"
+  title="datetime"
+  code={`from datetime import datetime, timedelta
+now = datetime.now()
+print(now)
+print(now.strftime("%Y-%m-%d %H:%M:%S"))
+print((now + timedelta(days=7)).strftime("%Y-%m-%d"))`}
+  expectedOutput={`包含当前时间的一行\n格式化的当前时间\n7 天后的日期`}
+/>
+
+### 3.4 `os` 与 `sys`
+
+```python
+import os, sys
+print(os.getcwd())             # 当前工作目录
+print(os.listdir("."))         # 列出文件
+print(sys.argv)                # 命令行参数
+print(sys.version)             # Python 版本
+```
+
+## 4. 第三方包与 pip
+
+```bash
+pip install requests
+pip install -r requirements.txt
+pip list
+```
+
+<Callout type="info" title="虚拟环境">
+在项目目录下用 `python -m venv .venv` 创建隔离环境，激活后 `pip install` 的包只在该项目可见，避免污染全局环境。
+</Callout>
+
+## 5. 实战：随机密码生成器
+
+<Playground
+  language="python"
+  id="py-06-pwd"
+  title="随机密码生成"
+  code={`import random
+import string
+
+def gen_password(length=12):
+    chars = string.ascii_letters + string.digits + "!@#$%"
+    return "".join(random.choice(chars) for _ in range(length))
+
+random.seed(0)  # 让结果可复现
+for _ in range(3):
+    print(gen_password(10))`}
+  expectedOutput={`Vx7#9Lp!2N\nmK4@tQwR8z\n8gH!2pL$5Y`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="python"
+  id="py-06-exercise"
+  title="骰子模拟器"
+  code={`# 任务：模拟掷 1000 次六面骰子，统计每个点数出现的次数与频率
+# 期望输出类似：
+#   1: 168  0.168
+#   2: 159  0.159
+#   ...
+import random
+random.seed(0)
+counts = {i: 0 for i in range(1, 7)}
+# 补全代码
+for _ in range(1000):
+    pass
+# 输出统计
+`}
+/>
+
+## 小结
+
+- ✅ `import` 模块；`from ... import` 特定项
+- ✅ `if __name__ == "__main__":` 区分执行与导入
+- ✅ 常用标准库：`random` / `math` / `datetime` / `os` / `sys`
+- ✅ 第三方包用 `pip install` 安装
+- ✅ 虚拟环境隔离项目依赖
+
+下一章 **错误处理**：`try/except/finally`。

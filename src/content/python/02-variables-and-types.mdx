@@ -1,0 +1,150 @@
+---
+title: 变量与数据类型
+order: 2
+description: Python 的动态类型系统、常用基本类型与类型转换
+---
+
+# 变量与数据类型
+
+Python 是**动态类型**语言：声明变量时无需指定类型，类型由值决定。
+
+## 1. 变量赋值
+
+```python
+name = "Alice"        # 字符串 str
+age = 30              # 整数 int
+height = 1.75         # 浮点数 float
+is_student = True     # 布尔 bool
+nothing = None        # 空值 NoneType
+```
+
+## 2. 常用类型一览
+
+| 类型 | 示例 | 说明 |
+|---|---|---|
+| `int` | `-1, 0, 42, 1_000_000` | 任意精度整数 |
+| `float` | `3.14, -0.5, 1e10` | 双精度浮点 |
+| `str` | `"hi", 'Python', '''多行'''` | 不可变字符串 |
+| `bool` | `True, False` | 实际上是 `int` 的子类 |
+| `NoneType` | `None` | 表示"空" |
+
+## 3. 用 `type()` 查看类型
+
+<Playground
+  language="python"
+  id="py-02-type"
+  title="type() 查看类型"
+  code={`a = 10
+b = 3.14
+c = "hello"
+d = True
+e = None
+
+print(type(a).__name__, a)
+print(type(b).__name__, b)
+print(type(c).__name__, c)
+print(type(d).__name__, d)
+print(type(e).__name__, e)`}
+  expectedOutput={`int 10\nfloat 3.14\nstr hello\nbool True\nNoneType None`}
+/>
+
+## 4. 类型转换
+
+Python 不会自动转换类型，需要手动调用 `int()` / `float()` / `str()` / `bool()`。
+
+<Playground
+  language="python"
+  id="py-02-cast"
+  title="类型转换"
+  code={`s = "123"
+n = int(s)            # str -> int
+f = float("3.14")     # str -> float
+back = str(42)        # int -> str
+
+print(n + 1)          # 124
+print(f * 2)          # 6.28
+print(back + " 分")    # 42 分
+
+# 错误示例
+# int("abc")  # 会抛 ValueError`}
+  expectedOutput={`124\n6.28\n42 分`}
+/>
+
+<Callout type="warn" title="类型转换失败的异常">
+`int("abc")`、`float("xyz")` 会抛出 `ValueError`。第 7 章会讲如何捕获。
+</Callout>
+
+## 5. 算术运算符
+
+```python
+print(10 + 3)   # 13
+print(10 - 3)   # 7
+print(10 * 3)   # 30
+print(10 / 3)   # 3.3333...  真除法
+print(10 // 3)  # 3          整除
+print(10 % 3)   # 1          取模
+print(10 ** 3)  # 1000       幂
+```
+
+<Playground
+  language="python"
+  id="py-02-arith"
+  title="算术运算"
+  code={`# 摄氏温度转华氏
+c = 25
+f = c * 9 / 5 + 32
+print(f"{c}°C = {f}°F")
+
+# 圆面积
+r = 5
+area = 3.14159 * r ** 2
+print(f"半径{r}的圆面积 ≈ {area:.2f}")`}
+  expectedOutput={`25°C = 77.0°F\n半径5的圆面积 ≈ 78.54`}
+/>
+
+## 6. 布尔值与比较
+
+```python
+print(3 > 2)    # True
+print(3 == 3)   # True
+print(3 != 3)   # False
+print("a" < "b") # True  字符串按字典序
+```
+
+<Playground
+  language="python"
+  id="py-02-bool"
+  title="比较运算"
+  code={`age = 20
+print(age >= 18)              # True
+print(age < 18 or age > 65)   # False
+print(18 <= age <= 30)        # True（链式比较）`}
+  expectedOutput={`True\nFalse\nTrue`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="python"
+  id="py-02-exercise"
+  title="BMI 计算器"
+  code={`# 任务：让用户输入身高（米）和体重（公斤），计算并输出 BMI
+# BMI = 体重 / (身高 ** 2)
+# 期望输出格式："你的 BMI 是 22.86"
+
+height = float(input("请输入身高（米）："))
+weight = float(input("请输入体重（公斤）："))
+# 补全下面的代码
+`}
+/>
+
+## 小结
+
+- ✅ Python 变量无需声明类型，赋值即创建
+- ✅ 常用类型：`int / float / str / bool / None`
+- ✅ `type()` 查看类型
+- ✅ `int()` / `float()` / `str()` 显式转换
+- ✅ 算术运算符 `+ - * / // % **`，比较返回 `bool`
+- ✅ Python 支持链式比较：`1 < x < 10`
+
+下一章进入 **流程控制**：`if/elif/else`、循环。

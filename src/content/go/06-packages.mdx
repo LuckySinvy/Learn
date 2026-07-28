@@ -1,0 +1,205 @@
+---
+title: 包与模块
+order: 6
+description: package 组织、import、go.mod、常用标准库
+---
+
+# 包与模块
+
+Go 用**包（package）** 组织代码，**模块（module）** 管理依赖。
+
+## 1. `package` 声明
+
+每个 `.go` 文件首行必须是 `package 名称`。同一目录下的文件属于同一个包。
+
+```go
+// 文件：mathutil/calc.go
+package mathutil
+
+func Add(a, b int) int { return a + b }  // 可导出
+func mul(a, b int) int { return a * b }  // 私有（小写）
+```
+
+<Callout type="tip" title="大小写决定可见性">
+- 大写字母开头：**导出**（其他包可访问）
+- 小写字母开头：**未导出**（包内私有）
+</Callout>
+
+## 2. `import` 路径
+
+```go
+import (
+    "fmt"                          // 标准库
+    "github.com/gin-gonic/gin"     // 第三方
+    "myproj/internal/utils"        // 内部包
+)
+```
+
+## 3. `go.mod` 与 module
+
+模块由 `go.mod` 文件标识：
+
+```go
+module example.com/mylearn
+
+go 1.22
+
+require (
+    github.com/google/uuid v1.6.0
+)
+```
+
+常用命令：
+
+```bash
+go mod init example.com/mylearn   # 初始化
+go mod tidy                       # 整理依赖
+go get pkg@version                # 添加依赖
+go mod download                   # 下载依赖
+```
+
+## 4. 常用标准库速览
+
+### 4.1 `strings`
+
+<Playground
+  language="go"
+  id="go-06-strings"
+  title="strings"
+  code={`package main
+
+import (
+    "fmt"
+    "strings"
+)
+
+func main() {
+    s := "Hello, World!"
+    fmt.Println(strings.ToUpper(s))
+    fmt.Println(strings.Contains(s, "World"))
+    fmt.Println(strings.Split("a,b,c", ","))
+    fmt.Println(strings.Replace(s, "World", "Go", 1))
+    fmt.Println(strings.TrimSpace("  hi  "))
+    fmt.Println(strings.HasPrefix(s, "Hello"))
+}`}
+  expectedOutput={`HELLO, WORLD!\ntrue\n[a b c]\nHello, Go!\nhi\ntrue`}
+/>
+
+### 4.2 `math/rand`
+
+<Playground
+  language="go"
+  id="go-06-rand"
+  title="math/rand"
+  code={`package main
+
+import (
+    "fmt"
+    "math/rand"
+    "time"
+)
+
+func main() {
+    rand.Seed(time.Now().UnixNano())
+    for i := 0; i < 5; i++ {
+        fmt.Println(rand.Intn(100))
+    }
+}`}
+  expectedOutput={`5 个 0~99 的随机数`}
+/>
+
+### 4.3 `time`
+
+<Playground
+  language="go"
+  id="go-06-time"
+  title="time"
+  code={`package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    now := time.Now()
+    fmt.Println(now.Format("2006-01-02 15:04:05"))
+    fmt.Println(now.Unix())
+
+    // 1 天后
+    tomorrow := now.Add(24 * time.Hour)
+    fmt.Println("明天：", tomorrow.Format("2006-01-02"))
+}`}
+  expectedOutput={`当前时间字符串\n当前 Unix 时间戳\n明天的日期`}
+/>
+
+<Callout type="info" title="2006-01-02 15:04:05 是 Go 的 reference time">
+这是 Go 独特的格式占位符（必须是这个时间点），不是随意数字。容易记错，建议保存为模板。
+</Callout>
+
+## 5. 实战：随机密码生成器
+
+<Playground
+  language="go"
+  id="go-06-pwd"
+  title="随机密码"
+  code={`package main
+
+import (
+    "fmt"
+    "math/rand"
+    "time"
+)
+
+const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%"
+
+func genPassword(length int) string {
+    b := make([]byte, length)
+    for i := range b {
+        b[i] = charset[rand.Intn(len(charset))]
+    }
+    return string(b)
+}
+
+func main() {
+    rand.Seed(time.Now().UnixNano())
+    for i := 0; i < 3; i++ {
+        fmt.Println(genPassword(12))
+    }
+}`}
+  expectedOutput={`3 个 12 位随机密码`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-06-exercise"
+  title="字符串反转"
+  code={`// 任务：写一个 reverse 函数，把字符串反转（不忽略中文）
+// 期望：reverse("Hello, 世界") = "界世 ,olleH"
+
+package main
+
+import "fmt"
+
+func reverse(s string) string {
+    // 提示：把 string 转 []rune 即可按码点反转
+    return ""
+}
+
+func main() {
+    fmt.Println(reverse("Hello, 世界"))
+}
+`}
+/>
+
+## 小结
+
+- ✅ 每个文件首行 `package 名称`
+- ✅ 大写字母开头导出，小写私有
+- ✅ `go.mod` 定义模块
+- ✅ 常用标准库：`strings` / `math/rand` / `time`
+- ✅ 时间格式必须是 `2006-01-02 15:04:05`
+
+下一章 **错误处理**：`error` 接口与 `panic/recover`。

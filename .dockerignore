@@ -1,0 +1,17 @@
+**/.git
+**/.gitignore
+**/.next
+**/node_modules
+**/.DS_Store
+**/.env*
+!**/.env.example
+**/README.md
+**/.vscode
+**/.idea
+**/*.log
+**/.cache
+**/test_*.py
+**/tmp/
+.dockerignore
+Dockerfile
+docker-compose.yml

@@ -1,0 +1,252 @@
+---
+title: 生成器与异步
+order: 11
+description: yield、生成器表达式、itertools、async/await、asyncio.gather
+---
+
+# 生成器与异步
+
+处理大数据流时，把全部数据塞进内存往往不现实。**生成器**让我们按需"惰性"产出；处理大量 I/O 时，**异步**让我们在等的过程中去做别的事。这两件事是 Python 高效编程的支柱。
+
+## 1. 生成器函数：`yield`
+
+包含 `yield` 的函数不再返回普通值，而是返回一个**生成器对象**。每次 `next()` 都会从上次 `yield` 处继续执行。
+
+<Playground
+  language="python"
+  id="py-11-yield-basic"
+  title="计数器生成器"
+  code={`def counter(n):
+    i = 0
+    while i < n:
+        yield i
+        i += 1
+
+# 手动驱动
+g = counter(3)
+print(next(g))   # 0
+print(next(g))   # 1
+print(next(g))   # 2
+try:
+    print(next(g))
+except StopIteration:
+    print("迭代结束")`}
+  expectedOutput={`0\n1\n2\n迭代结束`}
+/>
+
+<Callout type="info" title="惰性求值">
+`counter(10**18)` 瞬间返回，**不会**生成 10^18 个数。值是"被问到时"才产生的。处理大文件、无限序列、流时这是核心优势。
+</Callout>
+
+## 2. 生成器表达式
+
+类似列表推导式，但用圆括号，结果是生成器而不是列表。
+
+<Playground
+  language="python"
+  id="py-11-genexpr"
+  title="生成器表达式"
+  code={`# 列表推导式：立刻在内存中建好列表
+squares_list = [x * x for x in range(5)]
+print("list:", squares_list, "size:", len(squares_list))
+
+# 生成器表达式：惰性
+squares_gen = (x * x for x in range(5))
+print("gen:", squares_gen, "type:", type(squares_gen).__name__)
+
+# 用 sum() 消费
+total = sum(x * x for x in range(10))
+print("1²+2²+...+9² =", total)`}
+  expectedOutput={`list: [0, 1, 4, 9, 16] size: 5\ngen: <generator object <genexpr> at 0x...> type: generator\n1²+2²+...+9² = 285`}
+/>
+
+<Callout type="tip" title="什么时候用生成器表达式？">
+传给 `sum()`、`min()`、`max()`、`any()`、`all()` 时，可以省掉外层的圆括号：`sum(x*x for x in range(10))`。**能懒则懒**——但如果需要重复迭代或索引访问，必须物化成 list。
+</Callout>
+
+## 3. `itertools` 常用工具
+
+`itertools` 提供了一系列组合迭代器的"积木"。用熟这些能省掉大量手写循环。
+
+<Playground
+  language="python"
+  id="py-11-itertools"
+  title="itertools 高频函数"
+  code={`from itertools import count, islice, cycle, chain, groupby
+
+# count(start, step): 无限计数
+print("count(10, 2) 前 5 项:", list(islice(count(10, 2), 5)))
+
+# cycle: 无限循环
+print("cycle('AB') 前 6 项:", list(islice(cycle("AB"), 6)))
+
+# chain: 把多个迭代器首尾相接
+print("chain:", list(chain([1, 2], (3, 4), "ab")))
+
+# groupby: 连续相同 key 聚成一组
+words = ["apple", "ant", "banana", "blue", "berry", "cherry"]
+for key, group in groupby(sorted(words), key=lambda w: w[0]):
+    print(key, "->", list(group))`}
+  expectedOutput={`count(10, 2) 前 5 项: [10, 12, 14, 16, 18]\ncycle('AB') 前 6 项: ['A', 'B', 'A', 'B', 'A', 'B']\nchain: [1, 2, 3, 4, 'a', 'b']\na -> ['ant', 'apple']\nb -> ['banana', 'berry', 'blue']\nc -> ['cherry']`}
+/>
+
+<Callout type="warn" title="groupby 的坑">
+`groupby` 只会把**连续**相同的 key 聚成一组。上面我们先 `sorted(words)` 才会出现 a-b-c 三个分组；直接 groupby 原列表会得到错乱结果。
+</Callout>
+
+## 4. 异步函数：`async def` / `await`
+
+`async def` 定义**协程函数**，调用它返回一个**协程对象**，必须用 `await` 驱动或交给事件循环。
+
+<Playground
+  language="python"
+  id="py-11-async-basic"
+  title="第一个协程"
+  code={`import asyncio
+
+async def fetch(name, delay):
+    print(f"  [{name}] 开始")
+    await asyncio.sleep(delay)        # 非阻塞地等
+    print(f"  [{name}] 结束")
+    return f"{name}-结果"
+
+async def main():
+    result = await fetch("A", 0.1)
+    print("拿到:", result)
+
+asyncio.run(main())`}
+  expectedOutput={`  [A] 开始\n  [A] 结束\n拿到: A-结果`}
+/>
+
+<Callout type="info" title="asyncio.sleep vs time.sleep">
+`time.sleep(0.1)` 会**阻塞整个线程**。`asyncio.sleep(0.1)` 只是把当前协程挂起，让事件循环去跑别的协程——这就是"非阻塞"的核心。
+</Callout>
+
+## 5. 并发运行：`asyncio.gather`
+
+`asyncio.gather` 把多个协程打包，**并发**地跑（在 I/O 等待期间切换）：
+
+<Playground
+  language="python"
+  id="py-11-gather"
+  title="asyncio.gather 并发"
+  code={`import asyncio, time
+
+async def task(name, secs):
+    print(f"  [{name}] 启动，将等 {secs}s")
+    await asyncio.sleep(secs)
+    print(f"  [{name}] 完成")
+    return f"{name}={secs}"
+
+async def main():
+    start = time.perf_counter()
+    # 三个任务串行需要 1+2+3=6s；并发只需 3s
+    results = await asyncio.gather(
+        task("A", 1.0),
+        task("B", 2.0),
+        task("C", 3.0),
+    )
+    print("结果:", results)
+    print(f"总耗时: {time.perf_counter() - start:.2f}s")
+
+asyncio.run(main())`}
+  expectedOutput={`  [A] 启动，将等 1.0s\n  [B] 启动，将等 2.0s\n  [C] 启动，将等 3.0s\n  [A] 完成\n  [B] 完成\n  [C] 完成\n结果: ['A=1.0', 'B=2.0', 'C=3.0']\n总耗时: 3.00s`}
+/>
+
+## 6. `asyncio.create_task` 与超时
+
+`gather` 适合"全都要"；`create_task` 适合"启动后不管"；`wait_for` 提供超时控制。
+
+<Playground
+  language="python"
+  id="py-11-task-waitfor"
+  title="Task 与超时"
+  code={`import asyncio
+
+async def slow():
+    await asyncio.sleep(10)
+    return "完成"
+
+async def main():
+    # 启动但不等待
+    task = asyncio.create_task(slow())
+
+    # 等 0.2 秒，如果还没好就取消
+    try:
+        result = await asyncio.wait_for(task, timeout=0.2)
+        print(result)
+    except asyncio.TimeoutError:
+        print("超时，取消任务")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            print("任务已取消")
+
+asyncio.run(main())`}
+  expectedOutput={`超时，取消任务\n任务已取消`}
+/>
+
+## 7. 异步生成器（async generator）
+
+Python 把 `yield` 和 `async` 结合了起来，可以用 `async for` 消费。
+
+<Playground
+  language="python"
+  id="py-11-async-gen"
+  title="异步生成器"
+  code={`import asyncio
+
+async def ticker(n, interval):
+    for i in range(n):
+        await asyncio.sleep(interval)
+        yield i
+
+async def main():
+    async for x in ticker(3, 0.01):
+        print("tick", x)
+
+asyncio.run(main())`}
+  expectedOutput={`tick 0\ntick 1\ntick 2`}
+/>
+
+## 🎯 练习
+
+写一个并发示例：3 个"模拟请求"任务，分别耗时 1/2/3 秒。用 `asyncio.gather` 并发跑，统计**总耗时**并打印每个任务的返回值（包含名字和耗时）。
+
+<Playground
+  language="python"
+  id="py-11-exercise"
+  title="并发模拟请求"
+  code={`import asyncio, time
+
+async def fetch(name, secs):
+    # 模拟一个网络请求：等待 secs 秒后返回结果
+    pass
+
+async def main():
+    start = time.perf_counter()
+    # 在这里并发跑 fetch("A", 1.0) / fetch("B", 2.0) / fetch("C", 3.0)
+    # 期望总耗时 ~3s 而非 6s
+    pass
+
+asyncio.run(main())`}
+  expectedOutput={`fetch-A -> 1.00s\nfetch-B -> 2.00s\nfetch-C -> 3.00s\n总耗时 3.00s，并发拿到了 3 个结果`}
+/>
+
+<Callout type="exercise" title="提示">
+- `fetch` 内部用 `await asyncio.sleep(secs)` 模拟 I/O 等待。
+- 用 `await asyncio.gather(...)` 同时跑三个。
+- 内部可以记录开始 / 结束时间，返回 `(name, elapsed)`。
+</Callout>
+
+## 小结
+
+- ✅ 含 `yield` 的函数返回**生成器**，`next()` 一次走一步
+- ✅ 生成器表达式 `(x for x in xs)` 惰性求值，节省内存
+- ✅ `itertools.count / cycle / chain / islice / groupby` 是迭代器工具箱
+- ✅ `async def` 定义协程；`await` 等待；`asyncio.run()` 启动事件循环
+- ✅ `asyncio.gather` 并发跑多个协程；`wait_for` 提供超时；`create_task` 启动后台任务
+- ✅ 异步生成器用 `async for` 消费
+
+下一章 **上下文管理器**：用 `with` 把"获取资源 / 释放资源"封装得安全又优雅。

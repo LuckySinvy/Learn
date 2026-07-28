@@ -1,0 +1,229 @@
+---
+title: 文件 I/O
+order: 8
+description: os/io、bufio、encoding/json
+---
+
+# 文件 I/O
+
+## 1. 读文件
+
+<Playground
+  language="go"
+  id="go-08-read"
+  title="读取文件"
+  code={`package main
+
+import (
+    "fmt"
+    "os"
+)
+
+func main() {
+    // 一次性读（适合小文件）
+    data, err := os.ReadFile("/tmp/poem.txt")
+    if err != nil {
+        fmt.Println("错误：", err)
+        return
+    }
+    fmt.Println(string(data))
+}`}
+/>
+
+## 2. 写文件
+
+<Playground
+  language="go"
+  id="go-08-write"
+  title="写入文件"
+  code={`package main
+
+import (
+    "fmt"
+    "os"
+)
+
+func main() {
+    content := "第一行\\n第二行\\n第三行\\n"
+    err := os.WriteFile("/tmp/out.txt", []byte(content), 0644)
+    if err != nil {
+        fmt.Println("错误：", err)
+        return
+    }
+    fmt.Println("写入成功")
+}`}
+  expectedOutput={`写入成功`}
+/>
+
+## 3. `bufio` 缓冲读写
+
+`os.ReadFile` 一次读全文件；大文件用 `bufio.Scanner` 按行读取。
+
+<Playground
+  language="go"
+  id="go-08-bufio"
+  title="bufio 按行读"
+  code={`package main
+
+import (
+    "bufio"
+    "fmt"
+    "os"
+    "strings"
+)
+
+func main() {
+    // 准备一个文件
+    content := "alpha\\nbeta\\ngamma\\ndelta"
+    _ = os.WriteFile("/tmp/lines.txt", []byte(content), 0644)
+
+    f, _ := os.Open("/tmp/lines.txt")
+    defer f.Close()
+
+    scanner := bufio.NewScanner(f)
+    for scanner.Scan() {
+        line := scanner.Text()
+        fmt.Println(strings.ToUpper(line))
+    }
+    if err := scanner.Err(); err != nil {
+        fmt.Println("扫描错误：", err)
+    }
+}`}
+  expectedOutput={`ALPHA\nBETA\nGAMMA\nDELTA`}
+/>
+
+<Callout type="info" title="defer 关闭">
+打开的文件、数据库连接、网络句柄都必须 `defer Close()`，否则资源会泄漏。`defer` 在函数返回前执行，保证关闭一定发生。
+</Callout>
+
+## 4. JSON 序列化
+
+Go 用结构体 tag 控制 JSON 字段名。
+
+<Playground
+  language="go"
+  id="go-08-json"
+  title="JSON 序列化"
+  code={`package main
+
+import (
+    "encoding/json"
+    "fmt"
+)
+
+type User struct {
+    Name  string   \`json:"name"\`
+    Age   int      \`json:"age"\`
+    Email string   \`json:"email,omitempty"\`
+    Tags  []string \`json:"tags"\`
+}
+
+func main() {
+    u := User{Name: "Alice", Age: 30, Tags: []string{"vip", "founder"}}
+
+    // 序列化
+    data, _ := json.MarshalIndent(u, "", "  ")
+    fmt.Println(string(data))
+
+    // 反序列化
+    var u2 User
+    json.Unmarshal(data, &u2)
+    fmt.Printf("%+v\\n", u2)
+}`}
+  expectedOutput={`{\n  'name': 'Alice',\n  'age': 30,\n  'tags': [\n    'vip',\n    'founder'\n  ]\n}\n{Name:Alice Age:30 Email: Tags:[vip founder]}`}
+/>
+
+## 5. 实战：JSON 配置文件读写
+
+<Playground
+  language="go"
+  id="go-08-config"
+  title="JSON 配置文件"
+  code={`package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+)
+
+type Config struct {
+    AppName string \`json:"app_name"\`
+    Port    int    \`json:"port"\`
+    Debug   bool   \`json:"debug"\`
+}
+
+func main() {
+    cfg := Config{AppName: "LearnSite", Port: 8080, Debug: true}
+
+    // 写
+    data, _ := json.MarshalIndent(cfg, "", "  ")
+    _ = os.WriteFile("/tmp/config.json", data, 0644)
+    fmt.Println("已保存：", string(data))
+
+    // 读
+    loaded, _ := os.ReadFile("/tmp/config.json")
+    var c2 Config
+    _ = json.Unmarshal(loaded, &c2)
+    fmt.Printf("已加载：%+v\\n", c2)
+}`}
+/>
+
+## 🎯 综合练习
+
+<Playground
+  language="go"
+  id="go-08-exercise"
+  title="TODO 列表"
+  code={`// 任务：实现一个简单的 TODO 列表
+// 1. 定义 Todo 结构体（Done bool, Text string）
+// 2. 序列化为 JSON 写入 /tmp/todos.json
+// 3. 读回并打印
+
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+)
+
+type Todo struct {
+    Done bool   \`json:"done"\`
+    Text string \`json:"text"\`
+}
+
+func main() {
+    todos := []Todo{
+        {Done: true,  Text: "学完 Go 基础"},
+        {Done: false, Text: "用 Go 写个 Web 服务"},
+    }
+
+    // 写入
+    data, _ := json.MarshalIndent(todos, "", "  ")
+    _ = os.WriteFile("/tmp/todos.json", data, 0644)
+
+    // 读回
+    loaded, _ := os.ReadFile("/tmp/todos.json")
+    var back []Todo
+    _ = json.Unmarshal(loaded, &back)
+    for _, t := range back {
+        mark := "[ ]"
+        if t.Done { mark = "[x]" }
+        fmt.Printf("%s %s\\n", mark, t.Text)
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ `os.ReadFile/WriteFile` 简单读写
+- ✅ `bufio.Scanner` 处理大文件按行读
+- ✅ `defer Close()` 释放资源
+- ✅ `encoding/json` + 结构体 tag 序列化
+- ✅ `omitempty` 字段可省略
+
+🎉 **Go 8 章完结**！你已经能用 Go 写一个完整的小工具或 Web 后端。
+
+接下来进入 **Java**。

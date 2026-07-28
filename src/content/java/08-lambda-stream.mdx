@@ -1,0 +1,270 @@
+---
+title: Lambda 与 Stream
+order: 8
+description: 函数式接口、方法引用、Stream API、Optional
+---
+
+# Lambda 与 Stream
+
+Java 8 引入了 **Lambda 表达式** 和 **Stream API**，让代码更简洁、更声明式。
+
+## 1. Lambda 基础
+
+Lambda 是**匿名函数**，可以赋值给变量、作为参数传递。
+
+```java
+(参数) -> 表达式
+(参数) -> { 语句; return 值; }
+```
+
+<Playground
+  language="java"
+  id="java-08-lambda"
+  title="Lambda 入门"
+  code={`import java.util.*;
+
+public class Main {
+    public static void main(String[] args) {
+        // Runnable（无参无返回值）
+        Runnable hello = () -> System.out.println("Hello Lambda");
+        hello.run();
+
+        // 接收一个参数
+        var square = (int x) -> x * x;
+        System.out.println("5² = " + square.apply(5));  // 这里用 apply 演示
+    }
+
+    @FunctionalInterface
+    interface IntFunc {
+        int apply(int x);
+    }
+}`}
+  expectedOutput={`Hello Lambda\n5² = 25`}
+/>
+
+<Callout type="info" title="函数式接口">
+只有一个抽象方法的接口称为**函数式接口**（`@FunctionalInterface`），可以被 Lambda 替换：
+- `Runnable`：`() -> void`
+- `Supplier<T>`：`() -> T`
+- `Consumer<T>`：`(T) -> void`
+- `Function<T, R>`：`(T) -> R`
+- `Predicate<T>`：`(T) -> boolean`
+</Callout>
+
+## 2. 方法引用
+
+当 Lambda 只是调用一个已存在的方法时，可以用 `::` 简写。
+
+<Playground
+  language="java"
+  id="java-08-mref"
+  title="方法引用"
+  code={`import java.util.*;
+import java.util.stream.*;
+
+public class Main {
+    public static void main(String[] args) {
+        List<String> langs = List.of("Java", "Go", "Python", "Rust");
+
+        // 等价于 s -> System.out.println(s)
+        langs.forEach(System.out::println);
+
+        // 等价于 s -> s.toUpperCase()
+        var uppers = langs.stream()
+                          .map(String::toUpperCase)
+                          .collect(Collectors.toList());
+        System.out.println(uppers);
+    }
+}`}
+  expectedOutput={`Java\nGo\nPython\nRust\n[JAVA, GO, PYTHON, RUST]`}
+/>
+
+## 3. Stream 流水线
+
+Stream 操作分两类：
+- **中间操作**：filter、map、sorted（返回新 Stream）
+- **终止操作**：collect、forEach、count（触发实际计算）
+
+<Playground
+  language="java"
+  id="java-08-stream"
+  title="Stream 流水线"
+  code={`import java.util.*;
+import java.util.stream.*;
+
+public class Main {
+    public static void main(String[] args) {
+        List<Integer> nums = List.of(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+
+        // 找出偶数，平方，求和
+        int sum = nums.stream()
+                      .filter(n -> n % 2 == 0)         // 留下偶数
+                      .map(n -> n * n)                  // 平方
+                      .reduce(0, Integer::sum);         // 累加
+        System.out.println("偶数平方和 = " + sum);
+
+        // 排序
+        List<String> sorted = Stream.of("banana", "apple", "cherry")
+                                    .sorted()
+                                    .collect(Collectors.toList());
+        System.out.println(sorted);
+
+        // 统计
+        long count = nums.stream().filter(n -> n > 5).count();
+        System.out.println("大于 5 的有 " + count + " 个");
+    }
+}`}
+  expectedOutput={`偶数平方和 = 220\n[apple, banana, cherry]\n大于 5 的有 5 个`}
+/>
+
+## 4. 收集器 `Collectors`
+
+<Playground
+  language="java"
+  id="java-08-collect"
+  title="Collectors"
+  code={`import java.util.*;
+import java.util.stream.*;
+
+public class Main {
+    public static void main(String[] args) {
+        record Person(String name, int age) {}
+        List<Person> people = List.of(
+            new Person("Alice", 30),
+            new Person("Bob", 25),
+            new Person("Carol", 28),
+            new Person("Dave", 30)
+        );
+
+        // 按年龄分组
+        Map<Integer, List<Person>> byAge = people.stream()
+                                                 .collect(Collectors.groupingBy(Person::age));
+        System.out.println("按年龄分组: " + byAge);
+
+        // 统计平均年龄
+        double avg = people.stream()
+                           .collect(Collectors.averagingInt(Person::age));
+        System.out.printf("平均年龄: %.2f%n", avg);
+
+        // 拼接名字
+        String names = people.stream()
+                             .map(Person::name)
+                             .collect(Collectors.joining(", "));
+        System.out.println("名字: " + names);
+    }
+}`}
+  expectedOutput={`按年龄分组: {30=[Alice, Dave], 25=[Bob], 28=[Carol]}\n平均年龄: 28.25\n名字: Alice, Bob, Carol, Dave`}
+/>
+
+<Callout type="info" title="record 关键字">
+Java 14+ 的 `record` 是**不可变数据类**的语法糖：自动生成构造器、getter、equals、hashCode、toString。
+</Callout>
+
+## 5. `Optional` 防 NPE
+
+`Optional<T>` 是可能为 null 的容器，强迫调用者显式处理「无值」。
+
+<Playground
+  language="java"
+  id="java-08-optional"
+  title="Optional"
+  code={`import java.util.*;
+
+public class Main {
+    public static void main(String[] args) {
+        Optional<String> a = Optional.of("hello");
+        Optional<String> b = Optional.empty();
+
+        System.out.println(a.orElse("default"));   // hello
+        System.out.println(b.orElse("default"));   // default
+
+        a.ifPresent(s -> System.out.println("非空: " + s));
+        b.ifPresent(s -> System.out.println("不会执行"));
+
+        // 链式
+        String r = Optional.of("  Hi  ")
+                          .map(String::trim)
+                          .map(String::toUpperCase)
+                          .orElse("EMPTY");
+        System.out.println(r);
+    }
+}`}
+  expectedOutput={`hello\ndefault\n非空: hello\nHI`}
+/>
+
+## 6. 实战：学生成绩分析
+
+<Playground
+  language="java"
+  id="java-08-grade"
+  title="学生成绩分析"
+  code={`import java.util.*;
+import java.util.stream.*;
+
+public class Main {
+    record Student(String name, int score) {}
+
+    public static void main(String[] args) {
+        List<Student> students = List.of(
+            new Student("Alice", 85),
+            new Student("Bob", 92),
+            new Student("Carol", 78),
+            new Student("Dave", 95),
+            new Student("Eve", 88)
+        );
+
+        // Top 3
+        var top3 = students.stream()
+                           .sorted(Comparator.comparingInt(Student::score).reversed())
+                           .limit(3)
+                           .toList();
+        System.out.println("前三名:");
+        top3.forEach(s -> System.out.printf("  %s: %d%n", s.name(), s.score()));
+
+        // 通过/未通过
+        long pass = students.stream().filter(s -> s.score() >= 60).count();
+        long fail = students.size() - pass;
+        System.out.printf("通过 %d，未通过 %d%n", pass, fail);
+
+        // 平均分
+        double avg = students.stream().collect(Collectors.averagingInt(Student::score));
+        System.out.printf("平均分 %.2f%n", avg);
+    }
+}`}
+  expectedOutput={`前三名:\n  Dave: 95\n  Bob: 92\n  Eve: 88\n通过 5，未通过 0\n平均分 87.60`}
+/>
+
+## 🎯 综合练习
+
+<Playground
+  language="java"
+  id="java-08-exercise"
+  title="Lambda 排序"
+  code={`// 任务：用 Lambda 对字符串列表按长度降序排序
+// 期望输入：["Java", "Go", "Python", "Rust"]
+// 期望输出：[Python, Java, Rust, Go]
+
+import java.util.*;
+
+public class Main {
+    public static void main(String[] args) {
+        List<String> langs = new ArrayList<>(List.of("Java", "Go", "Python", "Rust"));
+        // 补全代码
+        System.out.println(langs);
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ Lambda：`() -> 表达式` 单方法接口的简写
+- ✅ 方法引用 `Class::method` 进一步简化
+- ✅ Stream 流水线：filter / map / reduce / collect
+- ✅ `Collectors.groupingBy / joining / averagingInt`
+- ✅ `Optional<T>` 防 NPE
+- ✅ `record` 是不可变数据类的语法糖
+
+🎉 **Java 8 章完结**！你已经掌握了 Java 核心语法与常用 API。
+
+到这里 Python / Go / Java 三门语言的核心章节都已完成。继续打磨或自行扩展专题章节（如「Python 数据分析」「Go Web 服务」「Java Spring」）即可。

@@ -1,0 +1,245 @@
+---
+title: 面向对象基础
+order: 5
+description: 类、对象、构造器、封装、this、static
+---
+
+# 面向对象基础
+
+Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、this、static**。
+
+## 1. 类与对象
+
+**类（class）** 是模板，**对象（object）** 是实例。
+
+<Playground
+  language="java"
+  id="java-05-class"
+  title="类与对象"
+  code={`public class Main {
+    static class Dog {
+        String name;
+        int age;
+
+        void bark() {
+            System.out.println(name + " 汪汪叫");
+        }
+    }
+
+    public static void main(String[] args) {
+        Dog d1 = new Dog();
+        d1.name = "旺财";
+        d1.age = 3;
+        d1.bark();
+        System.out.println(d1.name + " 今年 " + d1.age + " 岁");
+    }
+}`}
+  expectedOutput={`旺财 汪汪叫\n旺财 今年 3 岁`}
+/>
+
+## 2. 构造器
+
+构造器是创建对象时自动调用的特殊方法，与类同名、无返回值。
+
+<Playground
+  language="java"
+  id="java-05-ctor"
+  title="构造器"
+  code={`public class Main {
+    static class User {
+        String name;
+        int age;
+
+        User() {
+            this("匿名", 0);
+        }
+        User(String name, int age) {
+            this.name = name;
+            this.age = age;
+        }
+        void info() {
+            System.out.printf("%s (%d 岁)%n", name, age);
+        }
+    }
+
+    public static void main(String[] args) {
+        new User().info();
+        new User("Alice", 30).info();
+        new User("Bob", 25).info();
+    }
+}`}
+  expectedOutput={`匿名 (0 岁)\nAlice (30 岁)\nBob (25 岁)`}
+/>
+
+<Callout type="tip" title="this 关键字">
+`this` 指代当前对象，常用于：
+- 区分成员变量与参数同名：`this.name = name`
+- 一个构造器调用另一个：`this(...)`
+- 把当前对象作为参数传递
+</Callout>
+
+## 3. 封装与访问修饰符
+
+| 修饰符 | 同类 | 同包 | 子类 | 其他包 |
+|---|---|---|---|---|
+| `private` | ✅ | ❌ | ❌ | ❌ |
+| （默认） | ✅ | ✅ | ❌ | ❌ |
+| `protected` | ✅ | ✅ | ✅ | ❌ |
+| `public` | ✅ | ✅ | ✅ | ✅ |
+
+<Playground
+  language="java"
+  id="java-05-encap"
+  title="封装 BankAccount"
+  code={`public class Main {
+    static class BankAccount {
+        private double balance;
+
+        public BankAccount(double initial) {
+            if (initial < 0) throw new IllegalArgumentException("初始金额不能为负");
+            this.balance = initial;
+        }
+
+        public void deposit(double amount) {
+            if (amount <= 0) throw new IllegalArgumentException("存款必须为正");
+            balance += amount;
+        }
+
+        public boolean withdraw(double amount) {
+            if (amount <= 0 || amount > balance) return false;
+            balance -= amount;
+            return true;
+        }
+
+        public double getBalance() {
+            return balance;
+        }
+    }
+
+    public static void main(String[] args) {
+        BankAccount acc = new BankAccount(1000);
+        acc.deposit(500);
+        System.out.println("存款后余额：" + acc.getBalance());
+
+        boolean ok = acc.withdraw(200);
+        System.out.println("取款 200 成功？" + ok);
+        System.out.println("最终余额：" + acc.getBalance());
+
+        System.out.println(acc.withdraw(10000) ? "成功" : "失败（余额不足）");
+    }
+}`}
+  expectedOutput={`存款后余额：1500.0\n取款 200 成功？true\n最终余额：1300.0\n失败（余额不足）`}
+/>
+
+## 4. `static` 成员
+
+`static` 修饰的成员属于**类**而不是对象，所有实例共享。
+
+<Playground
+  language="java"
+  id="java-05-static"
+  title="static 字段与方法"
+  code={`public class Main {
+    static class Counter {
+        static int total = 0;       // 类变量
+        int id;                     // 实例变量
+
+        Counter() {
+            total++;
+            id = total;
+        }
+    }
+
+    public static void main(String[] args) {
+        new Counter();
+        new Counter();
+        new Counter();
+        System.out.println("创建了 " + Counter.total + " 个对象");
+    }
+}`}
+  expectedOutput={`创建了 3 个对象`}
+/>
+
+<Callout type="warn" title="static 不能访问实例成员">
+静态方法只能访问静态字段和其他静态方法。访问实例字段需要先有对象。
+</Callout>
+
+## 5. 实战：学生类
+
+<Playground
+  language="java"
+  id="java-05-student"
+  title="学生类"
+  code={`public class Main {
+    static class Student {
+        private String name;
+        private int[] scores;
+        private static int count = 0;
+
+        Student(String name, int[] scores) {
+            this.name = name;
+            this.scores = scores;
+            count++;
+        }
+
+        double average() {
+            if (scores.length == 0) return 0;
+            int s = 0;
+            for (int x : scores) s += x;
+            return (double) s / scores.length;
+        }
+
+        void report() {
+            System.out.printf("%s 平均分 %.2f%n", name, average());
+        }
+    }
+
+    public static void main(String[] args) {
+        new Student("Alice", new int[]{85, 92, 78}).report();
+        new Student("Bob",   new int[]{90, 88, 95}).report();
+        new Student("Carol", new int[]{76, 82, 80}).report();
+    }
+}`}
+  expectedOutput={`Alice 平均分 85.00\nBob 平均分 91.00\nCarol 平均分 79.33`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-05-exercise"
+  title="图书类"
+  code={`// 任务：实现 Book 类，包含 title、author、isBorrowed 状态
+// 提供 borrow()/returnBook()/status() 方法
+// 期望输出：
+//   《Java 编程》- 凯·霍斯特曼 状态：可借
+//   《Java 编程》- 凯·霍斯特曼 状态：已借出
+//   《Java 编程》- 凯·霍斯特曼 状态：可借
+
+public class Main {
+    static class Book {
+        // 补全字段和方法
+    }
+
+    public static void main(String[] args) {
+        Book b = new Book("Java 编程", "凯·霍斯特曼");
+        b.status();
+        b.borrow();
+        b.status();
+        b.returnBook();
+        b.status();
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ 类是模板，对象是实例
+- ✅ 构造器与类同名，可重载，可用 `this(...)` 互调
+- ✅ 访问修饰符：`private` / 默认 / `protected` / `public`
+- ✅ 封装：用 `private` 字段 + `public` 方法
+- ✅ `static` 成员属于类，所有实例共享
+- ✅ `this` 指代当前对象
+
+下一章 **集合框架**：List / Set / Map。

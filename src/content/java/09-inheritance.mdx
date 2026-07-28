@@ -1,0 +1,331 @@
+---
+title: 继承与多态
+order: 9
+description: extends、super、方法重写、抽象类、接口、默认方法、多接口实现
+---
+
+# 继承与多态
+
+面向对象的三大特性——**封装、继承、多态**——前两章已经覆盖了封装。本章深入 **继承** 与 **多态**：子类复用父类代码，方法重写让同一调用呈现不同行为。
+
+> **约定**：本章以及后续所有 Playground 中，`class X` 都会被运行时自动改写为 `class Main`，所以你可以写任何类名；但为了代码可读性，推荐统一用 `public class Main` + 内部类。
+
+## 1. `extends` 与父类构造
+
+子类用 `extends` 继承父类，Java 是**单继承**（一个类只能有一个直接父类）。
+
+<Playground
+  language="java"
+  id="java-09-extends"
+  title="继承基础"
+  code={`public class Main {
+    static class Animal {
+        String name;
+        Animal(String name) { this.name = name; }
+        void speak() { System.out.println(name + " 发出声音"); }
+    }
+
+    static class Dog extends Animal {
+        String breed;
+        Dog(String name, String breed) {
+            super(name);          // 调用父类构造器（必须第一行）
+            this.breed = breed;
+        }
+        void fetch() { System.out.println(name + " 叼回了球"); }
+    }
+
+    public static void main(String[] args) {
+        Dog d = new Dog("旺财", "柴犬");
+        d.speak();    // 继承自父类
+        d.fetch();    // 子类自有
+        System.out.println("品种：" + d.breed);
+    }
+}`}
+  expectedOutput={`旺财 发出声音\n旺财 叼回了球\n品种：柴犬`}
+/>
+
+<Callout type="warn" title="super() 必须是构造器第一行">
+如果父类**没有**无参构造器，子类必须显式 `super(args)`。否则编译失败。
+</Callout>
+
+## 2. 方法重写 `@Override`
+
+子类可以**重写**（override）父类方法。运行时根据实际类型决定调用哪个版本——这就是**多态**。
+
+<Playground
+  language="java"
+  id="java-09-override"
+  title="方法重写与多态"
+  code={`public class Main {
+    static class Shape {
+        double area() { return 0; }
+        String name() { return "Shape"; }
+    }
+
+    static class Circle extends Shape {
+        double r;
+        Circle(double r) { this.r = r; }
+        @Override
+        double area() { return Math.PI * r * r; }   // 重写
+        @Override
+        String name() { return "Circle"; }
+    }
+
+    static class Rectangle extends Shape {
+        double w, h;
+        Rectangle(double w, double h) { this.w = w; this.h = h; }
+        @Override
+        double area() { return w * h; }
+        @Override
+        String name() { return "Rectangle"; }
+    }
+
+    public static void main(String[] args) {
+        Shape[] shapes = {
+            new Circle(2.0),
+            new Rectangle(3.0, 4.0),
+            new Circle(1.0)
+        };
+
+        for (Shape s : shapes) {
+            // 编译期类型是 Shape，运行期调用的是实际子类的 area()
+            System.out.printf("%s area = %.2f%n", s.name(), s.area());
+        }
+    }
+}`}
+  expectedOutput={`Circle area = 12.57\nRectangle area = 12.00\nCircle area = 3.14`}
+/>
+
+<Callout type="tip" title="重写的规则">
+- 方法签名必须**完全一致**（参数、返回类型）
+- 访问修饰符**不能更严格**（父类 `public` → 子类不能 `protected`）
+- 不能重写 `static`、`private`、`final` 方法
+- `@Override` 注解让编译器帮你校验
+</Callout>
+
+## 3. 抽象类
+
+当父类只知道子类「应该有」某个方法、但无法给出默认实现时，就用 `abstract`。
+
+<Playground
+  language="java"
+  id="java-09-abstract"
+  title="抽象类"
+  code={`public class Main {
+    abstract static class Animal {
+        String name;
+        Animal(String name) { this.name = name; }
+        // 抽象方法：只有声明，没有实现
+        abstract void speak();
+        // 普通方法：所有子类共享
+        void introduce() {
+            System.out.print(name + "：");
+            speak();   // 多态调用
+        }
+    }
+
+    static class Cat extends Animal {
+        Cat(String name) { super(name); }
+        @Override void speak() { System.out.println("喵"); }
+    }
+
+    static class Duck extends Animal {
+        Duck(String name) { super(name); }
+        @Override void speak() { System.out.println("嘎"); }
+    }
+
+    public static void main(String[] args) {
+        // Animal a = new Animal("?");   // 编译错误：不能 new 抽象类
+        Animal[] pets = { new Cat("小花"), new Duck("嘎嘎") };
+        for (Animal a : pets) a.introduce();
+    }
+}`}
+  expectedOutput={`小花：喵\n嘎嘎：嘎`}
+/>
+
+## 4. 接口 `interface`
+
+接口定义**行为契约**，不关心实现。Java 8 之后接口可以有 `default` 方法和 `static` 方法。
+
+<Playground
+  language="java"
+  id="java-09-interface"
+  title="接口基础"
+  code={`public class Main {
+    interface Flyable {
+        void fly();                       // 抽象方法
+        default void land() {             // 默认方法（Java 8+）
+            System.out.println("安全着陆");
+        }
+        static int maxAltitude() {        // 静态方法
+            return 10000;
+        }
+    }
+
+    interface Swimmable {
+        void swim();
+    }
+
+    // 一个类可以实现多个接口（多继承的替代方案）
+    static class Duck implements Flyable, Swimmable {
+        @Override public void fly()  { System.out.println("鸭子飞不高"); }
+        @Override public void swim() { System.out.println("鸭子游得快"); }
+    }
+
+    public static void main(String[] args) {
+        Duck d = new Duck();
+        d.fly();
+        d.swim();
+        d.land();                       // 来自 default
+        System.out.println("理论上限：" + Flyable.maxAltitude() + " 米");
+    }
+}`}
+  expectedOutput={`鸭子飞不高\n鸭子游得快\n安全着陆\n理论上限：10000 米`}
+/>
+
+<Callout type="info" title="接口 vs 抽象类">
+| 维度 | 抽象类 | 接口 |
+|---|---|---|
+| 继承 | 单继承 | 多实现 |
+| 字段 | 可以是实例字段 | 只能是 `public static final` |
+| 构造器 | 有 | 无 |
+| 方法 | 抽象 + 普通 | 抽象 + default + static |
+| 何时用 | 共享**状态/实现** | 约定**行为** |
+</Callout>
+
+## 5. 接口的 default 方法
+
+`default` 让接口可以**向后兼容**地新增方法而不破坏已有实现。
+
+<Playground
+  language="java"
+  id="java-09-default"
+  title="default 方法"
+  code={`public class Main {
+    interface Greeter {
+        void hello();
+        default void greetTwice() {
+            hello();
+            hello();
+        }
+    }
+
+    static class Friendly implements Greeter {
+        @Override public void hello() { System.out.println("你好!"); }
+        // 不强制重写 greetTwice，直接用 default
+    }
+
+    public static void main(String[] args) {
+        Friendly f = new Friendly();
+        f.greetTwice();
+    }
+}`}
+  expectedOutput={`你好!\n你好!`}
+/>
+
+## 6. 综合：动物小世界
+
+<Playground
+  language="java"
+  id="java-09-zoo"
+  title="综合：动物园"
+  code={`public class Main {
+    interface Eater { default void eat() { System.out.println("在吃东西"); } }
+    interface Flyer { void fly(); }
+    interface Swimmer { void swim(); }
+
+    abstract static class Animal {
+        String name;
+        Animal(String name) { this.name = name; }
+        abstract void speak();
+        @Override public String toString() { return getClass().getSimpleName() + "(" + name + ")"; }
+    }
+
+    static class Dog extends Animal implements Eater {
+        Dog(String name) { super(name); }
+        @Override void speak() { System.out.println("汪"); }
+    }
+
+    static class Duck extends Animal implements Eater, Flyer, Swimmer {
+        Duck(String name) { super(name); }
+        @Override void speak() { System.out.println("嘎"); }
+        @Override public void fly()  { System.out.println(name + " 飞起来了"); }
+        @Override public void swim() { System.out.println(name + " 在游泳"); }
+    }
+
+    static class Fish extends Animal implements Swimmer {
+        Fish(String name) { super(name); }
+        @Override void speak() { System.out.println("..."); }
+        @Override public void swim() { System.out.println(name + " 摆尾游"); }
+    }
+
+    public static void main(String[] args) {
+        Animal[] zoo = { new Dog("旺财"), new Duck("嘎嘎"), new Fish("尼莫") };
+        for (Animal a : zoo) {
+            System.out.print(a + " -> ");
+            a.speak();
+            if (a instanceof Flyer)   ((Flyer) a).fly();
+            if (a instanceof Swimmer) ((Swimmer) a).swim();
+            if (a instanceof Eater)   ((Eater) a).eat();
+        }
+    }
+}`}
+  expectedOutput={`Dog(旺财) -> 汪\nDuck(嘎嘎) -> 嘎\n嘎嘎 飞起来了\n嘎嘎 在游泳\n在吃东西\nFish(尼莫) -> ...\n尼莫 摆尾游`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-09-exercise"
+  title="形状面积计算器"
+  code={`// 任务：补全 Shape 抽象类与 Triangle 子类
+// 期望输出：
+//   Circle(2.0)    area = 12.57
+//   Rect(3.0x4.0)  area = 12.00
+//   Tri(3.0x4.0)   area = 6.00
+
+public class Main {
+    abstract static class Shape {
+        abstract double area();
+        // 补全：toString() 返回 "ClassName(field)"
+    }
+
+    static class Circle extends Shape {
+        double r;
+        Circle(double r) { this.r = r; }
+        @Override double area() { return Math.PI * r * r; }
+    }
+
+    static class Rect extends Shape {
+        double w, h;
+        Rect(double w, double h) { this.w = w; this.h = h; }
+        @Override double area() { return w * h; }
+    }
+
+    static class Tri extends Shape {
+        double base, height;
+        Tri(double b, double h) { this.base = b; this.height = h; }
+        // 补全 area()
+    }
+
+    public static void main(String[] args) {
+        Shape[] shapes = { new Circle(2.0), new Rect(3.0, 4.0), new Tri(3.0, 4.0) };
+        for (Shape s : shapes) {
+            System.out.printf("%s  area = %.2f%n", s, s.area());
+        }
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ `extends` 单继承；`implements` 多实现
+- ✅ 子类构造器必须 `super(...)` 调用父类构造器（第一行）
+- ✅ `@Override` 重写父类方法，运行时按实际类型分派（多态）
+- ✅ 抽象类 `abstract` 不能 `new`，可有抽象+普通方法
+- ✅ 接口 `interface` 是行为契约；`default` / `static` 方法让接口进化
+- ✅ `instanceof` 在运行期判断具体类型，便于安全转型
+
+下一章 **泛型**：让类与方法的「类型」可参数化。

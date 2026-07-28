@@ -1,0 +1,252 @@
+---
+title: 上下文管理器
+order: 12
+description: with 语句、__enter__/__exit__、contextlib 工具
+---
+
+# 上下文管理器
+
+`with open(...) as f:` 你已经见过很多次了——这种"进入 / 离开一段代码自动做某件事"的模式就叫**上下文管理器**。它最适合管理资源（文件、锁、网络连接、临时状态）。
+
+## 1. 为什么需要 `with`
+
+`with` 保证：**无论中间是否抛异常，"收尾代码"一定执行**。等价于 `try / finally`，但更简洁。
+
+```python
+# 不推荐：手写 try/finally
+f = open("/tmp/x.txt", "w")
+try:
+    f.write("hello")
+finally:
+    f.close()
+
+# 推荐：用 with
+with open("/tmp/x.txt", "w") as f:
+    f.write("hello")
+# 离开 with 块时自动 close
+```
+
+## 2. 自己实现：`__enter__` / `__exit__`
+
+要让一个对象能用在 `with` 中，只需实现两个魔法方法：
+
+- `__enter__(self)`：进入 `with` 时调用，返回值赋给 `as` 后的变量
+- `__exit__(self, exc_type, exc_val, exc_tb)`：离开时调用。如果块内抛了异常，这三个参数会被填充；返回 `True` 会"吞掉"异常。
+
+<Playground
+  language="python"
+  id="py-12-cm-basic"
+  title="Timer 上下文管理器"
+  code={`import time
+
+class Timer:
+    """统计一段代码耗时"""
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self          # 赋给 as 后的变量
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.elapsed = time.perf_counter() - self.start
+        print(f"  耗时: {self.elapsed*1000:.2f} ms")
+        # 返回 None = 不吞异常
+        return False
+
+with Timer() as t:
+    total = sum(range(1_000_00))
+print(f"  计算结果: {total}")`}
+  expectedOutput={`  耗时: 0.x ms（数 ms 量级）\n  计算结果: 4999950000`}
+/>
+
+<Callout type="info" title="__exit__ 的返回值">
+- 返回 `None` / `False`：异常继续向外抛
+- 返回 `True`：异常被吞掉，外面 `try` 块看不到
+- 拿到 `exc_type` 不为 `None` 说明块内出错了，可以根据类型决定要不要吞
+</Callout>
+
+## 3. `contextlib.contextmanager` —— 用生成器写
+
+完整写一个类很啰嗦。`@contextmanager` 让你用**生成器**形式实现上下文管理器：
+
+<Playground
+  language="python"
+  id="py-12-contextmanager"
+  title="@contextmanager 写 cm"
+  code={`import time
+from contextlib import contextmanager
+
+@contextmanager
+def timer(label="block"):
+    start = time.perf_counter()
+    try:
+        yield          # 这里就是 with 块体的执行点
+    finally:
+        elapsed = time.perf_counter() - start
+        print(f"[{label}] 耗时 {elapsed*1000:.2f} ms")
+
+with timer("loop"):
+    s = sum(range(500_000))
+print("  结果:", s)
+
+# 异常情况下也会执行 finally
+with timer("error-block"):
+    try:
+        x = 1 / 0
+    except ZeroDivisionError:
+        print("  捕获了 ZeroDivisionError")`}
+  expectedOutput={`[loop] 耗时 x.xx ms\n  结果: 124999750000\n[error-block] 耗时 x.xx ms\n  捕获了 ZeroDivisionError`}
+/>
+
+<Callout type="tip" title="模板">
+```python
+@contextmanager
+def my_cm():
+    # 初始化（__enter__）
+    try:
+        yield value    # value 赋给 as 后的变量
+    finally:
+        # 清理（__exit__）
+```
+`yield` 之前是 `__enter__`，之后是 `__exit__`。
+</Callout>
+
+## 4. `contextlib.suppress` —— 静默指定异常
+
+不想为某个无害的异常写 try/except？用 `suppress`：
+
+<Playground
+  language="python"
+  id="py-12-suppress"
+  title="contextlib.suppress"
+  code={`import os
+from contextlib import suppress
+
+# 想删就删，文件不在也别报错
+with suppress(FileNotFoundError):
+    os.remove("/tmp/maybe-not-exists.txt")
+print("没有异常，程序继续")
+
+# 也可以一次 suppress 多种
+with suppress(KeyError, AttributeError):
+    d = {}
+    print(d["missing"].upper())
+print("继续执行")`}
+  expectedOutput={`没有异常，程序继续\n继续执行`}
+/>
+
+<Callout type="warn" title="别滥用 suppress">
+`suppress` 会**静默吞掉**异常——意味着你再也看不到它。**只在"异常是预期内的、并且你已经想清楚了"时使用**。比如删可能不存在的临时文件、关闭可能没打开过的连接。
+</Callout>
+
+## 5. 实战：临时切换目录
+
+<Playground
+  language="python"
+  id="py-12-cd"
+  title="临时切换工作目录"
+  code={`import os
+from contextlib import contextmanager
+from pathlib import Path
+
+@contextmanager
+def working_dir(path):
+    """临时切换工作目录，退出时恢复"""
+    old = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)
+
+Path("/tmp/demo_dir").mkdir(exist_ok=True)
+print("进入前:", os.getcwd())
+
+with working_dir("/tmp/demo_dir"):
+    print("with 中:", os.getcwd())
+    Path("inside.txt").write_text("hi", encoding="utf-8")
+
+print("退出后:", os.getcwd())
+print("文件已创建:", Path("/tmp/demo_dir/inside.txt").exists())`}
+  expectedOutput={`进入前: /\nwith 中: /tmp/demo_dir\n退出后: /\n文件已创建: True`}
+/>
+
+## 6. 实战：可重用的数据库连接
+
+<Playground
+  language="python"
+  id="py-12-connection"
+  title="模拟的 connection 池"
+  code={`import sqlite3, tempfile, os
+from contextlib import contextmanager
+
+# 准备一个临时 db
+db_path = tempfile.mktemp(suffix=".db")
+sqlite3.connect(db_path).execute("CREATE TABLE t(x INT)").close()
+
+class Connection:
+    def __init__(self, path):
+        self.path = path
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = sqlite3.connect(self.path)
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            self.conn.close()
+        return False
+
+with Connection(db_path) as conn:
+    conn.execute("INSERT INTO t VALUES (1),(2),(3)")
+    conn.commit()
+    for row in conn.execute("SELECT x FROM t"):
+        print(row[0])
+
+os.remove(db_path)`}
+  expectedOutput={`1\n2\n3`}
+/>
+
+## 🎯 练习
+
+实现一个 `indent()` 上下文管理器：进入时把全局 `print` 替换成"先输出 2 个空格再打印原内容"的版本，退出时还原。
+
+<Playground
+  language="python"
+  id="py-12-exercise"
+  title="indent 上下文管理器"
+  code={`import builtins
+from contextlib import contextmanager
+
+_original_print = builtins.print
+
+@contextmanager
+def indent():
+    # 你的实现
+    pass
+
+
+print("第一层")
+with indent():
+    print("第二层 A")
+    with indent():
+        print("第三层")
+    print("第二层 B")
+print("回到第一层")`}
+  expectedOutput={`第一层\n  第二层 A\n    第三层\n  第二层 B\n回到第一层`}
+/>
+
+<Callout type="exercise" title="提示">
+- `builtins.print = lambda *a, **kw: _original_print("  " + (a[0] if a else ""), *a[1:], **kw)` 这种写法
+- 也可以维护一个 `level` 计数器，每次 `indent()` 累加，离开时减掉
+- 别忘了 `finally` 里恢复原 `print`
+</Callout>
+
+## 小结
+
+- ✅ `with` 是 `try / finally` 的语法糖，保证收尾代码一定执行
+- ✅ 类形式：实现 `__enter__` / `__exit__`
+- ✅ `@contextmanager` 把生成器函数变成上下文管理器——`yield` 之前 = `__enter__`，之后 = `__exit__`
+- ✅ `contextlib.suppress` 静默指定异常（谨慎使用）
+- ✅ 适用场景：文件、锁、连接、计时、临时目录、临时状态切换
+
+下一章 **类型提示**：用类型注解让你的代码自带文档，IDE 也能更聪明。

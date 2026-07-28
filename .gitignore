@@ -1,0 +1,13 @@
+node_modules
+.next
+.env*
+!.env.example
+out
+dist
+.DS_Store
+*.log
+.vercel
+.idea
+.vscode
+.deploy
+*.tar.gz

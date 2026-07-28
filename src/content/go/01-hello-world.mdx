@@ -1,0 +1,176 @@
+---
+title: 第一个 Go 程序
+order: 1
+description: Go 包、import、func main、fmt 包
+---
+
+# 第一个 Go 程序
+
+Go 是一门**编译型**语言：源代码被编译成机器码后执行，启动快、部署简单。
+
+## 1. Hello, World!
+
+每个 Go 程序都属于一个**包（package）**，可执行入口是 `package main` 中的 `func main()`。
+
+<Playground
+  language="go"
+  id="go-01-hello"
+  title="Hello World"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello, 世界！")
+    fmt.Println("Go version:", "1.22")
+}`}
+  expectedOutput={`Hello, 世界！\nGo version: 1.22`}
+/>
+
+<Callout type="tip" title="运行方式">
+- `go run main.go`：编译并直接运行
+- `go build -o hello main.go`：编译为可执行文件
+- Go 是强类型语言，变量必须先声明后使用
+</Callout>
+
+## 2. 导入多个包
+
+```go
+import (
+    "fmt"
+    "math"
+    "strings"
+)
+```
+
+<Playground
+  language="go"
+  id="go-01-import"
+  title="多包导入"
+  code={`package main
+
+import (
+    "fmt"
+    "math"
+    "strings"
+)
+
+func main() {
+    fmt.Println(math.Pi)
+    fmt.Println(strings.ToUpper("hello go"))
+    fmt.Printf("圆周率 ≈ %.2f\\n", math.Pi)
+}`}
+  expectedOutput={`3.141592653589793\nHELLO GO\n圆周率 ≈ 3.14`}
+/>
+
+## 3. `Print` vs `Printf` vs `Println`
+
+- `Print(a, b)`：原样拼接，无空格
+- `Println(a, b)`：空格分隔，加换行
+- `Printf(format, args...)`：格式化
+
+| 动词 | 含义 |
+|---|---|
+| `%d` | 整数 |
+| `%f` | 浮点（默认 6 位小数） |
+| `%.2f` | 浮点保留 2 位 |
+| `%s` | 字符串 |
+| `%v` | 任意值的默认格式 |
+| `%T` | 类型 |
+| `\\n` | 换行符 |
+
+<Playground
+  language="go"
+  id="go-01-printf"
+  title="Printf 格式化"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    name := "Alice"
+    age := 30
+    fmt.Printf("姓名：%s，年龄：%d\\n", name, age)
+    fmt.Printf("类型：%T %T\\n", name, age)
+    fmt.Printf("布尔：%v\\n", true)
+    fmt.Printf("二进制：%b\\n", 10)
+    fmt.Printf("十六进制：%x\\n", 255)
+}`}
+  expectedOutput={`姓名：Alice，年龄：30\n类型：string int\n布尔：true\n二进制：1010\n十六进制：ff`}
+/>
+
+## 4. 注释
+
+```go
+// 单行注释
+
+/*
+   多行
+   注释
+*/
+```
+
+<Callout type="info" title="Go 文档约定">
+被 `// 名称:` 开头紧贴的注释会被 `godoc` / `pkg.go.dev` 识别为文档。例如：
+```go
+// Add 返回 a + b
+func Add(a, b int) int { return a + b }
+```
+</Callout>
+
+## 5. 命令行参数
+
+<Playground
+  language="go"
+  id="go-01-args"
+  title="os.Args"
+  code={`package main
+
+import (
+    "fmt"
+    "os"
+)
+
+func main() {
+    fmt.Println("参数个数：", len(os.Args))
+    for i, a := range os.Args {
+        fmt.Printf("  [%d] %s\\n", i, a)
+    }
+}`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-01-exercise"
+  title="自我介绍"
+  code={`// 任务：使用 Printf 输出你的自我介绍
+// 期望效果：
+//   姓名：XXX
+//   年龄：XX
+//   城市：XXX
+
+package main
+
+import "fmt"
+
+func main() {
+    name := "小明"
+    age := 25
+    city := "上海"
+    // 补全输出
+}
+`}
+/>
+
+## 小结
+
+- ✅ Go 程序入口：`package main` + `func main()`
+- ✅ `import "fmt"` 导入标准库
+- ✅ `Print/Println/Printf` 三种输出
+- ✅ `Printf` 用动词 `%d %f %s %v %T` 格式化
+- ✅ `os.Args` 拿命令行参数
+- ✅ 用 `//` 写注释（支持 `godoc` 风格）
+
+下一章 **变量与类型**。

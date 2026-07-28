@@ -1,0 +1,265 @@
+---
+title: 常用第三方库
+order: 16
+description: requests / pandas 入门、pathlib 回顾、pip 与离线安装
+---
+
+# 常用第三方库
+
+Python 强大在于生态。但**本沙箱无法联网**，所以"装不上的库"得用标准库替代。本章帮你认识三个最高频的库，并教你在受限环境里照样干活。
+
+## 1. `requests` —— 写 HTTP 客户端的事实标准
+
+`requests` 让发 HTTP 请求变成一行：
+
+```python
+import requests
+
+r = requests.get("https://api.github.com")
+print(r.status_code, r.json())
+
+r = requests.post("https://httpbin.org/post",
+                  json={"name": "Alice"},
+                  headers={"X-Token": "abc"})
+print(r.status_code, r.json())
+```
+
+<Callout type="warn" title="沙箱里没有 requests">
+默认 `python:3.12-alpine` 镜像**不预装** `requests`。沙箱也禁用了网络。生产环境里请运行：
+```bash
+pip install requests
+```
+本节**用 `urllib.request` 做等价演示**。
+</Callout>
+
+## 2. 沙箱里的 HTTP：`urllib.request`
+
+Python 自带 HTTP 客户端，写起来啰嗦一点但能用：
+
+<Playground
+  language="python"
+  id="py-16-urllib"
+  title="urllib.request 等价于 requests.get"
+  code={`import urllib.request
+import json
+
+# 等价于 requests.get(url).json()
+# 沙箱禁网，所以只演示结构化解析过程（用一个内置的演示字符串）
+
+demo_json = '{"user": "alice", "score": 95, "tags": ["py", "go"]}'
+data = json.loads(demo_json)
+print("用户名:", data["user"])
+print("分数:  ", data["score"])
+print("标签:  ", data["tags"])
+
+# 真要用时这么写：
+# with urllib.request.urlopen("https://api.example.com/data") as r:
+#     raw = r.read()
+#     data = json.loads(raw)
+#     print(r.status, data)`}
+  expectedOutput={`用户名: alice\n分数:   95\n标签:   ['py', 'go']`}
+/>
+
+<Callout type="tip" title="urllib vs requests 对照">
+| 需求 | requests | urllib |
+|---|---|---|
+| GET 请求 | `requests.get(url)` | `urllib.request.urlopen(url)` |
+| 带参数 | `params={...}` | 拼 query string |
+| POST JSON | `requests.post(url, json={...})` | `urlopen(req)` 手动序列化 |
+| 读响应 | `r.json()` | `json.loads(r.read())` |
+| Headers | `headers={...}` | `req.add_header(...)` |
+| 超时 | `timeout=5` | `urlopen(url, timeout=5)` |
+</Callout>
+
+## 3. `pandas` —— 表格数据的一站式工具
+
+`pandas` 是数据分析的事实标准。两个核心类型：`Series`（一列）和 `DataFrame`（整张表）。
+
+```python
+import pandas as pd
+
+df = pd.read_csv("sales.csv")
+print(df.head())           # 看前 5 行
+print(df.describe())       # 数值列的统计
+print(df.groupby("city")["amount"].sum())
+df.plot(kind="bar", x="city", y="amount")
+```
+
+<Callout type="warn" title="沙箱里没有 pandas">
+需要 `pip install pandas`。`pandas` 还依赖 numpy，**体积不小**。本节用 stdlib `csv` 做最小替代。
+</Callout>
+
+## 4. 沙箱里的"穷人版 pandas"：`csv`
+
+<Playground
+  language="python"
+  id="py-16-csv"
+  title="csv 模块：穷人版 pandas"
+  code={`import csv
+from collections import defaultdict
+from pathlib import Path
+
+# 准备一份销售数据
+Path("/tmp/sales.csv").write_text("""city,product,amount
+北京,Apple,120
+上海,Apple,80
+北京,Banana,50
+上海,Banana,70
+广州,Apple,200
+""", encoding="utf-8")
+
+# 读
+with open("/tmp/sales.csv", encoding="utf-8") as f:
+    rows = list(csv.DictReader(f))
+print("总行数:", len(rows))
+print("第一行:", rows[0])
+
+# 分组聚合（pandas 里的 groupby）
+by_city = defaultdict(int)
+for r in rows:
+    by_city[r["city"]] += int(r["amount"])
+
+print("按城市求和:")
+for city, total in sorted(by_city.items()):
+    print(f"  {city}: {total}")`}
+  expectedOutput={`总行数: 5\n第一行: {'city': '北京', 'product': 'Apple', 'amount': '120'}\n按城市求和:\n  上海: 150\n  北京: 170\n  广州: 200`}
+/>
+
+<Callout type="info" title="collections.defaultdict 的妙用">
+`defaultdict(int)` 自动给不存在的 key 初始化为 `0`，省去 `if key in d: ... else: ...`。
+类似的还有 `defaultdict(list)`（自动初始化为空 list）。
+</Callout>
+
+## 5. `pathlib` —— 面向对象的路径
+
+回顾一下第 8 章的 `pathlib`：
+
+<Playground
+  language="python"
+  id="py-16-pathlib"
+  title="pathlib 高频操作"
+  code={`from pathlib import Path
+import tempfile
+
+# 临时目录
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    print("临时目录:", root)
+
+    # 一行建多级
+    sub = root / "a" / "b" / "c.txt"
+    sub.parent.mkdir(parents=True, exist_ok=True)
+    sub.write_text("hello", encoding="utf-8")
+
+    # 遍历
+    print("目录内容:")
+    for p in root.rglob("*"):
+        print(" ", p.relative_to(root))
+
+    # 读
+    print("文件内容:", sub.read_text(encoding="utf-8"))
+    print("后缀:", sub.suffix, " 名字:", sub.name)`}
+  expectedOutput={`临时目录: /tmp/xxx\n目录内容:\n a\n a/b\n a/b/c.txt\n文件内容: hello\n后缀: .txt  名字: c.txt`}
+/>
+
+## 6. `pip` —— 包管理
+
+```bash
+# 安装
+pip install requests
+
+# 装指定版本
+pip install requests==2.31.0
+
+# 装某一组（从 requirements.txt）
+pip install -r requirements.txt
+
+# 导出当前环境
+pip freeze > requirements.txt
+
+# 离线安装（提前下载 wheel）
+pip install --no-index --find-links=/wheels requests
+```
+
+<Callout type="tip" title="国内加速镜像">
+```bash
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple requests
+```
+其他常见镜像：阿里云、豆瓣、中科大。
+</Callout>
+
+## 7. 看不懂报错时怎么办？
+
+`ImportError: No module named xxx` —— 别慌，按这个顺序排查：
+
+1. **拼写**：包名 ≠ import 名（`Pillow` 装出来叫 `PIL`，`python-dateutil` 装出来叫 `dateutil`）。
+2. **环境**：在哪个 Python 解释器？`which python`、`python -c "import sys; print(sys.executable)"`。
+3. **虚拟环境**：`python -m venv .venv && source .venv/bin/activate` 后再装。
+4. **版本冲突**：`pip install --upgrade xxx` 或用 `pip check` 看依赖图。
+
+<Playground
+  language="python"
+  id="py-16-import-check"
+  title="import 调试三件套"
+  code={`import sys
+print("当前 Python:", sys.executable)
+print("sys.path 前 5 项:")
+for p in sys.path[:5]:
+    print(" ", p)
+
+# 检查某个包是否安装
+try:
+    import requests
+    print("requests 已装, 版本:", requests.__version__)
+except ImportError as e:
+    print("requests 未安装:", e)`}
+  expectedOutput={`当前 Python: /usr/local/bin/python\nsys.path 前 5 项:\n  \n  /usr/local/lib/python3.12/site-packages\n  ...\nrequests 未安装: No module named 'requests'`}
+/>
+
+## 🎯 练习
+
+在沙箱里（没有网络、没有第三方库），用 `urllib.request` + `csv` 完成一次"伪 API 拉数据 → 写 CSV → 重新读出统计"的全流程。
+
+<Playground
+  language="python"
+  id="py-16-exercise"
+  title="穷人版数据流水线"
+  code={`import csv
+import json
+from collections import defaultdict
+from pathlib import Path
+
+# 1) 模拟从 API 拿到的 JSON
+api_response = '''
+[
+  {"city": "北京", "product": "Apple",  "amount": 120},
+  {"city": "上海", "product": "Apple",  "amount": 80},
+  {"city": "北京", "product": "Banana", "amount": 50},
+  {"city": "广州", "product": "Apple",  "amount": 200},
+  {"city": "上海", "product": "Banana", "amount": 70}
+]
+'''
+# 你的实现：
+# 2) 解析 JSON
+# 3) 写到 /tmp/orders.csv（含表头）
+# 4) 重新读出，按 product 聚合 amount 并打印
+`}
+  expectedOutput={`写入完成, 共 5 行\n按产品求和:\n  Apple: 400\n  Banana: 120`}
+/>
+
+<Callout type="exercise" title="提示">
+- `data = json.loads(api_response)`
+- `csv.DictWriter(..., fieldnames=data[0].keys()).writerows(data)`
+- 用 `defaultdict(int)` 聚合
+</Callout>
+
+## 小结
+
+- ✅ `requests` 是 HTTP 客户端的事实标准；沙箱里用 `urllib.request` 替代
+- ✅ `pandas` 是数据分析一站式工具；沙箱里用 `csv` + `collections` 替代
+- ✅ `pathlib` 让路径操作像字符串拼接一样自然
+- ✅ `pip` 是包管理器；网络受限时用 `--no-index` + 本地 wheel
+- ✅ 遇到 `ImportError` 先查拼写、再查环境、再查虚拟环境
+- ✅ 学会用 `defaultdict` / `Counter` 替代简单的 pandas 聚合
+
+下一章是**项目实战**：用前 16 章的所有知识，做一个 CLI TODO 工具。

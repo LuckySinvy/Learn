@@ -1,0 +1,409 @@
+---
+title: 项目：CLI TODO 工具
+order: 17
+description: 用 argparse + JSON 持久化 + dataclass 做一个完整的命令行 TODO 工具
+---
+
+# 项目：CLI TODO 工具
+
+本章我们用前 16 章学到的所有内容，做一个**真实可用**的命令行 TODO 工具：
+
+- 用 `argparse` 解析子命令
+- 用 `dataclass` 表示数据
+- 用 `pathlib` 处理路径
+- 用 JSON 文件做持久化
+- 用 `unittest` 写测试
+- 用 `with` 安全地写文件
+
+## 1. 项目结构
+
+真实项目里我们会拆成多个文件：
+
+```
+todo/
+├── todo.py          # 主入口（argparse + 调度）
+├── store.py         # TodoStore 类（CRUD + 持久化）
+├── models.py        # @dataclass Todo
+└── test_store.py    # 单元测试
+```
+
+下面我们**逐个文件**实现。
+
+## 2. `models.py` —— 数据类
+
+```python
+# models.py
+from dataclasses import dataclass, field, asdict
+from typing import List
+
+@dataclass
+class Todo:
+    id: int
+    title: str
+    done: bool = False
+    tags: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+```
+
+<Callout type="tip" title="为什么用 dataclass？">
+- 少写 `__init__` / `__repr__` / `__eq__`
+- 配合 `asdict()` 一行转字典，方便 JSON 序列化
+- IDE 能给完整提示
+</Callout>
+
+## 3. `store.py` —— 增删改查
+
+```python
+# store.py
+import json
+from pathlib import Path
+from typing import List, Optional
+from models import Todo
+
+class TodoStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self._todos: List[Todo] = []
+        self._load()
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self._todos = [Todo(**item) for item in data]
+
+    def _save(self):
+        data = [t.to_dict() for t in self._todos]
+        self.path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+    def add(self, title: str, tags: Optional[List[str]] = None) -> Todo:
+        next_id = (max((t.id for t in self._todos), default=0)) + 1
+        todo = Todo(id=next_id, title=title, tags=tags or [])
+        self._todos.append(todo)
+        self._save()
+        return todo
+
+    def list(self, only_pending: bool = False) -> List[Todo]:
+        if only_pending:
+            return [t for t in self._todos if not t.done]
+        return list(self._todos)
+
+    def complete(self, todo_id: int) -> bool:
+        for t in self._todos:
+            if t.id == todo_id:
+                t.done = True
+                self._save()
+                return True
+        return False
+
+    def delete(self, todo_id: int) -> bool:
+        before = len(self._todos)
+        self._todos = [t for t in self._todos if t.id != todo_id]
+        if len(self._todos) < before:
+            self._save()
+            return True
+        return False
+```
+
+<Callout type="info" title="私有方法的约定">
+下划线开头的 `_load` / `_save` 是约定为"内部使用"。Python 不会强制私有，但 IDE 会淡化显示，告诉调用者"请别直接调"。
+</Callout>
+
+## 4. `todo.py` —— CLI 入口
+
+```python
+# todo.py
+import argparse
+from pathlib import Path
+from store import TodoStore
+
+DEFAULT_PATH = Path.home() / ".todo.json"
+
+def main():
+    parser = argparse.ArgumentParser(prog="todo", description="极简 TODO 工具")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_add = sub.add_parser("add", help="添加一条")
+    p_add.add_argument("title")
+    p_add.add_argument("--tag", action="append", default=[])
+
+    p_list = sub.add_parser("list", help="列出")
+    p_list.add_argument("--pending", action="store_true")
+
+    p_done = sub.add_parser("done", help="标记完成")
+    p_done.add_argument("id", type=int)
+
+    p_del = sub.add_parser("del", help="删除")
+    p_del.add_argument("id", type=int)
+
+    args = parser.parse_args()
+    store = TodoStore(DEFAULT_PATH)
+
+    if args.cmd == "add":
+        t = store.add(args.title, args.tag)
+        print(f"添加成功: #{t.id} {t.title}")
+    elif args.cmd == "list":
+        for t in store.list(only_pending=args.pending):
+            mark = "✓" if t.done else " "
+            print(f"[{mark}] #{t.id} {t.title}  tags={t.tags}")
+    elif args.cmd == "done":
+        ok = store.complete(args.id)
+        print("完成" if ok else "找不到该 id")
+    elif args.cmd == "del":
+        ok = store.delete(args.id)
+        print("已删除" if ok else "找不到该 id")
+
+if __name__ == "__main__":
+    main()
+```
+
+使用示例：
+
+```bash
+$ python todo.py add "学完 Python" --tag python --tag study
+添加成功: #1 学完 Python
+
+$ python todo.py list
+[ ] #1 学完 Python  tags=['python', 'study']
+
+$ python todo.py done 1
+完成
+
+$ python todo.py list --pending
+（空）
+```
+
+## 5. 可运行的演示
+
+Playground 一次只能跑一个文件，下面把 `models.py` + `store.py` 合并成**单文件可运行版本**，走一遍完整 CRUD 流程：
+
+<Playground
+  language="python"
+  id="py-17-todo-demo"
+  title="TODO 工具完整演示"
+  code={`import json
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List, Optional
+
+# ---- models ----
+@dataclass
+class Todo:
+    id: int
+    title: str
+    done: bool = False
+    tags: List[str] = field(default_factory=list)
+    def to_dict(self): return asdict(self)
+
+# ---- store ----
+class TodoStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self._todos: List[Todo] = []
+        self._load()
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        self._todos = [Todo(**d) for d in json.loads(self.path.read_text(encoding="utf-8"))]
+
+    def _save(self):
+        self.path.write_text(
+            json.dumps([t.to_dict() for t in self._todos], ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+    def add(self, title, tags=None):
+        nid = (max((t.id for t in self._todos), default=0)) + 1
+        t = Todo(id=nid, title=title, tags=tags or [])
+        self._todos.append(t)
+        self._save()
+        return t
+
+    def list(self, only_pending=False):
+        return [t for t in self._todos if not t.done] if only_pending else list(self._todos)
+
+    def complete(self, tid):
+        for t in self._todos:
+            if t.id == tid:
+                t.done = True
+                self._save()
+                return True
+        return False
+
+    def delete(self, tid):
+        before = len(self._todos)
+        self._todos = [t for t in self._todos if t.id != tid]
+        if len(self._todos) < before:
+            self._save()
+            return True
+        return False
+
+# ---- 演示 ----
+store = TodoStore(Path("/tmp/demo_todo.json"))
+
+t1 = store.add("学完 Python 进阶", tags=["python", "study"])
+t2 = store.add("写一个 CLI 工具",   tags=["python", "project"])
+t3 = store.add("看 Go 教程",        tags=["go"])
+
+print("--- 全部 ---")
+for t in store.list():
+    mark = "✓" if t.done else " "
+    print(f"[{mark}] #{t.id} {t.title}  tags={t.tags}")
+
+store.complete(t1.id)
+print("")
+print("--- 标记 #1 完成, 只看未完成 ---")
+for t in store.list(only_pending=True):
+    print(f"[ ] #{t.id} {t.title}")
+
+store.delete(t3.id)
+print("")
+print("--- 删除 #3, 全部 ---")
+for t in store.list():
+    mark = "✓" if t.done else " "
+    print(f"[{mark}] #{t.id} {t.title}")
+
+print("")
+print("--- 持久化文件内容 ---")
+print(store.path.read_text(encoding="utf-8"))`}
+  expectedOutput={`--- 全部 ---\n[ ] #1 学完 Python 进阶  tags=['python', 'study']\n[ ] #2 写一个 CLI 工具  tags=['python', 'project']\n[ ] #3 看 Go 教程  tags=['go']\n\n--- 标记 #1 完成, 只看未完成 ---\n[ ] #2 写一个 CLI 工具\n\n--- 删除 #3, 全部 ---\n[✓] #1 学完 Python 进阶  tags=['python', 'study']\n[ ] #2 写一个 CLI 工具  tags=['python', 'project']\n\n--- 持久化文件内容 ---\n[\n  {\n    "id": 1,\n    "title": "学完 Python 进阶",\n    "done": true,\n    "tags": [\n      "python",\n      "study"\n    ]\n  },\n  {\n    "id": 2,\n    "title": "写一个 CLI 工具",\n    "done": false,\n    "tags": [\n      "python",\n      "project"\n    ]\n  }\n]`}
+/>
+
+## 6. 单元测试
+
+用 `unittest` 给 `TodoStore` 写测试：
+
+<Playground
+  language="python"
+  id="py-17-todo-test"
+  title="TodoStore 测试"
+  code={`import json, unittest
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List
+
+@dataclass
+class Todo:
+    id: int
+    title: str
+    done: bool = False
+    tags: List[str] = field(default_factory=list)
+    def to_dict(self): return asdict(self)
+
+class TodoStore:
+    def __init__(self, path: Path):
+        self.path = path; self._todos = []; self._load()
+    def _load(self):
+        if self.path.exists():
+            self._todos = [Todo(**d) for d in json.loads(self.path.read_text(encoding="utf-8"))]
+    def _save(self):
+        self.path.write_text(json.dumps([t.to_dict() for t in self._todos], ensure_ascii=False), encoding="utf-8")
+    def add(self, title, tags=None):
+        nid = (max((t.id for t in self._todos), default=0)) + 1
+        t = Todo(id=nid, title=title, tags=tags or [])
+        self._todos.append(t); self._save(); return t
+    def list(self, only_pending=False):
+        return [t for t in self._todos if not t.done] if only_pending else list(self._todos)
+    def complete(self, tid):
+        for t in self._todos:
+            if t.id == tid:
+                t.done = True; self._save(); return True
+        return False
+    def delete(self, tid):
+        before = len(self._todos)
+        self._todos = [t for t in self._todos if t.id != tid]
+        if len(self._todos) < before:
+            self._save(); return True
+        return False
+
+class TestTodoStore(unittest.TestCase):
+    def setUp(self):
+        # 每个测试用独立临时文件
+        self.path = Path(f"/tmp/todo_test_{id(self)}.json")
+        self.store = TodoStore(self.path)
+
+    def tearDown(self):
+        if self.path.exists():
+            self.path.unlink()
+
+    def test_add_assigns_unique_ids(self):
+        a = self.store.add("task A")
+        b = self.store.add("task B")
+        self.assertEqual(a.id, 1)
+        self.assertEqual(b.id, 2)
+        self.assertEqual(len(self.store.list()), 2)
+
+    def test_complete_marks_done(self):
+        t = self.store.add("task")
+        self.assertFalse(t.done)
+        ok = self.store.complete(t.id)
+        self.assertTrue(ok)
+        self.assertTrue(self.store.list()[0].done)
+
+    def test_complete_missing_returns_false(self):
+        self.assertFalse(self.store.complete(999))
+
+    def test_list_pending_filters(self):
+        a = self.store.add("A")
+        self.store.add("B")
+        self.store.complete(a.id)
+        pending = self.store.list(only_pending=True)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].title, "B")
+
+    def test_persistence_round_trip(self):
+        self.store.add("learn", tags=["py"])
+        # 用新 store 实例读同一文件，应该能恢复
+        fresh = TodoStore(self.path)
+        self.assertEqual(len(fresh.list()), 1)
+        self.assertEqual(fresh.list()[0].tags, ["py"])
+
+unittest.main(argv=[''], exit=False, verbosity=2)`}
+  expectedOutput={`test_add_assigns_unique_ids (__main__.TestTodoStore) ... ok\ntest_complete_marks_missing_returns_false (__main__.TestTodoStore) ... ok\ntest_complete_marks_done (__main__.TestTodoStore) ... ok\ntest_list_pending_filters (__main__.TestTodoStore) ... ok\ntest_persistence_round_trip (__main__.TestTodoStore) ... ok\n\n----------------------------------------------------------------------\nRan 5 tests in 0.000s\n\nOK`}
+/>
+
+## 🎯 练习
+
+给上面的 `TodoStore` 加一个 `find(keyword: str) -> list[Todo]` 方法，**在 title 中做大小写不敏感的子串匹配**。然后给这个方法写至少 2 个测试。
+
+<Playground
+  language="python"
+  id="py-17-exercise"
+  title="find 方法 + 测试"
+  code={`# 把 Todo / TodoStore 复制过来，给 TodoStore 加一个 find 方法
+# 然后至少写 2 个测试
+import json, unittest
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List
+
+# （省略 Todo / TodoStore 实现，复用上面的）
+
+# 在这里写 find(keyword) 方法
+# 然后写测试
+`}
+  expectedOutput={`test_find_case_insensitive (__main__.TestFind) ... ok\ntest_find_no_match (__main__.TestFind) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK`}
+/>
+
+<Callout type="exercise" title="提示">
+- `find` 实现：`[t for t in self._todos if keyword.lower() in t.title.lower()]`
+- 测试 1：插入 `"Buy Milk"` 和 `"Read Book"`，搜 `"milk"` 应返回 1 个
+- 测试 2：搜 `"xyz"` 应返回空列表
+</Callout>
+
+## 小结
+
+- ✅ `argparse` 配合 `add_subparsers` 实现"git 风格"的子命令 CLI
+- ✅ `@dataclass` + `asdict()` 是 JSON 序列化的好搭档
+- ✅ `pathlib` 让路径拼接可读：`Path.home() / ".todo.json"`
+- ✅ 持久化文件用 `read_text` / `write_text` 配 `encoding="utf-8"`
+- ✅ `unittest` + 临时文件 (`tempfile` / 自建路径) 是测试的标准模式
+- ✅ 拆成 `models` / `store` / `cli` 三层让单测只需要测中间层
+
+下一章 **项目：异步网页爬虫**——把所有异步知识用在一个真正并发抓取数据的项目上。

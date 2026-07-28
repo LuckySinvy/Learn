@@ -1,0 +1,205 @@
+---
+title: 变量与类型
+order: 2
+description: 8 大基本类型、引用类型、final、类型转换、Scanner
+---
+
+# 变量与类型
+
+Java 是**强类型静态语言**：每个变量都必须声明类型，类型在编译时确定。
+
+## 1. 8 大基本类型
+
+| 类型 | 大小 | 范围 | 默认值 | 字面量示例 |
+|---|---|---|---|---|
+| `byte` | 8 | -128 ~ 127 | 0 | `byte b = 100;` |
+| `short` | 16 | -32768 ~ 32767 | 0 | `short s = 1000;` |
+| `int` | 32 | -2³¹ ~ 2³¹-1 | 0 | `int n = 42;` |
+| `long` | 64 | -2⁶³ ~ 2⁶³-1 | 0L | `long l = 100L;` |
+| `float` | 32 | IEEE 754 | 0.0f | `float f = 3.14f;` |
+| `double` | 64 | IEEE 754 | 0.0d | `double d = 3.14;` |
+| `char` | 16 | Unicode | `'\u0000'` | `char c = 'A';` |
+| `boolean` | - | true/false | false | `boolean b = true;` |
+
+<Playground
+  language="java"
+  id="java-02-types"
+  title="基本类型"
+  code={`public class Main {
+    public static void main(String[] args) {
+        byte b = 100;
+        short s = 1000;
+        int i = 100_000;
+        long l = 100_000_000L;
+        float f = 3.14f;
+        double d = 3.14159;
+        char c = 'A';
+        boolean ok = true;
+
+        System.out.println("byte: " + b);
+        System.out.println("int: " + i);
+        System.out.println("long: " + l);
+        System.out.println("double: " + d);
+        System.out.println("char: " + c);
+        System.out.println("boolean: " + ok);
+    }
+}`}
+/>
+
+<Callout type="tip" title="下划线分隔数字">
+Java 7+ 允许数字字面量用下划线分隔提高可读性：`int n = 1_000_000;`。
+</Callout>
+
+## 2. 引用类型
+
+类、接口、数组都是引用类型，默认值是 `null`：
+
+```java
+String s = "Hello";      // 字符串
+int[] arr = {1, 2, 3};   // 数组
+Object obj = new Object();
+```
+
+## 3. `final` 常量
+
+```java
+final double PI = 3.14159;
+final int MAX = 100;
+```
+
+## 4. 类型转换
+
+### 4.1 自动转换（小→大）
+`byte → short → int → long → float → double`
+
+### 4.2 强制转换（大→小）
+可能丢失精度，需显式声明：
+
+<Playground
+  language="java"
+  id="java-02-cast"
+  title="类型转换"
+  code={`public class Main {
+    public static void main(String[] args) {
+        int a = 10;
+        double d = a;            // 自动：int -> double
+        System.out.println("自动：int -> double: " + d);
+
+        double pi = 3.14159;
+        int truncated = (int) pi;  // 强制：double -> int（截断小数）
+        System.out.println("强制：double -> int: " + truncated);
+
+        int big = 200;
+        byte small = (byte) big;   // 强制：int -> byte（溢出）
+        System.out.println("强制：200 -> byte: " + small);
+    }
+}`}
+  expectedOutput={`自动：int -> double: 10.0\n强制：double -> int: 3\n强制：200 -> byte: -56`}
+/>
+
+<Callout type="warn" title="强制转换可能溢出">
+`byte` 只有 8 位，200 强制转换后会变成 `-56`（因为高位被截断，只保留 11001000，这是 -56 的补码）。业务代码中应避免类似陷阱。
+</Callout>
+
+## 5. 算术运算
+
+<Playground
+  language="java"
+  id="java-02-arith"
+  title="算术运算"
+  code={`public class Main {
+    public static void main(String[] args) {
+        int a = 10, b = 3;
+        System.out.println(a + b);   // 13
+        System.out.println(a - b);   // 7
+        System.out.println(a * b);   // 30
+        System.out.println(a / b);   // 3   整数除法
+        System.out.println(a % b);   // 1
+        System.out.println((double) a / b);  // 3.3333...
+
+        // 自增
+        int n = 5;
+        n++;     // 6
+        ++n;     // 7
+        System.out.println(n);
+    }
+}`}
+  expectedOutput={`13\n7\n30\n3\n1\n3.3333333333333335\n7`}
+/>
+
+## 6. `Scanner` 读输入
+
+<Playground
+  language="java"
+  id="java-02-scanner"
+  title="Scanner"
+  code={`import java.util.Scanner;
+
+public class Main {
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        System.out.print("请输入你的名字：");
+        String name = sc.nextLine();
+        System.out.print("请输入年龄：");
+        int age = sc.nextInt();
+        System.out.println("你好，" + name + "，你" + age + "岁。");
+        sc.close();
+    }
+}`}
+/>
+
+## 7. 实战：圆面积
+
+<Playground
+  language="java"
+  id="java-02-area"
+  title="圆面积"
+  code={`import java.util.Scanner;
+
+public class Main {
+    public static void main(String[] args) {
+        final double PI = 3.14159;
+        Scanner sc = new Scanner(System.in);
+        System.out.print("请输入半径：");
+        double r = sc.nextDouble();
+        double area = PI * r * r;
+        System.out.printf("半径 %.2f 的圆面积 = %.2f%n", r, area);
+        sc.close();
+    }
+}`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-02-exercise"
+  title="BMI 计算器"
+  code={`// 任务：读取身高（米）与体重（公斤），输出 BMI
+// BMI = 体重 / (身高²)，保留 2 位小数
+// 期望：身高 1.75，体重 70 -> BMI 是 22.86
+
+import java.util.Scanner;
+
+public class Main {
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        System.out.print("身高（米）：");
+        double h = sc.nextDouble();
+        System.out.print("体重（公斤）：");
+        double w = sc.nextDouble();
+        // 补全代码
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ 8 大基本类型 + 引用类型
+- ✅ `final` 声明常量
+- ✅ 自动类型转换（小→大）；强制转换 `(T)v`（大→小）
+- ✅ `Scanner` 读控制台输入
+- ✅ 整数除法会截断小数部分
+
+下一章 **流程控制**。

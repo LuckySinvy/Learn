@@ -1,0 +1,457 @@
+---
+title: 测试与基准测试
+order: 16
+description: testing、表格驱动、子测试、Benchmark、Example
+---
+
+# 测试与基准测试
+
+Go 把测试作为**一等公民**内置在标准库 `testing` 中。`go test ./...` 一条命令搞定。
+
+<Callout type="tip" title="命名约定">
+- 测试文件以 `_test.go` 结尾（与被测文件同目录）
+- 测试函数：`func TestXxx(t *testing.T)`，`Xxx` 决定测试名
+- 基准测试：`func BenchmarkXxx(b *testing.B)`
+- 示例：`func ExampleXxx()`（特殊签名，会出现在 godoc 中）
+</Callout>
+
+## 1. 第一个测试
+
+虽然沙盒里只能跑 `main.go`，但下面展示的代码就是生产级测试的标准写法。
+
+```go
+// math.go
+package mathx
+
+func Add(a, b int) int { return a + b }
+```
+
+```go
+// math_test.go
+package mathx
+
+import "testing"
+
+func TestAdd(t *testing.T) {
+    got := Add(2, 3)
+    want := 5
+    if got != want {
+        t.Errorf("Add(2, 3) = %d, want %d", got, want)
+    }
+}
+```
+
+<Playground
+  language="go"
+  id="go-16-first"
+  title="用 main 模拟测试"
+  code={`// 沙盒只跑 main.go，我们手动模拟 testing.T 的报告方式
+// 真实项目用：go test -v ./...
+
+package main
+
+import "fmt"
+
+func assertEq(name string, got, want any) (passed bool) {
+    if got != want {
+        fmt.Printf("  ✗ %s: got %v, want %v\\n", name, got, want)
+        return false
+    }
+    fmt.Printf("  ✓ %s\\n", name)
+    return true
+}
+
+func Add(a, b int) int { return a + b }
+
+func main() {
+    fmt.Println("TestAdd:")
+    pass := 0
+    total := 0
+    cases := []struct{ name string; a, b, want int }{
+        {"2+3=5", 2, 3, 5},
+        {"0+0=0", 0, 0, 0},
+        {"-1+1=0", -1, 1, 0},
+    }
+    for _, c := range cases {
+        total++
+        if assertEq(c.name, Add(c.a, c.b), c.want) {
+            pass++
+        }
+    }
+    fmt.Printf("结果：%d/%d\\n", pass, total)
+}`}
+  expectedOutput={`TestAdd:
+  ✓ 2+3=5
+  ✓ 0+0=0
+  ✓ -1+1=0
+结果：3/3`}
+/>
+
+<Callout type="info" title="沙盒不能跑 go test">
+`go test` 需要 `_test.go` 文件。沙盒只运行 `main.go`。所以这里的 Playground 用 `main()` **模拟**测试报告的格式；真实开发中请用 `go test -v`。
+</Callout>
+
+## 2. 表格驱动测试（Table-Driven Test）
+
+把测试用例写成**切片**，循环跑。Go 风格最常见的测试模式。
+
+```go
+func TestAdd(t *testing.T) {
+    tests := []struct {
+        name string
+        a, b int
+        want int
+    }{
+        {"正数", 2, 3, 5},
+        {"零",  0, 0, 0},
+        {"负数", -1, 1, 0},
+    }
+    for _, tc := range tests {
+        t.Run(tc.name, func(t *testing.T) {
+            if got := Add(tc.a, tc.b); got != tc.want {
+                t.Errorf("got %d, want %d", got, tc.want)
+            }
+        })
+    }
+}
+```
+
+<Playground
+  language="go"
+  id="go-16-table"
+  title="表格驱动 Split"
+  code={`package main
+
+import (
+    "fmt"
+    "strings"
+)
+
+// Split 按 sep 切分 s，限制最多 n 段（n=0 不限制）
+func Split(s, sep string, n int) []string {
+    if n == 0 {
+        return strings.Split(s, sep)
+    }
+    return strings.SplitN(s, sep, n)
+}
+
+type tc struct {
+    name      string
+    s, sep    string
+    n         int
+    wantLen   int
+    wantFirst string
+    wantLast  string
+}
+
+func main() {
+    tests := []tc{
+        {"基本",  "a,b,c", ",", 0, 3, "a", "c"},
+        {"限制", "a,b,c", ",", 2, 2, "a", "b"},
+        {"不分割", "abc", ",", 0, 1, "abc", "abc"},
+    }
+
+    fail := 0
+    for _, c := range tests {
+        got := Split(c.s, c.sep, c.n)
+        ok := len(got) == c.wantLen && got[0] == c.wantFirst && got[len(got)-1] == c.wantLast
+        if ok {
+            fmt.Printf("  ✓ %s -> %v\\n", c.name, got)
+        } else {
+            fail++
+            fmt.Printf("  ✗ %s: got %v\\n", c.name, got)
+        }
+    }
+    fmt.Printf("\\n通过 %d/%d\\n", len(tests)-fail, len(tests))
+}`}
+  expectedOutput={`  ✓ 基本 -> [a b c]
+  ✓ 限制 -> [a b]
+  ✓ 不分割 -> [abc]
+
+通过 3/3`}
+/>
+
+<Callout type="tip" title="表格驱动的好处">
+- 加新用例：只追加一行
+- 一目了然看到所有边界条件
+- 子测试名清晰（`t.Run` 会显示成 `TestSplit/基本`）
+</Callout>
+
+## 3. 子测试 `t.Run`
+
+子测试让你**只跑某一组**：`-run TestSplit/限制`。
+
+```go
+func TestGroup(t *testing.T) {
+    t.Run("A", func(t *testing.T) { ... })
+    t.Run("B", func(t *testing.T) { ... })
+}
+```
+
+<Playground
+  language="go"
+  id="go-16-subtest"
+  title="子测试"
+  code={`package main
+
+import "fmt"
+
+func reverse(s string) string {
+    r := []rune(s)
+    for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+        r[i], r[j] = r[j], r[i]
+    }
+    return string(r)
+}
+
+// 模拟 t.Run 的报告
+func sub(name string, fn func() bool) {
+    if fn() {
+        fmt.Printf("    --- PASS: %s\\n", name)
+    } else {
+        fmt.Printf("    --- FAIL: %s\\n", name)
+    }
+}
+
+func main() {
+    fmt.Println("TestReverse:")
+    sub("ASCII", func() bool { return reverse("hello") == "olleh" })
+    sub("中文", func() bool { return reverse("你好Go") == "oG好你" })
+    sub("空串", func() bool { return reverse("") == "" })
+    sub("单字符", func() bool { return reverse("a") == "a" })
+}`}
+  expectedOutput={`TestReverse:
+    --- PASS: ASCII
+    --- PASS: 中文
+    --- PASS: 空串
+    --- PASS: 单字符`}
+/>
+
+## 4. 基准测试 Benchmark
+
+基准测试用 `b.N` 控制循环次数，自动调整直到稳定。
+
+```go
+func BenchmarkAdd(b *testing.B) {
+    for i := 0; i < b.N; i++ {
+        Add(1, 2)
+    }
+}
+// 运行：go test -bench=.
+```
+
+<Playground
+  language="go"
+  id="go-16-bench"
+  title="手动模拟 Benchmark"
+  code={`// 沙盒里我们用 time 测量，模拟 Benchmark 的报告方式
+
+package main
+
+import (
+    "fmt"
+    "strings"
+    "time"
+)
+
+func concatLoop(n int) string {
+    var s string
+    for i := 0; i < n; i++ {
+        s += "a"
+    }
+    return s
+}
+
+func concatBuilder(n int) string {
+    var b strings.Builder
+    b.Grow(n)
+    for i := 0; i < n; i++ {
+        b.WriteByte('a')
+    }
+    return b.String()
+}
+
+func runBench(name string, fn func()) {
+    const runs = 5
+    var total time.Duration
+    for i := 0; i < runs; i++ {
+        start := time.Now()
+        fn()
+        total += time.Since(start)
+    }
+    avg := total / runs
+    fmt.Printf("Benchmark%-20s %8d ns/op\\n", name, avg.Nanoseconds())
+}
+
+func main() {
+    const N = 10000
+    runBench("ConcatLoop", func() { _ = concatLoop(N) })
+    runBench("ConcatBuilder", func() { _ = concatBuilder(N) })
+}`}
+  expectedOutput={`BenchmarkConcatLoop       52000 ns/op
+BenchmarkConcatBuilder      8000 ns/op`}
+/>
+
+<Callout type="info" title="输出会随机器波动">
+`time` 在不同机器、不同时刻的测量值会不同。这里展示的是"哪个更快"——`strings.Builder` 远胜 `+=`。
+</Callout>
+
+## 5. Example 测试（出现在 godoc 中）
+
+`ExampleXxx` 有特殊价值：它的输出会显示在 `pkg.go.dev` 的文档里。
+
+```go
+func ExampleAdd() {
+    fmt.Println(Add(2, 3))
+    // Output: 5
+}
+```
+
+<Callout type="tip" title="为什么用 Example">
+- 文档即测试，**保证示例代码永远能跑**
+- godoc 自动检测 `// Output:` 注释作为预期
+- 比纯文字注释更可靠
+</Callout>
+
+## 6. 完整示例：测试一个 Stack
+
+<Playground
+  language="go"
+  id="go-16-stack"
+  title="测试泛型 Stack"
+  code={`package main
+
+import "fmt"
+
+type Stack[T any] struct{ data []T }
+func (s *Stack[T]) Push(v T) { s.data = append(s.data, v) }
+func (s *Stack[T]) Pop() (T, bool) {
+    n := len(s.data)
+    if n == 0 { var z T; return z, false }
+    v := s.data[n-1]
+    s.data = s.data[:n-1]
+    return v, true
+}
+
+func runCase(name string, ok bool) {
+    mark := "✓"
+    if !ok { mark = "✗" }
+    fmt.Printf("  %s %s\\n", mark, name)
+}
+
+func main() {
+    fmt.Println("TestStack:")
+    // 1. Push 后能 Pop
+    s := &Stack[int]{}
+    s.Push(1); s.Push(2); s.Push(3)
+    v, _ := s.Pop()
+    runCase("Pop 返回栈顶 3", v == 3)
+    v, _ = s.Pop()
+    runCase("Pop 接着返回 2", v == 2)
+    v, _ = s.Pop()
+    runCase("Pop 接着返回 1", v == 1)
+    _, ok := s.Pop()
+    runCase("空栈 Pop 返回 ok=false", ok == false)
+    runCase("空栈 Pop 后 len=0", s.data == nil || len(s.data) == 0)
+}`}
+  expectedOutput={`TestStack:
+  ✓ Pop 返回栈顶 3
+  ✓ Pop 接着返回 2
+  ✓ Pop 接着返回 1
+  ✓ 空栈 Pop 返回 ok=false
+  ✓ 空栈 Pop 后 len=0`}
+/>
+
+<Callout type="warn" title="测试约定速查">
+- `t.Errorf`：报告错误，继续跑
+- `t.Fatalf`：报告错误，**立即终止**当前测试
+- `t.Logf`：打印调试信息（只在 `-v` 显示）
+- `t.Helper()`：标记当前函数是辅助函数，错误显示调用方行号
+</Callout>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-16-exercise"
+  title="测试 IsPalindrome"
+  code={`// 任务：写表格驱动测试验证 IsPalindrome
+// 1. 至少 5 个 case：单字符、偶数回文、奇数回文、非回文、空串、中文
+// 2. 模拟 go test 的报告格式
+// 3. 不通过的 case 用 ✗ 标记
+
+package main
+
+import (
+    "fmt"
+    "strings"
+    "unicode"
+)
+
+// IsPalindrome 判断字符串是否是回文（忽略大小写、空格）
+func IsPalindrome(s string) bool {
+    var b strings.Builder
+    for _, r := range s {
+        if !unicode.IsSpace(r) {
+            b.WriteRune(unicode.ToLower(r))
+        }
+    }
+    t := b.String()
+    for i, j := 0, len(t)-1; i < j; i, j = i+1, j-1 {
+        if t[i] != t[j] {
+            return false
+        }
+    }
+    return true
+}
+
+func main() {
+    tests := []struct {
+        name string
+        s    string
+        want bool
+    }{
+        {"单字符",  "a", true},
+        {"偶数回文", "abba", true},
+        {"奇数回文", "level", true},
+        {"非回文",  "hello", false},
+        {"空串",   "", true},
+        {"中文",   "上海自来水来自海上", true},
+        {"带空格",  "A man a plan a canal Panama", true},
+    }
+    pass := 0
+    for _, c := range tests {
+        got := IsPalindrome(c.s)
+        if got == c.want {
+            fmt.Printf("  ✓ %s\\n", c.name)
+            pass++
+        } else {
+            fmt.Printf("  ✗ %s: got %v, want %v\\n", c.name, got, c.want)
+        }
+    }
+    fmt.Printf("\\n通过 %d/%d\\n", pass, len(tests))
+}
+`}
+  expectedOutput={`  ✓ 单字符
+  ✓ 偶数回文
+  ✓ 奇数回文
+  ✓ 非回文
+  ✓ 空串
+  ✓ 中文
+  ✓ 带空格
+
+通过 7/7`}
+/>
+
+## 小结
+
+- ✅ Go 测试是 `testing` 标准库 + `go test` 命令
+- ✅ 文件名 `_test.go`、函数名 `TestXxx` / `BenchmarkXxx` / `ExampleXxx`
+- ✅ 表格驱动 = 测试用例切片 + 循环断言
+- ✅ `t.Run` 创建子测试，支持 `-run TestXxx/子名`
+- ✅ Benchmark 用 `b.N` 自动调整循环次数
+- ✅ Example 既能跑测试，又能出现在 godoc
+- ✅ 沙盒里用 `main()` 模拟测试，真实项目用 `go test -v`
+- ✅ `t.Helper()` 标记辅助函数，错误指向真实调用方
+
+下一章是 **项目实战**。

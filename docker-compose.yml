@@ -1,0 +1,28 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: learn-web:latest
+    container_name: learn-web
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"   # 只监听 loopback（由 Nginx 转发的 https 访问）
+    environment:
+      NODE_ENV: production
+      # Linux 默认 /var/run/docker.sock；macOS Docker Desktop 改成 ~/.docker/run/docker.sock
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      # 宿主机 Docker socket —— 让容器内能 spawn 三语沙箱
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 沙箱 tmp dir（让 Python 文件 I/O、Go 缓存等可写）
+      - learn-runner-tmp:/tmp
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  learn-runner-tmp:

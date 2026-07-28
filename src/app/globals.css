@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg: 255 255 255;
+    --surface: 246 248 250;
+    --border: 229 231 235;
+    --text: 17 24 39;
+    --text-muted: 75 85 99;
+  }
+
+  .dark {
+    --bg: 11 16 32;
+    --surface: 18 26 51;
+    --border: 31 42 68;
+    --text: 226 232 240;
+    --text-muted: 148 163 184;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background: rgb(var(--bg));
+    color: rgb(var(--text));
+    font-family: 'Inter', 'PingFang SC', 'Hiragino Sans GB', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  code, pre, kbd, samp {
+    font-family: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
+  }
+}
+
+@layer components {
+  .prose h1 {
+    @apply text-3xl font-bold mt-8 mb-4 scroll-mt-24;
+  }
+  .prose h2 {
+    @apply text-2xl font-semibold mt-10 mb-3 scroll-mt-24 border-b border-gray-200 dark:border-gray-800 pb-2;
+  }
+  .prose h3 {
+    @apply text-xl font-semibold mt-6 mb-2 scroll-mt-24;
+  }
+  .prose p {
+    @apply leading-7 my-4;
+  }
+  .prose ul {
+    @apply list-disc pl-6 my-4 space-y-1;
+  }
+  .prose ol {
+    @apply list-decimal pl-6 my-4 space-y-1;
+  }
+  .prose li {
+    @apply leading-7;
+  }
+  .prose a {
+    @apply text-primary-600 hover:underline;
+  }
+  .prose code:not(pre code) {
+    @apply rounded bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 text-[0.875em] text-pink-600 dark:text-pink-300;
+  }
+  .prose blockquote {
+    @apply border-l-4 border-primary-400 bg-primary-50/40 dark:bg-primary-900/10 pl-4 py-1 my-4 italic text-gray-700 dark:text-gray-300;
+  }
+  .prose table {
+    @apply w-full my-4 border-collapse;
+  }
+  .prose th, .prose td {
+    @apply border border-gray-200 dark:border-gray-700 px-3 py-2 text-left;
+  }
+  .prose th {
+    @apply bg-gray-50 dark:bg-gray-800 font-semibold;
+  }
+  .prose pre {
+    @apply !my-0;
+  }
+
+  /* rehype-pretty-code */
+  pre[data-theme] {
+    @apply rounded-lg border border-gray-200 dark:border-gray-800 overflow-x-auto text-sm;
+    background: rgb(var(--surface));
+  }
+  pre[data-theme] code {
+    @apply block p-4 leading-6;
+    background: transparent;
+  }
+  pre[data-theme] code [data-line] {
+    @apply block;
+  }
+  [data-rehype-pretty-code-figure] {
+    @apply my-4;
+  }
+  [data-rehype-pretty-code-title] {
+    @apply text-xs font-mono px-4 py-1.5 rounded-t-lg border border-b-0 border-gray-200 dark:border-gray-800 text-gray-500;
+    background: rgb(var(--surface));
+  }
+  [data-rehype-pretty-code-title] + pre {
+    @apply rounded-t-none;
+  }
+}
+
+/* Monaco container */
+.monaco-container {
+  min-height: 120px;
+}

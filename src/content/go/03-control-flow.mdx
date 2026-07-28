@@ -1,0 +1,205 @@
+---
+title: 流程控制
+order: 3
+description: if/else、for 循环、switch、range
+---
+
+# 流程控制
+
+Go 的流程控制很简洁：**没有 while、没有 do-while**，只有 `for`（但有多种形式）。
+
+## 1. `if / else`
+
+```go
+if 条件 {
+} else if {
+} else {
+}
+```
+
+特点：`if` 后面可以跟一个**简短语句**（在条件求值前执行）。
+
+<Playground
+  language="go"
+  id="go-03-if"
+  title="if 简短语句"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    if x := 10; x > 0 {
+        fmt.Println("正数")
+    } else if x < 0 {
+        fmt.Println("负数")
+    } else {
+        fmt.Println("零")
+    }
+}`}
+  expectedOutput={`正数`}
+/>
+
+## 2. `for` 循环（唯一循环）
+
+```go
+for i := 0; i < 10; i++ { ... }   // 类 C
+for 条件 { ... }                   // 类 while
+for { ... }                        // 无限循环
+for k, v := range m { ... }        // 遍历
+```
+
+<Playground
+  language="go"
+  id="go-03-for"
+  title="for 多种形式"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    // 类 C
+    for i := 0; i < 3; i++ {
+        fmt.Print(i, " ")
+    }
+    fmt.Println()
+
+    // 类 while
+    n := 1
+    for n < 100 {
+        n *= 2
+    }
+    fmt.Println("n =", n)
+
+    // 无限循环 + break
+    sum := 0
+    for {
+        sum++
+        if sum >= 5 {
+            break
+        }
+    }
+    fmt.Println("sum =", sum)
+}`}
+  expectedOutput={`0 1 2 \nn = 128\nsum = 5`}
+/>
+
+## 3. `range` 遍历
+
+`range` 可以遍历字符串、数组、切片、map、channel。
+
+<Playground
+  language="go"
+  id="go-03-range"
+  title="range 遍历"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    nums := []int{10, 20, 30}
+    for i, v := range nums {
+        fmt.Printf("[%d]=%d ", i, v)
+    }
+    fmt.Println()
+
+    for i, v := range "Go语言" {
+        fmt.Printf("%d:%c ", i, v)
+    }
+    fmt.Println()
+}`}
+  expectedOutput={`[0]=10 [1]=20 [2]=30 \n0:G 1:o 2:语 3:言 `}
+/>
+
+<Callout type="tip" title="忽略索引或值">
+用 `_` 忽略：`for _, v := range nums` 或 `for i := range nums`。
+</Callout>
+
+## 4. `switch`
+
+Go 的 `switch` 自动 break，**不需要每个 case 末尾加 break**。
+
+<Playground
+  language="go"
+  id="go-03-switch"
+  title="switch"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    day := 3
+    switch day {
+    case 1, 2, 3, 4, 5:
+        fmt.Println("工作日")
+    case 6, 7:
+        fmt.Println("周末")
+    default:
+        fmt.Println("无效")
+    }
+
+    // 不带条件的 switch（等价 if-else 链）
+    score := 85
+    switch {
+    case score >= 90:
+        fmt.Println("A")
+    case score >= 80:
+        fmt.Println("B")
+    case score >= 70:
+        fmt.Println("C")
+    default:
+        fmt.Println("D")
+    }
+}`}
+  expectedOutput={`工作日\nB`}
+/>
+
+## 5. 实战：九九乘法表
+
+<Playground
+  language="go"
+  id="go-03-99"
+  title="九九乘法表"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    for i := 1; i <= 9; i++ {
+        for j := 1; j <= i; j++ {
+            fmt.Printf("%d*%d=%-2d ", j, i, j*i)
+        }
+        fmt.Println()
+    }
+}`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-03-exercise"
+  title="FizzBuzz"
+  code={`// 任务：打印 1~15，按 FizzBuzz 规则：
+// 3 的倍数输出 Fizz，5 的倍数输出 Buzz，3和5的公倍数输出 FizzBuzz
+// 期望：
+//   1 2 Fizz 4 Buzz Fizz 7 8 Fizz Buzz 11 Fizz 13 14 FizzBuzz
+
+package main
+
+import "fmt"
+
+func main() {
+    // 补全代码
+}
+`}
+/>
+
+## 小结
+
+- ✅ `if` 可带简短语句
+- ✅ `for` 是唯一循环关键字（4 种形式）
+- ✅ `range` 遍历字符串/数组/切片/map
+- ✅ `switch` 默认不 fallthrough
+- ✅ `break` / `continue` 与 C/Java 类似
+
+下一章 **函数**。

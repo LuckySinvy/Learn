@@ -1,0 +1,202 @@
+---
+title: 异常处理
+order: 7
+description: try/catch/finally、checked vs unchecked、throw/throws、自定义异常
+---
+
+# 异常处理
+
+Java 把异常分为两大类：
+- **Checked Exception**：编译期必须处理（IOException、SQLException）
+- **Unchecked Exception**：运行时异常，继承 `RuntimeException`（NullPointerException、IndexOutOfBoundsException）
+
+## 1. 基本 try/catch
+
+<Playground
+  language="java"
+  id="java-07-try"
+  title="基本捕获"
+  code={`public class Main {
+    public static void main(String[] args) {
+        try {
+            int n = Integer.parseInt("abc");
+            System.out.println(n);
+        } catch (NumberFormatException e) {
+            System.out.println("捕获：" + e.getMessage());
+        } finally {
+            System.out.println("无论如何都执行");
+        }
+    }
+}`}
+  expectedOutput={`捕获：For input string: 'abc'\n无论如何都执行`}
+/>
+
+## 2. 多 catch
+
+<Playground
+  language="java"
+  id="java-07-multicatch"
+  title="多 catch"
+  code={`public class Main {
+    public static void main(String[] args) {
+        String[] tests = {"42", "abc", null, "3.14"};
+        for (String s : tests) {
+            try {
+                int n = Integer.parseInt(s);
+                System.out.println(s + " -> " + n);
+            } catch (NumberFormatException e) {
+                System.out.println(s + " 不是整数");
+            } catch (NullPointerException e) {
+                System.out.println("输入为 null");
+            }
+        }
+    }
+}`}
+  expectedOutput={`42 -> 42\nabc 不是整数\n输入为 null\n3.14 不是整数`}
+/>
+
+<Callout type="tip" title="Java 7+ 多异常合并">
+```java
+try { ... }
+catch (IOException | SQLException e) { ... }
+```
+注意：合并的异常类型不能有继承关系。
+</Callout>
+
+## 3. `throw` 与 `throws`
+
+<Playground
+  language="java"
+  id="java-07-throw"
+  title="throw 与 throws"
+  code={`import java.io.IOException;
+
+public class Main {
+    // throws 声明可能抛 checked 异常
+    static String readFirst(String[] arr) throws IOException {
+        if (arr == null || arr.length == 0) {
+            throw new IOException("数组为空");
+        }
+        return arr[0];
+    }
+
+    public static void main(String[] args) {
+        try {
+            System.out.println(readFirst(new String[]{"hello", "world"}));
+            System.out.println(readFirst(new String[]{}));
+        } catch (IOException e) {
+            System.out.println("IO 错误：" + e.getMessage());
+        }
+    }
+}`}
+  expectedOutput={`hello\nIO 错误：数组为空`}
+/>
+
+## 4. try-with-resources（推荐）
+
+自动关闭实现了 `AutoCloseable` 的资源（流、连接等）。
+
+<Playground
+  language="java"
+  id="java-07-twr"
+  title="try-with-resources"
+  code={`import java.io.*;
+
+public class Main {
+    public static void main(String[] args) throws IOException {
+        // 等价于 try + finally close，但更简洁
+        try (var br = new BufferedReader(new StringReader("line1\nline2\nline3"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                System.out.println("读取: " + line);
+            }
+        }  // 自动调用 br.close()
+    }
+}`}
+  expectedOutput={`读取: line1\n读取: line2\n读取: line3`}
+/>
+
+## 5. 自定义异常
+
+<Playground
+  language="java"
+  id="java-07-custom"
+  title="自定义异常"
+  code={`public class Main {
+    static class InsufficientFundsException extends Exception {
+        private final double balance;
+        private final double amount;
+        InsufficientFundsException(double balance, double amount) {
+            super(String.format("余额 %.2f，尝试取款 %.2f", balance, amount));
+            this.balance = balance;
+            this.amount = amount;
+        }
+        public double getBalance() { return balance; }
+        public double getAmount() { return amount; }
+    }
+
+    static void withdraw(double balance, double amount) throws InsufficientFundsException {
+        if (amount > balance) throw new InsufficientFundsException(balance, amount);
+        System.out.printf("取款 %.2f 成功，余额 %.2f%n", amount, balance - amount);
+    }
+
+    public static void main(String[] args) {
+        try {
+            withdraw(100, 200);
+        } catch (InsufficientFundsException e) {
+            System.out.println("失败：" + e.getMessage());
+        }
+    }
+}`}
+  expectedOutput={`失败：余额 100.00，尝试取款 200.00`}
+/>
+
+## 6. 常见异常一览
+
+| 异常 | 类型 | 触发 |
+|---|---|---|
+| `NullPointerException` | unchecked | 访问 `null` 引用 |
+| `ArrayIndexOutOfBoundsException` | unchecked | 数组越界 |
+| `NumberFormatException` | unchecked | 数字解析失败 |
+| `ArithmeticException` | unchecked | 除以 0 |
+| `ClassCastException` | unchecked | 类型转换失败 |
+| `IOException` | checked | I/O 错误 |
+| `FileNotFoundException` | checked | 文件不存在 |
+| `SQLException` | checked | SQL 错误 |
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-07-exercise"
+  title="健壮整数解析"
+  code={`// 任务：实现 safeParse(String s) -> OptionalInt
+// 解析成功返回包含值的 OptionalInt，失败返回 OptionalInt.empty()
+// 期望：safeParse("42")=OptionalInt[42], safeParse("abc")=OptionalInt.empty
+
+import java.util.OptionalInt;
+
+public class Main {
+    static OptionalInt safeParse(String s) {
+        // 补全代码
+        return OptionalInt.empty();
+    }
+
+    public static void main(String[] args) {
+        System.out.println(safeParse("42"));
+        System.out.println(safeParse("abc"));
+        System.out.println(safeParse(""));
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ `try/catch/finally` 捕获异常
+- ✅ `throw` 主动抛；`throws` 声明可能抛 checked 异常
+- ✅ try-with-resources 自动关闭资源
+- ✅ 自定义异常继承 `Exception`（checked）或 `RuntimeException`（unchecked）
+- ✅ 优先处理具体异常类型，不要 `catch (Exception e)` 吞所有
+
+下一章 **Lambda 与 Stream API**。

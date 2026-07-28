@@ -1,0 +1,217 @@
+---
+title: 数据结构
+order: 5
+description: 数组、切片、map、struct
+---
+
+# 数据结构
+
+Go 的数据结构非常务实：**数组、切片、map、结构体**四种就能应对绝大多数场景。
+
+## 1. 数组（Array）
+
+固定长度，**不常用**（实际开发多数用切片）。
+
+```go
+var a [3]int                 // [0, 0, 0]
+b := [3]int{1, 2, 3}         // 字面量
+c := [...]int{1, 2, 3, 4}    // 长度自动推断
+```
+
+## 2. 切片（Slice）
+
+切片是**对数组的引用**，长度可变。Go 中最常用的序列类型。
+
+```go
+s := []int{1, 2, 3}
+s = append(s, 4, 5)          // 追加
+fmt.Println(len(s), cap(s))  // 长度、容量
+s2 := s[1:4]                 // 切片 [1,4)
+```
+
+<Playground
+  language="go"
+  id="go-05-slice"
+  title="切片基本操作"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    s := []int{1, 2, 3}
+    s = append(s, 4, 5)
+    fmt.Println(s, "len:", len(s), "cap:", cap(s))
+
+    // 切片切片（左闭右开）
+    fmt.Println(s[1:3])  // [2 3]
+    fmt.Println(s[:2])   // [1 2]
+    fmt.Println(s[2:])   // [3 4 5]
+}`}
+  expectedOutput={`[1 2 3 4 5] len: 5 cap: 6\n[2 3]\n[1 2]\n[3 4 5]`}
+/>
+
+<Callout type="warn" title="append 可能生成新底层数组">
+`append` 在容量不足时会分配新数组。引用旧底层数组的切片不会受影响。
+</Callout>
+
+### `make` 创建切片
+
+<Playground
+  language="go"
+  id="go-05-make"
+  title="make 创建"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    s := make([]int, 0, 5)   // 长度 0，容量 5
+    for i := 1; i <= 5; i++ {
+        s = append(s, i*i)
+    }
+    fmt.Println(s)
+}`}
+  expectedOutput={`[1 4 9 16 25]`}
+/>
+
+## 3. `map`
+
+无序键值对。**引用类型**，零值是 `nil`（不可直接写入）。
+
+<Playground
+  language="go"
+  id="go-05-map"
+  title="map"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    m := map[string]int{
+        "Alice": 30,
+        "Bob":   25,
+    }
+    m["Carol"] = 28
+
+    // 访问不存在的键得到零值
+    fmt.Println(m["Dave"])     // 0
+    fmt.Println(m["Alice"])    // 30
+
+    // 用 ok 判断存在
+    if age, ok := m["Dave"]; ok {
+        fmt.Println("Dave:", age)
+    } else {
+        fmt.Println("Dave 不存在")
+    }
+
+    // 遍历
+    for k, v := range m {
+        fmt.Printf("%s: %d  ", k, v)
+    }
+    fmt.Println()
+
+    delete(m, "Bob")
+    fmt.Println("删除后：", len(m), "项")
+}`}
+  expectedOutput={`0\n30\nDave 不存在\nCarol: 28  Alice: 30  Bob: 25  \n删除后： 2 项`}
+/>
+
+## 4. 结构体（Struct）
+
+<Playground
+  language="go"
+  id="go-05-struct"
+  title="结构体"
+  code={`package main
+
+import "fmt"
+
+type User struct {
+    Name string
+    Age  int
+    Tags []string   // 引用类型
+}
+
+func main() {
+    u := User{Name: "Alice", Age: 30, Tags: []string{"vip"}}
+    fmt.Println(u)
+    fmt.Println(u.Name)
+
+    // 匿名结构体
+    p := struct {
+        X, Y int
+    }{3, 4}
+    fmt.Println(p)
+}`}
+  expectedOutput={`{Alice 30 [vip]}\nAlice\n{3 4}`}
+/>
+
+## 5. 实战：词频统计
+
+<Playground
+  language="go"
+  id="go-05-wordcount"
+  title="词频统计"
+  code={`package main
+
+import (
+    "fmt"
+    "sort"
+    "strings"
+)
+
+func main() {
+    text := "the quick brown fox jumps over the lazy dog the"
+    words := strings.Fields(text)
+    freq := make(map[string]int)
+    for _, w := range words {
+        freq[w]++
+    }
+
+    // 按词频倒序
+    type kv struct{ Key string; Count int }
+    ss := make([]kv, 0, len(freq))
+    for k, v := range freq {
+        ss = append(ss, kv{k, v})
+    }
+    sort.Slice(ss, func(i, j int) bool {
+        return ss[i].Count > ss[j].Count
+    })
+
+    for _, p := range ss {
+        fmt.Printf("%-6s %d\\n", p.Key, p.Count)
+    }
+}`}
+  expectedOutput={`the    3\nquick  1\nbrown  1\nfox    1\njumps  1\nover   1\nlazy   1\ndog    1`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-05-exercise"
+  title="去重并保序"
+  code={`// 任务：给定 nums := []int{3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5}
+// 输出 []int{3, 1, 4, 5, 9, 2, 6}（保序去重）
+
+package main
+
+import "fmt"
+
+func main() {
+    nums := []int{3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5}
+    // 补全代码
+}
+`}
+/>
+
+## 小结
+
+- ✅ 数组固定长度，少用
+- ✅ 切片是数组的引用视图，是日常主力
+- ✅ `make([]T, len, cap)` 创建；`append` 动态增长
+- ✅ `map[K]V` 是哈希表引用；零值 `nil` 不可写
+- ✅ `struct` 把字段聚合在一起
+- ✅ 引用类型（slice/map/指针）零值小心
+
+下一章 **包与模块**。

@@ -1,0 +1,177 @@
+---
+title: 文件 I/O
+order: 8
+description: open 模式、with 语句、read/write、JSON 与 CSV
+---
+
+# 文件 I/O
+
+## 1. `open` 模式
+
+| 模式 | 含义 |
+|---|---|
+| `"r"` | 只读（默认） |
+| `"w"` | 写入（清空原内容） |
+| `"a"` | 追加 |
+| `"x"` | 排他创建（已存在则失败） |
+| `"b"` | 二进制（如 `"rb"`、`"wb"`） |
+| `"t"` | 文本（默认） |
+
+## 2. `with` 语句（推荐）
+
+`with` 会在代码块结束时**自动关闭文件**，即使中间发生异常。
+
+<Playground
+  language="python"
+  id="py-08-with"
+  title="with 写入与读取"
+  code={`# 写入
+with open("/tmp/hello.txt", "w", encoding="utf-8") as f:
+    f.write("第一行\\n")
+    f.write("第二行\\n")
+
+# 读取
+with open("/tmp/hello.txt", "r", encoding="utf-8") as f:
+    print(f.read())`}
+  expectedOutput={`第一行\n第二行\n`}
+/>
+
+<Callout type="warn" title="总是指定 encoding">
+跨平台文件读取务必带 `encoding="utf-8"`，否则 Windows 默认 GBK 会让中文乱码。
+</Callout>
+
+## 3. 多种读取方式
+
+<Playground
+  language="python"
+  id="py-08-read"
+  title="read / readline / readlines"
+  code={`with open("/tmp/poem.txt", "w", encoding="utf-8") as f:
+    f.write("床前明月光\\n疑是地上霜\\n举头望明月\\n低头思故乡\\n")
+
+with open("/tmp/poem.txt", encoding="utf-8") as f:
+    print("--- read() ---")
+    print(f.read())
+
+with open("/tmp/poem.txt", encoding="utf-8") as f:
+    print("--- readline() ---")
+    print(f.readline(), end="")
+    print(f.readline(), end="")
+
+with open("/tmp/poem.txt", encoding="utf-8") as f:
+    print("--- readlines() ---")
+    print(f.readlines())`}
+  expectedOutput={`--- read() ---\n床前明月光\n疑是地上霜\n举头望明月\n低头思故乡\n\n--- readline() ---\n床前明月光\n疑是地上霜\n\n--- readlines() ---\n['床前明月光\\n', '疑是地上霜\\n', '举头望明月\\n', '低头思故乡\\n']`}
+/>
+
+## 4. JSON 读写
+
+<Playground
+  language="python"
+  id="py-08-json"
+  title="JSON 序列化"
+  code={`import json
+
+data = {
+    "name": "Alice",
+    "age": 30,
+    "skills": ["Python", "Go", "Java"]
+}
+
+# 写入
+with open("/tmp/user.json", "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+
+# 读取
+with open("/tmp/user.json", encoding="utf-8") as f:
+    loaded = json.load(f)
+    print(loaded)
+    print(type(loaded["skills"]), loaded["skills"])`}
+  expectedOutput={`{'name': 'Alice', 'age': 30, 'skills': ['Python', 'Go', 'Java']}\n<class 'list'> ['Python', 'Go', 'Java']`}
+/>
+
+<Callout type="tip" title="ensure_ascii=False">
+默认 `json.dump` 会把中文转成 `\uXXXX`。设 `ensure_ascii=False` 保留中文字符。
+</Callout>
+
+## 5. CSV 读写
+
+<Playground
+  language="python"
+  id="py-08-csv"
+  title="CSV 读写"
+  code={`import csv
+
+# 写入
+rows = [
+    ["name", "age", "city"],
+    ["Alice", 30, "北京"],
+    ["Bob", 25, "上海"],
+]
+with open("/tmp/people.csv", "w", encoding="utf-8", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerows(rows)
+
+# 读取
+with open("/tmp/people.csv", encoding="utf-8", newline="") as f:
+    for row in csv.DictReader(f):
+        print(row)`}
+  expectedOutput={`{'name': 'Alice', 'age': '30', 'city': '北京'}\n{'name': 'Bob', 'age': '25', 'city': '上海'}`}
+/>
+
+## 6. 路径处理 `pathlib`
+
+<Playground
+  language="python"
+  id="py-08-pathlib"
+  title="pathlib"
+  code={`from pathlib import Path
+p = Path("/tmp") / "subdir" / "file.txt"
+print(p)
+print(p.name, p.suffix, p.parent)
+
+# 创建目录
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text("hello", encoding="utf-8")
+print(p.exists(), p.read_text(encoding="utf-8"))`}
+  expectedOutput={`/tmp/subdir/file.txt\nfile.txt .txt /tmp/subdir\nTrue hello`}
+/>
+
+## 🎯 综合实战
+
+<Playground
+  language="python"
+  id="py-08-project"
+  title="学生成绩单"
+  code={`import json
+from pathlib import Path
+
+# 准备数据
+students = [
+    {"name": "Alice", "scores": [85, 92, 78]},
+    {"name": "Bob",   "scores": [90, 88, 95]},
+    {"name": "Carol", "scores": [76, 82, 80]},
+]
+
+# 写入 JSON
+p = Path("/tmp/scores.json")
+p.write_text(json.dumps(students, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# 读取并计算平均分
+data = json.loads(p.read_text(encoding="utf-8"))
+for s in data:
+    avg = sum(s["scores"]) / len(s["scores"])
+    print(f"{s['name']}: 平均 {avg:.1f}")`}
+  expectedOutput={`Alice: 平均 85.0\nBob: 平均 91.0\nCarol: 平均 79.3`}
+/>
+
+## 小结
+
+- ✅ `open(path, mode, encoding="utf-8")` 打开文件
+- ✅ `with` 自动关闭
+- ✅ `read() / readline() / readlines()` 多种读法
+- ✅ `json.dump/load` 处理 JSON
+- ✅ `csv.writer / DictReader` 处理 CSV
+- ✅ `pathlib.Path` 面向对象地处理路径
+
+🎉 **Python 8 章完结**！你已掌握 Python 的核心语法与常用库。接下来进入 **Go** 语言的学习。

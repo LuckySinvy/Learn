@@ -1,0 +1,272 @@
+---
+title: 泛型
+order: 10
+description: 泛型类、泛型方法、受限类型参数、通配符 ? extends/super、类型擦除
+---
+
+# 泛型
+
+Java 5 引入的**泛型**（Generics）让类、接口、方法可以参数化**类型**。它是集合类型安全的基石，也是阅读主流框架代码的必修课。
+
+## 1. 为什么需要泛型
+
+没有泛型时，我们用 `Object` 装任何类型，存取都要强转——又丑又容易 `ClassCastException`。
+
+```java
+// 没有泛型的世界
+List list = new ArrayList();
+list.add("hello");
+Integer n = (Integer) list.get(0);   // 运行时 ClassCastException
+```
+
+泛型把类型错误**前移到编译期**。
+
+## 2. 泛型类
+
+类名后用 `<T>` 声明一个或多个类型参数。`T` 是惯例字母（`T` / `K` / `V` / `E`），你可以用任何标识符。
+
+<Playground
+  language="java"
+  id="java-10-class"
+  title="泛型类 Box"
+  code={`public class Main {
+    static class Box<T> {
+        private T value;
+        void put(T v) { this.value = v; }
+        T get() { return value; }
+        boolean isEmpty() { return value == null; }
+    }
+
+    public static void main(String[] args) {
+        Box<String>  sb = new Box<>();
+        sb.put("hi");
+        // sb.put(123);   // 编译错误：类型不匹配
+        System.out.println("String box: " + sb.get());
+
+        Box<Integer> ib = new Box<>();
+        ib.put(42);
+        System.out.println("Integer box: " + ib.get());
+
+        Box<Double>  db = new Box<>();
+        System.out.println("Empty? " + db.isEmpty());
+    }
+}`}
+  expectedOutput={`String box: hi\nInteger box: 42\nEmpty? true`}
+/>
+
+## 3. 泛型方法
+
+方法自己声明类型参数，放在**返回类型之前**。
+
+<Playground
+  language="java"
+  id="java-10-method"
+  title="泛型方法"
+  code={`import java.util.*;
+import java.util.stream.*;
+
+public class Main {
+    // 泛型方法：把数组转成 List
+    static <T> List<T> fromArray(T[] arr) {
+        return Arrays.stream(arr).collect(Collectors.toList());
+    }
+
+    // 两个参数的类型可以不同
+    static <K, V> Map<K, V> pair(K k, V v) {
+        Map<K, V> m = new HashMap<>();
+        m.put(k, v);
+        return m;
+    }
+
+    public static void main(String[] args) {
+        String[] langs = {"Java", "Go", "Rust"};
+        List<Integer> lens = fromArray(langs).stream()
+                                           .map(String::length)
+                                           .collect(Collectors.toList());
+        System.out.println("lens = " + lens);
+
+        Map<String, Integer> m = pair("age", 18);
+        System.out.println("pair = " + m);
+    }
+}`}
+  expectedOutput={`lens = [4, 2, 4]\npair = {age=18}`}
+/>
+
+## 4. 受限类型参数 `Bounded`
+
+用 `extends` 限制类型参数**必须是某类的子类**。
+
+<Playground
+  language="java"
+  id="java-10-bounded"
+  title="受限类型"
+  code={`public class Main {
+    // 必须是 Number 的子类（Integer, Double, Long...）
+    static <T extends Number> double sum(List<T> nums) {
+        double s = 0;
+        for (T n : nums) s += n.doubleValue();
+        return s;
+    }
+
+    // 多重限制：必须是 A 且 B
+    static <T extends Number & Comparable<T>> T maxOf(List<T> list) {
+        T best = list.get(0);
+        for (T t : list) if (t.compareTo(best) > 0) best = t;
+        return best;
+    }
+
+    public static void main(String[] args) {
+        System.out.println("sum = " + sum(List.of(1, 2.5, 3L)));   // 6.5
+        System.out.println("max = " + maxOf(List.of(3, 1, 4, 1, 5, 9, 2, 6)));
+    }
+}`}
+  expectedOutput={`sum = 6.5\nmax = 9`}
+/>
+
+## 5. 通配符 `?`
+
+通配符表示「未知类型」，常用于**读取**或**写入**场景：
+
+- `?` 任意类型
+- `? extends T` 上界——T 或子类（适合**只读**）
+- `? super T` 下界——T 或父类（适合**只写**）
+
+<Playground
+  language="java"
+  id="java-10-wildcard"
+  title="通配符"
+  code={`import java.util.*;
+
+public class Main {
+    // 只读：传入任何 Number 子类的 List
+    static double total(List<? extends Number> list) {
+        double s = 0;
+        for (Number n : list) s += n.doubleValue();
+        return s;
+    }
+
+    // 只写：把 Integer 放进任何 Integer 父类的 List
+    static void addInts(List<? super Integer> sink) {
+        sink.add(1);
+        sink.add(2);
+        sink.add(3);
+    }
+
+    public static void main(String[] args) {
+        List<Integer> ints = List.of(10, 20, 30);
+        List<Double>  dbls = List.of(1.5, 2.5);
+        System.out.println("ints total = " + total(ints));
+        System.out.println("dbls total = " + total(dbls));
+
+        List<Number> nums = new ArrayList<>();
+        addInts(nums);
+        System.out.println("after addInts = " + nums);
+    }
+}`}
+  expectedOutput={`ints total = 60.0\ndbls total = 4.0\nafter addInts = [1, 2, 3]`}
+/>
+
+<Callout type="tip" title="PECS 原则">
+**P**roducer **E**xtends, **C**onsumer **S**uper：
+- 数据从集合「**流出**」用 `? extends T`（生产者）
+- 数据向集合「**流入**」用 `? super T`（消费者）
+
+Collections.copy(dest, src) 就是经典案例：`dest` 用 `super`，`src` 用 `extends`。
+</Callout>
+
+## 6. 类型擦除（Type Erasure）
+
+泛型只在**编译期**存在。编译后，`Box<String>` 和 `Box<Integer>` 都会被擦成 `Box`，类型参数替换为 `Object`（或上界）。这是 Java 选择「伪泛型」的代价。
+
+```java
+// 编译前
+Box<String>  b1 = new Box<>();
+Box<Integer> b2 = new Box<>();
+b1.put("hi");
+
+// 编译后（字节码层面）
+Box b1 = new Box();
+Box b2 = new Box();
+b1.put((String) "hi");
+```
+
+<Callout type="warn" title="擦除带来的限制">
+- 不能 `new T()`：`T` 运行时不存在
+- 不能 `instanceof List<String>`：运行时只剩 `List`
+- 不能创建**参数化类型**数组：`new List<String>[10]` ❌，但 `new List<?>[10]` ✅
+- 静态字段不能在泛型类里使用类型参数
+</Callout>
+
+## 7. 实战：泛型栈
+
+<Playground
+  language="java"
+  id="java-10-stack"
+  title="泛型栈"
+  code={`import java.util.*;
+
+public class Main {
+    static class Stack<T> {
+        private final ArrayDeque<T> data = new ArrayDeque<>();
+        void push(T v) { data.push(v); }
+        T pop() { return data.pop(); }
+        T peek() { return data.peek(); }
+        boolean isEmpty() { return data.isEmpty(); }
+        int size() { return data.size(); }
+    }
+
+    public static void main(String[] args) {
+        Stack<Integer> s = new Stack<>();
+        for (int i = 1; i <= 5; i++) s.push(i * 10);
+        System.out.println("top = " + s.peek());
+        System.out.println("size = " + s.size());
+
+        while (!s.isEmpty()) {
+            System.out.print(s.pop() + " ");
+        }
+        System.out.println();
+    }
+}`}
+  expectedOutput={`top = 50\nsize = 5\n50 40 30 20 10 `}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-10-exercise"
+  title="泛型 Pair<K,V>"
+  code={`// 任务：实现一个不可变泛型 Pair<K,V>：
+//   - 构造器接收 k, v
+//   - k() / v() 访问器
+//   - 静态方法 of(k, v) 工厂
+//   - 实现 toString 返回 "Pair(k, v)"
+//   - 静态方法 swap(Pair<K,V>) 返回 Pair<V,K>
+// 期望输出：
+//   Pair(Alice, 30)
+//   Pair(30, Alice)
+
+public class Main {
+    record Pair<K, V>(K k, V v) {
+        // 补全：swap 静态方法
+    }
+
+    public static void main(String[] args) {
+        Pair<String, Integer> p = Pair.of("Alice", 30);
+        System.out.println(p);
+        System.out.println(Pair.swap(p));
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ 泛型把类型检查前移到编译期，避免 `ClassCastException`
+- ✅ 泛型类 `<T>`、泛型方法 `<T> ...`、菱形 `new ArrayList<>()`
+- ✅ `T extends Number` 限制上界；可多重限制
+- ✅ 通配符 `?` / `? extends T` / `? super T` —— PECS 原则
+- ✅ 类型擦除：`T` 在运行时是 `Object` 或上界
+- ✅ 不能 `new T()`、不能 `instanceof List<String>`
+
+下一章 **注解**：给代码贴「元数据标签」。

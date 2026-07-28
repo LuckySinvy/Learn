@@ -1,0 +1,173 @@
+---
+title: 流程控制
+order: 3
+description: if/elif/else、for/while 循环、break/continue
+---
+
+# 流程控制
+
+任何程序都可以分解为**顺序、选择、循环**三种结构。本章覆盖 Python 的 `if` 与 `for/while`。
+
+## 1. `if / elif / else`
+
+```python
+if 条件1:
+    ...
+elif 条件2:
+    ...
+else:
+    ...
+```
+
+<Playground
+  language="python"
+  id="py-03-if"
+  title="成绩分级"
+  code={`score = 85
+if score >= 90:
+    grade = "A"
+elif score >= 80:
+    grade = "B"
+elif score >= 70:
+    grade = "C"
+elif score >= 60:
+    grade = "D"
+else:
+    grade = "F"
+print(f"分数 {score} -> 等级 {grade}")`}
+  expectedOutput={`分数 85 -> 等级 B`}
+/>
+
+<Callout type="warn" title="缩进决定代码块">
+Python 用**缩进**表示代码块（4 空格或 1 Tab）。不要混用。
+</Callout>
+
+## 2. 三元表达式
+
+```python
+status = "成年人" if age >= 18 else "未成年"
+```
+
+<Playground
+  language="python"
+  id="py-03-ternary"
+  title="三元判断"
+  code={`age = 16
+status = "成年" if age >= 18 else "未成年"
+print(f"{age}岁 -> {status}")
+
+n = 7
+parity = "偶数" if n % 2 == 0 else "奇数"
+print(f"{n} 是{parity}")`}
+  expectedOutput={`16岁 -> 未成年\n7 是奇数`}
+/>
+
+## 3. `for` 循环
+
+`for x in 可迭代对象:` 是最常见的循环形式。
+
+<Playground
+  language="python"
+  id="py-03-for"
+  title="for 循环"
+  code={`# 遍历列表
+fruits = ["苹果", "香蕉", "橙子"]
+for f in fruits:
+    print(f"我喜欢{f}")
+
+# range 区间
+for i in range(5):           # 0,1,2,3,4
+    print(i, end=" ")
+print()
+
+for i in range(1, 10, 2):    # 1,3,5,7,9
+    print(i, end=" ")
+print()`}
+  expectedOutput={`我喜欢苹果\n我喜欢香蕉\n我喜欢橙子\n0 1 2 3 4 \n1 3 5 7 9 `}
+/>
+
+## 4. `while` 循环
+
+```python
+i = 0
+while i < 5:
+    print(i)
+    i += 1
+```
+
+<Playground
+  language="python"
+  id="py-03-while"
+  title="while 累加"
+  code={`# 1+2+...+100
+s = 0
+i = 1
+while i <= 100:
+    s += i
+    i += 1
+print("1 到 100 之和 =", s)`}
+  expectedOutput={`1 到 100 之和 = 5050`}
+/>
+
+## 5. `break` 与 `continue`
+
+- `break`：立即退出当前循环
+- `continue`：跳过本次迭代，进入下一次
+
+<Playground
+  language="python"
+  id="py-03-break-continue"
+  title="break 与 continue"
+  code={`# 找第一个能被 7 整除的数
+for n in range(1, 100):
+    if n % 7 == 0:
+        print("找到：", n)
+        break
+
+# 跳过偶数
+for n in range(1, 11):
+    if n % 2 == 0:
+        continue
+    print(n, end=" ")
+print()`}
+  expectedOutput={`找到： 7\n1 3 5 7 9 `}
+/>
+
+## 6. 实战：九九乘法表
+
+<Playground
+  language="python"
+  id="py-03-99"
+  title="九九乘法表"
+  code={`for i in range(1, 10):
+    for j in range(1, i + 1):
+        print(f"{j}*{i}={i*j}", end="\\t")
+    print()`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="python"
+  id="py-03-exercise"
+  title="素数判定"
+  code={`# 任务：判断用户输入的数字 n 是否为素数，输出 "是素数" 或 "不是素数"
+# 提示：从 2 遍历到 sqrt(n)，如果有能整除的就不是素数
+# 期望：输入 17 -> 是素数；输入 18 -> 不是素数
+
+import math
+n = int(input("请输入一个正整数："))
+# 补全代码
+`}
+/>
+
+## 小结
+
+- ✅ `if/elif/else` 进行条件分支
+- ✅ `for x in iterable` 遍历可迭代对象
+- ✅ `while 条件:` 条件循环
+- ✅ `break` 退出循环；`continue` 跳过本轮
+- ✅ `range(start, stop, step)` 生成整数序列
+- ✅ 用 4 空格缩进表示代码块
+
+下一章 **函数**：把可复用的逻辑封装成 `def`。

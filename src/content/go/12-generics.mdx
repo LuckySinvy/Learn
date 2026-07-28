@@ -1,0 +1,367 @@
+---
+title: 泛型
+order: 12
+description: 类型参数、约束、类型集、自定义泛型类型
+---
+
+# 泛型
+
+Go 1.18 起支持泛型（Generics）。泛型让"适用于多种类型的算法"不用再做类型断言或 `interface{}` 转换。
+
+## 1. 第一个泛型函数
+
+<Playground
+  language="go"
+  id="go-12-generic-func"
+  title="泛型 Min"
+  code={`package main
+
+import "fmt"
+
+// T 必须是可比较类型（comparable）
+func Min[T int | float64 | string](a, b T) T {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+func main() {
+    fmt.Println(Min(3, 5))          // int
+    fmt.Println(Min(3.14, 2.71))    // float64
+    fmt.Println(Min("go", "rust"))  // string
+}`}
+  expectedOutput={`3
+2.71
+go`}
+/>
+
+<Callout type="info" title="语法说明">
+`[T int | float64 | string]` 是**类型参数列表**。`T` 称为类型形参；`int | float64 | string` 称为**类型约束**。
+</Callout>
+
+## 2. 约束（Constraint）
+
+约束指定类型形参**必须满足的条件**（即允许哪些类型）。
+
+### 内置约束
+
+- `any`：等价于 `interface{}`，所有类型
+- `comparable`：支持 `==` 和 `!=` 的类型（map 的 key 必须如此）
+
+<Playground
+  language="go"
+  id="go-12-comparable"
+  title="comparable 约束"
+  code={`package main
+
+import "fmt"
+
+// Index 返回 v 在 s 中的下标，找不到返回 -1
+// comparable 用于 == 比较
+func Index[T comparable](s []T, v T) int {
+    for i, x := range s {
+        if x == v {
+            return i
+        }
+    }
+    return -1
+}
+
+func main() {
+    fmt.Println(Index([]int{10, 20, 30}, 20))
+    fmt.Println(Index([]string{"a", "b", "c"}, "d"))
+}`}
+  expectedOutput={`1
+-1`}
+/>
+
+### 自定义约束：用接口
+
+Go 1.18 起，接口可以**包含任意类型**（不只有方法），称为"类型集"。
+
+<Playground
+  language="go"
+  id="go-12-constraint"
+  title="自定义 Number 约束"
+  code={`package main
+
+import "fmt"
+
+// Number 是约束：所有数值类型
+type Number interface {
+    int | int32 | int64 | float32 | float64
+}
+
+func Sum[T Number](nums []T) T {
+    var s T
+    for _, n := range nums {
+        s += n
+    }
+    return s
+}
+
+func main() {
+    fmt.Println(Sum([]int{1, 2, 3, 4, 5}))
+    fmt.Println(Sum([]float64{1.1, 2.2, 3.3}))
+}`}
+  expectedOutput={`15
+6.6`}
+/>
+
+### `~` 符号：底层类型
+
+`~T` 表示"所有底层类型是 T 的类型"，包括自定义类型。
+
+<Playground
+  language="go"
+  id="go-12-tilde"
+  title="~T 底层类型"
+  code={`package main
+
+import "fmt"
+
+type MyInt int   // 底层类型是 int
+
+// 有 ~int 才能让 MyInt 通过约束
+type Integer interface {
+    ~int | ~int32
+}
+
+func Double[T Integer](x T) T {
+    return x * 2
+}
+
+func main() {
+    fmt.Println(Double(21))
+    fmt.Println(Double(MyInt(5)))
+}`}
+  expectedOutput={`42
+10`}
+/>
+
+<Callout type="warn" title="没加 ~ 会怎样">
+没有 `~` 时，自定义类型 `MyInt` **不**满足 `int` 约束。给约束加 `~` 是写泛型时的常见需求。
+</Callout>
+
+## 3. 多类型参数
+
+<Playground
+  language="go"
+  id="go-12-multi"
+  title="Map 函数"
+  code={`package main
+
+import "fmt"
+
+// Map 把 []T 转成 []U，转换规则由 f 提供
+func Map[T, U any](s []T, f func(T) U) []U {
+    out := make([]U, len(s))
+    for i, v := range s {
+        out[i] = f(v)
+    }
+    return out
+}
+
+func main() {
+    nums := []int{1, 2, 3}
+    strs := Map(nums, func(n int) string {
+        return fmt.Sprintf("#%d", n)
+    })
+    fmt.Println(strs)
+
+    lens := Map([]string{"go", "rust", "ts"}, func(s string) int {
+        return len(s)
+    })
+    fmt.Println(lens)
+}`}
+  expectedOutput={`[#1 #2 #3]
+[2 4 2]`}
+/>
+
+## 4. 泛型类型
+
+类型本身也可以带类型参数。
+
+<Playground
+  language="go"
+  id="go-12-stack"
+  title="泛型 Stack"
+  code={`package main
+
+import "fmt"
+
+type Stack[T any] struct {
+    data []T
+}
+
+func (s *Stack[T]) Push(v T) {
+    s.data = append(s.data, v)
+}
+
+func (s *Stack[T]) Pop() (T, bool) {
+    n := len(s.data)
+    if n == 0 {
+        var zero T
+        return zero, false
+    }
+    v := s.data[n-1]
+    s.data = s.data[:n-1]
+    return v, true
+}
+
+func main() {
+    intStack := &Stack[int]{}
+    intStack.Push(1)
+    intStack.Push(2)
+    intStack.Push(3)
+    for {
+        v, ok := intStack.Pop()
+        if !ok { break }
+        fmt.Println(v)
+    }
+}`}
+  expectedOutput={`3
+2
+1`}
+/>
+
+## 5. 标准库的泛型函数
+
+`golang.org/x/exp/slices`、`maps` 提供大量泛型工具。
+
+<Playground
+  language="go"
+  id="go-12-slices"
+  title="标准库 slices"
+  code={`package main
+
+import (
+    "fmt"
+    "slices"
+)
+
+func main() {
+    // 判断相等
+    fmt.Println(slices.Equal([]int{1, 2, 3}, []int{1, 2, 3}))
+
+    // 包含
+    fmt.Println(slices.Contains([]string{"a", "b", "c"}, "b"))
+
+    // 排序
+    nums := []int{3, 1, 4, 1, 5, 9, 2, 6}
+    slices.Sort(nums)
+    fmt.Println(nums)
+
+    // 去重（已排序）
+    uniq := slices.Compact(nums)
+    fmt.Println(uniq)
+}`}
+  expectedOutput={`true
+true
+[1 1 2 3 4 5 6 9]
+[1 2 3 4 5 6 9]`}
+/>
+
+<Callout type="info" title="Go 1.21+">
+Go 1.21 把 `slices`、`maps` 提升到标准库（`slices` 之前在 `golang.org/x/exp/slices`）。`cmp.Ordered`、`cmp.Compare` 也很常用。
+</Callout>
+
+## 6. 实战：泛型 Set
+
+<Playground
+  language="go"
+  id="go-12-set"
+  title="泛型 Set"
+  code={`package main
+
+import "fmt"
+
+type Set[T comparable] map[T]struct{}
+
+func NewSet[T comparable](items ...T) Set[T] {
+    s := make(Set[T])
+    for _, v := range items {
+        s[v] = struct{}{}
+    }
+    return s
+}
+
+func (s Set[T]) Add(v T)        { s[v] = struct{}{} }
+func (s Set[T]) Has(v T) bool   { _, ok := s[v]; return ok }
+func (s Set[T]) Delete(v T)     { delete(s, v) }
+func (s Set[T]) Size() int      { return len(s) }
+
+func main() {
+    s := NewSet("apple", "banana", "cherry")
+    fmt.Println("apple:", s.Has("apple"))
+    fmt.Println("grape:", s.Has("grape"))
+    s.Add("grape")
+    fmt.Println("size:", s.Size())
+}`}
+  expectedOutput={`apple: true
+grape: false
+size: 4`}
+/>
+
+<Callout type="tip" title="什么时候用泛型">
+- ✅ 类型无关的容器（Stack、Set、Map、Tree）
+- ✅ 通用算法（Filter、Map、Reduce、Sort）
+- ❌ 业务类型——写具体类型，文档和 IDE 提示更友好
+- ❌ 没必要"为了泛型而泛型"——大多数函数有明确类型就够
+</Callout>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-12-exercise"
+  title="泛型 Filter"
+  code={`// 任务：实现泛型 Filter 函数
+// 签名：func Filter[T any](s []T, pred func(T) bool) []T
+// 保留满足 pred 的元素
+//
+// 测试：
+//   Filter([]int{1,2,3,4,5}, func(n int) bool { return n%2==0 })
+//   应该得到 [2, 4]
+//   Filter([]string{"go", "rust", "ts"}, func(s string) bool { return len(s)>2 })
+//   应该得到 ["rust"]
+
+package main
+
+import "fmt"
+
+func Filter[T any](s []T, pred func(T) bool) []T {
+    out := make([]T, 0, len(s))
+    for _, v := range s {
+        if pred(v) {
+            out = append(out, v)
+        }
+    }
+    return out
+}
+
+func main() {
+    evens := Filter([]int{1, 2, 3, 4, 5}, func(n int) bool { return n%2 == 0 })
+    fmt.Println(evens)
+
+    long := Filter([]string{"go", "rust", "ts"}, func(s string) bool { return len(s) > 2 })
+    fmt.Println(long)
+}
+`}
+  expectedOutput={`[2 4]
+[rust]`}
+/>
+
+## 小结
+
+- ✅ 泛型让代码适用于多种类型而无需断言
+- ✅ `[T Constraint]` 定义类型参数；约束用 `|` 列类型
+- ✅ `comparable`、`any` 是内置约束
+- ✅ `~T` 表示底层类型为 T
+- ✅ 接口可作约束（包含方法或类型）
+- ✅ 泛型函数、泛型类型都可定义
+- ✅ `slices` 包提供开箱即用的泛型工具
+- ✅ 业务类型优先具体类型；容器/算法才用泛型
+
+下一章 **Context**。

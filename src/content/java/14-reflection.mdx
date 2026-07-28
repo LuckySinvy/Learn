@@ -1,0 +1,312 @@
+---
+title: 反射
+order: 14
+description: Class 对象、字段/方法/构造器、动态调用、动态代理 Proxy
+---
+
+# 反射
+
+**反射**（Reflection）让程序在**运行期**检视类的结构、动态创建对象、调用方法、读写字段。它是 Spring/Jackson/JUnit 等框架的「魔法」之源。
+
+> **代价**：反射牺牲了编译期类型安全，性能略低（现代 JVM 已经优化得不错），可读性也更弱。能不用就不用；框架层是它的主战场。
+
+## 1. 三种获取 `Class` 对象的方式
+
+<Playground
+  language="java"
+  id="java-14-class"
+  title="Class 对象"
+  code={`import java.util.*;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        // 1. 类字面量
+        Class<String> c1 = String.class;
+
+        // 2. 对象.getClass()
+        Class<?> c2 = "hello".getClass();
+
+        // 3. Class.forName（动态加载）
+        Class<?> c3 = Class.forName("java.util.ArrayList");
+
+        System.out.println("c1 == c2 ? " + (c1 == c2));
+        System.out.println("c1 classLoader = " + c1.getClassLoader());
+        System.out.println("c3 simpleName   = " + c3.getSimpleName());
+        System.out.println("c3 isInterface? = " + c3.isInterface());
+    }
+}`}
+  expectedOutput={`c1 == c2 ? true\nc1 classLoader = null\nc3 simpleName   = ArrayList\nc3 isInterface? = true`}
+/>
+
+<Callout type="tip" title="基本类型与 void 的 Class">
+- `int.class` → `Class<Integer>` 的「类型对象」  
+- `void.class` → `Class<Void>`
+- `int[].class` ≠ `String[].class` → 都是数组 Class
+</Callout>
+
+## 2. 检视类的结构
+
+<Playground
+  language="java"
+  id="java-14-inspect"
+  title="检视字段/方法/构造器"
+  code={`import java.lang.reflect.*;
+import static java.lang.reflect.Modifier.*;
+
+public class Main {
+    static class User {
+        private final long id;
+        public String name;
+        protected int age;
+        static int count;
+        private String[] tags;
+
+        public User(long id) { this.id = id; }
+        public User(long id, String name) { this.id = id; this.name = name; }
+        public long getId()   { return id; }
+        public void setAge(int age) { this.age = age; }
+        private void secret() {}
+    }
+
+    public static void main(String[] args) {
+        Class<?> c = User.class;
+
+        System.out.println("== 字段 ==");
+        for (Field f : c.getDeclaredFields()) {
+            System.out.printf("  %s %s %s%n",
+                Modifier.toString(f.getModifiers()),
+                f.getType().getSimpleName(),
+                f.getName());
+        }
+
+        System.out.println("== 公有方法（不含 Object） ==");
+        for (Method m : c.getMethods()) {
+            if (m.getDeclaringClass() == Object.class) continue;
+            System.out.printf("  %s %s%n", m.getReturnType().getSimpleName(), m.getName());
+        }
+
+        System.out.println("== 构造器 ==");
+        for (Constructor<?> ctor : c.getDeclaredConstructors()) {
+            System.out.printf("  ctor(%d 参数)%n", ctor.getParameterCount());
+        }
+    }
+}`}
+  expectedOutput={`== 字段 ==\n  private final long id\n  public String name\n  protected int age\n  static int count\n  private String[] tags\n== 公有方法（不含 Object） ==\n  long getId\n  void setAge\n== 构造器 ==\n  ctor(1 参数)\n  ctor(2 参数)`}
+/>
+
+<Callout type="info" title="getXxx vs getDeclaredXxx">
+- `getFields()` / `getMethods()`：只看**公有 + 继承**来的
+- `getDeclaredFields()` / `getDeclaredMethods()`：看**本类声明的所有**（含 private），不含继承
+</Callout>
+
+## 3. 动态创建对象与读写字段
+
+<Playground
+  language="java"
+  id="java-14-invoke"
+  title="动态创建与字段读写"
+  code={`import java.lang.reflect.*;
+
+public class Main {
+    static class User {
+        public String name;
+        private int age;
+        public User() {}
+        public User(String name) { this.name = name; }
+        public void setAge(int age) { this.age = age; }
+        public int  getAge()        { return age; }
+        @Override public String toString() {
+            return "User(name=" + name + ", age=" + age + ")";
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Class<?> c = User.class;
+
+        // 1. 用无参构造器 newInstance
+        Object u1 = c.getDeclaredConstructor().newInstance();
+        System.out.println("u1 = " + u1);
+
+        // 2. 用有参构造器
+        Object u2 = c.getDeclaredConstructor(String.class).newInstance("Alice");
+        System.out.println("u2 = " + u2);
+
+        // 3. 改公有字段
+        Field nameF = c.getField("name");
+        nameF.set(u2, "Bob");
+        System.out.println("after set name = " + u2);
+
+        // 4. 改私有字段（需 setAccessible）
+        Field ageF = c.getDeclaredField("age");
+        ageF.setAccessible(true);
+        ageF.set(u2, 28);
+        System.out.println("after set age  = " + u2);
+
+        // 5. 调方法
+        Method hello = c.getMethod("setAge", int.class);
+        hello.invoke(u2, 99);
+        System.out.println("age = " + ((User) u2).getAge());
+    }
+}`}
+  expectedOutput={`u1 = User(name=null, age=0)\nu2 = User(name=Alice, age=0)\nafter set name = User(name=Bob, age=0)\nafter set age  = User(name=Bob, age=28)\nage = 99`}
+/>
+
+<Callout type="warn" title="Java 17+ 的访问警告">
+`setAccessible(true)` 在标准模块（`java.*`）上会抛 `InaccessibleObjectException`。
+业务类在自己模块里通常没问题；想调 JDK 内部需要 `--add-opens`。
+</Callout>
+
+## 4. 动态代理 `Proxy`
+
+JDK 自带的**动态代理**：在运行期为接口生成实现类，把所有方法调用转给 `InvocationHandler`。
+
+<Playground
+  language="java"
+  id="java-14-proxy"
+  title="动态代理"
+  code={`import java.lang.reflect.*;
+import java.util.*;
+
+public class Main {
+    interface Hello {
+        String say(String name);
+    }
+
+    static class HelloImpl implements Hello {
+        public String say(String name) { return "Hello, " + name; }
+    }
+
+    public static void main(String[] args) {
+        Hello real = new HelloImpl();
+        Hello proxy = (Hello) Proxy.newProxyInstance(
+            Hello.class.getClassLoader(),
+            new Class<?>[] { Hello.class },
+            (proxyObj, method, methodArgs) -> {
+                long t0 = System.nanoTime();
+                Object result = method.invoke(real, methodArgs);
+                long ns = System.nanoTime() - t0;
+                System.out.printf("[proxy] %s took %d ns%n", method.getName(), ns);
+                return result;
+            }
+        );
+
+        System.out.println(proxy.say("Alice"));
+        System.out.println(proxy.say("Bob"));
+    }
+}`}
+  expectedOutput={`[proxy] say took 很大数字 ns\nHello, Alice\n[proxy] say took 很大数字 ns\nHello, Bob`}
+/>
+
+<Callout type="info" title="代理能做什么">
+动态代理是 AOP 的基础——在不修改业务代码的前提下，**横向**插入日志、事务、权限、监控等切面。
+Spring AOP 默认就用 JDK 动态代理（前提是目标实现接口）。
+</Callout>
+
+## 5. 实战：迷你 JSON 序列化器
+
+<Playground
+  language="java"
+  id="java-14-json"
+  title="迷你 JSON 序列化"
+  code={`import java.lang.reflect.*;
+import java.util.*;
+import java.util.stream.*;
+
+public class Main {
+    static class User {
+        public String name = "Alice";
+        public int    age  = 30;
+        public boolean admin = true;
+        public String[] tags = { "vip", "beta" };
+        public List<String> skills = List.of("Java", "Kotlin");
+    }
+
+    static String toJson(Object obj) throws Exception {
+        Class<?> c = obj.getClass();
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Field f : c.getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers())) continue;
+            f.setAccessible(true);
+            Object v = f.get(obj);
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("\"").append(f.getName()).append("\":");
+            sb.append(valueToJson(v));
+        }
+        return sb.append("}").toString();
+    }
+
+    static String valueToJson(Object v) {
+        if (v == null)                  return "null";
+        if (v instanceof String)        return "\"" + v + "\"";
+        if (v instanceof Number || v instanceof Boolean) return v.toString();
+        if (v instanceof Object[]) {
+            return Arrays.stream((Object[]) v).map(Main::valueToJson)
+                        .collect(Collectors.joining(",", "[", "]"));
+        }
+        if (v instanceof Collection<?>) {
+            return ((Collection<?>) v).stream().map(Main::valueToJson)
+                        .collect(Collectors.joining(",", "[", "]"));
+        }
+        return "\"" + v + "\"";
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println(toJson(new User()));
+    }
+}`}
+  expectedOutput={`{"name":"Alice","age":30,"admin":true,"tags":["vip","beta"],"skills":["Java","Kotlin"]}`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-14-exercise"
+  title="BeanCopier"
+  code={`// 任务：实现一个工具方法 copyProperties(src, dest)，
+// 把 src 中所有 String/int 公有字段拷贝到 dest 的同名字段。
+// 期望输出：dest = User(name=Alice, age=30, role=admin)
+import java.lang.reflect.*;
+
+public class Main {
+    static class User {
+        public String name;
+        public int    age;
+        public String role;
+        @Override public String toString() {
+            return "User(name=" + name + ", age=" + age + ", role=" + role + ")";
+        }
+    }
+
+    static class UserDTO {
+        public String name;
+        public int    age;
+        public String role;
+        public String extra;   // 目标里多出来的字段，保持原样
+        @Override public String toString() {
+            return "User(name=" + name + ", age=" + age + ", role=" + role + ")";
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        User    src  = new User();   src.name = "Alice"; src.age = 30; src.role = "admin";
+        UserDTO dest = new UserDTO();
+        // 补全：调用你的 copyProperties
+        System.out.println("dest = " + dest);
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ 三种 `Class` 获取：`.class` / `getClass()` / `Class.forName()`
+- ✅ `getXxx` 看 public+继承；`getDeclaredXxx` 看本类所有
+- ✅ `Constructor.newInstance` / `Method.invoke` / `Field.set` 动态操作
+- ✅ `setAccessible(true)` 突破 private 限制（模块化下需 `--add-opens`）
+- ✅ `Proxy.newProxyInstance` + `InvocationHandler` = JDK 动态代理
+- ✅ 反射是框架（Spring/Jackson/Hibernate）的底层支撑
+
+下一章 **JVM 与 GC 基础**：理解 Java 程序运行时。

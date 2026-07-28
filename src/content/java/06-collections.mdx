@@ -1,0 +1,231 @@
+---
+title: 集合框架
+order: 6
+description: ArrayList、HashMap、HashSet、泛型基础、迭代
+---
+
+# 集合框架
+
+Java 的 `java.util` 包提供了丰富的集合类。本章覆盖最常用的 List、Set、Map。
+
+## 1. `ArrayList`
+
+可变长度的数组实现。
+
+<Playground
+  language="java"
+  id="java-06-list"
+  title="ArrayList"
+  code={`import java.util.ArrayList;
+import java.util.List;
+
+public class Main {
+    public static void main(String[] args) {
+        List<String> list = new ArrayList<>();
+        list.add("Java");
+        list.add("Python");
+        list.add("Go");
+        list.add(1, "TypeScript");   // 插入到索引 1
+
+        System.out.println("size: " + list.size());
+        System.out.println("get(0): " + list.get(0));
+        System.out.println("contains Go? " + list.contains("Go"));
+
+        for (String s : list) System.out.println("  " + s);
+
+        list.remove("Python");
+        System.out.println("remove 后: " + list);
+    }
+}`}
+  expectedOutput={`size: 4\nget(0): Java\ncontains Go? true\n  Java\n  TypeScript\n  Python\n  Go\nremove 后: [Java, TypeScript, Go]`}
+/>
+
+<Callout type="tip" title="接口 vs 实现">
+声明时用 `List<String>`，实现用 `new ArrayList<>()`，便于以后换 `LinkedList`。
+</Callout>
+
+## 2. `HashMap`
+
+键值对哈希表。
+
+<Playground
+  language="java"
+  id="java-06-map"
+  title="HashMap"
+  code={`import java.util.HashMap;
+import java.util.Map;
+
+public class Main {
+    public static void main(String[] args) {
+        Map<String, Integer> ages = new HashMap<>();
+        ages.put("Alice", 30);
+        ages.put("Bob", 25);
+        ages.put("Carol", 28);
+
+        System.out.println("Alice: " + ages.get("Alice"));
+        System.out.println("default: " + ages.getOrDefault("Dave", 0));
+
+        ages.put("Alice", 31);   // 覆盖
+        ages.putIfAbsent("Bob", 99);  // 不存在才放
+        System.out.println("Alice: " + ages.get("Alice"));
+        System.out.println("Bob: " + ages.get("Bob"));
+
+        for (var e : ages.entrySet()) {
+            System.out.printf("  %s -> %d%n", e.getKey(), e.getValue());
+        }
+    }
+}`}
+  expectedOutput={`Alice: 30\ndefault: 0\nAlice: 31\nBob: 25\n  Carol -> 28\n  Alice -> 31\n  Bob -> 25`}
+/>
+
+## 3. `HashSet`
+
+无序不重复。
+
+<Playground
+  language="java"
+  id="java-06-set"
+  title="HashSet"
+  code={`import java.util.HashSet;
+import java.util.Set;
+import java.util.TreeSet;
+
+public class Main {
+    public static void main(String[] args) {
+        Set<Integer> s = new HashSet<>();
+        s.add(3); s.add(1); s.add(3); s.add(2);
+        System.out.println("HashSet: " + s);
+
+        Set<Integer> ts = new TreeSet<>();
+        ts.add(3); ts.add(1); ts.add(3); ts.add(2);
+        System.out.println("TreeSet: " + ts);
+    }
+}`}
+  expectedOutput={`HashSet: [1, 2, 3]\nTreeSet: [1, 2, 3]`}
+/>
+
+## 4. 泛型基础
+
+泛型让集合在编译期就保证类型安全：
+
+```java
+List<String> list = new ArrayList<>();   // 只能放 String
+list.add(123);   // 编译错误
+```
+
+<Callout type="info" title="泛型三个要点">
+- 不指定泛型会出现「原始类型」警告
+- 菱形 `<>` 让编译器推断类型
+- 泛型只在编译期有效，运行时被擦除（type erasure）
+</Callout>
+
+## 5. 迭代
+
+<Playground
+  language="java"
+  id="java-06-iter"
+  title="三种迭代方式"
+  code={`import java.util.*;
+
+public class Main {
+    public static void main(String[] args) {
+        List<String> list = List.of("A", "B", "C");
+
+        // 1. for-each
+        for (String s : list) System.out.print(s + " ");
+        System.out.println();
+
+        // 2. Iterator
+        Iterator<String> it = list.iterator();
+        while (it.hasNext()) {
+            System.out.print(it.next() + " ");
+        }
+        System.out.println();
+
+        // 3. forEach + Lambda
+        list.forEach(s -> System.out.print(s + " "));
+        System.out.println();
+    }
+}`}
+  expectedOutput={`A B C \nA B C \nA B C `}
+/>
+
+## 6. 实战：学生成绩管理
+
+<Playground
+  language="java"
+  id="java-06-grade"
+  title="学生成绩管理"
+  code={`import java.util.*;
+
+public class Main {
+    static class Student {
+        String name;
+        Map<String, Integer> scores = new HashMap<>();
+        Student(String name) { this.name = name; }
+        void add(String course, int score) { scores.put(course, score); }
+        double average() {
+            return scores.values().stream()
+                         .mapToInt(Integer::intValue)
+                         .average()
+                         .orElse(0);
+        }
+        @Override public String toString() {
+            return String.format("%s 均分 %.1f", name, average());
+        }
+    }
+
+    public static void main(String[] args) {
+        Map<String, Student> db = new HashMap<>();
+        db.put("Alice", new Student("Alice"));
+        db.put("Bob", new Student("Bob"));
+
+        db.get("Alice").add("语文", 85);
+        db.get("Alice").add("数学", 92);
+        db.get("Bob").add("语文", 78);
+        db.get("Bob").add("数学", 88);
+
+        for (var s : db.values()) System.out.println(s);
+    }
+}`}
+  expectedOutput={`Bob 均分 83.0\nAlice 均分 88.5`}
+/>
+
+<Callout type="info" title="hashCode 与 equals">
+HashSet / HashMap 用对象的 `hashCode` 和 `equals` 决定位置和唯一性。自定义类要正确重写这两个方法，否则对象无法被正确识别为重复。
+</Callout>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-06-exercise"
+  title="词频统计"
+  code={`// 任务：统计一句话中每个单词出现的次数
+// 期望：Map<String, Integer>
+// 输入："the quick brown fox jumps over the lazy dog the"
+// 输出: {the=3, quick=1, brown=1, fox=1, jumps=1, over=1, lazy=1, dog=1}
+
+import java.util.*;
+
+public class Main {
+    public static void main(String[] args) {
+        String text = "the quick brown fox jumps over the lazy dog the";
+        String[] words = text.split(" ");
+        Map<String, Integer> freq = new HashMap<>();
+        // 补全代码
+        System.out.println(freq);
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ `ArrayList` 可变数组；`HashMap` 哈希表；`HashSet` 不重复集合
+- ✅ 优先用接口（`List`/`Map`/`Set`）声明
+- ✅ 泛型 `<T>` 保证编译期类型安全
+- ✅ 迭代：`for-each` / `Iterator` / `forEach(Lambda)`
+- ✅ 自定义类要正确重写 `equals` / `hashCode`
+
+下一章 **异常处理**。

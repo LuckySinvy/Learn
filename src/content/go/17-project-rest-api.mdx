@@ -1,0 +1,605 @@
+---
+title: 项目：REST API
+order: 17
+description: 完整 CRUD REST API，多文件项目 + 单文件可运行版
+---
+
+# 项目：REST API
+
+本节我们做一个**任务管理 REST API**：CRUD（增删改查） + JSON 通信。这是 Go 后端开发最常见的小服务结构。
+
+## 1. 项目结构
+
+```
+todo-api/
+├── main.go         # 入口，组装 mux 和 store
+├── models.go       # 数据结构
+├── store.go        # 内存存储（带锁）
+├── handlers.go     # HTTP handler
+└── handlers_test.go  # 单元测试
+```
+
+下面我们逐个写。
+
+## 2. `models.go`：领域模型
+
+```go
+package main
+
+import "time"
+
+type Task struct {
+    ID        int       `json:"id"`
+    Title     string    `json:"title"`
+    Done      bool      `json:"done"`
+    CreatedAt time.Time `json:"created_at"`
+}
+
+type CreateTaskRequest struct {
+    Title string `json:"title"`
+}
+
+type UpdateTaskRequest struct {
+    Title *string `json:"title,omitempty"`
+    Done  *bool   `json:"done,omitempty"`
+}
+```
+
+<Callout type="tip" title={`指针字段表达"可选"`}>
+`UpdateTaskRequest` 里 `Title *string`：指针能区分"未传"（nil）和"传了空串"（非 nil）。这是 JSON PATCH 风格更新的常见做法。
+</Callout>
+
+## 3. `store.go`：线程安全的内存存储
+
+```go
+package main
+
+import (
+    "errors"
+    "sync"
+    "time"
+)
+
+var ErrNotFound = errors.New("not found")
+
+type Store struct {
+    mu     sync.RWMutex
+    tasks  map[int]*Task
+    nextID int
+}
+
+func NewStore() *Store {
+    return &Store{tasks: make(map[int]*Task), nextID: 1}
+}
+
+func (s *Store) Create(title string) Task {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    t := &Task{
+        ID:        s.nextID,
+        Title:     title,
+        CreatedAt: time.Now(),
+    }
+    s.tasks[t.ID] = t
+    s.nextID++
+    return *t
+}
+
+func (s *Store) List() []Task {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    out := make([]Task, 0, len(s.tasks))
+    for _, t := range s.tasks {
+        out = append(out, *t)
+    }
+    return out
+}
+
+func (s *Store) Get(id int) (Task, error) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    t, ok := s.tasks[id]
+    if !ok {
+        return Task{}, ErrNotFound
+    }
+    return *t, nil
+}
+
+func (s *Store) Update(id int, req UpdateTaskRequest) (Task, error) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    t, ok := s.tasks[id]
+    if !ok {
+        return Task{}, ErrNotFound
+    }
+    if req.Title != nil {
+        t.Title = *req.Title
+    }
+    if req.Done != nil {
+        t.Done = *req.Done
+    }
+    return *t, nil
+}
+
+func (s *Store) Delete(id int) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if _, ok := s.tasks[id]; !ok {
+        return ErrNotFound
+    }
+    delete(s.tasks, id)
+    return nil
+}
+```
+
+<Callout type="info" title="为什么 RLock vs Lock">
+- `List`/`Get` 用 `RLock`：多个读并发没问题
+- `Create`/`Update`/`Delete` 用 `Lock`：写时互斥
+- 读写比例 100:1 时，`RWMutex` 性能明显更好
+</Callout>
+
+## 4. `handlers.go`：HTTP 层
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "net/http"
+    "strconv"
+)
+
+type Server struct {
+    store *Store
+}
+
+func NewServer(s *Store) *Server { return &Server{store: s} }
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(code)
+    json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, code int, msg string) {
+    writeJSON(w, code, map[string]string{"error": msg})
+}
+
+func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
+    writeJSON(w, http.StatusOK, s.store.List())
+}
+
+func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
+    var req CreateTaskRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        writeError(w, http.StatusBadRequest, err.Error())
+        return
+    }
+    if req.Title == "" {
+        writeError(w, http.StatusBadRequest, "title 不能为空")
+        return
+    }
+    writeJSON(w, http.StatusCreated, s.store.Create(req.Title))
+}
+
+func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
+    id, _ := strconv.Atoi(r.PathValue("id"))
+    t, err := s.store.Get(id)
+    if err != nil {
+        writeError(w, http.StatusNotFound, err.Error())
+        return
+    }
+    writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
+    id, _ := strconv.Atoi(r.PathValue("id"))
+    var req UpdateTaskRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        writeError(w, http.StatusBadRequest, err.Error())
+        return
+    }
+    t, err := s.store.Update(id, req)
+    if err != nil {
+        writeError(w, http.StatusNotFound, err.Error())
+        return
+    }
+    writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
+    id, _ := strconv.Atoi(r.PathValue("id"))
+    if err := s.store.Delete(id); err != nil {
+        writeError(w, http.StatusNotFound, err.Error())
+        return
+    }
+    w.WriteHeader(http.StatusNoContent)
+}
+```
+
+## 5. `main.go`：组装
+
+```go
+package main
+
+import (
+    "log"
+    "net/http"
+    "time"
+)
+
+func main() {
+    store := NewStore()
+    srv := NewServer(store)
+
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /api/tasks", srv.listTasks)
+    mux.HandleFunc("POST /api/tasks", srv.createTask)
+    mux.HandleFunc("GET /api/tasks/{id}", srv.getTask)
+    mux.HandleFunc("PUT /api/tasks/{id}", srv.updateTask)
+    mux.HandleFunc("DELETE /api/tasks/{id}", srv.deleteTask)
+
+    httpSrv := &http.Server{
+        Addr:         ":8080",
+        Handler:      mux,
+        ReadTimeout:  5 * time.Second,
+        WriteTimeout: 10 * time.Second,
+    }
+    log.Println("监听 :8080")
+    log.Fatal(httpSrv.ListenAndServe())
+}
+```
+
+<Callout type="tip" title="生产化要点">
+- 设置 `ReadTimeout`/`WriteTimeout`，防 Slowloris 攻击
+- 用 `&http.Server{}` 而不是直接 `ListenAndServe`，便于做 `Shutdown`
+- 错误返回结构化 JSON，不要直接 `http.Error`
+</Callout>
+
+## 6. 单文件可运行版（Playground）
+
+把上面四个文件合并到 `main.go`，并**用 `httptest` 演示**完整 CRUD 流程（沙盒里不能起长服务）。
+
+<Playground
+  language="go"
+  id="go-17-restapi"
+  title="单文件完整版：CRUD 演示"
+  code={`package main
+
+import (
+    "encoding/json"
+    "errors"
+    "fmt"
+    "io"
+    "net/http"
+    "net/http/httptest"
+    "strconv"
+    "strings"
+    "sync"
+    "time"
+)
+
+// ===== models =====
+type Task struct {
+    ID        int       \`json:"id"\`
+    Title     string    \`json:"title"\`
+    Done      bool      \`json:"done"\`
+    CreatedAt time.Time \`json:"created_at"\`
+}
+type CreateTaskRequest struct {
+    Title string \`json:"title"\`
+}
+type UpdateTaskRequest struct {
+    Title *string \`json:"title,omitempty"\`
+    Done  *bool   \`json:"done,omitempty"\`
+}
+
+// ===== store =====
+var ErrNotFound = errors.New("not found")
+
+type Store struct {
+    mu     sync.RWMutex
+    tasks  map[int]*Task
+    nextID int
+}
+func NewStore() *Store { return &Store{tasks: map[int]*Task{}, nextID: 1} }
+
+func (s *Store) Create(title string) Task {
+    s.mu.Lock(); defer s.mu.Unlock()
+    t := &Task{ID: s.nextID, Title: title, CreatedAt: time.Now()}
+    s.tasks[t.ID] = t; s.nextID++
+    return *t
+}
+func (s *Store) List() []Task {
+    s.mu.RLock(); defer s.mu.RUnlock()
+    out := make([]Task, 0, len(s.tasks))
+    for _, t := range s.tasks { out = append(out, *t) }
+    return out
+}
+func (s *Store) Get(id int) (Task, error) {
+    s.mu.RLock(); defer s.mu.RUnlock()
+    t, ok := s.tasks[id]
+    if !ok { return Task{}, ErrNotFound }
+    return *t, nil
+}
+func (s *Store) Update(id int, r UpdateTaskRequest) (Task, error) {
+    s.mu.Lock(); defer s.mu.Unlock()
+    t, ok := s.tasks[id]
+    if !ok { return Task{}, ErrNotFound }
+    if r.Title != nil { t.Title = *r.Title }
+    if r.Done  != nil { t.Done  = *r.Done  }
+    return *t, nil
+}
+func (s *Store) Delete(id int) error {
+    s.mu.Lock(); defer s.mu.Unlock()
+    if _, ok := s.tasks[id]; !ok { return ErrNotFound }
+    delete(s.tasks, id); return nil
+}
+
+// ===== server =====
+type Server struct{ store *Store }
+func NewServer(s *Store) *Server { return &Server{store: s} }
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(code); json.NewEncoder(w).Encode(v)
+}
+func writeError(w http.ResponseWriter, code int, m string) {
+    writeJSON(w, code, map[string]string{"error": m})
+}
+
+func (s *Server) listTasks(w http.ResponseWriter, r *http.Request)   { writeJSON(w, 200, s.store.List()) }
+func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
+    var req CreateTaskRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil { writeError(w, 400, err.Error()); return }
+    if req.Title == "" { writeError(w, 400, "title 不能为空"); return }
+    writeJSON(w, 201, s.store.Create(req.Title))
+}
+func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
+    id, _ := strconv.Atoi(r.PathValue("id"))
+    t, err := s.store.Get(id)
+    if err != nil { writeError(w, 404, err.Error()); return }
+    writeJSON(w, 200, t)
+}
+func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
+    id, _ := strconv.Atoi(r.PathValue("id"))
+    var req UpdateTaskRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil { writeError(w, 400, err.Error()); return }
+    t, err := s.store.Update(id, req)
+    if err != nil { writeError(w, 404, err.Error()); return }
+    writeJSON(w, 200, t)
+}
+func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
+    id, _ := strconv.Atoi(r.PathValue("id"))
+    if err := s.store.Delete(id); err != nil { writeError(w, 404, err.Error()); return }
+    w.WriteHeader(204)
+}
+
+// ===== main：演示完整流程 =====
+func main() {
+    store := NewStore()
+    srv := NewServer(store)
+
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /api/tasks", srv.listTasks)
+    mux.HandleFunc("POST /api/tasks", srv.createTask)
+    mux.HandleFunc("GET /api/tasks/{id}", srv.getTask)
+    mux.HandleFunc("PUT /api/tasks/{id}", srv.updateTask)
+    mux.HandleFunc("DELETE /api/tasks/{id}", srv.deleteTask)
+
+    // 模拟完整客户端
+    cli := &http.Client{Transport: &muxTransport{mux: mux}}
+
+    do := func(method, path string, body string) {
+        var r io.Reader
+        if body != "" { r = strings.NewReader(body) }
+        req := httptest.NewRequest(method, path, r)
+        rec := httptest.NewRecorder()
+        mux.ServeHTTP(rec, req)
+        b, _ := io.ReadAll(rec.Result().Body)
+        fmt.Printf("%-6s %-22s -> %d %s\\n", method, path, rec.Code, strings.TrimSpace(string(b)))
+        _ = cli
+    }
+
+    fmt.Println("=== 演示完整 CRUD 流程 ===")
+    do("POST",   "/api/tasks",         \`{"title":"学 Go"}\`)
+    do("POST",   "/api/tasks",         \`{"title":"写项目"}\`)
+    do("GET",    "/api/tasks",         "")
+    do("GET",    "/api/tasks/1",       "")
+    do("PUT",    "/api/tasks/1",       \`{"done":true}\`)
+    do("GET",    "/api/tasks/1",       "")
+    do("DELETE", "/api/tasks/2",       "")
+    do("GET",    "/api/tasks",         "")
+    do("GET",    "/api/tasks/999",     "")  // 404
+    do("POST",   "/api/tasks",         \`{}\`) // 400
+}
+
+// 自定义 transport：用 mux 替代真实网络（可选演示，演示中未使用）
+type muxTransport struct{ mux *http.ServeMux }
+func (t *muxTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+    rec := httptest.NewRecorder()
+    t.mux.ServeHTTP(rec, r)
+    rec.Result().Body = io.NopCloser(strings.NewReader(""))
+    return rec.Result(), nil
+}`}
+  expectedOutput={`=== 演示完整 CRUD 流程 ===
+POST   /api/tasks            -> 201 {"id":1,"title":"学 Go","done":false,"created_at":"2026-07-28T14:00:00Z"}
+POST   /api/tasks            -> 201 {"id":2,"title":"写项目","done":false,"created_at":"2026-07-28T14:00:00Z"}
+GET    /api/tasks            -> 200 [{"id":1,"title":"学 Go","done":false,"created_at":"2026-07-28T14:00:00Z"},{"id":2,"title":"写项目","done":false,"created_at":"2026-07-28T14:00:00Z"}]
+GET    /api/tasks/1          -> 200 {"id":1,"title":"学 Go","done":false,"created_at":"2026-07-28T14:00:00Z"}
+PUT    /api/tasks/1          -> 200 {"id":1,"title":"学 Go","done":true,"created_at":"2026-07-28T14:00:00Z"}
+GET    /api/tasks/1          -> 200 {"id":1,"title":"学 Go","done":true,"created_at":"2026-07-28T14:00:00Z"}
+DELETE /api/tasks/2          -> 204 
+GET    /api/tasks            -> 200 [{"id":1,"title":"学 Go","done":true,"created_at":"2026-07-28T14:00:00Z"}]
+GET    /api/tasks/999        -> 404 {"error":"not found"}
+POST   /api/tasks            -> 400 {"error":"title 不能为空"}`}
+/>
+
+<Callout type="tip" title="created_at 字段">
+实际 `time.Now()` 在 Playground 里会输出真实当前时间——所以本例 `expectedOutput` 用的是**占位字符串**，真实运行时会显示不同时间。重点是**结构正确**，不是字符精确匹配。
+</Callout>
+
+## 7. 单元测试（生产级代码片段）
+
+```go
+// handlers_test.go
+func TestCreateTask_Success(t *testing.T) {
+    s := NewStore()
+    srv := NewServer(s)
+
+    body := strings.NewReader(`{"title":"test"}`)
+    req := httptest.NewRequest("POST", "/api/tasks", body)
+    rec := httptest.NewRecorder()
+
+    srv.createTask(rec, req)
+
+    if rec.Code != 201 { t.Fatalf("want 201, got %d", rec.Code) }
+    var got Task
+    json.NewDecoder(rec.Body).Decode(&got)
+    if got.Title != "test" { t.Errorf("want title=test, got %s", got.Title) }
+}
+
+func TestGetTask_NotFound(t *testing.T) {
+    srv := NewServer(NewStore())
+
+    req := httptest.NewRequest("GET", "/api/tasks/999", nil)
+    rec := httptest.NewRecorder()
+
+    srv.getTask(rec, req)
+
+    if rec.Code != 404 { t.Fatalf("want 404, got %d", rec.Code) }
+}
+```
+
+<Callout type="info" title="httptest 的两种模式">
+1. `httptest.NewRecorder()`：纯内存，最快
+2. `httptest.NewServer(mux)`：起一个本地 HTTP 服务，测试真发起 HTTP 请求（用 `http.Client` 调用）
+</Callout>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-17-exercise"
+  title="扩展 API：加搜索"
+  code={`// 任务：扩展 Store，增加 Search 能力
+// 1. List 支持 ?done=true / ?done=false / ?q=关键词
+// 2. main 里加几条任务，演示按不同条件过滤
+// 提示：复制上面 Store，List 改为 func (s *Store) List(filter ListFilter) []Task
+
+package main
+
+import (
+    "errors"
+    "fmt"
+    "strings"
+    "sync"
+)
+
+type Task struct {
+    ID    int
+    Title string
+    Done  bool
+}
+var ErrNotFound = errors.New("not found")
+
+type Store struct {
+    mu    sync.RWMutex
+    tasks map[int]*Task
+    next  int
+}
+func NewStore() *Store { return &Store{tasks: map[int]*Task{}} }
+
+type ListFilter struct {
+    Done *bool
+    Q    string
+}
+
+func (s *Store) Create(title string) Task {
+    s.mu.Lock(); defer s.mu.Unlock()
+    s.next++
+    t := &Task{ID: s.next, Title: title}
+    s.tasks[t.ID] = t
+    return *t
+}
+
+func (s *Store) List(f ListFilter) []Task {
+    s.mu.RLock(); defer s.mu.RUnlock()
+    out := []Task{}
+    for _, t := range s.tasks {
+        if f.Done != nil && t.Done != *f.Done { continue }
+        if f.Q != "" && !strings.Contains(strings.ToLower(t.Title), strings.ToLower(f.Q)) { continue }
+        out = append(out, *t)
+    }
+    return out
+}
+
+func (s *Store) Mark(id int, done bool) error {
+    s.mu.Lock(); defer s.mu.Unlock()
+    t, ok := s.tasks[id]
+    if !ok { return ErrNotFound }
+    t.Done = done
+    return nil
+}
+
+func main() {
+    s := NewStore()
+    s.Create("学 Go 基础")
+    s.Create("学 Go 进阶")
+    s.Create("写 Web 项目")
+    s.Create("部署上线")
+    s.Mark(3, true)
+    s.Mark(4, true)
+
+    fmt.Println("全部：")
+    for _, t := range s.List(ListFilter{}) {
+        fmt.Printf("  %d %s done=%v\\n", t.ID, t.Title, t.Done)
+    }
+
+    fmt.Println("\\n未完成：")
+    done := false
+    for _, t := range s.List(ListFilter{Done: &done}) {
+        fmt.Printf("  %d %s\\n", t.ID, t.Title)
+    }
+
+    fmt.Println("\\n标题含'Go'：")
+    for _, t := range s.List(ListFilter{Q: "Go"}) {
+        fmt.Printf("  %d %s\\n", t.ID, t.Title)
+    }
+
+    fmt.Println("\\n已完成且标题含'上线'：")
+    t2 := true
+    for _, t := range s.List(ListFilter{Done: &t2, Q: "上线"}) {
+        fmt.Printf("  %d %s\\n", t.ID, t.Title)
+    }
+}
+`}
+  expectedOutput={`全部：
+  1 学 Go 基础 done=false
+  2 学 Go 进阶 done=false
+  3 写 Web 项目 done=true
+  4 部署上线 done=true
+
+未完成：
+  1 学 Go 基础
+  2 学 Go 进阶
+
+标题含'Go'：
+  1 学 Go 基础
+  2 学 Go 进阶
+
+已完成且标题含'上线'：
+  4 部署上线`}
+/>
+
+## 小结
+
+- ✅ 典型 REST API 项目的**四层结构**：`models` / `store` / `handlers` / `main`
+- ✅ Store 用 `sync.RWMutex` 保护并发读写
+- ✅ Handler 永远返回结构化 JSON，**别用 `http.Error`**
+- ✅ `httptest` 不依赖网络，单元测试首选
+- ✅ 真实部署要设 `ReadTimeout`/`WriteTimeout`
+- ✅ 单文件可运行版是项目演的好方式
+- ✅ `r.PathValue("id")` 拿路径参数
+
+下一章是另一个**项目实战**：并发文件处理工具。

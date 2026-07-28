@@ -1,0 +1,359 @@
+---
+title: 面向对象
+order: 9
+description: class、继承、MRO、魔法方法、property、classmethod/staticmethod
+---
+
+# 面向对象编程
+
+面向对象（OOP）把数据和操作数据的方法捆绑在一起，让代码更容易复用、扩展和推理。Python 中一切皆对象 —— 整数、字符串、函数都是类的实例。本章我们从最基础的 `class` 语法一路走到多重继承、魔法方法与属性装饰器。
+
+## 1. 第一个类
+
+`class` 关键字定义一个类。`__init__` 是构造器，**第一个参数永远是 `self`**，代表"当前实例"。
+
+<Playground
+  language="python"
+  id="py-09-class-basic"
+  title="Dog 类"
+  code={`class Dog:
+    # 类属性：所有实例共享
+    species = "Canis familiaris"
+
+    def __init__(self, name, age):
+        # 实例属性：每个实例独立
+        self.name = name
+        self.age = age
+
+    def bark(self):
+        return f"{self.name}: 汪汪！"
+
+    def info(self):
+        return f"{self.name}, {self.age} 岁"
+
+d1 = Dog("旺财", 3)
+d2 = Dog("小白", 5)
+print(d1.info())
+print(d2.bark())
+print("species:", Dog.species, "==", d1.species)`}
+  expectedOutput={`旺财, 3 岁\n小白: 汪汪！\nspecies: Canis familiaris == Canis familiaris`}
+/>
+
+<Callout type="info" title="self 是什么？">
+调用 `d1.bark()` 时，Python 实际上会执行 `Dog.bark(d1)`，所以 `self` 就是被传入的实例本身。命名约定是 `self`（不是关键字，只是惯例）。
+</Callout>
+
+## 2. 实例属性 vs 类属性
+
+- **实例属性**写在 `__init__` 里，每个对象独立。
+- **类属性**写在类体内、方法外，所有对象共享。
+- 读取时 Python 会先找实例，找不到再找类；**赋值**则一定在实例上新建。
+
+<Playground
+  language="python"
+  id="py-09-class-attr"
+  title="类属性与实例属性"
+  code={`class Counter:
+    count = 0   # 类属性
+
+    def __init__(self):
+        Counter.count += 1
+        self.local = 0  # 实例属性
+
+c1 = Counter()
+c2 = Counter()
+c3 = Counter()
+print("创建了", Counter.count, "个实例")
+print("c1.count:", c1.count, "  c2.count:", c2.count)
+
+# 通过实例"遮蔽"类属性
+c1.count = 100
+print("c1.count:", c1.count, "  c2.count:", c2.count, "  Counter.count:", Counter.count)`}
+  expectedOutput={`创建了 3 个实例\nc1.count: 3  c2.count: 3\nc1.count: 100  c2.count: 3  Counter.count: 3`}
+/>
+
+## 3. 继承与 `super()`
+
+子类可以复用父类的方法，并能通过 `super()` 调用父类版本。
+
+<Playground
+  language="python"
+  id="py-09-inherit"
+  title="继承与 super()"
+  code={`class Animal:
+    def __init__(self, name):
+        self.name = name
+
+    def speak(self):
+        raise NotImplementedError("子类必须实现 speak()")
+
+class Cat(Animal):
+    def __init__(self, name, color):
+        super().__init__(name)   # 调用父类 __init__
+        self.color = color
+
+    def speak(self):
+        return f"{self.name}（{self.color}）: 喵～"
+
+class Dog(Animal):
+    def speak(self):
+        return f"{self.name}: 汪汪！"
+
+animals = [Cat("小花", "橘色"), Dog("旺财")]
+for a in animals:
+    print(a.speak())`}
+  expectedOutput={`小花（橘色）: 喵～\n旺财: 汪汪！`}
+/>
+
+<Callout type="tip" title="多态">
+`for a in animals` 循环里调用 `a.speak()`，Python 不关心具体类型，只看"有没有 `speak` 方法"。这就是**鸭子类型**。
+</Callout>
+
+## 4. 多重继承与 MRO
+
+Python 允许一个类继承多个父类。方法查找顺序由 **MRO（Method Resolution Order）** 决定，可以用 `mro()` 查看。
+
+<Playground
+  language="python"
+  id="py-09-mro"
+  title="菱形继承的 MRO"
+  code={`class A:
+    def who(self): return "A"
+
+class B(A):
+    def who(self): return "B"
+
+class C(A):
+    def who(self): return "C"
+
+class D(B, C):
+    pass
+
+d = D()
+print("D().who() =", d.who())
+print("MRO:", [c.__name__ for c in D.mro()])
+
+# 用 super() 链式调用
+class A2:
+    def hello(self): print("A2.hello")
+
+class B2(A2):
+    def hello(self):
+        print("B2.hello before")
+        super().hello()
+        print("B2.hello after")
+
+class C2(A2):
+    def hello(self):
+        print("C2.hello before")
+        super().hello()
+        print("C2.hello after")
+
+class D2(B2, C2):
+    def hello(self):
+        print("D2.hello before")
+        super().hello()
+        print("D2.hello after")
+
+D2().hello()`}
+  expectedOutput={`D().who() = B\nMRO: ['D', 'B', 'C', 'A', 'object']\nD2.hello before\nB2.hello before\nC2.hello before\nA2.hello\nC2.hello after\nB2.hello after\nD2.hello after`}
+/>
+
+<Callout type="warn" title="MRO 算法：C3 线性化">
+Python 用 **C3 线性化**算法计算 MRO，保证：① 子类在父类前；② 父类按继承顺序保留；③ 单调性（子类顺序不破坏父类顺序）。多重继承用得不当会非常难调试，**优先用组合或混入（Mixin）**。
+</Callout>
+
+## 5. 魔法方法（Dunder Methods）
+
+以双下划线 `__xxx__` 包裹的方法叫"魔法方法"，由 Python 在特定场景自动调用。
+
+| 方法 | 触发场景 |
+|---|---|
+| `__str__` | `str(obj)` / `print(obj)` / f-string |
+| `__repr__` | `repr(obj)` / 交互式回显 |
+| `__eq__` | `obj == other` |
+| `__lt__` | `obj < other`（配合 `__eq__` 可用 `@total_ordering`） |
+| `__len__` | `len(obj)` |
+| `__getitem__` | `obj[key]` |
+| `__iter__` | `for x in obj` |
+| `__call__` | `obj()` 像函数一样调用 |
+
+<Playground
+  language="python"
+  id="py-09-dunder"
+  title="Vector 类：重载运算符"
+  code={`import math
+
+class Vector:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+    def __repr__(self):
+        return f"Vector({self.x}, {self.y})"
+
+    def __str__(self):
+        return f"({self.x}, {self.y})"
+
+    def __eq__(self, other):
+        return self.x == other.x and self.y == other.y
+
+    def __add__(self, other):
+        return Vector(self.x + other.x, self.y + other.y)
+
+    def __mul__(self, k):
+        return Vector(self.x * k, self.y * k)
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, i):
+        return (self.x, self.y)[i]
+
+    def __abs__(self):
+        return math.hypot(self.x, self.y)
+
+a = Vector(3, 4)
+b = Vector(1, 2)
+print("a =", a)                      # __str__
+print("repr(a) =", repr(a))          # __repr__
+print("a + b =", a + b)              # __add__
+print("a * 3 =", a * 3)              # __mul__
+print("len(a) =", len(a))            # __len__
+print("a[0], a[1] =", a[0], a[1])    # __getitem__
+print("abs(a) =", abs(a))            # __abs__`}
+  expectedOutput={`a = (3, 4)\nrepr(a) = Vector(3, 4)\na + b = Vector(4, 6)\na * 3 = Vector(9, 12)\nlen(a) = 2\na[0], a[1] = 3 4\nabs(a) = 5.0`}
+/>
+
+<Callout type="tip" title="__str__ vs __repr__">
+- `__repr__` 面向开发者：理想情况下 `eval(repr(obj))` 能重建对象。
+- `__str__` 面向用户：可读性优先。
+- `print(obj)` 优先调用 `__str__`，否则 fallback 到 `__repr__`。
+</Callout>
+
+## 6. `@property` —— 受控的属性访问
+
+`@property` 把方法"伪装"成属性，让你既能验证输入，又能保持 `obj.attr` 这样自然的访问语法。
+
+<Playground
+  language="python"
+  id="py-09-property"
+  title="@property 受控属性"
+  code={`class Circle:
+    def __init__(self, radius):
+        self.radius = radius    # 走 setter
+
+    @property
+    def radius(self):
+        return self._radius
+
+    @radius.setter
+    def radius(self, value):
+        if value < 0:
+            raise ValueError("半径不能为负")
+        self._radius = value
+
+    @property
+    def area(self):
+        import math
+        return math.pi * self._radius ** 2
+
+c = Circle(5)
+print(f"r = {c.radius}, area = {c.area:.2f}")
+
+c.radius = 10
+print(f"r = {c.radius}, area = {c.area:.2f}")
+
+try:
+    c.radius = -1
+except ValueError as e:
+    print("错误:", e)`}
+  expectedOutput={`r = 5, area = 78.54\nr = 10, area = 314.16\n错误: 半径不能为负`}
+/>
+
+## 7. `@classmethod` 与 `@staticmethod`
+
+| 装饰器 | 第一个参数 | 用途 |
+|---|---|---|
+| 普通方法 | `self`（实例） | 操作实例数据 |
+| `@classmethod` | `cls`（类本身） | 工厂方法、备选构造器 |
+| `@staticmethod` | 无 | 与类相关但不依赖实例/类的工具函数 |
+
+<Playground
+  language="python"
+  id="py-09-class-static"
+  title="classmethod 与 staticmethod"
+  code={`class Date:
+    def __init__(self, year, month, day):
+        self.year, self.month, self.day = year, month, day
+
+    def __repr__(self):
+        return f"{self.year}-{self.month:02d}-{self.day:02d}"
+
+    @classmethod
+    def from_string(cls, s):
+        # 备选构造器：从字符串解析
+        y, m, d = map(int, s.split("-"))
+        return cls(y, m, d)
+
+    @staticmethod
+    def is_valid(s):
+        parts = s.split("-")
+        return len(parts) == 3 and all(p.isdigit() for p in parts)
+
+d1 = Date(2026, 1, 1)
+d2 = Date.from_string("2026-07-28")
+print(d1, d2)
+print("'2026-07-28' 合法:", Date.is_valid("2026-07-28"))
+print("'hello'    合法:", Date.is_valid("hello"))`}
+  expectedOutput={`2026-01-01 2026-07-28\n'2026-07-28' 合法: True\n'hello'    合法: False`}
+/>
+
+## 🎯 练习
+
+设计一个 `BankAccount` 类，要求：
+
+1. 构造时接收 `owner` 和可选的 `balance=0`。
+2. 提供 `deposit(amount)` / `withdraw(amount)` 方法，余额不足时 raise `ValueError`。
+3. 用 `@property` 暴露 `balance`（只读，外部不能直接修改）。
+4. 实现 `__str__` 输出 `"账户(owner): 余额"`。
+5. 实现 `__eq__`，账号和余额都相同才算相等。
+6. 写一个 `@classmethod from_dict(data)` 工厂方法。
+
+<Playground
+  language="python"
+  id="py-09-exercise"
+  title="BankAccount"
+  code={`# 在下面实现 BankAccount 类
+class BankAccount:
+    pass
+
+
+# ---- 验证 ----
+a = BankAccount("Alice", 100)
+b = BankAccount.from_dict({"owner": "Bob", "balance": 50})
+
+print(a)                       # 账户(Alice): 100
+a.deposit(50)
+print(a)                       # 账户(Alice): 150
+try:
+    a.withdraw(1000)
+except ValueError as e:
+    print("取款失败:", e)
+print("a == BankAccount('Alice', 150):", a == BankAccount("Alice", 150))`}
+  expectedOutput={`账户(Alice): 100\n账户(Alice): 150\n取款失败: 余额不足\na == BankAccount("Alice", 150): True`}
+/>
+
+<Callout type="exercise" title="参考实现思路">
+提示：内部存 `_balance`，对外暴露 `balance` property 不带 setter。`from_dict` 中用 `cls(...)` 而不是 `BankAccount(...)`，这样子类化时也能正常工作。
+</Callout>
+
+## 小结
+
+- ✅ `class` 定义类，`__init__(self, ...)` 构造实例
+- ✅ 实例属性独立，类属性共享
+- ✅ `super()` 调用父类；MRO 决定多继承查找顺序
+- ✅ 魔法方法（`__str__`/`__repr__`/`__eq__`/`__len__`/`__getitem__` 等）让自定义对象支持 Python 语法
+- ✅ `@property` 提供受控属性访问
+- ✅ `@classmethod` 给类传 `cls`，`@staticmethod` 不传隐式参数
+
+下一章 **装饰器**：用函数包裹函数，写出可复用的横切关注点（计时、重试、缓存、日志……）。

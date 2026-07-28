@@ -1,0 +1,167 @@
+---
+title: 函数
+order: 4
+description: def 定义函数、参数、返回值、*args/**kwargs、lambda
+---
+
+# 函数
+
+函数是组织代码的基本单位。本章覆盖 Python 函数的完整用法。
+
+## 1. 定义与调用
+
+```python
+def greet(name):
+    return f"Hello, {name}!"
+
+msg = greet("Alice")
+print(msg)
+```
+
+<Playground
+  language="python"
+  id="py-04-greet"
+  title="最简单的函数"
+  code={`def greet(name):
+    return f"Hello, {name}!"
+
+print(greet("Alice"))
+print(greet("Bob"))`}
+  expectedOutput={`Hello, Alice!\nHello, Bob!`}
+/>
+
+## 2. 默认参数
+
+<Playground
+  language="python"
+  id="py-04-default"
+  title="默认参数"
+  code={`def power(x, n=2):
+    return x ** n
+
+print(power(3))       # 9
+print(power(3, 3))    # 27
+print(power(3, n=4))  # 81  关键字参数`}
+  expectedOutput={`9\n27\n81`}
+/>
+
+<Callout type="warn" title="默认参数的可变对象陷阱">
+不要用 `def f(x, items=[]):` —— 默认值在函数定义时只创建一次，列表会被共享。应该用 `def f(x, items=None): if items is None: items = []`。
+</Callout>
+
+## 3. 多返回值
+
+Python 函数可以一次返回多个值（实际是返回一个元组）。
+
+<Playground
+  language="python"
+  id="py-04-multi-return"
+  title="多返回值"
+  code={`def divmod(a, b):
+    return a // b, a % b
+
+q, r = divmod(17, 5)
+print(f"17 ÷ 5 = {q} 余 {r}")`}
+  expectedOutput={`17 ÷ 5 = 3 余 2`}
+/>
+
+## 4. `*args` 与 `**kwargs`
+
+- `*args`：接收任意数量的**位置参数**，打包成元组
+- `**kwargs`：接收任意数量的**关键字参数**，打包成字典
+
+<Playground
+  language="python"
+  id="py-04-args"
+  title="*args 与 **kwargs"
+  code={`def avg(*nums):
+    return sum(nums) / len(nums) if nums else 0
+
+print(avg(1, 2, 3, 4, 5))   # 3.0
+print(avg(10, 20))           # 15.0
+
+def user_profile(name, **info):
+    print(f"姓名：{name}")
+    for k, v in info.items():
+        print(f"  {k}: {v}")
+
+user_profile("小明", age=18, city="北京", hobby="编程")`}
+  expectedOutput={`3.0\n15.0\n姓名：小明\n  age: 18\n  city: 北京\n  hobby: 编程`}
+/>
+
+## 5. `lambda` 匿名函数
+
+`lambda 参数: 表达式` 创建一个**匿名**的简单函数。
+
+<Playground
+  language="python"
+  id="py-04-lambda"
+  title="lambda 表达式"
+  code={`square = lambda x: x * x
+print(square(5))            # 25
+
+# 配合 sorted 的 key 参数
+pairs = [("Alice", 30), ("Bob", 25), ("Carol", 28)]
+pairs.sort(key=lambda p: p[1])   # 按年龄排序
+print(pairs)`}
+  expectedOutput={`25\n[('Bob', 25), ('Carol', 28), ('Alice', 30)]`}
+/>
+
+## 6. 递归函数
+
+<Playground
+  language="python"
+  id="py-04-recursion"
+  title="递归：斐波那契"
+  code={`def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+for i in range(10):
+    print(fib(i), end=" ")
+print()`}
+  expectedOutput={`0 1 1 2 3 5 8 13 21 34 `}
+/>
+
+<Callout type="tip" title="递归的两个关键">
+① 终止条件（base case）；② 递归调用向终止条件推进。否则会无限递归导致 `RecursionError`。
+</Callout>
+
+## 7. 文档字符串（docstring）
+
+```python
+def area(r):
+    """计算圆的面积。"""
+    return 3.14159 * r * r
+```
+
+## 🎯 练习
+
+<Playground
+  language="python"
+  id="py-04-exercise"
+  title="阶乘函数"
+  code={`# 任务：用递归实现阶乘 n!
+# 期望：factorial(5) = 120
+def factorial(n):
+    # 补全代码
+    pass
+
+print(factorial(5))
+print(factorial(0))
+print(factorial(10))
+`}
+/>
+
+## 小结
+
+- ✅ `def 函数名(参数):` 定义函数
+- ✅ 默认参数、关键字参数、位置参数
+- ✅ `return` 可以返回多个值（解包）
+- ✅ `*args` 收多余位置参数；`**kwargs` 收多余关键字参数
+- ✅ `lambda` 适合写一行的小函数
+- ✅ 递归必须有终止条件
+- ✅ 三引号字符串写文档（docstring）
+
+下一章 **数据结构**：`list / tuple / dict / set`。

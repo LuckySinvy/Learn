@@ -1,0 +1,246 @@
+---
+title: 错误处理与测试
+order: 7
+description: error 接口、errors.New/Is/As、自定义 error、panic/recover、单元测试
+---
+
+# 错误处理与测试
+
+Go 的错误处理哲学：**错误是值（error is just a value）**，不通过异常机制。
+
+## 1. `error` 接口
+
+```go
+type error interface {
+    Error() string
+}
+```
+
+任何实现了 `Error() string` 方法的类型都是 `error`。
+
+<Playground
+  language="go"
+  id="go-07-error"
+  title="error 基础"
+  code={`package main
+
+import (
+    "errors"
+    "fmt"
+)
+
+func divide(a, b int) (int, error) {
+    if b == 0 {
+        return 0, errors.New("division by zero")
+    }
+    return a / b, nil
+}
+
+func main() {
+    if v, err := divide(10, 0); err != nil {
+        fmt.Println("出错了：", err)
+    } else {
+        fmt.Println("结果：", v)
+    }
+}`}
+  expectedOutput={`出错了： division by zero`}
+/>
+
+## 2. `fmt.Errorf` 格式化
+
+<Playground
+  language="go"
+  id="go-07-errorf"
+  title="fmt.Errorf"
+  code={`package main
+
+import "fmt"
+
+func openFile(name string) error {
+    if name == "" {
+        return fmt.Errorf("open file: name is empty")
+    }
+    return nil
+}
+
+func main() {
+    fmt.Println(openFile(""))
+    fmt.Println(openFile("data.txt"))
+}`}
+  expectedOutput={`open file: name is empty\n<nil>`}
+/>
+
+## 3. 自定义 error 类型
+
+携带更多上下文信息是 error 的常见需求。
+
+<Playground
+  language="go"
+  id="go-07-custom"
+  title="自定义 error 类型"
+  code={`package main
+
+import "fmt"
+
+type ValidationError struct {
+    Field   string
+    Message string
+}
+
+func (e *ValidationError) Error() string {
+    return fmt.Sprintf("validation failed on %q: %s", e.Field, e.Message)
+}
+
+func registerUser(age int) error {
+    if age < 0 {
+        return &ValidationError{Field: "age", Message: "不能为负"}
+    }
+    return nil
+}
+
+func main() {
+    err := registerUser(-5)
+    if err != nil {
+        // 类型断言取出详细信息
+        if ve, ok := err.(*ValidationError); ok {
+            fmt.Println("字段：", ve.Field)
+            fmt.Println("消息：", ve.Message)
+        }
+        fmt.Println("err.Error():", err)
+    }
+}`}
+  expectedOutput={`字段： age\n消息： 不能为负\nerr.Error(): validation failed on 'age': 不能为负`}
+/>
+
+## 4. 错误包装 `fmt.Errorf %w`
+
+Go 1.13+ 支持用 `%w` 包装错误，可以用 `errors.Is` / `errors.As` 解包。
+
+<Playground
+  language="go"
+  id="go-07-wrap"
+  title="错误包装"
+  code={`package main
+
+import (
+    "errors"
+    "fmt"
+)
+
+var ErrNotFound = errors.New("not found")
+
+func load() error {
+    return fmt.Errorf("load user %d: %w", 42, ErrNotFound)
+}
+
+func main() {
+    err := load()
+    fmt.Println("error:", err)
+
+    if errors.Is(err, ErrNotFound) {
+        fmt.Println("是的，找不到！")
+    }
+}`}
+  expectedOutput={`error: load user 42: not found\n是的，找不到！`}
+/>
+
+## 5. `panic` 与 `recover`
+
+`panic` 让程序崩溃，`recover` 在 `defer` 中捕获。
+
+<Playground
+  language="go"
+  id="go-07-panic"
+  title="panic / recover"
+  code={`package main
+
+import "fmt"
+
+func safeCall() {
+    defer func() {
+        if r := recover(); r != nil {
+            fmt.Println("已恢复：", r)
+        }
+    }()
+    panic("出大事了！")
+}
+
+func main() {
+    safeCall()
+    fmt.Println("程序继续运行")
+}`}
+  expectedOutput={`已恢复： 出大事了！\n程序继续运行`}
+/>
+
+<Callout type="warn" title="panic 适用场景">
+- 真正的不可恢复错误（编程 bug、配置缺失）
+- 框架初始化失败
+**不要** 把 panic 当作普通异常使用 —— 业务错误请用 `error`。
+</Callout>
+
+## 6. 单元测试
+
+文件名以 `_test.go` 结尾，函数以 `Test` 开头，参数为 `*testing.T`。
+
+```go
+// calc_test.go
+package calc
+
+import "testing"
+
+func TestAdd(t *testing.T) {
+    if got := Add(2, 3); got != 5 {
+        t.Errorf("Add(2,3) = %d; want 5", got)
+    }
+}
+```
+
+常用命令：
+
+```bash
+go test ./...        # 跑所有测试
+go test -v ./...     # 详细输出
+go test -cover ./... # 覆盖率
+```
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-07-exercise"
+  title="安全除法"
+  code={`// 任务：实现 safeDiv(a, b)，b==0 时返回自定义错误
+// 期望：safeDiv(10, 0) -> 错误：cannot divide by zero
+
+package main
+
+import "fmt"
+
+type DivError struct{ A, B int }
+
+func (e *DivError) Error() string {
+    return "cannot divide by zero"
+}
+
+func safeDiv(a, b int) (int, error) {
+    // 补全代码
+    return 0, nil
+}
+
+func main() {
+    v, err := safeDiv(10, 0)
+    fmt.Println("结果：", v, "错误：", err)
+}
+`}
+/>
+
+## 小结
+
+- ✅ `error` 是接口，业务错误都用它
+- ✅ `errors.New` / `fmt.Errorf` 创建 error
+- ✅ 自定义类型实现 `Error() string` 即可
+- ✅ `errors.Is/As` 解包 `%w` 包装的错误链
+- ✅ `panic/recover` 只用于不可恢复错误
+- ✅ `*_test.go` + `TestXxx` 写单元测试，`go test ./...` 跑
+
+下一章 **文件 I/O 与 JSON**。

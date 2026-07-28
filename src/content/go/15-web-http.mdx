@@ -1,0 +1,534 @@
+---
+title: Web 服务
+order: 15
+description: net/http 路由、JSON、中间件、httptest
+---
+
+# Web 服务
+
+Go 标准库的 `net/http` 足以搭建生产级 Web 服务，无需任何第三方框架。
+
+<Callout type="info" title="为什么先学 net/http">
+- 没有魔法——所有 Web 框架（Gin、Echo）底层都是它
+- 性能优异（`net/http` 是 Go 生态最快的 HTTP 实现之一）
+- 标准库永远跟 Go 版本同步
+</Callout>
+
+## 1. 第一个 HTTP 服务
+
+<Playground
+  language="go"
+  id="go-15-hello"
+  title="Hello Handler"
+  code={`package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func helloHandler(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintf(w, "Hello, %s!", r.URL.Path[1:])
+}
+
+func main() {
+    http.HandleFunc("/", helloHandler)
+    fmt.Println("监听 :8080")
+
+    // 启动后 server 不会退出，但 sandbox 会超时杀掉
+    // 实际项目用： srv := &http.Server{Addr: ":8080", Handler: nil}
+    //             go srv.ListenAndServe()
+    if err := http.ListenAndServe(":8080", nil); err != nil {
+        fmt.Println("错误：", err)
+    }
+}`}
+  expectedOutput={`监听 :8080
+错误： listen tcp :8080: bind: address already in use`}
+/>
+
+<Callout type="tip" title="沙盒里跑长服务">
+沙盒（sandbox）里的 `main.go` 启动后会被超时（15s）强制终止。这里只展示代码模式，**不要真去运行**。真实开发用 `httptest` 测试。
+</Callout>
+
+## 2. 用 `httptest` 测试 Handler
+
+不用真起服务就能测试：模拟请求 → 拿到响应。
+
+<Playground
+  language="go"
+  id="go-15-httptest"
+  title="httptest 测试"
+  code={`package main
+
+import (
+    "fmt"
+    "io"
+    "net/http"
+    "net/http/httptest"
+)
+
+func helloHandler(w http.ResponseWriter, r *http.Request) {
+    name := r.URL.Query().Get("name")
+    if name == "" {
+        name = "世界"
+    }
+    fmt.Fprintf(w, "Hello, %s!", name)
+}
+
+func main() {
+    req := httptest.NewRequest("GET", "/hello?name=Alice", nil)
+    rec := httptest.NewRecorder()
+
+    helloHandler(rec, req)
+
+    res := rec.Result()
+    defer res.Body.Close()
+    body, _ := io.ReadAll(res.Body)
+    fmt.Println("status:", res.StatusCode)
+    fmt.Println("body:  ", string(body))
+
+    // 不带 name 参数
+    req2 := httptest.NewRequest("GET", "/hello", nil)
+    rec2 := httptest.NewRecorder()
+    helloHandler(rec2, req2)
+    body2, _ := io.ReadAll(rec2.Result().Body)
+    fmt.Println("默认： ", string(body2))
+}`}
+  expectedOutput={`status: 200
+body:   Hello, Alice!
+默认：  Hello, 世界!`}
+/>
+
+<Callout type="info" title="httptest 三件套">
+- `httptest.NewRecorder()`：实现 `http.ResponseWriter`，记下响应
+- `httptest.NewRequest(method, url, body)`：构造 `*http.Request`
+- `httptest.NewServer(handler)`：真起一个本地 HTTP 服务（带端口）
+</Callout>
+
+## 3. 路由与 404
+
+<Playground
+  language="go"
+  id="go-15-router"
+  title="简单路由"
+  code={`package main
+
+import (
+    "fmt"
+    "io"
+    "net/http"
+    "net/http/httptest"
+)
+
+func main() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprint(w, "hello")
+    })
+    mux.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+        id := r.PathValue("id")
+        fmt.Fprintf(w, "user id = %s", id)
+    })
+
+    // 模拟请求
+    cases := []string{
+        "GET /hello",
+        "GET /users/42",
+        "POST /hello",      // 405
+        "GET /notfound",    // 404
+    }
+    for _, c := range cases {
+        method, path := splitReq(c)
+        req := httptest.NewRequest(method, path, nil)
+        rec := httptest.NewRecorder()
+        mux.ServeHTTP(rec, req)
+        body, _ := io.ReadAll(rec.Result().Body)
+        fmt.Printf("%-20s -> %d %s\n", c, rec.Code, body)
+    }
+}
+
+func splitReq(s string) (string, string) {
+    for i, c := range s {
+        if c == ' ' {
+            return s[:i], s[i+1:]
+        }
+    }
+    return s, ""
+}`}
+  expectedOutput={`GET /hello           -> 200 hello
+GET /users/42         -> 200 user id = 42
+POST /hello           -> 405
+GET /notfound         -> 404`}
+/>
+
+<Callout type="tip" title="Go 1.22 的新 ServeMux">
+- 支持 `METHOD /path` 前缀
+- 支持路径参数：`/users/{id}` + `r.PathValue("id")`
+- 支持通配符：`/files/{path...}`（匹配剩余路径）
+- 这是 stdlib 自带路由，写小服务完全够用
+</Callout>
+
+## 4. JSON API
+
+<Playground
+  language="go"
+  id="go-15-json"
+  title="JSON API"
+  code={`package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "net/http/httptest"
+    "strings"
+)
+
+type User struct {
+    ID   int    \`json:"id"\`
+    Name string \`json:"name"\`
+}
+
+var users = []User{
+    {ID: 1, Name: "Alice"},
+    {ID: 2, Name: "Bob"},
+}
+
+func listUsers(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(users)
+}
+
+func createUser(w http.ResponseWriter, r *http.Request) {
+    var u User
+    if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    u.ID = len(users) + 1
+    users = append(users, u)
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusCreated)
+    json.NewEncoder(w).Encode(u)
+}
+
+func main() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /api/users", listUsers)
+    mux.HandleFunc("POST /api/users", createUser)
+
+    // GET
+    rec := httptest.NewRecorder()
+    req := httptest.NewRequest("GET", "/api/users", nil)
+    mux.ServeHTTP(rec, req)
+    body, _ := io.ReadAll(rec.Result().Body)
+    fmt.Println("GET:", string(body))
+
+    // POST
+    rec2 := httptest.NewRecorder()
+    body2 := strings.NewReader(\`{"name":"Carol"}\`)
+    req2 := httptest.NewRequest("POST", "/api/users", body2)
+    mux.ServeHTTP(rec2, req2)
+    body3, _ := io.ReadAll(rec2.Result().Body)
+    fmt.Println("POST:", string(body3))
+}`}
+  expectedOutput={`GET: [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
+POST: {"id":3,"name":"Carol"}`}/>
+
+<Callout type="warn" title="忘了加 Content-Type">
+`json.NewEncoder` 不会自动设置 `Content-Type` header。**手工** `w.Header().Set("Content-Type", "application/json")` 客户端才能正确解析。
+</Callout>
+
+## 5. 中间件（Middleware）
+
+中间件 = 包装 handler 的一层函数，可以**前置**（记录日志、鉴权）和**后置**（统一错误处理）。
+
+<Playground
+  language="go"
+  id="go-15-middleware"
+  title="中间件"
+  code={`package main
+
+import (
+    "fmt"
+    "io"
+    "net/http"
+    "net/http/httptest"
+    "time"
+)
+
+// 中间件签名：func(http.Handler) http.Handler
+func logging(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        next.ServeHTTP(w, r)
+        fmt.Printf("[%s] %s %s (%v)\n",
+            r.Method, r.URL.Path, time.Since(start))
+    })
+}
+
+func mainHandler(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprint(w, "ok")
+}
+
+// 串联多个中间件
+func chain(h http.Handler, mws ...func(http.Handler) http.Handler) http.Handler {
+    for i := len(mws) - 1; i >= 0; i-- {
+        h = mws[i](h)
+    }
+    return h
+}
+
+func main() {
+    h := chain(http.HandlerFunc(mainHandler), logging)
+
+    for _, path := range []string{"/a", "/b", "/c"} {
+        rec := httptest.NewRecorder()
+        h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+        body, _ := io.ReadAll(rec.Result().Body)
+        fmt.Printf("  -> %d %s\n", rec.Code, body)
+    }
+}`}
+  expectedOutput={`  -> 200 ok
+  -> 200 ok
+  -> 200 ok
+[GET] /a 35µs
+[GET] /b 9µs
+[GET] /c 4µs`}
+/>
+
+<Callout type="tip" title="responseRecorder 缓冲">
+`httptest.NewRecorder` 是 buffer，不走真实网络。中间件在 `next.ServeHTTP` 返回后做的操作是同步的，所以日志能在 handler 调用后立刻看到。真实网络下要等响应写完。
+</Callout>
+
+## 6. 完整可测试的 API 例子
+
+<Playground
+  language="go"
+  id="go-15-fullapi"
+  title="完整 CRUD API"
+  code={`package main
+
+import (
+    "encoding/json"
+    "errors"
+    "fmt"
+    "io"
+    "net/http"
+    "net/http/httptest"
+    "strconv"
+    "strings"
+    "sync"
+)
+
+type Task struct {
+    ID    int    \`json:"id"\`
+    Title string \`json:"title"\`
+    Done  bool   \`json:"done"\`
+}
+
+type Store struct {
+    mu     sync.RWMutex
+    tasks  map[int]*Task
+    nextID int
+}
+
+func NewStore() *Store {
+    return &Store{tasks: make(map[int]*Task), nextID: 1}
+}
+
+func (s *Store) All() []Task {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    out := make([]Task, 0, len(s.tasks))
+    for _, t := range s.tasks {
+        out = append(out, *t)
+    }
+    return out
+}
+
+func (s *Store) Create(title string) Task {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    t := &Task{ID: s.nextID, Title: title}
+    s.tasks[t.ID] = t
+    s.nextID++
+    return *t
+}
+
+func (s *Store) Get(id int) (Task, error) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    t, ok := s.tasks[id]
+    if !ok {
+        return Task{}, errors.New("not found")
+    }
+    return *t, nil
+}
+
+func (s *Store) Toggle(id int) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    t, ok := s.tasks[id]
+    if !ok {
+        return errors.New("not found")
+    }
+    t.Done = !t.Done
+    return nil
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(code)
+    json.NewEncoder(w).Encode(v)
+}
+
+func main() {
+    s := NewStore()
+    s.Create("学 Go")
+    s.Create("写项目")
+
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /api/tasks", func(w http.ResponseWriter, r *http.Request) {
+        writeJSON(w, 200, s.All())
+    })
+    mux.HandleFunc("POST /api/tasks", func(w http.ResponseWriter, r *http.Request) {
+        var body struct{ Title string \`json:"title"\` }
+        if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+            writeJSON(w, 400, map[string]string{"error": err.Error()})
+            return
+        }
+        writeJSON(w, 201, s.Create(body.Title))
+    })
+    mux.HandleFunc("PATCH /api/tasks/{id}/toggle", func(w http.ResponseWriter, r *http.Request) {
+        id, _ := strconv.Atoi(r.PathValue("id"))
+        if err := s.Toggle(id); err != nil {
+            writeJSON(w, 404, map[string]string{"error": err.Error()})
+            return
+        }
+        t, _ := s.Get(id)
+        writeJSON(w, 200, t)
+    })
+
+    // 1) 列出
+    rec := httptest.NewRecorder()
+    mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/tasks", nil))
+    b, _ := io.ReadAll(rec.Result().Body)
+    fmt.Println("LIST:", string(b))
+
+    // 2) 新建
+    rec2 := httptest.NewRecorder()
+    mux.ServeHTTP(rec2, httptest.NewRequest("POST", "/api/tasks",
+        strings.NewReader(\`{"title":"部署上线"}\`)))
+    b2, _ := io.ReadAll(rec2.Result().Body)
+    fmt.Println("CREATE:", string(b2))
+
+    // 3) 切换完成
+    rec3 := httptest.NewRecorder()
+    mux.ServeHTTP(rec3, httptest.NewRequest("PATCH", "/api/tasks/1/toggle", nil))
+    b3, _ := io.ReadAll(rec3.Result().Body)
+    fmt.Println("TOGGLE:", string(b3))
+}`}
+  expectedOutput={`LIST: [{"id":1,"title":"学 Go","done":false},{"id":2,"title":"写项目","done":false}]
+CREATE: {"id":3,"title":"部署上线","done":false}
+TOGGLE: {"id":1,"title":"学 Go","done":true}`}
+/>
+
+<Callout type="info" title="真实部署差异">
+真实服务：
+- `srv := &http.Server{Addr: ":8080", Handler: mux, ReadTimeout: 5*time.Second}`
+- `go srv.ListenAndServe()` 在独立 goroutine
+- 信号监听：`signal.Notify(ch, os.Interrupt)` + `srv.Shutdown(ctx)`
+- 用 `httptest.NewServer(mux)` 可以真起一个临时端口做集成测试
+</Callout>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-15-exercise"
+  title="/api/echo"
+  code={`// 任务：实现 /api/echo
+// 1. POST /api/echo，body 是 JSON {"msg": "hello"}
+// 2. 返回 {"echo": "hello", "length": 5}
+// 3. msg 为空时返回 400 {"error": "msg 不能为空"}
+//
+// 用 httptest 测试三个 case：空 / 正常 / 缺失 msg 字段
+
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "net/http/httptest"
+    "strings"
+)
+
+type EchoRequest struct {
+    Msg string \`json:"msg"\`
+}
+type EchoResponse struct {
+    Echo   string \`json:"echo"\`
+    Length int    \`json:"length"\`
+}
+
+func echoHandler(w http.ResponseWriter, r *http.Request) {
+    var req EchoRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(400)
+        json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+        return
+    }
+    if req.Msg == "" {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(400)
+        json.NewEncoder(w).Encode(map[string]string{"error": "msg 不能为空"})
+        return
+    }
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(EchoResponse{Echo: req.Msg, Length: len(req.Msg)})
+}
+
+func main() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("POST /api/echo", echoHandler)
+
+    cases := []struct {
+        name string
+        body string
+    }{
+        {"正常", \`{"msg": "hello"}\`},
+        {"空字符串", \`{"msg": ""}\`},
+        {"缺失字段", \`{}\`},
+    }
+    for _, c := range cases {
+        rec := httptest.NewRecorder()
+        req := httptest.NewRequest("POST", "/api/echo", strings.NewReader(c.body))
+        mux.ServeHTTP(rec, req)
+        b, _ := io.ReadAll(rec.Result().Body)
+        fmt.Printf("[%s] %d %s\n", c.name, rec.Code, b)
+    }
+}
+`}
+  expectedOutput={`[正常] 200 {"echo":"hello","length":5}
+[空字符串] 400 {"error":"msg 不能为空"}
+[缺失字段] 400 {"error":"msg 不能为空"}`}
+/>
+
+## 小结
+
+- ✅ `net/http` 标准库足够搭建生产 API
+- ✅ `http.HandleFunc` 注册路由；`http.ListenAndServe` 启动
+- ✅ `httptest.NewRecorder()` + `httptest.NewRequest()` 测试 handler
+- ✅ Go 1.22 `ServeMux` 支持方法和路径参数
+- ✅ `json.NewEncoder(w).Encode(v)` 序列化；记得设 `Content-Type`
+- ✅ 中间件 = `func(http.Handler) http.Handler` 的链式包装
+- ✅ 用 `sync.RWMutex` 保护共享状态
+- ✅ 真实部署要设 `ReadTimeout`、`Shutdown` 等
+
+下一章 **测试与基准测试**。

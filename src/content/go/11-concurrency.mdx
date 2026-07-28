@@ -1,0 +1,482 @@
+---
+title: 并发编程
+order: 11
+description: goroutine、channel、select、sync、Worker Pool
+---
+
+# 并发编程
+
+Go 的并发模型基于 **CSP（Communicating Sequential Processes）**：goroutine 之间通过 channel 传递消息，而不是共享内存。口号是：
+
+> **Don't communicate by sharing memory; share memory by communicating.**
+
+## 1. goroutine
+
+`go` 关键字启动一个 goroutine——比线程轻量得多（初始栈 2KB）。
+
+<Playground
+  language="go"
+  id="go-11-goroutine"
+  title="启动 goroutine"
+  code={`package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func say(msg string) {
+    for i := 0; i < 3; i++ {
+        fmt.Println(msg, i)
+        time.Sleep(10 * time.Millisecond)
+    }
+}
+
+func main() {
+    go say("goroutine")
+    say("main")    // 主 goroutine
+
+    // 等待 50ms 让另一个 goroutine 完成
+    time.Sleep(50 * time.Millisecond)
+    fmt.Println("结束")
+}`}
+  expectedOutput={`main 0
+goroutine 0
+main 1
+goroutine 1
+main 2
+goroutine 2
+结束`}
+/>
+
+<Callout type="warn" title={`主 goroutine 退出 = 整个程序退出`}>
+`main()` 返回时，**所有其他 goroutine 立刻终止**。需要用 `sync.WaitGroup` 或 channel 等待。
+</Callout>
+
+## 2. channel
+
+channel 是 goroutine 之间的类型化管道。`<-` 方向：`ch <- v` 发送，`v := <-ch` 接收。
+
+<Playground
+  language="go"
+  id="go-11-channel"
+  title="channel 基础"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    // 无缓冲 channel：发送和接收必须同时就绪
+    ch := make(chan int)
+
+    go func() {
+        ch <- 42       // 发送
+    }()
+
+    v := <-ch          // 接收（会阻塞直到另一方发送）
+    fmt.Println("收到：", v)
+
+    // 有缓冲 channel：容量满前发送不阻塞
+    buf := make(chan string, 2)
+    buf <- "a"
+    buf <- "b"
+    // buf <- "c"   // 这里会阻塞
+    fmt.Println(<-buf, <-buf)
+}`}
+  expectedOutput={`收到： 42
+a b`}
+/>
+
+### 单向 channel
+
+为 API 表达"只能发"或"只能收"的约束。
+
+<Playground
+  language="go"
+  id="go-11-direction"
+  title="单向 channel"
+  code={`package main
+
+import (
+    "fmt"
+    "time"
+)
+
+// 只能收
+func consumer(in <-chan int) {
+    for v := range in {
+        fmt.Println("消费：", v)
+    }
+}
+
+// 只能发
+func producer(out chan<- int) {
+    for i := 1; i <= 3; i++ {
+        out <- i
+    }
+    close(out)
+}
+
+func main() {
+    ch := make(chan int, 3)
+    go producer(ch)
+    consumer(ch)
+    time.Sleep(10 * time.Millisecond)
+}`}
+  expectedOutput={`消费： 1
+消费： 2
+消费： 3`}
+/>
+
+<Callout type="tip" title="close 的作用">
+- 发送方 `close(ch)` 表示"不会再发了"
+- 接收方 `v, ok := <-ch`，`ok==false` 表示 channel 已关闭且无数据
+- 用 `for v := range ch` 自动退出
+- **关闭已关闭的 channel 会 panic；接收方不要关闭**
+</Callout>
+
+## 3. select
+
+`select` 让 goroutine 等待多个 channel 操作。
+
+<Playground
+  language="go"
+  id="go-11-select"
+  title="select 多路复用"
+  code={`package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    a := make(chan string)
+    b := make(chan string)
+
+    go func() { time.Sleep(20 * time.Millisecond); a <- "A" }()
+    go func() { time.Sleep(10 * time.Millisecond); b <- "B" }()
+
+    for i := 0; i < 2; i++ {
+        select {
+        case msg := <-a:
+            fmt.Println("收到 a:", msg)
+        case msg := <-b:
+            fmt.Println("收到 b:", msg)
+        }
+    }
+}`}
+  expectedOutput={`收到 b: B
+收到 a: A`}
+/>
+
+### 超时模式
+
+<Playground
+  language="go"
+  id="go-11-timeout"
+  title="超时控制"
+  code={`package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    ch := make(chan string, 1)
+    go func() {
+        time.Sleep(100 * time.Millisecond)
+        ch <- "结果"
+    }()
+
+    select {
+    case res := <-ch:
+        fmt.Println(res)
+    case <-time.After(30 * time.Millisecond):
+        fmt.Println("超时！")
+    }
+}`}
+  expectedOutput={`超时！`}
+/>
+
+## 4. sync 包：`WaitGroup` 和 `Mutex`
+
+### `WaitGroup`：等待一组 goroutine
+
+<Playground
+  language="go"
+  id="go-11-waitgroup"
+  title="WaitGroup"
+  code={`package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func worker(id int, wg *sync.WaitGroup) {
+    defer wg.Done()   // 通知完成
+    time.Sleep(10 * time.Millisecond)
+    fmt.Printf("worker %d 完成\n", id)
+}
+
+func main() {
+    var wg sync.WaitGroup
+    for i := 1; i <= 5; i++ {
+        wg.Add(1)        // 增加计数
+        go worker(i, &wg)
+    }
+    wg.Wait()             // 阻塞直到计数为 0
+    fmt.Println("全部完成")
+}`}
+  expectedOutput={`worker 3 完成
+worker 5 完成
+worker 1 完成
+worker 4 完成
+worker 2 完成
+全部完成`}
+/>
+
+<Callout type="info" title="输出顺序是随机的">
+goroutine 由调度器决定先后，所以完成顺序不固定。
+</Callout>
+
+### `Mutex`：互斥锁
+
+<Playground
+  language="go"
+  id="go-11-mutex"
+  title="Mutex"
+  code={`package main
+
+import (
+    "fmt"
+    "sync"
+)
+
+type Counter struct {
+    mu sync.Mutex
+    n  int
+}
+
+func (c *Counter) Inc() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.n++
+}
+
+func (c *Counter) Value() int {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    return c.n
+}
+
+func main() {
+    c := &Counter{}
+    var wg sync.WaitGroup
+    for i := 0; i < 1000; i++ {
+        wg.Add(1)
+        go func() { defer wg.Done(); c.Inc() }()
+    }
+    wg.Wait()
+    fmt.Println("结果：", c.Value())   // 1000
+}`}
+  expectedOutput={`结果： 1000`}
+/>
+
+<Callout type="warn" title="race 警告">
+没有 `Lock/Unlock` 时，并发写会丢失更新。运行 `go run -race main.go` 可检测数据竞争。
+</Callout>
+
+## 5. Worker Pool 模式
+
+固定数量的 worker 反复从任务 channel 取任务。
+
+<Playground
+  language="go"
+  id="go-11-workerpool"
+  title="Worker Pool"
+  code={`package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func worker(id int, jobs <-chan int, results chan<- int, wg *sync.WaitGroup) {
+    defer wg.Done()
+    for j := range jobs {
+        time.Sleep(5 * time.Millisecond)   // 模拟耗时
+        results <- j * 2
+    }
+}
+
+func main() {
+    jobs := make(chan int, 10)
+    results := make(chan int, 10)
+
+    // 3 个 worker
+    var wg sync.WaitGroup
+    for w := 1; w <= 3; w++ {
+        wg.Add(1)
+        go worker(w, jobs, results, &wg)
+    }
+
+    // 9 个任务
+    for j := 1; j <= 9; j++ {
+        jobs <- j
+    }
+    close(jobs)
+
+    // 等 worker 全部退出再关结果 channel
+    go func() { wg.Wait(); close(results) }()
+
+    sum := 0
+    for r := range results {
+        sum += r
+    }
+    fmt.Println("总和：", sum)   // 1+2+...+9 × 2 = 90
+}`}
+  expectedOutput={`总和： 90`}
+/>
+
+## 6. 并发安全的"任务并发执行器"
+
+<Playground
+  language="go"
+  id="go-11-fanin"
+  title="Fan-in 合并"
+  code={`package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+// 多个 goroutine 产生数据，合并到一个 channel
+func fanIn(chans ...<-chan string) <-chan string {
+    out := make(chan string)
+    var wg sync.WaitGroup
+    for _, c := range chans {
+        wg.Add(1)
+        go func(c <-chan string) {
+            defer wg.Done()
+            for v := range c {
+                out <- v
+            }
+        }(c)
+    }
+    go func() { wg.Wait(); close(out) }()
+    return out
+}
+
+func produce(name string, n int) <-chan string {
+    c := make(chan string)
+    go func() {
+        defer close(c)
+        for i := 0; i < n; i++ {
+            time.Sleep(5 * time.Millisecond)
+            c <- fmt.Sprintf("%s-%d", name, i)
+        }
+    }()
+    return c
+}
+
+func main() {
+    out := fanIn(produce("A", 3), produce("B", 3), produce("C", 3))
+    for msg := range out {
+        fmt.Println(msg)
+    }
+}`}
+  expectedOutput={`A-0
+C-0
+B-0
+A-1
+B-1
+C-1
+A-2
+B-2
+C-2`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-11-exercise"
+  title="并发求和"
+  code={`// 任务：把 [1, 2, 3, ..., 100] 分给 4 个 worker 求和，最后合并
+// 1. 用 jobs channel 派发任务（每个 worker 拿到一段区间）
+// 2. 用 results channel 收集部分和
+// 3. 主 goroutine 求总和并打印
+// 期望结果：5050
+
+package main
+
+import (
+    "fmt"
+    "sync"
+)
+
+func main() {
+    const workers = 4
+    const total = 100
+
+    jobs := make(chan [2]int, workers)
+    results := make(chan int, workers)
+
+    var wg sync.WaitGroup
+    for w := 0; w < workers; w++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for r := range jobs {
+                s := 0
+                for i := r[0]; i <= r[1]; i++ {
+                    s += i
+                }
+                results <- s
+            }
+        }()
+    }
+
+    // 划分区间
+    step := total / workers
+    for i := 0; i < workers; i++ {
+        lo := i*step + 1
+        hi := (i + 1) * step
+        if i == workers-1 {
+            hi = total
+        }
+        jobs <- [2]int{lo, hi}
+    }
+    close(jobs)
+
+    go func() { wg.Wait(); close(results) }()
+
+    sum := 0
+    for s := range results {
+        sum += s
+    }
+    fmt.Println("sum =", sum)
+}
+`}
+  expectedOutput={`sum = 5050`}
+/>
+
+## 小结
+
+- ✅ `go` 启动 goroutine（轻量线程）
+- ✅ channel：`make(chan T)` 无缓冲，`make(chan T, n)` 有缓冲
+- ✅ 发送方负责 `close(ch)`，接收方用 `for v := range ch` 或 `ok` 检测
+- ✅ `select` 多路复用 + `time.After` 超时
+- ✅ `sync.WaitGroup` 等一组 goroutine
+- ✅ `sync.Mutex` 保护共享状态；用 `go run -race` 检测
+- ✅ Worker Pool 模式：固定 N 个 worker 处理无限任务流
+- ✅ Fan-in 模式：多个 channel 合并到一个
+
+下一章 **泛型**。

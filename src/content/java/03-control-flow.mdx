@@ -1,0 +1,192 @@
+---
+title: 流程控制
+order: 3
+description: if/else、switch、for、while、do-while、增强 for
+---
+
+# 流程控制
+
+## 1. `if / else`
+
+<Playground
+  language="java"
+  id="java-03-if"
+  title="成绩分级"
+  code={`public class Main {
+    public static void main(String[] args) {
+        int score = 85;
+        char grade;
+        if (score >= 90)      grade = 'A';
+        else if (score >= 80) grade = 'B';
+        else if (score >= 70) grade = 'C';
+        else if (score >= 60) grade = 'D';
+        else                  grade = 'F';
+        System.out.println("分数 " + score + " -> " + grade);
+    }
+}`}
+  expectedOutput={`分数 85 -> B`}
+/>
+
+## 2. 三元运算符
+
+```java
+String status = (age >= 18) ? "成年" : "未成年";
+```
+
+## 3. `switch`（Java 14+ 箭头语法）
+
+<Playground
+  language="java"
+  id="java-03-switch"
+  title="switch 箭头语法"
+  code={`public class Main {
+    public static void main(String[] args) {
+        int day = 3;
+        String name = switch (day) {
+            case 1, 2, 3, 4, 5 -> "工作日";
+            case 6, 7          -> "周末";
+            default            -> "无效";
+        };
+        System.out.println(day + " -> " + name);
+    }
+}`}
+  expectedOutput={`3 -> 工作日`}
+/>
+
+<Callout type="tip" title="箭头语法不再需要 break">
+Java 14 引入 `case x -> ...`，每个 case 只执行匹配的分支，**不需要 break**。传统 `case x: ... break;` 仍可用。
+</Callout>
+
+## 4. `for` 循环
+
+<Playground
+  language="java"
+  id="java-03-for"
+  title="for 循环"
+  code={`public class Main {
+    public static void main(String[] args) {
+        // 标准 for
+        for (int i = 0; i < 5; i++) {
+            System.out.print(i + " ");
+        }
+        System.out.println();
+
+        // 增强 for（for-each）
+        int[] nums = {10, 20, 30};
+        for (int n : nums) {
+            System.out.print(n + " ");
+        }
+        System.out.println();
+    }
+}`}
+  expectedOutput={`0 1 2 3 4 \n10 20 30 `}
+/>
+
+## 5. `while` 与 `do-while`
+
+<Playground
+  language="java"
+  id="java-03-while"
+  title="while vs do-while"
+  code={`public class Main {
+    public static void main(String[] args) {
+        // while：先判断再执行
+        int i = 0;
+        while (i < 3) {
+            System.out.print(i++ + " ");
+        }
+        System.out.println();
+
+        // do-while：先执行一次再判断
+        int j = 10;
+        do {
+            System.out.println("至少执行一次: j = " + j);
+        } while (j < 3);
+    }
+}`}
+  expectedOutput={`0 1 2 \n至少执行一次: j = 10`}
+/>
+
+## 6. `break` 与 `continue`
+
+<Playground
+  language="java"
+  id="java-03-break"
+  title="break / continue / 带标签 break"
+  code={`public class Main {
+    public static void main(String[] args) {
+        // 找第一个 7 的倍数
+        for (int n = 1; n < 100; n++) {
+            if (n % 7 == 0) {
+                System.out.println("找到: " + n);
+                break;
+            }
+        }
+
+        // 跳过偶数
+        for (int n = 1; n <= 10; n++) {
+            if (n % 2 == 0) continue;
+            System.out.print(n + " ");
+        }
+        System.out.println();
+
+        // 带标签的 break（跳出多层循环）
+        outer:
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                if (i == 1 && j == 1) break outer;
+                System.out.printf("(%d,%d) ", i, j);
+            }
+        }
+        System.out.println();
+    }
+}`}
+  expectedOutput={`找到: 7\n1 3 5 7 9 \n(0,0) (0,1) (0,2) (1,0)`}
+/>
+
+## 7. 实战：九九乘法表
+
+<Playground
+  language="java"
+  id="java-03-99"
+  title="九九乘法表"
+  code={`public class Main {
+    public static void main(String[] args) {
+        for (int i = 1; i <= 9; i++) {
+            for (int j = 1; j <= i; j++) {
+                System.out.printf("%d*%d=%-3d", j, i, j * i);
+            }
+            System.out.println();
+        }
+    }
+}`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-03-exercise"
+  title="FizzBuzz"
+  code={`// 任务：打印 1~15，Fizz/Buzz/FizzBuzz
+// 3 倍数 -> Fizz；5 倍数 -> Buzz；3 和 5 公倍数 -> FizzBuzz
+// 期望：
+//   1 2 Fizz 4 Buzz Fizz 7 8 Fizz Buzz 11 Fizz 13 14 FizzBuzz
+
+public class Main {
+    public static void main(String[] args) {
+        // 补全代码
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ `if/else if/else`
+- ✅ Java 14+ `switch (x) { case a -> ... }`
+- ✅ `for` / 增强 `for` / `while` / `do-while`
+- ✅ `break` 可带标签跳出多层循环
+- ✅ `continue` 跳过本轮
+
+下一章 **方法**。

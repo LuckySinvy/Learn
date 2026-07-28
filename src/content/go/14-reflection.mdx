@@ -1,0 +1,367 @@
+---
+title: 反射
+order: 14
+description: reflect.TypeOf/ValueOf、结构体 tag、动态调用
+---
+
+# 反射
+
+反射（reflection）是程序在**运行时**检查自身结构的能力。Go 通过 `reflect` 包提供。常见用途：JSON 序列化、ORM、依赖注入、配置绑定。
+
+> **Go 谚语**：*Reflection is never clear.* 反射强大但晦涩，能不反射就不反射。
+
+## 1. 两个核心类型
+
+- `reflect.Type`：类型信息（方法、字段、tag）
+- `reflect.Value`：值信息（具体值、可修改性）
+
+<Playground
+  language="go"
+  id="go-14-basic"
+  title="反射入门"
+  code={`package main
+
+import (
+    "fmt"
+    "reflect"
+)
+
+func main() {
+    var x float64 = 3.14
+
+    t := reflect.TypeOf(x)   // 类型
+    v := reflect.ValueOf(x)  // 值
+    fmt.Println("类型：", t)         // float64
+    fmt.Println("值：  ", v)         // 3.14
+    fmt.Println("Kind：", t.Kind()) // float64（基础类型分类）
+
+    // 互相转换
+    fmt.Println("v.Float() =", v.Float())
+    fmt.Printf("t == float64? %v\n", t == reflect.TypeOf(0.0))
+}`}
+  expectedOutput={`类型： float64
+值：   3.14
+Kind： float64
+v.Float() = 3.14
+t == float64? true`}
+/>
+
+<Callout type="info" title="Kind vs Type">
+- `Type` 是**具体类型**（如 `MyStruct`）
+- `Kind` 是**基础分类**（如 `struct`、`int`、`slice`）
+- 同一 Kind 的不同 Type 不能互相赋值
+</Callout>
+
+## 2. 反射结构体
+
+<Playground
+  language="go"
+  id="go-14-struct"
+  title="反射结构体字段"
+  code={`package main
+
+import (
+    "fmt"
+    "reflect"
+)
+
+type User struct {
+    Name  string \`json:"name" validate:"required"\`
+    Age   int    \`json:"age"\`
+    Email string \`json:"email,omitempty"\`
+}
+
+func inspect(u any) {
+    t := reflect.TypeOf(u)
+    v := reflect.ValueOf(u)
+
+    fmt.Printf("类型：%s，字段数：%d\n", t.Name(), t.NumField())
+    for i := 0; i < t.NumField(); i++ {
+        f := t.Field(i)
+        fmt.Printf("  %s: type=%s json=%q validate=%q value=%v\n",
+            f.Name, f.Type, f.Tag.Get("json"),
+            f.Tag.Get("validate"), v.Field(i))
+    }
+}
+
+func main() {
+    inspect(User{Name: "Alice", Age: 30, Email: "a@b.com"})
+}`}
+  expectedOutput={`类型：User，字段数：3
+  Name: type=string json="name" validate="required" value=Alice
+  Age: type=int json="age" validate="" value=30
+  Email: type=string json="email,omitempty" validate="" value=a@b.com`}
+/>
+
+<Callout type="tip" title="Tag 的格式">
+```go
+\`json:"name" validate:"required"\`
+```
+`f.Tag.Get("json")` 取 `json:"..."` 的值；`f.Tag.Lookup` 还能判断是否存在。
+</Callout>
+
+## 3. 反射修改值
+
+要修改原对象，必须传**指针**。
+
+<Playground
+  language="go"
+  id="go-14-modify"
+  title="反射修改值"
+  code={`package main
+
+import (
+    "fmt"
+    "reflect"
+)
+
+func setField(obj any, name string, value any) error {
+    v := reflect.ValueOf(obj)
+    if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
+        return fmt.Errorf("必须是 *Struct 指针")
+    }
+    f := v.Elem().FieldByName(name)
+    if !f.IsValid() {
+        return fmt.Errorf("没有字段 %s", name)
+    }
+    if !f.CanSet() {
+        return fmt.Errorf("字段 %s 不可设置", name)
+    }
+    f.Set(reflect.ValueOf(value))
+    return nil
+}
+
+type User struct {
+    Name string
+    Age  int
+}
+
+func main() {
+    u := User{Name: "Alice", Age: 30}
+    fmt.Println("改前：", u)
+    if err := setField(&u, "Age", 31); err != nil {
+        fmt.Println("错误：", err)
+    }
+    fmt.Println("改后：", u)
+}`}
+  expectedOutput={`改前： {Alice 30}
+改后： {Alice 31}`}
+/>
+
+<Callout type="warn" title="CanSet 的要求">
+要 `Set` 成功：
+1. 必须传**指针**（让 reflect 拿到可寻址的 value）
+2. 字段必须是**可导出**的（首字母大写）
+3. `f.CanSet()` 必须返回 true
+</Callout>
+
+## 4. 反射调用方法
+
+<Playground
+  language="go"
+  id="go-14-call"
+  title="反射调用方法"
+  code={`package main
+
+import (
+    "fmt"
+    "reflect"
+)
+
+type Calc struct{ X, Y int }
+func (c Calc) Sum() int           { return c.X + c.Y }
+func (c *Calc) Set(x, y int)      { c.X, c.Y = x, y }
+
+func main() {
+    c := Calc{X: 3, Y: 4}
+    v := reflect.ValueOf(c)
+
+    // 反射调用 Sum()
+    sum := v.MethodByName("Sum").Call(nil)
+    fmt.Println("Sum:", sum[0].Int())   // 7
+
+    // 反射调用 Set(x, y)，需要 *Calc
+    pv := reflect.ValueOf(&c)
+    args := []reflect.Value{
+        reflect.ValueOf(10),
+        reflect.ValueOf(20),
+    }
+    pv.MethodByName("Set").Call(args)
+    fmt.Println("改后 c:", c)        // {10 20}
+    fmt.Println("再次 Sum:", c.Sum())  // 30
+}`}
+  expectedOutput={`Sum: 7
+改后 c: {10 20}
+再次 Sum: 30`}
+/>
+
+## 5. 反射 slice / map
+
+<Playground
+  language="go"
+  id="go-14-slice-map"
+  title="反射 slice 与 map"
+  code={`package main
+
+import (
+    "fmt"
+    "reflect"
+)
+
+func main() {
+    // slice
+    s := []int{1, 2, 3}
+    sv := reflect.ValueOf(s)
+    fmt.Println("len:", sv.Len())
+    sv.Index(1).SetInt(20)   // 修改 s[1]
+    fmt.Println("改后 s:", s)
+
+    // map
+    m := map[string]int{"a": 1, "b": 2}
+    mv := reflect.ValueOf(m)
+    for _, k := range mv.MapKeys() {
+        fmt.Printf("  %s = %d\n", k, mv.MapIndex(k))
+    }
+    // 设置 map 值
+    mv.SetMapIndex(reflect.ValueOf("c"), reflect.ValueOf(3))
+    fmt.Println("加 c 后:", m)
+}`}
+  expectedOutput={`len: 3
+改后 s: [1 20 3]
+  a = 1
+  b = 2
+加 c 后: map[a:1 b:2 c:3]`}
+/>
+
+## 6. 实战：通用 JSON→map 转换
+
+<Playground
+  language="go"
+  id="go-14-tomap"
+  title="结构体转 map"
+  code={`package main
+
+import (
+    "fmt"
+    "reflect"
+    "strings"
+)
+
+// StructToMap 用 json tag 作为 key
+func StructToMap(obj any) map[string]any {
+    out := make(map[string]any)
+    v := reflect.ValueOf(obj)
+    t := v.Type()
+    for i := 0; i < t.NumField(); i++ {
+        f := t.Field(i)
+        tag := f.Tag.Get("json")
+        if tag == "" {
+            tag = strings.ToLower(f.Name)
+        }
+        if idx := strings.Index(tag, ","); idx != -1 {
+            tag = tag[:idx]
+        }
+        out[tag] = v.Field(i).Interface()
+    }
+    return out
+}
+
+type User struct {
+    Name  string \`json:"name"\`
+    Age   int    \`json:"age"\`
+    Email string \`json:"email,omitempty"\`
+}
+
+func main() {
+    u := User{Name: "Alice", Age: 30}
+    m := StructToMap(u)
+    for k, v := range m {
+        fmt.Printf("%s: %v\n", k, v)
+    }
+}`}
+  expectedOutput={`email: 
+name: Alice
+age: 30`}
+/>
+
+<Callout type="info" title="实际场景">
+- ✅ `encoding/json`、`gorm`、`validator` 等库大量用反射
+- ✅ 配置热加载（YAML/JSON → struct）
+- ✅ 实现通用 ORM、DTO 转换器
+- ❌ 业务热路径别用反射（性能差，比直接调用慢 10-100x）
+</Callout>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-14-exercise"
+  title="简单 validator"
+  code={`// 任务：实现一个简易的 validator
+// 规则：检查所有有 validate:"required" 标记的字符串字段非空
+// 1. 写 Validate(obj any) []string，返回错误信息列表
+// 2. 用反射遍历字段
+// 3. 主函数测试：
+//    - User{Name: "Alice", Email: ""}    -> ["Email 不能为空"]
+//    - User{Name: "", Email: "a@b.com"}  -> ["Name 不能为空"]
+//    - User{Name: "Bob", Email: "c@d"}   -> []
+
+package main
+
+import (
+    "fmt"
+    "reflect"
+)
+
+type User struct {
+    Name  string \`validate:"required"\`
+    Email string \`validate:"required"\`
+}
+
+func Validate(obj any) []string {
+    var errs []string
+    v := reflect.ValueOf(obj)
+    t := v.Type()
+    for i := 0; i < t.NumField(); i++ {
+        f := t.Field(i)
+        if f.Tag.Get("validate") != "required" {
+            continue
+        }
+        if f.Type.Kind() != reflect.String {
+            continue
+        }
+        if v.Field(i).String() == "" {
+            errs = append(errs, fmt.Sprintf("%s 不能为空", f.Name))
+        }
+    }
+    return errs
+}
+
+func main() {
+    tests := []User{
+        {Name: "Alice", Email: ""},
+        {Name: "", Email: "a@b.com"},
+        {Name: "Bob", Email: "c@d"},
+    }
+    for _, u := range tests {
+        errs := Validate(u)
+        fmt.Printf("%+v -> %v\n", u, errs)
+    }
+}
+`}
+  expectedOutput={`{Alice } -> [Email 不能为空]
+{ a@b.com} -> [Name 不能为空]
+{Bob c@d} -> []`}
+/>
+
+## 小结
+
+- ✅ `reflect.TypeOf` 拿类型；`reflect.ValueOf` 拿值
+- ✅ `Kind` 是基础分类（struct/int/slice/...）
+- ✅ 用 `f.Tag.Get("json")` 取结构体 tag
+- ✅ 修改值必须传**指针** + 字段**可导出**
+- ✅ `v.MethodByName("Foo").Call(args)` 动态调用方法
+- ✅ 反射的真正威力：写**通用库**（JSON、ORM、validator）
+- ❌ 业务代码避免反射（性能差 + 难调试）
+
+下一章 **Web 服务**。

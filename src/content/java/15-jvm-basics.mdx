@@ -1,0 +1,258 @@
+---
+title: JVM 与 GC 基础
+order: 15
+description: JVM 架构、堆/栈/元空间、GC 算法、常用 JVM 工具
+---
+
+# JVM 与 GC 基础
+
+Java 程序不是「直接跑在 CPU 上」——它跑在 **JVM**（Java Virtual Machine）里。理解 JVM 就像了解你的「房」：哪块放家具（堆），哪块做厨房（栈），垃圾怎么回收。
+
+## 1. JVM 总体结构
+
+```
+┌──────────────────────────────────────────────────────┐
+│                Class Loader Subsystem                 │
+│   Bootstrap → Platform → Application  ClassLoader    │
+└──────────────┬───────────────────────────────────────┘
+               │  加载 .class
+               ▼
+┌──────────────────────────────────────────────────────┐
+│                  Runtime Data Areas                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐        │
+│  │  Heap    │  │  Stack   │  │ Metaspace    │        │
+│  │ (所有对象)│  │ (每线程) │  │ (类元数据)   │        │
+│  └──────────┘  └──────────┘  └──────────────┘        │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐        │
+│  │   PC     │  │ Native   │  │ Direct       │        │
+│  │ Register │  │ Method   │  │ Memory       │        │
+│  │ (每线程) │  │ Stack    │  │              │        │
+│  └──────────┘  └──────────┘  └──────────────┘        │
+└──────────────────────────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────────────┐
+│       Execution Engine: Interpreter + JIT + GC       │
+└──────────────────────────────────────────────────────┘
+```
+
+- **Heap**：所有对象 + 数组都在堆上。**GC 唯一真正管理的区域**。
+- **Stack**：每线程一个栈帧，存局部变量、方法调用。**没有 GC**，方法结束自动出栈。
+- **Metaspace**（Java 8+）：类的元数据、常量池。**取代**了 Java 7 之前的 PermGen。
+- **PC Register**：当前线程执行的字节码行号。
+- **Native Method Stack**：给 JNI 用的。
+
+<Callout type="info" title="Java 8 为什么把 PermGen 改成 Metaspace">
+PermGen 大小在启动时就固定（`-XX:MaxPermSize`），容易 `OutOfMemoryError: PermGen space`。
+Metaspace 改为**本地内存**（默认无上限），按需伸缩。代价：内存泄漏更难发现。
+</Callout>
+
+## 2. 堆内存分区
+
+```
+┌─────────────────── Heap ──────────────────────┐
+│              Young Generation                  │
+│   ┌───────┐   ┌────────┐   ┌────────┐         │
+│   │ Eden  │   │ S0     │   │ S1     │         │
+│   │ (新对象)│   │(幸存者) │   │(幸存者)│         │
+│   └───────┘   └────────┘   └────────┘         │
+├────────────────────────────────────────────────┤
+│              Old Generation                    │
+│             (长期存活对象)                       │
+└────────────────────────────────────────────────┘
+```
+
+- **绝大多数对象在 Eden 出生，活不过一次 GC**（称为「朝生夕死」）。
+- 活下来的进入 Survivor（S0/S1 来回复制），熬过一定次数（默认 15）晋升 Old。
+- Old 满了触发 **Full GC**——会**暂停所有应用线程**（Stop-The-World），要尽量避免。
+
+<Playground
+  language="java"
+  id="java-15-heap"
+  title="观察堆分配"
+  code={`public class Main {
+    public static void main(String[] args) {
+        Runtime rt = Runtime.getRuntime();
+        long max = rt.maxMemory();
+        long total = rt.totalMemory();
+        long free = rt.freeMemory();
+        System.out.printf("Max heap  = %.1f MB%n", max / 1024.0 / 1024);
+        System.out.printf("Total     = %.1f MB%n", total / 1024.0 / 1024);
+        System.out.printf("Used      = %.1f MB%n", (total - free) / 1024.0 / 1024);
+    }
+}`}
+  expectedOutput={`Max heap  = 依赖运行参数 MB\nTotal     = 依赖运行参数 MB\nUsed      = 依赖运行参数 MB`}
+/>
+
+> 上面的输出实际取决于 Playground 后端的 `-Xmx` 设置。生产里通常会显式指定。
+
+## 3. 常用 JVM 参数
+
+| 参数 | 作用 | 例子 |
+|---|---|---|
+| `-Xms` | 初始堆大小 | `-Xms512m` |
+| `-Xmx` | 最大堆大小 | `-Xmx2g` |
+| `-Xss` | 每线程栈大小 | `-Xss256k` |
+| `-XX:MaxMetaspaceSize` | 元空间上限 | `-XX:MaxMetaspaceSize=256m` |
+| `-XX:+PrintGCDetails` | 打印 GC 详情 | 调试用 |
+| `-Xlog:gc*` | 统一 GC 日志（Java 9+） | `-Xlog:gc:/tmp/gc.log` |
+
+```bash
+java -Xms256m -Xmx512m -Xlog:gc* Main
+```
+
+## 4. 四种常见 GC 算法
+
+| 收集器 | 算法 | 特点 | 适用 |
+|---|---|---|---|
+| Serial | 单线程、复制/标记-整理 | 简单、STW 长 | 客户端 |
+| Parallel | 多线程、复制/标记-整理 | 吞吐量优先 | 后台批处理 |
+| G1 | 分区、增量整理 | 停顿可控（默认 JDK 9+） | 通用 |
+| ZGC | 染色指针 + 读屏障 | 亚毫秒停顿 | 超大堆、低延迟 |
+
+<Playground
+  language="java"
+  id="java-15-gc"
+  title="当前 GC 名称"
+  code={`import java.util.*;
+
+public class Main {
+    public static void main(String[] args) {
+        List<java.lang.management.GarbageCollectorMXBean> gcs =
+            java.lang.management.ManagementFactory.getGarbageCollectorMXBeans();
+        for (var g : gcs) {
+            System.out.printf("%s: count=%d, time=%dms%n",
+                g.getName(), g.getCollectionCount(), g.getCollectionTime());
+        }
+    }
+}`}
+  expectedOutput={`G1 Young Generation: count=0, time=0ms\nG1 Old Generation: count=0, time=0ms`}
+/>
+
+> 实际输出取决于 Playground 后端用哪个 GC。
+
+## 5. 引用类型与可达性
+
+GC 判断对象是否存活靠**可达性分析**——从 GC Roots 出发，引用链上不可达的对象会被回收。
+
+| 引用类型 | 回收时机 |
+|---|---|
+| 强引用 (`Object o = new Object()`) | 永不回收（除非引用断开） |
+| 软引用 (`SoftReference`) | 内存不够时回收（适合缓存） |
+| 弱引用 (`WeakReference`) | 下次 GC 必回收 |
+| 虚引用 (`PhantomReference`) | 用来跟踪对象被回收的通知 |
+
+<Playground
+  language="java"
+  id="java-15-soft"
+  title="软引用缓存"
+  code={`import java.lang.ref.*;
+import java.util.*;
+
+public class Main {
+    public static void main(String[] args) {
+        // 软引用：堆吃紧时回收
+        SoftReference<byte[]> ref = new SoftReference<>(new byte[1024 * 1024]);
+        System.out.println("拿到 1MB 数组? " + (ref.get() != null));
+
+        // 弱引用：HashMap 经典坑
+        WeakHashMap<String, Integer> map = new WeakHashMap<>();
+        String key = "temp";
+        map.put(key, 1);
+        key = null;                 // key 不再强引用
+        System.gc();                // 提示 JVM 跑一次 GC
+        System.out.println("WeakHashMap 仍有 " + map.size() + " 个 key");
+    }
+}`}
+  expectedOutput={`拿到 1MB 数组? true\nWeakHashMap 仍有 0 个 key`}
+/>
+
+## 6. 命令行工具巡礼
+
+```bash
+# 1. jps：列出本机 Java 进程
+$ jps
+12345 Main
+12350 MyApp
+
+# 2. jstat：看 GC / 类加载
+$ jstat -gc 12345
+ S0C    S1C    S0U    S1U      EC       EU        OC         OU       MC     MU
+ 0.0    0.0    0.0    0.0   65536.0  32768.0   131072.0   16384.0   4864.0  3872.5
+
+# 3. jstack：线程栈（排查死锁）
+$ jstack 12345 | grep -A 20 "BLOCKED"
+
+# 4. jmap：堆信息
+$ jmap -heap 12345
+$ jmap -histo:live 12345 | head -20    # 占用最多的对象
+
+# 5. jcmd：综合工具（推荐）
+$ jcmd 12345 GC.heap_info
+$ jcmd 12345 Thread.print
+$ jcmd 12345 VM.flags
+```
+
+<Callout type="tip" title="现代替代品">
+JDK 8u40+ 之后推荐用 **JDK Mission Control (JMC)** + **JFR**（Java Flight Recorder），零性能损耗采样生产环境。命令行里 `jcmd <pid> JFR.start` 就能开。
+</Callout>
+
+## 7. 一个常见面试题：内存泄漏怎么排查
+
+```bash
+# 1. 找到可疑进程
+jps
+
+# 2. 抓堆 dump（HProf 格式）
+jmap -dump:live,format=b,file=heap.hprof 12345
+
+# 3. 用 VisualVM / Eclipse MAT 打开
+#    - Leak Suspects 报告
+#    - 找 Retained Heap 最大的对象
+#    - 顺引用链看谁在持有它
+```
+
+Java 程序里**最常见的内存泄漏**：
+- 静态集合（`static Map`）忘记 remove
+- 监听器 / 回调忘了反注册
+- ThreadLocal 没 `remove()`（线程池场景下尤其致命）
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-15-exercise"
+  title="查看自己进程的运行时信息"
+  code={`// 任务：用 ManagementFactory 打印以下信息：
+// 1. JVM 版本与厂商
+// 2. 当前进程 PID（用 getName() 第一段）
+// 3. 启动至今的 JVM uptime（毫秒）
+// 4. 操作系统 load average
+// 5. 可用处理器数
+// 期望输出形如：
+//   java.version=21
+//   pid=12345
+//   uptime=1234 ms
+//   load=0.12
+//   processors=8
+
+import java.lang.management.*;
+
+public class Main {
+    public static void main(String[] args) {
+        // 补全
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ JVM 内存：堆（对象）+ 栈（局部变量）+ 元空间（类元数据）
+- ✅ 堆分区：Young（Eden + Survivor）+ Old，新对象大多在 Young 死掉
+- ✅ 常用参数 `-Xms` / `-Xmx` / `-Xss`
+- ✅ GC 收集器：Serial / Parallel / G1（默认）/ ZGC
+- ✅ 引用强度：强 > 软 > 弱 > 虚
+- ✅ 工具链：jps / jstat / jstack / jmap / jcmd + JFR
+
+下一章 **Maven 与 JUnit 5**：工程化基础。

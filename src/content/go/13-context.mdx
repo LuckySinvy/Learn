@@ -1,0 +1,372 @@
+---
+title: Context
+order: 13
+description: context.Context、超时取消、跨 goroutine 传播
+---
+
+# Context
+
+`context.Context` 是 Go 用来**跨 goroutine 传递请求范围数据**的标准机制：超时、取消信号、键值对。Go 的服务端、客户端库都依赖它。
+
+## 1. 为什么需要 Context
+
+设想一个 HTTP 请求处理函数启动了 5 个 goroutine 查询数据库，客户端中途断开了——这 5 个查询还应该继续跑吗？**不应该**。Context 就是用来传达"取消信号"的。
+
+<Callout type="info" title="Context 携带的两类信息">
+1. **取消信号**（cancel、timeout、deadline）——传递给所有子 goroutine
+2. **请求范围数据**（traceID、userID）——通过 key-value 携带
+</Callout>
+
+## 2. 根 Context
+
+<Playground
+  language="go"
+  id="go-13-root"
+  title="根 Context"
+  code={`package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+func main() {
+    // Background：所有 Context 的根
+    bg := context.Background()
+
+    // TODO：占位用，不确定用哪个时用 TODO
+    todo := context.TODO()
+
+    fmt.Println("bg.Err():", bg.Err())      // <nil>，永不取消
+    fmt.Println("todo.Err():", todo.Err())  // <nil>
+
+    // 简单用法
+    ctx, cancel := context.WithCancel(bg)
+    cancel()   // 立刻取消
+    fmt.Println("canceled?", ctx.Err())     // context canceled
+    _ = time.Now
+}`}
+  expectedOutput={`bg.Err(): <nil>
+todo.Err(): <nil>
+canceled? context canceled`}
+/>
+
+<Callout type="tip" title="Background vs TODO">
+- `Background()`：在 `main`、初始化、请求处理入口使用
+- `TODO()`：在不确定该用哪个 Context 时临时使用
+- 二者本质一样，只是表达意图不同
+</Callout>
+
+## 3. `WithCancel`：手动取消
+
+<Playground
+  language="go"
+  id="go-13-cancel"
+  title="WithCancel"
+  code={`package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+func worker(ctx context.Context, id int) {
+    for {
+        select {
+        case <-ctx.Done():
+            fmt.Printf("worker %d 收到取消：%v\n", id, ctx.Err())
+            return
+        default:
+            fmt.Printf("worker %d 工作中…\n", id)
+            time.Sleep(20 * time.Millisecond)
+        }
+    }
+}
+
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    for i := 1; i <= 2; i++ {
+        go worker(ctx, i)
+    }
+    time.Sleep(50 * time.Millisecond)
+    cancel()              // 通知所有 goroutine 退出
+    time.Sleep(30 * time.Millisecond)  // 等子 goroutine 打印
+}`}
+  expectedOutput={`worker 1 工作中…
+worker 2 工作中…
+worker 1 工作中…
+worker 2 工作中…
+worker 1 收到取消：context canceled
+worker 2 收到取消：context canceled`}
+/>
+
+<Callout type="warn" title="记得 cancel">
+`cancel` 是一个函数对象，必须调用（通常 `defer cancel()`）来释放 Context 占用的资源。
+</Callout>
+
+## 4. `WithTimeout` / `WithDeadline`：自动超时
+
+<Playground
+  language="go"
+  id="go-13-timeout"
+  title="WithTimeout"
+  code={`package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+func slowOp(ctx context.Context) error {
+    select {
+    case <-time.After(100 * time.Millisecond):
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+}
+
+func main() {
+    // 30ms 超时，但操作要 100ms
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+    defer cancel()
+
+    err := slowOp(ctx)
+    fmt.Println("结果：", err)
+
+    // WithDeadline：指定绝对时间
+    deadline := time.Now().Add(50 * time.Millisecond)
+    ctx2, cancel2 := context.WithDeadline(context.Background(), deadline)
+    defer cancel2()
+    fmt.Println("deadline:", ctx2.Deadline())
+}`}
+  expectedOutput={`结果： context deadline exceeded
+deadline: 2026-07-28 14:00:00.123 +0000 UTC m=+0.050`}
+/>
+
+<Callout type="info" title={`WithTimeout = WithDeadline + time.Duration`}>
+`WithTimeout` 内部就是 `WithDeadline(parent, time.Now().Add(d))`。
+</Callout>
+
+## 5. `WithValue`：传递请求范围数据
+
+<Playground
+  language="go"
+  id="go-13-value"
+  title="WithValue"
+  code={`package main
+
+import (
+    "context"
+    "fmt"
+)
+
+// 推荐用自定义类型做 key，避免冲突
+type ctxKey string
+const userKey ctxKey = "userID"
+
+func WithUserID(ctx context.Context, id int) context.Context {
+    return context.WithValue(ctx, userKey, id)
+}
+
+func UserID(ctx context.Context) (int, bool) {
+    id, ok := ctx.Value(userKey).(int)
+    return id, ok
+}
+
+func handleReq(ctx context.Context) {
+    if uid, ok := UserID(ctx); ok {
+        fmt.Println("处理用户：", uid)
+    } else {
+        fmt.Println("未登录")
+    }
+}
+
+func main() {
+    ctx := WithUserID(context.Background(), 42)
+    handleReq(ctx)
+    handleReq(context.Background())
+}`}
+  expectedOutput={`处理用户： 42
+未登录`}
+/>
+
+<Callout type="warn" title="WithValue 注意事项">
+- key 必须是**可比较**且**不冲突**的——别用 `string`！用自定义类型
+- value 应该**小且不可变**（ID、token）
+- **不要**用 Context 传递可选参数——那是函数参数的活
+</Callout>
+
+## 6. Context 传播
+
+Context 必须**从父 goroutine 显式传给子 goroutine**。
+
+<Playground
+  language="go"
+  id="go-13-propagate"
+  title="Context 传播"
+  code={`package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+// 三层调用，ctx 一路传下去
+func level3(ctx context.Context) {
+    select {
+    case <-time.After(20 * time.Millisecond):
+        fmt.Println("level3 成功")
+    case <-ctx.Done():
+        fmt.Println("level3 取消：", ctx.Err())
+    }
+}
+func level2(ctx context.Context) { level3(ctx) }
+func level1(ctx context.Context) { level2(ctx) }
+
+func main() {
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+    defer cancel()
+    level1(ctx)
+}`}
+  expectedOutput={`level3 取消： context deadline exceeded`}
+/>
+
+<Callout type="tip" title="Context 在参数列表中的位置">
+惯例：`ctx` 作为**第一个参数**。例如：
+```go
+func DoSomething(ctx context.Context, arg1 string, arg2 int) error
+```
+库函数（`http.NewRequestWithContext`、`db.QueryContext`）都遵守这个约定。
+</Callout>
+
+## 7. 实战：带超时的数据库查询模拟
+
+<Playground
+  language="go"
+  id="go-13-db"
+  title="模拟带超时的查询"
+  code={`package main
+
+import (
+    "context"
+    "errors"
+    "fmt"
+    "time"
+)
+
+// 模拟一个慢查询
+func queryDB(ctx context.Context, sql string) (string, error) {
+    // 模拟 50ms 延迟
+    select {
+    case <-time.After(50 * time.Millisecond):
+        return "rows: 42", nil
+    case <-ctx.Done():
+        return "", ctx.Err()
+    }
+}
+
+func main() {
+    // 场景 1：足够的时间
+    ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+    defer cancel()
+    res, err := queryDB(ctx, "SELECT * FROM users")
+    fmt.Println("场景1：", res, err)
+
+    // 场景 2：超时
+    ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Millisecond)
+    defer cancel2()
+    _, err = queryDB(ctx2, "SELECT * FROM users")
+    fmt.Println("场景2：", err)
+    fmt.Println("是否超时？", errors.Is(err, context.DeadlineExceeded))
+}`}
+  expectedOutput={`场景1： rows: 42 <nil>
+场景2： context deadline exceeded
+是否超时？ true`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-13-exercise"
+  title="可控 goroutine 池"
+  code={`// 任务：实现一个可控的 worker 函数
+// 1. 接收 ctx 和 id
+// 2. 每 10ms 打印一次 "worker N tick"
+// 3. ctx 被取消时打印 "worker N 停止" 并返回
+//
+// 在 main 中：
+// - 启动 3 个 worker
+// - 60ms 后 cancel
+// - 等待 30ms 让 worker 打印完
+
+package main
+
+import (
+    "context"
+    "fmt"
+    "sync"
+    "time"
+)
+
+func worker(ctx context.Context, id int, wg *sync.WaitGroup) {
+    defer wg.Done()
+    ticker := time.NewTicker(10 * time.Millisecond)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            fmt.Printf("worker %d 停止\n", id)
+            return
+        case <-ticker.C:
+            fmt.Printf("worker %d tick\n", id)
+        }
+    }
+}
+
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    var wg sync.WaitGroup
+    for i := 1; i <= 3; i++ {
+        wg.Add(1)
+        go worker(ctx, i, &wg)
+    }
+    time.Sleep(60 * time.Millisecond)
+    cancel()
+    wg.Wait()
+}
+`}
+  expectedOutput={`worker 2 tick
+worker 1 tick
+worker 3 tick
+worker 2 tick
+worker 1 tick
+worker 3 tick
+worker 2 tick
+worker 1 tick
+worker 3 tick
+worker 2 tick
+worker 1 tick
+worker 3 tick
+worker 1 停止
+worker 2 停止
+worker 3 停止`}
+/>
+
+## 小结
+
+- ✅ Context 跨 goroutine 传递**取消信号**和**键值数据**
+- ✅ `Background()` 是根；`TODO()` 是不确定时的占位
+- ✅ `WithCancel`：手动 `cancel()`
+- ✅ `WithTimeout` / `WithDeadline`：自动超时
+- ✅ `WithValue`：传递请求数据；key 用**自定义类型**
+- ✅ ctx 是函数**第一个参数**
+- ✅ 父 Context 取消，所有子 Context 自动取消
+- ✅ 用 `errors.Is(err, context.DeadlineExceeded)` 判断超时
+
+下一章 **反射**。

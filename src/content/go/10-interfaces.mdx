@@ -1,0 +1,406 @@
+---
+title: 接口
+order: 10
+description: 隐式实现、类型断言、组合、常见接口
+---
+
+# 接口
+
+接口是 Go 抽象能力的核心。Go 的接口是**隐式实现**的——任何类型只要实现了接口的全部方法，就"自动"满足该接口，无需 `implements` 关键字。
+
+## 1. 接口基础
+
+接口是一组方法签名的集合。零值是 `nil`。
+
+<Playground
+  language="go"
+  id="go-10-iface-basic"
+  title="接口基础"
+  code={`package main
+
+import "fmt"
+
+type Speaker interface {
+    Speak() string
+}
+
+type Dog struct{ Name string }
+func (d Dog) Speak() string { return d.Name + ": 汪！" }
+
+type Cat struct{ Name string }
+func (c Cat) Speak() string { return c.Name + ": 喵~" }
+
+func announce(s Speaker) {
+    fmt.Println(s.Speak())
+}
+
+func main() {
+    animals := []Speaker{
+        Dog{Name: "旺财"},
+        Cat{Name: "小花"},
+    }
+    for _, a := range animals {
+        announce(a)
+    }
+}`}
+  expectedOutput={`旺财: 汪！
+小花: 喵~`}
+/>
+
+<Callout type="info" title="隐式实现的好处">
+- 解耦：定义接口的包不需要依赖实现
+- 测试方便：可以临时写个 mock 实现
+- 鸭子类型：行为决定类型归属
+</Callout>
+
+## 2. 空接口 `any`
+
+空接口 `interface{}`（Go 1.18+ 可写为 `any`）没有任何方法，**所有类型都实现它**。常用于接受任意类型。
+
+<Playground
+  language="go"
+  id="go-10-empty"
+  title="空接口 any"
+  code={`package main
+
+import "fmt"
+
+func printAny(v any) {
+    fmt.Printf("值：%v，类型：%T\n", v, v)
+}
+
+func main() {
+    printAny(42)
+    printAny("hello")
+    printAny([]int{1, 2, 3})
+    printAny(nil)
+}`}
+  expectedOutput={`值：42，类型：int
+值：hello，类型：string
+值：[1 2 3]，类型：[]int
+值：<nil>，类型：<nil>`}
+/>
+
+<Callout type="warn" title="不要滥用 any">
+`any` 把类型检查推到了运行时。优先用具体接口（如 `io.Reader`），类型安全 + 文档自描述。
+</Callout>
+
+## 3. 类型断言与类型 switch
+
+接口变量背后是具体类型。**类型断言**把它转回具体类型。
+
+<Playground
+  language="go"
+  id="go-10-assert"
+  title="类型断言"
+  code={`package main
+
+import "fmt"
+
+func main() {
+    var x any = 42
+
+    // 带 ok 的安全断言
+    if n, ok := x.(int); ok {
+        fmt.Println("是 int：", n*2)
+    }
+
+    // 不带 ok 会 panic
+    s := x.(string)   // 危险
+    fmt.Println(s)     // 不会执行到这里
+}`}
+  expectedOutput={`是 int： 84
+panic: interface conversion: interface {} is int, not string`}
+/>
+
+> Playground 默认会展示 panic 信息，运行时会在 panic 处终止。
+
+### 类型 switch
+
+<Playground
+  language="go"
+  id="go-10-switch"
+  title="类型 switch"
+  code={`package main
+
+import "fmt"
+
+func describe(v any) string {
+    switch x := v.(type) {
+    case int:
+        return fmt.Sprintf("int=%d (×2=%d)", x, x*2)
+    case string:
+        return fmt.Sprintf("string=%q (len=%d)", x, len(x))
+    case bool:
+        if x { return "bool=true" }
+        return "bool=false"
+    default:
+        return fmt.Sprintf("其他类型：%T", x)
+    }
+}
+
+func main() {
+    for _, v := range []any{7, "hi", true, 3.14} {
+        fmt.Println(describe(v))
+    }
+}`}
+  expectedOutput={`int=7 (×2=14)
+string="hi" (len=2)
+bool=true
+其他类型：float64`}
+/>
+
+## 4. 接口组合（嵌入）
+
+接口可以嵌入其他接口，自动合并方法集。
+
+<Playground
+  language="go"
+  id="go-10-compose"
+  title="接口组合"
+  code={`package main
+
+import "fmt"
+
+type Reader interface {
+    Read(p []byte) (int, error)
+}
+type Writer interface {
+    Write(p []byte) (int, error)
+}
+type Closer interface {
+    Close() error
+}
+
+// 嵌入组合 = 三个方法
+type ReadWriteCloser interface {
+    Reader
+    Writer
+    Closer
+}
+
+type File struct{ Name string }
+func (f *File) Read(p []byte) (int, error)  { return len(p), nil }
+func (f *File) Write(p []byte) (int, error) { return len(p), nil }
+func (f *File) Close() error                { return nil }
+
+func use(rwc ReadWriteCloser) {
+    fmt.Printf("打开文件：%s\n", rwc.(*File).Name)
+}
+
+func main() {
+    f := &File{Name: "data.txt"}
+    use(f)
+}`}
+  expectedOutput={`打开文件：data.txt`}
+/>
+
+<Callout type="tip" title="小接口原则">
+Go 社区推崇**小接口**：1~3 个方法。`io.Reader`（1 个方法）、`io.Writer`（1 个方法）是典范。组合小接口比设计大接口更灵活。
+</Callout>
+
+## 5. 常见标准库接口
+
+### `error`
+
+<Playground
+  language="go"
+  id="go-10-error-iface"
+  title="error 接口"
+  code={`package main
+
+import "fmt"
+
+type MyError struct {
+    Code int
+    Msg  string
+}
+
+func (e *MyError) Error() string {
+    return fmt.Sprintf("[%d] %s", e.Code, e.Msg)
+}
+
+func divide(a, b int) (int, error) {
+    if b == 0 {
+        return 0, &MyError{Code: 400, Msg: "除数不能为零"}
+    }
+    return a / b, nil
+}
+
+func main() {
+    if v, err := divide(10, 0); err != nil {
+        fmt.Println("错误：", err)
+    } else {
+        fmt.Println("结果：", v)
+    }
+}`}
+  expectedOutput={`错误： [400] 除数不能为零`}
+/>
+
+### `fmt.Stringer`
+
+<Playground
+  language="go"
+  id="go-10-stringer"
+  title="Stringer 接口"
+  code={`package main
+
+import "fmt"
+
+type Color int
+
+const (
+    Red Color = iota
+    Green
+    Blue
+)
+
+func (c Color) String() string {
+    return [...]string{"红", "绿", "蓝"}[c]
+}
+
+func main() {
+    c := Green
+    fmt.Println("我喜欢的颜色是：", c)
+    fmt.Printf("类型：%T 值：%v\n", c, c)
+}`}
+  expectedOutput={`我喜欢的颜色是： 绿
+类型：main.Color 值：绿`}
+/>
+
+<Callout type="info" title="Stringer 妙用">
+只要实现 `String() string`，`fmt.Println` 和 `%v` 就会自动调用它。`time.Duration` 内部就用这个机制打印 `"1h30m"` 这种格式。
+</Callout>
+
+## 6. 接口的 nil 陷阱
+
+<Playground
+  language="go"
+  id="go-10-nil-trap"
+  title="接口 nil 陷阱"
+  code={`package main
+
+import "fmt"
+
+type I interface{ Foo() }
+
+type T struct{}
+func (t *T) Foo() {}
+
+func main() {
+    var p *T          // p 是 nil 指针
+    var i I = p       // i 不是 nil 接口（内部有类型信息）
+    if i != nil {
+        fmt.Println("i != nil，但调用会 panic！")
+    }
+    i.Foo()           // panic: nil pointer dereference
+}`}
+  expectedOutput={`i != nil，但调用会 panic！
+panic: runtime error: invalid memory address or nil pointer dereference`}
+/>
+
+> 关键：**接口值 == nil 当且仅当类型和值都为 nil**。
+
+## 7. 多态实战：Shape 接口
+
+<Playground
+  language="go"
+  id="go-10-shape"
+  title="多态 Shape"
+  code={`package main
+
+import (
+    "fmt"
+    "math"
+)
+
+type Shape interface {
+    Area() float64
+    Name() string
+}
+
+type Circle struct{ R float64 }
+func (c Circle) Area() float64 { return math.Pi * c.R * c.R }
+func (c Circle) Name() string  { return "圆形" }
+
+type Rect struct{ W, H float64 }
+func (r Rect) Area() float64 { return r.W * r.H }
+func (r Rect) Name() string  { return "矩形" }
+
+type Triangle struct{ B, H float64 }
+func (t Triangle) Area() float64 { return t.B * t.H / 2 }
+func (t Triangle) Name() string  { return "三角形" }
+
+func main() {
+    shapes := []Shape{
+        Circle{R: 2},
+        Rect{W: 3, H: 4},
+        Triangle{B: 4, H: 5},
+    }
+    for _, s := range shapes {
+        fmt.Printf("%s 面积 = %.2f\n", s.Name(), s.Area())
+    }
+}`}
+  expectedOutput={`圆形 面积 = 12.57
+矩形 面积 = 12.00
+三角形 面积 = 10.00`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="go"
+  id="go-10-exercise"
+  title="Stringer 链"
+  code={`// 任务：定义一个 LimitedString 类型，限制字符串最长 10 字符
+// 1. 实现 String() string 方法，超过 10 字符时返回前 10 字符 + "..."
+// 2. 实现 ToUpper() string 方法（同上但大写）
+// 3. 让 LimitedString 满足 fmt.Stringer
+
+package main
+
+import (
+    "fmt"
+    "strings"
+)
+
+type LimitedString string
+
+func (l LimitedString) String() string {
+    s := string(l)
+    if len([]rune(s)) > 10 {
+        // 按 rune 截断（避免半个汉字）
+        return string([]rune(s)[:10]) + "..."
+    }
+    return s
+}
+
+func (l LimitedString) ToUpper() string {
+    return strings.ToUpper(l.String())
+}
+
+func main() {
+    a := LimitedString("hello world")
+    b := LimitedString("你好世界 Go 语言教程")
+    fmt.Println(a)
+    fmt.Println(b)
+    fmt.Println(b.ToUpper())
+}
+`}
+  expectedOutput={`hello world
+你好世界 Go 语...
+你好世界 GO 语...`}
+/>
+
+## 小结
+
+- ✅ 接口是一组方法签名的集合
+- ✅ 隐式实现：实现方法即满足接口
+- ✅ `any` = `interface{}` 接受任意类型
+- ✅ 类型断言 `x.(T)` 和类型 switch 还原具体类型
+- ✅ 接口可嵌入组合，构造复杂接口
+- ✅ 小接口 + 接口组合 是 Go 风格
+- ✅ 常见接口：`error`、`fmt.Stringer`、`io.Reader`/`io.Writer`
+- ✅ 接口 nil 陷阱：内部类型不为 nil 时接口也不为 nil
+
+下一章 **并发编程**。

@@ -1,0 +1,274 @@
+---
+title: 类型提示
+order: 13
+description: type hints、Optional/Union/Any、dataclass、TypeVar/Generic
+---
+
+# 类型提示
+
+类型提示（Type Hints）让 Python 兼顾"动态语言的灵活"和"静态语言的可读"。Python **不会**在运行时强制检查类型，但 IDE、mypy、pyright 能基于提示给你更准确的自动补全和错误提示。
+
+## 1. 最基础的注解
+
+<Playground
+  language="python"
+  id="py-13-basic-annot"
+  title="变量与函数注解"
+  code={`# 变量注解
+name: str = "Alice"
+age: int = 30
+scores: list[int] = [85, 92, 78]
+profile: dict[str, int | str] = {"city": "北京", "zip": "100000"}
+
+# 函数注解
+def add(a: int, b: int) -> int:
+    return a + b
+
+def greet(name: str, excited: bool = False) -> str:
+    suffix = "!" if excited else "."
+    return f"Hi, {name}{suffix}"
+
+print(add(3, 4))
+print(greet("Alice", excited=True))
+
+# Python 3.10+ 可以直接写 int | str
+# 老版本需要 from __future__ import annotations
+def parse(s: str) -> int | None:
+    return int(s) if s.isdigit() else None
+
+print(parse("42"), parse("hi"))`}
+  expectedOutput={`7\nHi, Alice!\n42 None`}
+/>
+
+<Callout type="info" title="注解不强制！">
+```python
+def add(a: int, b: int) -> int: ...
+add("hi", "world")  # 运行时不会报错！
+```
+类型提示本质是**给工具看的文档**。要严格检查用 mypy / pyright。
+</Callout>
+
+## 2. `Optional` / `Union` / `Any`
+
+<Playground
+  language="python"
+  id="py-13-optional-union"
+  title="Optional 与 Union"
+  code={`from typing import Optional, Union, Any
+
+# Optional[X] = Union[X, None] = X | None
+def find_user(uid: int) -> Optional[dict]:
+    users = {1: {"name": "Alice"}, 2: {"name": "Bob"}}
+    return users.get(uid)
+
+print(find_user(1))
+print(find_user(99))
+
+# Union[A, B] = A | B
+def stringify(v: Union[int, float, str]) -> str:
+    return str(v)
+
+print(stringify(1), stringify(3.14), stringify("hi"))
+
+# Any: 不做类型检查（动态逃生口）
+def debug_print(x: Any) -> None:
+    print("debug:", x, type(x).__name__)
+
+debug_print(42)
+debug_print([1, 2, 3])
+debug_print({"k": "v"})`}
+  expectedOutput={`{'name': 'Alice'}\nNone\n1 3.14 hi\ndebug: 42 int\ndebug: [1, 2, 3] list\ndebug: {'k': 'v'} dict`}
+/>
+
+<Callout type="tip" title="优先用 | 而不是 Union">
+Python 3.10+ 支持 `int | str`、`list[int] | None` 这种写法，比 `Union[int, str]`、`Optional[list[int]]` 更短。需要兼容老版本就 `from __future__ import annotations`。
+</Callout>
+
+## 3. `dataclass` —— 少写一半的样板代码
+
+写"主要用来存数据"的类时，`@dataclass` 帮你自动生成 `__init__`、`__repr__`、`__eq__`：
+
+<Playground
+  language="python"
+  id="py-13-dataclass"
+  title="@dataclass"
+  code={`from dataclasses import dataclass, field
+from typing import List
+
+@dataclass
+class User:
+    name: str
+    age: int = 0
+    skills: List[str] = field(default_factory=list)
+
+    def introduce(self) -> str:
+        return f"我是 {self.name}, {self.age} 岁, 技能: {', '.join(self.skills) or '无'}"
+
+u1 = User("Alice", 30, ["Python", "Go"])
+u2 = User("Bob")
+u3 = User("Alice", 30, ["Python", "Go"])
+
+print(u1.introduce())
+print(u2.introduce())
+print("u1 == u3:", u1 == u3)        # 自动 __eq__
+print(u1)                            # 自动 __repr__`}
+  expectedOutput={`我是 Alice, 30 岁, 技能: Python, Go\n我是 Bob, 0 岁, 技能: 无\nu1 == u3: True\nUser(name='Alice', age=30, skills=['Python', 'Go'])`}
+/>
+
+<Callout type="warn" title="可变默认值必须用 default_factory">
+```python
+@dataclass
+class Bad:
+    items: list[int] = []   # 错！所有实例共享同一个 list
+```
+正解：`items: list[int] = field(default_factory=list)`。
+</Callout>
+
+<Playground
+  language="python"
+  id="py-13-dataclass-frozen"
+  title="frozen 与 asdict"
+  code={`from dataclasses import dataclass, asdict, astuple
+import json
+
+@dataclass(frozen=True)        # 实例不可变（哈希可作 dict key）
+class Point:
+    x: float
+    y: float
+
+p = Point(3, 4)
+print(p, hash(p))
+try:
+    p.x = 99
+except Exception as e:
+    print("frozen 阻止修改:", type(e).__name__)
+
+# dataclass <-> dict
+print(asdict(p))
+print(astuple(p))
+
+# dataclass 直接喂给 json.dumps
+@dataclass
+class Product:
+    name: str
+    price: float
+
+prod = Product("笔记本", 12.5)
+print(json.dumps(asdict(prod), ensure_ascii=False))`}
+  expectedOutput={`Point(x=3, y=4) 7\nfrozen 阻止修改: FrozenInstanceError\n{'x': 3, 'y': 4}\n(3, 4)\n{"name": "笔记本", "price": 12.5}`}
+/>
+
+## 4. `TypeVar` 与 `Generic`
+
+当你想写一个"对任意类型都成立"的函数或类（如容器），用 `TypeVar`：
+
+<Playground
+  language="python"
+  id="py-13-typevar"
+  title="TypeVar 入门"
+  code={`from typing import TypeVar, Sequence
+
+T = TypeVar("T")            # 通用类型变量
+
+def first(items: Sequence[T]) -> T | None:
+    return items[0] if items else None
+
+print(first([1, 2, 3]))            # 推断为 int
+print(first(["a", "b", "c"]))      # 推断为 str
+print(first([]))                   # None
+
+# 约束型 TypeVar
+from typing import TypeVar
+
+Number = TypeVar("Number", int, float)   # 必须是 int 或 float
+
+def double(x: Number) -> Number:
+    return x * 2
+
+print(double(3), double(1.5))`}
+  expectedOutput={`1\na\nNone\n6 3.0`}
+/>
+
+## 5. 泛型类
+
+<Playground
+  language="python"
+  id="py-13-generic"
+  title="Generic 泛型类"
+  code={`from typing import Generic, TypeVar, Iterator
+
+T = TypeVar("T")
+
+class Stack(Generic[T]):
+    """一个泛型栈"""
+    def __init__(self) -> None:
+        self._items: list[T] = []
+
+    def push(self, item: T) -> None:
+        self._items.append(item)
+
+    def pop(self) -> T:
+        return self._items.pop()
+
+    def peek(self) -> T:
+        return self._items[-1]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[T]:
+        return iter(reversed(self._items))
+
+# 装 int
+s1: Stack[int] = Stack()
+s1.push(1); s1.push(2); s1.push(3)
+print("s1 pop:", s1.pop(), "len:", len(s1))
+
+# 装 str
+s2: Stack[str] = Stack()
+s2.push("a"); s2.push("b")
+print("s2:", list(s2))`}
+  expectedOutput={`s1 pop: 3 len: 2\ns2: ['b', 'a']`}
+/>
+
+## 🎯 练习
+
+用 `@dataclass` 实现一个 `Book` 数据类，包含 `title: str`、`author: str`、`year: int = 2024`。再写一个泛型函数 `latest(books: list[T]) -> T | None`，返回"year 最大的那本"（用 `getattr` 或 dataclass 的 `dataclasses.astuple` 取 year 也行）。处理空列表返回 `None`。
+
+<Playground
+  language="python"
+  id="py-13-exercise"
+  title="Book + latest()"
+  code={`from dataclasses import dataclass
+
+@dataclass
+class Book:
+    # 你的代码
+    pass
+
+# latest 应该返回 year 最大的那本
+def latest(books):
+    pass
+
+
+b1 = Book("三体", "刘慈欣", 2008)
+b2 = Book("活着", "余华", 1993)
+b3 = Book("百年孤独", "马尔克斯", 1967)
+print(latest([b1, b2, b3]))
+print(latest([]))`}
+  expectedOutput={`Book(title='三体', author='刘慈欣', year=2008)\nNone`}
+/>
+
+<Callout type="exercise" title="提示">
+`max(books, key=lambda b: b.year, default=None)` 一行搞定。
+</Callout>
+
+## 小结
+
+- ✅ 变量与函数都可以加注解，运行时**不强制检查**
+- ✅ `Optional[X]` / `X | None`、`Union[A, B]` / `A | B`、`Any` 是高频工具
+- ✅ `@dataclass` 自动生成 `__init__` / `__repr__` / `__eq__`；`frozen=True` 不可变
+- ✅ `TypeVar` + `Generic` 让你写类型安全的容器和工具
+- ✅ 配合 mypy / pyright 能在写代码时就发现类型错误
+
+下一章 **并发编程**：threading、multiprocessing、asyncio —— 写出能榨干多核 CPU / 高 I/O 利用率的程序。

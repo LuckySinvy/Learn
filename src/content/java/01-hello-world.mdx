@@ -1,0 +1,142 @@
+---
+title: 第一个 Java 程序
+order: 1
+description: JDK、javac/java 命令、类、public static void main
+---
+
+# 第一个 Java 程序
+
+Java 是一门**编译型 + 虚拟机**语言：源代码被 `javac` 编译为字节码，由 JVM 执行。
+
+## 1. Hello, World!
+
+<Playground
+  language="java"
+  id="java-01-hello"
+  title="Hello World"
+  code={`public class Main {
+    public static void main(String[] args) {
+        System.out.println("Hello, 世界！");
+        System.out.println("Java " + System.getProperty("java.version"));
+    }
+}`}
+  expectedOutput={`Hello, 世界！\nJava 21.x`}
+/>
+
+<Callout type="warn" title="本 Playground 约束">
+本平台要求示例中**类名必须为 `Main`**，且必须声明为 `public class Main`。运行时会编译 `Main.java` 并执行 `java Main`。
+</Callout>
+
+## 2. 关键名词
+
+- **JDK**：Java Development Kit（编译、调试、运行工具集）
+- **JRE**：Java Runtime Environment（运行字节码）
+- **JVM**：Java Virtual Machine（执行字节码的虚拟机）
+- **字节码**：`.class` 文件，JVM 的指令集
+
+```bash
+javac Main.java     # 编译 -> Main.class
+java Main           # 运行
+```
+
+## 3. `main` 方法签名
+
+```java
+public static void main(String[] args)
+```
+
+- `public`：JVM 调用，必须 public
+- `static`：无需创建实例
+- `void`：无返回值
+- `args`：命令行参数
+
+<Playground
+  language="java"
+  id="java-01-args"
+  title="main 接收参数"
+  code={`public class Main {
+    public static void main(String[] args) {
+        System.out.println("参数个数：" + args.length);
+        for (int i = 0; i < args.length; i++) {
+            System.out.println("  [" + i + "] " + args[i]);
+        }
+    }
+}`}
+/>
+
+## 4. 输出方法
+
+| 方法 | 用途 |
+|---|---|
+| `System.out.print(s)` | 不换行 |
+| `System.out.println(s)` | 换行 |
+| `System.out.printf(fmt, args)` | 格式化 |
+
+<Playground
+  language="java"
+  id="java-01-printf"
+  title="printf 格式化"
+  code={`public class Main {
+    public static void main(String[] args) {
+        String name = "Alice";
+        int age = 30;
+        System.out.printf("姓名：%s，年龄：%d%n", name, age);
+        System.out.printf("π = %.4f%n", Math.PI);
+        System.out.printf("布尔：%b%n", true);
+    }
+}`}
+  expectedOutput={`姓名：Alice，年龄：30\nπ = 3.1416\n布尔：true`}
+/>
+
+<Callout type="tip" title="%n vs \n">
+Java 跨平台换行用 `%n`（Formatter）或 `System.lineSeparator()`，比 `\n` 更安全（Windows 下也是正确的换行符）。
+</Callout>
+
+## 5. 注释
+
+```java
+// 单行注释
+
+/*
+   多行
+   注释
+*/
+
+/**
+ * 文档注释（Javadoc）
+ * @author sinvy
+ */
+```
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-01-exercise"
+  title="自我介绍"
+  code={`// 任务：使用 printf 输出自我介绍
+// 期望效果：
+//   姓名：XXX
+//   年龄：XX
+//   城市：XXX
+
+public class Main {
+    public static void main(String[] args) {
+        String name = "小明";
+        int age = 25;
+        String city = "上海";
+        // 补全输出
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ Java 编译运行：`javac Main.java` → `java Main`
+- ✅ 入口方法 `public static void main(String[] args)`
+- ✅ `System.out.print/println/printf` 输出
+- ✅ 注释：`//` / `/* */` / `/** */`
+- ✅ `%n` 跨平台换行
+
+下一章 **变量与类型**。

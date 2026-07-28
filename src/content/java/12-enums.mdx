@@ -1,0 +1,299 @@
+---
+title: 枚举进阶
+order: 12
+description: enum 基础、字段/方法/构造器、接口实现、values/valueOf/ordinal、EnumSet/EnumMap
+---
+
+# 枚举进阶
+
+枚举（`enum`）不是「一组常量」的同义词，而是一个**完整的类**——可以拥有字段、方法、构造器，甚至实现接口。它是**有限集合**场景下的最佳实践。
+
+## 1. 最简单的枚举
+
+<Playground
+  language="java"
+  id="java-12-basic"
+  title="基础枚举"
+  code={`public class Main {
+    enum Color { RED, GREEN, BLUE }
+
+    public static void main(String[] args) {
+        Color c = Color.RED;
+        System.out.println("c = " + c);
+        System.out.println("ordinal = " + c.ordinal());   // 0
+        System.out.println("name = " + c.name());
+
+        // values() 返回所有枚举常量
+        for (Color v : Color.values()) {
+            System.out.printf("  %s (ord=%d)%n", v, v.ordinal());
+        }
+
+        // valueOf: 按名字拿
+        Color g = Color.valueOf("GREEN");
+        System.out.println("valueOf(GREEN) = " + g);
+    }
+}`}
+  expectedOutput={`c = RED\nordinal = 0\nname = RED\n  RED (ord=0)\n  GREEN (ord=1)\n  BLUE (ord=2)\nvalueOf(GREEN) = GREEN`}
+/>
+
+<Callout type="tip" title="switch 用枚举">
+Java 14+ switch 表达式对枚举特别优雅：
+```java
+String cn = switch (c) {
+    case RED -> "红";
+    case GREEN -> "绿";
+    case BLUE -> "蓝";
+};
+```
+</Callout>
+
+## 2. 枚举 = 类
+
+枚举可以有**字段、构造器、方法**——但构造器必须是 `private`（或默认）。
+
+<Playground
+  language="java"
+  id="java-12-fields"
+  title="枚举字段"
+  code={`public class Main {
+    enum Planet {
+        MERCURY(3.30e23, 2.44e6),
+        EARTH  (5.97e24, 6.37e6),
+        JUPITER(1.90e27, 6.99e7);
+
+        private final double mass;   // kg
+        private final double radius; // m
+
+        Planet(double mass, double radius) {     // 必须是 private
+            this.mass = mass;
+            this.radius = radius;
+        }
+
+        double surfaceGravity() {
+            double G = 6.67e-11;
+            return G * mass / (radius * radius);
+        }
+    }
+
+    public static void main(String[] args) {
+        for (Planet p : Planet.values()) {
+            System.out.printf("%-7s gravity = %.2f m/s²%n", p, p.surfaceGravity());
+        }
+    }
+}`}
+  expectedOutput={`MERCURY gravity = 3.70 m/s²\nEARTH   gravity = 9.80 m/s²\nJUPITER gravity = 24.79 m/s²`}
+/>
+
+## 3. 枚举实现接口
+
+枚举常量可以**分别**实现抽象方法——这是 enum 最强大的特性之一。
+
+<Playground
+  language="java"
+  id="java-12-interface"
+  title="枚举实现接口"
+  code={`public class Main {
+    interface Operation {
+        double apply(double a, double b);
+        String symbol();
+    }
+
+    enum BasicOp implements Operation {
+        PLUS("+")  { public double apply(double a, double b) { return a + b; } },
+        MINUS("-") { public double apply(double a, double b) { return a - b; } },
+        TIMES("*") { public double apply(double a, double b) { return a * b; } },
+        DIVIDE("/") {
+            public double apply(double a, double b) {
+                if (b == 0) throw new ArithmeticException("除数不能为 0");
+                return a / b;
+            }
+        };
+
+        private final String sym;
+        BasicOp(String sym) { this.sym = sym; }
+        public String symbol() { return sym; }
+    }
+
+    public static void main(String[] args) {
+        double a = 10, b = 3;
+        for (Operation op : BasicOp.values()) {
+            try {
+                System.out.printf("%.1f %s %.1f = %.2f%n", a, op.symbol(), b, op.apply(a, b));
+            } catch (Exception e) {
+                System.out.println("err: " + e.getMessage());
+            }
+        }
+    }
+}`}
+  expectedOutput={`10.0 + 3.0 = 13.00\n10.0 - 3.0 = 7.00\n10.0 * 3.0 = 30.00\n10.0 / 3.0 = 3.33`}
+/>
+
+## 4. 常用方法：`values()` / `valueOf()` / `ordinal()`
+
+<Playground
+  language="java"
+  id="java-12-methods"
+  title="枚举 API"
+  code={`public class Main {
+    enum Status {
+        NEW, IN_PROGRESS, DONE, CANCELED
+    }
+
+    public static void main(String[] args) {
+        // values()：所有常量（编译器自动生成）
+        Status[] all = Status.values();
+        System.out.println("count = " + all.length);
+
+        // valueOf(String)：按名字拿
+        Status s = Status.valueOf("DONE");
+        System.out.println("valueOf = " + s);
+
+        // ordinal()：声明顺序（0 起）
+        for (Status st : Status.values()) {
+            System.out.printf("  %s = %d%n", st, st.ordinal());
+        }
+
+        // compareTo：按 ordinal 比
+        System.out.println("NEW compareTo DONE = " + Status.NEW.compareTo(Status.DONE));
+    }
+}`}
+  expectedOutput={`count = 4\nvalueOf = DONE\n  NEW = 0\n  IN_PROGRESS = 1\n  DONE = 2\n  CANCELED = 3\nNEW compareTo DONE = -2`}
+/>
+
+<Callout type="warn" title="别用 ordinal() 当持久化字段">
+`ordinal()` 是声明顺序——一旦调整枚举顺序就乱。数据库或文件里存**名字**或**显式 code**，不要存 `ordinal`。
+</Callout>
+
+## 5. `EnumSet` 与 `EnumMap`
+
+- `EnumSet`：枚举的**高性能 Set**，底层是位向量
+- `EnumMap`：以枚举为 Key 的**专用 Map**
+
+<Playground
+  language="java"
+  id="java-12-collections"
+  title="EnumSet & EnumMap"
+  code={`import java.util.*;
+
+public class Main {
+    enum Day { MON, TUE, WED, THU, FRI, SAT, SUN }
+
+    public static void main(String[] args) {
+        // EnumSet: 工作日
+        EnumSet<Day> work = EnumSet.of(Day.MON, Day.TUE, Day.WED, Day.THU, Day.FRI);
+        // 周末 = Day 的全集 - 工作日
+        EnumSet<Day> weekend = EnumSet.complementOf(work);
+
+        System.out.println("工作日: " + work);
+        System.out.println("周末:   " + weekend);
+
+        // EnumMap: 每天的待办
+        EnumMap<Day, String> todos = new EnumMap<>(Day.class);
+        todos.put(Day.MON, "周会");
+        todos.put(Day.WED, "代码评审");
+        todos.put(Day.FRI, "周报");
+
+        for (Day d : Day.values()) {
+            System.out.printf("  %s: %s%n", d, todos.getOrDefault(d, "休息"));
+        }
+    }
+}`}
+  expectedOutput={`工作日: [MON, TUE, WED, THU, FRI]\n周末:   [SAT, SUN]\n  MON: 周会\n  WED: 代码评审\n  FRI: 周报\n  TUE: 休息\n  THU: 休息\n  SAT: 休息\n  SUN: 休息`}
+/>
+
+<Callout type="tip" title="为什么 EnumSet/EnumMap 更快">
+`EnumSet` 内部用一个 `long`（最多 64 个枚举）位掩码表示集合，操作是位运算，**O(1)** 完成 add/remove/contains。`HashSet` 至少需要算 hash。
+</Callout>
+
+## 6. 实战：状态机
+
+枚举天生适合实现有限状态机：每个状态自己知道「下一个合法状态」。
+
+<Playground
+  language="java"
+  id="java-12-fsm"
+  title="订单状态机"
+  code={`import java.util.*;
+
+public class Main {
+    enum OrderState {
+        CREATED,    PAID,    SHIPPED,    DELIVERED,    CANCELED;
+
+        private static final Map<OrderState, Set<OrderState>> TRANSITIONS = new EnumMap<>(OrderState.class);
+        static {
+            TRANSITIONS.put(CREATED,   EnumSet.of(PAID, CANCELED));
+            TRANSITIONS.put(PAID,      EnumSet.of(SHIPPED, CANCELED));
+            TRANSITIONS.put(SHIPPED,   EnumSet.of(DELIVERED));
+            TRANSITIONS.put(DELIVERED, EnumSet.noneOf(OrderState.class));
+            TRANSITIONS.put(CANCELED,  EnumSet.noneOf(OrderState.class));
+        }
+
+        public boolean canTransitTo(OrderState next) {
+            return TRANSITIONS.get(this).contains(next);
+        }
+    }
+
+    public static void main(String[] args) {
+        OrderState s = OrderState.CREATED;
+        System.out.println("start = " + s);
+
+        System.out.println("CREATED -> PAID? " + s.canTransitTo(OrderState.PAID));
+        System.out.println("CREATED -> SHIPPED? " + s.canTransitTo(OrderState.SHIPPED));
+
+        s = OrderState.PAID;
+        System.out.println("after pay = " + s);
+        System.out.println("PAID -> SHIPPED? " + s.canTransitTo(OrderState.SHIPPED));
+    }
+}`}
+  expectedOutput={`start = CREATED\nCREATED -> PAID? true\nCREATED -> SHIPPED? false\nafter pay = PAID\nPAID -> SHIPPED? true`}
+/>
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-12-exercise"
+  title="交通灯状态机"
+  code={`// 任务：实现交通灯状态机
+// - 三种状态 RED, GREEN, YELLOW
+// - 每个状态有 duration(int 秒) 和 next() 返回下一个状态
+// - 转换顺序：RED -> GREEN -> YELLOW -> RED
+// - 用 EnumMap 保存「每种灯亮的时长」
+// 期望输出：
+//   RED    30s -> GREEN
+//   GREEN  25s -> YELLOW
+//   YELLOW 3s  -> RED
+
+import java.util.*;
+
+public class Main {
+    enum Light {
+        // 补全：枚举常量（带 duration）
+        // RED(30), GREEN(25), YELLOW(3)
+
+        // 补全：字段 + 构造器
+        ;
+
+        public abstract Light next();
+
+        // 补全：静态字段 EnumMap<Light, Integer> durations
+        // 补全：静态初始化
+    }
+
+    public static void main(String[] args) {
+        // 补全：从 RED 出发连续转 3 次并打印
+    }
+}
+`}
+/>
+
+## 小结
+
+- ✅ 枚举是**类**：`private` 构造器 + 字段 + 方法
+- ✅ 枚举常量可以**分别**实现抽象方法（常用于策略模式）
+- ✅ 常用 API：`values()` / `valueOf()` / `ordinal()` / `name()`
+- ✅ `EnumSet`（位向量）和 `EnumMap`（数组实现）性能优于 `HashSet` / `HashMap`
+- ✅ 状态机、策略、有限集合——enum 都是首选
+- ✅ 别用 `ordinal()` 当持久化字段；用 `name` 或显式 `code`
+
+下一章 **多线程**：`Thread`、`synchronized`、线程池、`Future`。

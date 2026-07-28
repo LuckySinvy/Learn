@@ -1,0 +1,368 @@
+---
+title: Maven 与 JUnit 5
+order: 16
+description: Maven 项目结构、pom.xml、JUnit 5 基础、断言、参数化测试
+---
+
+# Maven 与 JUnit 5
+
+当代码超过一个文件，就需要**构建工具**（管理依赖、编译、测试、打包）。Java 生态最常用的就是 **Maven**（Gradle 也很流行，思路类似）。**JUnit** 则是测试的事实标准。
+
+> **本章的 Playground 限制**：Playground 只能跑 `Main.java` 单文件，没法真跑 Maven。所以 Playground 里我们用一个**迷你测试运行器**（上一章注解的延续）来体验 JUnit 风格的断言与参数化。
+
+## 1. Maven 项目结构
+
+```
+my-app/
+├── pom.xml                  # 项目模型：依赖、插件、构建配置
+├── src/
+│   ├── main/
+│   │   ├── java/            # 业务代码
+│   │   │   └── com/example/App.java
+│   │   └── resources/       # 资源文件
+│   └── test/
+│       ├── java/            # 测试代码
+│       │   └── com/example/AppTest.java
+│       └── resources/
+└── target/                  # 编译产物（git ignore）
+```
+
+## 2. 最小可用的 `pom.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>my-app</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <junit.version>5.10.2</junit.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+<Callout type="info" title="GAV 坐标">
+- `groupId`：组织域名倒写（`com.example`）
+- `artifactId`：项目名（`my-app`）
+- `version`：版本（`1.0.0`）
+</Callout>
+
+## 3. 一个真正的 Java 类 + 对应的 JUnit 测试
+
+`src/main/java/com/example/Calculator.java`：
+
+```java
+package com.example;
+
+public class Calculator {
+    public int add(int a, int b)    { return a + b; }
+    public int divide(int a, int b) {
+        if (b == 0) throw new IllegalArgumentException("divisor cannot be 0");
+        return a / b;
+    }
+}
+```
+
+`src/test/java/com/example/CalculatorTest.java`：
+
+```java
+package com.example;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+class CalculatorTest {
+    @Test
+    void add_returnsSum() {
+        assertEquals(5, new Calculator().add(2, 3));
+    }
+
+    @Test
+    void divide_throwsOnZero() {
+        var ex = assertThrows(IllegalArgumentException.class,
+            () -> new Calculator().divide(10, 0));
+        assertEquals("divisor cannot be 0", ex.getMessage());
+    }
+}
+```
+
+## 4. 常用 JUnit 5 注解
+
+| 注解 | 作用 |
+|---|---|
+| `@Test` | 标记测试方法 |
+| `@BeforeEach` | 每个测试前执行 |
+| `@AfterEach` | 每个测试后执行 |
+| `@BeforeAll` | 所有测试前执行一次（须 `static`） |
+| `@AfterAll` | 所有测试后执行一次（须 `static`） |
+| `@Disabled` | 跳过此方法 |
+| `@DisplayName("...")` | 自定义显示名（支持中文） |
+| `@Nested` | 嵌套测试类 |
+
+## 5. 常用断言
+
+```java
+assertEquals(预期, 实际);
+assertNotEquals(a, b);
+assertTrue(cond);  assertFalse(cond);
+assertNull(o);     assertNotNull(o);
+assertSame(a, b);  // 同一对象
+assertThrows(异常类, () -> ...);
+assertAll(() -> ..., () -> ...);  // 多个断言一次性报告
+assertTimeout(Duration.ofSeconds(1), () -> ...);
+```
+
+## 6. 单文件 Playground：迷你测试运行器
+
+下面这个 Playground 自己实现了一个简化版的 JUnit——可以让你**单文件**地感受 `@Test` / `@BeforeEach` / 断言 / 异常检查 / 参数化测试的运行效果。
+
+<Playground
+  language="java"
+  id="java-16-mini"
+  title="迷你 JUnit"
+  code={`import java.lang.annotation.*;
+import java.lang.reflect.*;
+import java.util.*;
+
+public class Main {
+    // ====== 注解 ======
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface Test {}
+
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface BeforeEach {}
+
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.PARAMETER)
+    public @interface Value { String[] strs() default {}; int[] ints() default {}; }
+
+    // ====== 断言 ======
+    static int failures = 0;
+    static void assertEq(Object expected, Object actual) {
+        if (!Objects.equals(expected, actual)) {
+            failures++;
+            throw new AssertionError("expected=" + expected + " actual=" + actual);
+        }
+    }
+    static void assertTrue(boolean cond) {
+        if (!cond) { failures++; throw new AssertionError("expected true"); }
+    }
+    static <T extends Throwable> T assertThrows(Class<T> type, Runnable r) {
+        try { r.run(); failures++; throw new AssertionError("no exception"); }
+        catch (Throwable t) {
+            if (type.isInstance(t)) return type.cast(t);
+            failures++; throw new AssertionError("wrong type: " + t);
+        }
+    }
+
+    // ====== Calculator（被测对象） ======
+    static class Calculator {
+        int add(int a, int b) { return a + b; }
+        int divide(int a, int b) {
+            if (b == 0) throw new IllegalArgumentException("divisor 0");
+            return a / b;
+        }
+    }
+
+    Calculator calc;
+
+    @BeforeEach
+    void setUp() { calc = new Calculator(); }
+
+    @Test void add_2_and_3() { assertEq(5, calc.add(2, 3)); }
+    @Test void add_negative() { assertEq(-2, calc.add(-5, 3)); }
+    @Test void divide_ok() { assertEq(4, calc.divide(20, 5)); }
+    @Test void divide_by_zero() {
+        assertThrows(IllegalArgumentException.class, () -> calc.divide(1, 0));
+    }
+
+    // ====== 运行器 ======
+    public static void main(String[] args) throws Exception {
+        Main tester = new Main();
+        Class<?> c = tester.getClass();
+        Method[] all = c.getDeclaredMethods();
+
+        List<Method> before = new ArrayList<>();
+        List<Method> tests  = new ArrayList<>();
+        for (Method m : all) {
+            if (m.isAnnotationPresent(BeforeEach.class)) before.add(m);
+            if (m.isAnnotationPresent(Test.class))       tests.add(m);
+        }
+
+        int pass = 0, fail = 0;
+        for (Method t : tests) {
+            failures = 0;
+            try {
+                t.setAccessible(true);
+                for (Method b : before) { b.setAccessible(true); b.invoke(tester); }
+                t.invoke(tester);
+                if (failures == 0) { pass++; System.out.println("[ok]   " + t.getName()); }
+                else               { fail++; System.out.println("[fail] " + t.getName()); }
+            } catch (Exception e) {
+                fail++;
+                System.out.println("[fail] " + t.getName() + ": " + e.getCause());
+            }
+        }
+        System.out.printf("%n通过 %d / 失败 %d%n", pass, fail);
+    }
+}`}
+  expectedOutput={`[ok]   add_2_and_3\n[ok]   add_negative\n[ok]   divide_ok\n[ok]   divide_by_zero\n\n通过 4 / 失败 0`}
+/>
+
+## 7. 参数化测试
+
+<Playground
+  language="java"
+  id="java-16-param"
+  title="参数化测试"
+  code={`import java.lang.annotation.*;
+import java.lang.reflect.*;
+import java.util.*;
+
+public class Main {
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface ParamTest {}
+
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface Case {
+        int a(); int b(); int sum();
+    }
+
+    public static void main(String[] args) throws Exception {
+        int pass = 0, fail = 0;
+        for (Method m : Main.class.getDeclaredMethods()) {
+            if (!m.isAnnotationPresent(ParamTest.class)) continue;
+            for (Case c : m.getAnnotationsByType(Case.class)) {
+                m.setAccessible(true);
+                int got = (int) m.invoke(null, c.a(), c.b());
+                if (got == c.sum()) {
+                    pass++;
+                    System.out.printf("  [ok]   %d + %d = %d%n", c.a(), c.b(), c.sum());
+                } else {
+                    fail++;
+                    System.out.printf("  [fail] %d + %d = %d, got %d%n", c.a(), c.b(), c.sum(), got);
+                }
+            }
+        }
+        System.out.printf("%n通过 %d / 失败 %d%n", pass, fail);
+    }
+
+    @ParamTest @Case(a = 1, b = 2, sum = 3)  static int t1(int a, int b) { return a + b; }
+    @ParamTest @Case(a = 5, b = 5, sum = 10) static int t2(int a, int b) { return a + b; }
+    @ParamTest @Case(a = 0, b = 0, sum = 0)  static int t3(int a, int b) { return a + b; }
+}`}
+  expectedOutput={`  [ok]   1 + 2 = 3\n  [ok]   5 + 5 = 10\n  [ok]   0 + 0 = 0\n\n通过 3 / 失败 0`}
+/>
+
+<Callout type="tip" title="真正的 JUnit 5 参数化测试长这样">
+```java
+@ParameterizedTest
+@ValueSource(ints = {1, 2, 3, 5})
+void isOdd(int n) {
+    assertTrue(n % 2 == 1);
+}
+
+@ParameterizedTest
+@MethodSource("cases")
+void add(int a, int b, int expected) {
+    assertEquals(expected, calc.add(a, b));
+}
+static Stream<Arguments> cases() {
+    return Stream.of(
+        Arguments.of(1, 2, 3),
+        Arguments.of(5, 5, 10));
+}
+```
+</Callout>
+
+## 8. 常用 Maven 命令
+
+```bash
+mvn -v                          # 版本
+mvn compile                     # 编译 main
+mvn test                        # 编译 + 跑测试
+mvn package                     # 打包成 jar
+mvn clean                       # 删 target/
+mvn dependency:tree             # 依赖树
+mvn -DskipTests package         # 跳过测试打包
+```
+
+## 🎯 练习
+
+<Playground
+  language="java"
+  id="java-16-exercise"
+  title="补全迷你测试"
+  code={`// 任务：在 calculatorTest() 里加 3 条 @Case 参数化测试
+// 测试 add 方法，覆盖正数 + 正数、正数 + 0、负数 + 正数 三种情况
+// 期望输出：
+//   [ok]   2 + 3 = 5
+//   [ok]   7 + 0 = 7
+//   [ok]   -4 + 9 = 5
+
+import java.lang.annotation.*;
+import java.lang.reflect.*;
+import java.util.*;
+
+public class Main {
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface ParamTest {}
+
+    @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+    public @interface Case { int a(); int b(); int sum(); }
+
+    static int add(int a, int b) { return a + b; }
+
+    public static void main(String[] args) throws Exception {
+        for (Method m : Main.class.getDeclaredMethods()) {
+            if (!m.isAnnotationPresent(ParamTest.class)) continue;
+            for (Case c : m.getAnnotationsByType(Case.class)) {
+                int got = (int) m.invoke(null, c.a(), c.b());
+                System.out.printf("[%s] %d + %d = %d (got %d)%n",
+                    got == c.sum() ? "ok" : "fail", c.a(), c.b(), c.sum(), got);
+            }
+        }
+    }
+
+    @ParamTest
+    // 补全 @Case 三条
+    static int calculatorTest(int a, int b) { return add(a, b); }
+}
+`}
+/>
+
+## 小结
+
+- ✅ Maven = GAV 坐标 + 依赖管理 + 生命周期（compile / test / package）
+- ✅ 标准布局：`src/main/java` 与 `src/test/java` 分离
+- ✅ JUnit 5 注解：`@Test` / `@BeforeEach` / `@AfterEach` / `@Disabled`
+- ✅ 常用断言：`assertEquals` / `assertThrows` / `assertAll`
+- ✅ 参数化测试：`@ParameterizedTest` + `@ValueSource` / `@MethodSource`
+- ✅ 跑测试：`mvn test`；看依赖树：`mvn dependency:tree`
+
+下一章 **项目：Spring Boot REST API**——从代码到 HTTP 服务。
