@@ -1,0 +1,122 @@
+---
+title: 查询与数据转换
+order: 8
+description: Transform 在数据进图前做过滤、聚合、联表；掌握 Reduce/Filter/Group by/Join 等常用转换
+---
+
+# 查询与数据转换（Transform）
+
+PromQL 负责「把数据取出来」，而 **Transform（转换）** 负责「取出来之后、画图之前」再加工。它不改数据源，只在面板内对结果做变换，非常适合把多个查询拼成一张干净报表。
+
+## 1. Transform 在哪
+
+编辑面板 → 切到 **Transform** 标签页（在 Query 旁边）。转换按顺序串联，上一个的输出是下一个的输入。
+
+<Callout type="info" title="Transform vs PromQL">
+能写在 PromQL 里的聚合（如 `sum by`）优先用 PromQL，性能好。Transform 适合「跨多个不同查询合并」「按表格行列重组」这类 PromQL 不擅长的事。
+</Callout>
+
+## 2. Reduce：把多行压成一行/一个值
+
+把每个序列的最新值聚合成单行，常用于 Table 汇总。
+
+```promql
+# 查询 A：各实例 CPU
+node_cpu_seconds_total{mode="idle"}   # 多个序列
+```
+
+Transform 加 **Reduce**：
+
+- Mode：`Last *`（取每个序列最后一个值）
+- 输出：一行 = 一个实例，一列 = 一个指标
+
+## 3. Group by：按某字段分组聚合
+
+```text
+Group by fields: instance
+Calculations: Mean
+```
+
+把结果按 `instance` 分组，对每列取均值。和 PromQL 的 `avg by (instance)` 类似，但作用于已返回的数据。
+
+## 4. Filter by name / regex：过滤字段
+
+只保留想要的列：
+
+- **Filter by name**：勾选保留的字段
+- **Filter by value**：按数值过滤，如「只显示 CPU > 80% 的实例」
+
+```text
+# Filter by value 示例
+Conditions: | cpu | > | 80 |
+```
+
+<Callout type="tip" title="Filter by value 做「异常清单」">
+把各实例延迟做 Filter by value > 阈值，Table 面板就只列出「超标的实例」，天然是一张异常清单。
+</Callout>
+
+## 5. Join / Merge：合并多个查询
+
+当你有查询 A（QPS）和查询 B（错误数），想放同一张表：
+
+- **Join**：按共同字段（如 `instance`）横向合并
+- **Merge**：直接堆叠（字段不同也能拼）
+
+```text
+Transform: Join
+On field: instance
+```
+
+## 6. Organize fields：重排列与改名
+
+- Hide/show 列
+- Rename：`cpu` → `CPU 使用率`
+- 调整列顺序
+
+## 7. 实战：一张「服务健康总表」
+
+多个查询 + 转换串起来：
+
+```promql
+# A: 在线实例数
+sum by (job) (up)
+# B: QPS
+sum by (job) (rate(http_requests_total[5m]))
+# C: 错误率
+sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+  /
+  sum by (job) (rate(http_requests_total[5m]))
+```
+
+Transform 链：
+
+1. **Merge** 三个查询结果 → 一张宽表
+2. **Organize fields** 改名、调顺序
+3. **Filter by value** 让错误率 > 0.01 的行高亮（配合 Table 的阈值着色）
+
+输出一张运营关心的「服务总览表」：哪个 job 在线、QPS 多少、错误率多少，一目了然。
+
+## 8. 常用 Transform 速查
+
+| Transform | 用途 |
+|---|---|
+| Reduce | 序列 → 单值/单行 |
+| Group by | 按字段分组聚合 |
+| Filter by name/regex | 过滤列 |
+| Filter by value | 按数值过滤行 |
+| Join / Merge | 合并多查询结果 |
+| Organize fields | 改名、调序、隐藏 |
+| Sort by | 排序 |
+| Convert field type | 类型转换 |
+
+<Callout type="exercise" title="练习">
+把「各实例 CPU」「各实例内存」「各实例磁盘」三个查询用 Merge + Organize fields 拼成一张 Table，并按磁盘使用率降序排列。
+</Callout>
+
+## 小结
+
+- Transform 在「取数后、画图前」加工，不改数据源
+- Reduce 压行、Group by 分组、Filter 过滤、Join/Merge 合并
+- 与 PromQL 配合：聚合优先 PromQL，跨查询重组用 Transform
+
+下一章：模板变量，让仪表盘可交互 →

@@ -1,0 +1,75 @@
+---
+title: Grafana 是什么
+order: 1
+description: 理解 Grafana 的定位、核心能力与可观测性（Metrics/Logs/Traces）三大支柱
+---
+
+# Grafana 是什么
+
+**Grafana** 是一个开源的、水平可扩展的**可视化与可观测性（Observability）平台**。它本身不采集数据，而是把来自各种数据源（Prometheus、Loki、Tempo、Elasticsearch、MySQL、InfluxDB……）的数据统一成漂亮的图表与仪表盘，帮助你监控、排查和分析系统。
+
+<Callout type="info" title="Grafana 不负责存数据">
+Grafana 是「前端展示 + 查询 + 告警」层。原始指标/日志/链路由专门的存储系统（如 Prometheus）负责，Grafana 通过它们的查询接口拉数据。
+</Callout>
+
+## 1. 可观测性的三大支柱
+
+现代系统的可观测性通常分为三类信号：
+
+| 信号 | 回答的问题 | 典型数据源 |
+|---|---|---|
+| **Metrics（指标）** | 「系统现在有多忙 / 多健康？」 | Prometheus、InfluxDB、CloudWatch |
+| **Logs（日志）** | 「具体发生了什么？」 | Loki、Elasticsearch、ClickHouse |
+| **Traces（链路）** | 「一次请求经历了哪些服务、慢在哪？」 | Tempo、Jaeger、Zipkin |
+
+Grafana 的强项正是把这三类信号**关联在同一块大屏上**：从图表发现 CPU 飙高 → 点开看同时段的日志 → 再下钻到慢调用对应的链路。
+
+## 2. LGTM 技术栈
+
+Grafana Labs 维护了一整套开源可观测性组件，首字母拼成 **LGTM**：
+
+- **L**oki — 日志聚合（类 Prometheus 理念，索引标签而非全文）
+- **G**rafana — 可视化与告警
+- **T**empo — 分布式链路追踪
+- **M**imir — 指标存储（Prometheus 的长期存储方案；也可直接用 Prometheus）
+
+```bash
+# 一行拉起整套 LGTM（仅演示，生产另有配置）
+docker run -d -p 3000:3000 grafana/grafana-oss
+```
+
+<Callout type="tip" title="Grafana OSS 还是 Enterprise？">
+本教程以 **Grafana OSS（开源版）** 为主，所有核心能力（数据源、仪表盘、告警、Loki/Tempo 集成）都免费。Enterprise 版额外提供 SSO、高级权限、报表等，社区版用不上。
+</Callout>
+
+## 3. Grafana 能做什么
+
+- 📊 **Dashboard**：把任意数据源的查询结果拼成可视化大屏
+- 🔍 **Explore**：临时查询、排查问题（不落盘成仪表盘）
+- 🚨 **Alerting**：基于查询定义告警规则，统一路由到邮件/Slack/Webhook
+- 🧩 **Provisioning**：用代码（YAML）声明数据源与仪表盘，纳入 Git 管理
+- 👥 **权限**：团队/文件夹级访问控制、LDAP/OAuth 登录
+
+## 4. 与其他工具的区别
+
+- 对比 **Kibana**：Kibana 强在 Elasticsearch 日志检索；Grafana 更通用，能同时吃指标/日志/链路，且仪表盘体验更好。
+- 对比 **Prometheus 自带的 UI**：Prometheus 只管指标，原生界面仅够调试；Grafana 才是生产级展示与告警入口。
+
+## 5. 本教程路线
+
+本教程共 18 章，分三阶段：
+
+1. **基础（1–8 章）**：概念、安装、数据源、仪表盘、面板、PromQL、转换、模板变量
+2. **进阶（9–16 章）**：告警体系、Loki 日志、Tempo 链路、Provisioning、认证与权限、最佳实践
+3. **实战（17–18 章）**：搭建 Prometheus 监控栈、构建完整可观测性平台
+
+<Callout type="exercise" title="想一想">
+你们的系统中，现在指标、日志、链路分别存在哪里？如果没有，本章的 LGTM 栈是后续章节会逐步搭建的目标。
+</Callout>
+
+## 小结
+
+- Grafana 是「展示 + 查询 + 告警」层，自己不存数据
+- 可观测性三大支柱：Metrics / Logs / Traces
+- LGTM 是一套开箱即用的开源组合
+- 下一步我们动手把它跑起来 →

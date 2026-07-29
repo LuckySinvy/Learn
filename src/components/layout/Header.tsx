@@ -10,7 +10,7 @@ export function Header() {
         <Link href="/" className="flex items-center gap-2 font-semibold">
           <Code2 className="w-5 h-5 text-primary-500" />
           <span>Learn</span>
-          <span className="text-xs text-gray-500 ml-1">Python · Go · Java</span>
+          <span className="text-xs text-gray-500 ml-1">Python · Go · Java · Grafana</span>
         </Link>
         <nav className="flex items-center gap-1 text-sm">
           <Link
@@ -30,6 +30,12 @@ export function Header() {
             className="px-3 py-1.5 rounded-md hover:bg-gray-100 dark:hover:bg-gray-800"
           >
             Java
+          </Link>
+          <Link
+            href="/grafana"
+            className="px-3 py-1.5 rounded-md hover:bg-gray-100 dark:hover:bg-gray-800"
+          >
+            Grafana
           </Link>
           <ThemeToggle />
         </nav>

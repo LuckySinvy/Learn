@@ -18,6 +18,7 @@ export function LangOverview({ lang }: { lang: Language }) {
         {lang === 'python' && '从语法到常用标准库，渐进式掌握 Python。'}
         {lang === 'go' && '从语法到并发与 Web 服务，渐进式掌握 Go。'}
         {lang === 'java' && '从语法到集合与并发，渐进式掌握 Java。'}
+        {lang === 'grafana' && '从安装到告警与可观测性平台，渐进式掌握 Grafana。'}
       </p>
       <ul className="space-y-1">
         {chapters.map((c, i) => (

@@ -1,0 +1,99 @@
+---
+title: 首次配置与数据源
+order: 3
+description: 登录 Grafana，理解 Data Source 概念，添加第 Prometheus 数据源并保存
+---
+
+# 首次配置与数据源
+
+Grafana 的数据来自 **Data Source（数据源）**。本章完成首次登录，并添加一个 Prometheus 数据源——后续所有指标查询都从它来。
+
+## 1. 首次登录
+
+打开 `http://localhost:3000`，用 `admin` 登录后设置新密码。你会进入首页（Home），左侧是导航栏：
+
+- **Dashboards**：仪表盘
+- **Explore**：临时查询
+- **Connections → Data sources**：数据源管理
+- **Alerting**：告警
+- **Administration**：用户、插件、配置
+
+## 2. 什么是 Data Source
+
+Data Source 是一次「去哪查数据 + 怎么查」的连接配置。常见类型：
+
+| 类型 | 用途 |
+|---|---|
+| Prometheus | 指标 |
+| Loki | 日志 |
+| Tempo | 链路 |
+| Elasticsearch | 日志/全文检索 |
+| MySQL / PostgreSQL | 业务库查询 |
+| Jaeger | 链路 |
+
+<Callout type="info" title="一个数据源 = 一个连接">
+一个 Prometheus 集群对应一个 Data Source；如果你有「生产」「预发」两套 Prometheus，就配两个 Data Source。仪表盘面板通过 `datasource` 字段引用它（可用模板变量切换，见第 9 章）。
+</Callout>
+
+## 3. 添加 Prometheus 数据源
+
+1. 左侧 **Connections → Data sources → Add new data source**
+2. 选择 **Prometheus**
+3. 填写：
+   - Name：`Prometheus`（默认，可改）
+   - URL：`http://prometheus:9090`（容器网络内用服务名；本机直连用 `http://host.docker.internal:9090`）
+   - 其他默认
+4. 点 **Save & test**，出现 `Data source is working` 即成功
+
+对应的 **Provisioning** 等价配置（推荐用于环境一致，见第 15 章）：
+
+```yaml
+# provisioning/datasources/prometheus.yml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+```
+
+字段说明：
+
+- `access: proxy`：浏览器把查询发给 Grafana 后端，由后端转发给 Prometheus（**推荐**，避免把数据源地址暴露给前端、也无需浏览器能直连）
+- `isDefault: true`：新建面板默认选中它
+
+<Callout type="tip" title="proxy 还是 direct？">
+`proxy`（默认）更安全：数据源凭据只在服务端。除非有特殊跨域需求，否则不要选 `direct`。
+</Callout>
+
+## 4. 用 Explore 验证查询
+
+进 **Explore**，数据源选 Prometheus，输入一条查询：
+
+```promql
+up
+```
+
+`up` 是 Prometheus 自动采集的「目标存活」指标，值为 1 表示在线。能看到曲线就说明链路通了。
+
+## 5. 数据源的常见问题排查
+
+| 现象 | 原因 |
+|---|---|
+| `Bad Gateway` | Grafana 访问不到 Prometheus 的 URL（容器网络/域名错误） |
+| `403 Forbidden` | Prometheus 开启了鉴权，需要在数据源里配 HTTP Header/Token |
+| 曲线为空 | 查询写错，或时间范围不对（右上角选最近 5 分钟） |
+
+<Callout type="warn" title="时间范围别选错">
+新手最常犯的错：时间范围默认是「最近 6 小时」，但你的服务刚起、只有近 1 分钟数据，于是「什么都没有」。把右上角时间调到「Last 5 minutes」再试。
+</Callout>
+
+## 小结
+
+- Data Source 是一次「去哪查 + 怎么查」的连接
+- 添加 Prometheus 数据源并 Save & test
+- 优先用 `access: proxy`
+- 用 Explore 快速验证查询
+
+下一章我们创建第一块仪表盘 →

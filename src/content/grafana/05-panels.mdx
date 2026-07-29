@@ -1,0 +1,108 @@
+---
+title: 面板与可视化类型
+order: 5
+description: Time series / Stat / Gauge / Bar gauge / Table / Heatmap 等常用面板的适用场景与配置
+---
+
+# 面板与可视化类型
+
+**Panel（面板）** 决定「数据长什么样」。选对可视化类型，信息一目了然；选错则让人困惑。本章讲最常用的几种。
+
+## 1. Time series（时序图）
+
+最常用。适合任何随时间变化的数值，如 CPU、QPS、延迟。
+
+```promql
+rate(http_requests_total[5m])
+```
+
+配置要点：
+
+- **Line / Bars / Points**：线图最通用
+- **Stack**：多序列是否堆叠（看「总量构成」时开）
+- **Legend**：图例显示方式（右侧 as table 便于排序）
+- **Tooltip**：All series / Single 模式
+
+<Callout type="tip" title="看峰值用 tooltip=All">
+排查「某个时间点总 QPS 多少」时，把 tooltip 设为显示所有序列，鼠标悬停即可看总和。
+</Callout>
+
+## 2. Stat（单值大数字）
+
+显示一个关键指标，如「当前在线用户」「错误率」。支持阈值变色。
+
+```promql
+sum(up)   # 在线服务数
+```
+
+- **Thresholds**：设阈值，超过变红
+- **Sparkline**：在数字下方附一个小走势线
+- **Value mapping**：把 `1` 显示成「正常」、`0` 显示成「宕机」
+
+## 3. Gauge / Bar gauge（仪表盘）
+
+表达「当前值占某个区间的比例」，如磁盘使用率、连接池占用。
+
+```promql
+node_filesystem_avail_bytes / node_filesystem_size_bytes
+```
+
+- **Gauge**：圆盘表
+- **Bar gauge**：横向/纵向条，适合一排指标对比（如多实例 CPU）
+
+## 4. Table（表格）
+
+把多维结果排成行列，适合 Top N、明细。
+
+```promql
+topk(10, rate(http_requests_total[5m]))
+```
+
+- **Column styles**：某列着色、单位
+- **Transform → Reduce**：把多行聚合成一行汇总
+- **Cell display mode**：用颜色/图标表示状态
+
+## 5. Heatmap（热力图）
+
+看分布与密度，如请求延迟的直方图、按小时的访问热力。
+
+```promql
+sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+```
+
+配合 Prometheus 的 **histogram** 指标，用 `heatmap` + `le` 分桶，能直观看到「大部分请求 &lt;100ms，少量 &gt;1s」。
+
+<Callout type="info" title="Heatmap 配 histogram 最香">
+服务端埋点时用 `Histogram`（如 `http_request_duration_seconds_bucket`），前端用 Heatmap 展示延迟分布，比平均数更有信息量。
+</Callout>
+
+## 6. 其他常用
+
+| 类型 | 场景 |
+|---|---|
+| **Pie chart** | 占比（需装 `grafana-piechart-panel` 插件） |
+| **News** | 嵌入公告/iframe |
+| **Text** | 用 Markdown 写说明、链接 |
+| **State timeline** | 展示「某状态持续了多久」（如在线/离线区间） |
+| **Flame graph** | 展示 Tempo 链路的火焰图 |
+
+## 7. 面板通用配置
+
+每个面板右侧都有：
+
+- **Title**：标题
+- **Description**：悬停问号显示
+- **Repeat options**：按模板变量重复面板（如 `Repeat by variable = instance`，每个实例复制一张图）
+- **Standard options**：单位（percent, bytes, ms）、小数位、最小值/最大值
+
+<Callout type="exercise" title="练习">
+为你的服务创建一块仪表盘，包含：①Time series 显示 QPS；②Stat 显示当前错误率并设阈值变红；③Table 显示 Top 5 慢接口。把 JSON 导出保存。
+</Callout>
+
+## 小结
+
+- Time series 最通用；Stat/Gauge 看单值；Table 看明细；Heatmap 看分布
+- 选可视化类型 = 选「你想回答的问题」
+- 面板通用配置：单位、阈值、Repeat by variable
+
+下一章正式学 PromQL —— Grafana 指标查询的语言 →

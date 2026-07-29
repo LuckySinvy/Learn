@@ -1,0 +1,139 @@
+---
+title: 自动化配置（Provisioning）
+order: 15
+description: 用 YAML 声明数据源与仪表盘、告警，把 Grafana 配置纳入 Git 实现 GitOps
+---
+
+# 自动化配置（Provisioning）
+
+在 UI 里点出来的仪表盘，换台机器就没了。生产环境应当用 **Provisioning**：把数据源、仪表盘、告警写成 YAML/JSON 文件，Grafana 启动时自动加载，纳入 Git 管理（GitOps）。
+
+## 1. Provisioning 能做什么
+
+| 类型 | 作用 | 目录/文件 |
+|---|---|---|
+| **datasources** | 自动建数据源 | `provisioning/datasources/*.yaml` |
+| **dashboards** | 自动加载 JSON 仪表盘 | `provisioning/dashboards/*.yaml` + JSON |
+| **alerting** | 自动建告警规则/通知策略 | `provisioning/alerting/*.yaml` |
+| **plugins** | 自动装插件 | `grafana.ini` 或环境变量 |
+
+## 2. 数据源 Provisioning
+
+```yaml
+# provisioning/datasources/datasources.yaml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+```
+
+## 3. 仪表盘 Provisioning
+
+先定义 provider，告诉 Grafana 去哪找 JSON：
+
+```yaml
+# provisioning/dashboards/default.yaml
+apiVersion: 1
+providers:
+  - name: default
+    folder: "自动加载"
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true      # 允许在 UI 改，改完再导出回 Git
+    options:
+      path: /etc/grafana/provisioning/dashboards
+```
+
+把前面章节导出的 `my-first.json` 放进去即可。更新流程：
+
+```bash
+# 改完 UI → 导出 JSON → 提交 Git → 重新挂载/重启 Grafana
+git add dashboards/ && git commit -m "chore: 更新错误率仪表盘" && git push
+```
+
+<Callout type="tip" title="allowUiUpdates 取舍">
+`allowUiUpdates: true` 允许临时在 UI 改并导出，适合过渡期；稳定后设 `false` 强制一切以 Git 为准，避免「配置漂移」。
+</Callout>
+
+## 4. 告警 Provisioning
+
+```yaml
+# provisioning/alerting/alerts.yaml
+apiVersion: 1
+groups:
+  - name: backend
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: critical, team: backend }
+        annotations:
+          summary: "错误率超过 5%"
+```
+
+Contact point 与 Notification policy 也能 Provisioning：
+
+```yaml
+# provisioning/alerting/contact-points.yaml
+apiVersion: 1
+contactPoints:
+  - name: slack-alerts
+    receivers:
+      - uid: slack
+        type: slack
+        settings:
+          webhook: https://hooks.slack.com/services/XXX
+```
+
+<Callout type="info" title="环境变量注入敏感信息">
+Webhook URL、SMTP 密码别写死在 YAML 里。Grafana 支持在 Provisioning 里用 `${SLACK_WEBHOOK}` 引用环境变量，由部署时的 Secret 注入。
+</Callout>
+
+## 5. 目录挂载到容器
+
+```yaml
+# docker-compose.yml 片段
+services:
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+```
+
+启动日志里会看到 `Provisioning results: 3 datasources, 5 dashboards`。
+
+## 6. GitOps 工作流
+
+```text
+开发者改仪表盘
+   → 导出 JSON 提交 PR
+   → Review 合并到 main
+   → CI/CD 重新部署 Grafana（或 ArgoCD 自动同步）
+   → 所有环境配置一致
+```
+
+<Callout type="warn" title="别手动改生产">
+一旦走 Provisioning，生产仪表盘应「只读」。谁在 UI 手动改了，下次重启就被 Git 版本覆盖——这正是正确的约束。
+</Callout>
+
+## 小结
+
+- Provisioning 用 YAML 声明数据源/仪表盘/告警，纳入 Git
+- 数据源 + 仪表盘 providers 指向文件目录
+- 敏感信息用 `${ENV}` 注入
+- GitOps：一切以 Git 为准，环境一致、可回滚
+
+下一章：认证、团队与权限（RBAC） →

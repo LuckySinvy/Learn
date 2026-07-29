@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dockerRun, LANG_CONFIG, isDockerAvailable } from '@/lib/runner/docker-runner';
-import type { ExecuteRequest, ExecuteResponse, Language } from '@/lib/types';
+import type { ExecuteRequest, ExecuteResponse, Language, ExecutableLanguage } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const cfg = LANG_CONFIG[body.language];
+  const cfg = LANG_CONFIG[body.language as ExecutableLanguage];
 
   // Java: 将用户代码中的 `class X` 统一改写为 `class Main`，并将文件名命名为 Main.java
   let code = body.code;

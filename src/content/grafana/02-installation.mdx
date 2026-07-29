@@ -1,0 +1,119 @@
+---
+title: 安装与部署
+order: 2
+description: 用 Docker / docker-compose 一键启动 Grafana，理解配置文件与关键目录
+---
+
+# 安装与部署
+
+Grafana 官方提供容器镜像，最干净、最贴近生产的安装方式就是 **Docker**。本章带你从零跑起一个 Grafana 实例。
+
+## 1. 最简启动（Docker）
+
+```bash
+docker run -d \
+  --name grafana \
+  -p 3000:3000 \
+  grafana/grafana-oss:11.3.0
+```
+
+启动后访问 `http://localhost:3000`，默认账号 `admin / admin`，首次登录会要求改密码。
+
+<Callout type="warn" title="生产不要用默认密码">
+默认 admin/admin 只是本地演示。生产环境务必通过环境变量 `GF_SECURITY_ADMIN_PASSWORD` 设置强密码，或接入 SSO（见第 16 章）。
+</Callout>
+
+## 2. 用 docker-compose 管理
+
+真实项目里用 `docker-compose.yml` 管理更直观，也方便把 Grafana 和 Prometheus/Loki 编排在一起。
+
+```yaml
+# docker-compose.yml
+services:
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=changeme
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    restart: unless-stopped
+
+volumes:
+  grafana-data:
+```
+
+要点：
+
+- `grafana-data` 卷持久化仪表盘、用户、插件，避免容器重建后丢失
+- `GF_INSTALL_PLUGINS` 可在启动时自动装插件
+- `provisioning` 目录用于自动配置数据源（第 15 章详解）
+
+启动：
+
+```bash
+docker compose up -d
+docker compose ps        # 查看状态
+docker logs -f grafana   # 看日志
+```
+
+## 3. 配置文件 grafana.ini
+
+Grafana 主配置是 `grafana.ini`。容器内路径为 `/etc/grafana/grafana.ini`，可用环境变量 `GF_<段>_<键>` 覆盖任意一项。
+
+```ini
+[server]
+http_port = 3000
+domain = grafana.example.com
+
+[security]
+admin_user = admin
+admin_password = changeme   ; 或用 GF_SECURITY_ADMIN_PASSWORD 环境变量
+
+[auth.anonymous]
+enabled = false             ; 是否允许匿名查看
+
+[paths]
+data = /var/lib/grafana
+logs = /var/log/grafana
+provisioning = /etc/grafana/provisioning
+```
+
+<Callout type="tip" title="环境变量优先">
+容器内配置读环境变量优先级高于 ini 文件。约定：`GF_SERVER_HTTP_PORT` 对应 `[server] http_port`。生产推荐用环境变量 + 密钥管理，避免把密码写进 ini 提交到 Git。
+</Callout>
+
+## 4. 关键目录
+
+| 路径 | 作用 |
+|---|---|
+| `/var/lib/grafana` | SQLite 数据库（用户、仪表盘）、插件、会话 |
+| `/etc/grafana/grafana.ini` | 主配置 |
+| `/etc/grafana/provisioning` | 自动配置（datasources / dashboards） |
+| `/var/log/grafana` | 日志 |
+
+<Callout type="warn" title="数据一定要挂卷">
+如果你只 `docker run` 不加 `-v`，容器删掉后所有仪表盘和用户都没了。生产务必挂载 `/var/lib/grafana` 到命名卷或主机目录。
+</Callout>
+
+## 5. 验证安装
+
+```bash
+# 健康检查接口
+curl -s http://localhost:3000/api/health
+# 预期返回：{"commit":"...","database":"ok","version":"11.3.0"}
+```
+
+## 小结
+
+- 用 `grafana/grafana-oss` 镜像 + docker-compose 最稳妥
+- 挂载 `/var/lib/grafana` 卷持久化数据
+- 用 `GF_*` 环境变量覆盖配置，密码勿硬编码
+- `/api/health` 可验证存活
+
+下一章配置第一个数据源并创建仪表盘 →

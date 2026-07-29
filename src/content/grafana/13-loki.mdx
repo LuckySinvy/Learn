@@ -1,0 +1,107 @@
+---
+title: 日志与 Loki
+order: 13
+description: 接入 Loki 数据源，掌握 LogQL 基础查询、标签过滤、行过滤、量化和日志面板
+---
+
+# 日志与 Loki（LogQL）
+
+指标告诉你「系统病了」，日志告诉你「为什么」。**Loki** 是 Grafana 生态的日志系统，查询语言叫 **LogQL**。本章讲怎么在 Grafana 里查日志。
+
+## 1. 添加 Loki 数据源
+
+**Connections → Data sources → Loki**，填 URL（如 `http://loki:3100`），Save & test。
+
+<Callout type="info" title="Loki 的索引思路">
+Loki 不像 ELK 那样对全文建倒排索引，而是**只索引标签（labels）**，日志正文存在对象存储。所以查日志要先靠标签缩小范围（如 `job`、`level`），再在结果里做行内过滤。便宜、快，但「全文模糊搜」不如 ES 强。
+</Callout>
+
+## 2. LogQL 基础
+
+一条日志流由**标签**标识，查询分两段：`{标签选择} | 行过滤管道`。
+
+```logql
+{job="api", level="error"}
+```
+
+- `{job="api"}`：**流选择器**，按标签挑日志流（必须放最前）
+- `level="error"`：标签匹配
+
+## 3. 标签选择器
+
+```logql
+{job="api"}                     # 一个标签
+{job="api", env="prod"}         # 多标签（AND）
+{job=~"api|web"}                # 正则
+{job!="test"}                   # 取反
+```
+
+<Callout type="warn" title="先选标签，再筛正文">
+`{job="api"} |~ "timeout"` 是「先按 job 定位流，再在行内正则匹配 timeout」。不要试图直接对全部日志做全文搜——既慢又贵。
+</Callout>
+
+## 4. 行过滤管道（|）
+
+```logql
+{job="api"} |~ "error|fail"        # 行内正则匹配（包含）
+{job="api"} !~ "health"            # 行内正则排除
+{job="api"} | json                  # 把 JSON 日志解析成字段
+{job="api"} | logfmt                # 解析 logfmt（k=v）格式
+{job="api"} | line_format "{{.status}} {{.path}}"   # 重排输出行
+```
+
+`| json` 之后可以直接用解析出的字段：
+
+```logql
+{job="api"} | json | status >= 500
+```
+
+## 5. 把日志变成指标：量化查询
+
+LogQL 还能「数日志」，生成时序，放进图表或告警：
+
+```logql
+# 每分钟错误日志条数
+count_over_time({job="api", level="error"}[1m])
+
+# 5xx 占比
+sum(count_over_time({job="api"} | json | status>=500 [1m]))
+/
+sum(count_over_time({job="api"}[1m]))
+```
+
+- `count_over_time()`：区间计数 → 时序
+- `rate()` / `bytes_rate()`：日志速率
+- `topk()`：最频繁的日志
+
+## 6. 日志面板（Logs panel）
+
+在 Grafana 里用 **Logs** 面板展示原始日志：
+
+- 显示时间、标签、行内容
+- 点击某行可 **Add to filter**（加为过滤条件）
+- 支持**日志上下文**（在 Tempo 链路里看相邻日志）
+
+## 7. 与指标联动：派生字段（Derived fields）
+
+在 Loki 数据源配置里加 **Derived fields**，从日志中提取 `trace_id`，点击即可跳转到对应 Tempo 链路——指标、日志、链路真正打通。
+
+```text
+# Derived field 示例
+Name: TraceID
+Regex: trace_id=(\w+)
+Query: ${__value.raw}
+```
+
+<Callout type="tip" title="结构化日志是关键">
+想让日志好查，应用要打**结构化日志**（JSON，带 `level`/`trace_id`/`status` 等字段）。纯文本 `printf` 日志事后很难解析。
+</Callout>
+
+## 小结
+
+- Loki 只索引标签，正文靠行过滤
+- 查询：`{标签} | 管道`；先选流，再筛行
+- `| json` 解析后可用字段过滤
+- 量化查询（`count_over_time`）把日志变时序，可画图可告警
+
+下一章：链路追踪与 Tempo →

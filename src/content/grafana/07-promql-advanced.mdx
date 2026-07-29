@@ -1,0 +1,124 @@
+---
+title: PromQL 进阶
+order: 7
+description: histogram_quantile 分位数、聚合运算、子查询、记录规则（Recording Rules）
+---
+
+# PromQL 进阶
+
+掌握基础后，本章讲生产中最常用到的进阶写法：分位数、运算、子查询、记录规则。
+
+## 1. 分位数：histogram_quantile
+
+延迟的「平均值」会掩盖长尾。看 **P95 / P99** 才真实反映用户体验。前提是你的指标是 **Histogram** 类型（带 `_bucket` 后缀，按 `le` 分桶）。
+
+```promql
+# P95 请求延迟（秒）
+histogram_quantile(
+  0.95,
+  sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+)
+```
+
+要点：
+
+- 外层 `sum by (le)` 把多实例的 bucket 合并，再交给 `histogram_quantile`
+- `0.95` 是要的百分位；`0.99` 即 P99
+- 必须作用于 `rate(..._bucket[5m])`，且按 `le` 聚合
+
+<Callout type="warn" title="别忘了 sum by (le)">
+新手常写 `histogram_quantile(0.95, rate(x_bucket[5m]))` 报错——因为 `rate` 后还带着 `instance` 等标签，必须 `sum by (le)` 压平再算分位。
+</Callout>
+
+## 2. 四则运算与向量匹配
+
+两个瞬时向量可以直接运算（如 错误率 = 错误/总量）。
+
+```promql
+# 每个序列各自相除（按相同标签集合对齐）
+errors / total
+```
+
+当两边标签不完全一致，需要显式指定匹配：
+
+```promql
+# 忽略 instance 标签，只按 job 对齐
+sum by (job) (errors) / on (job) sum by (job) (total)
+```
+
+- `on (label)`：只按这些标签匹配
+- `ignoring (label)`：忽略这些标签后匹配
+- `group_left` / `group_right`：一对多匹配（很多场景需要，如把 `up` 关联到带额外标签的序列）
+
+## 3. 子查询（Subquery）
+
+有时你想对一个「已经聚合过的区间」再聚合，比如「过去 1 小时里，每 5 分钟窗口的 P95 的最大值」：
+
+```promql
+max_over_time(
+  histogram_quantile(0.95,
+    sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+  )[1h:5m]
+)
+```
+
+语法：`expr[start:resolution]` —— 在 `start` 长度内，每 `resolution` 取一个采样点。
+
+<Callout type="info" title="子查询的代价">
+子查询会对每个子窗口重算一遍内部查询，开销较大。高频使用的复杂查询应改用**记录规则**（见下）。
+</Callout>
+
+## 4. 记录规则（Recording Rules）
+
+把「算得慢、用得勤」的查询预先算好存成新指标，仪表盘直接查结果，又快又省。
+
+在 Prometheus 侧定义（`prometheus.yml` 或独立 rules 文件）：
+
+```yaml
+# prometheus/rules.yml
+groups:
+  - name: example
+    interval: 30s
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+      - record: job:http_errors:ratio5m
+        expr: |
+        sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+        /
+        sum by (job) (rate(http_requests_total[5m]))
+```
+
+之后在 Grafana 里直接写：
+
+```promql
+job:http_errors:ratio5m
+```
+
+<Callout type="tip" title="命名约定">
+社区约定 `level:metric:operation` 三段式，例如 `job:http_requests:rate5m`，可读性好、不易冲突。
+</Callout>
+
+## 5. 常用进阶函数
+
+| 函数 | 作用 |
+|---|---|
+| `histogram_quantile(q, b)` | 分位数 |
+| `clamp_max(x, m)` / `clamp_min` | 限制上下限 |
+| `absent()` | 序列消失时返回 1（适合「该有却没有」的告警） |
+| `label_replace()` | 运行时改写/新增标签 |
+| `predict_linear()` | 线性预测（如磁盘多久满） |
+
+```promql
+# 预测 4 小时后磁盘可用字节（小于 0 即将写满）
+predict_linear(node_filesystem_avail_bytes[1h], 4 * 3600) < 0
+```
+
+## 小结
+
+- 分位数用 `histogram_quantile(0.95, sum by (le)(rate(bucket[5m])))`
+- 向量运算用 `on()/ignoring()/group_left()` 控制匹配
+- 子查询 `expr[start:res]` 做嵌套区间
+- 记录规则把重查询预计算，仪表盘秒开
+
+下一章：查询结果的「数据转换（Transform）」→

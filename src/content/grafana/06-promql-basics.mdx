@@ -1,0 +1,126 @@
+---
+title: PromQL 基础
+order: 6
+description: 指标、标签、瞬时/区间向量，以及 rate/sum/by 等最常用的查询函数
+---
+
+# PromQL 基础
+
+**PromQL** 是 Prometheus 的查询语言，也是 Grafana 里写指标查询时用的语言。本章从最基础的语法讲起。
+
+## 1. 指标与标签
+
+一条时间序列由「指标名 + 一组标签（labels）」唯一确定：
+
+```text
+http_requests_total{job="api", method="GET", status="200"} 1342
+#                    └────────── 标签 ──────────┘            └─ 值(在某个时间点)
+```
+
+- **指标名**：测什么（`http_requests_total`）
+- **标签**：按维度切片（`method`、`status`、`instance`）
+- **值**：当前的样本值
+
+## 2. 瞬时向量 vs 区间向量
+
+这是 PromQL 最核心的概念，新手最容易混：
+
+| 类型 | 写法 | 含义 |
+|---|---|---|
+| **瞬时向量** | `http_requests_total` | 每个序列**当前**最新一个值 |
+| **区间向量** | `http_requests_total[5m]` | 每个序列**最近 5 分钟**的所有样本 |
+
+```promql
+http_requests_total            # 瞬时：每个序列此刻的值
+http_requests_total[5m]        # 区间：最近 5 分钟的样本窗口
+```
+
+<Callout type="warn" title="rate 只能用在区间向量上">
+`rate()` 计算「速率」，必须吃区间向量：`rate(x[5m])`。写成 `rate(x)` 直接报错。区间长度要 ≥ 抓取间隔的 2–4 倍。
+</Callout>
+
+## 3. rate / irate：算速率
+
+```promql
+# 每秒请求数（最近 5 分钟平均）
+rate(http_requests_total[5m])
+
+# 更灵敏的瞬时速率（用区间内最后两个样本）
+irate(http_requests_total[5m])
+```
+
+- `rate`：平滑，适合画趋势图
+- `irate`：灵敏，适合看突刺，但噪声大
+
+## 4. sum / by / without：聚合
+
+默认查询返回的是「每个标签组合一条线」。通常你想看**总和**或**按某维度分组**。
+
+```promql
+# 所有实例的 QPS 总和（压平所有标签）
+sum(rate(http_requests_total[5m]))
+
+# 按 method 分组求和（保留 method 标签）
+sum by (method) (rate(http_requests_total[5m]))
+
+# 除了 instance 标签外都聚合（保留其余维度）
+sum without (instance) (rate(http_requests_total[5m]))
+```
+
+记忆：`by (label)` = 保留这些标签再聚合；`without (label)` = 去掉这些标签再聚合。
+
+## 5. 标签匹配：= != =~ !~
+
+```promql
+# 精确等于
+http_requests_total{status="200"}
+
+# 不等于
+http_requests_total{status!="200"}
+
+# 正则匹配（~） / 不匹配（!~）
+http_requests_total{method=~"GET|POST"}
+http_requests_total{path!~"/health|/ping"}
+```
+
+<Callout type="tip" title="用标签切分错误率">
+错误率 = 错误数 / 总数，按 status 标签切：
+```promql
+sum by (status) (rate(http_requests_total[5m]))
+```
+一眼看出 4xx / 5xx 各占多少。
+</Callout>
+
+## 6. 常用函数速查
+
+| 函数 | 作用 | 示例 |
+|---|---|---|
+| `rate()` | 区间平均速率 | `rate(x[5m])` |
+| `irate()` | 瞬时速率 | `irate(x[5m])` |
+| `increase()` | 区间增量 | `increase(x[1h])` |
+| `sum/min/max/avg` | 聚合 | `max by (instance)(x)` |
+| `count()` | 序列条数 | `count(up)` |
+| `topk()/bottomk()` | Top/Bottom N | `topk(5, x)` |
+| `histogram_quantile()` | 分位数（见下章） | `histogram_quantile(0.95, x)` |
+
+## 7. 一个完整例子：错误率
+
+```promql
+# 5xx 错误率 = 5xx QPS / 总 QPS
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+<Callout type="exercise" title="练习">
+用你环境里的指标，写出：① 各实例 CPU 使用率；② 按 `method` 分组的 QPS；③ P95 延迟（提示：`histogram_quantile(0.95, rate(x_bucket[5m]))`，下章详解）。
+</Callout>
+
+## 小结
+
+- 指标 = 名称 + 标签 + 值
+- 瞬时向量 vs 区间向量（`[5m]`）
+- `rate(x[5m])` 算速率；`sum by (label)` 分组聚合
+- 标签匹配 `= != =~ !~`
+
+下一章进阶：分位数、子查询、记录规则 →

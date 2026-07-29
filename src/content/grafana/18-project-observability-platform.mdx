@@ -1,0 +1,153 @@
+---
+title: 实战项目二：完整可观测性平台
+order: 18
+description: 在监控栈基础上加入 Loki 日志、Tempo 链路、OpenTelemetry 与统一告警，构建 LGTM 可观测性平台
+---
+
+# 实战项目二：完整可观测性平台（LGTM）
+
+项目一只有「指标」。真实生产需要 **Metrics + Logs + Traces** 三合一。本章把 Loki、Tempo、OpenTelemetry Collector 加进来，并在 Grafana 里把三者打通。
+
+## 1. 目标架构
+
+```text
+                ┌─────────────────────────────────────┐
+   应用(OTel SDK)─┼─► OTel Collector ─┬─► Tempo (链路)   │
+        │         │                  ├─► Loki  (日志)   │
+        │         │                  └─► Prometheus(指标)│
+        │         └─────────────────────────────────────┘
+        │                    │
+        └── /metrics ─────► Prometheus ──► Grafana（统一展示+告警）
+                   └── 日志(trace_id) ─► Loki ──► Grafana
+```
+
+三者靠 **`trace_id`** 串联：日志里带 trace_id，指标按 service 切，链路按 trace_id 查。
+
+## 2. 扩展 docker-compose
+
+```yaml
+services:
+  # —— 已有的 ——
+  prometheus: { image: prom/prometheus:latest, ports: ["9090:9090"] }
+  grafana:    { image: grafana/grafana-oss:11.3.0, ports: ["3000:3000"],
+                volumes: ["./grafana/provisioning:/etc/grafana/provisioning"] }
+  node-exporter: { image: prom/node-exporter:latest }
+
+  # —— 新增：日志 ——
+  loki:
+    image: grafana/loki:latest
+    command: -config.file=/etc/loki/local-config.yaml
+    ports: ["3100:3100"]
+
+  # —— 新增：链路 ——
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports: ["3200:3200", "4317:4317"]
+
+  # —— 新增：OTel 收集器（统一接收埋点，分发到后端的存储）——
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel/config.yaml"]
+    ports: ["4317:4317", "4318:4318"]
+```
+
+## 3. OpenTelemetry Collector 配置
+
+```yaml
+# otel/config.yaml（示意）
+receivers:
+  otlp:
+    protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
+exporters:
+  tempo:
+    endpoint: tempo:4317
+    tls: { insecure: true }
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+  prometheus:
+    endpoint: prometheus:9090
+processors:
+  batch: {}
+service:
+  pipelines:
+    traces:  { receivers: [otlp], processors: [batch], exporters: [tempo] }
+    logs:    { receivers: [otlp], processors: [batch], exporters: [loki] }
+    metrics: { receivers: [otlp], processors: [batch], exporters: [prometheus] }
+```
+
+<Callout type="info" title="OTel 是胶水层">
+应用只需对接 OTel SDK（语言无关），Collector 负责把 trace/log/metric 分发到 Tempo/Loki/Prometheus。换后端不用改代码。
+</Callout>
+
+## 4. Grafana 同时接三个数据源
+
+```yaml
+# grafana/provisioning/datasources/all.yaml
+apiVersion: 1
+datasources:
+  - { name: Prometheus, type: prometheus, access: proxy, url: http://prometheus:9090, isDefault: true }
+  - { name: Loki,      type: loki,      access: proxy, url: http://loki:3100 }
+  - { name: Tempo,     type: tempo,     access: proxy, url: http://tempo:3200 }
+```
+
+并开启关联：
+
+- Tempo 数据源 → **Trace to logs**：用 `trace_id` 跳 Loki
+- Loki 数据源 → **Derived fields**：从日志提取 `trace_id` 跳 Tempo
+- 指标面板 → **Data links**：点时间点跳 Explore 查对应日志/链路
+
+## 5. 应用侧：结构化日志 + trace_id
+
+让日志带上 `trace_id`，三者才能真正联动：
+
+```json
+{"level":"info","trace_id":"abc123","status":200,"path":"/checkout","latency_ms":47}
+```
+
+配合 Loki 的 `| json` 解析 + Derived fields，点击日志里的 trace_id 即可看这次请求的全链路。
+
+## 6. 统一告警
+
+所有信号都能告警：
+
+- **指标**：错误率/延迟（Prometheus 规则，第 11 章）
+- **日志**：出现 `level=error` 突增（`count_over_time` > 阈值，第 13 章）
+- **链路**：某 span 错误率 / P99 超阈（Tempo 规则）
+
+统一走 Grafana Alerting 的 Notification policy 路由到 Slack/钉钉。
+
+## 7. 一份「SRE 总览」大屏
+
+把三信号放一块：
+
+1. **Row 指标**：QPS、错误率、P99（Time series）
+2. **Row 日志**：最近 error 日志（Logs 面板，点 trace_id 下钻）
+3. **Row 链路**：Service Map + 慢 Trace 列表（Tempo）
+4. **Row 告警**：Alert list 面板，贴当前触发的告警
+
+这就是一个团队级的「可观测性驾驶舱」。
+
+<Callout type="exercise" title="毕业练习">
+在上一项目的 compose 基础上加入 Loki + Tempo + OTel Collector，部署一个会打 trace_id 的示例应用，构建「SRE 总览」大屏，并验证：指标异常 → 点下去看到对应日志 → 再点看到慢链路。
+</Callout>
+
+## 8. 收尾与下一步
+
+你已经走完 Grafana 全链路：
+
+- 概念 → 安装 → 数据源 → 仪表盘 → 面板 → PromQL → 转换 → 模板变量
+- 告警体系 → 规则 → 通知
+- 日志(Loki) → 链路(Tempo) → Provisioning → 认证权限
+- 两个实战项目把一切串成生产级平台
+
+继续深入可看官方文档的 **Grafana Labs 博客**、**Awesome Grafana Dashboards**（社区仪表盘库），以及 **Prometheus / OpenTelemetry** 官方文档。
+
+## 小结
+
+- LGTM = Loki + Grafana + Tempo + Mimir/Prometheus
+- OTel Collector 是统一埋点入口，后端可替换
+- `trace_id` 把指标/日志/链路串成一条排障路径
+- 一屏总览 + 统一告警 = 可观测性平台闭环
+
+🎉 恭喜完成 Grafana 全部 18 章！

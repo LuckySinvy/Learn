@@ -1,0 +1,110 @@
+---
+title: 仪表盘与 JSON 结构
+order: 4
+description: Panel / Row / Dashboard 的层级关系，仪表盘底层就是 JSON，理解它能让你用代码管理一切
+---
+
+# 仪表盘与 JSON 结构
+
+**Dashboard（仪表盘）** 是 Grafana 的核心载体，本质是一份 **JSON 文档**。理解它的结构，你就能用代码生成、版本化和批量管理仪表盘。
+
+## 1. 三层结构
+
+一个仪表盘由三层组成：
+
+```
+Dashboard（仪表盘）
+├── Row（行，可选的视觉分组）
+│   ├── Panel（面板）   ← 真正画图的地方
+│   └── Panel
+└── Row
+    └── Panel
+```
+
+- **Panel（面板）**：最小的可见单元，绑定一个数据源 + 一条/多条查询，渲染成图。
+- **Row（行）**：把多个 Panel 横向归为一组，便于折叠和布局。
+- **Dashboard（仪表盘）**：Row/Panel 的容器，带全局时间范围、变量、标题。
+
+## 2. 创建第一个仪表盘
+
+1. 左侧 **Dashboards → New → New dashboard**
+2. 点 **Add visualization**，选数据源 `Prometheus`
+3. 输入查询 `up`，保存
+
+就这么简单。但底层 Grafana 已经帮你生成了一份 JSON。
+
+## 3. 仪表盘就是 JSON
+
+点仪表盘右上角 **Dashboard settings（齿轮）→ JSON Model**，你会看到类似：
+
+```json
+{
+  "title": "我的第一个仪表盘",
+  "uid": "my-first-dash",
+  "schemaVersion": 39,
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "服务存活",
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "up", "refId": "A" }
+      ]
+    }
+  ],
+  "templating": { "list": [] }
+}
+```
+
+关键字段：
+
+- `uid`：仪表盘唯一 ID，URL 与 Provisioning 都靠它（建议显式指定，便于引用）
+- `panels[].type`：可视化类型（`timeseries` / `stat` / `gauge` / `table` …）
+- `panels[].gridPos`：在网格中的 `x/y/w/h`（每格 24 列宽）
+- `panels[].targets[].expr`：查询表达式（PromQL / LogQL …）
+- `templating.list`：模板变量（第 9 章）
+
+<Callout type="info" title="为什么懂 JSON 很有用">
+当你需要「100 个服务、每个服务一张一样的 CPU 图」时，手写 JSON 模板 + 脚本批量生成，比在 UI 里点 100 次高效得多。这也是 GitOps 管理仪表盘的基础。
+</Callout>
+
+## 4. 用代码保存仪表盘（Provisioning 预览）
+
+把上面的 JSON 存成 `dashboards/my-first.json`，再用 Provisioning 让 Grafana 启动时自动加载（完整见第 15 章）：
+
+```yaml
+# provisioning/dashboards/default.yml
+apiVersion: 1
+providers:
+  - name: default
+    folder: ''
+    type: file
+    disableDeletion: false
+    options:
+      path: /etc/grafana/provisioning/dashboards
+```
+
+<Callout type="tip" title="导出即备份">
+每次在 UI 改完仪表盘，去 JSON Model 复制或点「Export」下载 JSON，提交到 Git。这就是仪表盘的版本管理。
+</Callout>
+
+## 5. 常用操作
+
+| 操作 | 位置 |
+|---|---|
+| 新增面板 | 仪表盘右上 **Add → Visualization** |
+| 调整布局 | 直接拖面板，或改 `gridPos` |
+| 复制面板 | 面板标题下拉 → **More → Duplicate** |
+| 全屏 | 面板标题下拉 → **View** |
+
+## 小结
+
+- Dashboard = Row + Panel，本质是一份 JSON
+- `uid` 是唯一标识；`gridPos` 控制布局
+- 理解 JSON 让你能用代码批量管理仪表盘
+- 改完记得导出 JSON 进 Git
+
+下一章深入了解各类面板与可视化 →

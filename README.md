@@ -1,6 +1,6 @@
-# Learn — 编程语言交互式学习
+# Learn — 编程语言与可观测性交互式学习
 
-渐进式学习 **Python / Go / Java** 的交互式教程网站。每节嵌入可运行的 Playground（代码在 Docker 沙箱中执行）。
+渐进式学习 **Python / Go / Java / Grafana** 的交互式教程网站。编程语言每节嵌入可运行的 Playground（代码在 Docker 沙箱中执行）；Grafana 为配置型教程，以真实 YAML/JSON/PromQL 示例贯穿。
 
 ## 快速开始
 
@@ -30,13 +30,13 @@ pnpm dev
 src/
 ├── app/                  # Next.js App Router
 │   ├── api/execute/      # 代码执行 API（Node.js runtime）
-│   ├── python|go|java/   # 三语言章节
+│   ├── python|go|java|grafana/   # 四门教程章节
 │   └── page.tsx          # 首页
 ├── components/
 │   ├── layout/           # Header / Sidebar / LanguageCard
-│   ├── playground/       # Monaco 编辑器 + 输出面板
+│   ├── playground/       # Monaco 编辑器 + 输出面板（仅编程语言）
 │   └── mdx/              # MDX 渲染组件
-├── content/              # MDX 教程源文件（每语言 18 章）
+├── content/              # MDX 教程源文件（每门 18 章）
 └── lib/
     ├── content.ts        # 章节元数据加载
     ├── mdx.tsx           # MDX 编译（rehype-pretty-code + 锚点）
@@ -142,7 +142,7 @@ server {
 | 命令 | 说明 |
 |---|---|
 | `pnpm dev` | 启动开发服务器 |
-| `pnpm build` | 生产构建（预渲染 58 个静态页：首页 + 3 语言索引 + 54 章节） |
+| `pnpm build` | 生产构建（预渲染 77 个静态页：首页 + 4 门索引 + 72 章节） |
 | `pnpm start` | 启动生产服务器 |
 | `pnpm lint` | ESLint |
 

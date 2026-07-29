@@ -1,0 +1,135 @@
+---
+title: 告警通知渠道
+order: 12
+description: 配置 Email / Slack / Webhook / 钉钉 / 企业微信等 Contact point，并用 Notification policy 路由
+---
+
+# 告警通知渠道（Contact points）
+
+规则触发后，告警要**发到该去的地方**。本章配置各类 Contact point，并用 Notification policy 把告警路由过去。
+
+## 1. 配置 Contact point
+
+**Alerting → Contact points → New contact point**：
+
+- **Name**：`slack-alerts`
+- **Integration**：选渠道类型（Email / Slack / Webhook / DingDing / Prometheus Alertmanager …）
+- 填对应参数
+- 可加多个 Integration（一封告警同时发邮件 + 钉钉）
+
+## 2. Email
+
+```text
+Integration: Email
+Addresses: ops@example.com, oncall@example.com
+Subject: "🚨 [{{ .Status }}] {{ .CommonAnnotations.summary }}"
+Message: "{{ .CommonAnnotations.description }}"
+```
+
+Grafana 用 Go template 渲染，`{{ .CommonAnnotations.summary }}` 取出规则里的注解。
+
+<Callout type="tip" title="SMTP 要先配">
+发邮件前需在 `grafana.ini` 配 SMTP：
+```ini
+[smtp]
+enabled = true
+host = smtp.example.com:465
+user = grafana@example.com
+password = <app-password>
+from_address = grafana@example.com
+```
+</Callout>
+
+## 3. Slack
+
+```text
+Integration: Slack
+Webhook URL: https://hooks.slack.com/services/XXX/YYY/ZZZ
+Recipient: #alerts
+```
+
+Webhook URL 在 Slack 的 Incoming Webhooks 应用里创建。消息会自动带附件卡片，体验很好。
+
+## 4. Webhook（最灵活，对接钉钉/企业微信/自建系统）
+
+Grafana 会 POST 一个 JSON 到你的地址：
+
+```json
+{
+  "title": "[FIRING:1] HighErrorRate",
+  "status": "firing",
+  "alerts": [
+    {
+      "labels": { "severity": "critical", "team": "backend" },
+      "annotations": { "summary": "错误率超过 5%", "description": "..." }
+    }
+  ]
+}
+```
+
+对接**钉钉/企业微信**通常用一个中转服务把上面的 JSON 转成对应机器人格式（Markdown）。例如一个简单转发脚本：
+
+```python
+# 伪代码：把 Grafana webhook 转成钉钉 markdown
+import json, requests
+def on_grafana(payload):
+    text = f"### {payload['title']}\n" + "\n".join(
+        a["annotations"].get("description", "") for a in payload["alerts"]
+    )
+    requests.post(DING_URL, json={"msgtype": "markdown", "markdown": {"title": "告警", "text": text}})
+```
+
+<Callout type="warn" title="Webhook 要公网可达">
+Grafana 主动 POST 给你的 Webhook，所以你的接收服务必须能被 Grafana 访问到（同一内网或公网）。本地 `localhost` 仅当 Grafana 也在本机时可用。
+</Callout>
+
+## 5. Notification policy 路由
+
+配好 Contact point 后，用策略把告警送过去。
+
+**Alerting → Notification policies**：
+
+- **Root policy**：默认 Contact point = `email-ops`
+- 加子策略：
+  - `Match labels: severity = critical` → `Contact point: slack-alerts`
+  - `Match labels: team = payment` → `Contact point: dingding-payment`
+
+```text
+Root (email-ops)
+ ├─ severity=critical → slack-alerts
+ └─ team=payment     → dingding-payment
+```
+
+<Callout type="info" title="标签匹配是核心">
+策略只认告警的 `labels`。所以规则里 `severity`/`team` 打对，路由才对。改通知渠道只动 policy，不用动规则。
+</Callout>
+
+## 6. 分组、去重、静默
+
+- **Group by**：相同标签的告警合并成一条消息（避免轰炸）。建议按 `alertname, instance` 分组
+- **Group wait / Group interval**：第一条等多久发、之后多久补发
+- **Silence**：临时静默，如发布期间屏蔽某 `job`
+- **Mute timing**：周期性静默（每周维护窗口）
+
+## 7. 模板美化消息
+
+在 Contact point 的 Message 里用模板变量让消息更可读：
+
+```text
+[{{ .Status | toUpper }}] {{ .CommonLabels.severity }} · {{ .CommonLabels.team }}
+{{ .CommonAnnotations.summary }}
+详情：{{ .CommonAnnotations.description }}
+```
+
+<Callout type="exercise" title="练习">
+配一个 Slack Contact point 和一个钉钉 Webhook 中转，再用 Notification policy 把 `severity=critical` 同时发到两者，`warning` 只发 Slack。给支付团队单独一条路由。
+</Callout>
+
+## 小结
+
+- Contact point 决定「发到哪」：Email/Slack/Webhook/钉钉
+- Webhook 最灵活，但接收端要能收 Grafana 的 POST
+- Notification policy 按 `labels` 路由，规则只负责打标签
+- 用 Group/Silence/Mute timing 防止告警风暴
+
+下一章：日志与 Loki →

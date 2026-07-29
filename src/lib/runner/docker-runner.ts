@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Language } from '@/lib/types';
+import type { ExecutableLanguage } from '@/lib/types';
 
 export type DockerRunConfig = {
   image: string;
@@ -102,7 +102,7 @@ export async function isDockerAvailable(): Promise<boolean> {
   });
 }
 
-export const LANG_CONFIG: Record<Language, Omit<DockerRunConfig, 'cmd' | 'filename'> & { cmd: string; filename: string }> = {
+export const LANG_CONFIG: Record<ExecutableLanguage, Omit<DockerRunConfig, 'cmd' | 'filename'> & { cmd: string; filename: string }> = {
   python: {
     image: 'python:3.12-alpine',
     cmd: 'python -u /code/main.py',

@@ -1,0 +1,131 @@
+---
+title: 告警规则
+order: 11
+description: 在 Grafana 中创建阈值告警、PromQL 条件告警，理解 For 持续时间、Pending 与标签注解
+---
+
+# 告警规则（Alert rules）
+
+上一章讲了体系，本章动手创建规则。我们以「错误率超过 5% 持续 5 分钟就告警」为例。
+
+## 1. 创建一条阈值告警
+
+进入 **Alerting → Alert rules → New alert rule**：
+
+**① 设置查询（Query）**
+
+- Data source：Prometheus
+- 查询 A：
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+**② 设置条件（Condition）**
+
+添加一个 **Expression** 步骤：
+
+- 类型：`Threshold`
+- 输入：`WHEN last() OF A IS ABOVE 0.05`
+
+含义：取查询 A 的最后一个值，若 > 0.05（即 5%）则满足条件。
+
+**③ 设置 For 与标签**
+
+- **For**：`5m`（连续 5 分钟超标才真正告警，过滤抖动）
+- **Labels**：`severity=critical`, `team=backend`
+- **Annotations**：
+  - `summary`：`错误率过高`
+  - `description`：`{{ $labels.team }} 服务错误率 {{ $values.A.Value }} 超过 5%`
+
+<Callout type="info" title="A / B / C 是引用名">
+每个查询/表达式有 `refId`（默认 A、B…）。条件里写 `OF A` 表示用 A 的结果。多个查询可串联：A 取数 → B 做数学 → C 设阈值。
+</Callout>
+
+## 2. 用 PromQL 表达式代替 Threshold
+
+更灵活的方式是直接在表达式里算「是否超标」，再让条件判断「是否为 1」。
+
+```promql
+# 表达式 B：错误率是否超 5%（是=1，否=0）
+(
+  sum(rate(http_requests_total{status=~"5.."}[5m]))
+  /
+  sum(rate(http_requests_total[5m]))
+) > bool 0.05
+```
+
+然后条件：`WHEN last() OF B IS ABOVE 0`。`> bool` 返回 0/1，非常适合组合逻辑。
+
+## 3. 多条件与 AND/OR
+
+Grafana 支持用 **Math** 表达式组合多个查询结果：
+
+```promql
+# 表达式 C：CPU 高 且 内存也高 才告警
+$A > 80 and $B > 90
+```
+
+- `and` / `or` 按序列逐个布尔运算
+- 引用上一表达式结果用 `$refId`
+
+## 4. 没有数据也算告警：absent
+
+监控「该上报却没上报」比监控数值更关键。
+
+```promql
+# 若 up 指标消失（实例下线），absent 返回 1 → 触发
+absent(up{job="api"})
+```
+
+配成告警：`WHEN last() OF A IS ABOVE 0`，实例一掉线就报警。
+
+<Callout type="warn" title="No Data 别忽视">
+默认情况下查询无数据可能只是「不报警」而非「报警」。对「心跳类」指标，务必用 `absent()` 显式把「没数据」转成「触发」。
+</Callout>
+
+## 5. For 与 Pending 的意义
+
+- 条件刚满足 → 状态 `Pending`
+- 持续满 `For` 时长 → 状态 `Alerting`，真正发送
+- 期间若恢复 → 回到 `Inactive`，不发
+
+这能挡掉大多数瞬时抖动（如 GC 导致的 1 秒延迟尖峰）。
+
+## 6. 一条完整的规则 JSON（Provisioning）
+
+规则也能用文件声明（放在 Grafana 的 `provisioning/alerting` 或 Grafana Alerting 的 file provisioning）：
+
+```yaml
+apiVersion: 1
+groups:
+  - name: backend-alerts
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "错误率超过 5%"
+          description: "当前错误率 {{ $values.A.Value }}"
+```
+
+<Callout type="exercise" title="练习">
+为你的服务创建两条规则：① 5xx 错误率 > 5% 持续 5 分钟（critical）；② 实例 `up == 0` 即告警（用 `absent`）。给它们打好 `severity`/`team` 标签。
+</Callout>
+
+## 小结
+
+- 规则 = 查询 + 条件(Threshold/表达式) + For + 标签 + 注解
+- `> bool` / `and` / `or` 写复杂逻辑
+- `absent()` 监控「该有却没有」
+- For 挡抖动；用文件 Provisioning 规则可纳入 Git
+
+下一章：把告警发到邮件/Slack/钉钉 →

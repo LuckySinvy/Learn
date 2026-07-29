@@ -1,0 +1,160 @@
+---
+title: 实战项目一：Prometheus 监控栈
+order: 17
+description: 用 docker-compose 搭建 Prometheus + Grafana + node-exporter + 一个示例应用，端到端跑通指标监控
+---
+
+# 实战项目一：Prometheus + Grafana 监控栈
+
+把前 16 章串起来：用一份 `docker-compose.yml` 搭一个**能真实跑起来**的监控栈，监控一台机器和一个示例应用。
+
+## 1. 组件清单
+
+| 组件 | 作用 |
+|---|---|
+| Prometheus | 拉取并存储指标 |
+| Grafana | 展示 + 告警 |
+| node-exporter | 暴露主机（CPU/内存/磁盘）指标 |
+| blackbox-exporter | （可选）探测 HTTP/端口存活 |
+| 示例 app | 一个会打指标的 Spring/Flask/Go 服务 |
+
+## 2. 目录结构
+
+```text
+monitoring/
+├── docker-compose.yml
+├── prometheus/
+│   └── prometheus.yml
+└── grafana/
+    └── provisioning/
+        ├── datasources/prometheus.yaml
+        └── dashboards/node.json
+```
+
+## 3. Prometheus 配置
+
+```yaml
+# prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: app
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8080"]
+```
+
+## 4. docker-compose
+
+```yaml
+# docker-compose.yml
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus:/etc/prometheus
+    ports: ["9090:9090"]
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=changeme
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+  app:
+    image: your-registry/sample-app:latest   # 任何 /metrics 暴露指标的服务
+    ports: ["8080:8080"]
+    restart: unless-stopped
+
+volumes:
+  grafana-data:
+```
+
+## 5. Grafana 自动配数据源
+
+```yaml
+# grafana/provisioning/datasources/prometheus.yaml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+```
+
+启动：
+
+```bash
+docker compose up -d
+# 访问 http://localhost:3000 → 数据源已自动就绪
+```
+
+## 6. 一块 node 监控仪表盘
+
+用前面学的知识，把 `node-exporter` 指标拼成仪表盘（可导入官方 ID `1860` 的 Node Exporter Full，或自己写）：
+
+```promql
+# CPU 使用率
+100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# 内存使用率
+(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)
+  / node_memory_MemTotal_bytes * 100
+
+# 磁盘使用率
+(node_filesystem_size_bytes - node_filesystem_free_bytes)
+  / node_filesystem_size_bytes * 100
+```
+
+配上 Time series + Stat + Gauge，再按 `instance` 做模板变量（第 9 章），即可切换查看每台机器。
+
+## 7. 加一条告警
+
+用 Provisioning 加「磁盘将满」告警（结合第 7 章 `predict_linear`）：
+
+```yaml
+# grafana/provisioning/alerting/disks.yaml
+apiVersion: 1
+groups:
+  - name: host
+    rules:
+      - alert: DiskWillFill
+        expr: predict_linear(node_filesystem_avail_bytes[1h], 4*3600) < 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "磁盘 4 小时内将写满"
+```
+
+<Callout type="exercise" title="动手">
+克隆本项目，跑起 `docker compose up -d`，打开 Grafana 确认数据源连通；导入一块 node 仪表盘；触发一次 `up == 0` 告警验证通知链路。
+</Callout>
+
+## 小结
+
+- 一份 compose 拉起 Prometheus + Grafana + exporters
+- Prometheus 负责拉/存，Grafana 负责看/告警
+- Provisioning 让数据源与仪表盘零手动配置
+- 端到端跑通 = 你已具备搭建基础监控的能力
+
+下一章：把它升级成完整可观测性平台 →

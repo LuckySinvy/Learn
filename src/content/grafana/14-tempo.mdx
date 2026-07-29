@@ -1,0 +1,92 @@
+---
+title: 链路追踪与 Tempo
+order: 14
+description: 接入 Tempo 数据源，理解 Trace/Span，在 Grafana 中查询链路、火焰图与 Service Map
+---
+
+# 链路追踪与 Tempo
+
+当请求跨越多个微服务，**Trace（链路）** 能还原「这一次调用走了哪些服务、各花多久」。Grafana 生态用 **Tempo** 存链路，查询直接在 Grafana 里完成。
+
+## 1. 核心概念
+
+- **Trace**：一次完整请求的生命周期
+- **Span**：链路里的一个「工作单元」（一次 RPC、一次 DB 查询），带起止时间
+- **Span 关系**：父子嵌套，构成一棵调用树
+- **trace_id**：贯穿整条链路的 ID，也写在日志里（见上章 Derived fields）
+
+```text
+Trace abc123
+├─ Span: GET /checkout        (api, 120ms)
+│  ├─ Span: SELECT orders     (db, 30ms)
+│  └─ Span: POST payment      (payment, 70ms)
+└─ Span: render               (web, 20ms)
+```
+
+## 2. 添加 Tempo 数据源
+
+**Connections → Data sources → Tempo**，URL 填 `http://tempo:3200`，Save & test。建议开启 **Trace to logs**（链路跳日志）和 **Trace to metrics**（链路跳指标）。
+
+## 3. 在 Explore 里查链路
+
+**Explore → Tempo**，可用三种方式定位一条 Trace：
+
+- **Search**：按 `service`、`operation`、`duration >` 过滤（如「payment 服务、耗时 > 500ms」）
+- **Trace ID**：直接粘贴 `trace_id`
+- **从日志/指标跳转**：日志面板里点 trace_id 自动跳过来
+
+## 4. Trace 视图与火焰图
+
+打开一条 Trace，你会看到：
+
+- **Span 列表**：每个跨度的时间、状态、自身耗时 vs 总耗时
+- **火焰图（Flame graph）**：横向条，越长越慢，嵌套表示调用关系
+- **瀑布图**：时间轴上的先后与重叠
+
+<Callout type="tip" title="找瓶颈看最宽的 Span">
+火焰图里最宽的那个 Span 就是瓶颈。结合 `duration` 过滤，专看「慢链路」能快速定位是哪个服务拖慢了整体。
+</Callout>
+
+## 5. Service Map（服务拓扑）
+
+Tempo + 指标能自动画出 **Service Map**：各服务为节点，调用关系为边，边粗表示流量大、红表示错误多。这是「一眼看清架构与故障传播」的利器。
+
+前提：你的应用用 OpenTelemetry 埋点，Span 带 `service.name`、`client`/`server` 等标准属性。
+
+## 6. 从指标 → 日志 → 链路 打通
+
+Grafana 的强项是**关联**：
+
+1. 时序图发现 payment 服务 P99 飙高
+2. 点击该时间点 → Jump to logs（看同时段日志）
+3. 日志里点 `trace_id` → Jump to trace（看这条慢请求卡在哪）
+
+这三条信号在同一界面串联，排障从「猜」变成「顺藤摸瓜」。
+
+## 7. 应用怎么埋点（OpenTelemetry 概览）
+
+Grafana 负责展示，埋点靠 **OpenTelemetry（OTel）** SDK：
+
+```yaml
+# collector 把 trace 发给 Tempo（示意）
+exporters:
+  otlp:
+    endpoint: tempo:4317
+service:
+  pipelines:
+    traces:
+      exporters: [otlp]
+```
+
+<Callout type="info" title="本教程范围">
+埋点 SDK 的具体代码（每种语言的 OTel 用法）不在本教程内。重点是：让应用产出带标准属性的 trace，Grafana/Tempo 自然能展示。可观测性 = 埋点 + 存储 + 展示 三段协作。
+</Callout>
+
+## 小结
+
+- Trace = 一次请求；Span = 一个工作单元，嵌套成树
+- Grafana 接 Tempo，用 Search / Trace ID / 跳转三种方式查链路
+- 火焰图找最宽 Span = 找瓶颈
+- 指标→日志→链路打通，排障效率倍增
+
+下一章：用代码自动化配置（Provisioning） →

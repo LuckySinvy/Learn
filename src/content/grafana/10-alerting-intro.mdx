@@ -1,0 +1,93 @@
+---
+title: 告警体系概览
+order: 10
+description: Alert rule / Contact point / Notification policy / Silence 的关系，Grafana 统一告警模型
+---
+
+# 告警体系概览
+
+Grafana 9+ 把指标和日志的告警**统一成一套模型**，不再区分 Prometheus 告警和 Grafana 告警。理解整体结构，后续配规则才不迷路。
+
+## 1. 四个核心概念
+
+```
+Alert rule（告警规则）
+    │  触发
+    ▼
+Notification policy（通知策略）  ──路由──▶  Contact point（通知渠道：邮件/Slack/Webhook）
+    │
+    └─ Silence（静默）/ Mute timing（定时静默）
+```
+
+| 概念 | 作用 |
+|---|---|
+| **Alert rule** | 定义「什么条件算告警」，绑定查询 + 阈值 + 持续时间 |
+| **Contact point** | 告警发到哪（邮件、Slack、Webhook、钉钉…） |
+| **Notification policy** | 按标签把告警路由到哪个 Contact point |
+| **Silence** | 临时屏蔽某些告警（如发布期间） |
+
+<Callout type="info" title="统一告警，不再分家">
+旧版 Grafana 有「Graphite/Prometheus 告警」和「Grafana 告警」两套。现在统一为 Grafana 告警引擎，数据源负责提供查询，Grafana 负责评估与发送。
+</Callout>
+
+## 2. Alert rule 的关键字段
+
+一条规则由这些部分组成：
+
+- **Query & Conditions（查询与条件）**：A 查询取数，用表达式（Reduce/Threshold）判定是否触发
+- **Conditions（阈值条件）**：如 `WHEN last() OF A IS ABOVE 0.05`
+- **For（持续时间）**：连续满足条件多久才真正告警（避免抖动）
+- **Labels（标签）**：给告警打标（如 `severity=critical`），用于路由
+- **Annotations（注解）**：`summary` / `description`，人读的信息，支持模板变量
+
+## 3. 通知策略路由
+
+Notification policy 是一棵**路由树**，按告警的标签匹配：
+
+```text
+Root policy
+ ├─ severity=critical  →  Contact: 电话/短信群
+ ├─ severity=warning   →  Contact: Slack #alerts
+ └─ team=payment       →  Contact: 钉钉支付群
+```
+
+- 没匹配到子策略的，走 **Root policy** 的默认 Contact point
+- 一条告警可匹配多条策略（继续往下分）
+
+<Callout type="tip" title="用标签路由，而不是建 N 条规则">
+不要把「发给谁」写死在规则里。规则只负责打 `severity`/`team` 标签，路由交给 Notification policy。这样换通知渠道只改一处。
+</Callout>
+
+## 4. Silence 与 Mute timing
+
+- **Silence**：临时静默（指定标签 + 时间段），如「发布窗口 10 分钟不报警」
+- **Mute timing**：周期性静默，如「每晚 02:00–04:00 维护期」
+
+## 5. 告警状态
+
+每条告警实例有状态：
+
+- **Inactive**：条件不满足
+- **Pending**：条件满足，但未满 `For` 时长
+- **Alerting**：已触发，已发出
+- **No Data**：查询没返回数据（可配置成触发或不触发）
+- **Error**：查询执行出错
+
+## 6. 在哪看告警
+
+- **Alerting → Alert rules**：管理规则
+- **Alerting → Alert list / Overview**：查看当前触发状态
+- 面板里也能加 **Alert list** 面板，把当前告警直接贴在仪表盘上
+
+<Callout type="exercise" title="练习">
+画一张你团队的告警路由草图：critical / warning 分别去哪，哪些团队有专属群。这正是下一章要落地的配置。
+</Callout>
+
+## 小结
+
+- 四件套：Alert rule → Notification policy → Contact point → Silence
+- 规则打标签，策略按标签路由
+- `For` 避免抖动；状态有 Pending/Alerting/No Data
+- 告警既可在 Alerting 页看，也可贴进仪表盘
+
+下一章：动手写告警规则 →

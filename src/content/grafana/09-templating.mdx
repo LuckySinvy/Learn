@@ -1,0 +1,114 @@
+---
+title: 模板变量
+order: 9
+description: Query / Custom / Constant / Interval 变量，用 $var 让仪表盘可切换数据源、实例、时间粒度
+---
+
+# 模板变量（Templating）
+
+**模板变量** 让仪表盘「活」起来：用下拉框切换实例、服务、环境，而不必为每个组合建一块新仪表盘。这是 Grafana 最强大的特性之一。
+
+## 1. 什么是模板变量
+
+变量以 `$name` 形式插入查询、面板标题、甚至数据源选择。用户在下拉框选值，所有引用它的地方实时刷新。
+
+## 2. 变量类型
+
+| 类型 | 场景 |
+|---|---|
+| **Query** | 选项来自某数据源的查询结果（如 Prometheus 的 label 值） |
+| **Custom** | 手写固定选项（`prod,staging,dev`） |
+| **Constant** | 固定常量，隐藏为变量 |
+| **Interval** | 时间粒度（`1m,5m,1h`），配合 `$__interval` |
+| **Text box** | 用户自由输入 |
+| **Datasource** | 切换数据源（多环境共用仪表盘） |
+
+## 3. Query 变量（最常用）
+
+例子：用下拉框选择要查看的 `instance`。
+
+在 Dashboard settings → **Variables → New variable**：
+
+- **Type**：Query
+- **Data source**：Prometheus
+- **Query**：`label_values(up, instance)`
+- **Name**：`instance`
+- **Multi-value**：✅（允许选多个）
+- **Include All option**：✅（出现「All」）
+
+`label_values(up, instance)` 会返回 `up` 指标里所有 `instance` 标签值，作为下拉选项。
+
+之后在查询里引用：
+
+```promql
+node_cpu_seconds_total{instance=~"$instance"}
+```
+
+- `=~"$instance"`：支持多选（自动展开为正则）
+- 选「All」时等价于匹配全部
+
+<Callout type="tip" title="多选必须用 =~ 而不是字面量">
+`$instance` 多选时展开成 `instance1|instance2`。用 `=~"$instance"`（正则匹配）才正确；用 `="instance1|instance2"` 会按字面量匹配而查不到。
+</Callout>
+
+## 4. 级联变量（依赖）
+
+可以实现「选了 job，再选该 job 下的 instance」。在 instance 变量的 Query 里加过滤：
+
+```promql
+label_values(up{job="$job"}, instance)
+```
+
+并设置 **Hide = Variable depends on**：`job`。这样先选 job，instance 列表才填充。
+
+## 5. 数据源变量（多环境共用）
+
+```text
+Type: Datasource
+Name: ds
+Type: prometheus
+```
+
+查询里写：
+
+```promql
+up{job="$job"}   # 数据源选 $ds
+```
+
+这样同一块仪表盘，下拉切到「生产 Prometheus」或「预发 Prometheus」即可，无需复制。
+
+## 6. Interval 变量与 $__interval
+
+让图表的时间粒度也可选：
+
+- 变量 `interval`，Custom 值 `1m,5m,15m,1h`，含 All
+- 查询里用 `$__interval` 自动适配当前面板时间范围；用 `$interval` 取用户选的值：
+
+```promql
+rate(http_requests_total[$interval])
+```
+
+<Callout type="info" title="$__interval vs $interval">
+`$__interval` 由 Grafana 按面板宽度自动算（自适应，推荐）；`$interval` 是用户在下拉框选的手动值。
+</Callout>
+
+## 7. 在标题里用变量
+
+面板标题可含变量，动态显示当前上下文：
+
+```text
+标题：服务 {{$job}} 在实例 {{$instance}} 的 QPS
+```
+
+<Callout type="exercise" title="练习">
+建一个变量 `env`（Custom: prod,staging），再建一个 `instance` 的 Query 变量依赖 `env`（提示：Prometheus 指标带 `env` 标签）。做一块仪表盘，切换 env 即看对应环境的实例。
+</Callout>
+
+## 小结
+
+- 变量 = `$name`，下拉框驱动，引用处实时刷新
+- Query 变量最常用：`label_values(metric, label)`
+- 多选务必用 `=~"$var"`
+- 级联、数据源切换、Interval 让仪表盘高度复用
+
+下一章进入告警体系 →

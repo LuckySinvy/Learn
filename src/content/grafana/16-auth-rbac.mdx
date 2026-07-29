@@ -1,0 +1,141 @@
+---
+title: 认证与权限（RBAC）
+order: 16
+description: 内置用户、匿名访问、LDAP/OAuth 登录，以及文件夹级权限与 RBAC 角色
+---
+
+# 认证与权限（RBAC）
+
+团队用 Grafana，必须管好「谁能看什么、谁能改什么」。本章讲登录方式和权限模型。
+
+## 1. 认证方式
+
+| 方式 | 场景 |
+|---|---|
+| **内置用户** | 小团队，Grafana 自己管账号密码 |
+| **匿名（anonymous）** | 公开大屏（如公司电视墙） |
+| **LDAP / Active Directory** | 企业内部统一账号 |
+| **OAuth / OIDC** | GitHub / Google / 企业 SSO |
+| **SAML** | 企业级 SSO（Enterprise 更全） |
+
+## 2. 内置用户与组织
+
+Grafana 有「组织（Org）」概念，可用于多租户隔离：
+
+```ini
+[auth]
+disable_login_form = false
+
+[users]
+allow_sign_up = false     ; 禁止自助注册，统一由管理员建号
+auto_assign_org = true
+```
+
+建用户：**Administration → Users → Invite user**，设邮箱、角色（Viewer/Editor/Admin）。
+
+<Callout type="tip" title="关掉自助注册">
+生产务必 `allow_sign_up = false`，否则任何人都能注册进来看数据。账号由管理员邀请或走 SSO。
+</Callout>
+
+## 3. 匿名访问（大屏场景）
+
+给公司电视墙放一块只读大屏：
+
+```ini
+[auth.anonymous]
+enabled = true
+org_role = Viewer
+```
+
+此时访客无需登录即可看（仅 Viewer 权限）。注意这等于「谁都能看」，只适合非敏感的公开看板。
+
+## 4. LDAP 登录（企业常见）
+
+```ini
+[auth.ldap]
+enabled = true
+config_file = /etc/grafana/ldap.toml
+```
+
+```toml
+# ldap.toml（示意）
+[[servers]]
+host = "ldap.example.com"
+port = 636
+use_ssl = true
+bind_dn = "cn=grafana,dc=example,dc=com"
+bind_password = "***"
+search_base_dns = ["dc=example,dc=com"]
+
+[[servers.group_mappings]]
+group_dn = "cn=ops,dc=example,dc=com"
+org_role = "Admin"
+[[servers.group_mappings]]
+group_dn = "cn=dev,dc=example,dc=com"
+org_role = "Editor"
+```
+
+登录用域账号，且按 LDAP 组自动分配 Grafana 角色。
+
+## 5. OAuth / OIDC（推荐）
+
+```ini
+[auth.github]
+enabled = true
+client_id = xxx
+client_secret = yyy
+scopes = user:email
+allowed_organizations = my-org
+
+[auth.generic_oauth]   # 任意 OIDC（如 Keycloak）
+enabled = true
+client_id = xxx
+client_secret = yyy
+auth_url = https://sso.example.com/auth
+token_url = https://sso.example.com/token
+api_url = https://sso.example.com/userinfo
+```
+
+<Callout type="info" title="SSO 同时解决认证和授权">
+OIDC 的 `role_attribute_path` 可把 IdP 里的角色映射到 Grafana 角色，实现「登录即分配权限」。
+</Callout>
+
+## 6. 权限模型：文件夹 + RBAC
+
+Grafana 的权限分两层：
+
+**① 文件夹（Folder）权限**
+仪表盘放文件夹里，给文件夹设 Viewer/Editor 权限，里面的仪表盘继承。
+
+- Viewer：只能看
+- Editor：能改仪表盘、建告警
+- Admin：能管文件夹权限
+
+**② RBAC（角色权限，细粒度）**
+Enterprise 支持更细的角色（如 `fixed:datasources:reader` 只能读数据源不能改）。OSS 用基础的 Viewer/Editor/Admin 三档已够大多数团队。
+
+```text
+Folder: 支付团队
+ ├─ 权限：payment 组 = Editor
+ ├─ 权限：others   = Viewer
+ └─ 内仪表盘继承
+```
+
+<Callout type="warn" title="最小权限原则">
+给 viewer 的别给 editor。能看报表的人很多，能改生产告警的人应该很少。用文件夹把「支付」「风控」等敏感看板隔离。
+</Callout>
+
+## 7. 服务账号（API 用）
+
+程序调用 Grafana API（如自动建仪表盘）用 **Service Account**，而非个人账号：
+
+**Administration → Service accounts → Add**，生成 Token，权限按需分配。离职员工走了，服务账号不受影响。
+
+## 小结
+
+- 登录：内置 / 匿名 / LDAP / OAuth，生产关自助注册
+- 权限分文件夹权限（Viewer/Editor/Admin）与细粒度 RBAC
+- 用文件夹隔离敏感看板，遵循最小权限
+- 程序调用用 Service Account Token
+
+下一章：实战搭建 Prometheus + Grafana 监控栈 →
