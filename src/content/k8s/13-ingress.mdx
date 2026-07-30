@@ -1,0 +1,120 @@
+---
+title: Ingress 与路由
+order: 13
+description: 用 Ingress 基于域名和路径将集群内服务统一暴露到外部
+---
+
+# Ingress 与路由
+
+NodePort 和 LoadBalancer 都能暴露服务，但每个服务都申请一个负载均衡器既贵又不方便。真正生产推荐用 **Ingress**：它像一个**七层网关**，按**域名**和**路径**把外部流量路由到不同 Service。
+
+<Callout type="info" title="Ingress 不等于 Ingress Controller">
+Ingress 只是"路由规则"（YAML）；真正干活的是 **Ingress Controller**（如 nginx-ingress），它运行在集群里，监听 Ingress 规则并配置底层代理。装了 Controller 规则才生效。
+</Callout>
+
+## 1. 为什么需要 Ingress
+
+- 一个公网入口（IP/域名）服务多个应用
+- 按路径分流：`/api` 去后端，`/` 去前端
+- 按域名分流：`blog.example.com` 和 `shop.example.com` 指向不同服务
+- 还能统一做 TLS 终止、重写、限流
+
+## 2. 基础 Ingress 示例（按路径）
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-ingress
+spec:
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+              name: backend
+              port:
+                number: 8080
+```
+
+<Callout type="tip" title="pathType 三种取值">
+`Prefix`（前缀匹配）、`Exact`（精确匹配）、`ImplementationSpecific`（由 Controller 决定）。多数场景用 `Prefix`。
+</Callout>
+
+## 3. 基于域名的路由
+
+```yaml
+spec:
+  rules:
+    - host: blog.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: blog, port: { number: 80 } }
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: shop, port: { number: 80 } }
+```
+
+## 4. 配置 TLS（HTTPS）
+
+先把证书存进 Secret：
+
+```bash
+kubectl create secret tls web-tls \
+  --cert=example.com.crt --key=example.com.key
+```
+
+```yaml
+spec:
+  tls:
+    - hosts: ["example.com"]
+      secretName: web-tls
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: frontend, port: { number: 80 } }
+```
+
+<Callout type="warn" title="本地没域名也能测">
+本地可用 `kubectl port-forward` 或 `minikube tunnel` 把 Ingress Controller 的端口映射出来，再改 `/etc/hosts` 把 `example.com` 指向本地 IP 来验证。
+</Callout>
+
+## 5. 验证 Ingress
+
+```bash
+kubectl get ingress web-ingress
+# ADDRESS 列显示分配到的入口地址
+curl -H "Host: example.com" http://<入口IP>/
+```
+
+<Callout type="exercise" title="练习">
+为前几章的 frontend、backend 两个 Service 建一个 Ingress：根路径 `/` 走 frontend，`/api` 走 backend，并加上 `example.com` 的 TLS。用 `curl` 带 Host 头分别验证两条路由。
+</Callout>
+
+## 小结
+
+- Ingress 是七层路由规则，Ingress Controller 才是执行者
+- 支持按路径（pathType）和按域名（host）分流
+- 配合 TLS Secret 实现 HTTPS 统一终止
+- 下一章学习命名空间与资源配额 →

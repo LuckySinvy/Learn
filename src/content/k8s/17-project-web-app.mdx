@@ -1,0 +1,137 @@
+---
+title: 项目实战：部署 Web 应用
+order: 17
+description: 用 Deployment + Service 从零部署一个可访问的 Web 应用（含完整 YAML）
+---
+
+# 项目实战：部署 Web 应用
+
+前面各章是单点知识，本章把它们串起来：用 **Deployment + Service** 部署一个真实可访问的 Web 应用，并验证自愈、扩缩容与滚动更新。
+
+## 1. 目标架构
+
+```text
+浏览器 / curl
+     │
+     ▼
+  Service (ClusterIP + NodePort)
+     │  按标签选择
+     ▼
+  Deployment (3 副本 nginx)
+     │
+     ▼
+   Pod × 3
+```
+
+## 2. 完整 YAML
+
+把下面内容保存为 `web-app.yaml`：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: NodePort
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+<Callout type="info" title="一个文件多个资源">
+用 `---` 分隔，可以在一个 YAML 文件里写 Deployment 和 Service，一次 `apply` 全部创建，便于管理。
+</Callout>
+
+## 3. 部署与验证
+
+```bash
+kubectl apply -f web-app.yaml
+
+# 等 Pod 就绪
+kubectl get pods -l app=web
+# NAME                  READY   STATUS    RESTARTS
+# web-7d8f9c-x1   1/1    Running   0
+# web-7d8f9c-x2   1/1    Running   0
+# web-7d8f9c-x3   1/1    Running   0
+
+# 通过 NodePort 访问
+curl http://<节点IP>:30080
+```
+
+如果本地用 minikube：`minikube service web --url` 可直接拿到访问地址。
+
+## 4. 验证自愈
+
+```bash
+kubectl delete pod -l app=web   # 删掉一个
+kubectl get pods -l app=web      # 立刻有新 Pod 补上，仍是 3 个
+```
+
+## 5. 验证滚动更新
+
+```bash
+# 升级到新版本
+kubectl set image deployment/web nginx=nginx:1.28
+kubectl rollout status deployment/web
+
+# 访问确认版本变化（看响应头或页面标题）
+curl -I http://<节点IP>:30080
+
+# 有问题就回滚
+kubectl rollout undo deployment/web
+```
+
+<Callout type="tip" title="生产建议加探针">
+本例只配了 readiness，生产还应加 liveness（见第 11 章），并改用 ClusterIP + Ingress（第 13 章）而非直接 NodePort。
+</Callout>
+
+## 6. 清理
+
+```bash
+kubectl delete -f web-app.yaml
+```
+
+<Callout type="exercise" title="练习">
+把副本数改为 5 再 apply，观察滚动过程；然后给 Deployment 加一个 livenessProbe（探 `/`），再次删除 Pod，确认自愈且不会因探针误判被反复重启。
+</Callout>
+
+## 小结
+
+- 一个文件用 `---` 同时定义 Deployment 和 Service
+- Deployment 管副本与自愈，Service 用 selector 暴露稳定入口
+- NodePort 便于本地验证；生产推荐 ClusterIP + Ingress
+- 已串起探针、滚动更新、回滚等能力
+- 下一章进阶：多服务微服务 + Ingress 统一入口 →

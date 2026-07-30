@@ -22,6 +22,7 @@ export function LangOverview({ lang }: { lang: Language }) {
         {lang === 'rag' && '从文档切分到检索重排与评估，系统掌握检索增强生成。'}
         {lang === 'langchain' && '用 Langchain.js 编排模型、链、检索与 Agent，构建 LLM 应用。'}
         {lang === 'dify' && '用 Dify 低代码搭建知识库、工作流与 Agent 应用并发布 API。'}
+        {lang === 'k8s' && '从 Pod 到 Deployment、Service、Ingress 与自动扩缩容，掌握容器编排。'}
       </p>
       <ul className="space-y-1">
         {chapters.map((c, i) => (

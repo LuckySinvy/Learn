@@ -1,0 +1,98 @@
+---
+title: 核心概念
+order: 2
+description: 理解 Kubernetes 的核心对象：Pod、Node、Cluster 与控制平面（Control Plane）
+---
+
+# 核心概念
+
+要驾驭 Kubernetes，先要建立一套对象模型的心智地图。本章讲清最基础的几个概念：**Pod、Node、Cluster、Control Plane**。
+
+## 1. Cluster（集群）
+
+一个 Kubernetes **集群**是一组计算资源的集合，由两部分组成：
+
+- **控制平面（Control Plane）**：集群的"大脑"，负责决策和调度
+- **工作节点（Node）**：真正运行容器的"工人"
+
+你通过 `kubectl` 向控制平面提交期望状态，控制平面再把任务下发给各 Node。
+
+## 2. Node（节点）
+
+Node 是集群里的一台机器（物理机或虚拟机），上面跑着：
+
+- **kubelet**：与控制平面通信的"代理"，负责把 Pod 跑起来并汇报状态
+- **容器运行时**：真正拉镜像、起容器的引擎（如 containerd）
+- **kube-proxy**：维护网络规则，实现 Service 的负载均衡
+
+```bash
+# 查看集群里有哪些节点及其状态
+kubectl get nodes
+# NAME       STATUS   ROLES           AGE   VERSION
+# minikube   Ready    control-plane   10d   v1.30.0
+```
+
+<Callout type="info" title="控制平面也能跑 Pod">
+在单节点本地环境（minikube/kind）里，控制平面所在的机器同时也是一个 Node，所以可以既调度又运行工作负载。
+</Callout>
+
+## 3. Control Plane（控制平面）
+
+控制平面由多个组件构成，共同保证集群按期望运行：
+
+| 组件 | 职责 |
+|---|---|
+| **API Server** | 唯一入口，所有操作都经它（`kubectl` 也是在和它对话） |
+| **etcd** | 集群的"数据库"，保存全部状态（唯一真相源） |
+| **Scheduler** | 决定新 Pod 该调度到哪个 Node |
+| **Controller Manager** | 一组控制器，负责自愈、副本数、端点等 |
+| **kubelet（在每个 Node）** | 执行控制平面下发的指令 |
+
+<Callout type="tip" title="记住一句话">
+API Server 是门面，etcd 是记忆，Scheduler 管分配，Controller 管纠偏。理解这四点，就理解了 k8s 怎么运作。
+</Callout>
+
+## 4. Pod（最小调度单元）
+
+**Pod** 是 Kubernetes 里**最小、不可再分**的部署单元。一个 Pod 里可以有一个或多个**紧密协作**的容器，它们共享网络（同一个 IP）和存储（Volume），像在同一台机器上一样通过 `localhost` 通信。
+
+为什么不直接调度容器，而要包一层 Pod？因为很多场景需要"辅助容器"配合主容器（如日志收集、配置同步），把它们绑在一起调度、一起生死，更合理。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: app
+      image: myapp:1.0
+    - name: log-sidecar
+      image: busybox
+      command: ["sh", "-c", "tail -f /var/log/app.log"]
+```
+
+<Callout type="warn" title="Pod 不是进程，会消失">
+Pod 本身不被"保活"——它挂了就真没了。要保证"永远有 3 个副本"，要用上层对象（Deployment），而非直接管 Pod。下一章会讲。
+</Callout>
+
+## 5. 对象层级关系
+
+一个直观的层级：
+
+```text
+Cluster
+ └─ Node（多台机器）
+     └─ Pod（调度的最小单元）
+         └─ Container（实际运行的进程）
+```
+
+而 Deployment、Service 等是"管理者"，它们创建并管理 Pod 的生命周期。
+
+## 小结
+
+- Cluster = 控制平面 + 多个 Node
+- 控制平面：API Server / etcd / Scheduler / Controller Manager
+- Node 上跑 kubelet、容器运行时、kube-proxy
+- Pod 是最小调度单元，可含多个共享网络的容器
+- 下一章动手搭建本地环境 →

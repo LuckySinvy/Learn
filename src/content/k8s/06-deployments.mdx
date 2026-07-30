@@ -1,0 +1,112 @@
+---
+title: 工作负载 Deployment
+order: 6
+description: 用 Deployment 管理副本数、实现自愈与声明式应用发布
+---
+
+# 工作负载 Deployment
+
+直接手工管理 Pod 有两个致命问题：Pod 挂了不会自动重建，副本数无法保证。为此 Kubernetes 提供了 **Deployment**——它管理一组 Pod 的"期望副本数"，并负责自愈与滚动更新。
+
+## 1. Deployment 是什么
+
+Deployment 不直接"持有"Pod，而是通过一个中间对象 **ReplicaSet** 来保证"始终有 N 个 Pod 在跑"。Deployment 管"版本"，ReplicaSet 管"数量"，二者配合完成发布。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 3              # 期望 3 个副本
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+```
+
+<Callout type="info" title="selector 与 template 标签必须一致">
+`spec.selector.matchLabels` 和 `template.metadata.labels` 必须匹配，否则 Deployment 找不到自己创建的 Pod，会陷入无限新建的循环。
+</Callout>
+
+## 2. 自愈能力
+
+当某个 Pod 崩溃或被误删，ReplicaSet 立刻检测"实际副本数 < 期望副本数"，自动新建一个补齐。你可以亲自试：
+
+```bash
+kubectl get pods
+kubectl delete pod nginx-xxxxx     # 删掉一个
+kubectl get pods                   # 立刻又有一个新 Pod 补上
+```
+
+## 3. 扩缩容
+
+```bash
+# 命令式临时调整（不写回 YAML）
+kubectl scale deployment nginx --replicas=5
+
+# 声明式（推荐）：改 YAML 中 replicas 再 apply
+kubectl apply -f deployment.yaml
+```
+
+<Callout type="tip" title="scale 还是改 YAML？">
+临时验证用 `kubectl scale` 很方便；但生产环境务必改 YAML 再 `apply`，让 Git 记录真实状态，避免"集群里改了但代码没改"的漂移。
+</Callout>
+
+## 4. 查看状态
+
+```bash
+# 看 Deployment 概览：期望/就绪/最新副本数
+kubectl get deployments
+
+# 看滚动更新的实时进度
+kubectl rollout status deployment/nginx
+
+# 看历史版本（配合回滚用）
+kubectl rollout history deployment/nginx
+```
+
+## 5. 更新镜像（触发滚动更新）
+
+```bash
+# 改镜像即触发新一批 Pod 的滚动替换
+kubectl set image deployment/nginx nginx=nginx:1.28
+
+# 或直接改 YAML 后 apply
+kubectl apply -f deployment.yaml
+```
+
+<Callout type="warn" title="不要手动删 Pod 来更新">
+手动删 Pod 只会触发"原地重建"回旧版本。更新请用 `set image` 或改 YAML，让 Deployment 走正规的滚动流程。
+</Callout>
+
+## 6. 回滚
+
+```bash
+# 回滚到上一个版本
+kubectl rollout undo deployment/nginx
+
+# 回滚到指定历史版本
+kubectl rollout undo deployment/nginx --to-revision=2
+```
+
+<Callout type="exercise" title="练习">
+创建一个 2 副本的 Deployment，分别用 `kubectl scale` 加到 4 个、用 `kubectl set image` 换版本、再用 `kubectl rollout undo` 回滚，体会"声明期望状态"带来的自愈与可回退。
+</Callout>
+
+## 小结
+
+- Deployment 通过 ReplicaSet 保证副本数，实现自愈
+- `replicas` 控制规模，`scale` 或改 YAML 均可调整
+- 更新镜像触发滚动更新，`rollout undo` 可回滚
+- 下一章用 Service 让 Pod 可被访问 →

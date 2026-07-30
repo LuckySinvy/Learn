@@ -1,0 +1,106 @@
+---
+title: 安装与本地环境
+order: 3
+description: 用 minikube、kind、Docker Desktop 在本地快速搭建可用的 Kubernetes 集群
+---
+
+# 安装与本地环境
+
+学习 Kubernetes 不需要一整个云。本章介绍三种最常用的**本地单集群**方案，任选其一即可。
+
+## 1. 三种方案对比
+
+| 方案 | 底层 | 特点 | 适用 |
+|---|---|---|---|
+| **minikube** | 虚拟机/容器 | 最经典，命令简单 | 入门首选 |
+| **kind**（Kubernetes IN Docker） | Docker 容器 | 启动快，支持多节点 | CI、集群实验 |
+| **Docker Desktop** | 内置 | 开箱即用，GUI 友好 | 已装 Docker Desktop 的用户 |
+
+<Callout type="info" title="需要容器运行时">
+kind 和 Docker Desktop 都依赖 Docker。minikube 可用 Docker 驱动，也可用自带虚拟机驱动。
+</Callout>
+
+## 2. 用 minikube 安装
+
+```bash
+# 安装 minikube（macOS）
+brew install minikube
+
+# 启动一个单节点集群，使用 Docker 驱动
+minikube start --driver=docker --kubernetes-version=v1.30.0
+
+# 验证集群状态
+kubectl get nodes
+# minikube   Ready   control-plane   12s   v1.30.0
+
+# 打开 Kubernetes 仪表盘（可选）
+minikube dashboard
+```
+
+<Callout type="tip" title="启动慢？先拉镜像">
+首次 `start` 会下载节点镜像，可能较慢。可加 `--driver=docker` 复用已装的 Docker，避免再装虚拟机。
+</Callout>
+
+## 3. 用 kind 安装
+
+```bash
+# 安装
+brew install kind
+
+# 用默认配置起一个单节点集群
+kind create cluster --name demo
+
+# 查看
+kubectl cluster-info --context kind-demo
+```
+
+想模拟多节点集群，写个配置文件：
+
+```yaml
+# kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+```
+
+```bash
+kind create cluster --name multi --config kind-config.yaml
+```
+
+## 4. Docker Desktop 内置 Kubernetes
+
+如果你已安装 Docker Desktop：
+
+1. 打开 **Settings → Kubernetes**
+2. 勾选 **Enable Kubernetes**
+3. 点 **Apply & Restart**
+
+完成后 `kubectl` 会自动指向 Docker Desktop 的集群。
+
+<Callout type="warn" title="只启用一个集群">
+minikube、kind、Docker Desktop 可能同时注册多个 context，记得用 `kubectl config current-context` 确认当前连的是哪个，避免操作错集群。
+</Callout>
+
+## 5. 验证安装
+
+无论用哪种方案，跑下面命令确认环境正常：
+
+```bash
+# 当前集群信息
+kubectl cluster-info
+
+# 跑一个临时 Pod 测试调度
+kubectl run hello --image=busybox --restart=Never -- echo "hi"
+kubectl get pods
+kubectl delete pod hello
+```
+
+## 小结
+
+- minikube 经典易用，kind 快且支持多节点，Docker Desktop 开箱即用
+- 三者都依赖 Docker 作为容器运行时（minikube 可换驱动）
+- 用 `kubectl get nodes` 和 `kubectl cluster-info` 验证
+- 下一章学习 kubectl 常用命令 →

@@ -1,0 +1,103 @@
+---
+title: 运维与排障
+order: 16
+description: 用 describe、events、logs、exec 系统排查 Pod 故障的标准思路
+---
+
+# 运维与排障
+
+"Pod 一直 Pending""服务访问不通""副本起不来"——排障是日常最频繁的操作。本章给出一套**从宏观到微观**的标准排查思路，几乎能覆盖 90% 的问题。
+
+## 1. 先看整体状态
+
+```bash
+kubectl get pods -A
+# 关注 STATUS 列：Running / Pending / CrashLoopBackOff / ImagePullBackOff / Error
+```
+
+常见异常状态含义：
+
+| 状态 | 可能原因 |
+|---|---|
+| `Pending` | 调度失败：资源不足、节点满了、PVC 未绑定 |
+| `ImagePullBackOff` | 镜像名错、仓库无权限、版本不存在 |
+| `CrashLoopBackOff` | 容器启动后立即退出（应用报错/配置错） |
+| `OOMKilled` | 内存超 limits 被系统杀掉 |
+
+## 2. describe 看事件（最关键一步）
+
+`kubectl describe` 末尾的 **Events** 段常直接给出原因：
+
+```bash
+kubectl describe pod nginx
+# 例：FailedScheduling: 0/1 nodes are available: 1 Insufficient cpu
+# 例：Failed to pull image "nginx:9.99": not found
+```
+
+<Callout type="tip" title="Events 是排障第一现场">
+多数问题（拉不到镜像、调度不上、探针失败）都会在 Events 留下线索。先看它，能省下大量瞎猜的时间。
+</Callout>
+
+## 3. logs 看应用日志
+
+```bash
+kubectl logs nginx                  # 当前日志
+kubectl logs nginx --previous       # 上一次崩溃容器的日志（CrashLoop 必看）
+kubectl logs -f nginx               # 跟踪
+kubectl logs nginx -c sidecar       # 多容器需指定
+```
+
+## 4. exec 进容器验证
+
+```bash
+kubectl exec -it nginx -- sh
+# 在容器内：看进程、查端口、测网络连通性
+curl http://localhost:8080/healthz
+```
+
+网络不通时，可临时起个调试 Pod：
+
+```bash
+kubectl run nettool --rm -it --image=nicolaka/netshoot -- sh
+```
+
+<Callout type="info" title="服务不通的三层检查">
+① Pod 是否 Running 且 READY（探针）？② Service 的 endpoints 是否非空（`kubectl get endpoints`）？③ 网络策略/DNS 是否挡住？逐层排查最快。
+</Callout>
+
+## 5. 排障决策树
+
+```text
+Pod 不 Running？
+ ├─ Pending   → describe 看调度/资源/PV
+ ├─ ImagePullBackOff → 查镜像名/权限/版本
+ └─ CrashLoopBackOff → logs --previous 看应用报错
+Running 但访问不通？
+ ├─ READY 0/1 → readiness 探针未过
+ ├─ Service endpoints 空 → selector 不匹配
+ └─ 跨服务不通 → DNS / NetworkPolicy
+```
+
+<Callout type="warn" title="别在容器里打补丁">
+`exec` 进去改文件只能临时验证。**修复必须回到 YAML（ConfigMap/Deployment）再 `apply`**，否则容器一重建改动就没了。
+</Callout>
+
+## 6. 常见命令速查
+
+```bash
+kubectl get events --sort-by=.lastTimestamp   # 看全集群事件
+kubectl top pods                              # 看实际资源占用（需 metrics-server）
+kubectl describe node <node>                  # 看节点资源与压力
+```
+
+<Callout type="exercise" title="练习">
+故意把镜像版本写成不存在的 `nginx:9.99`，apply 后依次用 `get pods`、`describe pod`、`logs` 复现"ImagePullBackOff"的完整排查过程，再改回正确版本。
+</Callout>
+
+## 小结
+
+- 先看 `get pods` 状态，再 `describe` 看 Events 找根因
+- `logs --previous` 看崩溃前日志，`exec` 进容器验证
+- 服务不通按 Pod→endpoints→网络 三层排查
+- 修复必须回到 YAML 再 apply，不在容器里改
+- 下一章进入实战：部署一个 Web 应用 →

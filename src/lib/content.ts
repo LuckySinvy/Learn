@@ -9,7 +9,7 @@ const TITLES: Record<string, string> = {};
 
 function loadTitlesOnce() {
   if (Object.keys(TITLES).length) return;
-  for (const lang of ['python', 'go', 'java', 'grafana', 'rag', 'langchain', 'dify'] as const) {
+  for (const lang of ['python', 'go', 'java', 'grafana', 'rag', 'langchain', 'dify', 'k8s'] as const) {
     const dir = path.join(CONTENT_ROOT, lang);
     if (!fs.existsSync(dir)) continue;
     for (const file of fs.readdirSync(dir)) {
@@ -49,7 +49,7 @@ export function getChapter(lang: Language, slug: string): Chapter | null {
 }
 
 export function getAllChaptersFlat(): { lang: Language; chapter: Chapter }[] {
-  return (['python', 'go', 'java', 'grafana', 'rag', 'langchain', 'dify'] as Language[]).flatMap((lang) =>
+  return (['python', 'go', 'java', 'grafana', 'rag', 'langchain', 'dify', 'k8s'] as Language[]).flatMap((lang) =>
     getChapters(lang).map((chapter) => ({ lang, chapter })),
   );
 }

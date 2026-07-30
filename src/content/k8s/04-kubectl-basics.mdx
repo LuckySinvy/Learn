@@ -1,0 +1,119 @@
+---
+title: kubectl 基础
+order: 4
+description: 掌握 kubectl 最常用的命令：get、describe、apply、logs、exec
+---
+
+# kubectl 基础
+
+`kubectl` 是你和 Kubernetes 集群对话的命令行工具。本章梳理最高频的命令，记住它们就够应付日常 80% 的操作。
+
+## 1. 通用结构
+
+```bash
+kubectl <动作> <资源类型> <名称> [选项]
+```
+
+常见"动作"：`get`、`describe`、`apply`、`delete`、`logs`、`exec`、`create`、`explain`。
+
+## 2. get：查看资源
+
+```bash
+# 查看所有 Pod
+kubectl get pods
+
+# 看更详细信息（IP、所在节点）
+kubectl get pods -o wide
+
+# 看所有命名空间的服务
+kubectl get svc -A
+
+# 实时刷新
+kubectl get pods -w
+```
+
+<Callout type="tip" title="记不住资源缩写？">
+`kubectl api-resources` 会列出所有资源类型及其缩写（如 `po`=pod、`svc`=service、`deploy`=deployment）。`kubectl get po` 和 `kubectl get pods` 等价。
+</Callout>
+
+## 3. describe：查看详情与事件
+
+`describe` 是排障第一步，它会列出资源的配置、状态、关联事件（Events）。
+
+```bash
+kubectl describe pod nginx
+# 末尾的 Events 段常能直接看出调度失败、镜像拉取失败等原因
+```
+
+## 4. apply：声明式创建/更新
+
+`apply` 把 YAML 文件描述的期望状态提交给集群，已存在则更新，不存在则创建。
+
+```bash
+# 创建或更新
+kubectl apply -f deployment.yaml
+
+# 一次提交多个文件/目录
+kubectl apply -f ./manifests/
+
+# 预览变更而不真正执行（强烈推荐）
+kubectl apply -f deployment.yaml --dry-run=server
+```
+
+<Callout type="info" title="apply 优先于 create">
+`create` 只能新建，`apply` 才是日常推荐的声明式方式。配合 Git 管理 YAML，即可实现"基础设施即代码"。
+</Callout>
+
+## 5. logs：查看日志
+
+```bash
+# 查看 Pod 主容器日志
+kubectl logs nginx
+
+# 多容器 Pod 需指定容器名
+kubectl logs nginx -c app
+
+# 跟踪新日志（类似 tail -f）
+kubectl logs -f nginx
+
+# 看上一次崩溃的容器日志（排障利器）
+kubectl logs nginx --previous
+```
+
+## 6. exec：进入容器执行命令
+
+```bash
+# 在 Pod 里执行命令
+kubectl exec nginx -- ls /usr/share/nginx/html
+
+# 进入交互式 shell（像 ssh 进容器）
+kubectl exec -it nginx -- /bin/sh
+```
+
+<Callout type="warn" title="exec 进容器只是排障手段">
+不要依赖 `exec` 进去改配置来"修"环境——容器随时可能被重建。正确做法是用 ConfigMap/Secret 声明配置，再用 `kubectl apply` 更新。
+</Callout>
+
+## 7. 删除资源
+
+```bash
+# 按 YAML 删除
+kubectl delete -f deployment.yaml
+
+# 按名称删除
+kubectl delete pod nginx
+
+# 删除命名空间下所有 Pod
+kubectl delete pods --all -n default
+```
+
+<Callout type="exercise" title="动手练">
+起一个 `kubectl run debug --image=busybox --restart=Never -- sleep 3600`，然后依次用 `get`、`describe`、`logs`、`exec` 观察它，最后删除。把这条命令链走通你就入门了。
+</Callout>
+
+## 小结
+
+- `get` 看列表，`describe` 看详情与事件
+- `apply -f` 是声明式创建/更新的主力
+- `logs` 看日志（加 `--previous` 看崩溃前），`exec -it` 进容器排障
+- 下一章深入 Pod 与容器配置 →

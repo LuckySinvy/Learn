@@ -9,6 +9,7 @@ const CATEGORIES: { label: string; items: Language[] }[] = [
   { label: '编程语言', items: ['python', 'go', 'java'] },
   { label: '可观测性', items: ['grafana'] },
   { label: 'AI 工程', items: ['rag', 'langchain', 'dify'] },
+  { label: '云原生', items: ['k8s'] },
 ];
 
 export function Header() {
@@ -18,7 +19,7 @@ export function Header() {
         <Link href="/" className="flex items-center gap-2 font-semibold">
           <Code2 className="w-5 h-5 text-primary-500" />
           <span>Learn</span>
-          <span className="text-xs text-gray-500 ml-1 hidden sm:inline">编程 · 可观测性 · AI 工程</span>
+          <span className="text-xs text-gray-500 ml-1 hidden sm:inline">编程 · 可观测性 · AI 工程 · 云原生</span>
         </Link>
         <nav className="flex items-center gap-1 text-sm">
           {CATEGORIES.map((cat) => (

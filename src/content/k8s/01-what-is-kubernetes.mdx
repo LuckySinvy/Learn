@@ -1,0 +1,84 @@
+---
+title: 什么是 Kubernetes
+order: 1
+description: 理解容器编排为什么需要 Kubernetes，以及它与 Docker Compose 的核心区别
+---
+
+# 什么是 Kubernetes
+
+**Kubernetes**（常缩写为 k8s，k 与 s 之间有 8 个字母）是一个开源的**容器编排（Orchestration）平台**。当你只有一两个容器时，手动 `docker run` 就够了；但当应用拆成几十个服务、需要在多台机器上调度、自愈、扩缩容时，就需要一个"调度大脑"来统一管理。Kubernetes 就是这个大脑。
+
+<Callout type="info" title="Kubernetes 不负责构建镜像">
+Kubernetes 只负责**运行**容器（更准确说是 Pod），镜像仍然由 Docker / BuildKit / 镜像仓库负责。它不关心你的代码怎么编译。
+</Callout>
+
+## 1. 为什么需要容器编排
+
+单机跑容器的痛点，在规模上来后会全部暴露：
+
+- **调度**：几十个容器该放到哪台机器？手动分配不可持续。
+- **自愈**：某个容器挂了，谁来重启？谁来把流量切走？
+- **扩缩容**：流量高峰来了，如何把副本从 3 个加到 10 个？
+- **服务发现**：新实例 IP 变了，其他服务怎么找到它？
+- **滚动更新**：如何在不停机的情况下发布新版本？
+
+这些问题本质上都是"编排"问题，Kubernetes 用一套声明式 API 统一解决。
+
+## 2. 声明式 vs 命令式
+
+这是理解 k8s 的关键心智模型：你**描述期望状态**（"我要 3 个 nginx 副本"），k8s 里的控制器不断把**实际状态**向期望状态收敛。你不需要告诉它"先启动一个、再启动第二个"。
+
+```yaml
+# 期望状态：3 个 nginx 副本
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: nginx }
+  template:
+    metadata:
+      labels: { app: nginx }
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+```
+
+<Callout type="tip" title="把 YAML 当配置而不是脚本">
+和写 Shell 脚本一步步操作不同，k8s 里你提交一份"期望状态"的 YAML，剩下的交给控制平面。这种思路是 k8s 强大的根本。
+</Callout>
+
+## 3. Kubernetes 与 Docker Compose 的区别
+
+Docker Compose 也是多容器管理工具，但定位和能力强弱完全不同：
+
+| 维度 | Docker Compose | Kubernetes |
+|---|---|---|
+| 适用规模 | 单机、开发/测试 | 多机集群、生产 |
+| 调度能力 | 无（都在本机） | 跨节点智能调度 |
+| 自愈 | 无 | 容器/节点故障自动重建 |
+| 扩缩容 | 手动改配置重启 | HPA 自动按指标扩缩 |
+| 服务发现 | 同网络内通过服务名 | 内置 Service + DNS |
+| 滚动更新/回滚 | 无 | 原生支持 `rollout` |
+
+<Callout type="warn" title="不要用 Compose 当生产编排">
+Compose 适合本地一键起依赖（数据库、缓存）。一旦需要高可用、多节点、弹性伸缩，就该上 Kubernetes。
+</Callout>
+
+## 4. 本教程路线
+
+本教程共 18 章：
+
+1. **基础（1–5 章）**：概念、核心对象、安装、kubectl、Pod
+2. **工作负载与网络（6–13 章）**：Deployment、Service、配置、存储、标签、探针、更新回滚、Ingress
+3. **进阶与实战（14–18 章）**：命名空间、HPA、排障、两个完整项目
+
+## 小结
+
+- Kubernetes 是容器编排平台，负责调度、自愈、扩缩、服务发现、滚动更新
+- 核心是"声明期望状态，控制器负责收敛"
+- Docker Compose 适合单机开发，Kubernetes 适合多节点生产
+- 下一章认识 k8s 的核心概念与组件 →

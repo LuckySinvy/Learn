@@ -1,0 +1,117 @@
+---
+title: Pod 与容器配置
+order: 5
+description: 配置 Pod 的镜像、资源限制、重启策略与多容器协作
+---
+
+# Pod 与容器配置
+
+Pod 是最小部署单元，但"好用"的 Pod 需要正确的配置。本章讲解镜像、资源、重启策略，以及多容器模式。
+
+## 1. 指定镜像与端口
+
+最直接的方式还是 YAML 声明：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27          # 固定版本而非 latest，保证可复现
+      ports:
+        - containerPort: 80       # 容器监听的端口（仅是声明，不真正暴露）
+```
+
+<Callout type="warn" title="不要用 latest 标签">
+`image: nginx` 默认拉 latest，每次重建可能拿到不同版本，导致"在我机器上是好的"。生产务必写死版本号。
+</Callout>
+
+## 2. 资源限制（resources）
+
+如果不设限制，某个容器可能吃光节点内存，拖垮同机所有 Pod。用 `requests`（调度保证）和 `limits`（硬上限）约束：
+
+```yaml
+spec:
+  containers:
+    - name: app
+      image: myapp:1.0
+      resources:
+        requests:
+          cpu: "100m"        # 保证至少 0.1 核
+          memory: "128Mi"    # 保证至少 128 MB
+        limits:
+          cpu: "500m"        # 最多 0.5 核
+          memory: "256Mi"    # 超出会被 OOMKill
+```
+
+`100m` 表示 0.1 个 CPU（毫核），`256Mi` 是 256 MiB。
+
+<Callout type="tip" title="requests 影响调度，limits 影响生死">
+Scheduler 按 `requests` 找"放得下"的节点；运行时若超 `limits` 内存，容器会被系统 OOM 杀掉重启。
+</Callout>
+
+## 3. 重启策略（restartPolicy）
+
+Pod 级设置，决定容器退出后是否重启：
+
+| 值 | 含义 | 典型场景 |
+|---|---|---|
+| `Always` | 永远重启（默认） | 长期运行的服务 |
+| `OnFailure` | 失败才重启 | 批处理任务 |
+| `Never` | 不重启 | 一次性任务、调试 |
+
+```yaml
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: job
+      image: myjob:1.0
+```
+
+## 4. 多容器 Pod（sidecar 模式）
+
+当主容器需要一个"搭档"辅助（日志收集、配置同步、网络代理），把它们放进同一 Pod 共享网络与存储：
+
+```yaml
+spec:
+  containers:
+    - name: app           # 主容器，提供业务
+      image: myapp:1.0
+    - name: log-agent     # sidecar，采集主容器日志
+      image: busybox
+      command: ["sh", "-c", "tail -F /var/log/app.log"]
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log
+  volumes:
+    - name: logs
+      emptyDir: {}
+```
+
+两个容器通过 `localhost` 互通，通过共享 `emptyDir` 卷交换文件。
+
+<Callout type="info" title="什么时候放多个容器？">
+只在"必须一起调度、共享存储/网络、生命周期一致"时才用多容器。否则应拆成独立 Pod，让它们各自扩缩。
+</Callout>
+
+## 5. 临时调试 Pod
+
+```bash
+kubectl run tmp --image=busybox --restart=Never -- sleep 3600
+kubectl exec -it tmp -- sh
+```
+
+<Callout type="exercise" title="练习">
+写一个 Pod YAML：镜像用 `nginx:1.27`，限制内存 128Mi、CPU 100m，容器端口 80。用 `kubectl apply -f` 创建，再用 `kubectl describe pod` 确认资源限制已生效，最后删除。
+</Callout>
+
+## 小结
+
+- 镜像写死版本号，避免 latest 带来的不确定性
+- `requests` 保证调度资源，`limits` 防止超用被 OOM
+- `restartPolicy` 控制容器退出后的行为
+- 多容器 Pod 用于紧密协作（sidecar），共享网络与存储
+- 下一章用 Deployment 管理 Pod 生命周期 →

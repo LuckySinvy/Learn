@@ -1,0 +1,108 @@
+---
+title: 存储
+order: 9
+description: 理解 Volume、emptyDir、以及持久化存储 PV 与 PVC 的关系
+---
+
+# 存储
+
+容器文件系统是**临时**的——Pod 一重建，里面的数据就没了。要在 Kubernetes 里保存数据（数据库、用户上传、日志），必须借助**存储卷（Volume）**。
+
+## 1. Volume 的基本思路
+
+Volume 是挂载进容器的目录，其生命周期由类型决定，不一定随容器删除而消失。Pod 里声明 `volumes`，再在容器里 `volumeMounts` 挂载。
+
+## 2. emptyDir（临时共享盘）
+
+`emptyDir` 在 Pod 被调度到节点时创建，Pod 删除即清空。适合同一 Pod 内多容器**临时交换数据**。
+
+```yaml
+spec:
+  containers:
+    - name: app
+      image: myapp:1.0
+      volumeMounts:
+        - name: cache
+          mountPath: /cache
+    - name: sidecar
+      image: busybox
+      volumeMounts:
+        - name: cache
+          mountPath: /cache
+  volumes:
+    - name: cache
+      emptyDir: {}
+```
+
+<Callout type="info" title="emptyDir 不跨 Pod">
+emptyDir 只在一个 Pod 内有效，Pod 重建即丢。真正要持久化请用下面的 PV/PVC。
+</Callout>
+
+## 3. PV 与 PVC：持久化的标准方式
+
+- **PV（PersistentVolume）**：集群层面的"真实存储"（一块磁盘），由管理员或动态供给（StorageClass）创建。
+- **PVC（PersistentVolumeClaim）**：用户对存储的"申请"（"我要 10Gi 的读写盘"）。k8s 自动把 PVC 绑定到一个合适的 PV。
+
+```yaml
+# 1) 申请存储
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+# 2) Pod 挂载这个 PVC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db
+spec:
+  containers:
+    - name: mysql
+      image: mysql:8.0
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: data-pvc
+```
+
+<Callout type="tip" title="写 Pod 只认 PVC">
+应用开发者只管声明 PVC（要多大、什么模式），底层是本地盘还是云盘、怎么挂载，交给 PV/StorageClass。这种"解耦"让配置可移植。
+</Callout>
+
+## 4. 访问模式
+
+| 模式 | 含义 |
+|---|---|
+| `ReadWriteOnce` | 单节点读写（最常见） |
+| `ReadOnlyMany` | 多节点只读 |
+| `ReadWriteMany` | 多节点读写（需支持的存储，如 NFS） |
+
+## 5. 清理与回收
+
+```bash
+# 删除 Pod 后，PVC/PV 默认保留数据
+kubectl delete pod db
+
+# 删除 PVC 后，按 PV 的 reclaimPolicy 决定（Retain 保留 / Delete 删除）
+kubectl delete pvc data-pvc
+```
+
+<Callout type="warn" title="删 PVC 可能丢数据">
+默认 `reclaimPolicy` 若为 `Delete`，删 PVC 会连带删 PV 和数据。生产数据库务必确认是 `Retain`，并配合备份。
+</Callout>
+
+## 小结
+
+- 容器文件系统是临时的，数据要持久化必须挂载 Volume
+- emptyDir 随 Pod 生灭，适合临时共享
+- PV 是真实存储，PVC 是用户申请，Pod 挂载 PVC 即可持久化
+- 下一章学习标签、选择器与注解 →

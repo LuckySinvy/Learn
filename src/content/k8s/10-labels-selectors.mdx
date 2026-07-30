@@ -1,0 +1,103 @@
+---
+title: 标签、选择器与注解
+order: 10
+description: 用 Label 分组资源、用 Selector 筛选与关联，并用 Annotation 记录元数据
+---
+
+# 标签、选择器与注解
+
+随着集群里资源变多，如何"成组管理"和"精准关联"就成了核心问题。Kubernetes 给出的答案是 **Label（标签）**、**Selector（选择器）** 和 **Annotation（注解）**。
+
+## 1. Label（标签）
+
+Label 是附加在资源上的键值对，用来**标识资源的属性**（如环境、团队、版本、层）。它本身不直接影响行为，而是供选择器查询。
+
+```yaml
+metadata:
+  labels:
+    app: nginx
+    env: production
+    tier: frontend
+    version: "1.27"
+```
+
+<Callout type="info" title="Label 的命名规范">
+键分两部分：可选前缀（如 `app.kubernetes.io/`）和名称（如 `name`）。值需满足短名称规范，通常用小写中划线。
+</Callout>
+
+## 2. Selector（选择器）
+
+选择器根据 Label 筛选资源。最常见于两类场景：
+
+**关联资源**（Service 选中后端 Pod）：
+
+```yaml
+# Service 通过 selector 找到带 app=nginx 的 Pod
+spec:
+  selector:
+    app: nginx
+```
+
+**命令行筛选**：
+
+```bash
+# 只看生产环境的 Pod
+kubectl get pods -l env=production
+
+# 多条件：env=production 且 tier=frontend
+kubectl get pods -l "env=production,tier=frontend"
+
+# 集合匹配：version 属于 v1 开头
+kubectl get pods -l "version in (1.27,1.28)"
+```
+
+## 3. 推荐的标准标签
+
+Kubernetes 社区建议给应用打一组通用标签，便于工具统一识别：
+
+```yaml
+metadata:
+  labels:
+    app.kubernetes.io/name: nginx
+    app.kubernetes.io/instance: nginx-prod
+    app.kubernetes.io/version: "1.27"
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: web-platform
+    app.kubernetes.io/managed-by: kubectl
+```
+
+<Callout type="tip" title="统一标签让运维可编排">
+有了标准标签，`kubectl get all -l app.kubernetes.io/part-of=web-platform` 就能一键捞出某个系统的所有组件。
+</Callout>
+
+## 4. Annotation（注解）
+
+注解也挂在资源上，但**不用于筛选**，而是存"非标识性"的元数据，如构建信息、联系方式、工具备注。
+
+```yaml
+metadata:
+  annotations:
+    description: "前端网关，处理外部流量"
+    contact: "team-web@example.com"
+    prometheus.io/scrape: "true"
+```
+
+<Callout type="warn" title="别把注解当标签用">
+注解不参与选择器匹配。如果想"按某属性筛选资源"，必须用 Label，不能用 Annotation。
+</Callout>
+
+## 5. Label vs Annotation 速查
+
+| 特性 | Label | Annotation |
+|---|---|---|
+| 用于筛选/关联 | 是 | 否 |
+| 影响调度/选择 | 是 | 否 |
+| 存什么 | 标识属性 | 描述性元数据 |
+
+## 小结
+
+- Label 是键值对，用于分组、筛选与资源关联
+- Selector 用 `-l` 或在 YAML 的 `selector` 里匹配 Label
+- 标准标签（`app.kubernetes.io/*`）让运维更统一
+- Annotation 存非标识元数据，不参与筛选
+- 下一章学习探针（健康检查）→

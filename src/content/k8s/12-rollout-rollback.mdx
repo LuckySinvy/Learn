@@ -1,0 +1,102 @@
+---
+title: 滚动更新与回滚
+order: 12
+description: 配置滚动更新策略，掌握暂停、恢复与版本回滚的操作
+---
+
+# 滚动更新与回滚
+
+发布新版本最怕"一发布全宕机"。Kubernetes 的 Deployment 默认采用**滚动更新（Rolling Update）**：逐步用新 Pod 替换旧 Pod，全程保持可用副本数，实现**零停机发布**。
+
+## 1. 滚动更新策略
+
+```yaml
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # 最多比期望多 1 个（更新时的峰值）
+      maxUnavailable: 0    # 更新时允许不可用的最少数量（0=始终不缺副本）
+  selector:
+    matchLabels: { app: nginx }
+  template:
+    metadata:
+      labels: { app: nginx }
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.28
+```
+
+<Callout type="info" title="maxSurge 与 maxUnavailable">
+二者控制"新旧交替"的节奏：`maxSurge=1, maxUnavailable=0` 表示先起 1 个新的、再退 1 个旧的，始终满副本、略多资源。想更快可加大 maxSurge。
+</Callout>
+
+## 2. 触发更新
+
+```bash
+# 改镜像即触发滚动更新
+kubectl set image deployment/nginx nginx=nginx:1.28
+
+# 观察进度（实时）
+kubectl rollout status deployment/nginx
+```
+
+更新期间 `kubectl get pods` 会看到新旧 Pod 并存，旧 Pod 被逐个替换。
+
+## 3. 暂停与恢复（金丝雀式发布）
+
+可以中途暂停，先让少量新副本跑一会儿验证，再继续：
+
+```bash
+# 开始更新但立刻暂停
+kubectl set image deployment/nginx nginx=nginx:1.28
+kubectl rollout pause deployment/nginx
+
+# 此时只有部分新副本上线，手动验证……
+
+# 验证 OK，继续完成剩余替换
+kubectl rollout resume deployment/nginx
+```
+
+<Callout type="tip" title="暂停实现金丝雀">
+`pause` + `resume` 是轻量金丝雀：先放一小撮流量到新版本，观察无误再全量。需要按百分比精细控制时，可用更高级的发布工具（如 Argo Rollouts）。
+</Callout>
+
+## 4. 回滚
+
+如果新版本有问题，一键回到上一次稳定状态：
+
+```bash
+# 回滚到上一个版本
+kubectl rollout undo deployment/nginx
+
+# 查看历史版本
+kubectl rollout history deployment/nginx
+
+# 回滚到指定版本
+kubectl rollout undo deployment/nginx --to-revision=3
+```
+
+<Callout type="warn" title="回滚恢复的是旧配置，不是旧流量">
+`undo` 会把 Pod 模板改回旧版并重新滚动。注意：第 11 章的 readiness 探针会保证回滚过程也是平滑的，别手动删 Pod。
+</Callout>
+
+## 5. 排障更新卡住
+
+```bash
+# 查看是否卡在暂停或镜像拉取失败
+kubectl describe deployment nginx
+kubectl get pods
+```
+
+常见卡点：新镜像不存在（ImagePullBackOff）、就绪探针一直不过（readiness 失败导致新副本不就绪）。
+
+## 小结
+
+- 默认 RollingUpdate 滚动替换，零停机
+- `maxSurge`/`maxUnavailable` 控制更新节奏
+- `pause` + `resume` 可做轻量金丝雀验证
+- `rollout undo` 一键回滚到历史版本
+- 下一章学习用 Ingress 把服务暴露到集群外 →

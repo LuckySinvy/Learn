@@ -1,0 +1,97 @@
+---
+title: 探针
+order: 11
+description: 用 liveness、readiness、startup 三种探针实现容器的健康检查与流量管控
+---
+
+# 探针
+
+容器进程"在跑"不等于"能服务"。Kubernetes 用**探针（Probe）**判断容器是否健康、是否就绪接收流量。配置好探针，才能让自愈和滚动更新真正可靠。
+
+## 1. 三种探针
+
+| 探针 | 作用 | 失败后果 |
+|---|---|---|
+| **livenessProbe** | 检测容器是否"活着" | 失败 → 杀掉并重启容器 |
+| **readinessProbe** | 检测是否"就绪"接收流量 | 失败 → 从 Service 后端摘掉 |
+| **startupProbe** | 检测应用是否"启动完成" | 失败 → 杀掉重启；成功前另两个暂停 |
+
+<Callout type="info" title="liveness 与 readiness 的差异">
+liveness 失败=容器废了，要重启；readiness 失败=容器在但还没好（如还在加载缓存），暂时别发流量。两者失败后果不同，务必区分。
+</Callout>
+
+## 2. 探测方式
+
+三种通用方式：
+
+- **exec**：在容器内执行命令，退出码 0 为成功
+- **httpGet**：对指定路径发 HTTP 请求，2xx/3xx 为成功
+- **tcpSocket**：探测端口是否可连
+
+## 3. livenessProbe 示例
+
+```yaml
+spec:
+  containers:
+    - name: app
+      image: myapp:1.0
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        initialDelaySeconds: 10     # 启动后等 10s 再开始探测
+        periodSeconds: 5            # 每 5s 探一次
+        failureThreshold: 3         # 连续 3 次失败才判定
+```
+
+## 4. readinessProbe 示例
+
+```yaml
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8080
+        periodSeconds: 5
+        failureThreshold: 2
+```
+
+<Callout type="tip" title="readiness 保证滚动更新零中断">
+新版本 Pod 未通过 readiness 前，Service 不会把流量转给它；它变成就绪后才逐步切流，老 Pod 再下线，从而实现平滑发布。
+</Callout>
+
+## 5. startupProbe 示例（慢启动应用）
+
+对启动很慢的应用（如 JVM 预热），用 startupProbe 给足启动时间，避免被 liveness 误杀：
+
+```yaml
+      startupProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        failureThreshold: 30        # 最多试 30 次
+        periodSeconds: 10          # 每次间隔 10s → 最多容忍 300s 启动
+```
+
+<Callout type="warn" title="liveness 不要探业务依赖">
+liveness 应只反映进程存活（如 `/healthz` 只查自身）。若它去探数据库，数据库抖动会导致容器被反复重启，雪上加霜。
+</Callout>
+
+## 6. 排查探针问题
+
+```bash
+kubectl describe pod app
+# 看 Events 里是否有 Unhealthy / Killing 等信息
+kubectl get pod app
+# READY 列如果是 0/1，说明 readiness 未通过
+```
+
+<Callout type="exercise" title="练习">
+给一个 Web 应用加上 `/healthz`（liveness）和 `/ready`（readiness）两个端点，并配置对应探针；故意让 `/ready` 返回 500，观察 READY 状态变为 0/1、Pod 从 Service endpoints 中消失。
+</Callout>
+
+## 小结
+
+- liveness 失败重启容器，readiness 失败摘流量，startup 给慢启动兜底
+- 探测方式：exec / httpGet / tcpSocket
+- liveness 只探自身存活，readiness 决定是否接流量
+- 下一章学习滚动更新与回滚 →

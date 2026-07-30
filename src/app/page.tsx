@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { Code2, Terminal, Coffee, BarChart3, Brain, Link2, Blocks } from 'lucide-react';
+import { Code2, Terminal, Coffee, BarChart3, Brain, Link2, Blocks, Boxes } from 'lucide-react';
 import { LanguageCard } from '@/components/layout/LanguageCard';
 
 export default function HomePage() {
@@ -7,10 +7,10 @@ export default function HomePage() {
     <main className="mx-auto max-w-6xl px-6 py-16">
       <section className="text-center mb-16">
         <h1 className="text-4xl md:text-5xl font-bold tracking-tight mb-4">
-          编程 · 可观测性 · AI 工程 交互式学习
+          编程 · 可观测性 · AI 工程 · 云原生 交互式学习
         </h1>
         <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
-          从零掌握 Python、Go、Java、Grafana，以及 RAG、Langchain.js、Dify。每章循序渐进，配有讲解、示例与实战。
+          从零掌握 Python、Go、Java、Grafana，以及 RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
         </p>
       </section>
 
@@ -84,6 +84,20 @@ export default function HomePage() {
           description="低代码 LLMOps 平台：知识库、工作流、Agent 与 API 发布一站式。"
           icon={<Blocks className="w-8 h-8" />}
           accent="from-pink-400 to-rose-500"
+          chapters={18}
+        />
+      </Category>
+
+      <Category
+        title="云原生"
+        desc="容器编排与基础设施，从 Pod 到生产级集群管理。"
+      >
+        <LanguageCard
+          href="/k8s"
+          title="Kubernetes"
+          description="工业级容器编排：Pod、Deployment、Service、Ingress 与自动扩缩容。"
+          icon={<Boxes className="w-8 h-8" />}
+          accent="from-sky-400 to-blue-500"
           chapters={18}
         />
       </Category>

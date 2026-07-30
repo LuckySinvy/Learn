@@ -1,0 +1,109 @@
+---
+title: 自动扩缩容
+order: 15
+description: 用 HPA 基于 CPU 或自定义指标自动调整 Deployment 副本数
+---
+
+# 自动扩缩容
+
+第 6 章我们手动 `kubectl scale` 调整副本数，但人工盯流量既不现实也来不及。**HPA（Horizontal Pod Autoscaler，水平 Pod 自动伸缩器）** 能根据指标（如 CPU 使用率）自动增减副本，让应用"该扩容时扩容、该缩容时缩容"。
+
+<Callout type="info" title="HPA 的前提：必须设 resources.requests">
+HPA 计算 CPU 使用率时，分母用的是 Pod 的 `requests.cpu`。若容器没设 requests，HPA 无法计算利用率，会不工作。务必给 Deployment 写好 resources。
+</Callout>
+
+## 1. HPA 的工作原理
+
+HPA 控制器周期性（默认 15s）查询指标服务器，算出当前平均利用率，与目标值比较，再调整 Deployment 的 `replicas`。
+
+```text
+当前平均 CPU 利用率 80%   > 目标 50%   →  增加副本
+当前平均 CPU 利用率 20%   < 目标 50%   →  减少副本
+```
+
+## 2. 基于 CPU 的 HPA
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx              # 要伸缩的目标
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50    # 目标平均 CPU 利用率 50%
+```
+
+先确保目标 Deployment 设了 requests：
+
+```yaml
+resources:
+  requests: { cpu: "100m" }
+  limits:   { cpu: "500m" }
+```
+
+<Callout type="tip" title="min/max 兜底保护">
+`minReplicas` 保证低峰也不少于 2 个（高可用），`maxReplicas` 防止流量洪峰把集群资源吃光。二者都要设。
+</Callout>
+
+## 3. 查看 HPA 状态
+
+```bash
+kubectl get hpa
+# NAME        REFERENCE          TARGETS   MINPODS  MAXPODS  REPLICAS
+# nginx-hpa   Deployment/nginx   45%/50%   2        10       3
+```
+
+```bash
+# 观察伸缩事件
+kubectl describe hpa nginx-hpa
+```
+
+## 4. 基于自定义/多指标
+
+HPA v2 支持多指标组合，也能用内存或自定义指标（需 Prometheus Adapter 等采集）：
+
+```yaml
+metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: { type: Utilization, averageUtilization: 60 }
+  - type: Resource
+    resource:
+      name: memory
+      target: { type: Utilization, averageUtilization: 70 }
+```
+
+<Callout type="warn" title="缩容有冷却时间">
+HPA 缩容比扩容保守（默认有冷却窗口，约 5 分钟），避免指标抖动造成副本频繁增减（"抖动"）。调优时可关注 `behavior` 字段。
+</Callout>
+
+## 5. 压测验证
+
+```bash
+# 在 Pod 里制造 CPU 压力，观察副本数是否上涨
+kubectl exec -it <pod> -- sh -c "yes > /dev/null &"
+```
+
+<Callout type="exercise" title="练习">
+为 nginx Deployment 配一个 HPA（目标 CPU 50%，2–10 副本），用上面的 `yes` 命令制造负载，观察 `kubectl get hpa` 中 REPLICAS 上升；停止负载后看它是否自动缩回。
+</Callout>
+
+## 小结
+
+- HPA 按指标（默认 CPU 利用率）自动调副本数
+- 目标 Deployment 必须设 `resources.requests`，否则 HPA 不工作
+- `minReplicas`/`maxReplicas` 提供高可用与资源保护
+- 支持 CPU/内存/自定义多指标组合
+- 下一章系统学习运维排障思路 →

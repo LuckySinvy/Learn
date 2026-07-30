@@ -1,0 +1,103 @@
+---
+title: 命名空间与资源配额
+order: 14
+description: 用 Namespace 隔离多团队/多环境，并用 ResourceQuota 与 LimitRange 约束资源
+---
+
+# 命名空间与资源配额
+
+当集群给多个团队、多个环境共用时，"互相干扰"和"资源被某个人占满"是两大痛点。**Namespace（命名空间）** 提供逻辑隔离，**ResourceQuota / LimitRange** 提供资源约束。
+
+<Callout type="info" title="Namespace 是逻辑隔离，不是网络隔离">
+Namespace 默认不隔离网络（同集群内 Service 仍能互通）。要网络隔离需配合 NetworkPolicy。它主要用来做配额、权限（RBAC）和作用域管理。
+</Callout>
+
+## 1. 命名空间基础
+
+```bash
+# 查看现有命名空间
+kubectl get namespaces
+
+# 创建命名空间
+kubectl create namespace team-a
+
+# 在指定命名空间里操作（加 -n）
+kubectl get pods -n team-a
+kubectl apply -f app.yaml -n team-a
+```
+
+系统自带几个：`default`（默认）、`kube-system`（系统组件）、`kube-public`、`kube-node-lease`。
+
+<Callout type="tip" title="用 context 切换默认命名空间">
+`kubectl config set-context --current --namespace=team-a` 可把当前上下文默认命名空间设为 team-a，省去每次加 `-n`。
+</Callout>
+
+## 2. ResourceQuota：限制命名空间总用量
+
+管理员可限制某个命名空间"最多能用多少资源"：
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    pods: "20"
+    requests.cpu: "4"
+    requests.memory: 4Gi
+    limits.cpu: "8"
+    limits.memory: 8Gi
+    services: "10"
+```
+
+超过配额后，新的 Pod 创建会被拒绝（报 `exceeded quota`）。
+
+## 3. LimitRange：给未设限制的 Pod 设默认值
+
+不是所有人都记得写 `resources`。LimitRange 可为命名空间内的容器设默认/最小/最大限制：
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-a-limits
+  namespace: team-a
+spec:
+  limits:
+    - type: Container
+      default:                 # 未指定 limit 时默认给的值
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:          # 未指定 request 时默认给的值
+        cpu: "100m"
+        memory: "128Mi"
+      min:
+        memory: "64Mi"
+      max:
+        memory: 1Gi
+```
+
+<Callout type="warn" title="LimitRange 只补默认值">
+它不会替你"限制"已有的 Pod，只是当你漏写 resources 时自动补上默认/上下限。要硬上限请配合 ResourceQuota。
+</Callout>
+
+## 4. 三者配合的价值
+
+| 对象 | 作用 |
+|---|---|
+| Namespace | 逻辑隔离、配额与作用域的边界 |
+| ResourceQuota | 限制整个命名空间的总资源/对象数 |
+| LimitRange | 为单个容器补默认与上下限 |
+
+<Callout type="exercise" title="练习">
+新建命名空间 `demo`，为其创建一份 ResourceQuota（最多 5 个 Pod、2 核 CPU）和一个 LimitRange（默认内存 128Mi）。然后尝试创建超过配额的 Pod，观察被拒的报错信息。
+</Callout>
+
+## 小结
+
+- Namespace 做逻辑隔离与配额边界
+- ResourceQuota 限制命名空间总量（Pod 数、CPU、内存）
+- LimitRange 为漏写 resources 的容器补默认/上下限
+- 下一章学习基于指标的自动扩缩容 HPA →
