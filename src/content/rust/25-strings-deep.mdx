@@ -1,0 +1,91 @@
+---
+title: 字符串深入
+order: 25
+description: String 与 &str 的本质区别、UTF-8 编码陷阱，以及拼接、切片与转换的常见坑
+---
+
+# 字符串深入
+
+Rust 的字符串是 UTF-8 编码，且分 `String`（拥有）与 `&str`（借用）两种形态。理解它们能避开大量新手坑。
+
+## 1. String vs &str
+
+```rust
+let owned: String = String::from("你好");   // 堆上，可变、拥有
+let borrowed: &str = "你好";                 // 只读、借用（字面量在二进制里）
+```
+
+- `String`：可在堆上增长、修改，拥有数据。
+- `&str`：对 UTF-8 字节序列的视图，不可变、不拥有。
+
+<Callout type="info" title="函数参数为何用 &str">
+`&str` 既能接收 `String` 切片也能接收字面量，最通用。需要修改/构建字符串时才用 `String`。
+</Callout>
+
+## 2. UTF-8 编码陷阱
+
+一个字符可能占多个字节。按**字节**索引会出错：
+
+```rust
+let s = String::from("你好");
+// println!("{}", &s[0..1]);   // 编译/运行错误：切在字符中间
+println!("字符数 = {}", s.chars().count());   // 2，按 Unicode 字符
+```
+
+<Callout type="warn" title="不要按字节切字符串">
+中文字符在 UTF-8 中占 3 字节。对 `String` 用 `[0..1]` 切片极易落在字符中间，Rust 会直接 panic 来阻止产生非法 UTF-8。
+</Callout>
+
+## 3. 遍历字符
+
+```rust
+for c in "你好abc".chars() {
+    println!("{}", c);
+}
+// 若要字节：.bytes()
+```
+
+## 4. 拼接与转换
+
+```rust
+let mut s = String::from("Hello");
+s.push_str(", Rust");
+s.push('!');
+let combined = format!("{} {}", s, 2024);
+
+let n = 42;
+let ns = n.to_string();          // 数字 -> String
+let parsed: i32 = "42".parse().unwrap();   // &str -> 数字
+```
+
+## 5. &str 与 String 互转
+
+```rust
+let s: String = "hi".to_string();   // &str -> String
+let r: &str = &s;                    // String -> &str（取切片）
+let r2: &str = s.as_str();           // 等价写法
+```
+
+<Callout type="tip" title="尽量晚地转成 String">
+很多函数接受 `&str` 即可，不必先 `to_string()`。只有需要所有权或修改时才升级为 `String`，能减少不必要的分配。
+</Callout>
+
+## 6. 常见坑速查
+
+| 坑 | 正确做法 |
+|---|---|
+| `&s[0..1]` 切中文 | 用 `chars()` / `char_indices()` |
+| 用 `+` 拼接 `&str` | 右侧须是 `&str`（`s + &tail`） |
+| 忘记 UTF-8 长度 | `s.len()` 是字节数，`chars().count()` 是字符数 |
+
+<Callout type="exercise" title="练习">
+写一个 `fn reverse_chars(s: &str) -> String`，按 Unicode 字符反转字符串（用 `chars().rev().collect()`）。对「Rust语言」调用，验证是「言语tsuR」而非按字节乱码。
+</Callout>
+
+## 小结
+
+- `String` 拥有/可改；`&str` 借用/只读，最通用
+- UTF-8 下不要按字节切片，用 `chars()`
+- 拼接用 `push_str`/`+`/`format!`；解析用 `parse()`
+- 晚转 `String`、早用 `&str` 减少分配
+- 下一章看文件 IO →

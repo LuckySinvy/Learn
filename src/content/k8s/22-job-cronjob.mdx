@@ -1,0 +1,78 @@
+---
+title: Job 与 CronJob 批处理任务
+order: 22
+description: 用 Job 运行一次性批处理任务，用 CronJob 调度周期性定时任务
+---
+
+# Job 与 CronJob 批处理任务
+
+Deployment/StatefulSet 跑的是「永远在线」的服务，而数据迁移、报表生成、备份这类**一次性或周期性任务**需要保证「跑完即止、失败可重试」。Kubernetes 用 **Job** 和 **CronJob** 来承载。
+
+## 1. Job：运行到完成
+
+Job 会启动 Pod 并反复重试，直到指定数量的 Pod 成功退出（`completionMode:Indexed` 支持并行分片）。
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-migrate
+spec:
+  completions: 1
+  backoffLimit: 3          # 失败最多重试 3 次
+  activeDeadlineSeconds: 600   # 整体超时 10 分钟
+  template:
+    spec:
+      restartPolicy: Never     # Job 只能用 Never 或 OnFailure
+      containers:
+        - name: migrate
+          image: myapp:migrate
+          command: ["python", "migrate.py"]
+```
+
+## 2. CronJob：定时调度
+
+CronJob 按类 Linux crontab 的语法周期触发 Job。
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-report
+spec:
+  schedule: "0 2 * * *"    # 每天凌晨 2 点
+  concurrencyPolicy: Forbid   # 上一次没跑完则跳过本次
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: report
+              image: myapp:report
+              command: ["python", "report.py"]
+```
+
+<Callout type="tip" title="时区问题常被忽略">
+CronJob 的 `schedule` 默认按 **kube-controller-manager 所在时区**（通常是 UTC）。需要本地时区时设置 `.spec.timeZone: "Asia/Shanghai"`（1.27+）。
+</Callout>
+
+## 3. 查看与排错
+
+```bash
+kubectl get jobs
+kubectl get cronjob
+kubectl logs job/data-migrate
+```
+
+<Callout type="warn" title="失败 Job 的 Pod 默认保留">
+Job 完成后成功/失败的 Pod 会留着便于排查，长期堆积占资源。用 `ttlSecondsAfterFinished` 让 Job 自动清理（需特性门控开启）。
+</Callout>
+
+## 小结
+
+- Job 保证任务跑完，支持重试、超时、并行完成
+- CronJob 用 crontab 语法周期触发，注意时区与并发策略
+- Job 的 `restartPolicy` 只能是 Never/OnFailure
+- 下一章学习 RBAC 如何控制「谁能做什么」 →

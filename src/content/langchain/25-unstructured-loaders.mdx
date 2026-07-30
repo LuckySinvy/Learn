@@ -1,0 +1,76 @@
+---
+title: 非结构化文档加载与转换
+order: 25
+description: 用 UnstructuredLoader 解析 PDF/PPT/HTML 等多格式文件，并做元素级清洗
+---
+
+# 非结构化文档加载与转换
+
+第 8 章介绍了 `TextLoader`、`PDFLoader` 等基础加载器。真实知识库常是 PDF、PPT、Word、HTML 混在一起。`UnstructuredLoader` 基于 `unstructured` 库，能统一解析几十种格式，并把文档切成「标题、段落、表格」等语义元素，便于后续清洗与切分。
+
+## 1. 单文件加载
+
+```ts
+import { UnstructuredLoader } from "langchain/document_loaders/fs/unstructured";
+
+const loader = new UnstructuredLoader("./docs/report.pdf", {
+  strategy: "hi_res", // hi_res=高精度（含版式），fast=更快
+  pdfInference: true,
+});
+
+const docs = await loader.load();
+// 每个 doc.metadata 含 category（Title/ListItem/Table 等）
+console.log(docs[0].metadata.category, docs[0].pageContent);
+```
+
+<Callout type="info" title="需要本地服务或 API">
+`UnstructuredLoader` 默认连本地 `unstructured` 服务（`UNSTRUCTURED_API_URL`），也可用托管 API。安装参考官方 `unstructured` 文档。
+</Callout>
+
+## 2. 目录批量加载
+
+```ts
+import { UnstructuredDirectoryLoader } from "langchain/document_loaders/fs/unstructured";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+
+const dirLoader = new UnstructuredDirectoryLoader("./kb/", {
+  recursive: true,
+  // 按元素类型过滤，只保留正文与标题
+});
+
+const raw = await dirLoader.load();
+const splits = await new RecursiveCharacterTextSplitter({
+  chunkSize: 800,
+  chunkOverlap: 80,
+}).splitDocuments(raw);
+```
+
+## 3. 元素级清洗
+
+`unstructured` 会标出元素类别，可在入库前过滤掉页眉、页脚、噪点：
+
+```ts
+const clean = raw.filter(
+  (d) => !["Header", "Footer", "PageNumber"].includes(d.metadata.category)
+);
+```
+
+<Callout type="tip" title="HI_RES 还是 FAST">
+追求版面/表格还原（如扫描件、复杂排版）用 `hi_res`；纯文本为主的文档用 `fast` 省成本。配合第 9 章切分器使用。
+</Callout>
+
+<Callout type="warn" title="大批量要限速">
+`hi_res` 解析比文本加载慢很多。大知识库建议分批、异步处理，并缓存解析结果，避免每次重建索引都重新解析。
+</Callout>
+
+<Callout type="exercise" title="练习">
+准备一份含标题与表格的 PDF，用 `UnstructuredLoader` 加载，过滤掉 `Header/Footer`，再切分存入第 10 章的 MemoryVectorStore 做一次检索。
+</Callout>
+
+## 小结
+
+- `UnstructuredLoader` 统一解析 PDF/PPT/HTML 等几十种格式
+- `strategy: hi_res` 重版面、`fast` 重速度
+- 元素级 `category` 元数据便于过滤噪点
+- 大批量解析需分批与缓存
+- 本组进阶章节到此，可结合第 17/18 章实战综合运用 →

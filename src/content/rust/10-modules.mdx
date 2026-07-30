@@ -1,0 +1,110 @@
+---
+title: 模块与包管理
+order: 10
+description: mod/use 组织代码、路径与 crate 根、可见性 pub 规则，以及 workspace 多包结构
+---
+
+# 模块与包管理
+
+随着代码增长，需要**模块（module）** 来划分命名空间、控制可见性，并用 **crate / workspace** 组织更大的项目。
+
+## 1. 用 mod 定义模块
+
+```rust
+mod network {
+    pub fn connect() {
+        println!("连接中...");
+    }
+
+    fn secret() { /* 默认私有，仅模块内可见 */ }
+}
+
+fn main() {
+    network::connect();
+}
+```
+
+<Callout type="info" title="默认私有">
+模块内项默认是 `私有的`（仅本模块及子模块可见）。加 `pub` 才对外暴露。这与「变量默认不可变」一样，都是 Rust「默认收紧」哲学的体现。
+</Callout>
+
+## 2. 用 use 引入路径
+
+```rust
+use crate::network::connect;
+
+fn main() {
+    connect();   // 不必写全路径
+}
+```
+
+也可用 `as` 改名避免冲突：`use std::io::Result as IoResult;`。
+
+## 3. 多文件模块
+
+把模块拆到独立文件：
+
+```
+src/
+  main.rs
+  network.rs      // 在 main.rs 写: mod network;
+```
+
+或在 `src/network/mod.rs` 中组织子模块。Rust 2018 之后也支持 `src/network.rs` + `src/network/` 目录并存。
+
+## 4. crate 与可见性层级
+
+- **crate**：一个编译单元（库或二进制）。顶层 `mod` 在 `lib.rs`/`main.rs`。
+- **pub(crate)**：仅当前 crate 内可见。
+- **pub(in path)**：限定在某个路径下可见。
+
+```rust
+pub(crate) fn internal() {}    // 库内部共享，对外隐藏
+```
+
+<Callout type="tip" title="pub 的细分粒度">
+`pub`、`pub(crate)`、`pub(super)`、`pub(in crate::foo)` 让你精确控制 API 边界，避免内部实现泄漏成公开接口。
+</Callout>
+
+## 5. workspace 多包
+
+多个相关 crate 放在一个 workspace 共享 `Cargo.lock` 与 `target/`：
+
+```toml
+# 根 Cargo.toml
+[workspace]
+members = ["crates/core", "crates/cli"]
+```
+
+```
+my-workspace/
+  Cargo.toml
+  crates/
+    core/    # 库
+    cli/     # 二进制，依赖 core
+```
+
+<Callout type="warn" title="workspace 的共享依赖">
+workspace 内所有成员共用一份 `Cargo.lock` 与依赖解析，避免版本分裂。改一处依赖，全 workspace 生效。
+</Callout>
+
+## 6. 标准库常用路径
+
+| 路径 | 用途 |
+|---|---|
+| `std::collections` | Vec/HashMap 等 |
+| `std::fs` | 文件操作 |
+| `std::io` | 输入输出 |
+| `std::thread` | 线程 |
+
+<Callout type="exercise" title="练习">
+把上一章的 `Shape` 与 `area` 放进一个 `mod geometry { pub enum Shape {...} pub fn area(...) }`，在 `main` 里用 `use` 引入并调用。再给内部 helper 函数设为私有，验证外部无法访问。
+</Callout>
+
+## 小结
+
+- `mod` 划命名空间，`pub` 控制可见性，默认私有
+- `use` 简化路径；`as` 改名防冲突
+- `pub(crate)` 等细分粒度管理 API 边界
+- workspace 用 `members` 组织多 crate 并共享依赖
+- 下一章看常用集合类型 →

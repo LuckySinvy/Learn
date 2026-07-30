@@ -1,0 +1,84 @@
+---
+title: 私有化部署运维
+order: 23
+description: 掌握自部署的数据卷、数据库备份、版本迁移与平滑升级，保障生产环境稳定
+---
+
+# 私有化部署运维
+
+第 2 章讲了怎么把 Dify 跑起来。进入生产后，真正的功课是**运维**：数据怎么备份、版本怎么升、升级翻车怎么回退。本章聚焦自部署（Self-hosted）的运维要点。
+
+## 1. 部署组成与数据持久化
+
+Docker Compose 部署下，核心组件与各司其职：
+
+| 组件 | 作用 | 数据风险 |
+|---|---|---|
+| `api` / `worker` | 后端逻辑与异步任务 | 无状态，可重启 |
+| `db`（PostgreSQL） | 应用、知识库、日志元数据 | **必须备份** |
+| `redis` | 缓存与队列 | 可重建 |
+| `weaviate` / `qdrant` | 向量存储 | **必须备份** |
+
+<Callout type="warn" title="向量库也要备份">
+知识库切片向量存在向量库里，只备份 PostgreSQL 不够。升级或迁移前，务必同时处理数据库与向量库两份数据，否则知识库变空。
+</Callout>
+
+## 2. 数据库备份
+
+用官方提供的 `docker-compose` 卷名直接导出：
+
+```bash
+# 备份 PostgreSQL
+docker exec -t docker-api-1 pg_dumpall -c -U postgres > dify_db_$(date +%F).sql
+
+# 备份向量库（以 weaviate 为例，停写后拷贝数据卷）
+docker run --rm -v dify_weaviate_data:/data -v $(pwd):/backup busybox \
+  tar czf /backup/weaviate_$(date +%F).tar.gz -C /data .
+```
+
+## 3. 版本迁移
+
+Dify 升级常伴随数据库 schema 变更。官方在 `api` 容器启动时自动执行迁移，但**先备份再升**是铁律。
+
+```yaml
+# 升级前确认镜像版本一致
+services:
+  api:
+    image: langgenius/dify-api:0.8.3   # 与原版本记录一致后再改
+  worker:
+    image: langgenius/dify-worker:0.8.3
+```
+
+```bash
+# 升级流程
+docker compose down
+docker compose pull
+docker compose up -d   # api 启动会自动 migrate
+docker compose logs -f api   # 观察迁移是否成功
+```
+
+## 4. 升级失败的回退
+
+若新版本异常，用备份的镜像标签与数据库回退到旧版：
+
+```bash
+# 回到旧镜像
+sed -i 's/0.8.3/0.8.2/' docker-compose.yaml
+docker compose up -d
+# 必要时用旧 db 备份恢复 PostgreSQL
+```
+
+<Callout type="tip" title="升级前读 release notes">
+Dify 大版本可能改环境变量、移除旧字段。升级前先读官方变更说明，核对 `.env` 里的新增配置项，避免启动后因缺配置而崩溃。
+</Callout>
+
+<Callout type="exercise" title="做一次演练">
+在测试环境执行一次「备份 → 修改镜像版本号 → 升级 → 观察日志 → 回退」全流程，确认你能在 15 分钟内恢复服务。
+</Callout>
+
+## 小结
+
+- 数据持久化重点在 PostgreSQL 与向量库两份
+- 升级前务必全量备份，启动自动 migrate
+- 回退靠旧镜像标签 + 数据库备份
+- 升级前读 release notes 核对环境变量；下一步做插件扩展 →

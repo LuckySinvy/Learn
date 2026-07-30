@@ -1,0 +1,78 @@
+---
+title: Stream API 进阶
+order: 22
+description: Collectors.groupingBy 下游收集器、partitioningBy 分区、并行流 parallelStream 的适用场景与陷阱
+---
+
+# Stream API 进阶
+
+第 8 章介绍了 Stream 的过滤、映射与基础收集器。本章深入三个高频进阶点：分组、分区，以及并行流。
+
+## 1. groupingBy 与下游收集器
+
+`Collectors.groupingBy` 把元素按某键分组，结果默认是 `Map<K, List<T>>`。真正强大的是它的**第二个参数——下游收集器**，决定每组内部怎么聚合：
+
+```java
+record Order(String customer, double amount) {}
+
+List<Order> orders = List.of(
+    new Order("A", 100), new Order("A", 200),
+    new Order("B", 50),  new Order("B", 80),  new Order("B", 70)
+);
+
+// 每个客户的订单数
+Map<String, Long> count = orders.stream()
+    .collect(Collectors.groupingBy(Order::customer, Collectors.counting()));
+
+// 每个客户的总金额
+Map<String, Double> total = orders.stream()
+    .collect(Collectors.groupingBy(Order::customer,
+             Collectors.summingDouble(Order::amount)));
+
+// 每个客户的金额列表（已排序）
+Map<String, List<Double>> byCust = orders.stream()
+    .collect(Collectors.groupingBy(Order::customer,
+             Collectors.mapping(Order::amount, Collectors.toList())));
+```
+
+## 2. partitioningBy 二分区
+
+当分组键是布尔值时，用 `partitioningBy` 更直接，结果固定是 `Map<Boolean, List<T>>`：
+
+```java
+Map<Boolean, List<Integer>> byParity = List.of(1, 2, 3, 4, 5).stream()
+    .collect(Collectors.partitioningBy(n -> n % 2 == 0));
+// {false=[1, 3, 5], true=[2, 4]}
+```
+
+<Callout type="info" title="groupingBy 多级分组">
+`groupingBy` 的下游收集器还能再嵌 `groupingBy`，实现「先按部门、再按职级」的多级分组，结果类型是嵌套 Map。
+</Callout>
+
+## 3. 并行流 parallelStream
+
+在流上调用 `.parallel()` 或 `parallelStream()`，框架会用公共 `ForkJoinPool` 把任务拆到多个线程：
+
+```java
+long sum = LongStream.rangeClosed(1, 100_000_000)
+    .parallel()
+    .sum();
+```
+
+<Callout type="warn" title="并行流不是银弹">
+并行有开销：拆分、合并、线程调度。数据量小或操作很轻时，并行反而更慢。且流内部若用到**共享可变状态**（如外部 `ArrayList` 做 `forEach` 收集），会产生线程安全问题——并行流的结果必须靠真正的收集器产出。
+</Callout>
+
+## 4. 何时用并行
+
+- ✅ 数据量大（十万级以上）、操作是纯计算（无 I/O、无共享状态）
+- ❌ 涉及网络/磁盘 I/O（会阻塞线程池）
+- ❌ 操作依赖顺序（如 `findFirst` 在并行下仍要保序，得不偿失）
+
+## 小结
+
+- ✅ `groupingBy` + 下游收集器（counting / summingDouble / mapping）做复杂聚合
+- ✅ `partitioningBy` 处理布尔二分区
+- ✅ 多级 `groupingBy` 产生嵌套 Map
+- ✅ 并行流适合「大数据量 + 纯计算」，避免共享可变状态
+- ✅ 不要为并行而并行，先用顺序流验证正确性

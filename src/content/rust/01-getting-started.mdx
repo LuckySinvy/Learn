@@ -1,0 +1,86 @@
+---
+title: Rust 入门与环境搭建
+order: 1
+description: 安装 rustup 与 cargo，写出第一个 Hello World，理解编辑-编译-运行流程与 cargo 项目结构
+---
+
+# Rust 入门与环境搭建
+
+Rust 是一门注重**内存安全**与**零成本抽象**的系统级编程语言。它能在不依赖垃圾回收的前提下，在编译期就消灭大多数内存错误。本章带你从零把环境跑起来。
+
+## 1. 安装 Rust 工具链
+
+官方推荐用 `rustup` 安装，它会同时带来编译器 `rustc` 和包管理器 `cargo`：
+
+```bash
+# 安装 rustup（会附带 stable 工具链与 cargo）
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 验证安装
+rustc --version
+cargo --version
+```
+
+<Callout type="tip" title="国内网络加速">
+若下载慢，可先设置镜像：`export RUSTUP_DIST_SERVER=https://rsproxy.cn`，再执行安装脚本。更新时用 `rustup update`。
+</Callout>
+
+## 2. 第一个 Hello World
+
+不用 cargo 也能直接编译单个文件，适合快速验证：
+
+```rust
+fn main() {
+    println!("Hello, world!");
+}
+```
+
+```bash
+rustc main.rs      # 编译生成可执行文件 main
+./main             # 运行，输出 Hello, world!
+```
+
+`println!` 末尾的 `!` 表示它是一个**宏**而非普通函数；字符串里的 `{}` 是占位符（在代码块里写没问题）。
+
+## 3. 用 cargo 管理项目
+
+真实项目都用 cargo。它负责构建、运行、测试与依赖管理：
+
+```bash
+cargo new hello --bin     # 创建二进制项目
+cd hello
+cargo run                 # 编译并运行
+cargo build --release     # 发布优化构建，产物在 target/release
+```
+
+<Callout type="info" title="cargo 项目的标准结构">
+`Cargo.toml` 是清单（名称、版本、依赖）；`src/main.rs` 是入口；`target/` 存放编译产物，`Cargo.lock` 锁定依赖版本。库项目用 `cargo new hello --lib`，入口改为 `src/lib.rs`。
+</Callout>
+
+## 4. Cargo.toml 简介
+
+```toml
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 在这里添加第三方 crate，例如 serde = "1.0"
+```
+
+## 5. 编辑-编译-运行的循环
+
+Rust 是** ahead-of-time 编译**语言：先 `cargo build` 生成机器码，再运行。编译期检查极其严格——很多 bug 在编译阶段就被拦下，换来的是「编译通过基本就能跑对」的踏实感。
+
+<Callout type="exercise" title="练习">
+用 `cargo new hello --bin` 创建项目，把输出改成你的名字（例如 `Hello, 小明!`），再 `cargo run` 确认成功。然后试试故意写错一个字母让编译失败，观察编译器的友好报错。
+</Callout>
+
+## 小结
+
+- 用 `rustup` 安装工具链，得到 `rustc` 与 `cargo`
+- `println!` 是宏，编译期处理
+- 真实项目用 `cargo new` 创建，`cargo run` 一键构建运行
+- `Cargo.toml` 管理元数据与依赖，`edition = "2021"` 指定语言版本
+- 下一章讲变量与可变性 →

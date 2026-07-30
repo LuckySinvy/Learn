@@ -1,0 +1,65 @@
+---
+title: 注解与区域标记（Annotations）
+order: 19
+description: 用 Annotations 在时序图上标记事件与故障区间，让图表「会说话」
+---
+
+# 注解与区域标记（Annotations）
+
+**Annotations（注解）** 是在时间序列图上叠加的「事件标记」。它不改变指标本身，而是在某个时间点（或一段区间）画一条竖线 / 一块阴影，用来标注「这里部署了新版本」「那一刻发生了告警」等背景信息。相比靠记忆回忆时间，注解把上下文直接钉在曲线上。
+
+<Callout type="info" title="注解与告警的区别">
+告警是「系统自动触发、需要响应」的规则产物；注解是「人工或外部事件留下的标记」，用于事后回顾与关联分析。
+</Callout>
+
+## 1. 两种注解类型
+
+- **Built-in（内置）**：在当前 Dashboard 内手动添加，存于 Dashboard JSON，随仪表盘移动。
+- **Query（查询型）**：由数据源（如 Prometheus）返回带时间戳的事件，所有面板可共享，适合自动化。
+
+## 2. 配置查询型注解
+
+以 Prometheus 为例，把「部署事件」标记出来：
+
+```yaml
+# Dashboard → Settings → Annotations → New
+name: deployments
+data source: Prometheus
+expr: |
+  kube_pod_created{namespace="app"}
+title: 新 Pod 启动
+text: 实例 {{ $labels.pod }}
+```
+
+配置后，曲线上会出现竖线，悬停可见 `text` 内容。
+
+## 3. 区域标记（Region）
+
+当查询返回的是**区间**而非瞬间点时（如 `ALERTS` 指标，值为 1 的时间段），Grafana 会自动画成阴影区域：
+
+```text
+# 用已存在的告警时间序列标记故障区间
+expr: ALERTS{alertname="HighCpu"}
+```
+
+<Callout type="tip" title="用 Graph 面板联动">
+在时间序列面板上开启 Annotations 后，可一眼看出「CPU 飙升」是否正好落在「发布」竖线附近 —— 快速验证因果。
+</Callout>
+
+## 4. 通过 API 写入注解
+
+Grafana 原生注解也可直接 POST，常用于 CI 在部署时打点：
+
+```bash
+curl -X POST http://localhost:3000/api/annotations \
+  -H "Authorization: Bearer $GRAFANA_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"dashboardUID":"abc","time":1700000000000,"text":"v1.2.0 发布","tags":["deploy"]}'
+```
+
+## 小结
+
+- 注解是叠加在图上的事件标记，分内置与查询型两类
+- 查询型注解由数据源返回时间点或区间，可实现故障区域阴影
+- 配合 API，可在 CI/CD 中自动留下发布标记，便于事后归因
+- 下一步可把注解与告警时间线对照，提升排障效率 →

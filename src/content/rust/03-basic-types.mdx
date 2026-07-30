@@ -1,0 +1,96 @@
+---
+title: 基础数据类型
+order: 3
+description: 标量类型（整型、浮点、布尔、字符）与复合类型（元组、数组）的声明、使用与边界
+---
+
+# 基础数据类型
+
+Rust 的类型分为**标量（scalar）**与**复合（compound）**两大类。它们都在栈上分配，大小已知。
+
+## 1. 标量类型
+
+### 1.1 整型
+
+有符号 `i8/i16/i32/i64/i128/isize` 与无符号 `u8/u16/u32/u64/u128/usize`。默认整型是 `i32`。
+
+```rust
+let a: i32 = -100;
+let b: u8 = 255;       // 范围 0..=255
+let c = 50;            // 推断为 i32
+let size: usize = 10;  // 用于索引/长度
+```
+
+<Callout type="warn" title="整型溢出">
+Debug 模式下溢出会 panic；Release 模式会按补码回绕（如 `u8` 的 256 变 0）。务必用 `checked_add` 等安全方法处理可能溢出的情况。
+</Callout>
+
+### 1.2 浮点
+
+仅 `f32` 与 `f64`（默认 `f64`）。
+
+```rust
+let x = 2.0;    // f64
+let y: f32 = 3.14;
+```
+
+### 1.3 布尔与字符
+
+```rust
+let flag = true;          // bool
+let letter = 'A';         // char，占 4 字节，是 Unicode 标量值
+let emoji = '😊';         // char 可存任意 Unicode 字符
+```
+
+<Callout type="info" title="char 不是 u8">
+`char` 是 4 字节的 Unicode 标量值，能表示中文、emoji 等；而字符串才是 UTF-8 字节序列，二者不要混用。
+</Callout>
+
+## 2. 复合类型
+
+### 2.1 元组（tuple）
+
+固定长度、可异类型的组合：
+
+```rust
+let tup: (i32, f64, char) = (500, 6.4, 'z');
+let (a, b, c) = tup;       // 解构
+println!("{} {} {}", a, b, c);
+println!("第一个 = {}", tup.0);  // 用 .索引 访问
+```
+
+### 2.2 数组（array）
+
+同类型、固定长度，栈上连续存储：
+
+```rust
+let arr = [1, 2, 3, 4, 5];
+let same = [0; 3];         // [0, 0, 0]
+println!("长度 = {}", arr.len());
+println!("第二个 = {}", arr[1]);
+```
+
+<Callout type="warn" title="越界访问会 panic">
+用越界下标 `arr[99]` 访问数组，运行时会触发 panic 并安全退出，不会像 C 那样读到脏内存。这正是 Rust 安全性的体现。
+</Callout>
+
+## 3. 类型速查
+
+| 类别 | 类型 | 默认 |
+|---|---|---|
+| 有符号整型 | `i8..i128, isize` | `i32` |
+| 无符号整型 | `u8..u128, usize` | `u32`(上下文) |
+| 浮点 | `f32, f64` | `f64` |
+| 元组/数组 | 不定 | — |
+
+<Callout type="exercise" title="练习">
+定义一个元组 `(String, i32, bool)` 存放「姓名、年龄、是否会员」，解构后打印；再定义一个长度为 4 的数组存放四个季度销售额，用循环求和。
+</Callout>
+
+## 小结
+
+- 标量：整型（含 `usize`）、浮点、布尔、字符（Unicode）
+- 复合：元组（异类型、`.0` 访问）、数组（同类型、固定长）
+- 默认整型 `i32`、浮点 `f64`
+- 越界访问会安全 panic，不会内存越界
+- 下一章讲控制流与函数 →

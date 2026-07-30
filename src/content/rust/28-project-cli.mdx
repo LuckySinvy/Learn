@@ -1,0 +1,105 @@
+---
+title: 项目实战：命令行工具
+order: 28
+description: 用 clap 构建一个带子命令与参数的命令行工具，整合前面所学的结构体、错误处理与文件 IO
+---
+
+# 项目实战：命令行工具
+
+本章用 **clap** 做一个实用的 CLI 工具：统计文本文件的行数、词数、字符数（类 `wc`）。
+
+## 1. 依赖
+
+```toml
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+```
+
+## 2. 用 derive 定义参数
+
+```rust
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "mywc", about = "简易 wc 工具")]
+struct Cli {
+    /// 要统计的文件路径
+    #[arg(required = true)]
+    path: String,
+
+    /// 是否统计字符数
+    #[arg(short, long)]
+    chars: bool,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let content = std::fs::read_to_string(&cli.path)?;
+
+    let lines = content.lines().count();
+    let words = content.split_whitespace().count();
+    let chars = content.chars().count();
+
+    println!("行数: {}", lines);
+    println!("词数: {}", words);
+    if cli.chars {
+        println!("字符数: {}", chars);
+    }
+    Ok(())
+}
+```
+
+<Callout type="info" title="clap derive 极简">
+`#[derive(Parser)]` + 字段上的 `#[arg(...)]` 即声明式地定义了 CLI。自动获得 `--help`、类型解析与报错，省去手写参数解析。
+</Callout>
+
+## 3. 子命令
+
+```rust
+#[derive(clap::Subcommand)]
+enum Command {
+    /// 统计文件
+    Count { path: String },
+    /// 显示版本信息
+    Version,
+}
+
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+```
+
+## 4. 运行效果
+
+```bash
+cargo run -- ./README.md --chars
+# 行数: 120
+# 词数: 800
+# 字符数: 5400
+```
+
+<Callout type="tip" title="把逻辑拆成函数">
+真实项目里把「统计」抽成 `fn analyze(text: &str) -> Stats`，把 IO 与 CLI 解耦，便于单元测试（呼应第 23 章）。
+</Callout>
+
+## 5. 错误处理
+
+本例用 `Box<dyn Error>` 统一兜底。`?` 把各处的 `io::Error` 自动转换成返回类型，main 里 `Result` 让任何失败都干净退出。
+
+<Callout type="warn" title="路径要用 &str 而非 String 移动">
+`read_to_string(&cli.path)` 传引用即可；若写成 `read_to_string(cli.path)` 会把 `path` move 走，之后无法再用。
+</Callout>
+
+<Callout type="exercise" title="练习">
+给工具加一个 `--words-only` 与 `--lines-only` 开关（互斥时用 `ArgGroup`），并把统计逻辑抽成返回结构体的函数，补一个单元测试验证「`a b\nc`」词数=2、行数=2。
+</Callout>
+
+## 小结
+
+- clap 的 `derive` 模式声明式定义 CLI 参数/子命令
+- `#[arg(short, long)]` 定义短/长选项，`required` 设必填
+- 用 `Box<dyn Error>` + `?` 统一错误处理
+- 把业务逻辑抽成函数，便于测试
+- 下一章做 Web 服务实战 →

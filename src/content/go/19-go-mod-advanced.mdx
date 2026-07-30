@@ -1,0 +1,79 @@
+---
+title: Go Module 进阶
+order: 19
+description: replace / workspace / go.sum 校验和 / 私有模块配置
+---
+
+# Go Module 进阶
+
+第 6 章介绍了 `go mod init` 与基本依赖管理。本章深入日常工程里真正常用、却常被忽略的高级能力：replace、workspace、校验和数据库与私有模块配置。
+
+## 1. `replace` 指令：本地替换与分叉
+
+`replace` 让模块路径指向另一个源（本地路径或另一个版本），常用于调试第三方库、引入 fork。
+
+```go
+// go.mod
+require github.com/foo/bar v1.2.3
+
+replace github.com/foo/bar => github.com/myfork/bar v1.2.3-fixed
+
+// 或指向本地目录（开发联调）
+replace github.com/foo/bar => ../bar-local
+```
+
+<Callout type="warn" title="别把本地 replace 提交上去">
+开发联调时写的 `=> ../bar-local` 只该留在自己机器。提交前改用真实版本或 fork，否则队友 `go mod download` 会失败。
+</Callout>
+
+## 2. `go.work` 多模块工作区
+
+单体仓库里有多个 module 时，每次改一个都要靠 `replace` 指来指去。Go 1.18 的 workspace 用 `go.work` 一次解决。
+
+```bash
+go work init ./service ./shared
+go work use ./newmodule
+```
+
+`go.work` 只在你本地生效，通常不进版本库（加入 `.gitignore`）。它让工作区里所有 module 互相引用当前目录版本，无需改各自的 `go.mod`。
+
+## 3. `go.sum` 与校验和数据库
+
+`go.sum` 记录每个依赖的加密哈希，防止依赖被篡改。`GOPROXY` 默认指向官方代理与校验和数据库 `sum.gdb.io`。
+
+```bash
+go mod verify     # 校验已下载模块未被修改
+go mod tidy       # 删除未用的 require，补全缺失的
+```
+
+<Callout type="info" title="为什么需要 sumdb">
+即便你换了代理，依赖内容的哈希仍由独立的校验和数据库背书，避免「代理投毒」。
+</Callout>
+
+## 4. 私有模块
+
+公司内网模块不应走公共代理。用 `GOPRIVATE` 跳过代理与校验。
+
+```bash
+go env -w GOPRIVATE=git.corp.com,github.com/corp
+```
+
+之后 `git.corp.com/internal/lib` 会直接走 git，不再查询公共 `sumdb`。
+
+## 5. 语义化版本与伪版本
+
+没打 tag 的提交用伪版本号，例如 `v0.0.0-20231010120000-abcdef123456`。理解它能帮你读懂 `go.mod` 里那些「长得怪」的版本号。
+
+<Callout type="tip" title="实战清单">
+- 联调第三方库：先用 `replace` 指向本地或 fork，验证后再提 PR
+- 多 module 单体仓库：用 `go.work` 而非满屏 `replace`
+- 安全底线：`go mod verify` 加 `GOPRIVATE` 缺一不可
+</Callout>
+
+## 小结
+
+- `replace` 可把依赖重定向到 fork 或本地目录，调试利器但别误提交
+- `go.work` 用 workspace 统一管理多 module，免去大量 replace
+- `go.sum` 与 sumdb 共同保证依赖不可篡改
+- `GOPRIVATE` 让私有模块绕开公共代理与校验
+- 伪版本号描述「未打 tag 的提交」

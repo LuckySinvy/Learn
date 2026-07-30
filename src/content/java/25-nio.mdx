@@ -1,0 +1,78 @@
+---
+title: NIO 与文件操作
+order: 25
+description: 用 java.nio.file 的 Path 与 Files 做现代文件操作，理解 Channel 与 Buffer 的底层模型
+---
+
+# NIO 与文件操作
+
+`java.nio.file`（NIO.2，Java 7 引入）提供了比旧 `java.io.File` 更现代、更可靠的文件 API。`Path` 描述位置，`Files` 提供静态工具方法，几乎覆盖日常所有文件需求。
+
+## 1. Path 与 Files 基础
+
+`Path` 用 `Paths.get` 创建，`Files` 提供读、写、复制、移动、删除：
+
+```java
+import java.nio.file.*;
+
+Path p = Paths.get("data", "input.txt");
+
+// 一次性读全部行
+List<String> lines = Files.readAllLines(p);
+
+// 写文件（自动创建父目录需自行保证）
+Files.writeString(Paths.get("out.txt"), "hello nio\n", StandardOpenOption.CREATE);
+
+// 复制 / 移动
+Files.copy(p, Paths.get("backup.txt"), StandardCopyOption.REPLACE_EXISTING);
+Files.move(p, Paths.get("archive/input.txt"), StandardCopyOption.ATOMIC_MOVE);
+```
+
+<Callout type="info" title="Files vs File">
+旧 `File` 的 `delete()` 失败只返回 `false` 不告诉你原因；`Files.delete()` 失败会抛具体异常（如 `NoSuchFileException`），更利于排错。
+</Callout>
+
+## 2. 遍历目录
+
+`Files.walk` 返回深度优先的 `Stream<Path>`，配合 Stream 操作非常灵活：
+
+```java
+try (Stream<Path> stream = Files.walk(Paths.get("src"))) {
+    stream.filter(Files::isRegularFile)
+          .filter(p -> p.toString().endsWith(".java"))
+          .forEach(System.out::println);
+}
+```
+
+<Callout type="tip" title="别忘了关流">
+`Files.walk` 返回的是 Stream，底层持有目录迭代器。务必用 try-with-resources 包住，否则目录句柄可能泄漏。
+</Callout>
+
+## 3. 底层模型：Channel 与 Buffer
+
+NIO 的核心是**通道（Channel）**与**缓冲区（Buffer）**。`Channel` 是双向的（可读可写），数据总是经 `Buffer` 流转：
+
+```java
+// 用 FileChannel 高效拷贝大文件
+try (FileChannel in = FileChannel.open(Paths.get("big.iso"), StandardOpenOption.READ);
+     FileChannel out = FileChannel.open(Paths.get("copy.iso"),
+         StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+    in.transferTo(0, in.size(), out);   // 零拷贝式传输
+}
+```
+
+`transferTo` 在支持的操作系统和文件系统上能走「零拷贝」路径，比逐字节读写快得多。
+
+## 4. 什么时候用 NIO 通道
+
+- 普通文本/小文件：`Files.readAllLines` / `Files.writeString` 最简单
+- 大文件、需要精确控制读写位置或内存映射：`FileChannel` + `ByteBuffer`
+- 网络：`SocketChannel` / `ServerSocketChannel`（配合选择器做多路复用）
+
+## 小结
+
+- ✅ `Path` + `Files` 是现代文件操作首选
+- ✅ 读写用 `Files.readAllLines` / `writeString`，复制移动带 `StandardCopyOption`
+- ✅ `Files.walk` 遍历目录，记得用 try-with-resources 关闭
+- ✅ 底层是 Channel + Buffer，`transferTo` 可实现高效/零拷贝传输
+- ✅ 小文件用工具方法，大文件再上 Channel

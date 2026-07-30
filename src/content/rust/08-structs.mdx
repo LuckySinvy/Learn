@@ -1,0 +1,112 @@
+---
+title: 结构体
+order: 8
+description: 定义与实例化结构体、字段可变性、为结构体实现方法（impl）与关联函数
+---
+
+# 结构体
+
+**结构体（struct）** 把多个相关的值组合成自定义类型，是构建领域模型的基本单位。
+
+## 1. 定义与实例化
+
+```rust
+struct User {
+    username: String,
+    email: String,
+    active: bool,
+    sign_in_count: u64,
+}
+
+fn main() {
+    let mut u = User {
+        username: String::from("alice"),
+        email: String::from("a@x.com"),
+        active: true,
+        sign_in_count: 1,
+    };
+    u.sign_in_count += 1;   // 整个结构体 mut 才能改字段
+    println!("{} 登录 {} 次", u.username, u.sign_in_count);
+}
+```
+
+<Callout type="tip" title="用 .. 复用字段">
+`let u2 = User { email: ..., ..u };` 可把 `u` 其余字段搬过来，省去重复书写。
+</Callout>
+
+## 2. 字段可变性
+
+Rust 没有「单字段 mut」——`mut` 作用于整个绑定。想要细粒度可变，可借助后面章节的 `RefCell`，但多数时候整体 `mut` 即可。
+
+## 3. 元组结构体与单元结构体
+
+```rust
+struct Point(i32, i32);          // 元组结构体，用 .0 .1 访问
+struct AlwaysEqual;              // 单元结构体，不含字段
+```
+
+## 4. 方法（impl）
+
+用 `impl` 块为结构体定义方法，第一个参数通常是 `&self`：
+
+```rust
+impl User {
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn change_email(&mut self, email: String) {
+        self.email = email;
+    }
+}
+```
+
+<Callout type="info" title="self 的三种形式">
+`&self`（借用）、`&mut self`（可变借用）、`self`（取得所有权）。只读操作用 `&self`，要消耗自身用 `self`。
+</Callout>
+
+## 5. 关联函数
+
+不带 `self` 的函数称为关联函数，常用于构造器，调用时用 `::`：
+
+```rust
+impl User {
+    fn new(username: String, email: String) -> User {
+        User {
+            username,
+            email,
+            active: true,
+            sign_in_count: 1,
+        }
+    }
+}
+
+fn main() {
+    let u = User::new(String::from("bob"), String::from("b@x.com"));
+}
+```
+
+## 6. 打印结构体
+
+直接 `println!("{}", u)` 不行。要么实现 `Debug` 再 `println!("{:?}", u)`，要么用 `derive`：
+
+```rust
+#[derive(Debug)]
+struct User { /* ... */ }
+```
+
+<Callout type="warn" title="打印需要 Debug 派生">
+未实现 `Debug`/`Display` 的类型不能直接打印。开发期用 `#[derive(Debug)]` 最方便，记得 `{:?}` 或 `{:#?}` 漂亮打印。
+</Callout>
+
+<Callout type="exercise" title="练习">
+定义一个 `struct Rectangle { width: u32, height: u32 }`，实现方法 `fn area(&self) -> u32`，再写一个关联函数 `fn square(size: u32) -> Rectangle`。用 `derive(Debug)` 打印一个实例。
+</Callout>
+
+## 小结
+
+- `struct` 聚合字段；`mut` 作用于整体绑定
+- 方法在 `impl` 里，`&self`/`&mut self`/`self` 区分借用方式
+- 关联函数（无 self）常用作构造器，用 `::` 调用
+- 打印需 `#[derive(Debug)]` 配合 `{:?}`
+- 下一章看枚举与 Option →

@@ -1,0 +1,76 @@
+---
+title: API 批量调用与 Webhook
+order: 22
+description: 批量处理消息、接收外部事件回调（Webhook），并把 Dify 接入自动化系统
+---
+
+# API 批量调用与 Webhook
+
+第 14 章讲了单次 API 调用与流式返回。生产里你常需要**批量跑一批数据**，或**被外部系统触发**（如新工单进来自动分析）。本章讲批量调用与 Webhook 两种进阶集成。
+
+## 1. 批量消息调用
+
+Dify 服务 API 本身按条调用，批量靠你在**自己的后端**并发循环实现。务必复用会话、控制并发、做好限流。
+
+```bash
+# 伪代码：批量给一批用户问题生成回复
+for q in questions; do
+  curl -X POST https://your-dify.example.com/v1/chat-messages \
+    -H "Authorization: Bearer $DIFY_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"inputs\":{}, \"query\":\"$q\", \"response_mode\":\"blocking\", \"user\":\"batch-001\"}"
+done
+```
+
+<Callout type="warn" title="别无限制并发">
+模型供应商有每秒配额。不加并发上限会触发 429。建议用信号量把并发控制在 5–10，并对失败请求做指数退避重试。
+</Callout>
+
+## 2. 多轮批处理的会话隔离
+
+批量场景若每条都需要独立上下文，给每条数据一个唯一 `user` 值；若想复用同一会话记忆，保持同一 `user` 并带 `conversation_id`。
+
+```yaml
+batch_config:
+  concurrency: 8
+  rate_limit_per_sec: 10
+  retry:
+    max_attempts: 3
+    backoff: exponential
+  user_strategy: per_item_unique
+```
+
+## 3. Webhook：让外部事件触发 Dify
+
+Dify 可作为被调用方：外部系统（如客服平台、CI）在发生事件时，向 Dify 暴露的 **Webhook 地址** POST 数据，触发对应应用运行。
+
+```bash
+# 外部系统在「新工单创建」时调用
+curl -X POST https://your-dify.example.com/v1/workflows/run \
+  -H "Authorization: Bearer $DIFY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": { "ticket_id": "T-1001", "content": "无法登录后台" },
+    "response_mode": "blocking",
+    "user": "webhook-sender"
+  }'
+```
+
+## 4. 把结果回写外部系统
+
+工作流末尾可用 **HTTP 请求节点** 把结论回写到工单系统、数据库或消息队列，形成「事件进 → 处理 → 结果出」的闭环。
+
+<Callout type="tip" title="Webhook 也要鉴权">
+暴露的 Webhook 地址应配合签名校验或 IP 白名单，避免被恶意触发消耗配额。Dify 侧的 API Key 不要直接写在第三方可公开访问的配置里。
+</Callout>
+
+<Callout type="exercise" title="动手做">
+写一个小脚本，读取一个包含 5 条问题的文本文件，逐条调用 Dify API 并打印每条回答，给脚本加上并发上限与失败重试。
+</Callout>
+
+## 小结
+
+- 批量调用在你后端并发循环实现，需控并发 + 退避重试
+- 用 `user` 策略控制会话隔离或复用
+- Webhook 让外部事件触发 Dify，配合 HTTP 节点回写形成闭环
+- 务必鉴权与限流；下一步看私有化部署怎么运维 →

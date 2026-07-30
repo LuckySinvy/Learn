@@ -1,0 +1,101 @@
+---
+title: serde 序列化
+order: 27
+description: 用 serde 与 serde_json 在 Rust 结构体与 JSON 之间做序列化/反序列化实战
+---
+
+# serde 序列化
+
+**serde** 是 Rust 事实标准的序列化框架，配合 `serde_json` 可在结构体与 JSON 之间无缝转换。
+
+## 1. 引入依赖
+
+```toml
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+## 2. 派生 Serialize / Deserialize
+
+```rust
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Debug)]
+struct User {
+    name: String,
+    age: u32,
+    active: bool,
+}
+```
+
+<Callout type="info" title="derive 自动生成编解码">
+标记 `#[derive(Serialize, Deserialize)]` 后，serde 在编译期生成把结构体与 JSON 互转的代码，无需手写字段映射。
+</Callout>
+
+## 3. 序列化（struct -> JSON）
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let u = User {
+        name: String::from("小明"),
+        age: 18,
+        active: true,
+    };
+    let json = serde_json::to_string_pretty(&u)?;
+    println!("{}", json);
+    Ok(())
+}
+```
+
+## 4. 反序列化（JSON -> struct）
+
+```rust
+let data = r#"
+{
+    "name": "小红",
+    "age": 20,
+    "active": false
+}"#;
+
+let u: User = serde_json::from_str(data)?;
+println!("{:?}", u);
+```
+
+<Callout type="warn" title="字段不匹配怎么办">
+默认反序列化要求字段齐全，缺字段会报错。可用 `#[serde(default)]` 给字段默认值，或 `#[serde(rename = "user_name")]` 重命名对应 JSON key。
+</Callout>
+
+## 5. 处理动态/未知结构
+
+当 JSON 结构不确定，用 `serde_json::Value`（类似动态类型）：
+
+```rust
+let v: serde_json::Value = serde_json::from_str(data)?;
+println!("名字是 {}", v["name"]);
+```
+
+## 6. 常用属性
+
+| 属性 | 作用 |
+|---|---|
+| `#[serde(rename = "x")]` | 改名对应 JSON 字段 |
+| `#[serde(default)]` | 缺字段用 `Default` |
+| `#[serde(skip)]` | 不参与序列化 |
+| `#[serde(flatten)]` | 内联展开子结构 |
+
+<Callout type="tip" title="Value 灵活但有损类型安全">
+`serde_json::Value` 能接任意 JSON，但失去编译期类型检查。结构已知时优先用具体结构体。
+</Callout>
+
+<Callout type="exercise" title="练习">
+定义 `struct Config { host: String, port: u16 }` 派生 serde，把一段 JSON 反序列化成 `Config`，再把它序列化回紧凑 JSON（`to_string`）打印。给 `port` 加 `#[serde(default)]` 并测试缺省端口时的行为。
+</Callout>
+
+## 小结
+
+- serde + serde_json 是 Rust 序列化事实标准
+- `#[derive(Serialize, Deserialize)]` 自动生成代码
+- `to_string`/`from_str` 做双向转换
+- 字段重命名/默认值用 serde 属性；动态结构用 `Value`
+- 下一章开始项目实战：CLI 工具 →

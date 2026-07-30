@@ -1,0 +1,78 @@
+---
+title: NetworkPolicy 网络策略
+order: 24
+description: 用 NetworkPolicy 实现 Pod 间的网络隔离与白名单，默认拒绝与最小暴露
+---
+
+# NetworkPolicy 网络策略
+
+默认情况下，Kubernetes 集群内**所有 Pod 之间网络互通**。但生产环境需要「前端能访问后端、其他一律拒绝」这类隔离。**NetworkPolicy** 就是 k8s 原生的防火墙，控制 Pod 级别的入站（ingress）与出站（egress）流量。
+
+<Callout type="info" title="需要支持 NetworkPolicy 的 CNI">
+NetworkPolicy 是一种声明，真正执行依赖网络插件（如 Calico、Cilium）。用 Flannel 的集群默认不生效，需额外组件。
+</Callout>
+
+## 1. 默认拒绝入站
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: default
+spec:
+  podSelector: {}        # 匹配该命名空间所有 Pod
+  policyTypes:
+    - Ingress            # 未显式允许的入站一律拒绝
+```
+
+## 2. 只允许前端访问后端
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend
+  namespace: default
+spec:
+  podSelector:
+    matchLabels: { app: backend }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: frontend }
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+<Callout type="tip" title="用命名空间标签做跨空间授权">
+`from` 里可用 `namespaceSelector` 按命名空间标签放行，例如只允许带 `env: prod` 标签的命名空间访问。
+</Callout>
+
+## 3. 限制出站流量
+
+```yaml
+spec:
+  podSelector: { matchLabels: { app: backend } }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/24    # 只允许访问数据库网段
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+<Callout type="warn" title="不能限制 hostNetwork 与 127.0.0.1">
+NetworkPolicy 不作用于 `hostNetwork: true` 的 Pod，也不限制 Pod 访问自身的 localhost 端口。
+</Callout>
+
+## 小结
+
+- 默认全通，NetworkPolicy 实现 Pod 级白名单隔离
+- 依赖支持策略的 CNI（Calico/Cilium）
+- 入站/出站均可用 podSelector、namespaceSelector、ipBlock 精细控制
+- 下一章学习节点调度与亲和性如何影响 Pod 落点 →

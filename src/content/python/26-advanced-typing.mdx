@@ -1,0 +1,91 @@
+---
+title: 类型提示进阶
+order: 26
+description: Protocol 结构化子类型、Literal、TypedDict、overload 与 NewType
+---
+
+# 类型提示进阶
+
+第 13 章讲了基础注解。进阶提示能表达更精细的约束：`Protocol` 做"鸭子类型"的静态检查、`Literal` 限制取值集合、`TypedDict` 给字典加结构、`overload` 描述不同入参对应不同返回。
+
+## 1. `Protocol`：结构化子类型
+
+只要对象"长得像"就通过，不必继承——这正是 Python 鸭子类型的类型化。
+
+```python
+from typing import Protocol
+
+class Sized(Protocol):
+    def __len__(self) -> int: ...
+
+def count(x: Sized) -> int:
+    return len(x)
+
+print(count([1, 2, 3]))
+print(count("hello"))
+```
+
+## 2. `Literal` 与 `NewType`
+
+`Literal` 把参数限定为几个固定值；`NewType` 在不改运行时成本的前提下，区分"同名但语义不同"的类型。
+
+```python
+from typing import Literal, NewType
+
+Mode = Literal["read", "write", "append"]
+
+UserId = NewType("UserId", int)
+uid = UserId(42)
+print(uid, type(uid))        # 42 <class 'int'>，但类型检查视为 UserId
+```
+
+## 3. `TypedDict`：有结构的字典
+
+普通 `dict` 注解不出字段名，`TypedDict` 让字典像"带字段名的结构"。
+
+```python
+from typing import TypedDict
+
+class User(TypedDict):
+    name: str
+    age: int
+
+u: User = {"name": "小明", "age": 18}
+print(u["name"])
+```
+
+<Callout type="info" title="TypedDict 对 JSON 特别友好">
+接口返回的 JSON 本质是字典，用 `TypedDict` 注解后，IDE 能补全 `user["name"]`，避免拼错 key。
+</Callout>
+
+## 4. `@overload`：描述多种签名
+
+同一个函数对"不同类型入参"返回不同类型时，用 `overload` 声明，实现体只用宽松类型兜底。
+
+```python
+from typing import overload, List
+
+@overload
+def first(items: List[int]) -> int | None: ...
+@overload
+def first(items: List[str]) -> str | None: ...
+
+def first(items):
+    return items[0] if items else None
+
+print(first([1, 2]), first(["a", "b"]))
+```
+
+<Callout type="tip" title="overload 只影响检查器">
+`overload` 装饰的版本体是 `...`，运行时不参与；真正的实现只有一个，参数/返回用宽松类型，靠类型检查器在调用处做区分。
+</Callout>
+
+## 小结
+
+- ✅ `Protocol` 给鸭子类型加静态约束，不必继承
+- ✅ `Literal` 限制取值集合；`NewType` 区分同名语义类型
+- ✅ `TypedDict` 给字典加字段结构，JSON 处理更安全
+- ✅ `@overload` 声明多签名，实现体兜底
+- ✅ 进阶提示让大型项目的类型检查更精准
+
+到这里，Python 课程从语法到工程化打包已经基本完整。

@@ -1,0 +1,106 @@
+---
+title: 迭代器
+order: 17
+description: Iterator trait、map/filter/collect 等适配器，以及惰性求值如何避免中间分配
+---
+
+# 迭代器
+
+**迭代器（iterator）** 是 Rust 遍历集合的核心抽象。配合闭包，能写出既高效又声明式的代码。
+
+## 1. Iterator trait
+
+迭代器核心是一个方法：
+
+```rust
+trait Iterator {
+    type Item;
+    fn next(&mut self) -> Option<Self::Item>;
+}
+```
+
+`next` 每次返回 `Some(元素)`，遍历完返回 `None`。
+
+```rust
+fn main() {
+    let v = vec![1, 2, 3];
+    let mut it = v.iter();
+    println!("{:?}", it.next());   // Some(&1)
+    println!("{:?}", it.next());   // Some(&2)
+}
+```
+
+## 2. 适配器：map / filter
+
+适配器是**惰性**的——定义转换但不立即执行，直到被「消费」：
+
+```rust
+fn main() {
+    let v = vec![1, 2, 3, 4, 5];
+    let evens_sq: Vec<i32> = v
+        .iter()
+        .filter(|&&x| x % 2 == 0)
+        .map(|&x| x * x)
+        .collect();
+    println!("{:?}", evens_sq);   // [4, 16]
+}
+```
+
+<Callout type="info" title="惰性求值的威力">
+`map`/`filter` 不会立刻产生新集合，只构建一条「处理流水线」。只有 `collect`/`sum` 等消费型方法触发时，才真正逐个计算，避免中间 Vec 分配。
+</Callout>
+
+## 3. 消费型方法
+
+| 方法 | 作用 |
+|---|---|
+| `collect()` | 收集成集合（Vec/HashMap…） |
+| `sum()` / `product()` | 求和/求积 |
+| `count()` | 计数 |
+| `fold(init, f)` | 自定义累积 |
+| `any()` / `all()` | 存在 / 全部满足 |
+
+```rust
+let total: i32 = v.iter().sum();
+let has_big = v.iter().any(|&x| x > 10);
+```
+
+## 4. 所有权与迭代
+
+- `iter()`：不可变借用，产生 `&T`
+- `iter_mut()`：可变借用，产生 `&mut T`
+- `into_iter()`：拿走所有权，产生 `T`
+
+```rust
+let mut v = vec![1, 2, 3];
+for x in v.iter_mut() { *x *= 2; }
+```
+
+<Callout type="warn" title="选对迭代器种类">
+需要修改元素用 `iter_mut`，需要 move 元素用 `into_iter`。用错会导致借用冲突或无法取得所有权。
+</Callout>
+
+## 5. 实现自定义迭代器
+
+```rust
+struct Counter { n: u32 }
+impl Iterator for Counter {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        self.n += 1;
+        if self.n <= 3 { Some(self.n) } else { None }
+    }
+}
+```
+
+<Callout type="exercise" title="练习">
+用迭代器把 `Vec<String>` 里所有长度大于 3 的单词转成大写，收集成新 `Vec<String>`（提示：`filter` + `map` + `to_uppercase` + `collect`）。再统计其中字符总数。
+</Callout>
+
+## 小结
+
+- `Iterator` 靠 `next()` 逐个产出 `Option<Item>`
+- `map`/`filter` 是惰性适配器，消费量方法才触发执行
+- `iter`/`iter_mut`/`into_iter` 区分借用与所有权
+- 可为自己类型实现 `Iterator`
+- 下一章看智能指针 →

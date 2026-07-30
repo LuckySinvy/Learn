@@ -1,0 +1,107 @@
+---
+title: Trait
+order: 14
+description: 定义与实现 trait、默认方法、trait 对象实现多态，以及 impl Trait 与 trait bound
+---
+
+# Trait
+
+**trait** 定义一种「类型能做什么」的抽象接口，类似其他语言的接口（interface）。它是 Rust 实现多态与代码复用核心。
+
+## 1. 定义与实现 trait
+
+```rust
+trait Summary {
+    fn summarize(&self) -> String;
+}
+
+struct News {
+    headline: String,
+}
+
+impl Summary for News {
+    fn summarize(&self) -> String {
+        format!("头条: {}", self.headline)
+    }
+}
+```
+
+<Callout type="info" title="trait 是能力契约">
+trait 只声明「有哪些方法」。一个类型 `impl` 了某 trait，就意味着它具备该能力，可被要求该能力的泛型/trait bound 接受。
+</Callout>
+
+## 2. 默认方法实现
+
+```rust
+trait Summary {
+    fn author(&self) -> String;
+    fn summarize(&self) -> String {
+        format!("(作者: {})", self.author())   // 默认实现可调用其他方法
+    }
+}
+
+impl Summary for News {
+    fn author(&self) -> String { String::from("编辑部") }
+}
+```
+
+## 3. trait 作为约束（trait bound）
+
+```rust
+fn notify<T: Summary>(item: &T) {
+    println!("通知: {}", item.summarize());
+}
+```
+
+也可用 `impl Trait` 简写：`fn notify(item: &impl Summary)`。
+
+<Callout type="tip" title="impl Trait vs 泛型 bound">
+`fn f(x: &impl Trait)` 与 `fn f<T: Trait>(x: &T)` 等价，前者更简洁，仅用于单约束单参数时。
+</Callout>
+
+## 4. trait 对象实现运行时多态
+
+用 `&dyn Trait` 存放「任何实现了该 trait 的类型」，在运行时动态分发：
+
+```rust
+fn main() {
+    let items: Vec<&dyn Summary> = vec![&news, &tweet];
+    for i in items {
+        println!("{}", i.summarize());
+    }
+}
+```
+
+<Callout type="warn" title="dyn 有运行时开销">
+`dyn Trait` 通过虚表（vtable）动态调用，有轻微开销且大小不固定（需指针）。若编译期多态够用，优先用泛型 + trait bound（静态分发，零开销）。
+</Callout>
+
+## 5. 派生 trait
+
+用 `#[derive(...)]` 让编译器自动实现常用 trait：
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+struct Point { x: i32, y: i32 }
+```
+
+## 6. 返回 impl Trait
+
+```rust
+fn make_counter() -> impl FnMut() -> i32 {
+    let mut n = 0;
+    move || { n += 1; n }
+}
+```
+
+<Callout type="exercise" title="练习">
+定义一个 `trait Draw { fn draw(&self); }`，为 `Circle` 和 `Square` 实现它。写一个函数 `fn render(shapes: &[&dyn Draw])` 遍历绘制。再给 trait 加一个默认方法 `fn name(&self) -> &str { "unknown" }`。
+</Callout>
+
+## 小结
+
+- trait 抽象「能力」，类型用 `impl` 实现
+- 默认方法可复用；trait bound 约束泛型参数
+- `impl Trait` 简写单约束；`&dyn Trait` 实现运行时多态
+- 派生 trait 一键获得 `Debug`/`Clone` 等
+- 下一章看生命周期标注 →

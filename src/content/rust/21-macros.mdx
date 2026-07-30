@@ -1,0 +1,98 @@
+---
+title: 宏
+order: 21
+description: 声明宏 macro_rules! 的写法、常用内置宏，以及过程宏（derive/属性/函数式）的简介
+---
+
+# 宏
+
+**宏（macro）** 是在编译期对代码做「代码生成」的工具。它操作的是**语法树**而非值，因此可以构造出函数做不到的抽象（如变长参数、`vec!`）。
+
+## 1. 声明宏 macro_rules!
+
+用 `macro_rules!` 写匹配模式的宏：
+
+```rust
+macro_rules! say_hello {
+    () => {
+        println!("你好！");
+    };
+    ($name:expr) => {
+        println!("你好，{}！", $name);
+    };
+}
+
+fn main() {
+    say_hello!();
+    say_hello!("小明");
+}
+```
+
+<Callout type="info" title="宏是模式匹配">
+宏体由「匹配器 => 展开体」组成。`$name:expr` 表示捕获一个表达式，`$name` 在右侧可重复引用。类似 `match`，按首匹配生效。
+</Callout>
+
+## 2. 重复捕获
+
+```rust
+macro_rules! vec_of {
+    ($($x:expr),*) => {
+        {
+            let mut v = Vec::new();
+            $( v.push($x); )*
+            v
+        }
+    };
+}
+
+fn main() {
+    let v = vec_of![1, 2, 3];
+    println!("{:?}", v);
+}
+```
+
+`$($x:expr),*` 表示「重复零次或多次，用逗号分隔」，右侧 `$(...)*` 同步展开。
+
+## 3. 常用内置宏
+
+| 宏 | 作用 |
+|---|---|
+| `println!` / `format!` | 格式化输出/构造字符串 |
+| `vec!` | 创建向量 |
+| `panic!` | 触发 panic |
+| `assert_eq!` | 断言相等 |
+| `write!` / `writeln!` | 写入实现了 Write 的对象 |
+
+<Callout type="tip" title="宏以 ! 结尾">
+调用宏时名字后必须跟 `!`，这是区分宏与函数的标志。`macro_rules!` 定义的宏用 `[]`、`()`、`{}` 均可。
+</Callout>
+
+## 4. 过程宏简介
+
+过程宏是「接收 TokenStream、返回 TokenStream」的普通 Rust 函数，分三类：
+
+- **派生宏（derive）**：`#[derive(Debug)]` 自动实现 trait。
+- **属性宏**：`#[route(GET, "/")]` 自定义注解。
+- **函数式宏**：`sqlx::query!(...)` 类。
+
+```rust
+use serde::Deserialize;
+#[derive(Deserialize)]        // 派生成熟宏，自动生成解析代码
+struct Config { name: String }
+```
+
+<Callout type="warn" title="过程宏需要单独 crate">
+`proc-macro` 必须定义在 `crate-type = ["proc-macro"]` 的独立库中，不能直接写在二进制 crate 里。新手用 `derive` 即可，无需立即手写过程宏。
+</Callout>
+
+<Callout type="exercise" title="练习">
+写一个声明宏 `hashmap!` 接受 `k => v, ...` 形式（提示：`$( $k:expr => $v:expr ),*`），展开成 `HashMap::from([...])`）。在 `main` 里构造一个字符串到整数的映射并打印。
+</Callout>
+
+## 小结
+
+- `macro_rules!` 用模式匹配生成代码，支持 `$x:expr` 捕获与重复
+- 内置宏 `vec!`/`println!`/`panic!` 等以 `!` 结尾
+- 过程宏分 derive/属性/函数式三类，需独立 crate
+- 宏操作语法树，能做函数做不到的抽象
+- 下一章看异步 async/await →

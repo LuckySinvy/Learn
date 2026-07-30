@@ -1,0 +1,77 @@
+---
+title: gRPC 入门
+order: 25
+description: Protobuf 契约、四种调用模式、Go 服务端与客户端的实现
+---
+
+# gRPC 入门
+
+微服务间通信，gRPC 是 Go 生态的主流选择：基于 HTTP/2、Protobuf，强类型、高性能。
+
+## 1. 核心概念
+
+- **Protocol Buffers**：接口契约与序列化格式
+- **.proto 文件**：定义 service 与 message
+- **代码生成**：`protoc` 生成 Go 的客户端或服务端桩代码
+- **四种调用方式**：一元、服务端流、客户端流、双向流
+
+## 2. 定义契约
+
+```proto
+syntax = "proto3";
+package api;
+
+service Greeter {
+  rpc SayHello (HelloRequest) returns (HelloReply);
+}
+
+message HelloRequest { string name = 1; }
+message HelloReply   { string message = 2; }
+```
+
+<Callout type="info" title="为什么用 gRPC 而非 REST">
+Protobuf 二进制比 JSON 小、快；强类型契约让改接口有编译期保障；天然支持流式。
+</Callout>
+
+## 3. 实现服务端
+
+```go
+type server struct{ pb.UnimplementedGreeterServer }
+
+func (s *server) SayHello(ctx context.Context, req *pb.HelloRequest) (*pb.HelloReply, error) {
+    return &pb.HelloReply{Message: "你好, " + req.Name}, nil
+}
+
+func main() {
+    lis, _ := net.Listen("tcp", ":50051")
+    s := grpc.NewServer()
+    pb.RegisterGreeterServer(s, &server{})
+    s.Serve(lis)
+}
+```
+
+## 4. 调用客户端
+
+```go
+conn, _ := grpc.Dial("localhost:50051", grpc.WithInsecure())
+defer conn.Close()
+c := pb.NewGreeterClient(conn)
+r, _ := c.SayHello(context.Background(), &pb.HelloRequest{Name: "Alice"})
+fmt.Println(r.Message)
+```
+
+<Callout type="tip" title="别忘了 Context">
+gRPC 调用第一个参数就是 `ctx`，用它做超时与取消：`grpc.Dial` 后配合 `context.WithTimeout` 避免永久阻塞。
+</Callout>
+
+## 5. 流式调用
+
+`rpc Chat(stream Msg) returns (stream Msg)` 可双向收发，适合聊天、日志推送等场景。
+
+## 小结
+
+- gRPC 等于 HTTP/2 加 Protobuf，强类型、高性能
+- `.proto` 定义 service 与 message，`protoc` 生成桩代码
+- 四种模式：一元、服务端流、客户端流、双向流
+- 服务端实现接口并 `Register`，客户端 `Dial` 后调用
+- 调用务必传 `ctx` 控制超时与取消

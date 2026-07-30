@@ -1,0 +1,90 @@
+---
+title: 性能分析与 cProfile
+order: 24
+description: 用 cProfile、timeit、line_profiler 思路定位瓶颈，理解「不要过早优化」
+---
+
+# 性能分析与 cProfile
+
+优化第一步是**测量**。凭直觉猜瓶颈十有八九是错的。Python 标准库自带 `cProfile` 和 `timeit`，足够定位大多数性能问题。
+
+## 1. `cProfile`：函数级 Profiling
+
+`cProfile.run` 会统计每个函数被调用多少次、累计花多少时间。
+
+```python
+import cProfile
+
+def slow():
+    total = 0
+    for i in range(1_000_000):
+        total += i * i
+    return total
+
+cProfile.run("slow()")
+```
+
+输出表关键列：`ncalls`（调用次数）、`tottime`（函数自身耗时，不含子调用）、`cumtime`（含子调用的累计耗时）、`percall`（平均每次）。
+
+## 2. 用 `pstats` 排序看 Top N
+
+直接在代码里拿到排序后的结果，找最贵的几个函数。
+
+```python
+import cProfile, pstats
+from io import StringIO
+
+def workload():
+    s = sum(i * i for i in range(500_000))
+    return s
+
+pr = cProfile.Profile()
+pr.enable()
+workload()
+pr.disable()
+
+buf = StringIO()
+stats = pstats.Stats(pr, stream=buf)
+stats.sort_stats("cumtime").print_stats(5)
+print(buf.getvalue())
+```
+
+<Callout type="tip" title="先看 cumtime 再看 tottime">
+`cumtime` 高说明是热点路径（哪怕自身不慢，被反复调用也贵）；`tottime` 高说明函数内部实现本身慢，是优先重写的目标。
+</Callout>
+
+## 3. `timeit`：精确测一小段
+
+给单行或小块代码计时，`timeit` 会自动多次运行取稳。
+
+```python
+import timeit
+
+a = list(range(1000))
+t1 = timeit.timeit("sum(a)", globals={"a": a}, number=10000)
+t2 = timeit.timeit("[x for x in a]", globals={"a": a}, number=10000)
+print("sum:", t1, "comprehension:", t2)
+```
+
+## 4. 优化思路
+
+找到热点后，常见手段：
+
+- 用内置函数 / 推导式替代手写循环
+- 用 `set` / `dict` 做查找替代列表遍历（`O(1)` vs `O(n)`）
+- 把热点函数交给 `numpy`，或者缓存结果（`functools.lru_cache`）
+- 真正 CPU 密集再考虑 `multiprocessing`（见第 14 章）
+
+<Callout type="warn" title="不要过早优化">
+「过早优化是万恶之源」。先让代码正确、可读，用 profiler 找到真实瓶颈再下手，否则大部分优化都是白忙。
+</Callout>
+
+## 小结
+
+- ✅ `cProfile.run` 看每个函数的调用次数与耗时
+- ✅ `pstats` 排序取 Top N：`cumtime` 找热路径，`tottime` 找慢实现
+- ✅ `timeit` 精确测量小段代码，自动多次取平均
+- ✅ 优化顺序：测量 → 定位热点 → 用内置/集合/缓存/多进程
+- ✅ 不要过早优化，先正确再提速
+
+下一章 **打包发布**：把代码变成可安装的包。

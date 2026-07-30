@@ -1,0 +1,98 @@
+---
+title: 正则表达式 re
+order: 19
+description: 用 re 模块做模式匹配、提取、替换，掌握字符类、分组、贪婪与非贪婪
+---
+
+# 正则表达式 re
+
+正则表达式是处理文本的强大工具：校验格式、抽取字段、批量替换都能一行搞定。Python 标准库 `re` 把这套能力完整暴露出来。
+
+## 1. 最基础的匹配
+
+`re.search` 在字符串里找第一个匹配，`re.match` 只从开头匹配，`re.fullmatch` 要求整串匹配。
+
+```python
+import re
+
+text = "订单号: ORD-2024-7788, 金额 1299 元"
+m = re.search(r"ORD-\d{4}-\d{4}", text)
+print(m.group())          # ORD-2024-7788
+
+# 严格校验手机号（11 位，1 开头）
+ok = re.fullmatch(r"1\d{10}", "13800138000")
+print(bool(ok))           # True
+print(bool(re.fullmatch(r"1\d{10}", "2380013800")))  # False
+```
+
+## 2. 分组与提取
+
+用圆括号 `()` 把想抽取的部分圈起来，再用 `group(1)`、`group(2)` 取出。
+
+```python
+import re
+
+s = "姓名=小明, 年龄=18"
+m = re.search(r"姓名=(\w+), 年龄=(\d+)", s)
+name, age = m.group(1), m.group(2)
+print(name, age)          # 小明 18
+
+# findall 直接返回所有分组元组
+logs = "a=1 b=2 c=3"
+pairs = re.findall(r"(\w+)=(\d+)", logs)
+print(pairs)              # [('a', '1'), ('b', '2'), ('c', '3')]
+```
+
+<Callout type="tip" title="命名分组更易读">
+写成 `r"(?P<name>\w+)"`，取用时用 `m.group("name")`，比数位置更不容易错。
+</Callout>
+
+## 3. 字符类与量词
+
+- `\d` 数字、`\w` 单词字符、`\s` 空白
+- `.` 任意字符（除换行）、`[]` 自定义集合如 `[a-z]`
+- `*` 0 次或多次、`+` 1 次或多次、`?` 0 或 1 次、`{n,m}` 区间
+
+## 4. 贪婪 vs 非贪婪
+
+默认量词是**贪婪**的，会尽量多吃；加 `?` 变非贪婪。
+
+```python
+import re
+
+html = "<b>标题</b><i>副标题</i>"
+print(re.findall(r"<b>(.*)</b>", html))     # ['标题']
+print(re.findall(r"<.*>", html))            # 贪婪：['<b>标题</b><i>副标题</i>']
+print(re.findall(r"<.*?>", html))           # 非贪婪：['<b>', '</b>', '<i>', '</i>']
+```
+
+## 5. 替换与编译
+
+`re.sub` 做替换；频繁使用的模式用 `re.compile` 预编译提速。
+
+```python
+import re
+
+# 把手机号中间四位打码
+masked = re.sub(r"(\d{3})\d{4}(\d{4})", r"\1****\2", "13800138000")
+print(masked)             # 138****8000
+
+# 预编译：循环里反复用同一模式时更高效
+pattern = re.compile(r"\d+")
+print(pattern.findall("a1b22c333"))         # ['1', '22', '333']
+```
+
+<Callout type="warn" title="危险的正则回溯">
+类似 `(a+)+$` 这种嵌套量词遇到不匹配的长字符串会指数级回溯，可能拖垮服务（ReDoS 风险）。对用户输入务必限制长度或改用朴素字符串处理。
+</Callout>
+
+## 小结
+
+- ✅ `re.search` / `re.match` / `re.fullmatch` 三种匹配粒度
+- ✅ `()` 分组 + `group()` 提取，`(?P<name>...)` 命名分组更好维护
+- ✅ 量词 `*` `+` `?` `{n,m}`，`.` 匹配任意字符
+- ✅ 贪婪默认吃最多，加 `?` 变非贪婪
+- ✅ `re.sub` 替换、`re.compile` 预编译提速
+- ✅ 警惕嵌套量词导致的回溯爆炸（ReDoS）
+
+下一章 **datetime 与时区**：正确处理日期、时间与时区。

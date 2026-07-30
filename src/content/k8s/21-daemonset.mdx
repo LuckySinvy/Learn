@@ -1,0 +1,70 @@
+---
+title: DaemonSet 节点级守护
+order: 21
+description: 用 DaemonSet 在每个（或指定）节点上运行一个 Pod，常用于日志采集与监控代理
+---
+
+# DaemonSet 节点级守护
+
+有些工作负载不属于某个应用，而是要**覆盖整集群的每台节点**——比如日志采集器、节点监控代理、网络插件。它们要做到「每台机器一个实例」，新增节点自动部署、移除节点自动回收。**DaemonSet** 正是为此设计。
+
+## 1. 工作原理
+
+DaemonSet 控制器会为每个匹配的节点调度一个 Pod 副本，并通过节点上的「污点容忍」与「节点选择器」控制覆盖范围。
+
+```bash
+# 查看集群中运行的 DaemonSet
+kubectl get daemonset -A
+
+# 常见系统 DaemonSet：kube-proxy、CNI 网络插件、fluentd
+```
+
+## 2. 典型清单
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: { app: fluentd }
+  template:
+    metadata:
+      labels: { app: fluentd }
+    spec:
+      tolerations:
+        - operator: Exists        # 容忍所有污点，连控制平面节点也采集
+      containers:
+        - name: fluentd
+          image: fluentd:v1.16
+          resources:
+            limits:
+              memory: 200Mi
+```
+
+<Callout type="tip" title="用 nodeSelector 限制范围">
+若只想在特定节点运行（如带 GPU 的机器跑 GPU 监控），加 `nodeSelector` 或 `nodeAffinity` 即可，不必每台都跑。
+</Callout>
+
+## 3. 滚动更新与回滚
+
+DaemonSet 也支持滚动更新，但按顺序逐个节点替换，避免同一时间全部下线：
+
+```bash
+kubectl set image daemonset/fluentd fluentd=fluentd:v1.17
+kubectl rollout status daemonset/fluentd
+kubectl rollout undo daemonset/fluentd
+```
+
+<Callout type="warn" title="小心占用节点资源">
+DaemonSet 在每台节点都跑，资源请求会乘以节点数。务必设 `resources.limits`，否则可能挤占业务 Pod 导致节点资源紧张。
+</Callout>
+
+## 小结
+
+- DaemonSet 在每（指定）节点跑一个实例，节点增删自动跟随
+- 常用于日志、监控、网络插件；靠污点容忍覆盖所有节点
+- 支持滚动更新与回滚，注意资源占用
+- 下一章学习 Job 与 CronJob 处理一次性与定时任务 →

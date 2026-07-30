@@ -1,0 +1,86 @@
+---
+title: Operator 与 CRD 入门
+order: 26
+description: 用 CRD 扩展 Kubernetes API，用 Operator 把运维知识编码进控制器
+---
+
+# Operator 与 CRD 入门
+
+Kubernetes 内置了 Deployment、Service 等对象，但业务需要的「数据库集群」「消息队列」怎么办？**CRD（Custom Resource Definition）** 让你定义自己的资源类型，**Operator** 则是一个监听这些自定义资源、把运维操作自动化的控制器。二者一起，让「数据库」也能像内置对象一样 `kubectl apply`。
+
+## 1. 定义 CRD
+
+CRD 向 API 服务器注册一种新资源，无需改 k8s 源码。
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.example.com
+spec:
+  group: example.com
+  names:
+    kind: Database
+    plural: databases
+    singular: database
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                engine:
+                  type: string
+                replicas:
+                  type: integer
+```
+
+注册后就能创建自定义资源：
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: example.com/v1
+kind: Database
+metadata:
+  name: mydb
+spec:
+  engine: postgres
+  replicas: 3
+EOF
+```
+
+## 2. Operator 的本质
+
+Operator = **自定义资源 + 自定义控制器**。控制器不断对比「用户期望」（`spec`）与「实际状态」，执行创建备份、扩缩副本、故障转移等动作——本质是「把 DBA 的经验写成代码」。
+
+<Callout type="info" title="成熟 Operator 直接用">
+社区有大量现成 Operator（etcd、Prometheus、Redis 等），多通过 Operator Lifecycle Manager 或 Helm 安装，无需自己写控制器。
+</Callout>
+
+## 3. 开发与工具链
+
+主流用 **Kubebuilder** 或 **Operator SDK**（基于 controller-runtime）脚手架生成代码：
+
+```bash
+kubebuilder init --domain example.com
+kubebuilder create api --group example --version v1 --kind Database
+make install      # 安装 CRD
+make run          # 本地跑控制器
+```
+
+<Callout type="warn" title="CRD 升级要小心 schema">
+CRD 的 `schema` 一旦被资源引用，删除字段或改类型会破坏兼容性。生产变更应遵循「先加后删」的版本演进策略。
+</Callout>
+
+## 小结
+
+- CRD 扩展 k8s API，定义自己的资源类型
+- Operator = 自定义资源 + 控制器，把运维知识自动化
+- 优先复用社区 Operator，自研用 Kubebuilder/Operator SDK
+- 恭喜你完成进阶章节，建议动手在集群里实践这些对象

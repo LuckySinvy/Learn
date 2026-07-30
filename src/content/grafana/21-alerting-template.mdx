@@ -1,0 +1,59 @@
+---
+title: 告警通知模板进阶
+order: 21
+description: 用 Go 模板自定义 Slack / Webhook / 邮件通知内容，让告警信息更有用
+---
+
+# 告警通知模板进阶
+
+第 12 章配置了 Email / Slack / Webhook 等渠道，但默认通知往往只有「告警触发了」。本章用 **Grafana 模板语言（基于 Go text/template）** 定制富信息通知。
+
+<Callout type="info" title="模板在哪里写">
+在 Alerting → Contact points → Edit，底部 `Optional Alerting message templates` 里定义命名模板；再在渠道的 `Message` 或 `Title` 中通过 `{{ template "my.tpl" . }}` 引用。
+</Callout>
+
+## 1. 模板可用变量
+
+每个告警实例会传入 `.CommonLabels`、`.Alerts`（含 `.Labels` / `.Annotations` / `.Status` / `.StartsAt`）等字段。
+
+## 2. 一个 Slack 模板示例
+
+```go
+{{ define "slack.message" }}
+{{ range .Alerts }}
+*{{ .Status }}* — {{ .Labels.alertname }}
+实例: {{ .Labels.instance }}
+详情: {{ .Annotations.description }}
+触发于: {{ .StartsAt }}
+{{ end }}
+{{ end }}
+```
+
+在 Slack contact point 的 `Message` 填 `{{ template "slack.message" . }}`。
+
+## 3. Webhook 自定义 JSON
+
+Webhook 渠道可在 `Body template` 中输出任意 JSON，便于对接内部系统：
+
+```json
+{
+  "title": "{{ .CommonAnnotations.summary }}",
+  "severity": "{{ .CommonLabels.severity }}",
+  "alerts": "{{ len .Alerts }}"
+}
+```
+
+<Callout type="tip" title="用 toUpper / humanize">
+模板内置 `humanize` `toUpper` 等函数，例如 `{{ .Labels.severity | toUpper }}` 让严重级别统一大写，更易读。
+</Callout>
+
+## 4. 邮件标题与正文
+
+邮件渠道在 `Subject` 中可用 `{{ template "mail.subject" . }}`，正文支持 Markdown，便于贴出 Runbook 链接。
+
+## 小结
+
+- Grafana 通知模板基于 Go text/template，可复用命名模板
+- Slack / Webhook / 邮件均支持自定义，Webhook 可输出任意 JSON
+- 善用 `humanize`、`toUpper` 等内置函数美化输出
+- 把 Runbook 链接写进 `Annotations` 再渲染进模板，值班更高效 →

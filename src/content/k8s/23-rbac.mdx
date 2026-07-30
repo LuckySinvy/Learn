@@ -1,0 +1,72 @@
+---
+title: RBAC 权限控制
+order: 23
+description: 用 Role/ClusterRole 与 RoleBinding 实现基于角色的访问控制，最小权限原则
+---
+
+# RBAC 权限控制
+
+谁能在哪个命名空间删除 Pod？哪个 ServiceAccount 能读取 Secret？Kubernetes 通过 **RBAC（Role-Based Access Control）** 进行细粒度授权，遵循「最小权限」原则。
+
+## 1. 四个核心对象
+
+- **Role / ClusterRole**：定义「一组权限规则」。Role 限定在单个命名空间，ClusterRole 集群范围。
+- **RoleBinding / ClusterRoleBinding**：把角色**绑定**到用户、组或 ServiceAccount。
+
+<Callout type="info" title="ClusterRole 也能绑到命名空间">
+ClusterRole 既可用 ClusterRoleBinding 做集群级授权，也可用 RoleBinding 在指定命名空间内绑定（权限被限制在该命名空间）。
+</Callout>
+
+## 2. 定义角色
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+```
+
+## 3. 绑定到 ServiceAccount
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: reporter
+    namespace: default
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+## 4. 常用排查命令
+
+```bash
+# 查看当前身份能做什么
+kubectl auth can-i delete pods --as=system:serviceaccount:default:reporter
+kubectl auth can-i "*" "*"        # 是否集群管理员
+
+# 查看某主体拥有的权限
+kubectl get rolebindings -n default
+```
+
+<Callout type="warn" title="慎用 cluster-admin">
+`cluster-admin` ClusterRole 拥有集群全部权限。给普通应用或 CI 账号绑定时务必收窄到具体资源和动词，避免横向移动风险。
+</Callout>
+
+## 小结
+
+- RBAC 四件套：Role/ClusterRole + RoleBinding/ClusterRoleBinding
+- 权限规则由 apiGroups/resources/verbs 组成
+- 用 `kubectl auth can-i` 验证授权，遵循最小权限
+- 下一章学习 NetworkPolicy 如何隔离 Pod 间网络 →

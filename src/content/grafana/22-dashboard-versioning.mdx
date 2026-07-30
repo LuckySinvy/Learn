@@ -1,0 +1,60 @@
+---
+title: 仪表盘版本与 JSON 模型管理
+order: 22
+description: 理解 Dashboard JSON 模型、版本历史与 Git 化治理，让大屏可回滚、可评审
+---
+
+# 仪表盘版本与 JSON 模型管理
+
+第 4 章提到「仪表盘底层就是 JSON」。本章讲清楚如何用这个特性做**版本管理、回滚与协作评审**，避免「谁改崩了不知道」。
+
+<Callout type="info" title="Dashboard 的 version 字段">
+每个 Dashboard JSON 里有 `"version": N`，每次保存自增。Grafana 据此提供历史版本列表，可一键回滚。
+</Callout>
+
+## 1. 利用内置版本历史
+
+Dashboard → Settings → Versions，能看到每次保存的 diff 与时间、作者。点击任意版本即可 `Restore`。
+
+## 2. 用 API 导出 / 导入
+
+把当前大屏导成文件纳入 Git：
+
+```bash
+# 导出
+curl -H "Authorization: Bearer $GRAFANA_TOKEN" \
+  http://localhost:3000/api/dashboards/uid/$UID > dash.json
+
+# 导入（注意先剥离 server 字段）
+curl -X POST http://localhost:3000/api/dashboards/db \
+  -H "Authorization: Bearer $GRAFANA_TOKEN" \
+  -d @dash.json
+```
+
+## 3. 与 Provisioning 结合做 GitOps
+
+把导出的 JSON 放到仓库，由第 15 章的 provisioning 自动加载，配合 CI 做 diff 评审：
+
+```yaml
+apiVersion: 1
+providers:
+  - name: git-dashboards
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+```
+
+<Callout type="warn" title="不要手改 uid 冲突">
+手动编辑 JSON 时，`uid` 必须全局唯一。重复 uid 会让两个 Dashboard 互相覆盖。
+</Callout>
+
+## 4. 模板化治理
+
+把数据源、标签用 `__inputs` / 模板变量抽离，使同一份 JSON 能跨环境（测试 / 生产）复用，降低漂移。
+
+## 小结
+
+- Dashboard 的 `version` 字段驱动内置版本历史，可回滚
+- 用 API 导出 JSON 纳入 Git，是协作与审计的基础
+- Provisioning 加载 + CI diff，实现大屏的 GitOps
+- `uid` 唯一性是手动编辑的红线 →

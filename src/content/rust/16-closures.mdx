@@ -1,0 +1,101 @@
+---
+title: 闭包
+order: 16
+description: 闭包语法、Fn/FnMut/FnOnce 三个 trait，以及闭包如何捕获环境、与泛型配合
+---
+
+# 闭包
+
+**闭包（closure）** 是可以捕获环境的匿名函数。它语法紧凑，是迭代器与并发里的高频工具。
+
+## 1. 闭包语法
+
+```rust
+fn main() {
+    let add_one = |x: i32| x + 1;        // 单表达式
+    let sum = |a, b| {                   // 多语句用花括号
+        a + b
+    };
+    println!("{} {}", add_one(5), sum(2, 3));
+}
+```
+
+<Callout type="tip" title="类型通常可省略">
+闭包参数与返回类型大多能被编译器推断，比 `fn` 更省标注。仅在你想限定类型时才写。
+</Callout>
+
+## 2. 捕获环境
+
+闭包能从定义处「借用」周围变量：
+
+```rust
+fn main() {
+    let factor = 3;
+    let scale = |x| x * factor;     // 捕获 factor
+    println!("{}", scale(10));      // 30
+}
+```
+
+## 3. Fn / FnMut / FnOnce
+
+闭包按**如何捕获变量**自动实现这三个 trait：
+
+| trait | 捕获方式 | 示例 |
+|---|---|---|
+| `Fn` | 不可变借用 `&T` | 只读 |
+| `FnMut` | 可变借用 `&mut T` | 修改捕获值 |
+| `FnOnce` | 取得所有权 `T` | 消耗捕获值（如 `move` 移走） |
+
+```rust
+let mut count = 0;
+let mut inc = || { count += 1; };   // 实现 FnMut
+inc();
+println!("{}", count);
+```
+
+<Callout type="warn" title="move 闭包会拿走所有权">
+`move |...| ...` 强制把捕获的变量 move 进闭包。跨线程传闭包时经常需要 `move`，但它会让原变量失效。
+</Callout>
+
+## 4. 闭包作为函数参数
+
+用泛型 + trait bound 接收闭包：
+
+```rust
+fn apply<F>(f: F)
+where
+    F: Fn(i32) -> i32,
+{
+    println!("{}", f(5));
+}
+
+fn main() {
+    apply(|x| x * 2);
+}
+```
+
+## 5. 返回闭包
+
+闭包无固定大小，需用 `impl Fn` 或 `Box<dyn Fn>`：
+
+```rust
+fn make_adder(n: i32) -> impl Fn(i32) -> i32 {
+    move |x| x + n
+}
+```
+
+<Callout type="info" title="返回闭包用 impl Fn">
+因闭包是匿名类型，直接写返回类型不可行。用 `impl Fn(...)->...` 让编译器推导具体类型最干净。
+</Callout>
+
+<Callout type="exercise" title="练习">
+写一个 `fn apply_to_vec(v: Vec<i32>, f: impl Fn(i32) -> i32) -> Vec<i32>`，把 `f` 应用到每个元素（用迭代器）。用闭包 `|x| x * x` 与 `|x| x + 1` 各调一次。
+</Callout>
+
+## 小结
+
+- 闭包语法 `|参数| 体`，类型常可省略
+- 捕获方式决定实现 `Fn`/`FnMut`/`FnOnce`
+- `move` 闭包拿走所有权，常用于跨线程
+- 参数用泛型 + `Fn` bound；返回用 `impl Fn`
+- 下一章看迭代器 →

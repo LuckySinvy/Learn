@@ -1,0 +1,92 @@
+---
+title: 切片
+order: 7
+description: 字符串切片与数组切片，理解切片本质是对数据的借用，以及它们与引用的关系
+---
+
+# 切片
+
+**切片（slice）** 是「对一段连续序列的视图」，本身不拥有数据，只是借用。它让你安全地引用集合的一部分。
+
+## 1. 字符串切片 &str
+
+```rust
+fn main() {
+    let s = String::from("hello world");
+    let hello = &s[0..5];     // "hello"
+    let world = &s[6..11];    // "world"
+    println!("{} + {}", hello, world);
+}
+```
+
+`&str` 是「字符串切片」：一个指针 + 长度。字符串字面量 `"abc"` 的类型就是 `&'static str`——指向二进制里的只读数据。
+
+<Callout type="info" title="为什么函数参数用 &str 而非 &String">
+`&str` 既能接 `String` 的切片（`&s[..]`），也能接字面量。写 `fn f(s: &str)` 最通用；`&String` 只接受 String。
+</Callout>
+
+## 2. 切片是借用
+
+对 `s` 取切片时，同时持有一个不可变借用。因此切片存活期间，不能对 `s` 做可变操作：
+
+```rust
+fn first_word(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b' ' {
+            return &s[0..i];
+        }
+    }
+    &s[..]
+}
+```
+
+<Callout type="warn" title="切片的边界检查">
+`&s[0..100]` 若越界会 panic。切片必须在 UTF-8 字符边界上切，否则编译/运行报错——Rust 不会让你把一个多字节字符劈成两半。
+</Callout>
+
+## 3. 数组切片
+
+```rust
+fn main() {
+    let arr = [1, 2, 3, 4, 5];
+    let mid = &arr[1..4];     // [2, 3, 4]，类型 &[i32]
+    let sum: i32 = mid.iter().sum();
+    println!("{}", sum);
+}
+```
+
+数组切片 `&[T]` 与 `Vec<T>` 的切片同理，都是「指针 + 长度」的胖指针。
+
+## 4. 切片作为通用参数
+
+很多 API 接受切片而非具体集合，便于复用：
+
+```rust
+fn largest(nums: &[i32]) -> i32 {
+    *nums.iter().max().unwrap()
+}
+```
+
+<Callout type="tip" title="切片让函数更通用">
+接收 `&[i32]` 的函数，既能吃数组 `&arr[..]`，也能吃 `Vec` 的 `&vec[..]`。优先用切片做只读接口。
+</Callout>
+
+## 5. 对比字符串与切片
+
+| 类型 | 拥有数据 | 可修改 | 典型用途 |
+|---|---|---|---|
+| `String` | 是 | 是 | 需要构造/修改字符串 |
+| `&str` | 否（借用） | 否 | 只读查看、函数参数 |
+
+<Callout type="exercise" title="练习">
+写一个 `fn second_word(s: &str) -> &str` 返回第二个单词（按空格切分）。对 `"the quick brown"` 调用，验证返回 `"quick"`。注意处理不足两个词时的边界。
+</Callout>
+
+## 小结
+
+- 切片是对连续序列的「视图」，胖指针（指针+长度）
+- `&str` 用于只读字符串，`&[T]` 用于数组/Vec 片段
+- 取切片即借用，与可变操作互斥
+- 函数参数优先用切片，通用且零拷贝
+- 下一章看结构体 →

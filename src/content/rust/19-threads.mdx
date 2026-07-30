@@ -1,0 +1,98 @@
+---
+title: 线程
+order: 19
+description: 用 std::thread::spawn 创建线程、move 闭包捕获环境，以及用 channel 做消息传递
+---
+
+# 线程
+
+Rust 的标准库直接提供操作系统线程，并靠**所有权**在编译期消除数据竞争。核心哲学：「不用共享内存来通信，用通信来共享内存」。
+
+## 1. 创建线程
+
+```rust
+use std::thread;
+
+fn main() {
+    let handle = thread::spawn(|| {
+        for i in 1..4 {
+            println!("子线程: {}", i);
+        }
+    });
+
+    handle.join().unwrap();   // 等待子线程结束
+    println!("主线程结束");
+}
+```
+
+<Callout type="info" title="join 阻塞等待">
+`spawn` 返回 `JoinHandle`。`join()` 会阻塞当前线程直到它结束。不调用 `join` 可能主线程先退出，子线程被强制终止。
+</Callout>
+
+## 2. move 闭包捕获环境
+
+子线程可能比当前栈活得久，所以必须用 `move` 把数据所有权移进去：
+
+```rust
+use std::thread;
+
+fn main() {
+    let msg = String::from("你好");
+    let handle = thread::spawn(move || {
+        println!("{}", msg);   // msg 被 move 进闭包
+    });
+    handle.join().unwrap();
+}
+```
+
+<Callout type="warn" title="忘记 move 会编译失败">
+若直接捕获 `msg`（非 move），闭包借用了可能已 drop 的变量，编译期就被拒绝。这正是 Rust 防止悬垂引用的体现。
+</Callout>
+
+## 3. 消息传递：channel
+
+`mpsc`（多生产者单消费者）通道在线程间传递数据：
+
+```rust
+use std::sync::mpsc;
+use std::thread;
+
+fn main() {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        tx.send(String::from("来自子线程")).unwrap();
+    });
+    let received = rx.recv().unwrap();   // 阻塞接收
+    println!("收到: {}", received);
+}
+```
+
+<Callout type="tip" title="channel 转移所有权">
+`send` 把值的**所有权**移交到另一线程，接收方独占它。无需锁，天然避免竞争。
+</Callout>
+
+## 4. 多生产者
+
+`mpsc` 支持多个发送端（`tx.clone()`）：
+
+```rust
+let tx1 = tx.clone();
+thread::spawn(move || { tx1.send(String::from("a")).unwrap(); });
+thread::spawn(move || { tx.send(String::from("b")).unwrap(); });
+```
+
+## 5. 线程与借用检查
+
+Rust 保证：被 `move` 进线程的数据，别的线程/原作用域都无法再访问它，从根上消除数据竞争。
+
+<Callout type="exercise" title="练习">
+创建两个子线程，通过单个 `mpsc` 通道（用 `tx.clone()`）各发送一条消息，主线程用 `for received in rx` 循环接收并打印两条。注意 `tx` 在生成完线程后无需再持有。
+</Callout>
+
+## 小结
+
+- `thread::spawn` 创建 OS 线程，`join()` 等待
+- `move` 闭包把数据所有权移入子线程
+- `mpsc::channel` 用消息传递代替共享内存
+- 编译器保证跨线程数据无竞争
+- 下一章看共享状态与锁 →

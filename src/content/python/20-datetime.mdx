@@ -1,0 +1,104 @@
+---
+title: datetime 与时区
+order: 20
+description: 用 datetime 处理日期时间，理解 timezone、naive 与 aware、时区转换
+---
+
+# datetime 与时区
+
+时间处理有四件容易踩坑的事：格式解析、时区、夏令时、时间运算。Python 的 `datetime` 模块全都覆盖，关键是分清「naive」与「aware」。
+
+## 1. 获取与构造时间
+
+```python
+from datetime import datetime, date, timedelta
+
+now = datetime.now()
+print(now, type(now))
+print(now.strftime("%Y-%m-%d %H:%M:%S"))
+
+# 构造指定时间
+d = datetime(2024, 1, 15, 9, 30)
+print(d.isoformat())
+
+# 只关心日期
+today = date.today()
+print(today, today.weekday())      # 周一=0
+```
+
+## 2. naive 与 aware
+
+没有时区信息的时间叫 **naive**，带时区的叫 **aware**。两个 aware 时间才能安全比较。
+
+```python
+from datetime import datetime, timezone
+
+naive = datetime(2024, 1, 1, 12, 0)
+aware = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+print(naive.tzinfo, aware.tzinfo)
+print(aware.utcoffset())           # 0:00:00
+```
+
+<Callout type="warn" title="永远别混用">
+对 naive 和 aware 直接做减法会抛 `TypeError`。工程里建议**全程用 aware**，存库/传接口统一用 UTC。
+</Callout>
+
+## 3. 时区转换
+
+标准库只有 UTC 和本地时区，需要具体时区就装 `zoneinfo`（Python 3.9+ 内置）。
+
+```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+utc = datetime(2024, 6, 1, 0, 0, tzinfo=ZoneInfo("UTC"))
+bj = utc.astimezone(ZoneInfo("Asia/Shanghai"))
+ny = utc.astimezone(ZoneInfo("America/New_York"))
+print("北京:", bj.isoformat())
+print("纽约:", ny.isoformat())
+```
+
+## 4. 时间运算与解析
+
+`timedelta` 做加减；`strptime` 把字符串解析成 datetime。
+
+```python
+from datetime import datetime, timedelta
+
+t = datetime(2024, 1, 31)
+print((t + timedelta(days=1)).date())      # 2024-02-01
+print((t - timedelta(weeks=2)).date())     # 2024-01-17
+
+parsed = datetime.strptime("2024/01/15 09:30", "%Y/%m/%d %H:%M")
+print(parsed)
+```
+
+<Callout type="tip" title="解析 ISO 字符串用 fromisoformat">
+现代接口多用 ISO 8601，直接 `datetime.fromisoformat("2024-01-15T09:30:00+08:00")` 即可，不必手搓格式串。
+</Callout>
+
+## 5. 计算时间差
+
+```python
+from datetime import datetime
+
+a = datetime(2024, 1, 1)
+b = datetime(2024, 3, 1)
+delta = b - a
+print(delta.days)            # 60
+print(delta.total_seconds()) # 间隔秒数
+```
+
+<Callout type="exercise" title="动手试">
+写一个函数：输入两个 ISO 字符串，返回相差多少「天、小时、分钟」。提示：用 `fromisoformat` 解析后相减，从 `total_seconds()` 拆出天/时/分。
+</Callout>
+
+## 小结
+
+- ✅ `datetime.now()` / `strftime` / `strptime` 做格式化与解析
+- ✅ naive（无时区）与 aware（带时区）不要混算
+- ✅ `ZoneInfo` 提供真实时区，`astimezone` 做转换
+- ✅ `timedelta` 做时间加减，相减得到时间差
+- ✅ 工程实践：统一用 UTC 存、用本地时区展示
+
+下一章 **dataclasses 进阶**：把数据类用得更顺手。

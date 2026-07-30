@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { Code2, Terminal, Coffee, BarChart3, Brain, Link2, Blocks, Boxes } from 'lucide-react';
+import { Code2, Terminal, Coffee, BarChart3, Brain, Link2, Blocks, Boxes, Flame } from 'lucide-react';
 import { LanguageCard } from '@/components/layout/LanguageCard';
 
 export default function HomePage() {
@@ -41,6 +41,14 @@ export default function HomePage() {
           icon={<Coffee className="w-8 h-8" />}
           accent="from-orange-400 to-red-500"
           chapters={18}
+        />
+        <LanguageCard
+          href="/rust"
+          title="Rust"
+          description="系统级语言：所有权保障内存安全，零成本抽象，适合高性能与并发。"
+          icon={<Flame className="w-8 h-8" />}
+          accent="from-red-400 to-orange-500"
+          chapters={30}
         />
       </Category>
 

@@ -1,0 +1,108 @@
+---
+title: 测试
+order: 23
+description: 单元测试与集成测试的写法、#[test] 与断言宏，以及 cargo test 与文档测试
+---
+
+# 测试
+
+Rust 把测试作为一等公民：标准库提供 `#[test]` 属性，`cargo test` 一键运行全部测试。
+
+## 1. 单元测试
+
+测试与源码同文件、置于 `cfg(test)` 模块内，保证测试代码不进发布产物：
+
+```rust
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add() {
+        assert_eq!(add(2, 3), 5);
+        assert_ne!(add(2, 2), 5);
+        assert!(add(0, 0) == 0);
+    }
+}
+```
+
+<Callout type="info" title="#[cfg(test)] 的作用">
+`cfg(test)` 让这段模块只在 `cargo test` 时编译。发布构建 `cargo build` 时它完全不存在，零体积成本。
+</Callout>
+
+## 2. 断言宏
+
+| 宏 | 用途 |
+|---|---|
+| `assert!` | 布尔为真 |
+| `assert_eq!(a, b)` | 相等 |
+| `assert_ne!(a, b)` | 不等 |
+| `panic!` / `should_panic` | 期望 panic |
+
+```rust
+#[test]
+#[should_panic(expected = "boom")]
+fn test_panic() {
+    panic!("boom");
+}
+```
+
+## 3. 集成测试
+
+放在 `tests/` 目录，作为独立 crate 调用你的库（只能访问**公开 API**）：
+
+```
+my_lib/
+  src/lib.rs
+  tests/
+    integration.rs     // mod tests 不用写，直接写 #[test]
+```
+
+```rust
+use my_lib::add;
+#[test]
+fn it_adds() { assert_eq!(add(1, 2), 3); }
+```
+
+<Callout type="tip" title="单元测私有，集测测公开">
+单元测试可测私有函数（同模块 `use super::*`）；集成测试只走公开接口，更像「用户视角」。
+</Callout>
+
+## 4. 运行测试
+
+```bash
+cargo test                 # 全部
+cargo test add            # 按名称过滤
+cargo test -- --nocapture  # 显示 println! 输出
+```
+
+## 5. 文档测试
+
+写在文档注释里的代码块会被当作测试执行：
+
+```rust
+/// 两数相加。
+/// ```
+/// use my_lib::add;
+/// assert_eq!(add(2, 2), 4);
+/// ```
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+```
+
+<Callout type="warn" title="文档测试要能编译运行">
+`///` 里的 ```rust 代码块会被真的执行。确保它完整可编译，否则 `cargo test` 报错。不想测可标 ````no_run` 或 `ignore`。
+</Callout>
+
+<Callout type="exercise" title="练习">
+给第 8 章的 `Rectangle::area` 写单元测试：测 0 尺寸、正常尺寸两种情况，并用 `cargo test` 运行确认全绿。再加一个文档测试示例。
+</Callout>
+
+## 小结
+
+- `#[test]` 标记测试；`#[cfg(test)]` 隔离测试代码
+- `assert_eq!`/`assert!`/`should_panic` 常用断言
+- 单元测同文件私有逻辑，集成测试放 `tests/` 测公开 API
+- 文档注释里的代码块即文档测试
+- 下一章看常用派生 trait →

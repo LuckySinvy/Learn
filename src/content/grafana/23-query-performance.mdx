@@ -1,0 +1,60 @@
+---
+title: 查询性能与缓存调优
+order: 23
+description: 高基数、查询超时、缓存与并行度 —— 让大屏在大数据量下依然流畅
+---
+
+# 查询性能与缓存调优
+
+当指标规模增长，仪表盘变慢、超时甚至拖垮后端。本章给出 Grafana 与数据源两侧的实用调优点。
+
+<Callout type="warn" title="高基数是头号杀手">
+`instance`、`pod`、`url` 这类标签组合过细，会让序列数爆炸，单条查询扫描百万序列。先降基数，再谈其他优化。
+</Callout>
+
+## 1. 在数据源侧减负
+
+- **Recording Rules**：把高频、重的 `rate` / `sum by` 预计算成新指标，面板直接查结果。
+- **降采样**：长期视图用粗略分辨率，避免拉取原始点。
+
+```yaml
+# Prometheus recording rule 示例
+groups:
+  - name: api_latency
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+```
+
+## 2. Grafana 查询选项
+
+面板查询编辑器中可设：
+
+```text
+# Query options
+Max data points: 600      # 限制返回点数，前端自动降采样
+Interval: 30s             # 强制最小步长，避免过密
+Timeout: 60s              # 单查询超时
+```
+
+## 3. 后端缓存与并行
+
+Grafana 企业版的 **query caching** 可缓存数据源响应；OSS 侧可前置反向代理缓存。调整 `grafana.ini`：
+
+```ini
+[dataproxy]
+timeout = 90
+[query]
+concurrent_query_limit = 20
+```
+
+<Callout type="tip" title="用 Explore 定位慢查询">
+在 Explore 中执行同一查询，观察 `Query stats` 的耗时与扫描序列数，确认瓶颈在 Grafana 还是数据源。
+</Callout>
+
+## 小结
+
+- 高基数是性能第一敌人，优先用 Recording Rules 预计算降载
+- 面板侧限制 `Max data points` 与 `Interval`，避免拉原始点
+- 超时、并行度在 `grafana.ini` 调优
+- 用 Explore 的 Query stats 量化瓶颈 →

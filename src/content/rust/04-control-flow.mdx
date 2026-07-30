@@ -1,0 +1,114 @@
+---
+title: 函数与控制流
+order: 4
+description: fn 函数定义、if/else 表达式、loop/while/for 循环，以及用 match 做穷尽匹配
+---
+
+# 函数与控制流
+
+Rust 中**控制流也是表达式**——它们能返回值，这让代码更简洁。
+
+## 1. 函数 fn
+
+```rust
+fn add(a: i32, b: i32) -> i32 {
+    a + b          // 无分号 = 返回值（表达式）
+}
+
+fn main() {
+    let r = add(2, 3);
+    println!("{}", r);
+}
+```
+
+<Callout type="tip" title="表达式 vs 语句">
+以分号结尾是「语句」（无返回值）；不加结尾分号的最后一个表达式就是返回值。也可以显式 `return x;`，但通常省略更地道。
+</Callout>
+
+## 2. if / else 是表达式
+
+```rust
+fn main() {
+    let n = 7;
+    let desc = if n % 2 == 0 { "偶数" } else { "奇数" };
+    println!("{} 是 {}", n, desc);
+}
+```
+
+<Callout type="warn" title="两个分支类型要一致">
+`if/else` 作为表达式返回值时，所有分支必须返回**同一类型**，否则编译失败。
+</Callout>
+
+## 3. 循环：loop / while / for
+
+```rust
+fn main() {
+    // loop：无限循环，用 break 退出并可带值
+    let mut i = 0;
+    let result = loop {
+        i += 1;
+        if i == 5 { break i * 10; }
+    };
+    println!("loop 结果 = {}", result);
+
+    // while：条件循环
+    let mut n = 3;
+    while n > 0 {
+        n -= 1;
+    }
+
+    // for：遍历集合，最常用
+    for x in 0..3 {
+        println!("x = {}", x);
+    }
+}
+```
+
+## 4. match 穷尽匹配
+
+`match` 类似增强版 `switch`，但**必须覆盖所有可能**：
+
+```rust
+fn describe(n: i32) -> &'static str {
+    match n {
+        0 => "零",
+        1 | 2 => "小",
+        3..=9 => "个位数",
+        _ => "其他",     // 通配，保证穷尽
+    }
+}
+
+fn main() {
+    println!("{}", describe(5));
+}
+```
+
+<Callout type="info" title="为什么 match 安全">
+编译器强制「穷尽性」：漏掉任何分支（包括通配 `_`）都会编译报错。这避免了「忘了处理某种情况」的 bug。
+</Callout>
+
+## 5. 循环标签与 continue
+
+嵌套循环可用 `'label` 跳出指定层：
+
+```rust
+fn main() {
+    'outer: for i in 0..3 {
+        for j in 0..3 {
+            if i + j == 2 { break 'outer; }
+        }
+    }
+}
+```
+
+<Callout type="exercise" title="练习">
+写一个函数 `fn fib(n: u32) -> u32` 用 `loop` 计算第 n 个斐波那契数（用三个变量滚动即可），再用 `for` 打印前 10 项。体会 break 带返回值与 for 遍历。
+</Callout>
+
+## 小结
+
+- 函数返回值用「无分号表达式」，或显式 `return`
+- `if/else` 是表达式，分支类型须一致
+- `loop` 可 `break` 带值；`for` 遍历最常用
+- `match` 强制穷尽匹配，通配 `_` 兜底
+- 下一章进入 Rust 最核心：所有权 →

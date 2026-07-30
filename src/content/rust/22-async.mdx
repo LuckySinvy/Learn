@@ -1,0 +1,90 @@
+---
+title: 异步编程
+order: 22
+description: async/await 与 Future 模型、tokio 运行时入门，以及异步与多线程的关系
+---
+
+# 异步编程
+
+**异步（async）** 让你用接近同步的写法写出高并发的 I/O 程序——单线程即可处理成千上万并发连接，不靠为每个连接开一个线程。
+
+## 1. Future 与 async
+
+`async fn` 返回一个「将来会完成」的 `Future`，本身**不会立刻执行**，需要运行时去 poll（轮询）它：
+
+```rust
+async fn fetch(n: u32) -> u32 {
+    // 模拟异步等待
+    n * 2
+}
+```
+
+## 2. await 挂起
+
+`.await` 让当前异步任务「让出」控制权，等结果就绪再继续：
+
+```rust
+async fn main_task() {
+    let r = fetch(21).await;   // 在此挂起，不阻塞线程
+    println!("结果 {}", r);
+}
+```
+
+<Callout type="info" title="异步不阻塞线程">
+遇到 `.await`，任务让出线程去干别的事；等未来就绪，运行时再把它唤醒。一个线程能借此交错运行大量任务。
+</Callout>
+
+## 3. 需要运行时：tokio
+
+Rust 标准库只定义 `Future`，不含调度器。社区主流是 **tokio**：
+
+```toml
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+use tokio::time::{sleep, Duration};
+
+#[tokio::main]
+async fn main() {
+    let h1 = tokio::spawn(async {
+        sleep(Duration::from_millis(10)).await;
+        "任务1完成"
+    });
+    let msg = h1.await.unwrap();
+    println!("{}", msg);
+}
+```
+
+<Callout type="tip" title="#[tokio::main] 做了什么">
+它是个宏，把你写的 `async fn main` 包进运行时启动代码：创建多线程调度器，再 `block_on(main_task)`。没有它，`Future` 不会被执行。
+</Callout>
+
+## 4. 并发运行多个任务
+
+```rust
+let (a, b) = tokio::join!(task_a(), task_b());   // 并发等待两者
+```
+
+<Callout type="warn" title="别在异步里用阻塞调用">
+在 `.await` 之间调用 `std::thread::sleep` 或同步 `read` 会卡住整个线程，拖累所有任务。异步代码要用 tokio 提供的非阻塞版本（`tokio::fs`、`tokio::time::sleep`）。
+</Callout>
+
+## 5. async 与线程的关系
+
+- 异步任务运行在「执行器（executor）」管理的线程池上。
+- `spawn` 把任务交给调度器；`spawn_blocking` 才适合 CPU 重活。
+- 异步擅长 I/O 密集，多线程擅长 CPU 密集。
+
+<Callout type="exercise" title="练习">
+用 tokio 起两个 `async` 任务，分别 `sleep` 不同毫秒数后返回字符串，用 `tokio::join!` 并发等待并打印。观察总耗时接近较慢者而非两者之和。
+</Callout>
+
+## 小结
+
+- `async fn` 返回 `Future`，需运行时 poll 才执行
+- `.await` 挂起让出线程，不阻塞
+- tokio 提供运行时；`#[tokio::main]` 启动调度器
+- 异步适合 I/O 密集，避免在里面做阻塞调用
+- 下一章看测试 →

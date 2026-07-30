@@ -6,7 +6,7 @@ import { LANG_META } from '@/lib/types';
 import type { Language } from '@/lib/types';
 
 const CATEGORIES: { label: string; items: Language[] }[] = [
-  { label: '编程语言', items: ['python', 'go', 'java'] },
+  { label: '编程语言', items: ['python', 'go', 'java', 'rust'] },
   { label: '可观测性', items: ['grafana'] },
   { label: 'AI 工程', items: ['rag', 'langchain', 'dify'] },
   { label: '云原生', items: ['k8s'] },

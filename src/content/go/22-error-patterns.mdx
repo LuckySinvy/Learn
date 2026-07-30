@@ -1,0 +1,93 @@
+---
+title: 错误处理模式与包装
+order: 22
+description: 哨兵错误、错误类型、不透明错误、errors.Is/As 与包装链
+---
+
+# 错误处理模式与包装
+
+第 7 章讲了 error 基础与 `%w` 包装。本章进阶：如何设计可维护的错误体系。
+
+## 1. 哨兵错误（Sentinel Errors）
+
+预定义包级变量，调用方用 `errors.Is` 判定：
+
+```go
+var ErrNotFound = errors.New("not found")
+var ErrPermission = errors.New("permission denied")
+
+func Get(id string) (*User, error) {
+    if !exists(id) {
+        return nil, ErrNotFound
+    }
+    // ...
+}
+```
+
+<Callout type="tip" title="用 Is 而非 ==">
+总是用 `errors.Is(err, ErrNotFound)`，而不是 `err == ErrNotFound`——因为对方可能用 `%w` 把哨兵包在更深的链里。
+</Callout>
+
+## 2. 错误类型（Error Types）
+
+需要携带结构化字段时，定义类型：
+
+```go
+type ErrConflict struct {
+    Resource string
+    ID       string
+}
+
+func (e *ErrConflict) Error() string {
+    return fmt.Sprintf("%s %s 冲突", e.Resource, e.ID)
+}
+
+// 调用方用 errors.As 取出
+var ec *ErrConflict
+if errors.As(err, &ec) {
+    log.Printf("资源 %s 冲突", ec.Resource)
+}
+```
+
+## 3. 不透明错误（Opaque Errors）
+
+对外只暴露「成功或失败」，不暴露内部类型——调用方不该依赖你的错误细节：
+
+```go
+func Do() error { /* 内部随便怎么包装 */ }
+
+if err != nil {
+    return fmt.Errorf("do failed: %w", err) // 只透传，不假设类型
+}
+```
+
+## 4. 包装链与上下文化
+
+每层加自己的上下文，最底层保留原始错误：
+
+```go
+if err != nil {
+    return fmt.Errorf("保存用户 %s: %w", name, err)
+}
+```
+
+这样上层的日志能显示完整链路：`保存用户 Alice: 写入数据库: 连接超时`。
+
+<Callout type="warn" title="别滥用 WithStack">
+`%w` 已足够构建链。盲目加堆栈会让错误信息冗长、难以阅读。
+</Callout>
+
+## 5. 处理准则速查
+
+- 能判定的用 `Is`（哨兵）
+- 要取字段用 `As`（类型）
+- 对外暴露用不透明错误
+- 每层补充上下文，但只包装一次
+
+## 小结
+
+- 哨兵错误用 `errors.Is` 判定，别用 `==`
+- 需结构化信息用错误类型加 `errors.As`
+- 对外接口优先不透明错误，隐藏实现
+- `%w` 构建可追溯的上下文化错误链
+- 判定用 Is/As，包装用 `%w`，分层补充上下文

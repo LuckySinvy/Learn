@@ -1,0 +1,101 @@
+---
+title: 泛型
+order: 13
+description: 泛型函数、结构体与枚举，单态化（monomorphization）原理，以及 trait bound 约束类型
+---
+
+# 泛型
+
+**泛型（generics）** 让你写出不依赖具体类型、又能保持类型安全的代码，避免为 `i32`/`f64`/`String` 各写一份逻辑。
+
+## 1. 泛型函数
+
+```rust
+fn largest<T: PartialOrd + Copy>(list: &[T]) -> T {
+    let mut max = list[0];
+    for &item in list {
+        if item > max {
+            max = item;
+        }
+    }
+    max
+}
+
+fn main() {
+    let a = largest(&[1, 5, 3]);      // T = i32
+    let b = largest(&[1.0, 2.5]);     // T = f64
+    println!("{} {}", a, b);
+}
+```
+
+<Callout type="info" title="trait bound 限制能力">
+`T: PartialOrd` 表示 T 必须可比较（才能用 `>`）；`+ Copy` 表示可复制（避免所有权移动）。泛型不会凭空获得操作能力。
+</Callout>
+
+## 2. 泛型结构体与枚举
+
+```rust
+struct Point<T> {
+    x: T,
+    y: T,
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+```
+
+<Callout type="warn" title="单类型参数要求同类型">
+上面的 `Point<T>` 要求 `x` 与 `y` 同类型。若需不同，用两个参数 `Point<T, U>`。
+</Callout>
+
+## 3. 单态化（monomorphization）
+
+Rust 在**编译期**为用到的每个具体类型生成专属代码：
+
+```rust
+let _ = largest(&[1, 2]);
+let _ = largest(&[1.0, 2.0]);
+```
+
+编译器实际生成 `largest_i32` 与 `largest_f64` 两份函数。这就是「零成本抽象」——运行时没有泛型开销，性能等同手写专版。
+
+<Callout type="tip" title="零成本的意义">
+泛型不引入任何运行时间接层或额外内存。代价是二进制体积略增（每种类型一份代码），但速度是原生的。
+</Callout>
+
+## 4. trait bound 的两种写法
+
+```rust
+// 1. 在函数签名里
+fn f<T: Display + Clone>(x: T) {}
+
+// 2. where 子句，更清晰
+fn f<T>(x: T)
+where
+    T: Display + Clone,
+{
+}
+```
+
+## 5. 默认类型参数
+
+```rust
+enum Result<T, E = std::io::Error> {
+    Ok(T),
+    Err(E),
+}
+```
+
+<Callout type="exercise" title="练习">
+实现一个泛型 `struct Pair<T> { first: T, second: T }`，加一个方法 `fn cmp(&self) -> ...`（提示：约束 `T: PartialOrd`）返回较大者。再写个 `where` 子句版本的打印函数。
+</Callout>
+
+## 小结
+
+- 泛型提升复用而不牺牲类型安全
+- `T: Trait` 约束类型能做什么（如比较、复制）
+- 单态化：编译期为各具体类型生成专属代码，零运行时开销
+- `where` 子句让复杂 bound 更易读
+- 下一章看 trait —— Rust 的抽象核心 →

@@ -1,0 +1,74 @@
+---
+title: LangServe 部署：把链变成 API
+order: 23
+description: 用 langserve 的 addRoute 把 Runnable 一键暴露成带流式与 Playground 的 REST 接口
+---
+
+# LangServe 部署：把链变成 API
+
+写好的链要在生产里被调用，通常得包一层 Web 服务。LangServe 帮你把任意 `Runnable` 自动暴露成 REST 接口，自带 `/invoke`、`/batch`、`/stream` 以及交互式 Playground，省去手写样板。
+
+## 1. 用 addRoute 挂载链
+
+```ts
+// server.ts
+import { addRoute } from "langserve";
+import express from "express";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+const app = express();
+
+const chain = ChatPromptTemplate.fromTemplate("用中文回答：{question}")
+  .pipe(new ChatOpenAI({ model: "gpt-4o-mini" }))
+  .pipe(new StringOutputParser());
+
+addRoute(app, "/chat", chain, { playground: true });
+
+app.listen(8000, () => console.log("http://localhost:8000/chat/playground"));
+```
+
+启动后访问 `/chat/playground` 即可在浏览器里试链；`/chat/invoke` 接受 JSON 调用。
+
+<Callout type="info" title="自动生成的能力">
+挂载后自动拥有：`POST /invoke`（单次）、`/batch`（批量）、`/stream`（流式 SSE）、`/playground`（界面）。输入输出 schema 由 Runnable 推断。
+</Callout>
+
+## 2. 客户端调用
+
+LangServe 提供同构客户端，类型与服务器端共享：
+
+```ts
+import { RemoteRunnable } from "@langchain/core/runnables";
+
+const remote = new RemoteRunnable({
+  url: "http://localhost:8000/chat",
+});
+
+const res = await remote.invoke({ question: "什么是 RAG？" });
+```
+
+## 3. 生产注意点
+
+<Callout type="warn" title="别裸奔上线">
+LangServe 默认不鉴权。生产务必：①放在反向代理后加 API Key/鉴权；②限制请求体大小与并发；③对耗时链设置超时；④密钥走环境变量，绝不进代码。
+</Callout>
+
+| 项目 | 建议 |
+|---|---|
+| 部署 | 配合 Docker / 云函数，监听 `PORT` |
+| 流式 | 前端用 `EventSource` 消费 `/stream` |
+| 版本 | 链逻辑变更时给路由加版本前缀如 `/v1/chat` |
+
+<Callout type="exercise" title="练习">
+把第 16 章的流式问答链用 `addRoute` 挂载，并用 `RemoteRunnable` 从另一个 Node 脚本远程调用 `/invoke`。
+</Callout>
+
+## 小结
+
+- `addRoute(app, path, runnable)` 一键暴露链为 REST API
+- 自动带 invoke/batch/stream 接口与 Playground
+- `RemoteRunnable` 提供类型安全的同构客户端
+- 生产必须加鉴权、限流与超时
+- 下章学习用 LangSmith 评估链的质量 →

@@ -1,0 +1,88 @@
+---
+title: 评测集自动构建
+order: 26
+description: 用 LLM 从文档自动合成问答对，低成本搭建可回归的 RAG 评测集
+---
+
+# 评测集自动构建
+
+第 13 章强调要沉淀黄金测试集做回归。但手工写几十上百条「问题 + 标准答案 + 应命中片段」很贵。本章用 **LLM 从文档自动合成**评测集。
+
+## 1. 为什么自动构建
+
+```text
+人工: 慢、贵、难覆盖长尾问题
+自动: 从同一批文档批量生成，成本低、覆盖广，再人工抽检校正
+```
+
+思路：让 LLM 当「出题人」，基于原文生成可回答的问题与参考答案。
+
+## 2. 从原文合成问答对
+
+```python
+def make_qa(chunk):
+    prompt = f"""
+基于下面文本，生成 2 个用户可能问的问题，并给出基于该文本的标准答案。
+只使用文本中的事实，不要编造。
+文本：{chunk}
+输出 JSON：{{"question":..., "answer":..., "evidence": 原文片段}}
+"""
+    return llm.json(prompt)
+
+qa_pairs = [make_qa(c) for c in sample_chunks(500)]   # 批量合成
+```
+
+## 3. 标注应命中片段
+
+合成时一并记录 `evidence`（问题对应的原文片段），便于算 context_relevancy：
+
+```python
+dataset.append({
+    "question": qa["question"],
+    "reference": qa["answer"],
+    "gold_chunk_id": chunk.id,    # 理想情况下该召回的片段
+})
+```
+
+## 4. 质量控制
+
+自动生成会有噪声，需过滤：
+
+| 问题 | 处理 |
+|---|---|
+| 问题太泛（「这是什么」） | 要求问题含具体实体 |
+| 答案编造 | 约束「只用文本事实」，并人工抽检 10% |
+| 重复雷同 | 去重 + 多样性采样 |
+
+<Callout type="info" title="合成集 + 人工黄金集双轨">
+自动集用于日常大批量回归；再保留一小撮手工精标的黄金集做「可信基线」。两者互补，既广又准。
+</Callout>
+
+## 5. 接入回归
+
+```python
+from ragas import evaluate
+result = evaluate(Dataset.from_list(dataset),
+                  metrics=[faithfulness, answer_relevancy, context_relevancy])
+# 每次改 chunk / 模型 / 重排，都重跑对比
+```
+
+<Callout type="warn" title="合成答案不是真理">
+用 LLM 生成的「标准答案」本身可能有错。它适合衡量「相对变化」（这次比上次好没），不适合当绝对对错标准；关键结论仍需人工核验。
+</Callout>
+
+<Callout type="tip" title="先自动扩到百条，再人工精标 50 条">
+用自动法快速攒出 100+ 条做广度回归，挑其中易错样本人工精标 50 条当黄金基线，性价比最高。
+</Callout>
+
+<Callout type="exercise" title="练习">
+取 20 个 chunk，用上面的 `make_qa` 各生成 2 条问答，人工抽检并修正其中错误项，得到一个 40 条的初始评测集。
+</Callout>
+
+## 小结
+
+- 自动构建：让 LLM 基于原文合成「问题 + 答案 + 证据」，低成本扩量
+- 记录 gold_chunk_id 便于算上下文相关性
+- 过滤泛化/编造/重复的噪声，人工抽检保质量
+- 合成集做广度回归 + 人工黄金集做可信基线，双轨互补
+- 恭喜你学完 RAG 全 26 章，从基础到图谱、Agent、合规与运维的完整体系 →

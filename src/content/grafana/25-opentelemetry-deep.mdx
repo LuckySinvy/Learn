@@ -1,0 +1,60 @@
+---
+title: 与 OpenTelemetry 深度集成
+order: 25
+description: 用 OpenTelemetry Collector 统一采集指标/链路/日志，经 OTLP 送入 Mimir/Tempo/Loki
+---
+
+# 与 OpenTelemetry 深度集成
+
+第 18 章在实战中用到了 OpenTelemetry（OTel）。本章深入**管线架构**：一套 SDK + Collector，把三种信号统一收口，再分流到 LGTM 各组件。
+
+<Callout type="info" title="为什么用 OTel">
+OTel 提供厂商中立的 API/SDK 与协议（OTLP），避免被单一 APM 绑定。应用只埋一次，后端可换。
+</Callout>
+
+## 1. 整体架构
+
+```text
+App (OTel SDK) --OTLP--> Collector --metrics--> Mimir/Prometheus
+                                --traces--> Tempo
+                                --logs-->   Loki
+```
+
+## 2. Collector 配置
+
+Collector 用 `receivers` / `processors` / `exporters` 编排管线：
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  otlphttp/tempo:
+    endpoint: http://tempo:4318
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+service:
+  pipelines:
+    metrics: { receivers: [otlp], exporters: [prometheus] }
+    traces:  { receivers: [otlp], exporters: [otlphttp/tempo] }
+    logs:    { receivers: [otlp], exporters: [loki] }
+```
+
+## 3. 在 Grafana 中关联
+
+Tempo 的 `service.name` 与 Prometheus 的 `job`、Loki 的标签对齐后，可在 Explore 中「从链路跳日志、从指标跳链路」，实现真正的三信号关联。
+
+<Callout type="tip" title="启用自动埋点">
+对无代码改造诉求的服务，可用 OTel 的自动注入（如 Java agent、k8s operator），无需改业务代码即可拿到链路与指标。
+</Callout>
+
+## 小结
+
+- OTel 用 OTLP 统一采集指标/链路/日志，后端可替换
+- Collector 通过 receiver/processor/exporter 编排管线
+- 三信号标签对齐后可在 Grafana 中自由下钻关联
+- 自动注入降低接入成本 →

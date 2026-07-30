@@ -1,0 +1,78 @@
+---
+title: Struct Tag 与 JSON / Protobuf 序列化
+order: 23
+description: json tag、omitempty、自定义序列化与 protobuf 契约
+---
+
+# Struct Tag 与 JSON / Protobuf 序列化
+
+第 14 章用反射读取过 struct tag。本章讲 tag 如何驱动序列化，以及 JSON 与 Protobuf 的差异。
+
+## 1. JSON tag 的写法
+
+```go
+type User struct {
+    Name  string `json:"name"`
+    Age   int    `json:"age,omitempty"`  // 零值时省略
+    Email string `json:"-"`              // 永不序列化
+}
+```
+
+`encoding/json` 通过反射读 tag 决定字段名。
+
+<Callout type="info" title="omitempty 的坑">
+`omitempty` 在「零值」时省略：0、空串、nil、空切片都算。若业务上 0 是合法值，别加它，否则该字段会消失。
+</Callout>
+
+## 2. 自定义序列化
+
+实现 `MarshalJSON` / `UnmarshalJSON` 可完全控制：
+
+```go
+type Epoch int64
+
+func (e Epoch) MarshalJSON() ([]byte, error) {
+    return []byte(strconv.FormatInt(int64(e), 10)), nil
+}
+```
+
+## 3. Protobuf：契约优先
+
+Protobuf 用 `.proto` 定义契约，由工具生成 Go 代码，性能远胜 JSON。
+
+```proto
+syntax = "proto3";
+message User {
+  string name = 1;
+  int32  age  = 2;
+}
+```
+
+```go
+u := &pb.User{Name: "Alice", Age: 30}
+data, _ := proto.Marshal(u)   // 二进制，体积小、快
+```
+
+<Callout type="tip" title="JSON 还是 Protobuf">
+- 对外 HTTP API、配置文件：JSON 可读、易调试
+- 服务间内部 RPC、高吞吐：Protobuf 省带宽、强类型
+</Callout>
+
+## 4. 两者的 tag 互不干涉
+
+```go
+type Product struct {
+    ID   int    `json:"id" protobuf:"varint,1,opt,name=id"`
+    Name string `json:"name" protobuf:"bytes,2,opt,name=name"`
+}
+```
+
+反射读取时按 tag key 区分（`Get("json")` / `Get("protobuf")`）。
+
+## 小结
+
+- `json` tag 控制字段名；`omitempty` 省零值，`-` 跳过
+- 需要特殊规则就实现 `MarshalJSON` / `UnmarshalJSON`
+- Protobuf 契约优先、二进制编码，适合内部高吞吐
+- JSON 适合对外可读场景，Protobuf 适合内部 RPC
+- 不同格式的 tag 各自独立，靠反射的 key 区分

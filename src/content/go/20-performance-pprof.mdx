@@ -1,0 +1,86 @@
+---
+title: 性能剖析 pprof
+order: 20
+description: CPU / 堆 / goroutine 剖析、火焰图与优化流程
+---
+
+# 性能剖析 pprof
+
+代码跑得慢、内存涨不停，靠猜没用。Go 内置 `pprof`，能在运行时采集 CPU、堆、goroutine 等数据，定位真正的瓶颈。
+
+## 1. 两种采集方式
+
+- **测试时**：`go test -bench=. -cpuprofile=cpu.out`
+- **服务时**：引入 `net/http/pprof`，暴露 `/debug/pprof/`
+
+```go
+import _ "net/http/pprof"
+
+func main() {
+    go func() { http.ListenAndServe("localhost:6060", nil) }()
+    // 你的业务代码
+}
+```
+
+<Callout type="warn" title="别在生产默认开启">
+`net/http/pprof` 会暴露内部信息。生产请加鉴权，或只在出问题时临时开启。
+</Callout>
+
+## 2. 生成火焰图
+
+```bash
+# 采集 30 秒 CPU
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+
+# 采集堆
+go tool pprof http://localhost:6060/debug/pprof/heap
+```
+
+进入交互界面后：
+
+```bash
+(pprof) top10        # 耗时最高的 10 个函数
+(pprof) web          # 生成调用关系图（需 graphviz）
+(pprof) list Func名  # 看具体函数逐行开销
+```
+
+浏览器里还能看火焰图：
+
+```bash
+go tool pprof -http=:8080 cpu.out
+```
+
+## 3. 一个可被优化的例子
+
+```go
+func hot() string {
+    s := ""
+    for i := 0; i < 10000; i++ {
+        s += fmt.Sprintf("%d,", i) // 反复分配，开销大
+    }
+    return s
+}
+```
+
+`pprof` 会显示 `Sprintf` 与字符串拼接占满 CPU。改用 `strings.Builder` 即可大幅下降。
+
+<Callout type="tip" title="先量再改">
+优化铁律：**没有 profile 数据就不动手**。很多「我以为慢」的地方其实不是瓶颈。
+</Callout>
+
+## 4. 内存与 goroutine 泄漏
+
+- `heap`：看哪些对象占内存，定位缓存无限增长
+- `goroutine`：看卡住的 goroutine 堆栈，定位泄漏（比如忘了 close channel、context 没取消）
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+```
+
+## 小结
+
+- pprof 能从 CPU、堆、goroutine 多维度定位性能问题
+- 服务侧靠 `net/http/pprof`，测试侧靠 `-cpuprofile`
+- `top` / `web` / `list` 是三大分析命令，火焰图最直观
+- 优化前先想清楚：没有数据不要猜
+- `heap` 查内存膨胀，`goroutine` 查协程泄漏

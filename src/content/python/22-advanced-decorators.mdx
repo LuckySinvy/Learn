@@ -1,0 +1,116 @@
+---
+title: 装饰器进阶
+order: 22
+description: 异步装饰器、保留完整签名、@singledispatch 单分派与类方法装饰
+---
+
+# 装饰器进阶
+
+第 10 章讲了装饰器的基础模板。真实项目里你会遇到三类「进阶」需求：装饰 `async` 函数、保留被装饰函数的参数签名、以及按参数类型分派不同实现。
+
+## 1. 异步装饰器
+
+装饰 `async def` 时，wrapper 也得是 `async`，且内部 `await func(...)`。
+
+```python
+import asyncio
+import time
+from functools import wraps
+
+def async_timer(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = await func(*args, **kwargs)
+        print(f"[{func.__name__}] 耗时 {time.perf_counter()-start:.4f}s")
+        return result
+    return wrapper
+
+@async_timer
+async def slow(n):
+    await asyncio.sleep(n)
+```
+
+<Callout type="tip" title="统一同步与异步">
+需要一个装饰器同时吃同步和异步函数？在 wrapper 里判断 `inspect.iscoroutinefunction(func)`，分别返回 async / sync 版本。不过通常拆成两个装饰器更清晰。
+</Callout>
+
+## 2. 保留完整签名
+
+`@wraps` 只复制了名字和文档，参数签名仍需确认。`inspect.signature` 能看到真实参数。
+
+```python
+import inspect
+from functools import wraps
+
+def logged(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        print("调用", func.__name__, args, kwargs)
+        return func(*args, **kwargs)
+    return wrapper
+
+@logged
+def add(a: int, b: int) -> int:
+    return a + b
+
+print(inspect.signature(add))     # (a: int, b: int) -> int
+```
+
+## 3. `@singledispatch`：按类型分派
+
+`functools.singledispatch` 让你写一个「同名函数」，根据第一个参数的类型走不同实现——比 `if isinstance` 分支优雅得多。
+
+```python
+from functools import singledispatch
+
+@singledispatch
+def to_html(value):
+    return f"<span>{value}</span>"
+
+@to_html.register
+def _(value: int):
+    return f"<b>{value}</b>"
+
+@to_html.register
+def _(value: list):
+    items = "".join(f"<li>{x}</li>" for x in value)
+    return f"<ul>{items}</ul>"
+
+print(to_html(42))
+print(to_html(["a", "b"]))
+```
+
+<Callout type="info" title="singledispatch 的局限">
+分派只看第一个参数类型，且对子类按 MRO 匹配。多参数类型分派请用第三方库 `plum` 或 `multipledispatch`。
+</Callout>
+
+## 4. 装饰类方法
+
+装饰类方法 / 实例方法时，wrapper 的第一个参数必须是 `self`（或 `cls`），用 `*args, **kwargs` 通吃最省心。要替换方法逻辑推荐用描述符，但大多数场景 `*args, **kwargs` 足矣。
+
+```python
+from functools import wraps
+
+def trace(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        print(f"  -> {func.__name__}({args})")
+        return func(self, *args, **kwargs)
+    return wrapper
+
+class Calc:
+    @trace
+    def add(self, a, b):
+        return a + b
+```
+
+## 小结
+
+- ✅ 异步装饰器：wrapper 也写 `async`，内部 `await`
+- ✅ `inspect.signature` 验证被装饰函数的真实签名
+- ✅ `@singledispatch` 按首参类型分派，替代冗长 `isinstance` 分支
+- ✅ 类方法装饰器首参留 `self`，用 `*args` 通配
+- ✅ 进阶装饰器让横切逻辑（日志、计时、分派）更干净
+
+下一章 **上下文管理器进阶**：异步与动态栈。

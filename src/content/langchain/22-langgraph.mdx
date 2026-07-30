@@ -1,0 +1,82 @@
+---
+title: LangGraph 入门：状态图与多步 Agent
+order: 22
+description: 用 StateGraph 定义节点、边与条件路由，编排可循环、可中断的多步 AI 流程
+---
+
+# LangGraph 入门：状态图与多步 Agent
+
+第 12 章的 `AgentExecutor` 适合线性工具调用。当流程需要「循环、分支、人工审核、长期状态」时，LangGraph 更合适——它把应用建模成一张**状态图（StateGraph）**：节点是步骤，边是流转，状态在节点间累积。
+
+## 1. 定义状态与节点
+
+状态用 `Annotation` 声明，并指定「多个节点如何合并同一字段」：
+
+```ts
+import { StateGraph, Annotation, START, END } from "@langchain/langgraph";
+import { ChatOpenAI } from "@langchain/openai";
+
+const State = Annotation.Root({
+  messages: Annotation<{ role: string; content: string }[]>({
+    reducer: (a, b) => a.concat(b),
+    default: () => [],
+  }),
+  step: Annotation<number>({ default: () => 0 }),
+});
+
+const model = new ChatOpenAI({ model: "gpt-4o-mini" });
+
+async function agent(state: typeof State.State) {
+  const res = await model.invoke(state.messages);
+  return {
+    messages: [{ role: "assistant", content: res.content as string }],
+    step: state.step + 1,
+  };
+}
+```
+
+## 2. 加边与条件路由
+
+`START` 是入口，`END` 是终点；`addConditionalEdges` 让模型决定下一步走向，实现循环或分支：
+
+```ts
+function route(state: typeof State.State) {
+  if (state.step >= 5) return END;
+  if (state.messages.at(-1)?.content.includes("完成")) return END;
+  return "agent";
+}
+
+const graph = new StateGraph(State)
+  .addNode("agent", agent)
+  .addEdge(START, "agent")
+  .addConditionalEdges("agent", route, { agent: "agent", [END]: END })
+  .compile();
+
+const out = await graph.invoke({
+  messages: [{ role: "user", content: "逐步规划一次产品发布" }],
+});
+```
+
+<Callout type="info" title="为什么用 LangGraph">
+相比 `AgentExecutor`，它支持：①多节点循环（不止一次工具调用）；②可中断/恢复（human-in-the-loop）；③显式状态管理。复杂 Agent 首选。
+</Callout>
+
+## 3. 与工具结合
+
+把第 12 章的工具包装成节点，用条件边在「调用工具」与「结束」间切换，即可重建一个可控的 ReAct 循环。
+
+<Callout type="tip" title="可观测">
+LangGraph 与 LangSmith 天然兼容，`compile()` 后的图在 `LANGCHAIN_TRACING_V2=true` 下会被完整追踪每一步状态。
+</Callout>
+
+<Callout type="exercise" title="练习">
+把上面的示例改成「带工具」的图：新增一个 `toolNode`，让 `route` 根据模型是否请求工具决定走 `toolNode` 还是 `END`。
+</Callout>
+
+## 小结
+
+- LangGraph 用 `StateGraph` 把流程建成状态图，节点累积状态
+- `Annotation` 的 `reducer` 决定字段如何合并
+- `addConditionalEdges` + `START/END` 实现循环与分支
+- 适合需要循环、中断、长期状态的多步 Agent
+- 下章把链部署成在线 API →

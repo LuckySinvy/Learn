@@ -1,0 +1,72 @@
+---
+title: 更多数据源（InfluxDB / MySQL）
+order: 26
+description: 接入时序库 InfluxDB 与关系型 MySQL，把业务数据也搬上 Grafana 大屏
+---
+
+# 更多数据源（InfluxDB / MySQL）
+
+前几章的主力是 Prometheus / Loki / Tempo。但很多场景数据在 **InfluxDB**（IoT、传感器）或 **MySQL**（业务表）里。Grafana 原生支持它们，本章给出接入要点。
+
+<Callout type="info" title="数据源是插件化的">
+Grafana 内置数十种数据源，企业版还提供更多。添加方式与第 3 章一致：Configuration → Data sources → Add。
+</Callout>
+
+## 1. InfluxDB（Flux 查询）
+
+Grafana 支持 InfluxQL 与更现代的 **Flux** 两种查询语言。以 Flux 为例：
+
+```yaml
+# 数据源配置
+name: InfluxDB
+type: influxdb
+url: http://influxdb:8086
+organization: my-org
+token: $INFLUX_TOKEN
+```
+
+面板查询：
+
+```flux
+from(bucket: "sensors")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "temperature")
+  |> mean()
+```
+
+## 2. MySQL 业务表
+
+把数据库当数据源，直接可视化业务指标（订单数、活跃用户）：
+
+```yaml
+type: mysql
+url: mysql-host:3306
+database: shop
+user: grafana_ro
+# 建议给只读账号，限定 SELECT
+```
+
+面板里写 SQL（用时间宏 `$__timeFilter(created_at)`）：
+
+```sql
+SELECT created_at AS time, count(*) AS orders
+FROM orders
+WHERE $__timeFilter(created_at)
+GROUP BY time
+ORDER BY time;
+```
+
+<Callout type="warn" title="给数据库只读权限">
+Grafana 查询等于把 SQL 执行权交出去。务必用**只读账号**，并限制库表，避免误删或慢查询拖垮业务库。
+</Callout>
+
+## 3. 跨数据源混排
+
+不同数据源的面板可放在同一 Dashboard，配合模板变量（第 9 章）做统一时间切换，实现「业务指标 + 系统指标」同屏对照。
+
+## 小结
+
+- Grafana 原生支持 InfluxDB（Flux/InfluxQL）与 MySQL 等数据源
+- InfluxDB 用 bucket + range 查询；MySQL 用 SQL + 时间宏
+- 数据库数据源务必用只读账号，防止误操作和性能风险
+- 多源混排能让业务与系统指标同屏对照 →

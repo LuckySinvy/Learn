@@ -1,0 +1,122 @@
+---
+title: 枚举与模式匹配
+order: 9
+description: 定义枚举、理解 Option 消除空指针，并用 match 与 if let 做穷尽匹配
+---
+
+# 枚举与模式匹配
+
+**枚举（enum）** 让你定义一个「可能是几种类型之一」的类型。Rust 的枚举极强大：每个变体可携带不同数据。
+
+## 1. 基础枚举
+
+```rust
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+
+fn main() {
+    let d = Direction::North;
+}
+```
+
+## 2. 携带数据的枚举
+
+```rust
+enum Message {
+    Quit,                        // 无数据
+    Move { x: i32, y: i32 },     // 具名字段
+    Write(String),               // 元组式
+    ChangeColor(i32, i32, i32),
+}
+
+fn main() {
+    let m = Message::Write(String::from("hi"));
+}
+```
+
+## 3. Option：没有 null 的世界
+
+Rust 没有 `null`。用标准库 `Option<T>` 表达「可能有值」：
+
+```rust
+enum Option<T> {
+    Some(T),
+    None,
+}
+```
+
+用它彻底消灭空指针异常：
+
+```rust
+fn divide(a: f64, b: f64) -> Option<f64> {
+    if b == 0.0 { None } else { Some(a / b) }
+}
+
+fn main() {
+    match divide(10.0, 2.0) {
+        Some(v) => println!("结果 {}", v),
+        None => println!("除零错误"),
+    }
+}
+```
+
+<Callout type="warn" title="Option 强制你处理 None">
+因为 `Option<T>` 不是 `T`，你**必须**用 `match`/`if let` 把它拆开才能拿到里面的值。编译器逼你处理「没有值」的情况，从根上避免空引用崩溃。
+</Callout>
+
+## 4. if let / while let 简化匹配
+
+只关心一个分支时，不必写完整 `match`：
+
+```rust
+fn main() {
+    let some = Some(7);
+    if let Some(n) = some {
+        println!("得到 {}", n);
+    }
+
+    let mut stack = vec![Some(1), None, Some(2)];
+    while let Some(v) = stack.pop() {
+        println!("{:?}", v);
+    }
+}
+```
+
+<Callout type="tip" title="match 还是 if let">
+需要穷尽处理所有变体用 `match`；只关心某个变体、其余忽略时用 `if let`，更简洁。
+</Callout>
+
+## 5. 枚举也能有方法
+
+```rust
+impl Message {
+    fn call(&self) {
+        // 可在 impl 里为枚举定义方法
+    }
+}
+```
+
+## 6. 实战：计算表达式
+
+```rust
+enum Expr {
+    Num(i32),
+    Add(Box<Expr>, Box<Expr>),
+}
+```
+
+<Callout type="exercise" title="练习">
+定义一个 `enum Shape { Circle(f64), Rectangle(f64, f64) }`，写一个 `fn area(s: &Shape) -> f64` 用 `match` 计算面积（圆用 π·r²）。再补一个 `Triangle` 变体，体会穷尽性要求你同步更新 match。
+</Callout>
+
+## 小结
+
+- 枚举变体可携带任意数据（单元/元组/结构体风格）
+- `Option<T>` 替代 null，强制处理 `None`
+- `match` 穷尽匹配；`if let` 简化单分支
+- 枚举同样可用 `impl` 加方法
+- 下一章看模块与可见性 →

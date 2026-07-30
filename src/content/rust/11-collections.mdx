@@ -1,0 +1,105 @@
+---
+title: 常用集合类型
+order: 11
+description: Vec、String 与 HashMap 等标准集合的创建、增删查改，以及它们与所有权/借用的关系
+---
+
+# 常用集合类型
+
+Rust 标准库 `std::collections` 提供运行时动态的集合。它们都在**堆上**存储数据，与编译期定长的数组/元组互补。
+
+## 1. Vec 动态数组
+
+```rust
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(1);
+    v.push(2);
+
+    let v2 = vec![10, 20, 30];   // 宏快速创建
+    let third = &v2[2];          // 越界 panic
+    let maybe = v2.get(2);       // 越界返回 None，更安全
+
+    for x in &v2 {
+        println!("{}", x);
+    }
+}
+```
+
+<Callout type="warn" title="下标访问 vs get">
+`v[i]` 越界直接 panic；`v.get(i)` 返回 `Option<&T>`，应优先用于不确定是否越界的场景。
+</Callout>
+
+## 2. 元素的所有权
+
+`Vec` 拥有其元素。放入 `String` 等会 move 所有权；遍历时用 `&v` 借用：
+
+```rust
+let mut words = vec![String::from("a"), String::from("b")];
+words.push(String::from("c"));
+for w in &words { println!("{}", w); }
+```
+
+## 3. String 与字符串拼接
+
+`String` 是堆上可增长的 UTF-8 字符串。常用操作：
+
+```rust
+fn main() {
+    let mut s = String::from("Hello");
+    s.push_str(", ");
+    s.push('R');                  // push 单字符
+    s += "ust";                   // 等价于 push_str，需 &str
+
+    let s2 = format!("{}-{}", s, 2024);   // format! 不获取所有权
+    println!("{}", s2);
+}
+```
+
+<Callout type="tip" title="format! 不转移所有权">
+`format!` 很像 `println!`，但返回 `String`，且不获取参数所有权，适合构造新字符串。
+</Callout>
+
+## 4. HashMap 键值对
+
+```rust
+use std::collections::HashMap;
+
+fn main() {
+    let mut scores = HashMap::new();
+    scores.insert(String::from("blue"), 10);
+    scores.insert(String::from("red"), 20);
+
+    let v = scores.get("blue");   // Option<&i32>
+    scores.entry(String::from("green")).or_insert(0);  // 不存在才插入
+
+    for (k, val) in &scores {
+        println!("{}: {}", k, val);
+    }
+}
+```
+
+<Callout type="info" title="entry API 很实用">
+`entry(key).or_insert(default)` 是「存在就用、不存在就插入默认值」的惯用法，避免先 `get` 再 `insert` 的两次查找。
+</Callout>
+
+## 5. 集合选择速查
+
+| 集合 | 特点 | 场景 |
+|---|---|---|
+| `Vec<T>` | 顺序、可增长 | 列表、队列 |
+| `String` | UTF-8 文本 | 文本 |
+| `HashMap<K,V>` | 哈希查找 | 字典、缓存 |
+| `HashSet<T>` | 去重集合 | 唯一值 |
+
+<Callout type="exercise" title="练习">
+用 `Vec<i32>` 存一组数，计算平均值；再用 `HashMap<String, u32>` 统计一段文本中各单词出现次数（用 `entry().or_insert(0)` 累加）。
+</Callout>
+
+## 小结
+
+- `Vec` 动态数组，越界用 `get` 返回 `None` 更安全
+- `String` 可增长 UTF-8，拼接用 `push_str`/`+`/`format!`
+- `HashMap` 用 `entry().or_insert()` 做默认插入
+- 集合拥有元素所有权，遍历用 `&` 借用
+- 下一章看错误处理 →

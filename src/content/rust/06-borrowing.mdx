@@ -1,0 +1,98 @@
+---
+title: 借用与引用
+order: 6
+description: 理解 & 引用、不可变借用与可变借用的规则，以及借用检查器如何保证内存安全
+---
+
+# 借用与引用
+
+如果每次访问都要转移所有权，代码会很难写。Rust 提供**借用（borrowing）**：用 `&` 借来用一下，用完归还，所有权不变。
+
+## 1. 不可变引用 &T
+
+```rust
+fn print_len(s: &String) {
+    println!("长度 = {}", s.len());
+}   // s 只是借用，不会 drop 原数据
+
+fn main() {
+    let s = String::from("hello");
+    print_len(&s);          // 传引用，s 仍可用
+    println!("{}", s);
+}
+```
+
+## 2. 可变引用 &mut T
+
+```rust
+fn append(s: &mut String) {
+    s.push_str(" world");
+}
+
+fn main() {
+    let mut s = String::from("hello");
+    append(&mut s);
+    println!("{}", s);   // hello world
+}
+```
+
+<Callout type="warn" title="借用检查器的核心规则">
+1. 同一时刻可以有**多个不可变借用** `&T`；
+2. 或**只有一个可变借用** `&mut T`；
+3. 二者**不能同时存在**。
+这保证了不存在「数据竞争」——编译期就杜绝了并发读写冲突。
+</Callout>
+
+## 3. 借用规则实战
+
+```rust
+fn main() {
+    let mut s = String::from("hi");
+    let r1 = &s;          // 不可变借用
+    let r2 = &s;          // 多个不可变借用，OK
+    println!("{} {}", r1, r2);
+
+    // 借用结束后，才能再借可变
+    let r3 = &mut s;      // OK，因为 r1/r2 已不再使用
+    r3.push_str("!");
+}
+```
+
+<Callout type="tip" title="非词法生命周期（NLL）">
+现代 Rust 用 NLL：借用在「最后一次使用处」就结束，不必等到作用域末尾。上面例子能编译通过正是这个原因。
+</Callout>
+
+## 4. 悬垂引用被禁止
+
+Rust 不允许返回指向局部变量的引用：
+
+```rust
+// fn dangle() -> &String {       // 编译错误
+//     let s = String::from("x");
+//     &s                          // s 即将 drop，引用会悬垂
+// }
+```
+
+<Callout type="info" title="为何安全">
+编译器静态追踪每个引用的生命周期，发现引用活得比数据久就报错。无需运行时开销，也无需 GC。
+</Callout>
+
+## 5. 借用 vs 克隆的性能权衡
+
+| 方式 | 开销 | 场景 |
+|---|---|---|
+| `&T` 借用 | 零拷贝 | 只读访问大对象 |
+| `&mut T` | 零拷贝 | 需原地修改 |
+| `clone()` | 复制全部堆数据 | 确需独立副本 |
+
+<Callout type="exercise" title="练习">
+写一个 `fn longest(a: &String, b: &String) -> &String` 返回较长字符串的引用（先别管生命周期标注，体会借用）。再故意在持有 `&mut` 的同时又读 `&`，观察编译器的拒绝信息。
+</Callout>
+
+## 小结
+
+- `&T` 不可变借用，可多个共存；`&mut T` 可变借用，仅一个
+- 不可变与可变借用互斥，编译期消除数据竞争
+- NLL 让借用在使用结束即失效，更灵活
+- 悬垂引用被静态禁止
+- 下一章看切片与借用的关系 →

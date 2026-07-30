@@ -1,0 +1,86 @@
+---
+title: 输出解析进阶
+order: 19
+description: 用 OutputFixingParser、RetryOutputParser、XMLOutputParser 与流式解析应对脏输出与结构化需求
+---
+
+# 输出解析进阶
+
+第 5 章介绍了 `String / Json / Structured` 三类基础解析器。真实生产中，模型可能吐出非法 JSON、缺字段、或需要更严格的结构。本章补充几种进阶解析手段。
+
+## 1. OutputFixingParser：自动修复脏 JSON
+
+模型偶尔返回「少了个引号」的非法 JSON。与其直接报错，不如让另一个模型把输出修好再解析：
+
+```ts
+import { JsonOutputParser, OutputFixingParser } from "langchain/output_parsers";
+import { ChatOpenAI } from "@langchain/openai";
+
+const baseParser = new JsonOutputParser();
+const fixParser = OutputFixingParser.fromLLM(
+  new ChatOpenAI({ model: "gpt-4o-mini" }),
+  baseParser
+);
+
+const bad = '{ name: "张三", age: 28 }'; // 缺引号，非法 JSON
+const fixed = await fixParser.parse(bad);
+console.log(fixed); // { name: "张三", age: 28 }
+```
+
+<Callout type="info" title="修复也是一次 LLM 调用">
+`OutputFixingParser` 会附带原始错误与期望 schema 再问一次模型。注意它会额外消耗 Token 与延迟，仅对「大概率可修」的输出使用。
+</Callout>
+
+## 2. RetryOutputParser：结合提示重试
+
+与 Fixing 类似，但把「格式说明」重新塞回提示词，让模型重新生成，而非在原字符串上打补丁：
+
+```ts
+import { RetryOutputParser } from "langchain/output_parsers";
+
+const retryParser = new RetryOutputParser({
+  parser: baseParser,
+  retryChain: retryChain, // 把 format_instructions 再喂给模型
+});
+```
+
+## 3. XMLOutputParser：标签结构更稳
+
+当 JSON 嵌套深、易出括号错误时，改用 XML 标签输出，解析更不易坏：
+
+```ts
+import { XMLOutputParser } from "@langchain/core/output_parsers";
+
+const parser = new XMLOutputParser();
+// 模型输出 <person><name>张三</name><age>28</age></person>
+const out = await parser.parse(await model.invoke(prompt));
+```
+
+## 4. 流式下的解析
+
+接了 `StringOutputParser` 的链可直接 `.stream()` 逐块拿到字符串；结构化解析器同样支持 `streamEvents` 暴露中间 token：
+
+```ts
+const stream = await chain.streamEvents(input, { version: "v2" });
+for await (const ev of stream) {
+  if (ev.event === "on_parser_stream") {
+    process.stdout.write(ev.data.chunk as string);
+  }
+}
+```
+
+<Callout type="tip" title="挑选策略">
+偶发脏输出 → `OutputFixingParser`；需彻底重生成 → `RetryOutputParser`；结构极复杂 → `XMLOutputParser`。无论哪种，最终都要用 Zod `.safeParse` 兜底。
+</Callout>
+
+<Callout type="exercise" title="练习">
+构造一段故意缺引号的 JSON 字符串，用 `OutputFixingParser` 修复，并对比直接 `JSON.parse` 抛错的情况。
+</Callout>
+
+## 小结
+
+- `OutputFixingParser` 用二次 LLM 调用修复非法 JSON
+- `RetryOutputParser` 重喂格式说明让模型重新生成
+- `XMLOutputParser` 用标签结构降低括号错误
+- 结构化解析仍须 Zod 兜底校验
+- 下章把检索结果进一步压缩提纯 →

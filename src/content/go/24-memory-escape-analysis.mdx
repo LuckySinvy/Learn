@@ -1,0 +1,76 @@
+---
+title: 内存模型与逃逸分析
+order: 24
+description: 栈与堆、逃逸分析、-gcflags、happen-before 与并发可见性
+---
+
+# 内存模型与逃逸分析
+
+理解 Go 的内存分配与「逃逸」，能写出更省、更快的代码。
+
+## 1. 栈与堆
+
+Go 里局部变量优先分配在**栈**上，函数返回自动回收，零成本。若编译器判定「变量在函数返回后还得活着」，它就**逃逸**到**堆**，由 GC 管理。
+
+```go
+func stackInt() int {
+    x := 42
+    return x // x 在栈，安全复制
+}
+
+func escape() *int {
+    x := 42
+    return &x // x 逃逸到堆，因为返回了它的地址
+}
+```
+
+## 2. 查看逃逸
+
+```bash
+go build -gcflags="-m" main.go
+```
+
+输出会标出哪些变量逃逸，例如：`moved to heap: x`。
+
+<Callout type="info" title="为什么关心">
+堆分配更慢，还会增加 GC 压力。高频路径上减少逃逸，能明显降延迟。
+</Callout>
+
+## 3. 常见逃逸原因
+
+- 返回局部变量指针
+- 闭包捕获大对象
+- 切片或 map 在编译期大小未知
+- 接口值装箱（`any` 装大结构体）
+
+## 4. 内存模型与 happen-before
+
+Go 内存模型定义「什么情况下一个 goroutine 的写对另一个可见」。核心规则：
+
+- 同一 goroutine 内，顺序执行
+- channel 通信建立 happen-before：发送「先于」对应接收
+- `sync.Mutex` 的 `Unlock` 先于后续 `Lock`
+
+```go
+var done = make(chan bool)
+var data string
+
+go func() {
+    data = "ready"   // 写
+    done <- true     // 发送
+}()
+<-done               // 接收：保证能看到 data 的写
+fmt.Println(data)
+```
+
+<Callout type="warn" title="别靠推理并发可见性">
+不要假设「先写后读」就一定可见。务必用 channel 或锁建立 happen-before，否则是数据竞争。
+</Callout>
+
+## 小结
+
+- 局部变量优先在栈；被外部引用才逃逸到堆
+- `go build -gcflags="-m"` 查看逃逸情况
+- 返回指针、闭包捕获、接口装箱是常见逃逸诱因
+- 内存模型靠 channel 或锁建立 happen-before
+- 并发可见性必须用同步原语保证，不能靠直觉

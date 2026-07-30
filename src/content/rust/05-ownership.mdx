@@ -1,0 +1,93 @@
+---
+title: 所有权
+order: 5
+description: 掌握 Rust 内存管理的三大规则、move 语义，以及栈与堆对所有权的影响
+---
+
+# 所有权
+
+**所有权（Ownership）** 是 Rust 最独特的特性，它让 Rust 无需垃圾回收也能保证内存安全。每个值都有唯一的「所有者」。
+
+## 1. 三条规则
+
+1. 每个值有且仅有一个**所有者**（owner）。
+2. 同一时刻只能有一个所有者。
+3. 当所有者离开作用域，值被自动释放（`drop`）。
+
+```rust
+fn main() {
+    {
+        let s = String::from("hello");  // s 进入作用域，拥有堆上的字符串
+    }                                    // 离开作用域，s 被 drop，内存释放
+}
+```
+
+<Callout type="info" title="RAII 风格">
+Rust 用「资源获取即初始化」思路：值离开作用域就自动清理，无需手动 free，也不会有 GC 停顿。
+</Callout>
+
+## 2. 栈与堆
+
+- **栈（stack）**：大小固定、存取极快，存放 `i32`、`char`、以及指向堆的指针。
+- **堆（heap）**：大小可变（如 `String`、动态 `Vec`），分配较慢，通过指针访问。
+
+`String` 在栈上存「指针+长度+容量」，真正文本在堆上。正因如此，赋值时会涉及所有权转移。
+
+## 3. move 语义
+
+把值赋给另一个变量（或传参）时，对于堆数据会**转移所有权（move）**，而非深拷贝：
+
+```rust
+fn main() {
+    let s1 = String::from("hello");
+    let s2 = s1;          // 所有权从 s1 移到 s2
+    // println!("{}", s1); // 编译错误：s1 已失效，避免双重释放
+    println!("{}", s2);
+}
+```
+
+<Callout type="warn" title="浅拷贝 + 失效旧绑定">
+`let s2 = s1` 只复制了栈上的指针，但 Rust 让 s1 失效，保证不会有两个变量同时释放同一块堆内存。这就是「move」的本质。
+</Callout>
+
+## 4. 克隆与拷贝
+
+需要真正复制堆数据时，显式 `clone()`：
+
+```rust
+let s1 = String::from("hi");
+let s2 = s1.clone();    // 深拷贝，s1 仍可用
+```
+
+而 `i32` 等「实现了 `Copy`  trait」的简单类型，赋值会**按位复制**且旧值仍可用：
+
+```rust
+let a = 5;
+let b = a;              // i32 是 Copy，a 仍可用
+```
+
+## 5. 函数传参与返回
+
+传参也是 move，返回值可把所有权「交还」回来：
+
+```rust
+fn take(s: String) { /* s 在此 drop */ }
+fn give() -> String { String::from("owned") }
+
+fn main() {
+    let s = give();     // 获得所有权
+    take(s);            // 移交所有权，此后 s 不可用
+}
+```
+
+<Callout type="exercise" title="练习">
+预测并验证：写一个函数 `fn len(s: String) -> usize` 返回字符串长度（内部 `s.len()`），调用后试着再打印原变量，看编译器如何阻止你使用已 move 的值。
+</Callout>
+
+## 小结
+
+- 值有唯一所有者；离开作用域自动 drop
+- 堆数据赋值是 move（旧绑定失效），避免双重释放
+- `clone()` 深拷贝；`Copy` 类型（如 i32）赋值是位拷贝
+- 函数传参移交所有权，返回值可交还
+- 下一章用「借用」避免频繁 move →

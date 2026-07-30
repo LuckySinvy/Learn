@@ -1,0 +1,83 @@
+---
+title: Record 记录类
+order: 19
+description: Java 16 正式引入的 record：作为不可变数据载体，自动生成构造器、访问器、equals、hashCode 与 toString
+---
+
+# Record 记录类
+
+从 Java 16 开始，`record` 成为正式特性。它的定位非常清晰：**承载不可变数据的小型类型**。过去为了一个「坐标点」「配置项」要写几十行样板代码，现在一行搞定。
+
+## 1. 为什么需要 record
+
+传统 POJO（普通 Java 类）为了表达一个纯数据对象，必须手写或让 IDE 生成：构造器、getter、equals、hashCode、toString。这些代码没有任何业务逻辑，却占据大量篇幅，且容易写错。
+
+`record` 是**透明的数据载体**：你只声明「有哪些组件」，编译器自动补上其余一切。
+
+```java
+// 一行声明，自动获得 Point(int x, int y) 构造器、x() / y() 访问器、
+// equals / hashCode / toString
+public record Point(int x, int y) {}
+```
+
+## 2. 自动生成的成员
+
+声明 `record Point(int x, int y)` 后，编译器在底层生成：
+
+- 一个构造器 `Point(int x, int y)`，按声明顺序赋值
+- 每个组件的访问器（注意：叫 `x()` 而非 `getX()`)
+- `equals` 与 `hashCode`：当且仅当所有组件相等时两实例相等
+- `toString`：格式为 `Point[x=1, y=2]`
+
+<Callout type="info" title="record 默认不可变">
+组件字段是 `final` 的，没有 setter。这是它和「可变 JavaBean」最根本的区别——线程安全、可作 Map 的 key。
+</Callout>
+
+## 3. 紧凑构造器做校验
+
+如果需要在构造时校验数据，可以写**紧凑构造器**（compact constructor），没有参数列表，直接写大括号：
+
+```java
+public record Range(int lo, int hi) {
+    public Range {
+        if (lo > hi) throw new IllegalArgumentException("lo 必须 <= hi");
+    }
+}
+```
+
+编译器会把你写的赋值逻辑插回自动生成的构造器中，避免重复声明参数。
+
+## 4. 自定义成员与局部 record
+
+你可以给 record 追加方法，甚至覆盖访问器：
+
+```java
+public record Point(int x, int y) {
+    int sum() { return x + y; }
+
+    // 覆盖访问器：返回绝对值
+    public int x() { return Math.abs(x); }
+}
+```
+
+在方法内部还能声明**局部 record**，非常适合把中间计算结果打包：
+
+```java
+List<Point> pts = List.of(new Point(1, 2), new Point(3, 4));
+record Dist(Point p, double d) {}
+var result = pts.stream()
+    .map(p -> new Dist(p, Math.hypot(p.x(), p.y())))
+    .toList();
+```
+
+<Callout type="tip" title="record 与 Lombok 的区别">
+Lombok 用注解在编译期改字节码，需要插件且调试困难；`record` 是语言原生特性，语义明确、工具链零额外依赖。简单数据载体优先用 `record`。
+</Callout>
+
+## 小结
+
+- ✅ `record` 是 Java 16 的不可变数据载体，一行声明省去大量样板
+- ✅ 自动生成构造器、访问器（`x()` 风格）、equals、hashCode、toString
+- ✅ 字段默认 `final`，天然线程安全
+- ✅ 用紧凑构造器做参数校验，可追加/覆盖成员
+- ✅ 局部 record 适合打包中间计算结果

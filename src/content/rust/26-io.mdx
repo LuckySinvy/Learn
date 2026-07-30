@@ -1,0 +1,96 @@
+---
+title: 文件与 IO
+order: 26
+description: 用 std::fs 读写文件、BufReader/Writer 缓冲、以及 IO 错误与 Result 的配合
+---
+
+# 文件与 IO
+
+Rust 的文件操作集中在 `std::fs` 与 `std::io`。所有失败都以 `Result` 返回，逼你处理错误。
+
+## 1. 简单读写
+
+```rust
+use std::fs;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    fs::write("out.txt", "hello".as_bytes())?;     // 整个写入（覆盖）
+    let content = fs::read_to_string("out.txt")?;   // 读为字符串
+    println!("{}", content);
+    Ok(())
+}
+```
+
+<Callout type="info" title="write/read 一次性完成">
+`fs::write`/`fs::read_to_string`/`fs::read` 适合小文件，一次读写全部。大文件要用带缓冲的流式读写。
+</Callout>
+
+## 2. 打开文件与缓冲
+
+```rust
+use std::fs::File;
+use std::io::{self, Read, Write, BufReader, BufWriter};
+
+fn main() -> io::Result<()> {
+    let f = File::open("in.txt")?;
+    let mut reader = BufReader::new(f);   // 带缓冲，减少系统调用
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 { break; }
+        print!("{}", line);
+    }
+    Ok(())
+}
+```
+
+<Callout type="tip" title="BufReader/BufWriter 提升性能">
+直接对 `File` 读写每次都是系统调用。套一层 `BufReader`/`BufWriter` 后，数据先在内存缓冲，攒一批再落盘，大文件尤其明显。
+</Callout>
+
+## 3. 写入缓冲
+
+```rust
+let f = File::create("out.txt")?;
+let mut w = BufWriter::new(f);
+writeln!(w, "第一行")?;
+writeln!(w, "第二行")?;
+w.flush()?;    // 确保缓冲全部写入
+```
+
+## 4. 路径与目录
+
+```rust
+use std::path::Path;
+let p = Path::new("a/b.txt");
+println!("{:?}", p.parent());
+println!("{:?}", p.file_name());
+
+fs::create_dir_all("logs")?;
+```
+
+<Callout type="warn" title="IO 错误必须用 ? 或 match 处理">
+`File::open` 返回 `Result`，文件不存在时是 `Err`。务必传播或处理，不能 `unwrap` 进生产代码（库场景）。
+</Callout>
+
+## 5. 标准输入输出
+
+```rust
+use std::io::{self, Write};
+let mut input = String::new();
+io::stdin().read_line(&mut input)?;
+io::stdout().write_all(b"hi\n")?;
+```
+
+<Callout type="exercise" title="练习">
+写一个程序：读 `input.txt`（逐行用 `BufReader`），把每行加行号后写入 `output.txt`（用 `BufWriter`），统计总行数并打印。文件不存在时给出友好错误。
+</Callout>
+
+## 小结
+
+- `fs::write`/`read_to_string` 适合小文件一次性操作
+- `BufReader`/`BufWriter` 缓冲减少系统调用，适合大文件
+- 路径用 `Path`，目录用 `create_dir_all`
+- 所有 IO 返回 `Result`，必须处理错误
+- 下一章看 serde 序列化 →

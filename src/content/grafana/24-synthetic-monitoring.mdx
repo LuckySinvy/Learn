@@ -1,0 +1,58 @@
+---
+title: 合成监控（Synthetic Monitoring）
+order: 24
+description: 用 Grafana Synthetic Monitoring 主动探测可用性，从用户视角监控网站与接口
+---
+
+# 合成监控（Synthetic Monitoring）
+
+前面学的指标/日志/链路都是「被动」观测。**Synthetic Monitoring（合成监控）** 则是主动出击：从全球探针周期性地访问你的站点 / API，验证「用户能不能打开」「接口通不通」。
+
+<Callout type="info" title="本质是黑盒探测">
+合成监控不依赖应用埋点，而是像真实用户一样发请求，因而能发现「服务起来了但页面报错」这类埋点看不到的问题。
+</Callout>
+
+## 1. 支持的探测类型
+
+- **Ping**：ICMP 连通性
+- **HTTP**：状态码、响应时间、内容匹配
+- **DNS / TCP / gRPC**：协议层可用性
+- **Browser（多步）**：用脚本模拟点击、登录等真实用户路径
+
+## 2. 配置一个 HTTP 检查
+
+通过 Grafana Cloud 或自建 `sm-agent` + `blackbox-exporter`：
+
+```yaml
+# blackbox-exporter 模块
+modules:
+  http_2xx:
+    prober: http
+    http:
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+```
+
+在 Grafana → Synthetic Monitoring → Add check：
+
+```text
+Target: https://example.com
+Frequency: 60s
+Probe locations: 北京 / 法兰克福 / 弗吉尼亚
+Assertions: 状态码 == 200, 响应时间 < 800ms
+```
+
+## 3. 结果可视化
+
+探测结果自动进入 Prometheus 风格指标（如 `probe_success`、`probe_duration_seconds`），可直接在面板里画各地区的可用率与延迟热力图。
+
+<Callout type="tip" title="与告警联动">
+对 `probe_success == 0` 设告警，比「用户投诉后才发现宕机」早一步。多地区同时失败，基本可判定源站问题。
+</Callout>
+
+## 小结
+
+- 合成监控是主动黑盒探测，覆盖「可用性 + 体验」盲区
+- 支持 Ping / HTTP / DNS / TCP / Browser 多类型
+- 探测指标进入 Prometheus，可画图、可告警
+- 多地区探针能区分「局部网络」与「源站」故障 →

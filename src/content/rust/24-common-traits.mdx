@@ -1,0 +1,113 @@
+---
+title: 常用派生 Trait
+order: 24
+description: Debug/Display/Clone/Copy/Default/From/Into 等标准 trait 的用途、对比与实现方式
+---
+
+# 常用派生 Trait
+
+Rust 标准库提供一批**标记性/工具性 trait**，多数可用 `#[derive(...)]` 自动实现。掌握它们能大幅减少样板代码。
+
+## 1. Debug 与 Display
+
+- `Debug`（`{:?}`）：面向程序员的调试输出，`derive` 即可。
+- `Display`（`{}`）：面向用户的友好输出，需手动 `impl`。
+
+```rust
+use std::fmt;
+
+#[derive(Debug)]
+struct Point { x: i32, y: i32 }
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+fn main() {
+    let p = Point { x: 1, y: 2 };
+    println!("{:?}", p);   // Debug
+    println!("{}", p);     // Display
+}
+```
+
+<Callout type="info" title="Display 必须手写">
+`Debug` 能 derive，但 `Display` 表达「如何展示给用户」，语义各异，所以必须自己实现，且它不自动附带 `Debug`。
+</Callout>
+
+## 2. Clone 与 Copy
+
+- `Clone`：`clone()` 显式深拷贝（堆数据也复制）。
+- `Copy`：按位复制且源仍可用（仅限简单栈类型）。
+
+```rust
+#[derive(Clone, Copy)]
+struct Pixel { r: u8, g: u8, b: u8 }
+```
+
+<Callout type="warn" title="Copy 是标记，不实现方法">
+`Copy` 表示「赋值即复制且原值有效」。含堆数据的类型（如 String）不能 `Copy`。`Copy` 自动隐含 `Clone`。
+</Callout>
+
+## 3. Default
+
+提供「缺省值」：
+
+```rust
+#[derive(Default)]
+struct Config { port: u16, debug: bool }
+fn main() {
+    let c = Config::default();   // port=0, debug=false
+}
+```
+
+## 4. From / Into
+
+`From<T>` 定义「从 T 转换」，有了 `From` 编译器自动免费获得 `Into`：
+
+```rust
+struct Meter(f64);
+impl From<f64> for Meter {
+    fn from(v: f64) -> Self { Meter(v) }
+}
+fn main() {
+    let m: Meter = 3.0.into();   // 自动获得 Into
+}
+```
+
+<Callout type="tip" title="优先实现 From">
+实现 `From<T>` 后，`Into<T>` 自动可用，调用方选哪个都行。标准库转换（如 `String::from("x")`）都走 `From`。
+</Callout>
+
+## 5. PartialEq / Eq / PartialOrd / Ord
+
+用于 `==`、排序比较：
+
+```rust
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Rank { v: u32 }
+```
+
+## 6. 常用派生速查
+
+| trait | 用途 |
+|---|---|
+| `Debug` | `{:?}` 调试输出 |
+| `Display` | `{}` 用户输出（手写） |
+| `Clone`/`Copy` | 复制语义 |
+| `Default` | 默认值 |
+| `From`/`Into` | 类型转换 |
+| `PartialEq` | `==` 比较 |
+
+<Callout type="exercise" title="练习">
+定义 `struct Temperature { kelvin: f64 }`，实现 `From<f64>`（视为摄氏度转开尔文），并 `derive(Debug, Clone, PartialEq)`。写一个把 `Vec<f64>` 用 `into()` 转成 `Vec<Temperature>` 的小例子。
+</Callout>
+
+## 小结
+
+- `Debug` 可 derive；`Display` 须手写，面向用户
+- `Clone` 深拷贝，`Copy` 仅栈类型位拷贝
+- `Default` 提供缺省值；`From` 自动获得 `Into`
+- 比较类 trait 多数可 derive
+- 下一章深入字符串 →

@@ -1,0 +1,82 @@
+---
+title: 向量库进阶：自查询与混合检索
+order: 21
+description: 用 SelfQueryRetriever 让模型生成元数据过滤，用 EnsembleRetriever 融合语义与关键词
+---
+
+# 向量库进阶：自查询与混合检索
+
+第 10 章的向量检索只看「语义相似」。但用户常隐含过滤条件，例如「2024 年的产品文档」「价格低于 100 的手机」。本章介绍两种进阶检索能力。
+
+## 1. SelfQueryRetriever：自然语言转元数据过滤
+
+它让 LLM 把问题拆成两部分：①语义查询向量，②结构化过滤条件（如 `year == 2024`）。检索时同时生效：
+
+```ts
+import { SelfQueryRetriever } from "langchain/retrievers/self_query";
+import { Metalimiter } from "langchain/retrievers/self_query/metdata";
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+const attributeInfo = [
+  { name: "year", type: "integer", description: "文档年份" },
+  { name: "category", type: "string", description: "所属分类" },
+];
+
+const selfQuery = await SelfQueryRetriever.fromLLM(
+  new ChatOpenAI({ model: "gpt-4o-mini" }),
+  vectorStore,
+  attributeInfo,
+  "公司知识库",
+  { k: 4 }
+);
+
+const docs = await selfQuery.getRelevantDocuments("2024 年关于定价的文档");
+// 内部生成：query=定价, filter={ year: 2024 }
+```
+
+<Callout type="info" title="先有元数据">
+自查询依赖文档写入时已带 `metadata`（year、category 等）。建库时务必在 `addDocuments` 时附上结构化字段。
+</Callout>
+
+## 2. EnsembleRetriever：混合检索融合
+
+纯向量检索对「专有名词、编号、精确关键词」不敏感。混合检索把「向量语义」与「BM25 关键词」结果融合，取长补短：
+
+```ts
+import { EnsembleRetriever } from "langchain/retrievers/ensemble";
+import { BM25Retriever } from "langchain/retrievers/bm25";
+
+const bm25 = BM25Retriever.fromDocuments(docs, { k: 4 });
+const vector = vectorStore.asRetriever({ k: 4 });
+
+const hybrid = new EnsembleRetriever({
+  retrievers: [bm25, vector],
+  weights: [0.5, 0.5], // 两种结果各占一半
+});
+
+const docs = await hybrid.getRelevantDocuments("接口返回 500 怎么办");
+```
+
+<Callout type="tip" title="权重怎么调">
+专有名词/错误码多的语料 → 调高 BM25 权重；长尾语义问题多 → 调高向量权重。用第 14 章回调对比命中率再定。
+</Callout>
+
+## 3. 对比选型
+
+| 检索方式 | 擅长 | 短板 |
+|---|---|---|
+| 纯向量 | 语义泛化 | 精确词/编号弱 |
+| SelfQuery | 带过滤的语义 | 依赖元数据质量 |
+| 混合（Ensemble） | 语义+关键词 | 实现稍复杂 |
+
+<Callout type="exercise" title="练习">
+给文档补上 `year` 元数据后用 `SelfQueryRetriever` 查询「去年发布的接口文档」，观察生成的过滤条件是否符合预期。
+</Callout>
+
+## 小结
+
+- `SelfQueryRetriever` 用 LLM 把问题拆成语义查询 + 元数据过滤
+- `EnsembleRetriever` 融合 BM25 与向量，实现混合检索
+- 自查询强依赖建库时的结构化元数据
+- 混合检索兼顾语义泛化与精确关键词
+- 下章进入 LangGraph，编排多步状态图 →

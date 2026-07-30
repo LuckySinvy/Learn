@@ -1,0 +1,79 @@
+---
+title: 检索增强进阶：压缩与多查询
+order: 20
+description: 用 ContextualCompressionRetriever 与 MultiQueryRetriever 提纯上下文、提升召回
+---
+
+# 检索增强进阶：压缩与多查询
+
+第 11 章的 `VectorStoreRetriever` 把命中的整块文档塞进提示词。但整块里常含无关句子，既浪费 Token 又干扰模型。本章介绍两种「检索增强」手段。
+
+## 1. ContextualCompressionRetriever：压缩检索结果
+
+思路：先正常检索，再用一个 LLM 把每块「与问题相关」的句子抽出来，无关内容丢弃：
+
+```ts
+import { ContextualCompressionRetriever } from "langchain/retrievers/contextual_compression";
+import { LLMChainExtractor } from "langchain/retrievers/document_compressors/chain_extract";
+import { ChatOpenAI } from "@langchain/openai";
+
+const compressor = new ContextualCompressionRetriever({
+  baseCompressor: LLMChainExtractor.fromLLM(
+    new ChatOpenAI({ model: "gpt-4o-mini" })
+  ),
+  baseRetriever: vectorStore.asRetriever({ k: 6 }),
+});
+
+const docs = await compressor.getRelevantDocuments("退款流程是什么？");
+```
+
+<Callout type="info" title="压缩=再省一次调用">
+压缩器会对每块文档额外调用一次 LLM 做抽取，用少量成本换回更干净、更短的上下文，长文档场景收益明显。
+</Callout>
+
+## 2. MultiQueryRetriever：一个提问，多路检索
+
+用户问题往往表述单一，召回不足。多查询检索器用 LLM 把原问题改写成多个不同角度的问法，分别检索后合并去重：
+
+```ts
+import { MultiQueryRetriever } from "langchain/retrievers/multi_query";
+
+const multiRetriever = MultiQueryRetriever.fromLLM(
+  new ChatOpenAI({ model: "gpt-4o-mini" }),
+  vectorStore.asRetriever({ k: 3 })
+);
+
+const docs = await multiRetriever.getRelevantDocuments("怎么重置密码？");
+// 内部可能改写为「找回密码」「密码丢失怎么办」等再检索
+```
+
+## 3. 组合使用
+
+压缩与多查询可叠加：先用多查询扩大召回，再用压缩提纯，最后喂给模型：
+
+```ts
+const retriever = new ContextualCompressionRetriever({
+  baseCompressor: LLMChainExtractor.fromLLM(model),
+  baseRetriever: MultiQueryRetriever.fromLLM(model, baseRetriever),
+});
+```
+
+<Callout type="tip" title="何时上增强">
+单块命中已够准 → 不必增强；召回不足或上下文太长 → 先试 MultiQuery，仍噪声大再上压缩。两者都增加 LLM 调用，按语料规模权衡。
+</Callout>
+
+<Callout type="warn" title="别无限叠加">
+每加一层增强都多一次模型调用与延迟。先用 LangSmith（第 14 章）对比「加前/加后」的回答质量，确认收益再保留。
+</Callout>
+
+<Callout type="exercise" title="练习">
+对同一问题，分别用基础 `VectorStoreRetriever` 与 `MultiQueryRetriever` 取文档，对比命中块数与最终回答完整性。
+</Callout>
+
+## 小结
+
+- `ContextualCompressionRetriever` 用 LLM 抽取相关句，压缩上下文
+- `MultiQueryRetriever` 改写多视角问法，提升召回
+- 两者可组合：多查询扩召回 + 压缩提纯
+- 增强以额外调用为代价，需实测收益
+- 下章深入向量库：自查询与混合检索 →

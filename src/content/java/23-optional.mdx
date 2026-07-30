@@ -1,0 +1,78 @@
+---
+title: Optional 正确用法
+order: 23
+description: 避开 Optional.get / isPresent 反模式，掌握 orElse 与 orElseGet、flatMap、以及把 Optional 作为返回值
+---
+
+# Optional 正确用法
+
+`Optional<T>` 是可能为空的容器。它的初衷不是「避免写 null 检查」，而是**在 API 签名里显式表达『这个值可能没有』**，逼调用方思考缺失情况。用错方式（尤其是 `.get()`）反而会制造新的隐患。
+
+## 1. 反模式：把 Optional 当包装箱
+
+最常见错误是拿到 Optional 后立刻 `isPresent()` + `get()`，等于把 null 检查换皮：
+
+```java
+// 反模式：多此一举
+Optional<User> u = findUser(id);
+if (u.isPresent()) {
+    return u.get().getName();
+} else {
+    return "匿名";
+}
+```
+
+正确写法用 `orElse` 直接提供默认值，或 `ifPresent` 仅在有值时做事：
+
+```java
+// 推荐：无值即回退
+return findUser(id).map(User::getName).orElse("匿名");
+
+// 仅在存在时执行副作用
+findUser(id).ifPresent(u -> System.out.println(u.getName()));
+```
+
+<Callout type="warn" title="永远不要调用 Optional.get()">
+`get()` 在空容器上直接抛 `NoSuchElementException`。如果代码里出现 `get()`，几乎一定可以用 `orElse` / `orElseGet` / `orElseThrow` 改写得更安全。
+</Callout>
+
+## 2. orElse 与 orElseGet 的区别
+
+两者都提供回退值，但**求值时机不同**：
+
+```java
+// orElse 的参数「总是」会被计算，即使有值
+User u1 = findUser(id).orElse(createDefault());   // createDefault 一定执行
+
+// orElseGet 的 Supplier 仅在「空」时才执行（惰性）
+User u2 = findUser(id).orElseGet(() -> createDefault());  // 有值时不执行
+```
+
+当回退值创建成本高（查库、建大对象），务必用 `orElseGet`。
+
+## 3. flatMap 处理嵌套 Optional
+
+如果映射函数本身返回 `Optional`，用 `map` 会得到 `Optional<Optional<T>>`，此时用 `flatMap` 展平：
+
+```java
+Optional<String> email = findUser(id)
+    .flatMap(User::getPrimaryEmail)   // 返回 Optional<String>
+    .map(String::toLowerCase);
+```
+
+## 4. 作为返回值，而非字段/参数
+
+<Callout type="tip" title="Optional 的使用边界">
+- ✅ 适合作为方法**返回值**，表达『可能无结果』
+- ❌ 不要作为类**字段**（增加序列化与存储成本）
+- ❌ 不要作为方法**参数**（会让调用方被迫包一层）
+- ❌ 不要用 `Optional` 给集合类型兜底——空集合比 `Optional<List>` 更自然
+</Callout>
+
+## 小结
+
+- ✅ `Optional` 是返回值上的『可能缺失』信号，不是 null 的语法糖
+- ✅ 用 `orElse` / `orElseGet` / `ifPresent`，拒绝 `get()`
+- ✅ 高成本回退用 `orElseGet`（惰性）
+- ✅ 嵌套 Optional 用 `flatMap` 展平
+- ✅ 只作返回值，不作字段或参数

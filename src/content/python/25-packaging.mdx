@@ -1,0 +1,90 @@
+---
+title: 打包与发布
+order: 25
+description: 用 pyproject.toml、build、wheel 与 twine 把项目打成可发布的包
+---
+
+# 打包与发布
+
+第 16 章讲了 `pip install`。这章反过来：把你写的库变成别人 `pip install` 得到的包。现代 Python 用 `pyproject.toml` 统一配置。
+
+## 1. 项目最小结构
+
+```
+mycli/
+├── pyproject.toml
+├── src/
+│   └── mycli/
+│       ├── __init__.py
+│       └── main.py
+└── README.md
+```
+
+## 2. `pyproject.toml`
+
+这是现代打包的"单一事实来源"，声明名称、版本、依赖与入口。
+
+```toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mycli"
+version = "0.1.0"
+dependencies = ["requests>=2.31"]
+
+[project.scripts]
+mycli = "mycli.main:run"
+```
+
+## 3. 构建 wheel 与 sdist
+
+```bash
+# 安装构建工具
+pip install build
+
+# 生成 dist/*.whl 和 dist/*.tar.gz
+python -m build
+```
+
+`wheel`（`.whl`）是预编译的分发格式，安装几乎零开销；`sdist` 是源码包。`pip` 默认优先装 wheel。
+
+## 4. 发布到 PyPI
+
+```bash
+# 安装上传工具
+pip install twine
+
+# 先上传到测试源验证
+twine upload --repository testpypi dist/*
+
+# 确认无误后上传正式源
+twine upload dist/*
+```
+
+<Callout type="warn" title="别把密钥写进文件">
+token 用环境变量 `TWINE_USERNAME=__token__` 与 `TWINE_PASSWORD=你的token` 传入，或写进 `~/.pypirc`。**永远别把 token 提交到 git**。
+</Callout>
+
+## 5. 本地可编辑安装
+
+开发时用 `-e` 安装，改代码即时生效，不必反复重装。
+
+```bash
+pip install -e .
+```
+
+<Callout type="tip" title="为什么用 pyproject.toml">
+它取代老的 `setup.py` + `setup.cfg` 散落配置，工具（`build` / `pip` / `poetry` / `pdm`）都能读同一份声明，迁移和复现更可靠。
+</Callout>
+
+## 小结
+
+- ✅ 现代打包以 `pyproject.toml` 为单一配置源
+- ✅ `python -m build` 生成 wheel 与 sdist
+- ✅ `twine upload` 发布到 PyPI（先 testpypi 验证）
+- ✅ `pip install -e .` 可编辑安装，方便开发
+- ✅ token 用环境变量管理，绝不入库
+
+下一章 **类型提示进阶**：Protocol、Literal 与重载。

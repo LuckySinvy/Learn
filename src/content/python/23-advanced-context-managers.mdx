@@ -1,0 +1,105 @@
+---
+title: 上下文管理器进阶
+order: 23
+description: asynccontextmanager、ExitStack、closing、嵌套与动态资源栈
+---
+
+# 上下文管理器进阶
+
+第 12 章讲了 `with` 的基础。进阶场景包括：异步资源（`async with`）、运行时才决定开几个资源（动态栈）、以及把任意"用完即关"的对象包进 `with`。
+
+## 1. 异步上下文管理器
+
+异步资源（如 `aiohttp.ClientSession`、异步数据库）用 `async with`，对应 `@asynccontextmanager`。
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def connect(label):
+    print(f"  连接 {label} ...")
+    await asyncio.sleep(0.01)        # 模拟建立连接
+    try:
+        yield {"conn": label}
+    finally:
+        print(f"  断开 {label}")
+
+async def main():
+    async with connect("db") as c:
+        print("  使用中:", c)
+
+asyncio.run(main())
+```
+
+<Callout type="tip" title="async with 与 with 区别">
+`async with` 调用的是对象的 `__aenter__` / `__aexit__`（协程方法），必须在 `async def` 里用；普通 `with` 调用 `__enter__` / `__exit__`。
+</Callout>
+
+## 2. `ExitStack`：动态数量的资源
+
+当你**不知道**要开多少个资源（比如一批文件路径来自运行时），`ExitStack` 让你把任意多个 `with` 叠进一个管理器，退出时全部正确关闭。
+
+```python
+from contextlib import ExitStack
+
+files = ["/tmp/a.txt", "/tmp/b.txt"]
+with ExitStack() as stack:
+    handlers = [stack.enter_context(open(f, "w")) for f in files]
+    for h in handlers:
+        h.write("hello\n")
+# 所有文件在此统一关闭，即使中途抛异常
+```
+
+## 3. `closing` 与 `nullcontext`
+
+- `closing(obj)`：给没有实现上下文协议、但带 `close()` 的对象用（如某些网络流）。
+- `nullcontext()`：在需要"可选 `with`"时当占位符，避免写分支。
+
+```python
+from contextlib import closing, nullcontext
+
+class Resource:
+    def close(self):
+        print("  closed")
+
+with closing(Resource()) as r:
+    pass
+
+# 可选逻辑：需要时才进入某个耗时上下文，否则用 nullcontext 占位，调用处不用写 if/else
+cm = nullcontext()
+with cm:
+    print("正常执行，无需特殊清理")
+```
+
+<Callout type="info" title="为什么用 nullcontext">
+避免在调用处写 `if use_timer: with timer(): ... else: 直接跑` 这种分裂逻辑，统一成一段 `with cm:`。
+</Callout>
+
+## 4. `redirect_stdout` / `redirect_stderr`
+
+测试或批处理时，把 `print` 输出重定向到文件或 `io.StringIO`。
+
+```python
+from contextlib import redirect_stdout
+import io
+
+buf = io.StringIO()
+with redirect_stdout(buf):
+    print("被捕获的输出")
+print("读到:", buf.getvalue().strip())
+```
+
+<Callout type="warn" title="嵌套别太深">
+把十几个 `with` 硬嵌套会让代码难以阅读。考虑 `ExitStack` 或把逻辑拆成多个小函数。
+</Callout>
+
+## 小结
+
+- ✅ `@asynccontextmanager` + `async with` 管异步资源（`__aenter__` / `__aexit__`）
+- ✅ `ExitStack` 管理运行时才确定的多个资源，统一收尾
+- ✅ `closing` 包"有 close 但无协议"的对象；`nullcontext` 作 `with` 占位
+- ✅ `redirect_stdout` 捕获 print 输出，常用于测试
+- ✅ 动态、异步、可选——三类进阶场景都有对应工具
+
+下一章 **性能分析 cProfile**：找到真正的瓶颈。

@@ -1,0 +1,107 @@
+---
+title: 项目实战：Web 服务
+order: 29
+description: 用 axum 搭建一个带路由、JSON 序列化与共享状态的迷你 HTTP 服务，整合 trait、serde 与并发
+---
+
+# 项目实战：Web 服务
+
+本章用轻量 Web 框架 **axum** 写一个提供 REST 接口的迷你服务：一个内存版「待办清单」API。
+
+## 1. 依赖
+
+```toml
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+## 2. 数据模型与共享状态
+
+```rust
+use axum::{
+    extract::{State, Json},
+    routing::{get, post},
+    Router,
+};
+use serde::{Serialize, Deserialize};
+use std::sync::{Arc, Mutex};
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Todo {
+    id: u32,
+    title: String,
+    done: bool,
+}
+
+type Db = Arc<Mutex<Vec<Todo>>>;
+```
+
+<Callout type="info" title="Arc<Mutex<...>> 在 Web 中很常见">
+axum 的 `State` 要在多线程间共享，因此用 `Arc` 包裹；状态可变用 `Mutex`。这与第 20 章的并发模式一致。
+</Callout>
+
+## 3. 处理器
+
+```rust
+async fn list(State(db): State<Db>) -> Json<Vec<Todo>> {
+    let items = db.lock().unwrap().clone();
+    Json(items)
+}
+
+async fn create(
+    State(db): State<Db>,
+    Json(todo): Json<Todo>,
+) -> Json<Todo> {
+    db.lock().unwrap().push(todo.clone());
+    Json(todo)
+}
+```
+
+## 4. 路由与启动
+
+```rust
+#[tokio::main]
+async fn main() {
+    let db: Db = Arc::new(Mutex::new(Vec::new()));
+
+    let app = Router::new()
+        .route("/todos", get(list).post(create))
+        .with_state(db);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    println!("监听 http://127.0.0.1:3000");
+    axum::serve(listener, app).await.unwrap();
+}
+```
+
+<Callout type="tip" title="handler 是 async fn">
+axum 处理器返回 `Json<T>`/`Response`，配合 tokio 运行时处理并发请求。带状态用 `extract::State`，类型由路由 `with_state` 推断。
+</Callout>
+
+## 5. 测试请求
+
+```bash
+curl -X POST localhost:3000/todos \
+  -H 'Content-Type: application/json' \
+  -d '{"id":1,"title":"学 Rust","done":false}'
+
+curl localhost:3000/todos
+```
+
+<Callout type="warn" title="锁要快进快出">
+`db.lock().unwrap()` 拿到的守卫应在最小作用域内用完即丢，别在 async 处理器里长时间持锁，否则阻塞其他请求。async 下更优解是 `tokio::sync::Mutex`。
+</Callout>
+
+<Callout type="exercise" title="练习">
+为服务加一个 `DELETE /todos/:id` 路由，用 `axum::extract::Path` 取 id，从 `Vec` 中删除对应项。再写一个集成测试（用 `tower::ServiceExt::oneshot`）验证删除后列表为空。
+</Callout>
+
+## 小结
+
+- axum 用 `Router` + `route` 声明路由，`get/post` 区分方法
+- `State<Arc<Mutex<T>>>` 在多线程间安全共享可变状态
+- 处理器是 `async fn`，返回 `Json<T>` 自动序列化
+- 锁在 handler 内应短持；async 场景优先 `tokio::sync::Mutex`
+- 下一章做并发项目实战 →

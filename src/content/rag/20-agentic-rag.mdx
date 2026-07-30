@@ -1,0 +1,87 @@
+---
+title: Agentic RAG 与 Self-RAG
+order: 20
+description: 让模型自主决定检索时机与次数，并用自反思校验答案，而非固定一问一检索
+---
+
+# Agentic RAG 与 Self-RAG
+
+基础 RAG 是「**一问一检索**」：无论问题难易，永远先召回再生成。Agentic RAG 与 Self-RAG 把控制权交给模型——它自己判断**要不要检索、检索几次、答案够不够好**。
+
+## 1. 固定流程的局限
+
+```text
+固定 RAG:  提问 → 检索(top5) → 生成
+问题: 简单问候「你好」也被迫检索；复杂问题只检索一次可能不够
+```
+
+真正的难点是「检索」本身也该是**自适应**的。
+
+## 2. Agentic RAG：模型调度检索
+
+把检索封装成工具，由 Agent 决定是否调用、调用几次：
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def retrieve(query: str) -> str:
+    """当回答需要外部知识时，用此工具检索知识库。"""
+    return rag_search(query)
+
+# Agent 自主决定：先答一部分 → 发现缺知识 → 调 retrieve → 再续答
+agent.run("对比我们三款产品的退款政策，并指出差异")
+```
+
+适合需要**多步、跨来源**检索的场景，检索次数随问题动态变化。
+
+## 3. Self-RAG：带自反思的生成
+
+Self-RAG 引入特殊的**反思标记（reflection tokens）**，让模型在生成中自我校验：
+
+```text
+[检索?] 需要 → 调检索 → [相关性?] 高 → 引用片段作答
+                                  → [是否支持?] 否 → 重新检索或声明不知
+```
+
+核心四问：**要不要检索 / 检索到的相关吗 / 内容支持论断吗 / 整体没问题吗**。任一环节不过关就重试或拒答。
+
+<Callout type="info" title="Agentic 管「何时检」，Self-RAG 管「检得对不对」">
+两者可叠加：Agent 决定检索策略，Self-RAG 的反思机制保证每一步质量。共同目标都是「减少无效检索、抑制幻觉」。
+</Callout>
+
+## 4. 实现要点
+
+```python
+# Self-RAG 思路（示意）：生成中插入校验
+for step in generate(question):
+    if step.needs_retrieval and not step.supported_by(context):
+        context = retrieve(step.clarify())   # 带反思地补充检索
+    if not step.faithful(context):
+        step = regenerate(context)            # 重写使其忠于原文
+```
+
+<Callout type="warn" title="反思越多越慢越贵">
+每加一轮反思就多一次 LLM 调用。给「最大检索/生成轮数」设上限，避免为了完美而无限循环。
+</Callout>
+
+## 5. 何时用
+
+- 问题简单、答案稳定 → 普通 RAG 足够，别上 Agent 增加延迟
+- 多源、需推理、易幻觉 → Agentic + Self-RAG 显著提升质量
+
+<Callout type="tip" title="用指标决定是否值得">
+对照第 13 章的忠实度指标：若基础 RAG 幻觉率高，再引入 Self-RAG 的反思校验，用分数变化验证收益。
+</Callout>
+
+<Callout type="exercise" title="练习">
+在第 18 章客服 Agent 的 `search_knowledge` 工具前后，加一步「相关性判断」：若召回片段与问题无关，则改写查询再检一次，记录改写前后的 context_relevancy。
+</Callout>
+
+## 小结
+
+- 基础 RAG 一问一检索；Agentic RAG 让模型自主调度检索次数与时机
+- Self-RAG 用反思标记校验「是否该检、检得相关吗、内容支持吗」
+- 两者叠加可减无效检索、抑幻觉，但增加延迟与成本
+- 先测基础 RAG 指标，确有需要再升级
+- 下一章从决策视角看 RAG 与微调如何取舍 →

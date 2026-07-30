@@ -1,0 +1,104 @@
+---
+title: dataclasses 进阶
+order: 21
+description: field 进阶、__post_init__、继承、frozen、slots 与不可变数据类
+---
+
+# dataclasses 进阶
+
+第 13 章已讲过 `@dataclass` 的基础。这章深入那些「真正写业务时会用到」的细节：`field` 的更多控制、`__post_init__`、继承与不可变。
+
+## 1. `field` 的进阶参数
+
+`field` 不只是 `default_factory`，还能控制比较、排序与 repr。
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class User:
+    name: str
+    # 密码不参与 == 比较，也不出现在 repr 里
+    password: str = field(repr=False, compare=False)
+    # 按 age 排序（升序）
+    age: int = field(default=0, compare=True)
+
+u1 = User("A", "secret", 20)
+u2 = User("B", "x", 30)
+print(sorted([u2, u1]))        # 按 age 升序
+```
+
+## 2. `__post_init__` 做校验与派生字段
+
+构造完成后想做检查或计算字段，重写 `__post_init__`。
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Rectangle:
+    w: float
+    h: float
+    area: float = field(init=False)
+
+    def __post_init__(self):
+        if self.w <= 0 or self.h <= 0:
+            raise ValueError("宽高必须为正数")
+        self.area = self.w * self.h
+
+r = Rectangle(3, 4)
+print(r.area)                  # 12
+```
+
+<Callout type="tip" title="init=False 的字段">
+标了 `init=False` 的字段不会出现在构造函数签名里，由你在 `__post_init__` 内部赋值，常用来存派生结果。
+</Callout>
+
+## 3. 继承与顺序
+
+子类字段排在父类之后；小心默认值位置，避免「非默认字段跟在默认字段后」报错。
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Animal:
+    name: str
+
+@dataclass
+class Dog(Animal):
+    age: int = 0          # 子类带默认值，放最后没问题
+
+print(Dog("旺财", 3))
+```
+
+## 4. `frozen` 与 `slots`
+
+`frozen=True` 让实例不可变（天然可哈希）；`slots=True` 用 `__slots__` 省内存、防手滑加字段。
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)
+class Point:
+    x: int
+    y: int
+
+p = Point(1, 2)
+print(hash(p))
+# p.x = 9        # 会抛 FrozenInstanceError
+```
+
+<Callout type="warn" title="slots 的代价">
+开了 `slots=True` 后实例不能动态加属性，且继承链上的类都要配合设置，否则会冲突。小对象多的时候才划算。
+</Callout>
+
+## 小结
+
+- ✅ `field(repr=False, compare=False)` 控制字段是否进 repr / 比较
+- ✅ `__post_init__` 做参数校验与派生字段（标 `init=False`）
+- ✅ 子类字段排在父类后，注意默认值顺序
+- ✅ `frozen=True` 得不可变可哈希对象；`slots=True` 省内存
+- ✅ dataclass 让「数据载体」类的样板代码趋近于零
+
+下一章 **装饰器进阶**：异步装饰器、签名保留与单分派。

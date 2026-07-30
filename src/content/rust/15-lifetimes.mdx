@@ -1,0 +1,87 @@
+---
+title: 生命周期
+order: 15
+description: 理解生命周期标注 'a、编译器省略规则，以及如何在返回引用时显式标注生命周期
+---
+
+# 生命周期
+
+**生命周期（lifetime）** 是 Rust 另一项独特机制：它标注引用的「有效范围」，让借用检查器确信返回的引用不会悬垂。
+
+## 1. 为什么需要生命周期
+
+当函数接收多个引用、返回一个引用时，编译器无法判断返回值的引用来自哪个参数：
+
+```rust
+// fn longest(x: &str, y: &str) -> &str {   // 编译错误：缺少生命周期标注
+//     if x.len() > y.len() { x } else { y }
+// }
+```
+
+编译器不知道返回的引用该活多久——于是要求你显式标注。
+
+## 2. 生命周期标注 'a
+
+```rust
+fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
+    if x.len() > y.len() { x } else { y }
+}
+```
+
+`'a` 是一个**名字**（任意名称，习惯用 `'a`/`'b`）。含义是：返回的引用，活得不超过 `x` 与 `y` 中**较短**的那个。
+
+<Callout type="info" title="标注不改变生命周期长短">
+生命周期标注只是「告诉编译器约束关系」，不会延长或缩短任何数据的存活时间，纯粹是类型检查的信息。
+</Callout>
+
+## 3. 结构体中的生命周期
+
+当结构体持有引用，必须标注其生命周期：
+
+```rust
+struct Excerpt<'a> {
+    part: &'a str,   // 引用必须活得比结构体久
+}
+
+fn main() {
+    let s = String::from("hello world");
+    let ex = Excerpt { part: &s[0..5] };
+    println!("{}", ex.part);
+}
+```
+
+<Callout type="warn" title="结构体引用不能比数据活得久">
+若 `s` 在 `ex` 之前 drop，就悬垂了。编译器用 `'a` 强制「`s` 至少活到 `ex` 用完」。
+</Callout>
+
+## 4. 生命周期省略规则
+
+多数函数不用手写标注，编译器按三条规则自动推导：
+
+1. 每个引用参数各有一个独立生命周期。
+2. 若**只有**一个输入生命周期，它赋给所有输出。
+3. 若有 `&self`/`&mut self`，其生命周期赋给所有输出。
+
+```rust
+fn first_word(s: &str) -> &str { ... }   // 规则2：输入唯一，输出同生命周期
+```
+
+## 5. 'static 生命周期
+
+`'static` 表示「整个程序运行期都有效」。字符串字面量就是 `&'static str`；`Box::leak` 也能造 `'static`。
+
+<Callout type="tip" title="遇到 'static 报错">
+常见错误是把 `&str` 与 `String` 混用或返回局部引用。多数情况下你并不需要真正的 `'static`，标注正确输入生命周期即可。
+</Callout>
+
+<Callout type="exercise" title="练习">
+实现 `fn longest_with_default<'a>(x: &'a str, y: &'a str, ann: &str) -> &'a str`，先打印 `ann`，再比较长度返回较长者。去掉标注看编译器如何提示你补上。
+</Callout>
+
+## 小结
+
+- 生命周期标注 `'a` 描述引用存活约束，不改变实际存活
+- 返回引用且有多参数时，需显式标注
+- 结构体含引用必须标生命周期
+- 省略规则让常见情况免标注；`'static` 贯穿全程
+- 下一章看闭包 →

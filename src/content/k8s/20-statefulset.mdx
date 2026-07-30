@@ -1,0 +1,77 @@
+---
+title: StatefulSet 有状态应用
+order: 20
+description: 用 StatefulSet 部署需要稳定网络标识、稳定存储的有状态应用，如数据库与中间件
+---
+
+# StatefulSet 有状态应用
+
+Deployment 管理的 Pod 彼此等价、可随意替换。但数据库、消息队列这类**有状态应用**需要：稳定的网络标识、稳定的持久化存储、按序启停。这些正是 **StatefulSet** 解决的。
+
+## 1. 与 Deployment 的核心区别
+
+| 维度 | Deployment | StatefulSet |
+|---|---|---|
+| Pod 名称 | 随机后缀 | 固定有序：`web-0`、`web-1` |
+| 网络标识 | 不稳定 | 稳定的 DNS 名 `pod-name.svc` |
+| 存储 | 共享/临时 | 每个 Pod 独享 PVC（稳定） |
+| 启停顺序 | 并行 | 按序号 0→N 启动，N→0 停止 |
+
+<Callout type="info" title="Headless Service 是前提">
+StatefulSet 通常配合 **Headless Service**（`.spec.clusterIP: None`）使用，才能为每个 Pod 生成稳定的 `pod-name.service-name` DNS 记录。
+</Callout>
+
+## 2. 典型清单
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  serviceName: redis
+  replicas: 3
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+```
+
+`volumeClaimTemplates` 会为每个 Pod 自动创建独立的 PVC：`data-redis-0`、`data-redis-1`……Pod 重建后绑定的仍是同一份存储。
+
+## 3. 访问单个实例
+
+```bash
+# 直接进入特定副本，名称稳定可预测
+kubectl exec -it redis-0 -- redis-cli ping
+
+# 其他 Pod 通过稳定 DNS 互相发现
+redis-0.redis.default.svc.cluster.local
+```
+
+<Callout type="warn" title="缩容不会删除 PVC">
+缩容或删除 StatefulSet 时，PVC 默认**保留**，防止数据误删。清理存储需手动 `kubectl delete pvc`。
+</Callout>
+
+## 小结
+
+- StatefulSet 提供稳定 Pod 名、稳定 DNS、按序启停
+- `volumeClaimTemplates` 给每个副本独立且稳定的存储
+- 配合 Headless Service；缩容保留 PVC
+- 下一章学习 DaemonSet 如何把 Pod 跑在每个节点上 →

@@ -1,0 +1,88 @@
+---
+title: LangSmith 进阶：数据集与评估
+order: 24
+description: 用 LangSmith 数据集与 evaluate 对链做回归测试与自动化评分
+---
+
+# LangSmith 进阶：数据集与评估
+
+第 14 章讲了用 `LANGCHAIN_*` 环境变量接入 LangSmith 做追踪。光看单次调用还不够——你想知道「改完提示词后，整体质量有没有变好」。这就需要**数据集（Dataset）**与**评估（Evaluation）**。
+
+## 1. 创建数据集
+
+数据集是一组「输入 → 期望输出」的样本，相当于链的单测用例：
+
+```ts
+import { Client } from "langsmith";
+
+const client = new Client();
+const dataset = await client.createDataset("qa-eval");
+
+await client.createExamples({
+  datasetId: dataset.id,
+  inputs: [
+    { question: "退款多久到账？" },
+    { question: "支持哪些支付方式？" },
+  ],
+  outputs: [
+    { answer: "通常 3-5 个工作日" },
+    { answer: "微信、支付宝、银行卡" },
+  ],
+});
+```
+
+## 2. 定义评估函数并跑评估
+
+评估函数对「链输出 vs 参考答案」打分，可调用模型做语义评判：
+
+```ts
+import { evaluate } from "langsmith/evaluation";
+
+async function correctness({ inputs, outputs, referenceOutputs }: any) {
+  // 简单包含判定，生产可用 LLM 做语义评分
+  const hit = String(referenceOutputs.answer).includes(
+    String(outputs.answer).slice(0, 6)
+  );
+  return { key: "correctness", score: hit ? 1 : 0 };
+}
+
+await evaluate(
+  async (input: any) => chain.invoke(input),
+  {
+    data: "qa-eval",
+    evaluators: [correctness],
+  }
+);
+```
+
+<Callout type="info" title="evaluate 做了什么">
+它按数据集逐条跑你的链，记录每次输入/输出/延迟，并调用评估函数打分，结果直接落在 LangSmith 面板上可做版本对比。
+</Callout>
+
+## 3. 典型评估维度
+
+| 维度 | 说明 |
+|---|---|
+| 正确性 | 输出与参考答案是否一致 |
+| 相关性 | 是否回答了问题、无幻觉 |
+| 延迟/成本 | 单条耗时与 Token 消耗 |
+
+<Callout type="tip" title="把它当回归测试">
+每次改提示词或换模型，都跑一遍同一数据集，分数下降就是「回归」。可接进 CI，质量门禁自动化。
+</Callout>
+
+<Callout type="warn" title="评估函数别太松">
+用「简单包含」判分会漏判。关键场景请用 LLM-as-judge 或更严格指标，否则分数好看但线上仍出错。
+</Callout>
+
+<Callout type="exercise" title="练习">
+把第 17 章问答 Bot 接进一个 5 条样本的数据集，用 LLM 评估函数给「相关性」打分，对比改提示词前后的得分。
+</Callout>
+
+## 小结
+
+- 数据集 = 链的输入/期望输出样本，相当于单测
+- `evaluate` 按数据集跑链并调用评估函数自动打分
+- 常见维度：正确性、相关性、延迟与成本
+- 接 CI 做质量回归门禁
+- 下章补充非结构化文档加载能力 →

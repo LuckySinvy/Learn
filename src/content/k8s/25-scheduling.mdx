@@ -1,0 +1,81 @@
+---
+title: 资源调度与亲和性
+order: 25
+description: 用 nodeSelector、亲和性、污点与容忍控制 Pod 调度到哪些节点
+---
+
+# 资源调度与亲和性
+
+调度器决定 Pod 落在哪台节点。除了默认的「资源够用就放」策略，Kubernetes 提供多层机制让你精确控制落点：**nodeSelector**、**亲和性（affinity）**、**污点（taint）与容忍（toleration）**。
+
+## 1. nodeSelector：最简单
+
+给节点打标签，再让 Pod 只调度到带该标签的节点。
+
+```bash
+kubectl label nodes node-1 disktype=ssd
+```
+
+```yaml
+spec:
+  nodeSelector:
+    disktype: ssd
+```
+
+## 2. 亲和性：更灵活的表达
+
+`nodeAffinity` 支持「软偏好」与「硬性要求」，还能用 `In`/`NotIn` 匹配多值：
+
+```yaml
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/os
+                operator: In
+                values: ["linux"]
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 1
+          preference:
+            matchExpressions:
+              - key: disktype
+                operator: In
+                values: ["ssd"]
+```
+
+`podAffinity` / `podAntiAffinity` 则按「Pod 间是否同节点」调度，常用于打散（反亲和）避免单点。
+
+## 3. 污点与容忍
+
+污点是节点「排斥」Pod 的机制；容忍让特定 Pod 不被排斥。
+
+```bash
+# 给节点打污点，普通 Pod 不可调度
+kubectl taint nodes node-1 dedicated=gpu:NoSchedule
+```
+
+```yaml
+spec:
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "gpu"
+      effect: "NoSchedule"
+```
+
+<Callout type="tip" title="污点效果三选一">
+`NoSchedule` 不调度新 Pod；`PreferNoSchedule` 尽量不调度；`NoExecute` 还会驱逐已有不容忍的 Pod（常用于节点维护）。
+</Callout>
+
+<Callout type="warn" title="亲和性过强会导致 Pending">
+硬性 `required` 亲和/反亲和若无法满足（如节点不足），Pod 会一直 `Pending`。排错先看 `kubectl describe pod` 的 Events。
+</Callout>
+
+## 小结
+
+- nodeSelector 简单但只能精确匹配
+- 亲和性支持软/硬约束与多值，含节点与 Pod 两个维度
+- 污点排斥、容忍放行，二者配合划分专用节点
+- 下一章入门 Operator 与 CRD 扩展 k8s 能力 →

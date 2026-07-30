@@ -1,0 +1,54 @@
+---
+title: PromQL 高级陷阱（rate / irate / 子查询）
+order: 20
+description: 深入 rate 系列函数的坑、计数器重置、子查询分区，写出可靠的指标查询
+---
+
+# PromQL 高级陷阱（rate / irate / 子查询）
+
+第 6、7 章介绍了 `rate` 与子查询的基本用法，本章聚焦**生产中最容易写错、画出误导曲线**的几个陷阱。
+
+<Callout type="warn" title="rate 只看单增计数器">
+`rate` / `irate` 只应对 `counter` 类型。`gauge`（如内存使用量）直接用会得出负数或错误增速。
+</Callout>
+
+## 1. rate 与 irate 的取舍
+
+- `rate(range)`：取区间首尾两个点算平均速率，抗抖动，**适合画趋势图与告警**。
+- `irate(range)`：只取区间内**最后两个点**算瞬时速率，灵敏但噪声大，不适合长区间告警。
+
+```promql
+# 推荐：告警用 rate，窗口至少 2 倍 scrape_interval
+rate(http_requests_total[5m])
+
+# 慎用：irate 在数据点稀疏时会跳变
+irate(http_requests_total[5m])
+```
+
+## 2. 计数器重置（Counter Reset）
+
+进程重启会让计数器归零，`rate` 已能自动处理单次重置；但**区间跨多次重置**或抓取间隙过长时，速率会被低估。保证 `scrape_interval` 远小于 `rate` 窗口。
+
+## 3. 子查询的分区步长
+
+子查询 `[range:resolution]` 的第二个参数决定每次采样的步长，过细会爆查询、过粗会丢峰：
+
+```promql
+# 每小时的最大 5 分钟速率（分辨率 1h）
+max_over_time(rate(http_requests_total[5m])[1h:1m])
+```
+
+<Callout type="tip" title="histogram 的 rate 陷阱">
+`histogram_quantile` 必须包在 `rate` 外层，且 `_bucket` 必须有 `le` 标签。直接对 `bucket` 瞬时值求分位数会得到完全错误的结果。
+</Callout>
+
+## 4. 避免高基数爆炸
+
+对带 `instance` / `pod` 等高频标签的序列直接 `rate(...)` 再聚合尚可，但若在子查询内保留高基数再 `max_over_time`，内存开销骤增。先用 `sum by` 降维。
+
+## 小结
+
+- 告警与趋势用 `rate`，看瞬时尖峰才用 `irate`
+- `rate` 窗口至少是抓取间隔的两倍，规避计数器重置误差
+- 子查询步长要权衡精度与性能
+- `histogram_quantile` 必须配合 `rate` 使用 →

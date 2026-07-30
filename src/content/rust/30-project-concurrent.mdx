@@ -1,0 +1,110 @@
+---
+title: 项目实战：并发文件处理
+order: 30
+description: 综合运用线程、channel、Arc/Mutex 与迭代器，写一个并发统计多个文件行数的工具
+---
+
+# 项目实战：并发文件处理
+
+收官之战：把前面学到的**线程、消息传递、共享状态、迭代器**串起来，写一个并发统计目录下多个文件行数的工具。
+
+## 1. 设计思路
+
+- 主线程把多个文件路径通过 **channel** 发给工作线程池。
+- 每个工作线程独立读文件、统计行数，把 `(路径, 行数)` 通过另一 channel 发回。
+- 主线程收集结果汇总。这正是「用通信共享内存」的典范。
+
+## 2. 完整实现
+
+```rust
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+use std::fs;
+
+fn main() {
+    let paths = vec![
+        "a.txt".to_string(),
+        "b.txt".to_string(),
+        "c.txt".to_string(),
+    ];
+
+    let (tx_task, rx_task) = mpsc::channel();
+    let (tx_result, rx_result) = mpsc::channel();
+
+    // 启动 3 个工作线程
+    let workers = 3;
+    for _ in 0..workers {
+        let rx_task = rx_task.clone();
+        let tx_result = tx_result.clone();
+        thread::spawn(move || {
+            for path in rx_task {
+                let lines = fs::read_to_string(&path)
+                    .map(|c| c.lines().count())
+                    .unwrap_or(0);
+                tx_result.send((path, lines)).unwrap();
+            }
+        });
+    }
+    drop(tx_result);   // 关闭多余发送端，否则接收端不会结束
+
+    // 分发任务
+    for p in &paths {
+        tx_task.send(p.clone()).unwrap();
+    }
+    drop(tx_task);
+
+    // 汇总
+    let mut total = 0;
+    for (path, lines) in rx_result {
+        println!("{}: {} 行", path, lines);
+        total += lines;
+    }
+    println!("合计: {} 行", total);
+}
+```
+
+<Callout type="info" title="channel 自动转移所有权">
+工作线程 `move` 进 `rx_task`，文件内容在另一线程读、结果通过 `tx_result` 发回。全程无共享可变内存，数据竞争无从发生。
+</Callout>
+
+## 3. 关键点解析
+
+- `rx_task.clone()`：多消费者需要每个线程一份接收端。
+- `drop(tx_result)`：所有发送端关闭后，`for ... in rx_result` 才会自然结束（否则一直阻塞）。
+- `unwrap_or(0)`：文件读不到时计 0 行，程序更健壮。
+
+<Callout type="warn" title="忘记 drop 发送端会死等">
+若保留多余的 `tx_result`/`tx_task` 发送端不 `drop`，接收端会永远等待更多消息，主线程卡死。这是 channel 并发最常见的坑。
+</Callout>
+
+## 4. 用线程池替代手写
+
+生产环境可用 `rayon` 一行并行化：
+
+```rust
+use rayon::prelude::*;
+let total: usize = paths.par_iter()
+    .map(|p| fs::read_to_string(p).map(|c| c.lines().count()).unwrap_or(0))
+    .sum();
+```
+
+<Callout type="tip" title="rayon 让并行变简单">
+`rayon` 提供 `par_iter()`，把普通迭代器变成并行迭代器，自动调度线程池，几乎零改造即得并发加速。
+</Callout>
+
+## 5. 进阶方向
+
+完成本项目后，你已经具备独立开发 Rust 应用的能力。可继续探索：异步 Web（actix/tokio）、数据库（`sqlx`/`diesel`）、命令行生态（clap + anyhow）、以及嵌入式/WASM 等方向。
+
+<Callout type="exercise" title="练习">
+把上面工具改成：用 `Arc<Mutex<HashMap<String, usize>>>` 让工作线程直接写共享结果表，主线程 `join` 所有 worker 后再打印；对比 channel 版，体会两种共享方式的差异。
+</Callout>
+
+## 小结
+
+- channel 实现「通信式」并发，天然无数据竞争
+- 多消费线程需克隆接收端；结束要 `drop` 发送端
+- 共享结果也可用 `Arc<Mutex<HashMap>>`，与 channel 对照理解
+- 综合运用：线程 + 所有权 + 迭代器，已具备实战能力
+- 恭喜完成全部 30 章 Rust 课程 🎉

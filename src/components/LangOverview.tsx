@@ -18,6 +18,7 @@ export function LangOverview({ lang }: { lang: Language }) {
         {lang === 'python' && '从语法到常用标准库，渐进式掌握 Python。'}
         {lang === 'go' && '从语法到并发与 Web 服务，渐进式掌握 Go。'}
         {lang === 'java' && '从语法到集合与并发，渐进式掌握 Java。'}
+        {lang === 'rust' && '从所有权与借用到 trait、泛型、并发与异步，系统级语言渐进式精通。'}
         {lang === 'grafana' && '从安装到告警与可观测性平台，渐进式掌握 Grafana。'}
         {lang === 'rag' && '从文档切分到检索重排与评估，系统掌握检索增强生成。'}
         {lang === 'langchain' && '用 Langchain.js 编排模型、链、检索与 Agent，构建 LLM 应用。'}

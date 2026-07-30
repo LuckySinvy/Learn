@@ -1,0 +1,96 @@
+---
+title: 变量与可变性
+order: 2
+description: 理解 let、mut、类型推断、shadowing（遮蔽）与 const 常量，建立 Rust 默认不可变的心智模型
+---
+
+# 变量与可变性
+
+在 Rust 里，变量默认是**不可变（immutable）**的。这与大多数语言相反，却正是它安全性的基石。
+
+## 1. let 绑定与默认不可变
+
+```rust
+fn main() {
+    let x = 5;
+    // x = 6;  // 编译错误：cannot assign twice to immutable variable
+    println!("x = {}", x);
+}
+```
+
+<Callout type="warn" title="默认不可变是故意的">
+Rust 鼓励「默认不可变」。需要改变时显式加 `mut`。这让编译器能放心地做优化，也让你清楚哪些值会变。
+</Callout>
+
+## 2. mut 让变量可变
+
+```rust
+fn main() {
+    let mut count = 0;
+    count += 1;
+    println!("count = {}", count);  // 输出 1
+}
+```
+
+## 3. 类型推断
+
+Rust 是**静态类型**语言，但多数时候无需标注类型——编译器会从初始值推断：
+
+```rust
+let a = 42;          // i32
+let b = 3.14;        // f64
+let c = "hi";        // &str
+let d: u64 = 100;    // 显式标注也是允许的
+```
+
+<Callout type="tip" title="何时显式标注类型">
+当推断不出（如函数入参/出参、空集合 `Vec::<i32>::new()`）或想限定精度（如用 `u8` 省内存）时，显式写类型最稳妥。
+</Callout>
+
+## 4. Shadowing（遮蔽）
+
+用同名 `let` 重新绑定，会**遮蔽**旧值——注意这和 `mut` 不同，它是创建一个新绑定：
+
+```rust
+fn main() {
+    let spaces = "   ";
+    let spaces = spaces.len();   // 类型从 &str 变为 usize，合法
+    println!("空格数 = {}", spaces);
+}
+```
+
+<Callout type="info" title="shadowing 与 mut 的区别">
+`mut` 只能改值、不能改类型；shadowing 通过 `let` 重新声明，可以连类型一起换。常见用途：先读字符串，再解析成数字。
+</Callout>
+
+## 5. const 常量
+
+```rust
+const MAX_POINTS: u32 = 100_000;  // 必须标注类型，命名全大写
+fn main() {
+    println!("上限 = {}", MAX_POINTS);
+}
+```
+
+常量在编译期确定，可声明在任意作用域（含全局），不能用 `mut`，也不能用运行时才能算出的值。
+
+## 6. 对比小结
+
+| 写法 | 可重新赋值 | 可改类型 | 作用域 |
+|---|---|---|---|
+| `let x` | 否 | — | 局部 |
+| `let mut x` | 是 | 否 | 局部 |
+| `let x` 再次声明 | 产生新绑定 | 是（shadowing） | 局部 |
+| `const X` | 否 | — | 全局 |
+
+<Callout type="exercise" title="练习">
+写一个程序：用 `let` 绑定一个字符串 `"42"`，再用 shadowing 把它解析成 `u32`（提示：`"42".parse::<u32>().unwrap()`），最后乘 2 打印。体会类型如何随 shadowing 改变。
+</Callout>
+
+## 小结
+
+- 变量默认不可变，改变需 `mut`
+- 类型推断省去大量标注，但关键处可显式写
+- shadowing 允许同名重新绑定并改类型
+- `const` 是编译期常量，命名全大写、必须标类型
+- 下一章看 Rust 的基础类型 →

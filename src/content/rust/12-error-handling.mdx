@@ -1,0 +1,110 @@
+---
+title: 错误处理
+order: 12
+description: 用 Result/Option 表达可恢复错误，区分 panic 与可恢复错误，掌握 unwrap/? 与自定义错误
+---
+
+# 错误处理
+
+Rust 没有异常。可恢复错误用 `Result<T, E>` 表示，不可恢复错误用 `panic!`。
+
+## 1. Result 枚举
+
+```rust
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+```
+
+```rust
+use std::fs::File;
+
+fn main() {
+    let f = File::open("a.txt");
+    match f {
+        Ok(file) => println!("打开成功"),
+        Err(e) => println!("失败: {}", e),
+    }
+}
+```
+
+<Callout type="info" title="错误也是值">
+`Result` 把「可能失败」编码进类型。调用者必须处理 `Err`，无法假装它不存在——这比异常更不容易被遗漏。
+</Callout>
+
+## 2. panic! 与不可恢复错误
+
+```rust
+fn main() {
+    // panic!("程序无法继续");
+    let v = vec![1, 2, 3];
+    println!("{}", v[99]);   // 越界会自动 panic
+}
+```
+
+`panic` 会展开栈（默认）或终止进程。仅用于「确实是 bug、无法合理恢复」的情况。
+
+## 3. unwrap 与 expect
+
+开发期便捷，但 panic 风险高：
+
+```rust
+let f = File::open("a.txt").unwrap();           // Err 时 panic，信息简单
+let f = File::open("a.txt").expect("打开失败");  // Err 时 panic，带自定义信息
+```
+
+<Callout type="warn" title="unwrap 在库代码中要避免">
+`unwrap`/`expect` 一旦遇到 `Err` 就 panic。库代码应把 `Result` 返回给调用者，由上层决定如何处理。仅在示例/测试里图方便时使用。
+</Callout>
+
+## 4. ? 运算符传播错误
+
+`?` 是传播错误的语法糖：遇到 `Err` 立即 `return`，否则取出 `Ok` 的值：
+
+```rust
+use std::fs::File;
+use std::io::{self, Read};
+
+fn read_text() -> Result<String, io::Error> {
+    let mut f = File::open("a.txt")?;   // 失败则提前返回 Err
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+```
+
+## 5. 自定义错误类型
+
+用 `Box<dyn std::error::Error>` 兜底，或定义自己的枚举并实现 `std::error::Error`：
+
+```rust
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = read_text()?;
+    Ok(())
+}
+```
+
+<Callout type="tip" title="? 要求错误类型兼容">
+`?` 会把当前错误 `From` 转换为函数返回的 `E`。配合 `Box<dyn Error>` 最省事；大型项目常定义统一错误枚举。
+</Callout>
+
+## 6. Option 与错误
+
+`Option` 的 `ok_or` 可在需要时转成 `Result`：
+
+```rust
+let val = some_option.ok_or("缺少值")?;
+```
+
+<Callout type="exercise" title="练习">
+写一个 `fn read_first_line(path: &str) -> Result<String, Box<dyn std::error::Error>>`，用 `?` 打开文件并读取第一行返回。在 `main` 里调用，用 `match` 打印成功内容或错误。
+</Callout>
+
+## 小结
+
+- `Result<T,E>` 表达可恢复错误；`panic!` 用于不可恢复 bug
+- `unwrap`/`expect` 便捷但有 panic 风险，库代码慎用
+- `?` 传播错误并自动 `From` 转换，最优雅
+- 自定义错误可用 `Box<dyn Error>` 或专用枚举
+- 下一章看泛型 →

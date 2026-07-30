@@ -1,0 +1,76 @@
+---
+title: Sealed 密封类
+order: 20
+description: 用 sealed / permits / non-sealed 精确控制谁能继承一个类或实现接口，为模式匹配提供有限层次
+---
+
+# Sealed 密封类
+
+Java 17 引入的 `sealed`（密封）机制，让父类能**精确规定哪些子类允许存在**。它介于「随便继承」（默认）与「完全禁止继承」（`final`）之间，填补了长期缺失的「受控继承」空白。
+
+## 1. 为什么需要 sealed
+
+有时你希望一个类型只有固定的几种形态，例如「图形」只有圆形、矩形、三角形。普通继承无法阻止别人新增第四种，导致 `switch` 穷举时永远要写 `default` 兜底。
+
+`sealed` 把子类的集合**写死在声明里**，编译器因此知道「世上只有这几种可能」。
+
+## 2. 基本语法
+
+父类用 `sealed` 修饰，并用 `permits` 列出允许的直接子类；每个被许可的子类必须用 `final`、`sealed` 或 `non-sealed` 三选一收尾。
+
+```java
+public sealed interface Shape permits Circle, Rectangle, Triangle {
+    double area();
+}
+
+public final class Circle implements Shape {
+    private final double r;
+    public Circle(double r) { this.r = r; }
+    public double area() { return Math.PI * r * r; }
+}
+
+public non-sealed class Triangle implements Shape {
+    // 允许再被继承
+    public double area() { return 0; }
+}
+```
+
+<Callout type="info" title="permits 的就近原则">
+如果子类与父类在**同一个源文件**中，可以省略 `permits`，编译器自动推断。跨文件时必须显式写出。
+</Callout>
+
+## 3. 三种子类修饰符
+
+| 修饰符 | 含义 |
+|---|---|
+| `final` | 关闭继承（如 `Circle`） |
+| `sealed` | 继续密封，自己再 `permits` 下一级 |
+| `non-sealed` | 重新开放，允许任意类继承 |
+
+这样你可以构建「上层受控、下层开放」或「完全封死」的灵活层次。
+
+## 4. 与模式匹配配合
+
+`sealed` 的最大价值在于让 `switch` 表达式能**穷举**所有分支，编译器确认无需 `default`：
+
+```java
+double area(Shape s) {
+    return switch (s) {
+        case Circle c   -> Math.PI * c.r() * c.r();
+        case Rectangle r -> r.w() * r.h();
+        case Triangle t  -> 0;   // 编译器知道没有其它可能
+    };
+}
+```
+
+<Callout type="tip" title="何时用 sealed">
+当你建模的是「封闭的领域概念」（状态码、表达式节点、协议消息）时用 `sealed`；若是「开放式扩展点」（插件、策略），则保持普通继承。
+</Callout>
+
+## 小结
+
+- ✅ `sealed` 让父类精确 `permits` 允许的子类型
+- ✅ 子类必须标 `final` / `sealed` / `non-sealed`
+- ✅ 同文件可省略 `permits`
+- ✅ 为模式匹配提供可穷举的有限层次，消除无谓 `default`
+- ✅ 适用于封闭领域模型，而非开放扩展点

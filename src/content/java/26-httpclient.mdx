@@ -1,0 +1,95 @@
+---
+title: HttpClient 异步请求
+order: 26
+description: 用 Java 11 内置的 HttpClient 发送同步/异步 HTTP 请求，配置超时、请求体与响应处理
+---
+
+# HttpClient 异步请求
+
+Java 11 把 `java.net.http.HttpClient` 转正，终于有了**标准库自带**的现代 HTTP 客户端，支持 HTTP/2、异步、流式响应，不再依赖 Apache HttpClient 或 OkHttp。
+
+## 1. 构建客户端
+
+客户端应被复用（内部维护连接池），通常做成单例：
+
+```java
+HttpClient client = HttpClient.newBuilder()
+    .connectTimeout(Duration.ofSeconds(5))
+    .followRedirects(HttpClient.Redirect.NORMAL)
+    .build();
+```
+
+## 2. 同步请求
+
+最简单的 GET 直接 `send`，会阻塞当前线程直到拿到响应：
+
+```java
+HttpRequest req = HttpRequest.newBuilder()
+    .uri(URI.create("https://api.example.com/users/1"))
+    .timeout(Duration.ofSeconds(10))
+    .header("Accept", "application/json")
+    .build();
+
+HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+System.out.println(resp.statusCode());
+System.out.println(resp.body());
+```
+
+<Callout type="info" title="BodyHandlers 决定收什么">
+`ofString()` 收全文；`ofBytes()` 收字节；`ofFile(Path)` 直接落盘；`discarding()` 丢弃响应体。按需求选，避免无谓内存占用。
+</Callout>
+
+## 3. 异步请求
+
+用 `sendAsync` 返回 `CompletableFuture`，不阻塞调用线程，适合并发拉取多个接口：
+
+```java
+CompletableFuture<HttpResponse<String>> f1 =
+    client.sendAsync(req, HttpResponse.BodyHandlers.ofString());
+
+f1.thenApply(HttpResponse::body)
+  .thenAccept(body -> System.out.println("响应: " + body))
+  .join();   // 演示用 join 等待，生产可用 thenRun 串联后续
+```
+
+并发拉多个 URL 非常自然：
+
+```java
+List<URI> uris = List.of(
+    URI.create("https://api.example.com/a"),
+    URI.create("https://api.example.com/b"));
+
+List<CompletableFuture<String>> futures = uris.stream()
+    .map(u -> client.sendAsync(
+        HttpRequest.newBuilder(u).build(),
+        HttpResponse.BodyHandlers.ofString())
+        .thenApply(HttpResponse::body))
+    .toList();
+
+// 等全部完成
+futures.stream().map(CompletableFuture::join).forEach(System.out::println);
+```
+
+## 4. POST 与请求体
+
+发送 JSON 用 `POST` + `BodyPublishers.ofString`：
+
+```java
+HttpRequest post = HttpRequest.newBuilder()
+    .uri(URI.create("https://api.example.com/users"))
+    .header("Content-Type", "application/json")
+    .POST(HttpRequest.BodyPublishers.ofString("{\"name\":\"Alice\"}"))
+    .build();
+```
+
+<Callout type="warn" title="记得设置超时">
+无论是 `send` 还是 `sendAsync`，都应在 `HttpRequest` 上设置 `.timeout(...)`。否则网络挂起时，异步 future 可能永远不完成，悄悄拖垮整个任务。
+</Callout>
+
+## 小结
+
+- ✅ `HttpClient` 是 Java 11+ 标准库，支持 HTTP/2 与异步
+- ✅ 客户端应复用，配置连接超时与重定向
+- ✅ 同步 `send` 会阻塞；异步 `sendAsync` 返回 `CompletableFuture`
+- ✅ `BodyHandlers` 控制如何接收响应体
+- ✅ POST 用 `BodyPublishers.ofString`；务必给请求设超时

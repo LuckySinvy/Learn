@@ -1,0 +1,105 @@
+---
+title: 泛型进阶：约束与设计
+order: 21
+description: 约束组合、constraints 包、map key、泛型算法设计
+---
+
+# 泛型进阶：约束与设计
+
+第 12 章讲了泛型基础。本章聚焦「怎么把约束写对」以及常见进阶模式。
+
+## 1. 约束可组合
+
+约束本质是接口（类型集）。多个能力可叠加：
+
+```go
+type Number interface {
+    ~int | ~int64 | ~float64
+}
+
+type Stringer interface {
+    String() string
+}
+
+// 同时需要是数值、又能转字符串
+type NumericStringer interface {
+    Number
+    Stringer
+}
+```
+
+<Callout type="info" title="约束里的三种成员">
+1. 具体类型：`int`、`string`
+2. 底层类型：`~int`（含自定义类型）
+3. 方法：`String() string`
+三者用并集或交集自由组合。
+</Callout>
+
+## 2. 用 `constraints` 包省去手写
+
+```go
+import "golang.org/x/exp/constraints"
+
+func Max[T constraints.Ordered](a, b T) T {
+    if a > b {
+        return a
+    }
+    return b
+}
+```
+
+`constraints.Ordered` 覆盖了所有可比较大小的类型。
+
+## 3. 泛型与 map key
+
+只有 `comparable` 才能当 key。泛型让容器更通用：
+
+```go
+func Keys[K comparable, V any](m map[K]V) []K {
+    ks := make([]K, 0, len(m))
+    for k := range m {
+        ks = append(ks, k)
+    }
+    return ks
+}
+```
+
+## 4. 约束推导与实例化
+
+多数时候编译器能推导类型参数，但显式实例化也支持：
+
+```go
+var m SyncMap[int, string] // 实例化一个泛型类型
+```
+
+<Callout type="tip" title="约束写太宽会丢类型安全">
+若用 `any` 接收数值再相加，编译会失败——因为 `any` 不支持 `+`。约束要刚好表达「这个操作需要的能力」。
+</Callout>
+
+## 5. 泛型函数设计算法
+
+实现一个 `Reduce`：
+
+```go
+func Reduce[T, U any](s []T, init U, f func(U, T) U) U {
+    acc := init
+    for _, v := range s {
+        acc = f(acc, v)
+    }
+    return acc
+}
+```
+
+配合 `Map`、`Filter`，可拼出声明式数据处理链。
+
+<Callout type="warn" title="别过度泛型">
+业务函数类型明确时，写具体类型更易读、IDE 提示更好。泛型留给容器与通用算法。
+</Callout>
+
+## 小结
+
+- 约束就是接口，可叠加具体类型、底层类型与方法
+- `constraints` 包提供 `Ordered` 等现成约束
+- `comparable` 才能做 map key，泛型让容器通用
+- 约束要「刚好够用」，过宽会失去类型安全
+- 泛型适合容器与算法，业务类型仍用具体类型

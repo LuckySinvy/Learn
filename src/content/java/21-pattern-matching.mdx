@@ -1,0 +1,92 @@
+---
+title: 模式匹配
+order: 21
+description: instanceof 类型模式、switch 表达式与类型模式、守卫（guard），让 Java 的 branching 更紧凑安全
+---
+
+# 模式匹配
+
+模式匹配（Pattern Matching）是 Java 14 起逐步落地的现代化特性，目标是**减少样板、消除强制转换错误**。它让 `instanceof` 和 `switch` 在判断类型时顺手把变量绑定出来。
+
+## 1. instanceof 类型模式
+
+旧写法需要两次判断、一次强转：
+
+```java
+if (obj instanceof String) {
+    String s = (String) obj;
+    System.out.println(s.length());
+}
+```
+
+新模式把「判断 + 声明 + 转换」合并：
+
+```java
+if (obj instanceof String s) {
+    System.out.println(s.length());   // s 已自动转为 String
+} else {
+    // 此作用域内 s 不可用
+}
+```
+
+<Callout type="info" title="作用域规则">
+绑定变量 `s` 只在 `true` 分支可见。若 `obj` 为 `null`，模式直接失败（不会 NPE），因为 `null` 不属于任何类型。
+</Callout>
+
+## 2. switch 表达式与类型模式
+
+Java 17+ 允许在 `switch` 上做类型模式，配合 `->` 箭头语法，比一长串 `if/else` 更清晰：
+
+```java
+String describe(Object o) {
+    return switch (o) {
+        case Integer i -> "整数 " + i;
+        case String s  -> "字符串 " + s;
+        case Double d  -> "小数 " + d;
+        case null      -> "空值";
+        default        -> "其他类型";
+    };
+}
+```
+
+注意 `case null` 必须显式写出，否则 `null` 会抛 `NullPointerException`。
+
+## 3. 守卫（guard）与带括号模式
+
+当需要在匹配类型后追加条件，可以用 `when` 守卫（Java 17 预览、21 正式增强）：
+
+```java
+double area(Shape s) {
+    return switch (s) {
+        case Circle c      -> Math.PI * c.r() * c.r();
+        case Rectangle r   -> r.w() * r.h();
+        case Triangle t when t.base() == 0 -> 0;
+        case Triangle t    -> t.base() * t.height() / 2.0;
+    };
+}
+```
+
+<Callout type="tip" title="优先 switch 模式而非链状 if">
+当分支超过 3 个且都在判断「这是什么类型/值」时，改用 `switch` 模式匹配，可读性与可维护性都更好；配合 `sealed` 还能让编译器检查是否遗漏分支。
+</Callout>
+
+## 4. 解构模式（预览）
+
+未来 Java 还会支持对 record 直接「解构」：
+
+```java
+// 预览语法（后续版本）
+if (pt instanceof Point(int x, int y)) {
+    System.out.println(x + y);
+}
+```
+
+目前稳定版已能在 `switch` 中配合 record 组件做匹配基础，完整解构仍在演进。
+
+## 小结
+
+- ✅ `instanceof 类型 变量` 合并判断与转换，变量仅 true 分支可见
+- ✅ `switch` 类型模式用 `->`，可显式 `case null`
+- ✅ 用 `when` 守卫在匹配后追加条件
+- ✅ 配合 `sealed` 可让分支可被编译器穷举校验
+- ✅ 解构模式是后续演进方向，保持关注

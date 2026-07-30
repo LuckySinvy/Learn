@@ -1,0 +1,76 @@
+---
+title: 插件开发入门
+order: 24
+description: 了解 Dify 插件机制，用声明式配置封装一个自定义工具或模型供应商，扩展平台能力
+---
+
+# 插件开发入门
+
+第 9 章用了内置工具与插件。当你的业务系统有独特接口（内部 ERP、私有算法），就需要**自己写插件**把它接进 Dify。本章讲清插件的结构与最小开发路径。
+
+## 1. 插件解决什么问题
+
+插件让你把「外部能力」封装成 Dify 可识别的**工具（Tool）** 或**模型供应商（Model Provider）**，在工作流与 Agent 里直接拖用，无需改平台源码。
+
+## 2. 插件的基本结构
+
+一个工具插件通常包含清单与实现：
+
+```yaml
+# manifest.yaml 概要
+name: my-erp-tool
+version: 0.1.0
+type: tool
+label:
+  zh: 内部 ERP 查询
+tools:
+  - name: query_order
+    label: 查询订单
+    parameters:
+      - name: order_id
+        type: string
+        required: true
+    endpoint: http://erp.internal/order
+```
+
+<Callout type="tip" title="先想清输入输出契约">
+插件开发 80% 的工作量在「把外部接口的参数和返回，整理成清晰、可校验的 schema」。把字段类型、必填项、错误码先写清楚，实现反而简单。
+</Callout>
+
+## 3. 实现与本地调试
+
+工具实现负责：接收 Dify 传来的参数 → 调用你的后端 → 把结果整理成文本/JSON 返回。
+
+```text
+# 工具实现（伪代码）
+def query_order(order_id: str):
+    resp = requests.get(f"http://erp.internal/order/{order_id}")
+    if resp.status_code != 200:
+        return {"result": f"查询失败：{resp.status_code}"}
+    data = resp.json()
+    return {"result": f"订单 {order_id} 状态：{data['status']}"}
+```
+
+## 4. 注册与权限
+
+开发完成后，在 Dify 控制台「插件 → 本地插件 / 上传」加载，系统会校验清单格式并暴露为可用工具。
+
+```bash
+# 本地调试常用：用 ngrok 之类把本机暴露给 Dify 调试
+# 或直接把插件打包含上传到私有插件市场
+```
+
+<Callout type="warn" title="插件里的密钥不要硬编码">
+ERP、内部系统的凭证应走插件环境变量或 Dify 的密钥配置，不要写死在代码里，否则会随插件包泄露。
+</Callout>
+
+<Callout type="exercise" title="动手做">
+挑一个你最熟悉的简单 HTTP 接口（如查询天气、查快递），写一份插件清单，声明 1 个参数与 1 个返回字段，并试着在 Dify 里加载为工具。
+</Callout>
+
+## 小结
+
+- 插件把外部能力封装成可拖用的工具/模型供应商
+- 核心是写清 manifest 里的参数与返回 schema
+- 实现负责转发参数、整理返回、处理错误
+- 密钥走配置不硬编码；下一步讲多模型路由 →

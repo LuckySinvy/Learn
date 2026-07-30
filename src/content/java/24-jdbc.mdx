@@ -1,0 +1,89 @@
+---
+title: JDBC 与数据库访问
+order: 24
+description: 用 JDBC 连接关系型数据库、PreparedStatement 防注入、事务控制，以及 try-with-resources 管理连接
+---
+
+# JDBC 与数据库访问
+
+JDBC（Java Database Connectivity）是 Java 访问关系型数据库的标准 API。无论底层是 MySQL、PostgreSQL 还是 H2，代码套路都一致：建连接 → 执行 SQL → 处理结果 → 关闭资源。
+
+## 1. 建立连接
+
+现代驱动支持 `DriverManager.getConnection`，传入 URL、账号、密码：
+
+```java
+String url = "jdbc:mysql://localhost:3306/demo?useSSL=false&serverTimezone=UTC";
+try (Connection conn = DriverManager.getConnection(url, "root", "pwd")) {
+    System.out.println("连接成功：" + conn.getCatalog());
+}
+```
+
+这里用 **try-with-resources**，连接退出块时自动关闭，无需手写 `finally`。
+
+<Callout type="info" title="驱动注册">
+JDBC 4.0 后驱动通过 SPI 自动注册，无需再写 `Class.forName("com.mysql.cj.jdbc.Driver")`。只需把对应驱动的 jar 放进依赖即可。
+</Callout>
+
+## 2. PreparedStatement 防注入
+
+永远用 `PreparedStatement` 而不是字符串拼接 SQL，既防 SQL 注入，又便于参数复用：
+
+```java
+String sql = "SELECT id, name FROM users WHERE age > ? AND city = ?";
+try (Connection conn = DriverManager.getConnection(url, "root", "pwd");
+     PreparedStatement ps = conn.prepareStatement(sql)) {
+    ps.setInt(1, 18);        // 第 1 个占位符
+    ps.setString(2, "Beijing");
+    try (ResultSet rs = ps.executeQuery()) {
+        while (rs.next()) {
+            System.out.println(rs.getInt("id") + " " + rs.getString("name"));
+        }
+    }
+}
+```
+
+## 3. 事务控制
+
+默认每条语句自动提交。需要「要么全成、要么全败」（如转账）时，手动管理事务：
+
+```java
+try (Connection conn = DriverManager.getConnection(url, "root", "pwd")) {
+    conn.setAutoCommit(false);            // 关闭自动提交
+    try (PreparedStatement a = conn.prepareStatement("UPDATE acc SET bal=bal-? WHERE id=?");
+         PreparedStatement b = conn.prepareStatement("UPDATE acc SET bal=bal+? WHERE id=?")) {
+        a.setDouble(1, 100); a.setInt(2, 1); a.executeUpdate();
+        b.setDouble(1, 100); b.setInt(2, 2); b.executeUpdate();
+        conn.commit();                    // 全部成功才提交
+    } catch (Exception e) {
+        conn.rollback();                  // 出错回滚
+        throw e;
+    }
+}
+```
+
+<Callout type="warn" title="资源必须关闭">
+`Connection` / `Statement` / `ResultSet` 都持有底层资源。忘记关闭会耗尽连接池。一律用 try-with-resources，让编译器保证关闭顺序（ResultSet → Statement → Connection）。
+</Callout>
+
+## 4. 更新与批量
+
+`executeUpdate` 返回受影响行数；大量插入用 `addBatch` / `executeBatch` 减少往返：
+
+```java
+try (PreparedStatement ps = conn.prepareStatement("INSERT INTO log(msg) VALUES (?)")) {
+    for (String m : messages) {
+        ps.setString(1, m);
+        ps.addBatch();
+    }
+    int[] results = ps.executeBatch();   // 一次提交多行
+}
+```
+
+## 小结
+
+- ✅ 连接用 `DriverManager.getConnection`，资源交给 try-with-resources
+- ✅ 用 `PreparedStatement` + `?` 占位符防 SQL 注入
+- ✅ 事务：`setAutoCommit(false)` → `commit` / `rollback`
+- ✅ 查询结果遍历 `ResultSet.next()`，按列名取值
+- ✅ 批量写入用 `addBatch` / `executeBatch` 提升性能
