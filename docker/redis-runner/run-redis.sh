@@ -28,9 +28,14 @@ while IFS= read -r line || [ -n "$line" ]; do
   esac
   printf '127.0.0.1:6379> %s\n' "$trimmed"
   # eval 以支持带引号参数：SET greeting "hello world"
-  if ! eval "redis-cli --no-raw $trimmed"; then
-    fail=1
-  fi
+  out=$(eval "redis-cli --no-raw $trimmed" 2>&1)
+  rc=$?
+  printf '%s\n' "$out"
+  # redis-cli 对 -ERR 回复仍返回 0，需自行识别，否则 UI 会误报"执行成功"
+  case "$out" in
+    '(error)'*) fail=1 ;;
+  esac
+  [ "$rc" -ne 0 ] && fail=1
 done < /code/main.redis
 
 exit "$fail"
