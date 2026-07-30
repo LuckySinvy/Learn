@@ -1,0 +1,1588 @@
+---
+title: 项目实战：用 NestJS 构建类型安全的后端服务
+order: 23
+description: 把第 22 章的任务领域模型搬上 HTTP——模块与依赖注入、控制器与路由、DTO 校验、守卫拦截器管道、TypeORM 持久层、测试与生产化
+---
+
+# 项目实战：用 NestJS 构建类型安全的后端服务
+
+第 22 章我们用纯 TypeScript 写出了一个任务管理 CLI 的内核：泛型事件总线、Result 化的 `TaskStore`、类型安全的命令注册表。那套东西唯一的问题是——它只能在你的终端里跑。
+
+这一章我们把**同一个领域模型搬上 HTTP**。命令注册表变成控制器路由，`parse` 变成 DTO 校验，`Ctx` 变成依赖注入容器，事件总线变成拦截器链。你会发现 NestJS 做的事情，本质上就是把第 22 章那些手写的机制标准化、装饰器化了。
+
+<Callout type="warn" title="本章的 Playground 跑的不是 NestJS">
+课程沙箱只有 Node 标准库，没有 `@nestjs/common`，也不支持装饰器（V8 尚未实现标准装饰器，Node 无法直接运行）。所以本章所有**真实的 NestJS 代码都放在普通代码块里**（完整可抄，需要你在本机 `npm i` 之后运行）。
+
+而 Playground 里放的是**用纯 TypeScript 手写的 Nest 核心机制极简复刻**：DI 容器、路由分发器、校验管道、洋葱模型。这恰恰是理解框架最好的方式——先看见轮子长什么样，再去用别人造好的轮子。
+</Callout>
+
+## 1. 为什么是 NestJS
+
+### 1.1 Express 裸写会走到哪一步
+
+用 Express 写一个中型服务，大概三个月后会长成这样：一个 500 行的 `routes.js`，每个 handler 里混着参数校验、业务逻辑和 SQL；`req.body` 的类型是 `any`，改了字段名要靠全文搜索；想给某几个接口加鉴权，只能一个个手动挂 `app.use`；写单元测试时发现业务逻辑和 `req`/`res` 焊死在一起，根本没法单独测。
+
+这些问题的根源不是 Express 不好，而是它**只提供了 HTTP 层的原语，不提供组织代码的结构**。结构要靠团队自觉，而自觉是不可持续的。
+
+### 1.2 Nest 给了什么
+
+NestJS 的答案是把 Angular 那套（模块 + 依赖注入 + 装饰器）和 Spring 那套（分层、IoC 容器、AOP 切面）搬到了 Node 上，同时保留 Express/Fastify 作为底层驱动。它强制你把代码分成三层：
+
+| 层 | 职责 | 不该做什么 |
+|---|---|---|
+| Controller | 解析 HTTP、调用 Service、返回数据 | 不写业务逻辑，不碰数据库 |
+| Service | 业务规则、事务编排 | 不感知 HTTP，不出现 req 与 res |
+| Repository / Entity | 数据存取 | 不写业务判断 |
+
+这个分层的直接好处是：Service 里没有任何 HTTP 概念，所以给它写单元测试时不需要启动服务器；Controller 薄到几乎不需要测；换掉底层数据库时 Controller 一行都不用改。
+
+### 1.3 它为什么天然适合 TypeScript
+
+Nest 不是"支持 TypeScript"，而是**离开 TypeScript 就没法工作**。它的依赖注入靠的是 `emitDecoratorMetadata` 在编译期写入的 `design:paramtypes` 元数据——编译器把构造器每个参数的类型信息作为运行时数据注入进产物，容器读取它来决定注入什么。这在纯 JS 里做不到。
+
+同理，`ValidationPipe` 之所以能自动校验，是因为 `class-validator` 的装饰器把约束挂在了类的元数据上；Swagger 之所以能自动生成文档，是因为 `@nestjs/swagger` 插件读取了同一份类型信息。**一份类型声明，同时服务于编译期检查、运行时校验和 API 文档**——这是 Nest 最值钱的地方。
+
+## 2. 项目脚手架与目录结构
+
+### 2.1 生成项目
+
+```bash
+npm i -g @nestjs/cli
+nest new tasks-api          # 选 npm 或 pnpm
+cd tasks-api
+nest g resource tasks       # 选 REST API，选 y 生成 CRUD 入口
+npm run start:dev
+```
+
+`nest g resource tasks` 一条命令会生成模块、控制器、服务、DTO、实体和两个测试文件，并自动把新模块注册进 `AppModule`。这是日常最常用的生成器。
+
+### 2.2 目录结构
+
+```text
+src/
+├── main.ts                      # 引导入口：创建应用、挂全局管道/过滤器、listen
+├── app.module.ts                # 根模块：聚合所有功能模块
+├── common/                      # 跨模块共享的切面
+│   ├── filters/http-exception.filter.ts
+│   ├── guards/jwt-auth.guard.ts
+│   ├── interceptors/logging.interceptor.ts
+│   └── interceptors/timeout.interceptor.ts
+├── config/
+│   └── configuration.ts         # 类型安全的配置
+└── tasks/                       # 一个功能模块 = 一个目录
+    ├── tasks.module.ts
+    ├── tasks.controller.ts
+    ├── tasks.service.ts
+    ├── dto/create-task.dto.ts
+    ├── dto/update-task.dto.ts
+    ├── dto/query-task.dto.ts
+    └── entities/task.entity.ts
+```
+
+一个原则：**目录按业务领域划分，不按技术类型划分**。不要建 `controllers/`、`services/` 两个大目录再把所有文件塞进去——那样每加一个功能都要在四个目录之间跳。
+
+<Callout type="tip" title="用路径别名代替一串 ../../">
+在 `tsconfig.json` 里配 `"paths"`，把 `src` 映射成 `@/`，跨模块引用就能写成 `import { Task } from "@/tasks/entities/task.entity"`。Nest 项目还要在 `jest` 配置里同步加 `moduleNameMapper`，否则测试跑不起来——这是配了别名之后最常见的第二个坑。
+</Callout>
+
+### 2.3 tsconfig 里的两个关键开关
+
+```json
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2021",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "strictNullChecks": true,
+    "strict": true
+  }
+}
+```
+
+- `experimentalDecorators`：启用第 19 章讲的**旧版装饰器**语义。Nest 依赖参数装饰器（`@Param`、`@Inject`），而 TC39 标准装饰器**不支持参数装饰器**，所以 Nest 短期内不会迁移。
+- `emitDecoratorMetadata`：让 TS 在有装饰器的类上额外发出 `design:type`、`design:paramtypes`、`design:returntype` 三种元数据。**没有它，构造器注入会直接失败**。
+
+<Callout type="warn" title="用 SWC 或 esbuild 加速编译时的坑">
+`nest start --builder swc` 能把编译速度提升一个数量级，但 SWC 必须显式开启 `"jsc.transform.legacyDecorator": true` 与 `"jsc.transform.decoratorMetadata": true`，否则元数据不会发出，容器在启动时报 `Nest can't resolve dependencies`。esbuild 至今不支持 `emitDecoratorMetadata`，因此**不能**用它编译 Nest 项目的运行产物。
+</Callout>
+
+## 3. Module 与依赖注入
+
+### 3.1 模块是什么
+
+模块是 Nest 的组织单元，也是**依赖注入的作用域边界**。一个 provider 默认只在声明它的模块内可见，除非被 `exports` 出去。
+
+```ts
+// src/tasks/tasks.module.ts
+import { Module } from "@nestjs/common";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { TasksController } from "./tasks.controller";
+import { TasksService } from "./tasks.service";
+import { Task } from "./entities/task.entity";
+
+@Module({
+  imports: [TypeOrmModule.forFeature([Task])],
+  controllers: [TasksController],
+  providers: [TasksService],
+  exports: [TasksService],
+})
+export class TasksModule {}
+```
+
+四个字段的含义：`imports` 引入其它模块导出的 provider；`controllers` 声明本模块的路由处理者；`providers` 声明本模块可注入的服务；`exports` 把某些 provider 公开给引入本模块的人。
+
+### 3.2 构造器注入
+
+```ts
+// src/tasks/tasks.service.ts（片段）
+@Injectable()
+export class TasksService {
+  constructor(
+    private readonly repo: Repository<Task>,
+    private readonly logger: LoggerService,
+  ) {}
+}
+```
+
+注意这里用了第 7 章的**参数属性**语法：`private readonly repo` 一行完成"声明字段 + 赋值 + 加修饰符"。Nest 在实例化 `TasksService` 时，读取 `design:paramtypes` 拿到 `[Repository, LoggerService]`，再从容器里查出对应实例传进构造器。
+
+### 3.3 provider 的四种写法
+
+```ts
+// src/app.module.ts（片段）
+@Module({
+  providers: [
+    // 1) useClass：最常见，token 就是类本身
+    TasksService,
+    { provide: MailerService, useClass: SmtpMailerService },
+
+    // 2) useValue：注入常量、配置对象或测试替身
+    { provide: "APP_NAME", useValue: "tasks-api" },
+
+    // 3) useFactory：需要运行时计算，deps 声明工厂自己的依赖
+    {
+      provide: "DB_POOL",
+      useFactory: (config: ConfigService) => createPool(config.get("db")),
+      inject: [ConfigService],
+    },
+
+    // 4) useExisting：给已有 provider 起一个别名
+    { provide: "LOGGER_ALIAS", useExisting: LoggerService },
+  ],
+})
+export class AppModule {}
+```
+
+用字符串或 `Symbol` 当 token 时，注入处必须显式写 `@Inject`，因为类型信息里没有"字符串 token"这回事：
+
+```ts
+constructor(@Inject("APP_NAME") private readonly appName: string) {}
+```
+
+### 3.4 作用域
+
+| 作用域 | 常量 | 生命周期 |
+|---|---|---|
+| 单例（默认） | `Scope.DEFAULT` | 整个应用共享一个实例 |
+| 请求作用域 | `Scope.REQUEST` | 每个请求新建一份 |
+| 瞬时 | `Scope.TRANSIENT` | 每个注入点各持一份 |
+
+<Callout type="warn" title="请求作用域会传染，而且很贵">
+把一个 provider 标成 `Scope.REQUEST`，所有依赖它的 provider 和 controller **都会被自动提升为请求作用域**，整条依赖链每次请求都要重新实例化。在高 QPS 服务上这足以让吞吐掉一半。需要拿到请求上下文时，优先考虑 `AsyncLocalStorage`（`nestjs-cls` 包）而不是请求作用域。
+</Callout>
+
+### 3.5 极简复刻：手写一个 DI 容器
+
+下面这个 Playground 是 Nest IoC 容器的极简版：用一张 `Map` 存 token 到 provider 的映射，`resolve` 递归解析依赖、缓存单例、检测循环依赖。真实框架里 token 是类构造器、依赖列表来自 `Reflect.getMetadata("design:paramtypes", target)`，但**核心算法就是这三十行**。
+
+<Playground
+  language="typescript"
+  id="ts-23-di-container"
+  title="手写一个迷你 DI 容器"
+  code={`// ===== 这是 Nest IoC 容器的极简复刻 =====
+type Token = string;
+type Scope = "singleton" | "transient";
+
+type Provider =
+  | { readonly kind: "value"; readonly token: Token; readonly value: unknown }
+  | {
+      readonly kind: "factory";
+      readonly token: Token;
+      readonly scope: Scope;
+      readonly deps: readonly Token[];
+      readonly factory: (deps: readonly unknown[]) => unknown;
+    };
+
+// 依赖数组里的类型已被擦除，取出时由注册方负责标注（真实框架靠元数据自动完成）
+function dep<T>(deps: readonly unknown[], i: number): T {
+  return deps[i] as T;
+}
+
+class Container {
+  private readonly providers = new Map<Token, Provider>();
+  private readonly singletons = new Map<Token, unknown>();
+
+  register(provider: Provider): this {
+    this.providers.set(provider.token, provider);
+    return this;
+  }
+
+  resolve<T>(token: Token, chain: readonly Token[] = []): T {
+    if (chain.includes(token)) {
+      throw new Error("检测到循环依赖: " + [...chain, token].join(" -> "));
+    }
+    const provider = this.providers.get(token);
+    if (provider === undefined) {
+      throw new Error("找不到 provider [" + token + "]，它在当前模块里注册了吗？");
+    }
+    if (provider.kind === "value") return provider.value as T;
+
+    const cached = this.singletons.get(token);
+    if (provider.scope === "singleton" && cached !== undefined) return cached as T;
+
+    // 先递归解析每个依赖，再把它们按顺序传给工厂 —— 这就是构造器注入
+    const args = provider.deps.map((d) => this.resolve<unknown>(d, [...chain, token]));
+    const instance = provider.factory(args);
+    if (provider.scope === "singleton") this.singletons.set(token, instance);
+    return instance as T;
+  }
+}
+
+// ===== 业务类：完全不知道容器的存在 =====
+class Logger {
+  private static created = 0;
+  readonly serial: number;
+  constructor() {
+    Logger.created += 1;
+    this.serial = Logger.created;
+  }
+  log(msg: string): void {
+    console.log("  [Logger#" + this.serial + "] " + msg);
+  }
+}
+
+type Task = { readonly id: number; readonly title: string; readonly done: boolean };
+
+class TasksRepository {
+  private readonly rows = new Map<number, Task>();
+  private nextId = 1;
+  constructor(private readonly logger: Logger) {}
+
+  insert(title: string): Task {
+    const task: Task = { id: this.nextId, title, done: false };
+    this.nextId += 1;
+    this.rows.set(task.id, task);
+    this.logger.log("INSERT task #" + task.id);
+    return task;
+  }
+
+  findAll(): readonly Task[] {
+    return [...this.rows.values()];
+  }
+}
+
+class TasksService {
+  constructor(
+    private readonly repo: TasksRepository,
+    private readonly logger: Logger,
+    private readonly appName: string,
+  ) {}
+
+  create(title: string): Task {
+    this.logger.log(this.appName + " 创建任务: " + title);
+    return this.repo.insert(title);
+  }
+
+  list(): readonly Task[] {
+    return this.repo.findAll();
+  }
+}
+
+// ===== 注册：等价于 @Module 的 providers 数组 =====
+let requestSeq = 0;
+const container = new Container();
+
+container
+  .register({ kind: "value", token: "APP_NAME", value: "tasks-api" })
+  .register({
+    kind: "factory", token: "Logger", scope: "singleton", deps: [],
+    factory: () => new Logger(),
+  })
+  .register({
+    kind: "factory", token: "TasksRepository", scope: "singleton", deps: ["Logger"],
+    factory: (d) => new TasksRepository(dep<Logger>(d, 0)),
+  })
+  .register({
+    kind: "factory", token: "TasksService", scope: "singleton",
+    deps: ["TasksRepository", "Logger", "APP_NAME"],
+    factory: (d) =>
+      new TasksService(dep<TasksRepository>(d, 0), dep<Logger>(d, 1), dep<string>(d, 2)),
+  })
+  .register({
+    kind: "factory", token: "RequestContext", scope: "transient", deps: [],
+    factory: () => {
+      requestSeq += 1;
+      return { requestId: "req-" + requestSeq };
+    },
+  });
+
+// ===== 解析并使用 =====
+const svc1 = container.resolve<TasksService>("TasksService");
+const svc2 = container.resolve<TasksService>("TasksService");
+console.log("两次解析拿到同一个单例吗?", svc1 === svc2);
+
+svc1.create("把 CLI 内核搬上 HTTP");
+svc1.create("给 Tasks API 加上鉴权");
+console.log("任务列表:", svc2.list().map((t) => "#" + t.id + " " + t.title).join(" / "));
+
+const ctxA = container.resolve<{ requestId: string }>("RequestContext");
+const ctxB = container.resolve<{ requestId: string }>("RequestContext");
+console.log("transient 每次都是新的:", ctxA.requestId, "vs", ctxB.requestId);
+
+// ===== 两种典型启动期报错 =====
+container.register({
+  kind: "factory", token: "A", scope: "singleton", deps: ["B"],
+  factory: (d) => ({ b: d[0] }),
+});
+container.register({
+  kind: "factory", token: "B", scope: "singleton", deps: ["A"],
+  factory: (d) => ({ a: d[0] }),
+});
+
+for (const bad of ["A", "MailerService"]) {
+  try {
+    container.resolve(bad);
+  } catch (e) {
+    console.log("启动失败 ->", e instanceof Error ? e.message : String(e));
+  }
+}
+console.log("容器演示结束");`}
+/>
+
+<Callout type="warn" title="循环依赖与 forwardRef">
+上面容器抛出的"检测到循环依赖"，在真实 Nest 里就是那句著名的 `A circular dependency between modules`。官方给的解药是 `forwardRef(() => OtherModule)` 和 `@Inject(forwardRef(() => OtherService))`，但它只是延迟求值，**并没有消除设计上的环**。更好的做法是把两边共用的部分抽成第三个模块，或者用事件（`EventEmitterModule`）把强依赖改成弱通知——这正是第 22 章事件总线的价值。
+</Callout>
+
+## 4. Controller 与路由
+
+### 4.1 装饰器版
+
+```ts
+// src/tasks/tasks.controller.ts
+import {
+  Body, Controller, Delete, Get, HttpCode, HttpStatus,
+  Param, ParseIntPipe, Patch, Post, Query,
+} from "@nestjs/common";
+import { TasksService } from "./tasks.service";
+import { CreateTaskDto } from "./dto/create-task.dto";
+import { UpdateTaskDto } from "./dto/update-task.dto";
+import { QueryTaskDto } from "./dto/query-task.dto";
+import { Task } from "./entities/task.entity";
+
+@Controller("tasks")
+export class TasksController {
+  constructor(private readonly tasksService: TasksService) {}
+
+  @Get()
+  findAll(@Query() query: QueryTaskDto): Promise<Task[]> {
+    return this.tasksService.findAll(query);
+  }
+
+  @Get(":id")
+  findOne(@Param("id", ParseIntPipe) id: number): Promise<Task> {
+    return this.tasksService.findOne(id);
+  }
+
+  @Post()
+  @HttpCode(HttpStatus.CREATED)
+  create(@Body() dto: CreateTaskDto): Promise<Task> {
+    return this.tasksService.create(dto);
+  }
+
+  @Patch(":id")
+  update(
+    @Param("id", ParseIntPipe) id: number,
+    @Body() dto: UpdateTaskDto,
+  ): Promise<Task> {
+    return this.tasksService.update(id, dto);
+  }
+
+  @Delete(":id")
+  @HttpCode(HttpStatus.NO_CONTENT)
+  remove(@Param("id", ParseIntPipe) id: number): Promise<void> {
+    return this.tasksService.remove(id);
+  }
+}
+```
+
+几个约定：`@Controller("tasks")` 的字符串是路径前缀；方法装饰器里的路径是相对的，`@Get(":id")` 最终匹配 `/tasks/:id`；POST 默认返回 201，其余默认 200，用 `@HttpCode` 改写；返回值可以是同步值、Promise 或 Observable，Nest 会自动 `await` 并序列化成 JSON。
+
+`@Param("id", ParseIntPipe)` 里的第二个参数是**参数级管道**：它把路径里的字符串 `"12"` 转成数字 `12`，转不动就直接返回 400。这样 Service 拿到的一定是 `number`，不用自己 `Number()` 再判断 `NaN`。
+
+### 4.2 极简复刻：路由表与分发器
+
+装饰器做的事情，说白了就是"在类定义时把方法和一条路由规则登记到一张表里"（这正是第 19 章 `addInitializer` 注册模式那一节演示过的）。下面用普通对象手动登记同样的信息，你能清楚看到一次请求是怎么被匹配到方法上的。
+
+<Playground
+  language="typescript"
+  id="ts-23-router"
+  title="路由表与请求分发器（Controller 的本质）"
+  code={`type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
+// 用 string | undefined 建模缺失的键，等价于开启 noUncheckedIndexedAccess 的效果
+type Dict = Record<string, string | undefined>;
+
+type RequestCtx = {
+  readonly params: Dict;
+  readonly query: Dict;
+  readonly body: unknown;
+};
+
+type RouteHandler = (ctx: RequestCtx) => unknown;
+
+type Route = {
+  readonly method: HttpMethod;
+  readonly path: string;
+  readonly status: number;
+  readonly handler: RouteHandler;
+};
+
+class HttpError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
+class Router {
+  private readonly routes: Route[] = [];
+
+  // 等价于 @Get(path) / @Post(path) 在类定义时做的登记动作
+  add(method: HttpMethod, path: string, status: number, handler: RouteHandler): this {
+    this.routes.push({ method, path, status, handler });
+    return this;
+  }
+
+  private static match(pattern: string, path: string): Dict | null {
+    const pSeg = pattern.split("/").filter((s) => s !== "");
+    const aSeg = path.split("/").filter((s) => s !== "");
+    if (pSeg.length !== aSeg.length) return null;
+    const params: Dict = {};
+    for (let i = 0; i < pSeg.length; i += 1) {
+      const p = pSeg[i] as string;
+      const a = aSeg[i] as string;
+      if (p.startsWith(":")) params[p.slice(1)] = a;
+      else if (p !== a) return null;
+    }
+    return params;
+  }
+
+  private static parseQuery(raw: string): Dict {
+    const query: Dict = {};
+    for (const pair of raw.split("&")) {
+      if (pair === "") continue;
+      const eq = pair.indexOf("=");
+      if (eq < 0) query[pair] = "";
+      else query[pair.slice(0, eq)] = pair.slice(eq + 1);
+    }
+    return query;
+  }
+
+  dispatch(method: HttpMethod, url: string, body: unknown): { status: number; body: unknown } {
+    const qi = url.indexOf("?");
+    const path = qi < 0 ? url : url.slice(0, qi);
+    const query = qi < 0 ? {} : Router.parseQuery(url.slice(qi + 1));
+
+    for (const route of this.routes) {
+      if (route.method !== method) continue;
+      const params = Router.match(route.path, path);
+      if (params === null) continue;
+      try {
+        return { status: route.status, body: route.handler({ params, query, body }) };
+      } catch (e) {
+        // 这一段就是全局异常过滤器干的事
+        const status = e instanceof HttpError ? e.status : 500;
+        const message = e instanceof Error ? e.message : "Internal server error";
+        return { status, body: { statusCode: status, message } };
+      }
+    }
+    return { status: 404, body: { statusCode: 404, message: "Cannot " + method + " " + path } };
+  }
+}
+
+// ===== Controller：注意它只解析入参、调用逻辑、返回数据 =====
+type Task = { readonly id: number; readonly title: string; readonly done: boolean };
+
+class TasksController {
+  private readonly rows = new Map<number, Task>();
+  private nextId = 1;
+
+  findAll(ctx: RequestCtx): readonly Task[] {
+    const all = [...this.rows.values()];
+    const done = ctx.query["done"];
+    if (done === undefined) return all;
+    return all.filter((t) => t.done === (done === "true"));
+  }
+
+  findOne(ctx: RequestCtx): Task {
+    const id = this.parseId(ctx);
+    const task = this.rows.get(id);
+    if (task === undefined) throw new HttpError(404, "任务 " + id + " 不存在");
+    return task;
+  }
+
+  create(ctx: RequestCtx): Task {
+    const body = ctx.body;
+    if (typeof body !== "object" || body === null || !("title" in body)) {
+      throw new HttpError(400, "请求体缺少 title 字段");
+    }
+    const title = String((body as { title: unknown }).title);
+    const task: Task = { id: this.nextId, title, done: false };
+    this.nextId += 1;
+    this.rows.set(task.id, task);
+    return task;
+  }
+
+  remove(ctx: RequestCtx): null {
+    const id = this.parseId(ctx);
+    if (!this.rows.delete(id)) throw new HttpError(404, "任务 " + id + " 不存在");
+    return null;
+  }
+
+  // 等价于 @Param("id", ParseIntPipe)
+  private parseId(ctx: RequestCtx): number {
+    const raw = ctx.params["id"] ?? "";
+    const id = Number(raw);
+    if (!Number.isInteger(id)) throw new HttpError(400, "id 必须是整数，收到 " + raw);
+    return id;
+  }
+}
+
+const controller = new TasksController();
+const router = new Router();
+
+router
+  .add("GET", "/tasks", 200, (ctx) => controller.findAll(ctx))
+  .add("GET", "/tasks/:id", 200, (ctx) => controller.findOne(ctx))
+  .add("POST", "/tasks", 201, (ctx) => controller.create(ctx))
+  .add("DELETE", "/tasks/:id", 204, (ctx) => controller.remove(ctx));
+
+type Call = { readonly method: HttpMethod; readonly url: string; readonly body: unknown };
+
+const calls: readonly Call[] = [
+  { method: "POST", url: "/tasks", body: { title: "写 NestJS 章节" } },
+  { method: "POST", url: "/tasks", body: { title: "接入 TypeORM" } },
+  { method: "POST", url: "/tasks", body: { note: "忘了写 title" } },
+  { method: "GET", url: "/tasks", body: null },
+  { method: "GET", url: "/tasks/1", body: null },
+  { method: "GET", url: "/tasks/99", body: null },
+  { method: "GET", url: "/tasks/abc", body: null },
+  { method: "GET", url: "/tasks?done=false", body: null },
+  { method: "DELETE", url: "/tasks/2", body: null },
+  { method: "PATCH", url: "/tasks/1", body: null },
+];
+
+for (const call of calls) {
+  const res = router.dispatch(call.method, call.url, call.body);
+  console.log(call.method + " " + call.url + "  ->  " + res.status + " " + JSON.stringify(res.body));
+}`}
+/>
+
+真实 Nest 用 `Reflect.defineMetadata` 把 `path`、`method`、`statusCode` 写在方法上，启动时 `RoutesResolver` 扫描所有 controller，把元数据读出来注册到底层的 Express/Fastify 路由器。**登记的内容一模一样，只是登记的时机从"手写一行"变成了"类定义时自动发生"**。
+
+## 5. DTO 与校验
+
+### 5.1 DTO 必须是 class
+
+```ts
+// src/tasks/dto/create-task.dto.ts
+import {
+  IsArray, IsInt, IsOptional, IsString, Max, Min, MaxLength, MinLength,
+} from "class-validator";
+import { Type } from "class-transformer";
+
+export class CreateTaskDto {
+  @IsString()
+  @MinLength(1, { message: "标题不能为空" })
+  @MaxLength(60)
+  title!: string;
+
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(5)
+  priority!: number;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
+}
+```
+
+```ts
+// src/tasks/dto/update-task.dto.ts
+import { PartialType } from "@nestjs/mapped-types";
+import { CreateTaskDto } from "./create-task.dto";
+
+export class UpdateTaskDto extends PartialType(CreateTaskDto) {}
+```
+
+`PartialType` 会把父类所有字段变成可选，并**保留全部校验装饰器**——相当于运行时版本的 `Partial<T>`。同族的还有 `PickType`、`OmitType`、`IntersectionType`。
+
+<Callout type="warn" title="DTO 用 interface 会让 ValidationPipe 完全失效">
+`interface` 在编译后**不留下任何运行时痕迹**，`class-validator` 拿不到元数据，`ValidationPipe` 会认为这个 DTO 没有任何约束，于是**静默放行所有脏数据**——不报错，只是校验形同虚设，这比报错更危险。
+
+同理，字段类型也必须是 class-transformer 能识别的具体类型。嵌套对象要配 `@ValidateNested()` 和 `@Type(() => ChildDto)`，否则子对象不会被校验。
+</Callout>
+
+### 5.2 全局启用管道
+
+```ts
+// src/main.ts
+import { NestFactory } from "@nestjs/core";
+import { ValidationPipe } from "@nestjs/common";
+import { AppModule } from "./app.module";
+import { HttpExceptionFilter } from "./common/filters/http-exception.filter";
+
+async function bootstrap(): Promise<void> {
+  const app = await NestFactory.create(AppModule);
+
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,             // 剥离 DTO 未声明的字段
+      forbidNonWhitelisted: true,  // 出现未声明字段直接 400
+      transform: true,             // 把 plain object 转成 DTO 实例
+      transformOptions: { enableImplicitConversion: true },
+    }),
+  );
+  app.useGlobalFilters(new HttpExceptionFilter());
+  app.enableShutdownHooks();
+
+  await app.listen(Number(process.env.PORT ?? 3000));
+}
+void bootstrap();
+```
+
+`whitelist: true` 是安全底线：没有它，客户端可以往 `POST /tasks` 里塞一个 `isAdmin: true`，如果 Service 里有 `Object.assign(entity, dto)`，就是一个现成的提权漏洞。
+
+`transform: true` 让管道返回 DTO 类的**实例**而不是普通对象，`@Type(() => Number)` 这类转换才会生效——查询字符串里的 `?priority=3` 是字符串 `"3"`，没有 transform 就永远过不了 `@IsInt()`。
+
+<Callout type="warn" title="全局管道与模块级管道的差异">
+`app.useGlobalPipes(new ValidationPipe())` 创建的管道**在容器之外**，无法注入任何依赖。如果你的自定义管道需要注入 `ConfigService`，必须改用模块级注册：在 `AppModule` 的 providers 里写 `{ provide: APP_PIPE, useClass: MyValidationPipe }`。两者作用范围相同，但后者受容器管理。同样的规则适用于 `APP_GUARD`、`APP_INTERCEPTOR`、`APP_FILTER`。
+</Callout>
+
+### 5.3 极简复刻：管道校验链
+
+下面把 `ValidationPipe` 的核心流程复刻出来：**判断是对象 → 按规则转换 → whitelist 剥离 → 逐条约束校验 → 收集结构化错误 → 最后用第 14 章的类型守卫把 `unknown` 收窄成 DTO 类型**。最后那一步是整条链的意义所在：管道是 `unknown` 与静态类型之间唯一的合法关口。
+
+<Playground
+  language="typescript"
+  id="ts-23-validation-pipe"
+  title="ValidationPipe 的极简复刻"
+  code={`type FieldError = {
+  readonly field: string;
+  readonly constraint: string;
+  readonly message: string;
+};
+
+type Ok<T> = { readonly ok: true; readonly value: T };
+type Fail = { readonly ok: false; readonly status: number; readonly errors: readonly FieldError[] };
+type Validated<T> = Ok<T> | Fail;
+
+// 一条约束 = class-validator 里的一个 @IsXxx 装饰器
+type Check = {
+  readonly constraint: string;
+  readonly message: string;
+  readonly test: (value: unknown) => boolean;
+};
+
+type FieldRule = {
+  readonly field: string;
+  readonly optional: boolean;
+  readonly coerce: (raw: unknown) => unknown;   // 对应 @Type(() => Number)
+  readonly checks: readonly Check[];
+};
+
+type Schema<T> = {
+  readonly name: string;
+  readonly rules: readonly FieldRule[];
+  readonly guard: (candidate: unknown) => candidate is T;
+};
+
+type PipeOptions = { readonly whitelist: boolean; readonly transform: boolean };
+
+// ---- 转换器 ----
+const asIs = (raw: unknown): unknown => raw;
+
+const toNumber = (raw: unknown): unknown => {
+  if (typeof raw === "string" && raw.trim() !== "" && Number.isFinite(Number(raw))) {
+    return Number(raw);
+  }
+  return raw;
+};
+
+const toStringArray = (raw: unknown): unknown => {
+  if (typeof raw === "string") {
+    return raw.split(",").map((s) => s.trim()).filter((s) => s !== "");
+  }
+  return raw;
+};
+
+// ---- 约束工厂 ----
+function isString(): Check {
+  return { constraint: "isString", message: "必须是字符串", test: (v) => typeof v === "string" };
+}
+function minLength(n: number): Check {
+  return {
+    constraint: "minLength",
+    message: "长度不能少于 " + n,
+    test: (v) => typeof v === "string" && v.length >= n,
+  };
+}
+function maxLength(n: number): Check {
+  return {
+    constraint: "maxLength",
+    message: "长度不能超过 " + n,
+    test: (v) => typeof v === "string" && v.length <= n,
+  };
+}
+function isInt(): Check {
+  return {
+    constraint: "isInt",
+    message: "必须是整数",
+    test: (v) => typeof v === "number" && Number.isInteger(v),
+  };
+}
+function inRange(min: number, max: number): Check {
+  return {
+    constraint: "min/max",
+    message: "必须在 " + min + " 到 " + max + " 之间",
+    test: (v) => typeof v === "number" && v >= min && v <= max,
+  };
+}
+function isStringArray(): Check {
+  return {
+    constraint: "isArray",
+    message: "必须是字符串数组",
+    test: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
+  };
+}
+
+class ValidationPipe<T> {
+  constructor(
+    private readonly schema: Schema<T>,
+    private readonly options: PipeOptions,
+  ) {}
+
+  run(raw: unknown): Validated<T> {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return {
+        ok: false,
+        status: 400,
+        errors: [{ field: "(body)", constraint: "isObject", message: "请求体必须是 JSON 对象" }],
+      };
+    }
+
+    const input = raw as Record<string, unknown>;
+    const errors: FieldError[] = [];
+    const output: Record<string, unknown> = {};
+
+    // 1) whitelist：只保留 schema 声明过的字段
+    const known = new Set(this.schema.rules.map((r) => r.field));
+    for (const key of Object.keys(input)) {
+      if (known.has(key)) continue;
+      if (this.options.whitelist) console.log("    · whitelist 剥离了未声明字段: " + key);
+      else output[key] = input[key];
+    }
+
+    // 2) 逐字段：转换 -> 校验
+    for (const rule of this.schema.rules) {
+      const original = input[rule.field];
+      if (original === undefined) {
+        if (!rule.optional) {
+          errors.push({ field: rule.field, constraint: "isDefined", message: "字段必填" });
+        }
+        continue;
+      }
+      const value = this.options.transform ? rule.coerce(original) : original;
+      let passed = true;
+      for (const check of rule.checks) {
+        if (check.test(value)) continue;
+        errors.push({ field: rule.field, constraint: check.constraint, message: check.message });
+        passed = false;
+      }
+      if (passed) output[rule.field] = value;
+    }
+
+    if (errors.length > 0) return { ok: false, status: 400, errors };
+
+    // 3) 类型守卫：unknown -> T 的唯一合法通道
+    if (!this.schema.guard(output)) {
+      return {
+        ok: false,
+        status: 500,
+        errors: [{ field: "(body)", constraint: "guard", message: "规则与 DTO 类型不同步" }],
+      };
+    }
+    return { ok: true, value: output };
+  }
+}
+
+// ===== 对应真实项目里的 CreateTaskDto =====
+type CreateTaskDto = {
+  readonly title: string;
+  readonly priority: number;
+  readonly tags?: readonly string[];
+};
+
+function isCreateTaskDto(v: unknown): v is CreateTaskDto {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as Record<string, unknown>;
+  if (typeof o["title"] !== "string") return false;
+  if (typeof o["priority"] !== "number") return false;
+  const tags = o["tags"];
+  if (tags === undefined) return true;
+  return Array.isArray(tags) && tags.every((x) => typeof x === "string");
+}
+
+const createTaskSchema: Schema<CreateTaskDto> = {
+  name: "CreateTaskDto",
+  rules: [
+    { field: "title", optional: false, coerce: asIs, checks: [isString(), minLength(1), maxLength(60)] },
+    { field: "priority", optional: false, coerce: toNumber, checks: [isInt(), inRange(1, 5)] },
+    { field: "tags", optional: true, coerce: toStringArray, checks: [isStringArray()] },
+  ],
+  guard: isCreateTaskDto,
+};
+
+const pipe = new ValidationPipe(createTaskSchema, { whitelist: true, transform: true });
+
+const payloads: readonly unknown[] = [
+  { title: "把 CLI 内核搬上 HTTP", priority: "2", tags: "docs, nest" },
+  { title: "", priority: 9 },
+  { title: "偷偷提权", priority: 1, isAdmin: true },
+  { priority: 3 },
+  "not-an-object",
+];
+
+for (const payload of payloads) {
+  console.log("POST /tasks  " + JSON.stringify(payload));
+  const result = pipe.run(payload);
+  if (result.ok) {
+    // 这里 result.value 的类型已经是 CreateTaskDto，不是 unknown
+    console.log("  201 通过 -> " + JSON.stringify(result.value));
+  } else {
+    console.log("  " + result.status + " 校验失败:");
+    for (const e of result.errors) {
+      console.log("    " + e.field + " [" + e.constraint + "] " + e.message);
+    }
+  }
+}`}
+/>
+
+## 6. Service、异常与全局过滤器
+
+### 6.1 Service 只关心业务
+
+```ts
+// src/tasks/tasks.service.ts
+import { Injectable, NotFoundException, ConflictException, Logger } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository } from "typeorm";
+import { Task } from "./entities/task.entity";
+import { CreateTaskDto } from "./dto/create-task.dto";
+import { UpdateTaskDto } from "./dto/update-task.dto";
+import { QueryTaskDto } from "./dto/query-task.dto";
+
+@Injectable()
+export class TasksService {
+  private readonly logger = new Logger(TasksService.name);
+
+  constructor(
+    @InjectRepository(Task)
+    private readonly repo: Repository<Task>,
+  ) {}
+
+  async findAll(query: QueryTaskDto): Promise<Task[]> {
+    const qb = this.repo.createQueryBuilder("task");
+    if (query.done !== undefined) {
+      qb.andWhere("task.done = :done", { done: query.done });
+    }
+    if (query.keyword !== undefined) {
+      qb.andWhere("task.title LIKE :kw", { kw: "%" + query.keyword + "%" });
+    }
+    return qb.orderBy("task.priority", "DESC").take(query.limit ?? 20).getMany();
+  }
+
+  async findOne(id: number): Promise<Task> {
+    const task = await this.repo.findOne({ where: { id } });
+    if (task === null) {
+      throw new NotFoundException("任务 " + id + " 不存在");
+    }
+    return task;
+  }
+
+  async create(dto: CreateTaskDto): Promise<Task> {
+    const exists = await this.repo.findOne({ where: { title: dto.title } });
+    if (exists !== null) {
+      throw new ConflictException("已存在同名任务: " + dto.title);
+    }
+    const task = this.repo.create({ ...dto, done: false });
+    const saved = await this.repo.save(task);
+    this.logger.log("created task #" + saved.id);
+    return saved;
+  }
+
+  async update(id: number, dto: UpdateTaskDto): Promise<Task> {
+    const task = await this.findOne(id);
+    Object.assign(task, dto);
+    return this.repo.save(task);
+  }
+
+  async remove(id: number): Promise<void> {
+    const result = await this.repo.delete(id);
+    if (result.affected === 0) {
+      throw new NotFoundException("任务 " + id + " 不存在");
+    }
+  }
+}
+```
+
+注意 Service 里出现的是 `NotFoundException`、`ConflictException` 这类**语义异常**，而不是 `res.status(404).json(...)`。Service 不知道自己在 HTTP 环境里——同一个 Service 可以被 GraphQL resolver、gRPC handler 或定时任务复用。
+
+### 6.2 自定义异常与全局过滤器
+
+内置异常都继承自 `HttpException`，需要自定义业务错误码时可以扩展它：
+
+```ts
+// src/common/exceptions/business.exception.ts
+import { HttpException, HttpStatus } from "@nestjs/common";
+
+export class BusinessException extends HttpException {
+  constructor(
+    public readonly code: string,
+    message: string,
+    status: HttpStatus = HttpStatus.BAD_REQUEST,
+  ) {
+    super({ code, message }, status);
+  }
+}
+```
+
+```ts
+// src/common/filters/http-exception.filter.ts
+import {
+  ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger,
+} from "@nestjs/common";
+import { Request, Response } from "express";
+
+@Catch()
+export class HttpExceptionFilter implements ExceptionFilter {
+  private readonly logger = new Logger(HttpExceptionFilter.name);
+
+  catch(exception: unknown, host: ArgumentsHost): void {
+    const ctx = host.switchToHttp();
+    const res = ctx.getResponse<Response>();
+    const req = ctx.getRequest<Request>();
+
+    const status =
+      exception instanceof HttpException
+        ? exception.getStatus()
+        : HttpStatus.INTERNAL_SERVER_ERROR;
+
+    const payload =
+      exception instanceof HttpException
+        ? exception.getResponse()
+        : { message: "Internal server error" };
+
+    if (status >= 500) {
+      this.logger.error(req.method + " " + req.url, (exception as Error).stack);
+    }
+
+    res.status(status).json({
+      statusCode: status,
+      path: req.url,
+      timestamp: new Date().toISOString(),
+      error: payload,
+    });
+  }
+}
+```
+
+`@Catch()` 不带参数表示捕获一切；`@Catch(HttpException)` 则只处理指定类型。**5xx 打 stack、4xx 不打**是一条很实用的日志规则——客户端传错参数不该刷屏你的错误日志。
+
+## 7. 守卫、拦截器与中间件
+
+### 7.1 执行顺序
+
+一次请求在 Nest 里的完整旅程：
+
+```text
+请求 → 中间件 → 守卫 → 拦截器(前) → 管道 → 处理器
+                              ↓
+响应 ← 异常过滤器 ← 拦截器(后) ← ────┘
+```
+
+记住这个顺序才能把逻辑放对地方：
+
+- **中间件**最早，只能拿到原始的 req/res，适合 CORS、body 解析、请求 ID 注入。
+- **守卫**决定"这个请求能不能进"，返回 `boolean`。鉴权、权限判断放这里。它在管道之前，所以守卫里拿到的 body 还没被校验和转换。
+- **拦截器**包裹处理器前后，适合日志、缓存、超时、响应体统一包装。
+- **管道**最后一道，负责把参数转换和校验成处理器需要的类型。
+- **异常过滤器**兜底，任何一环抛出的异常都会落到它手里。
+
+### 7.2 JWT 守卫
+
+```ts
+// src/common/guards/jwt-auth.guard.ts
+import {
+  CanActivate, ExecutionContext, Injectable, UnauthorizedException,
+} from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { JwtService } from "@nestjs/jwt";
+import { Request } from "express";
+import { IS_PUBLIC_KEY } from "../decorators/public.decorator";
+
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  constructor(
+    private readonly jwt: JwtService,
+    private readonly reflector: Reflector,
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (isPublic === true) return true;
+
+    const req = context.switchToHttp().getRequest<Request>();
+    const auth = req.headers.authorization ?? "";
+    if (!auth.startsWith("Bearer ")) {
+      throw new UnauthorizedException("缺少 Bearer token");
+    }
+    try {
+      const payload = await this.jwt.verifyAsync<{ sub: number; role: string }>(auth.slice(7));
+      Object.assign(req, { user: payload });
+      return true;
+    } catch {
+      throw new UnauthorizedException("token 无效或已过期");
+    }
+  }
+}
+```
+
+```ts
+// src/common/decorators/public.decorator.ts
+import { SetMetadata } from "@nestjs/common";
+
+export const IS_PUBLIC_KEY = "isPublic";
+export const Public = (): MethodDecorator & ClassDecorator => SetMetadata(IS_PUBLIC_KEY, true);
+```
+
+`Reflector` 是 Nest 提供的元数据读取器，`getAllAndOverride` 会先看方法级、再看类级，实现"类上全局要求鉴权、个别方法用 `@Public()` 开洞"的效果。
+
+### 7.3 日志与超时拦截器
+
+```ts
+// src/common/interceptors/logging.interceptor.ts
+import {
+  CallHandler, ExecutionContext, Injectable, Logger, NestInterceptor,
+} from "@nestjs/common";
+import { Observable, tap } from "rxjs";
+import { Request } from "express";
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger("HTTP");
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const req = context.switchToHttp().getRequest<Request>();
+    const started = Date.now();
+    return next.handle().pipe(
+      tap(() => {
+        this.logger.log(req.method + " " + req.url + " " + (Date.now() - started) + "ms");
+      }),
+    );
+  }
+}
+```
+
+```ts
+// src/common/interceptors/timeout.interceptor.ts
+import {
+  CallHandler, ExecutionContext, Injectable, NestInterceptor,
+  RequestTimeoutException,
+} from "@nestjs/common";
+import { Observable, TimeoutError, catchError, throwError, timeout } from "rxjs";
+
+@Injectable()
+export class TimeoutInterceptor implements NestInterceptor {
+  constructor(private readonly ms = 5000) {}
+
+  intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    return next.handle().pipe(
+      timeout(this.ms),
+      catchError((err: unknown) =>
+        err instanceof TimeoutError
+          ? throwError(() => new RequestTimeoutException())
+          : throwError(() => err),
+      ),
+    );
+  }
+}
+```
+
+### 7.4 极简复刻：洋葱模型
+
+拦截器的 `next.handle()` 本质上就是洋葱模型的 `next()`。下面用泛型 `compose` 函数把一串中间件折叠成一个处理器——`reduceRight` 保证第一个中间件在最外层。这段代码可以直接搬进任何需要中间件链的地方（包括第 22 章那个 CLI 的 `dispatch`）。
+
+<Playground
+  language="typescript"
+  id="ts-23-interceptor-onion"
+  title="洋葱模型：compose 一条拦截器链"
+  code={`type Req = {
+  readonly method: string;
+  readonly url: string;
+  readonly token: string | null;
+};
+type Res = { readonly status: number; readonly data: unknown };
+
+type Handler<Q, R> = (req: Q) => Promise<R>;
+type Next<R> = () => Promise<R>;
+type Interceptor<Q, R> = (req: Q, next: Next<R>) => Promise<R>;
+
+// 泛型 compose：Q 与 R 把请求/响应类型贯穿整条链
+function compose<Q, R>(chain: readonly Interceptor<Q, R>[], handler: Handler<Q, R>): Handler<Q, R> {
+  return chain.reduceRight<Handler<Q, R>>(
+    (next, interceptor) => (req) => interceptor(req, () => next(req)),
+    handler,
+  );
+}
+
+class HttpError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve();
+    }, ms);
+  });
+}
+
+// 1) 异常过滤器：站在最外层，把任何异常翻译成响应
+const exceptionFilter: Interceptor<Req, Res> = async (_req, next) => {
+  try {
+    return await next();
+  } catch (e) {
+    const status = e instanceof HttpError ? e.status : 500;
+    const message = e instanceof Error ? e.message : String(e);
+    console.log("  <- [filter]   捕获异常 " + status + " " + message);
+    return { status, data: { statusCode: status, message } };
+  }
+};
+
+// 2) 日志拦截器：前后都执行，典型的洋葱
+const logging: Interceptor<Req, Res> = async (req, next) => {
+  console.log("  -> [logging]  " + req.method + " " + req.url);
+  const started = Date.now();
+  const res = await next();
+  const cost = Date.now() - started;
+  console.log("  <- [logging]  " + res.status + " 用时 " + (cost < 100 ? "小于 100ms" : "超过 100ms"));
+  return res;
+};
+
+// 3) 守卫：只有前置逻辑，不满足就直接抛
+const authGuard: Interceptor<Req, Res> = async (req, next) => {
+  console.log("  -> [guard]    校验 token");
+  if (req.token !== "valid-token") throw new HttpError(401, "Unauthorized");
+  return next();
+};
+
+// 4) 超时拦截器：用 Promise.race 给下游设上限
+function timeoutAfter(ms: number): Interceptor<Req, Res> {
+  return async (_req, next) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const alarm = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new HttpError(504, "请求超过 " + ms + "ms 未完成"));
+      }, ms);
+    });
+    try {
+      return await Promise.race([next(), alarm]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  };
+}
+
+// 5) 响应包装：只有后置逻辑
+const wrapResponse: Interceptor<Req, Res> = async (_req, next) => {
+  const res = await next();
+  return { status: res.status, data: { success: res.status < 400, result: res.data } };
+};
+
+// 处理器：真正的业务逻辑
+const handler: Handler<Req, Res> = async (req) => {
+  console.log("     [handler]  执行业务逻辑");
+  if (req.url === "/tasks/slow") {
+    await delay(200);
+    return { status: 200, data: { note: "这个接口很慢" } };
+  }
+  if (req.url === "/tasks/boom") throw new Error("数据库连接断了");
+  await delay(5);
+  return { status: 200, data: { tasks: ["写文档", "写测试"] } };
+};
+
+const pipeline = compose(
+  [exceptionFilter, logging, authGuard, timeoutAfter(80), wrapResponse],
+  handler,
+);
+
+const requests: readonly Req[] = [
+  { method: "GET", url: "/tasks", token: "valid-token" },
+  { method: "GET", url: "/tasks", token: null },
+  { method: "GET", url: "/tasks/slow", token: "valid-token" },
+  { method: "GET", url: "/tasks/boom", token: "valid-token" },
+];
+
+for (const req of requests) {
+  console.log("=== " + req.method + " " + req.url + "  token=" + (req.token ?? "(无)"));
+  const res = await pipeline(req);
+  console.log("最终响应 " + res.status + " " + JSON.stringify(res.data) + "\\n");
+}
+console.log("洋葱模型演示结束");`}
+/>
+
+观察输出会发现两件事：守卫抛出 401 时，`wrapResponse` 根本没被执行，所以响应体没有被包装；超时那次同理。**洋葱越靠外的层，覆盖面越广**——这就是为什么异常过滤器必须在最外层。
+
+## 8. 持久层：TypeORM
+
+### 8.1 接入
+
+```bash
+npm i @nestjs/typeorm typeorm pg
+```
+
+```ts
+// src/app.module.ts
+import { Module } from "@nestjs/common";
+import { ConfigModule, ConfigService } from "@nestjs/config";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { TasksModule } from "./tasks/tasks.module";
+import configuration from "./config/configuration";
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true, load: [configuration] }),
+    TypeOrmModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        type: "postgres" as const,
+        url: config.getOrThrow<string>("database.url"),
+        autoLoadEntities: true,
+        synchronize: false,       // 生产环境必须 false
+        migrationsRun: true,
+        migrations: ["dist/migrations/*.js"],
+      }),
+    }),
+    TasksModule,
+  ],
+})
+export class AppModule {}
+```
+
+`forRootAsync` + `useFactory` 是异步模块配置的标准套路：工厂本身也走依赖注入，所以能拿到 `ConfigService`。
+
+### 8.2 实体
+
+```ts
+// src/tasks/entities/task.entity.ts
+import {
+  Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, UpdateDateColumn,
+} from "typeorm";
+
+@Entity("tasks")
+export class Task {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Index({ unique: true })
+  @Column({ type: "varchar", length: 60 })
+  title!: string;
+
+  @Column({ type: "boolean", default: false })
+  done!: boolean;
+
+  @Column({ type: "int", default: 1 })
+  priority!: number;
+
+  @Column({ type: "simple-array", default: "" })
+  tags!: string[];
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+}
+```
+
+字段后面的 `!` 是第 7 章讲过的**确定赋值断言**：TypeORM 在运行时填充这些字段，编译器看不到赋值语句，不加 `!` 会被 `strictPropertyInitialization` 拦下。
+
+### 8.3 Repository 注入与迁移
+
+`TypeOrmModule.forFeature([Task])` 会在模块内注册一个 token 为 `getRepositoryToken(Task)` 的 provider，注入时用 `@InjectRepository(Task)` 声明。注入进来的 `repo` 类型是 `Repository<Task>`，`find`、`save`、`createQueryBuilder` 的返回类型全部由实体类推导，改字段名会立刻在所有查询处报错。
+
+```bash
+# package.json scripts
+# "typeorm": "typeorm-ts-node-commonjs -d src/data-source.ts"
+npm run typeorm migration:generate src/migrations/AddPriority
+npm run typeorm migration:run
+```
+
+<Callout type="warn" title="synchronize: true 只能出现在本地">
+`synchronize: true` 会在启动时按实体自动改表结构，**它会毫不犹豫地删掉「实体里没有」的列**。生产库开这个开关等于把数据交给运气。正确做法永远是关掉它，用 migration 管理结构变更。
+</Callout>
+
+### 8.4 与 Prisma 的取舍
+
+| 维度 | TypeORM | Prisma |
+|---|---|---|
+| 建模方式 | 装饰器写在 TS 类上 | 单独的 schema.prisma DSL |
+| 类型来源 | 从实体类推导 | 由 generate 生成客户端类型 |
+| 与 Nest 契合度 | 原生 `@nestjs/typeorm`，DI 顺畅 | 需自己包一层 PrismaService |
+| 复杂查询 | QueryBuilder 灵活，接近 SQL | 关系查询 API 优雅，极端复杂时要写 raw |
+| 类型精度 | 中等，关系字段可能是 undefined | 很高，select 决定返回类型 |
+
+新项目如果没有历史包袱，Prisma 的类型体验明显更好——它的 `select` 会让返回类型精确到字段级；老项目或需要大量手写 SQL、多数据源事务的场景，TypeORM 更自由。
+
+## 9. 配置与环境变量
+
+```ts
+// src/config/configuration.ts
+import { z } from "zod";
+
+const schema = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  PORT: z.coerce.number().int().positive().default(3000),
+  DATABASE_URL: z.string().url(),
+  JWT_SECRET: z.string().min(16),
+});
+
+export type AppConfig = {
+  env: string;
+  port: number;
+  database: { url: string };
+  jwt: { secret: string };
+};
+
+export default (): AppConfig => {
+  const parsed = schema.safeParse(process.env);
+  if (!parsed.success) {
+    throw new Error("环境变量校验失败: " + JSON.stringify(parsed.error.flatten().fieldErrors));
+  }
+  const env = parsed.data;
+  return {
+    env: env.NODE_ENV,
+    port: env.PORT,
+    database: { url: env.DATABASE_URL },
+    jwt: { secret: env.JWT_SECRET },
+  };
+};
+```
+
+这样配置在**进程启动的第一秒**就被校验，缺少 `DATABASE_URL` 会立刻崩溃并告诉你缺什么，而不是等到第一个请求打到数据库时才报一个莫名其妙的连接错误。读取时用 `config.getOrThrow<string>("database.url")`，比 `config.get()` 更安全——后者返回可能为 `undefined` 的类型。
+
+## 10. 测试
+
+### 10.1 单元测试：mock 掉 provider
+
+```ts
+// src/tasks/tasks.service.spec.ts
+import { Test, TestingModule } from "@nestjs/testing";
+import { getRepositoryToken } from "@nestjs/typeorm";
+import { NotFoundException } from "@nestjs/common";
+import { Repository } from "typeorm";
+import { TasksService } from "./tasks.service";
+import { Task } from "./entities/task.entity";
+
+describe("TasksService", () => {
+  let service: TasksService;
+  let repo: jest.Mocked<Pick<Repository<Task>, "findOne" | "save" | "create" | "delete">>;
+
+  beforeEach(async () => {
+    repo = {
+      findOne: jest.fn(),
+      save: jest.fn(),
+      create: jest.fn(),
+      delete: jest.fn(),
+    } as unknown as typeof repo;
+
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      providers: [
+        TasksService,
+        { provide: getRepositoryToken(Task), useValue: repo },
+      ],
+    }).compile();
+
+    service = moduleRef.get(TasksService);
+  });
+
+  it("findOne 找不到时抛 NotFoundException", async () => {
+    repo.findOne.mockResolvedValue(null);
+    await expect(service.findOne(42)).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it("create 会写库并返回实体", async () => {
+    repo.findOne.mockResolvedValue(null);
+    repo.create.mockReturnValue({ id: 1, title: "写测试" } as Task);
+    repo.save.mockResolvedValue({ id: 1, title: "写测试" } as Task);
+
+    const task = await service.create({ title: "写测试", priority: 1 });
+    expect(task.id).toBe(1);
+    expect(repo.save).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+`Test.createTestingModule` 就是一个可编程的容器：`providers` 数组里想放真实实现就放真实实现，想放替身就用 `useValue`。因为 Service 的依赖全部通过构造器注入，替换成本几乎为零——**依赖注入最大的收益其实在测试环节兑现**。
+
+<Callout type="info" title="用 overrideProvider 替换深层依赖">
+当依赖藏在被 import 的模块深处时，不必手动重建整棵 providers 树，用链式的 `overrideProvider(SomeService).useValue(fake)` 就能在编译测试模块前把它换掉。同族方法还有 `overrideGuard`、`overrideInterceptor`、`overridePipe`、`overrideFilter`，e2e 测试里绕过 JWT 守卫全靠它。
+</Callout>
+
+### 10.2 e2e 测试
+
+```ts
+// test/tasks.e2e-spec.ts
+import { INestApplication, ValidationPipe } from "@nestjs/common";
+import { Test } from "@nestjs/testing";
+import request from "supertest";
+import { AppModule } from "../src/app.module";
+
+describe("Tasks (e2e)", () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleRef.createNestApplication();
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it("POST /tasks 校验失败返回 400", () =>
+    request(app.getHttpServer())
+      .post("/tasks")
+      .send({ title: "", priority: 99 })
+      .expect(400));
+
+  it("POST /tasks 成功返回 201", async () => {
+    const res = await request(app.getHttpServer())
+      .post("/tasks")
+      .send({ title: "e2e 任务", priority: 3 })
+      .expect(201);
+    expect(res.body.id).toBeGreaterThan(0);
+  });
+});
+```
+
+e2e 测试用 `app.init()` 而不是 `app.listen()`——supertest 直接拿 HTTP server 实例发请求，不需要真的占端口。注意：**全局管道要在测试里手动挂一次**，因为它写在 `main.ts` 里，而 e2e 不走 `main.ts`。这是最常见的"本地测试通过、线上校验失效"或反之的原因。
+
+## 11. 生产化
+
+### 11.1 Swagger
+
+```ts
+// src/main.ts（片段）
+import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
+
+const config = new DocumentBuilder()
+  .setTitle("Tasks API")
+  .setDescription("任务管理服务")
+  .setVersion("1.0")
+  .addBearerAuth()
+  .build();
+SwaggerModule.setup("docs", app, SwaggerModule.createDocument(app, config));
+```
+
+在 `nest-cli.json` 里打开 `"plugins": ["@nestjs/swagger"]`，插件会读取 DTO 的 TS 类型自动补出 `@ApiProperty`，你几乎不用手写文档注解。
+
+### 11.2 健康检查
+
+```ts
+// src/health/health.controller.ts
+import { Controller, Get } from "@nestjs/common";
+import { HealthCheck, HealthCheckService, TypeOrmHealthIndicator } from "@nestjs/terminus";
+import { Public } from "../common/decorators/public.decorator";
+
+@Controller("health")
+export class HealthController {
+  constructor(
+    private readonly health: HealthCheckService,
+    private readonly db: TypeOrmHealthIndicator,
+  ) {}
+
+  @Public()
+  @Get()
+  @HealthCheck()
+  check() {
+    return this.health.check([() => this.db.pingCheck("database", { timeout: 1500 })]);
+  }
+}
+```
+
+### 11.3 Dockerfile
+
+```dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=builder /app/dist ./dist
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+```
+
+多阶段构建把 `devDependencies`（包括整个 TypeScript 工具链）挡在最终镜像之外，镜像体积通常能从 1GB 降到 200MB 以内。别忘了在应用里调用 `app.enableShutdownHooks()`，容器收到 `SIGTERM` 时才会优雅关闭数据库连接池。
+
+## 12. 小结
+
+- NestJS 的价值不是"更快地写接口"，而是**强制分层 + IoC 容器 + AOP 切面**，让中型以上的服务不会失控
+- 模块是 DI 的作用域边界，provider 有 useClass / useValue / useFactory / useExisting 四种写法
+- Controller 只做 HTTP 适配，Service 不感知 HTTP，Repository 只管存取
+- DTO **必须是 class**，因为校验和文档都依赖运行时元数据；`whitelist` 与 `transform` 是必开项
+- 执行顺序：中间件 → 守卫 → 拦截器前置 → 管道 → 处理器 → 拦截器后置 → 异常过滤器
+- 依赖注入的收益最终在测试环节兑现：`Test.createTestingModule` 让替换依赖几乎零成本
+- 框架的核心机制——容器、路由表、校验链、洋葱模型——都可以用一百行纯 TypeScript 复刻出来，装饰器只是让登记动作自动化
+
+<Callout type="exercise" title="练习">
+1. **补齐 CRUD**：给上面的 Tasks API 加上 `PATCH /tasks/:id/done` 接口，要求：新建 `ToggleDoneDto`，Service 里在任务已完成时抛 `ConflictException`，并补一个单元测试覆盖这个分支。
+2. **给迷你容器加请求作用域**：修改 `ts-23-di-container` 的 `Container`，支持第三种 scope `"request"`——新增 `createRequestScope()` 返回一个子容器，其中 request 作用域的 provider 在子容器内是单例、跨子容器互不共享。再验证一下：依赖 request provider 的 singleton provider 会不会拿到过期实例？（这正是真实 Nest 里"请求作用域会传染"的原因。）
+3. **把洋葱模型接回第 22 章的 CLI**：把 `ts-23-interceptor-onion` 里的 `compose` 搬到第 22 章的 `Cli.dispatch` 上，实现日志中间件（打印命令与耗时）、权限中间件（`rm` 命令需要确认）和错误中间件（把抛出的异常转成 `Result`）。注意类型参数要从 `Req`/`Res` 换成 `string[]`/`Result<string[]>`。
+4. **进阶**：为 Tasks API 加上基于 `AsyncLocalStorage` 的请求 ID 透传——中间件生成 ID，日志拦截器和 Service 里的 Logger 都能读到它，且**不使用请求作用域 provider**。
+</Callout>
+
+到这里，TypeScript 课程真正结束了。从第 1 章的 `tsc --init` 到现在的分层服务，你已经走完了一条完整的路：类型是用来描述约束的，而框架是用来把这些约束**自动兑现**的。接下来最好的练习，是拿一个你手上的 Express 项目，用这一章的分层方式重写它 🎉
