@@ -31,12 +31,18 @@ echo "--- fast-forward pull ---"
 git fetch origin main
 git merge --ff-only origin/main
 
-echo "--- ensure TypeScript playground image ---"
-if ! docker image inspect learn-ts:1 >/dev/null 2>&1; then
-  docker build -t learn-ts:1 docker/ts-runner
-else
-  echo "learn-ts:1 already present"
-fi
+echo "--- ensure playground images ---"
+# 注意：内容有变（如 seed.sql）需要 bump 镜像 tag（learn-mysql:2）并同步改
+# src/lib/runner/docker-runner.ts，否则这里不会重建。
+for spec in "learn-ts:1 docker/ts-runner" "learn-redis:1 docker/redis-runner" "learn-mysql:1 docker/mysql-runner"; do
+  IMG=${spec%% *}
+  DIR=${spec##* }
+  if ! docker image inspect "$IMG" >/dev/null 2>&1; then
+    docker build -t "$IMG" "$DIR"
+  else
+    echo "$IMG already present"
+  fi
+done
 
 echo "--- npm install ---"
 npm install --no-audit --no-fund

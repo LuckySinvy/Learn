@@ -15,10 +15,11 @@ export type Language =
   | 'clickhouse'
   | 'kafka';
 
-// 可在 Docker 沙箱中执行的“编程语言”。Grafana、数据库与消息队列等以配置/命令
-// （YAML/SQL/CLI）为主，不在沙箱中执行；Rust 用 rustc 单文件编译后运行；
-// TypeScript 先 tsc --strict 类型检查再用 node --experimental-transform-types 运行。
-export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust' | 'typescript';
+// 可在 Docker 沙箱中执行的语言。Rust 用 rustc 单文件编译后运行；
+// TypeScript 先 tsc --strict 类型检查再用 node --experimental-transform-types 运行；
+// redis / mysql 走一次性容器：每次执行现起一个 redis-server / mariadbd（预置电商示例库 shop），
+// 跑完即销毁，天然隔离无状态残留。Grafana / Kafka / ClickHouse / MongoDB 等暂不支持在线执行。
+export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust' | 'typescript' | 'redis' | 'mysql';
 
 export type ExecuteRequest = {
   language: Language;

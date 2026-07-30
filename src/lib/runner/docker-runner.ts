@@ -150,4 +150,26 @@ export const LANG_CONFIG: Record<ExecutableLanguage, Omit<DockerRunConfig, 'cmd'
     cpus: 1.0,
     filename: 'main.ts',
   },
+  redis: {
+    // 自建镜像（docker/redis-runner）：redis:7-alpine + 执行脚本。
+    // 一次性容器：起纯内存 redis-server（~300ms），逐行回显并执行 /code/main.redis，
+    // 输出与 redis-cli 交互模式一致。每行一条命令，不支持跨行 MULTI/SUBSCRIBE。
+    image: 'learn-redis:1',
+    cmd: 'sh /usr/local/bin/run-redis.sh',
+    timeoutMs: 10000,
+    memoryMb: 128,
+    cpus: 0.5,
+    filename: 'main.redis',
+  },
+  mysql: {
+    // 自建镜像（docker/mysql-runner）：MariaDB 11（MySQL 兼容），构建期已预初始化
+    // datadir 并灌入电商示例库 shop（users/categories/products/orders/order_items）。
+    // 冷启动约 2-4s；mariadb --table -v 输出 MySQL 风格 ASCII 表格。
+    image: 'learn-mysql:1',
+    cmd: 'bash /usr/local/bin/run-mysql.sh',
+    timeoutMs: 20000,
+    memoryMb: 512,
+    cpus: 1.0,
+    filename: 'main.sql',
+  },
 };

@@ -6,20 +6,19 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const MAX_CODE_LEN = 50_000;
-const VALID_LANGS: Language[] = ['python', 'go', 'java', 'rust', 'typescript'];
+const VALID_LANGS: Language[] = ['python', 'go', 'java', 'rust', 'typescript', 'redis', 'mysql'];
 
-// 简单限流：进程并发上限 5
-let inFlight = 0;
-const MAX_INFLIGHT = 5;
+// 分语言限流：服务器仅 ~1.8GB 可用内存，MariaDB 单实例峰值 ~250MB，
+// 必须单独收紧；Redis 极轻（~10MB）可放宽。另设全局上限兜底。
+const MAX_INFLIGHT_BY_LANG: Record<string, number> = {
+  python: 5, go: 4, java: 3, rust: 3, typescript: 3,
+  redis: 5, mysql: 2,
+};
+const MAX_INFLIGHT_TOTAL = 8;
+const inFlight: Record<string, number> = {};
+let inFlightTotal = 0;
 
 export async function POST(req: NextRequest) {
-  if (inFlight >= MAX_INFLIGHT) {
-    return NextResponse.json(
-      { status: 'internal_error', stdout: '', stderr: '', exitCode: null, durationMs: 0, timedOut: false, message: '服务繁忙，请稍后再试' } satisfies ExecuteResponse,
-      { status: 503 },
-    );
-  }
-
   let body: ExecuteRequest;
   try {
     body = (await req.json()) as ExecuteRequest;
@@ -32,8 +31,16 @@ export async function POST(req: NextRequest) {
 
   if (!body || typeof body.code !== 'string' || !VALID_LANGS.includes(body.language)) {
     return NextResponse.json(
-      { status: 'internal_error', stdout: '', stderr: '', exitCode: null, durationMs: 0, timedOut: false, message: 'language 必须是 python/go/java/rust/typescript 且 code 必填' } satisfies ExecuteResponse,
+      { status: 'internal_error', stdout: '', stderr: '', exitCode: null, durationMs: 0, timedOut: false, message: `language 必须是 ${VALID_LANGS.join('/')} 且 code 必填` } satisfies ExecuteResponse,
       { status: 400 },
+    );
+  }
+
+  const langLimit = MAX_INFLIGHT_BY_LANG[body.language] ?? 2;
+  if (inFlightTotal >= MAX_INFLIGHT_TOTAL || (inFlight[body.language] ?? 0) >= langLimit) {
+    return NextResponse.json(
+      { status: 'internal_error', stdout: '', stderr: '', exitCode: null, durationMs: 0, timedOut: false, message: '服务繁忙，请稍后再试' } satisfies ExecuteResponse,
+      { status: 503 },
     );
   }
   if (body.code.length > MAX_CODE_LEN) {
@@ -59,7 +66,8 @@ export async function POST(req: NextRequest) {
     code = code.replace(/\bclass\s+([A-Za-z_][A-Za-z0-9_]*)/g, (_m, _name) => 'class Main');
   }
 
-  inFlight++;
+  inFlight[body.language] = (inFlight[body.language] ?? 0) + 1;
+  inFlightTotal++;
   try {
     const result = await dockerRun(cfg, code, body.stdin ?? '');
 
@@ -94,6 +102,7 @@ export async function POST(req: NextRequest) {
       { status: 500 },
     );
   } finally {
-    inFlight--;
+    inFlight[body.language]--;
+    inFlightTotal--;
   }
 }
