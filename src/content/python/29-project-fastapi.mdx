@@ -1,0 +1,424 @@
+---
+title: '实战：用 FastAPI 构建 REST API'
+order: 29
+description: '从零搭建一个任务管理 REST API，掌握路由、Pydantic 校验、依赖注入与中间件'
+---
+
+# 实战：用 FastAPI 构建 REST API
+
+本章带你用 FastAPI 从零搭建一个任务管理（Task/Todo）REST API。我们会覆盖路由、Pydantic 数据校验、依赖注入、中间件，以及用 TestClient 写接口自测。
+
+<Callout type="warn" title="本沙箱没有安装 FastAPI">
+课程的 Playground 沙箱只装了 Python 3.12 标准库，没有 fastapi、uvicorn，也没有网络去 pip 安装。所以本章里**所有 FastAPI 代码都是展示用代码块**（不能点运行），需要你在本机 `pip install fastapi uvicorn` 之后才能真正跑起来。
+
+本章末尾提供了一个**只用标准库**的 `http.server` 小示例（可点运行），用来体会"没有框架时自己实现一个接口"的样子。
+</Callout>
+
+## 1. 安装与第一个接口
+
+FastAPI 本身很轻，真正提供服务的是 ASGI 服务器 uvicorn。
+
+```bash
+pip install fastapi uvicorn
+```
+
+写第一个接口 `main.py`：
+
+```python
+# main.py
+from fastapi import FastAPI
+
+app = FastAPI(title="Task API", version="1.0")
+
+@app.get("/")
+def root():
+    return {"msg": "Hello, Task API!"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+```
+
+启动服务（在终端里运行，不是 Playground）：
+
+```bash
+uvicorn main:app --reload
+```
+
+`--reload` 会在你改代码后自动重启，开发阶段非常方便。启动后访问 http://127.0.0.1:8000 就能看到 `{"msg":"Hello, Task API!"}`。
+
+用 curl 测试：
+
+```bash
+curl http://127.0.0.1:8000/
+curl http://127.0.0.1:8000/health
+```
+
+<Callout type="tip" title="自动文档">
+FastAPI 自带交互式文档：访问 http://127.0.0.1:8000/docs 是 Swagger UI，访问 http://127.0.0.1:8000/redoc 是 ReDoc。这两个页面都是根据你的代码自动生成的，不需要额外写一行配置。
+</Callout>
+
+## 2. 用 Pydantic 定义模型与字段校验
+
+FastAPI 用 Pydantic 做请求/响应数据校验。我们定义任务模型：
+
+```python
+# models.py
+from typing import Optional
+from pydantic import BaseModel, Field
+
+class TaskCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=100, description="任务标题")
+    done: bool = False
+    priority: int = Field(1, ge=1, le=5, description="优先级 1~5")
+
+class TaskOut(TaskCreate):
+    id: int
+    owner: str = "anonymous"
+```
+
+字段校验说明：
+- `Field(..., ...)` 里的 `...` 表示必填；省略则可选。
+- `min_length` / `max_length` 限制字符串长度。
+- `ge` / `le` 表示大于等于 / 小于等于（`gt` / `lt` 则是严格大于 / 小于）。
+
+如果客户端传了非法数据（例如 `priority=99`），FastAPI 会自动返回 422 错误并指明哪个字段不对，你不需要手写任何校验逻辑。
+
+<Callout type="info" title="请求体从哪来？">
+给函数参数标注成 Pydantic 模型（如 `body: TaskCreate`），FastAPI 就把请求 JSON 反序列化成该模型并做校验。标注成 `int` / `str` 等基础类型，则按来源（路径、查询、请求头）自动解析。
+</Callout>
+
+## 3. 路由：增删改查（CRUD）
+
+我们用一个进程内的字典当"数据库"，实现完整的 CRUD。
+
+```python
+# main.py （接第 1 节）
+from fastapi import FastAPI, HTTPException
+from models import TaskCreate, TaskOut
+
+app = FastAPI(title="Task API", version="1.0")
+
+# 简易内存数据库：id -> TaskOut
+db: dict[int, TaskOut] = {}
+_next_id = 1
+
+@app.get("/tasks", response_model=list[TaskOut])
+def list_tasks():
+    return list(db.values())
+
+@app.post("/tasks", response_model=TaskOut, status_code=201)
+def create_task(task: TaskCreate):
+    global _next_id
+    new = TaskOut(id=_next_id, **task.model_dump())
+    db[_next_id] = new
+    _next_id += 1
+    return new
+
+@app.get("/tasks/{task_id}", response_model=TaskOut)
+def get_task(task_id: int):
+    if task_id not in db:
+        raise HTTPException(status_code=404, detail="task not found")
+    return db[task_id]
+
+@app.put("/tasks/{task_id}", response_model=TaskOut)
+def update_task(task_id: int, task: TaskCreate):
+    if task_id not in db:
+        raise HTTPException(status_code=404, detail="task not found")
+    updated = TaskOut(id=task_id, **task.model_dump())
+    db[task_id] = updated
+    return updated
+
+@app.delete("/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int):
+    if task_id not in db:
+        raise HTTPException(status_code=404, detail="task not found")
+    del db[task_id]
+```
+
+要点：
+- 路径参数写在 `{}` 里，如 `/tasks/{task_id}`，并在函数签名里用同名参数接收（类型标注 `int` 会自动转换）。
+- `POST` 用 201 表示"已创建"，`DELETE` 成功常用 204 表示"无内容"。
+- `HTTPException` 用来返回标准错误响应，比手动 `return {"error": ...}` 更规范。
+
+## 4. 查询参数与分页
+
+列表接口常常需要过滤和分页，这些用查询参数（URL 里 `?` 后面的键值对）实现：
+
+```python
+from typing import Optional
+
+@app.get("/tasks/search", response_model=list[TaskOut])
+def search_tasks(
+    done: Optional[bool] = None,
+    priority: Optional[int] = None,
+    page: int = 1,
+    size: int = 10,
+):
+    items = list(db.values())
+    if done is not None:
+        items = [t for t in items if t.done == done]
+    if priority is not None:
+        items = [t for t in items if t.priority == priority]
+
+    start = (page - 1) * size
+    end = start + size
+    return items[start:end]
+```
+
+调用示例：
+
+```bash
+curl "http://127.0.0.1:8000/tasks/search?done=false&priority=3&page=1&size=5"
+```
+
+<Callout type="tip" title="默认值即代表可选">
+查询参数给了默认值（如 `page: int = 1`）就变成可选；想把它变成必填，就用 `page: int = Query(...)` 或干脆不带默认值。注意：上面这行只是说明，正文里 Query 的用法在本章无需展开。
+</Callout>
+
+## 5. 依赖注入（Dependency）
+
+依赖注入让你把"共享逻辑"（如获取当前用户、连接数据库）抽出来复用，并自动由 FastAPI 调用、注入结果。
+
+```python
+from fastapi import Depends, Header
+
+def get_current_user(x_user: str = Header(default="anonymous")) -> str:
+    # 真实项目里这里会校验 token；这里简化为从请求头读取用户名
+    return x_user
+
+@app.post("/tasks/me", response_model=TaskOut)
+def create_my_task(task: TaskCreate, user: str = Depends(get_current_user)):
+    global _next_id
+    new = TaskOut(id=_next_id, owner=user, **task.model_dump())
+    db[_next_id] = new
+    _next_id += 1
+    return new
+```
+
+调用时带上请求头：
+
+```bash
+curl -X POST http://127.0.0.1:8000/tasks/me \
+  -H "Content-Type: application/json" \
+  -H "X-User: alice" \
+  -d '{"title":"写 FastAPI 教程","priority":5}'
+```
+
+也可以把"共享数据库"做成一个依赖，避免到处传全局变量：
+
+```python
+def get_db() -> dict[int, TaskOut]:
+    return db  # 真实项目里这里返回数据库会话 connection/session
+
+@app.get("/tasks/db", response_model=list[TaskOut])
+def list_via_dep(store: dict[int, TaskOut] = Depends(get_db)):
+    return list(store.values())
+```
+
+<Callout type="info" title="依赖还能做鉴权">
+依赖函数里如果校验失败，直接 `raise HTTPException(status_code=401, detail="未登录")` 即可拦截请求，调用方完全不需要关心，非常适合统一做登录态校验。
+</Callout>
+
+## 6. 中间件（Middleware）
+
+中间件会在每个请求前后执行，常用于跨域、日志、计时。
+
+### CORSMiddleware
+
+前后端分离时，浏览器会因同源策略拦截跨域请求，需要 CORS：
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # 前端地址
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+### 自定义日志中间件
+
+```python
+import time
+from fastapi import Request
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    cost = time.perf_counter() - start
+    print(f"{request.method} {request.url.path} -> {response.status_code} ({cost:.3f}s)")
+    return response
+```
+
+`call_next(request)` 会把请求交给后续处理（路由或其他中间件），拿到响应后你可以改响应头、记日志，再返回。
+
+<Callout type="warn" title="中间件顺序有讲究">
+中间件按"注册的反序"执行（后注册的先包在外面）。CORSMiddleware 通常建议最先注册，让它处在最外层，以保证预检请求（OPTIONS）能被正确处理。
+</Callout>
+
+## 7. 用 TestClient 写接口自测
+
+FastAPI 内置基于 httpx 的 `TestClient`，可以在不启动真实服务器的情况下测试接口：
+
+```python
+# test_main.py
+from fastapi.testclient import TestClient
+from main import app
+
+client = TestClient(app)
+
+def test_create_and_get():
+    # 创建
+    r = client.post("/tasks", json={"title": "学习 FastAPI", "priority": 4})
+    assert r.status_code == 201
+    data = r.json()
+    assert data["title"] == "学习 FastAPI"
+    task_id = data["id"]
+
+    # 读取
+    r2 = client.get(f"/tasks/{task_id}")
+    assert r2.status_code == 200
+    assert r2.json()["done"] is False
+
+    # 删除
+    r3 = client.delete(f"/tasks/{task_id}")
+    assert r3.status_code == 204
+
+    # 再读应 404
+    r4 = client.get(f"/tasks/{task_id}")
+    assert r4.status_code == 404
+
+def test_validation():
+    # priority 越界应被拒绝
+    r = client.post("/tasks", json={"title": "x", "priority": 99})
+    assert r.status_code == 422
+```
+
+运行测试：
+
+```bash
+pip install httpx pytest
+pytest test_main.py -q
+```
+
+<Callout type="tip" title="TestClient 等价于跑了一遍真实流程">
+TestClient 内部用 ASGI 直连你的 `app`，所以路由、Pydantic 校验、依赖、中间件全都会执行——是验证接口行为最省事的方式，CI 里也常用。
+</Callout>
+
+## 8. 运行说明（本机）
+
+把上面的代码整理到 `main.py`，本机完整跑通流程：
+
+```bash
+# 安装
+pip install fastapi uvicorn httpx
+
+# 启动（开发模式，自动重载）
+uvicorn main:app --reload
+
+# 另开一个终端，用 curl 调用
+curl http://127.0.0.1:8000/
+curl -X POST http://127.0.0.1:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title":"买牛奶","priority":2}'
+curl http://127.0.0.1:8000/tasks
+
+# 或者用 Python 的 httpx 调用
+python -c "import httpx; print(httpx.get('http://127.0.0.1:8000/tasks').json())"
+```
+
+<Callout type="info" title="生产环境别用 --reload">
+`--reload` 只适合开发。生产部署通常用 `uvicorn main:app --workers 4` 多进程，或直接上 Gunicorn + Uvicorn worker，再前面加一层反向代理（Nginx）。
+</Callout>
+
+## 9. 没有框架时：标准库实现（可运行）
+
+为了让你体会 FastAPI 帮我们做了多少事（路由分发、JSON 解析、错误码），下面用**纯标准库** `http.server` 实现一个最小任务接口。这段代码可以在沙箱里直接运行：
+
+<Playground
+  language="python"
+  id="py-29-stdlib-server"
+  title="标准库版最小任务接口"
+  code={`from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from urllib.parse import urlparse
+
+db = {}
+_next_id = 1
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/tasks":
+            self._send(200, list(db.values()))
+        elif path.startswith("/tasks/"):
+            tid = int(path.rsplit("/", 1)[1])
+            if tid in db:
+                self._send(200, db[tid])
+            else:
+                self._send(404, {"error": "not found"})
+        else:
+            self._send(404, {"error": "unknown route"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = json.loads(self.rfile.read(length) or b"{}")
+        global _next_id
+        tid = _next_id
+        _next_id += 1
+        db[tid] = {"id": tid, "title": raw.get("title", ""), "done": False}
+        self._send(201, db[tid])
+
+    def log_message(self, *args):
+        pass  # 静音默认日志
+
+import threading, urllib.request as _req
+
+server = ThreadingHTTPServer(("127.0.0.1", 8000), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
+_created = json.loads(_req.urlopen(_req.Request(
+    "http://127.0.0.1:8000/tasks",
+    data=json.dumps({"title": "写 FastAPI 教程"}).encode(),
+    headers={"Content-Type": "application/json"},
+)).read())
+print("创建:", _created)
+print("列表:", json.loads(_req.urlopen("http://127.0.0.1:8000/tasks").read()))
+server.shutdown()
+print("演示结束")`}
+  expectedOutput={`创建: {'id': 1, 'title': '写 FastAPI 教程', 'done': False}
+列表: [{'id': 1, 'title': '写 FastAPI 教程', 'done': False}]
+演示结束`}
+/>
+
+<Callout type="exercise" title="动手练">
+把第 3 节的完整 FastAPI CRUD 在本机跑通，并补上：
+1. 一个 `PATCH /tasks/{task_id}` 接口，只更新 `done` 字段（提示：用可选字段的 Pydantic 模型）。
+2. 给 `create_task` 加一个依赖 `Depends(get_current_user)`，让创建的任务自动带上 owner。
+3. 用 `TestClient` 写一个"过滤 + 分页"的测试（搜索 `done=false` 并验证只返回未完成任务）。
+</Callout>
+
+## 小结
+
+- ✅ FastAPI = 路由 + Pydantic 校验 + 自动文档（/docs），用 uvicorn 启动，`--reload` 适合开发
+- ✅ Pydantic 的 `Field`/`BaseModel` 帮你自动做请求校验，非法数据直接 422
+- ✅ 路径参数 `/tasks/{id}` 做单个资源操作，查询参数做过滤与分页
+- ✅ `Depends` 把登录校验、共享数据库等横切逻辑抽出来复用
+- ✅ `CORSMiddleware` 解决跨域，自定义中间件做日志/计时，注意注册顺序
+- ✅ `TestClient` 在进程内跑通完整请求链，是接口自测与 CI 的利器
+- ✅ 沙箱只支持标准库，所以 FastAPI 代码均为展示；标准库 `http.server` 也能实现最小接口，但路由/校验都得自己写
+
+🎉 **Python 29 章完结**！你已经能独立用 FastAPI 搭一个可用的 REST API，并理解现代 Web 框架帮我们省掉了哪些重复劳动。

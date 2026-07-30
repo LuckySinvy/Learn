@@ -1,0 +1,471 @@
+---
+title: '实战：用 Gin 构建 REST API'
+order: 28
+description: '用 Go 最流行的 Web 框架 Gin 搭建任务管理 REST API，掌握路由、JSON 绑定、中间件与路由分组'
+---
+
+# 实战：用 Gin 构建 REST API
+
+在上一章我们用手写 `net/http` + `ServeMux` 做了一个任务管理 REST API。这一章我们用 **Gin** 重写它——Gin 是 Go 生态里使用最广的 Web 框架，路由语法更简洁、自带 JSON 绑定与中间件机制。
+
+<Callout type="tip" title="Gin 不是唯一选择">
+Go 的 Web 框架还有 **Echo**（API 设计优雅、文档友好）和 **Fiber**（受 Node.js Express 启发、基于 fasthttp，性能极高）。它们理念相似，学通 Gin 后切换成本很低。本章统一用 Gin。
+</Callout>
+
+## 1. 初始化模块
+
+和所有 Go 项目一样，先建目录、初始化 `go.mod`，再拉取 Gin 依赖。
+
+```bash
+mkdir todo-gin && cd todo-gin
+go mod init todo-gin
+go get github.com/gin-gonic/gin
+```
+
+`go get` 会把 `gin` 及其依赖写进 `go.mod`。完成后目录里多了 `go.mod` 与 `go.sum`，正式项目就从这步开始。
+
+<Callout type="info" title="为什么需要 go get">
+Gin 不在标准库内，必须作为模块下载。运行 `go run main.go` 时 Go 会自动按 `go.mod` 里的版本加载它——所以部署机器上也要有这份 `go.mod` 与 `go.sum`，并提前完成 `go mod download`。
+</Callout>
+
+## 2. 第一个路由与启动
+
+最小可运行的 Gin 服务只要三行核心代码：`gin.Default()` 创建引擎，`r.GET` 注册路由，`r.Run` 启动监听。
+
+```go
+package main
+
+import "github.com/gin-gonic/gin"
+
+func main() {
+    r := gin.Default() // 自带 Logger 与 Recovery 中间件
+
+    r.GET("/ping", func(c *gin.Context) {
+        c.JSON(200, gin.H{"message": "pong"})
+    })
+
+    // 监听并在 0.0.0.0:8080 启动服务（忽略错误）
+    r.Run(":8080")
+}
+```
+
+`gin.Default()` 返回的 `r` 就是路由引擎；`gin.H` 是 `map[string]any` 的快捷写法，方便拼 JSON。`c.JSON(code, obj)` 会自动设置 `Content-Type` 并把结构体编码成 JSON。
+
+启动后用 `curl` 验证（服务不要停，另开一个终端）：
+
+```bash
+go run main.go
+# 另一个终端：
+curl http://localhost:8080/ping
+# 输出：{"message":"pong"}
+```
+
+<Callout type="warn" title="r.Run 会阻塞">
+`r.Run(":8080")` 内部调用 `http.ListenAndServe`，会一直阻塞当前 goroutine。如果后面还有初始化逻辑，要放在 `r.Run` 之前，或改用 `r.Run` 的 `net/http` 包装版（见第 8 节进阶）。
+</Callout>
+
+## 3. 定义 Task 模型与 JSON 绑定
+
+用 `struct` 描述任务，并用 `json` tag 控制序列化字段名。创建请求单独建模，避免客户端能直接改 `id`、`created_at` 等字段。
+
+```go
+package main
+
+import "time"
+
+// Task 是领域模型，对应一条任务记录
+type Task struct {
+    ID        int       `json:"id"`
+    Title     string    `json:"title"`
+    Done      bool      `json:"done"`
+    CreatedAt time.Time `json:"created_at"`
+}
+
+// CreateTaskRequest 是创建任务时的请求体（客户端只传 title）
+type CreateTaskRequest struct {
+    Title string `json:"title" binding:"required"`
+}
+
+// UpdateTaskRequest 是更新任务时的请求体（所有字段可选）
+type UpdateTaskRequest struct {
+    Title *string `json:"title,omitempty"`
+    Done  *bool   `json:"done,omitempty"`
+}
+```
+
+`binding:"required"` 告诉 Gin：这个字段缺失或为空串时，`ShouldBindJSON` 直接返回错误。`UpdateTaskRequest` 用指针字段区分「没传」与「传了空值」——这正是 JSON 局部更新的惯用法。
+
+JSON 绑定用 `c.ShouldBindJSON`：
+
+```go
+func createTask(c *gin.Context) {
+    var req CreateTaskRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    // req.Title 已经过 required 校验，可直接使用
+}
+```
+
+<Callout type="tip" title="ShouldBindJSON 与 BindJSON 的区别">
+`c.ShouldBindJSON` 只做绑定、不自动写响应，适合你想自己决定返回什么错误码；`c.BindJSON` 在失败时还会自动 `c.AbortWithStatus` 返回 400。多数业务代码更推荐 `ShouldBindJSON`，控制更细。
+</Callout>
+
+## 4. 路由：完整 CRUD（内存 slice 存储）
+
+用一块内存 `[]Task` 当存储，配一把 `sync.Mutex` 保证并发安全。下面给出完整可对照上一章的 Gin 版本实现。
+
+```go
+package main
+
+import (
+    "net/http"
+    "strconv"
+    "sync"
+    "time"
+
+    "github.com/gin-gonic/gin"
+)
+
+// ===== 存储层：内存 slice =====
+type Store struct {
+    mu     sync.Mutex
+    tasks  []Task
+    nextID int
+}
+
+func NewStore() *Store { return &Store{nextID: 1} }
+
+func (s *Store) Create(title string) Task {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    t := Task{ID: s.nextID, Title: title, CreatedAt: time.Now()}
+    s.nextID++
+    s.tasks = append(s.tasks, t)
+    return t
+}
+
+func (s *Store) List() []Task {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    out := make([]Task, len(s.tasks))
+    copy(out, s.tasks)
+    return out
+}
+
+func (s *Store) Get(id int) (Task, bool) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    for _, t := range s.tasks {
+        if t.ID == id {
+            return t, true
+        }
+    }
+    return Task{}, false
+}
+
+func (s *Store) Update(id int, req UpdateTaskRequest) (Task, bool) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    for i := range s.tasks {
+        if s.tasks[i].ID == id {
+            if req.Title != nil {
+                s.tasks[i].Title = *req.Title
+            }
+            if req.Done != nil {
+                s.tasks[i].Done = *req.Done
+            }
+            return s.tasks[i], true
+        }
+    }
+    return Task{}, false
+}
+
+func (s *Store) Delete(id int) bool {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    for i, t := range s.tasks {
+        if t.ID == id {
+            s.tasks = append(s.tasks[:i], s.tasks[i+1:]...)
+            return true
+        }
+    }
+    return false
+}
+
+// ===== Handler 层 =====
+type Server struct{ store *Store }
+
+func NewServer(s *Store) *Server { return &Server{store: s} }
+
+func (s *Server) listTasks(c *gin.Context) {
+    c.JSON(200, s.store.List())
+}
+
+func (s *Server) createTask(c *gin.Context) {
+    var req CreateTaskRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    c.JSON(201, s.store.Create(req.Title))
+}
+
+func (s *Server) getTask(c *gin.Context) {
+    id, _ := strconv.Atoi(c.Param("id")) // 取路径参数 :id
+    t, ok := s.store.Get(id)
+    if !ok {
+        c.JSON(404, gin.H{"error": "not found"})
+        return
+    }
+    c.JSON(200, t)
+}
+
+func (s *Server) updateTask(c *gin.Context) {
+    id, _ := strconv.Atoi(c.Param("id"))
+    var req UpdateTaskRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    t, ok := s.store.Update(id, req)
+    if !ok {
+        c.JSON(404, gin.H{"error": "not found"})
+        return
+    }
+    c.JSON(200, t)
+}
+
+func (s *Server) deleteTask(c *gin.Context) {
+    id, _ := strconv.Atoi(c.Param("id"))
+    if !s.store.Delete(id) {
+        c.JSON(404, gin.H{"error": "not found"})
+        return
+    }
+    c.Status(204)
+}
+```
+
+路由注册时，`/tasks/:id` 里的 `:id` 是 Gin 的路径参数，在 handler 里用 `c.Param("id")` 取出。
+
+```go
+func main() {
+    store := NewStore()
+    srv := NewServer(store)
+    r := gin.Default()
+
+    r.GET("/tasks", srv.listTasks)
+    r.POST("/tasks", srv.createTask)
+    r.GET("/tasks/:id", srv.getTask)
+    r.PUT("/tasks/:id", srv.updateTask)
+    r.DELETE("/tasks/:id", srv.deleteTask)
+
+    r.Run(":8080")
+}
+```
+
+用 `curl` 走一遍完整流程：
+
+```bash
+curl -X POST localhost:8080/tasks -H 'Content-Type: application/json' -d '{"title":"学 Gin"}'
+# {"id":1,"title":"学 Gin","done":false,"created_at":"..."}
+
+curl localhost:8080/tasks
+# [{"id":1,"title":"学 Gin","done":false,"created_at":"..."}]
+
+curl -X PUT localhost:8080/tasks/1 -H 'Content-Type: application/json' -d '{"done":true}'
+# {"id":1,"title":"学 Gin","done":true,"created_at":"..."}
+
+curl -X DELETE localhost:8080/tasks/1
+# 无响应体，状态码 204
+```
+
+<Callout type="warn" title="生产环境别用默认 Gin 输出">
+示例里 `c.JSON(400, gin.H{"error": err.Error()})` 直接把绑定错误原文回给客户端，便于调试。真实服务应返回更收敛、更友好的错误信息，避免泄露内部细节。
+</Callout>
+
+## 5. 查询参数与分页
+
+列表接口常需要按条件过滤与分页。Gin 用 `c.Query("key")` 取 URL 查询参数，缺省时返回空串；可加第二个参数当默认值。
+
+```go
+func (s *Server) listTasks(c *gin.Context) {
+    // 查询参数：?done=true&q=关键词&page=1&size=10
+    doneParam := c.Query("done")   // 空串表示不过滤
+    q := c.Query("q")
+    page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+    size, _ := strconv.Atoi(c.DefaultQuery("size", "10"))
+
+    var filtered []Task
+    for _, t := range s.store.List() {
+        if doneParam == "true" && !t.Done {
+            continue
+        }
+        if doneParam == "false" && t.Done {
+            continue
+        }
+        if q != "" && !strings.Contains(strings.ToLower(t.Title), strings.ToLower(q)) {
+            continue
+        }
+        filtered = append(filtered, t)
+    }
+
+    // 简单分页
+    total := len(filtered)
+    start := (page - 1) * size
+    if start >= total {
+        start = total
+    }
+    end := start + size
+    if end > total {
+        end = total
+    }
+
+    c.JSON(200, gin.H{
+        "data":  filtered[start:end],
+        "total": total,
+        "page":  page,
+        "size":  size,
+    })
+}
+```
+
+`c.DefaultQuery("page", "1")` 在参数缺失时返回 `"1"`，比 `c.Query` 少一层判空。注意分页边界（越界时 `start` 钳到 `total`）是手写分页最容易踩的坑。
+
+## 6. 中间件：Logger/Recovery 与自定义日志中间件
+
+`gin.Default()` 已经挂了 `Logger()`（每次请求打印日志）和 `Recovery()`（panic 时返回 500 而不崩溃）。如果想自己控制挂载，用 `gin.New()` 再手动 `r.Use(...)`。
+
+```go
+func main() {
+    r := gin.New()               // 空引擎，不含任何中间件
+    r.Use(gin.Logger())          // 请求日志
+    r.Use(gin.Recovery())        // panic 恢复
+
+    // 自定义日志中间件：打印方法、路径、耗时
+    r.Use(func(c *gin.Context) {
+        start := time.Now()
+        c.Next() // 执行后续 handler
+        latency := time.Since(start)
+        log.Printf("%s %s 耗时 %v 状态 %d",
+            c.Request.Method, c.Request.URL.Path, latency, c.Writer.Status())
+    })
+
+    // ... 注册路由
+    r.Run(":8080")
+}
+```
+
+中间件本质是一个 `func(*gin.Context)`，`c.Next()` 之前的代码在 handler 前执行，之后的代码在 handler 后执行。这正是做统一日志、鉴权、耗时统计的标准位置。
+
+<Callout type="tip" title="中间件里尽早 c.Abort">
+鉴权中间件里如果判定无权限，要 `c.Abort()`（或 `c.AbortWithStatus`）阻止后续 handler 执行，否则请求仍会到达业务 handler。
+</Callout>
+
+## 7. 路由分组与统一前缀
+
+所有任务接口都带 `/api` 前缀，逐个写很啰嗦。用 `r.Group("/api")` 把前缀和公共中间件一起套上去。
+
+```go
+func main() {
+    store := NewStore()
+    srv := NewServer(store)
+    r := gin.Default()
+
+    api := r.Group("/api") // 统一前缀 /api
+    {
+        tasks := api.Group("/tasks") // 实际前缀 /api/tasks
+        {
+            tasks.GET("", srv.listTasks)        // GET  /api/tasks
+            tasks.POST("", srv.createTask)      // POST /api/tasks
+            tasks.GET("/:id", srv.getTask)      // GET  /api/tasks/:id
+            tasks.PUT("/:id", srv.updateTask)   // PUT  /api/tasks/:id
+            tasks.DELETE("/:id", srv.deleteTask)// DELETE /api/tasks/:id
+        }
+    }
+
+    r.Run(":8080")
+}
+```
+
+分组还能挂专属中间件，例如给 `/api` 整组加一个鉴权中间件：`api.Use(authMiddleware)`。这样 `/api` 下所有路由自动受保护，而 `/ping` 等公开路由不受影响。
+
+## 8. 用 httptest 写接口自测
+
+Gin 的 `Engine` 实现了 `http.Handler`，可以直接喂给 `net/http/httptest` 做纯内存测试，不依赖真实网络端口。
+
+```go
+func TestCreateAndGet(t *testing.T) {
+    store := NewStore()
+    srv := NewServer(store)
+    r := gin.New()
+    r.POST("/tasks", srv.createTask)
+    r.GET("/tasks/:id", srv.getTask)
+
+    // 创建
+    body := strings.NewReader(`{"title":"测试任务"}`)
+    req := httptest.NewRequest("POST", "/tasks", body)
+    req.Header.Set("Content-Type", "application/json")
+    w := httptest.NewRecorder()
+    r.ServeHTTP(w, req)
+
+    if w.Code != 201 {
+        t.Fatalf("期望 201，得到 %d", w.Code)
+    }
+
+    // 读取返回的 id 并查询
+    var created Task
+    json.NewDecoder(w.Body).Decode(&created)
+
+    req2 := httptest.NewRequest("GET", "/tasks/"+strconv.Itoa(created.ID), nil)
+    w2 := httptest.NewRecorder()
+    r.ServeHTTP(w2, req2)
+
+    if w2.Code != 200 {
+        t.Fatalf("期望 200，得到 %d", w2.Code)
+    }
+}
+```
+
+`httptest.NewRecorder()` 产出 `ResponseRecorder`，把响应写进内存；`r.ServeHTTP(w, req)` 把请求直接灌进 Gin 引擎。整条测试零网络、零端口，CI 里跑得又快又稳。
+
+<Callout type="info" title="为什么不用真实端口测">
+起真实端口（如 `httptest.NewServer`）要分配套接字、做 TCP 握手，慢且并发时容易端口冲突。`httptest.NewRecorder` 全程内存，是 Gin/标准库 handler 单测的首选。
+</Callout>
+
+## 9. 运行说明
+
+把上面的 `main.go` 与 `store.go`、`handlers.go` 按需拆分（教学上放一个文件也行），确保同目录、同 `package main`，然后：
+
+```bash
+# 在项目根目录
+go run main.go
+
+# 另开终端用 curl 调用
+curl localhost:8080/ping
+curl -X POST localhost:8080/api/tasks -H 'Content-Type: application/json' -d '{"title":"写文档"}'
+curl localhost:8080/api/tasks
+curl localhost:8080/api/tasks/1
+curl -X PUT localhost:8080/api/tasks/1 -H 'Content-Type: application/json' -d '{"done":true}'
+curl -X DELETE localhost:8080/api/tasks/1
+```
+
+首次 `go run` 会自动编译并缓存依赖；若改了 `go.mod`，记得先 `go mod tidy` 整理依赖。服务监听 `:8080`，按 `Ctrl+C` 停止。
+
+<Callout type="exercise" title="动手练习">
+给任务加一个 `priority`（优先级）字段，并在列表接口支持 `?priority=high` 过滤；再写一个 `httptest` 用例覆盖「按优先级过滤」这一分支。
+</Callout>
+
+## 小结
+
+- ✅ Gin 是 Go 最流行的 Web 框架，Echo / Fiber 是同级替代
+- ✅ `go mod init` + `go get github.com/gin-gonic/gin` 初始化依赖
+- ✅ `gin.Default()` 自带 Logger 与 Recovery；`r.GET` 注册路由，`r.Run(":8080")` 启动
+- ✅ 用 `struct` + `json` tag 建模，`c.ShouldBindJSON` 做请求绑定与校验
+- ✅ 内存 `[]Task` 当存储，配合 `sync.Mutex` 保证并发安全
+- ✅ `c.Param("id")` 取路径参数，`c.Query` / `c.DefaultQuery` 取查询参数并做分页
+- ✅ 中间件是 `func(*gin.Context)`，用 `r.Use(...)` 挂载；分组 `r.Group` 统一前缀
+- ✅ Gin 引擎实现 `http.Handler`，可直接用 `httptest.NewRecorder` 做纯内存自测
+
+下一章我们进入另一个实战方向：用 goroutine 与 channel 做并发数据处理工具。
