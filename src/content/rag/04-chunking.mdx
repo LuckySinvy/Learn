@@ -1,0 +1,98 @@
+---
+title: 文本拆分策略
+order: 4
+description: 固定长度、递归、语义三种切分方式，以及 chunk size 与 overlap 的工程取舍
+---
+
+# 文本拆分策略
+
+检索的最小单位是 **chunk（片段）**。切得太长 → 一段里混进无关内容，召回精度下降；切得太短 → 语义不完整，模型拿到的上下文破碎。切分策略直接决定检索质量。
+
+## 1. 为什么要切分
+
+- Embedding 模型对输入长度有限制（如 512/8192 token），超长文本必须截断
+- 检索时按「段」返回，粒度越合适，噪声越少
+- 生成阶段受 token 预算约束，需要精选若干段而非整篇文档
+
+## 2. 三种常见切分策略
+
+| 策略 | 做法 | 优点 | 缺点 |
+|---|---|---|---|
+| 固定长度 | 按 N 个字符/token 硬切 | 简单、均匀 | 易切断语义（半句话） |
+| 递归切分 | 按 `\n\n`→`\n`→`。` 逐级尝试 | 尽量保留自然边界 | 实现稍复杂 |
+| 语义切分 | 按句向量相似度断点 | 语义完整 | 计算成本高 |
+
+<Callout type="info" title="递归切分是默认首选">
+LangChain 的 `RecursiveCharacterTextSplitter` 按分隔符优先级递归切，能尽量在段落/句子边界断开，是大多数场景的稳妥起点。
+</Callout>
+
+## 3. 代码示例
+
+```python
+from langchain_text_splitters import (
+    RecursiveCharacterTextSplitter,
+    CharacterTextSplitter,
+)
+
+# 递归切分（推荐）
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,       # 每个 chunk 的目标字符数
+    chunk_overlap=80,     # 相邻 chunk 重叠，避免边界信息丢失
+    separators=["\n\n", "\n", "。", "；", "，", ""],
+)
+chunks = splitter.split_documents(all_docs)
+
+print(len(chunks), "个 chunk")
+print(chunks[0].page_content[:100])
+```
+
+固定长度切分（不推荐做主切分，但适合对齐）：
+
+```python
+fixed = CharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=80,
+    separator="\n",
+)
+```
+
+## 4. chunk_size 与 overlap 的取舍
+
+```text
+chunk_size 太小 ──► 语义破碎，检索到的片段看不懂
+chunk_size 太大 ──► 噪声多，且占用 token 预算
+overlap 太小   ──► 跨边界的句子被拆断，召回不到
+overlap 太大   ──► 重复内容多，浪费存储与 token
+```
+
+经验值（中文场景）：`chunk_size` 取 **300–800 字**，`overlap` 取 **10%–20%** 的 chunk_size。最终靠评估指标（第 13 章）来调。
+
+<Callout type="warn" title="别让 chunk 超过 Embedding 上限">
+如果 Embedding 模型最大输入 512 token，chunk 超过它会被截断，后半段根本没被向量化。切分 size 必须 ≤ 模型上限。
+</Callout>
+
+## 5. 语义切分示例
+
+```python
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_openai import OpenAIEmbeddings
+
+semantic = SemanticChunker(OpenAIEmbeddings())
+chunks = semantic.create_documents([long_text])
+```
+
+<Callout type="tip" title="混合切分思路">
+先用「标题层级」做大块（保持章节完整），再在块内用递归切分做小块。这种「结构感知」切分对技术文档、法律合同特别有效。
+</Callout>
+
+<Callout type="exercise" title="练习">
+用同一份文档，分别试 `chunk_size=200/500/1000`，各检索同一个问题，观察返回的片段是否「刚刚好包含答案」。记录哪种 size 让你最满意。
+</Callout>
+
+## 小结
+
+- 切分粒度影响召回精度与 token 预算
+- 递归切分是默认首选，语义切分质量最高但更贵
+- chunk_size 取 300–800 字，overlap 10–20%
+- chunk 不能超过 Embedding 模型输入上限
+- 下一章理解 Embedding 与向量相似度本身 →

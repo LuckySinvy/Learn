@@ -1,0 +1,107 @@
+---
+title: 生产化
+order: 16
+description: RAG 上生产的缓存、并发、成本控制、重试与降级等工程要点
+---
+
+# 生产化
+
+Demo 跑通只是开始。把 RAG 放到真实流量下，要面对**延迟、成本、不稳定**三座大山。本章覆盖关键工程化手段。
+
+## 1. 缓存：最常见也最划算的优化
+
+相同/相似问题重复出现（客服场景尤甚），可直接命中缓存，省去检索+生成。
+
+```python
+import hashlib, json
+cache = {}   # 生产用 Redis
+
+def ask(question):
+    key = hashlib.md5(question.strip().lower().encode()).hexdigest()
+    if key in cache:
+        return cache[key]                 # 命中，毫秒级返回
+    ans = rag_pipeline(question)
+    cache[key] = ans
+    return ans
+```
+
+<Callout type="info" title="语义缓存更进一步">
+精确字符串缓存命中率低。可用「问题向量近邻」做语义缓存：新问题向量与历史问题相似度超阈值即复用答案，对口语化提问更友好。
+</Callout>
+
+## 2. 并发与异步
+
+检索、重排、LLM 调用都应异步化，避免阻塞：
+
+```python
+import asyncio
+
+async def retrieve_and_gen(question):
+    vec = await embed_async(question)
+    hits = await search_async(vec, k=20)
+    reranked = await rerank_async(question, hits)
+    return await llm_async(build_prompt(question, reranked[:5]))
+```
+
+## 3. 成本控制
+
+| 大头 | 控制手段 |
+|---|---|
+| LLM 生成 token | 限制 max_tokens、精简 Prompt、缓存复用 |
+| Embedding 调用 | 批量嵌入、缓存向量、离线批处理 |
+| 向量库查询 | 限制 top_k、加 score 阈值减少后续处理 |
+
+```python
+# 给 LLM 调用加上限与超时
+resp = llm.chat(
+    messages=..., 
+    max_tokens=512,      # 防超长输出
+    timeout=10,          # 防挂起
+)
+```
+
+<Callout type="warn" title="警惕无限长输出与重试雪崩">
+不设 `max_tokens` 可能输出几千字烧钱；重试不加退避（backoff）会在下游抖动时打满请求，造成雪崩。两者都要有上限。
+</Callout>
+
+## 4. 重试与降级
+
+外部依赖（LLM、向量库）会抖动，需优雅降级：
+
+```python
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=8))
+def call_llm(prompt):
+    return llm.chat(messages=prompt)
+
+def rag_with_fallback(question):
+    try:
+        return call_llm(build_prompt(question, top5))
+    except Exception:
+        # 降级：只返回检索到的原文片段，不做生成
+        return "（生成服务暂时不可用）相关原文：\n" + "\n".join(top5_texts)
+```
+
+## 5. 可观测性
+
+```text
+记录每次请求：问题、召回片段、耗时、token 数、是否命中缓存、是否降级
+```
+接入日志/监控（如你站点的 Grafana），才能定位「为什么这次答得差」。
+
+<Callout type="tip" title="先加缓存和降级，再谈扩缩容">
+对小中型应用，语义缓存 + 重试 + 降级三件套能解决 80% 的生产稳定性问题，远比急着上分布式更划算。
+</Callout>
+
+<Callout type="exercise" title="练习">
+给你的 RAG 管线加上 Redis 语义缓存与 tenacity 重试，并写一条降级分支：当 LLM 连续失败 3 次时，直接返回 Top-3 原文片段。
+</Callout>
+
+## 小结
+
+- 语义缓存是性价比最高的优化，复用相似问题答案
+- 检索/重排/生成全程异步，避免阻塞
+- 控成本：限 max_tokens、批量嵌入、限 top_k
+- 重试加退避，失败有降级分支，全程可观测
+- 下一章端到端实战：搭建企业知识库问答 →

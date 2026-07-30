@@ -1,0 +1,95 @@
+---
+title: 快速开始
+order: 2
+description: 用 npm 安装依赖、配置 API Key，并跑通第一个调用模型的链
+---
+
+# 快速开始
+
+本章带你从零搭建一个最小可运行的 Langchain.js 项目，并完成第一次模型调用。
+
+## 1. 环境准备
+
+需要 Node.js 18+（支持原生 `fetch` 与顶层 `await`）。新建项目并安装依赖：
+
+```bash
+mkdir my-langchain-app && cd my-langchain-app
+npm init -y
+npm install @langchain/core @langchain/openai
+```
+
+<Callout type="info" title="TypeScript 用户">
+如需类型提示，额外安装 `npm i -D typescript @types/node`，并在 `tsconfig.json` 中开启 `"moduleResolution": "bundler"`（或 `"node16"`），否则可能解析不到子路径导出。
+</Callout>
+
+## 2. 配置 API Key
+
+Langchain.js 的 OpenAI 集成默认读取环境变量 `OPENAI_API_KEY`。最干净的做法是用 `.env` 文件配合 `dotenv`：
+
+```bash
+npm install dotenv
+```
+
+```bash
+# .env（切勿提交到 Git）
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
+```
+
+```ts
+// index.ts
+import "dotenv/config";
+import { ChatOpenAI } from "@langchain/openai";
+
+const model = new ChatOpenAI({
+  model: "gpt-4o-mini",
+  temperature: 0.7,
+});
+
+const res = await model.invoke("用一句话介绍 Langchain.js");
+console.log(res.content);
+```
+
+<Callout type="warn" title="Key 绝不能进前端代码">
+`OPENAI_API_KEY` 是服务端密钥。任何 `import "dotenv/config"` 的代码都**只能运行在 Node/服务端**。浏览器打包进去会直接泄露 Key（第 15 章专门讲 Next.js 集成的安全边界）。
+</Callout>
+
+## 3. 第一个完整的链
+
+结合提示模板与输出解析，写出「可复用」的调用：
+
+```ts
+import "dotenv/config";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+const prompt = ChatPromptTemplate.fromTemplate(
+  "你是一个乐于助人的助手。请回答：{question}"
+);
+const model = new ChatOpenAI({ model: "gpt-4o-mini" });
+const outputParser = new StringOutputParser();
+
+const chain = prompt.pipe(model).pipe(outputParser);
+
+const answer = await chain.invoke({ question: "什么是 RAG？" });
+console.log(answer);
+```
+
+## 4. 常见报错排查
+
+| 现象 | 原因与解法 |
+|---|---|
+| `401 Incorrect API key` | 环境变量未加载，确认 `dotenv` 已 `import`，或终端已 `export` |
+| `Module not found: @langchain/openai` | 仅装了 `langchain`，新版需单独安装厂商包 |
+| 返回 `AIMessage` 对象而非字符串 | 没接 `StringOutputParser`，`.content` 才是文本 |
+
+<Callout type="exercise" title="练习">
+把上面的 `question` 抽成命令行参数（`process.argv`），做一个能在终端里反复提问的小脚本。
+</Callout>
+
+## 小结
+
+- 安装 `@langchain/core` + 厂商包（如 `@langchain/openai`）
+- API Key 用 `.env` + `dotenv`，只在服务端加载
+- 用 `prompt.pipe(model).pipe(parser)` 拼出第一条链
+- 下一步深入了解 Chat Models →

@@ -19,6 +19,9 @@ export function LangOverview({ lang }: { lang: Language }) {
         {lang === 'go' && '从语法到并发与 Web 服务，渐进式掌握 Go。'}
         {lang === 'java' && '从语法到集合与并发，渐进式掌握 Java。'}
         {lang === 'grafana' && '从安装到告警与可观测性平台，渐进式掌握 Grafana。'}
+        {lang === 'rag' && '从文档切分到检索重排与评估，系统掌握检索增强生成。'}
+        {lang === 'langchain' && '用 Langchain.js 编排模型、链、检索与 Agent，构建 LLM 应用。'}
+        {lang === 'dify' && '用 Dify 低代码搭建知识库、工作流与 Agent 应用并发布 API。'}
       </p>
       <ul className="space-y-1">
         {chapters.map((c, i) => (

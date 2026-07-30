@@ -1,0 +1,94 @@
+---
+title: LCEL 表达式语言
+order: 7
+description: 用 pipe 语法、RunnableSequence 与并行/回退，组合出灵活的 Runnable 链
+---
+
+# LCEL 表达式语言
+
+**LCEL（LangChain Expression Language）** 是 v0.2 的核心组合方式。它基于统一的 `Runnable` 接口，用 `.pipe()` 把组件像水管一样串起来，并自动获得流式、批处理、异步与可观测能力。
+
+## 1. pipe 语法基础
+
+任何 `Runnable` 都能 `pipe` 到下一个 `Runnable`。模型吃消息、吐 `AIMessage`；解析器吃 `AIMessage`、吐字符串——类型自然衔接：
+
+```ts
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+const chain = ChatPromptTemplate.fromTemplate("{q}")
+  .pipe(new ChatOpenAI({ model: "gpt-4o-mini" }))
+  .pipe(new StringOutputParser());
+
+await chain.invoke({ q: "什么是 LCEL？" });
+```
+
+<Callout type="info" title="Runnable 的通用方法">
+每个 `Runnable` 都提供 `invoke / batch / stream / invoke` 变体，以及 `withConfig`、`withRetry`、`withFallbacks`，无需为不同组件记不同 API。
+</Callout>
+
+## 2. RunnableSequence 与 RunnableParallel
+
+`RunnableSequence` 显式串联；`RunnableParallel` 则**并行**执行多个分支并合并结果：
+
+```ts
+import { RunnableSequence, RunnableParallel } from "@langchain/core/runnables";
+
+const chain = RunnableSequence.from([
+  RunnableParallel({
+    translation: translateChain,   // 翻译成英文
+    original: (input: string) => input, // 保留原文
+  }),
+  summarizeChain, // 同时拿到原文与译文再总结
+]);
+```
+
+## 3. RunnableBranch：条件分支
+
+按条件走不同子链（类似 if/else）：
+
+```ts
+import { RunnableBranch } from "@langchain/core/runnables";
+
+const branch = RunnableBranch.from([
+  [(input: { len: number }) => input.len > 1000, longTextChain],
+  shortTextChain,
+]);
+```
+
+## 4. 回退与重试
+
+主模型失败时自动切换到备用模型，提升健壮性：
+
+```ts
+import { ChatAnthropic } from "@langchain/anthropic";
+
+const robust = new ChatOpenAI({ model: "gpt-4o-mini" }).withFallbacks({
+  fallbacks: [new ChatAnthropic({ model: "claude-3-5-sonnet-latest" })],
+});
+
+const chain = prompt.pipe(robust).pipe(new StringOutputParser());
+```
+
+<Callout type="warn" title="回退要语义一致">
+备用模型返回的格式/语气可能与主模型不同。涉及严格输出解析（如 JSON）时，回退后建议重新跑解析器并校验。
+</Callout>
+
+## 5. 为什么用 LCEL
+
+- **流式免费**：`chain.stream()` 自动逐块透传
+- **批处理**：`chain.batch([...])` 并发多输入
+- **可观测**：每个步骤都能挂回调（第 14 章）
+- **组合自由**：并行、分支、回退任意嵌套
+
+<Callout type="exercise" title="练习">
+写一个并行链：同时用「中文解释」和「英文解释」两个子链处理同一问题，最后用一个总结链合并两份答案。
+</Callout>
+
+## 小结
+
+- LCEL 用 `.pipe()` 串联 `Runnable`，统一 `invoke/stream/batch`
+- `RunnableSequence` 顺序、`RunnableParallel` 并行、`RunnableBranch` 分支
+- `withFallbacks` 实现模型/步骤级容错
+- 下章进入 RAG：先学文档加载 →

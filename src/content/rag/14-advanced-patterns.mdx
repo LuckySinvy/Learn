@@ -1,0 +1,91 @@
+---
+title: 高级 RAG 模式
+order: 14
+description: 父子文档、假设性问题、查询改写与 HyDE 等提升召回的高级技巧
+---
+
+# 高级 RAG 模式
+
+当基础 RAG 召回不够好时，以下模式能针对性补强。它们大多围绕「让检索更准」这一核心。
+
+## 1. 父子文档（Parent-Child）
+
+**问题**：chunk 切小了语义碎，切大了噪声多。
+**解法**：建索引用小 chunk（好检索），但命中后返回它的「父文档」（整节/整段），保证喂给 LLM 的上下文完整。
+
+```python
+# 父文档存完整段，子文档存切片的向量
+child_vec = embed(small_chunk)
+store.add(vector=child_vec, child_text=small_chunk,
+          parent_id=section_id)
+
+# 检索命中子文档 → 回查父文档原文
+hit = store.search(q_vec, k=5)
+parents = [store.get_parent(h["parent_id"]) for h in hit]
+```
+
+<Callout type="info" title="检索与阅读解耦">
+父子文档的本质：用小块做「检索精度」，用大块做「阅读完整度」。两者解耦，各取所长。
+</Callout>
+
+## 2. 假设性问题（Hypothetical Questions）
+
+为每个文档**预先生成**它可能回答的若干问题，用这些问题做 Embedding 索引。用户提问时，问题更易与「问题向量」对齐。
+
+```python
+prompt = "为下面这段内容生成 3 个用户可能问的问题：\n" + chunk
+qs = llm(prompt).split("\n")
+index_vector = embed(qs)   # 用问题向量代表该 chunk
+```
+
+## 3. 查询改写（Query Rewriting）
+
+用户问题常口语化、缺上下文（多轮对话里「它」「这个」指代不清）。改写后再检索：
+
+```python
+rewrite_prompt = f"把用户问题改写成独立、含关键实体的检索问句：{question}"
+better_q = llm(rewrite_prompt)
+hits = retrieve(embed(better_q))
+```
+
+## 4. HyDE（假设性文档嵌入）
+
+让 LLM 先**假装回答**问题，得到一个「假设答案」，再对假设答案做 Embedding 去检索——因为假设答案比原问题更接近真实文档的分布。
+
+```python
+hypo_answer = llm(f"请回答：{question}")     # 不必正确，只为对齐分布
+q_vec = embed(hypo_answer)                    # 用假设答案的向量检索
+hits = store.search(q_vec, k=5)
+```
+
+<Callout type="warn" title="HyDE 可能放大幻觉">
+HyDE 生成的假设答案本身可能含错误事实，但只用于「找相似文档」，不直接给用户。检索命中后仍以真实文档为准作答。
+</Callout>
+
+## 5. 多查询（Multi-Query）
+
+把一个问题发散成多个角度的查询，分别检索后合并去重，提升召回覆盖：
+
+```python
+angles = llm(f"从 3 个不同角度改写检索问句：{question}")
+all_hits = []
+for q in angles:
+    all_hits += retrieve(embed(q))
+merged = dedupe(all_hits)
+```
+
+<Callout type="tip" title="组合使用，别全上">
+父子文档 + 查询改写是性价比最高的组合，几乎适用所有场景；HyDE/假设性问题在特定语料上增益明显但增加延迟，按需引入并用第 13 章指标验证。
+</Callout>
+
+<Callout type="exercise" title="练习">
+在你最易「召回不到」的一类问题上，试试「查询改写 + 父子文档」组合，对比改写前后的 context_relevancy 分数是否提升。
+</Callout>
+
+## 小结
+
+- 父子文档：小块检索、父块阅读，解耦精度与完整
+- 假设性问题 / HyDE：用「问题/假设答案」向量对齐文档
+- 查询改写 / 多查询：补齐指代、发散角度，提升覆盖
+- 按指标验证后再引入，避免盲目堆技巧
+- 下一章扩展到多模态（表格/图片）RAG →

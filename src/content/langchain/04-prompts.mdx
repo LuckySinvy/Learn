@@ -1,0 +1,100 @@
+---
+title: 提示词模板 Prompts
+order: 4
+description: 使用 ChatPromptTemplate 与 FewShot 模板，把提示词结构化、参数化
+---
+
+# 提示词模板 Prompts
+
+提示模板（Prompts）是 Model I/O 中的 **Input** 部分——把「带变量的提示词」固化成可复用组件，运行时再填值。
+
+## 1. ChatPromptTemplate
+
+最常用的是 `ChatPromptTemplate`，支持按角色编排多段消息，并用 `{变量}` 占位：
+
+```ts
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", "你是{role}，请用{style}的语气回答。"],
+  ["human", "{question}"],
+]);
+
+const messages = await prompt.formatMessages({
+  role: "资深前端工程师",
+  style: "简洁专业",
+  question: "React 里 useMemo 什么时候该用？",
+});
+
+console.log(messages); // [SystemMessage, HumanMessage]
+```
+
+模板返回的是「消息数组」，可以直接 `model.invoke(messages)`，或接入 LCEL 管道。
+
+<Callout type="tip" title="变量名要唯一且语义化">
+`{question}`、`{context}`、`{history}` 是 RAG / 对话场景的约定俗成命名，团队统一后可读性更好。
+</Callout>
+
+## 2. 字符串模板与部分填充
+
+`PromptTemplate` 用于纯文本场景；`partial()` 可先固定部分变量（例如先填好 `language`，后面只传 `text`）：
+
+```ts
+import { PromptTemplate } from "@langchain/core/prompts";
+
+const tpl = PromptTemplate.fromTemplate(
+  "把下面文本翻译成{language}：\n{text}"
+);
+const enTpl = await tpl.partial({ language: "英语" });
+const prompt = await enTpl.format({ text: "今天天气真好" });
+```
+
+## 3. FewShot 示例模板
+
+FewShot（少样本）通过给模型看「示例」来引导输出格式与风格。常用 `FewShotChatMessagePromptTemplate` + `SemanticSimilarityExampleSelector` 自动挑选最相关示例：
+
+```ts
+import { FewShotChatMessagePromptTemplate } from "@langchain/core/prompts";
+
+const examplePrompt = ChatPromptTemplate.fromTemplate(
+  "输入：{input}\n输出：{output}"
+);
+const fewShot = FewShotChatMessagePromptTemplate.fromExamples(
+  [
+    { input: "高兴", output: "😊" },
+    { input: "生气", output: "😠" },
+  ],
+  { inputVariables: ["input", "output"], examplePrompt }
+);
+
+const final = ChatPromptTemplate.fromMessages([
+  ["system", "根据情绪给出表情符号。"],
+  fewShot,
+  ["human", "{input}"],
+]);
+```
+
+<Callout type="warn" title="示例不是越多越好">
+FewShot 会占用上下文窗口并增加 Token 成本。静态示例控制在 3–5 条；需要更多时优先用「语义相似示例选择器」动态挑选。
+</Callout>
+
+## 4. 与链串联
+
+模板天然是 LCEL 的「第一环」：
+
+```ts
+const chain = prompt.pipe(model).pipe(new StringOutputParser());
+await chain.invoke({ question: "..." });
+```
+
+<Callout type="exercise" title="练习">
+为「中英术语互译」场景写一个 PromptTemplate，用 `partial` 固定目标语言，再串到模型上跑通。
+</Callout>
+
+## 小结
+
+- `ChatPromptTemplate` 按角色编排，用 `{变量}` 占位
+- `partial()` 可先固定部分变量
+- FewShot 通过示例引导格式，注意控制数量
+- 模板是 LCEL 管道的起点
+- 下章学习如何把模型输出解析成结构化数据 →

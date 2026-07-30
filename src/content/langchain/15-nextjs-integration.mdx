@@ -1,0 +1,97 @@
+---
+title: 与 Next.js 集成
+order: 15
+description: 在 Next.js API Route 中调用 Langchain，并避免服务端密钥泄露
+---
+
+# 与 Next.js 集成
+
+Next.js 是构建 LLM 应用的天然搭档：用 **API Route（服务端）** 跑 Langchain，前端只拿结果。关键是把密钥永远留在服务端。
+
+## 1. 项目结构与密钥
+
+```bash
+# .env.local（Next.js 默认不提交，且只在服务端可用）
+OPENAI_API_KEY=sk-xxxxxxxx
+```
+
+```ts
+// app/api/chat/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+export const runtime = "nodejs"; // 必须 nodejs，不能用 edge（部分包不兼容）
+
+const chain = ChatPromptTemplate.fromTemplate("用一句话解释 {topic}")
+  .pipe(new ChatOpenAI({ model: "gpt-4o-mini" }))
+  .pipe(new StringOutputParser());
+
+export async function POST(req: NextRequest) {
+  const { topic } = await req.json();
+  const answer = await chain.invoke({ topic });
+  return NextResponse.json({ answer });
+}
+```
+
+<Callout type="warn" title="绝不在客户端 import 模型包">
+浏览器代码里出现 `@langchain/openai` 会打包进前端、泄露 Key。所有模型调用都放在 `app/api/**/route.ts` 等服务端文件。前端只 `fetch('/api/chat')`。
+</Callout>
+
+## 2. 复用单例，避免冷启动重复初始化
+
+```ts
+// lib/chain.ts
+import "server-only"; // 防止被误 import 到客户端
+import { ChatOpenAI } from "@langchain/openai";
+
+let cached: ChatOpenAI | null = null;
+export function getModel() {
+  if (!cached) cached = new ChatOpenAI({ model: "gpt-4o-mini" });
+  return cached;
+}
+```
+
+<Callout type="info" title="server-only 包">
+`npm i server-only` 后，任何客户端组件 import 该模块都会直接构建报错，是一道安全防线。
+</Callout>
+
+## 3. 前端调用
+
+```ts
+// app/page.tsx（客户端组件）
+async function ask(topic: string) {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    body: JSON.stringify({ topic }),
+  });
+  const { answer } = await res.json();
+  console.log(answer);
+}
+```
+
+## 4. 部署注意
+
+| 项 | 建议 |
+|---|---|
+| 运行时 | `export const runtime = "nodejs"` |
+| 超时 | 长链设 `export const maxDuration = 60`（Vercel 付费才更长） |
+| 并发 | 模型调用走流式（下章），避免请求堆积 |
+| 密钥 | 用平台环境变量，勿提交 `.env.local` |
+
+<Callout type="tip" title="用流式提升体验">
+同步等待完整回复会让用户盯着转圈。第 16 章讲如何用 `.stream()` 把字一个个推到前端。
+</Callout>
+
+<Callout type="exercise" title="练习">
+新建一个 Next.js App Router 项目，写 `/api/summary` 接口，接收 `{ text }` 返回摘要；前端放一个 textarea 调用它。
+</Callout>
+
+## 小结
+
+- 模型调用只放在 API Route（服务端），密钥永不进前端
+- 用 `runtime = "nodejs"` 与 `server-only` 加固安全边界
+- 复用模型/链单例，减少冷启动开销
+- 前端只 `fetch` 接口拿结果
+- 下章实现流式逐字输出 →

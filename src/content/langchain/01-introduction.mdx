@@ -1,0 +1,74 @@
+---
+title: Langchain.js 简介
+order: 1
+description: 认识 Langchain.js 的定位、核心模块（langchain-core / langchain / community）与整体生态
+---
+
+# Langchain.js 简介
+
+**Langchain.js** 是一个用于在 JavaScript / TypeScript 中构建大语言模型（LLM）应用的**开源框架**。它把「调用模型、拼接提示词、检索知识、调用工具、串联步骤」这一系列繁琐的胶水代码，封装成一套统一、可组合、可观测的抽象，让你专注于应用逻辑本身。
+
+<Callout type="info" title="为什么需要 Langchain">
+直接调用 OpenAI 的 SDK 只能「发一句话、收一句话」。真实应用需要把提示词模板化、把外部知识接进来、把多个步骤串成链、并监控每一步的耗时与 Token。Langchain.js 正是为解决这些「最后一公里」而生。
+</Callout>
+
+## 1. Langchain.js 是什么
+
+Langchain.js 是 Python 版 LangChain 的官方 JS/TS 实现，二者 API 设计高度一致。它的核心思想是：**把 LLM 应用拆成可复用的「组件」，再用统一的 Runnable 接口把它们像管道一样串起来（LCEL）**。
+
+```ts
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+// 三个组件：提示模板 + 模型 + 解析器
+const prompt = ChatPromptTemplate.fromTemplate("用一句话解释 {topic}");
+const model = new ChatOpenAI({ model: "gpt-4o-mini" });
+const parser = new StringOutputParser();
+
+// 用 pipe 串成一条链
+const chain = prompt.pipe(model).pipe(parser);
+await chain.invoke({ topic: "向量数据库" });
+```
+
+## 2. 三大核心模块
+
+Langchain.js 在 v0.2 之后拆分为清晰的包结构：
+
+| 包名 | 职责 |
+|---|---|
+| **@langchain/core** | 基础抽象：`Runnable`、`BasePromptTemplate`、`BaseChatModel`、`BaseRetriever`、回调等。所有上层包都依赖它。 |
+| **langchain** | 高层集成：链（Chains）、Agent、记忆（Memory）、检索问答等「组合型」能力。 |
+| **@langchain/community** | 社区维护的 100+ 集成：各种文档加载器、向量库、工具、嵌入模型。 |
+| **@langchain/openai** 等厂商包 | 官方维护的模型/嵌入/工具对接（OpenAI、Anthropic、Google……）。 |
+
+<Callout type="tip" title="按需安装">
+新项目推荐只装用到的包，例如只需要 OpenAI 模型就 `npm i @langchain/openai @langchain/core`，避免一次性拉入庞大的 `langchain` 全家桶。
+</Callout>
+
+## 3. 生态与版本
+
+- **LCEL（LangChain Expression Language）**：统一的管道式组合语法，是 v0.2 的基石。
+- **LangSmith**：官方可观测性平台，追踪每次调用的链路、Token、耗时（第 14 章详解）。
+- **LangGraph**：基于图的多步 Agent 编排，适合复杂状态机场景（进阶）。
+- 版本约定：v0.2+ 启用「按厂商分包」架构，安装时请统一版本前缀，避免 `langchain-core` 版本错配。
+
+## 4. 本课程路线
+
+本教程共 18 章，分四阶段：
+
+1. **基础概念（1–5）**：框架概览、快速开始、模型/提示/解析三大 Model I/O 组件
+2. **组合与数据（6–11）**：链、LCEL、文档加载、切分、向量库、检索器（RAG 全链路）
+3. **高级能力（12–16）**：Agent 与工具、记忆、回调、Next.js 集成、流式
+4. **实战（17–18）**：文档问答 Bot 与多工具 Agent 助手
+
+<Callout type="exercise" title="想一想">
+你手头最想用 LLM 解决的场景是什么？把它拆成「提示词 + 模型 + 数据/工具」三块，后面每章我们都会往这个框架上补一块积木。
+</Callout>
+
+## 小结
+
+- Langchain.js 是 JS/TS 的 LLM 应用开发框架，核心是「组件 + 管道」
+- 三大模块：`@langchain/core`（基础）、`langchain`（高层）、`@langchain/community`（集成）
+- 厂商能力按包拆分（如 `@langchain/openai`），按需安装
+- 下一步：跑通第一个链 →

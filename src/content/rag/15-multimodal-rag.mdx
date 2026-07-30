@@ -1,0 +1,96 @@
+---
+title: 多模态 RAG
+order: 15
+description: 处理 PDF 表格/图片、多向量表示，以及 ColPali 这类视觉化检索思路
+---
+
+# 多模态 RAG
+
+现实文档充满**表格、图表、扫描图片**——纯文本 Embedding 对这些「看得到但 extract 不出字」的内容无能为力。多模态 RAG 让系统能检索并理解图像化信息。
+
+## 1. 为什么纯文本 RAG 在这里失效
+
+```text
+PDF 里的财务表格 → pdfplumber 抽出来的文本顺序错乱
+产品手册的示意图 → 根本没有文字可抽
+扫描件合同       → 图片，无文本层
+```
+
+这些问题靠「切文本 + 文本向量」解决不了，需要把图像本身纳入检索。
+
+## 2. 路线一：图文分别编码（Late Fusion）
+
+把页面渲染成图，用多模态模型（如 CLIP）编码；文本仍用文本 Embedding；检索时分别查再融合。
+
+```python
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+
+clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+# 图片页向量
+img = Image.open("page3.png").convert("RGB")
+img_vec = clip.get_image_features(**proc(images=img, return_tensors="pt"))
+
+# 文本问题向量（同一 CLIP 空间）
+txt_vec = clip.get_text_features(**proc(text=["季度营收趋势图"], return_tensors="pt"))
+```
+
+<Callout type="info" title="CLIP 把图文投到同一空间">
+CLIP 训练目标就是「图」和「描述它的文字」靠近，因此能用文本问题直接检索相关图片页面。这是多模态 RAG 的地基。
+</Callout>
+
+## 3. 路线二：ColPali 思路（视觉化检索）
+
+传统做法先 OCR 再向量化，表格结构容易丢。**ColPali** 的思路更直接：把整页（含图、表、排版）渲染成图像，用视觉语言模型（如 PaliGemma）直接产出**多向量（patch 级）表示**，检索时按图像块匹配，无需任何 OCR 或版面解析。
+
+```text
+传统: PDF → 抽取文本(丢结构) → 文本向量 → 检索
+ColPali: PDF → 整页图片 → 视觉模型多向量 → 直接检索
+```
+
+优势：保留表格、图表、排版等视觉语义，对复杂扫描文档特别强。
+
+<Callout type="warn" title="ColPali 成本与依赖更高">
+视觉语言模型推理需要 GPU，且多向量存储占用更大。简单文档用 OCR + 文本 RAG 更划算，仅在「表格/扫描件密集」场景上 ColPali。
+</Callout>
+
+## 4. 表格专用处理
+
+对结构化表格，可先用表格识别转成 Markdown/CSV，再做文本向量：
+
+```python
+# 用 camelot / tabula 抽表格为 DataFrame，再拼成文本
+table_md = df.to_markdown()
+vec = embed(table_md)
+```
+
+## 5. 多向量与混合存储
+
+一个页面可能同时有图、表、文，可用**多向量**分别表示不同区域：
+
+```python
+page_vectors = {
+    "text": embed(text_segments),
+    "image": clip_image_vec,
+    "table": embed(table_md),
+}
+# 检索时分别查，按来源页聚合后回带整页
+```
+
+<Callout type="tip" title="从简单到复杂">
+先试 OCR + 文本 RAG；表格多就用表格抽取；只有扫描件/复杂排版才上 CLIP/ColPali。每步用检索命中率验证是否必要。
+</Callout>
+
+<Callout type="exercise" title="练习">
+找一份含表格的 PDF，分别用「OCR 文本向量」和「整页 CLIP 图像向量」检索同一个关于表格的问题，对比哪种能命中正确页面。
+</Callout>
+
+## 小结
+
+- 纯文本 RAG 对表格/图片/扫描件失效
+- 路线一 CLIP：图文同空间，文本问题检索图页
+- 路线二 ColPali：整页视觉多向量，免 OCR，适合复杂版面
+- 表格可先抽成 Markdown 再向量化
+- 下一章进入生产化：缓存、并发、成本与降级 →

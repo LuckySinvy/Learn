@@ -1,0 +1,109 @@
+---
+title: 检索器 Retrievers
+order: 11
+description: 用 VectorStoreRetriever 与 ParentDocumentRetriever 把知识库接进链
+---
+
+# 检索器 Retrievers
+
+**Retriever（检索器）** 是 RAG 中「根据用户问题取回相关文档」的统一抽象。它把底层的向量库、搜索引擎等封装成 `getRelevantDocuments(query)` 接口，可直接 `pipe` 进 LCEL。
+
+## 1. VectorStoreRetriever
+
+最常用：把上一章的 Vector Store 包装成检索器，设定取回数量 `k`：
+
+```ts
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+const vectorStore = await MemoryVectorStore.fromDocuments(
+  splits,
+  new OpenAIEmbeddings()
+);
+
+const retriever = vectorStore.asRetriever({
+  k: 4,                 // 取回 4 块
+  searchType: "mmr",     // similarity | mmr
+});
+
+const docs = await retriever.getRelevantDocuments("如何配置 API Key？");
+```
+
+<Callout type="info" title="检索器是 Runnable">
+`retriever` 本身可作为 LCEL 的一环：`{ context: retriever, question: (i) => i.q }`，下游直接拿到检索结果。
+</Callout>
+
+## 2. 在 RAG 链中使用
+
+把「检索结果」塞进提示词，让模型基于证据回答：
+
+```ts
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { RunnableSequence } from "@langchain/core/runnables";
+
+const prompt = ChatPromptTemplate.fromTemplate(
+  "根据上下文回答：\n{context}\n\n问题：{question}"
+);
+
+const ragChain = RunnableSequence.from([
+  {
+    context: retriever,                       // 输入 question → 检索文档
+    question: (input: { question: string }) => input.question,
+  },
+  prompt,
+  new ChatOpenAI({ model: "gpt-4o-mini" }),
+  new StringOutputParser(),
+]);
+
+await ragChain.invoke({ question: "如何配置 API Key？" });
+```
+
+## 3. ParentDocumentRetriever
+
+小块检索、大块喂给模型，兼顾「检索精度」与「上下文完整」：
+
+```ts
+import { ParentDocumentRetriever } from "langchain/retrievers/parent_document";
+import { InMemoryStore } from "langchain/stores/memory/in_memory";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+
+const parentSplitter = new RecursiveCharacterTextSplitter({ chunkSize: 2000 });
+const childSplitter = new RecursiveCharacterTextSplitter({ chunkSize: 400 });
+
+const retriever = new ParentDocumentRetriever({
+  vectorstore,          // 用 child 小块建索引
+  documentCompressor: undefined,
+  parentSplitter,
+  childSplitter,
+  docstore: new InMemoryStore(), // 保存 parent 大块
+});
+```
+
+<Callout type="tip" title="为什么用 Parent 检索器">
+只用 400 字小块检索很精准，但喂给模型时上下文太碎。Parent 检索器检索到小块后，自动回查并返还它所属的大块，模型看得更全。
+</Callout>
+
+## 4. 检索增强技巧
+
+| 技巧 | 作用 |
+|---|---|
+| MMR 搜索 | 去冗余，覆盖多角度 |
+| 元数据过滤 | 按 `source`/`date` 缩小范围 |
+| 重排（Re-rank） | 用交叉编码器对初筛结果再排序 |
+| 多查询（Multi-query） | 把问题改写多份再检索，提升召回 |
+
+<Callout type="warn" title="垃圾进垃圾出">
+检索质量直接决定 RAG 上限。切分参数、嵌入模型、检索数量都要针对你的语料调优，别指望「接上就能用」。
+</Callout>
+
+<Callout type="exercise" title="练习">
+用 `ParentDocumentRetriever` 改造第 10 章的 MemoryVectorStore，对比「直接检索」与「父文档检索」在长文档上的回答质量。
+</Callout>
+
+## 小结
+
+- Retriever 统一了「取回相关文档」的接口，是 LCEL 的一环
+- `vectorStore.asRetriever({ k, searchType })` 最常用
+- `ParentDocumentRetriever` 小块检索、大块喂模型，兼顾精度与完整
+- 检索质量决定 RAG 上限
+- 下章进入 Agent：让模型自己决定调用工具 →

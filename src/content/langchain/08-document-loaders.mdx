@@ -1,0 +1,90 @@
+---
+title: 文档加载器 Document Loaders
+order: 8
+description: 用 Document Loaders 加载 PDF / 网页 / Markdown 等外部知识源
+---
+
+# 文档加载器 Document Loaders
+
+**RAG（检索增强生成）** 的第一步是把外部知识读进来。Document Loaders 负责把各种格式转换成统一的 `Document` 对象：`{ pageContent: string, metadata: { source, ... } }`。
+
+## 1. 统一的数据结构
+
+```ts
+import type { Document } from "@langchain/core/documents";
+
+// 每个 Document 都是这样的形状
+const doc: Document = {
+  pageContent: "Langchain.js 是 JS 的 LLM 框架……",
+  metadata: { source: "intro.md", page: 1 },
+};
+```
+
+## 2. 加载 Markdown / 文本
+
+`@langchain/community` 提供 `TextLoader`、`DirectoryLoader`：
+
+```ts
+import { TextLoader } from "langchain/document_loaders/fs/text";
+import { DirectoryLoader } from "langchain/document_loaders/fs/directory";
+
+const loader = new TextLoader("./docs/intro.md");
+const docs = await loader.load(); // Document[]
+
+// 一次性加载整个目录
+const dirLoader = new DirectoryLoader("./docs", {
+  ".md": (path) => new TextLoader(path),
+});
+const allDocs = await dirLoader.load();
+```
+
+## 3. 加载 PDF
+
+PDF 需要解析库（如 `pdf-parse`）。社区 `PDFLoader` 开箱即用：
+
+```ts
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+
+const pdfLoader = new PDFLoader("./report.pdf");
+const pages = await pdfLoader.load();
+console.log(pages[0].metadata.loc.pageNumber); // 第几页
+```
+
+<Callout type="info" title="安装依赖">
+`PDFLoader` 依赖 `pdf-parse`，`DirectoryLoader` 的某些解析器另有依赖。按报错提示 `npm i` 对应包即可。
+</Callout>
+
+## 4. 加载网页
+
+用 `WebBaseLoader` 抓取并提取正文（依赖 `cheerio`）：
+
+```ts
+import { WebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
+
+const webLoader = new WebBaseLoader("https://js.langchain.com/docs/");
+const webDocs = await webLoader.load();
+```
+
+<Callout type="warn" title="网页抓取要守规矩">
+抓取前确认目标站点 `robots.txt` 与版权；高频抓取可能被封 IP。生产 RAG 建议先离线抓取落盘，再加载本地文件。
+</Callout>
+
+## 5. 选择加载器
+
+| 来源 | 加载器 | 关键依赖 |
+|---|---|---|
+| `.txt` / `.md` | `TextLoader` / `DirectoryLoader` | 无 |
+| `.pdf` | `PDFLoader` | `pdf-parse` |
+| 网页 | `WebBaseLoader` | `cheerio` |
+| 更多 | `@langchain/community` 100+ 集成 | 视来源而定 |
+
+<Callout type="exercise" title="练习">
+把你电脑里一份 PDF 手册加载进来，打印第一页的 `pageContent` 前 200 字，确认结构正确。
+</Callout>
+
+## 小结
+
+- 所有加载器输出统一的 `Document { pageContent, metadata }`
+- `TextLoader`/`DirectoryLoader` 处理本地文本， `PDFLoader` 处理 PDF，`WebBaseLoader` 抓网页
+- 抓取网页注意合规与频率
+- 下章学习把长文档切分成块 →

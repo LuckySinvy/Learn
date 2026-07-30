@@ -1,0 +1,78 @@
+---
+title: 文本切分 Text Splitters
+order: 9
+description: 用 RecursiveCharacterTextSplitter 等切分器把长文档切成适合检索的块
+---
+
+# 文本切分 Text Splitters
+
+LLM 有上下文窗口上限，检索时也希望「块」粒度适中。Text Splitters 负责把长 `Document` 切成合适大小的若干小 `Document`，同时尽量保留语义边界。
+
+## 1. 为什么需要切分
+
+- 模型一次吃不下整本书
+- 检索时「小块」比「大块」更精准（命中相关段落，而非整章）
+- 但块太小会丢失上下文。需要权衡 `chunkSize` 与 `chunkOverlap`
+
+<Callout type="info" title="两个核心参数">
+`chunkSize`：每块字符数上限；`chunkOverlap`：相邻块重叠的字符数，用于缓解「知识被切到两块中间」的丢失问题。
+</Callout>
+
+## 2. RecursiveCharacterTextSplitter
+
+最常用、最稳健的切分器。它按「段落 → 句子 → 词 → 字符」的优先级递归切，尽量不打断语义：
+
+```ts
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { TextLoader } from "langchain/document_loaders/fs/text";
+
+const rawDocs = await new TextLoader("./docs/intro.md").load();
+
+const splitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 500,      // 每块约 500 字符
+  chunkOverlap: 50,    // 重叠 50 字符
+  separators: ["\n\n", "\n", "。", " ", ""],
+});
+
+const splits = await splitter.splitDocuments(rawDocs);
+console.log(splits.length); // 切成了多少块
+console.log(splits[0].pageContent);
+```
+
+## 3. 其他切分策略
+
+| 切分器 | 适用 |
+|---|---|
+| `RecursiveCharacterTextSplitter` | 通用文本（默认首选） |
+| `CharacterTextSplitter` | 简单按固定分隔符 |
+| `MarkdownTextSplitter` | 按 Markdown 标题层级切，保留结构 |
+| `TokenTextSplitter` | 按 Token 数切，精确对齐模型窗口 |
+| `Language` 切分器 | 按代码语言语法切分（Python/JS 等） |
+
+```ts
+import { MarkdownTextSplitter } from "@langchain/textsplitters";
+
+const mdSplitter = new MarkdownTextSplitter({ chunkSize: 800 });
+```
+
+<Callout type="tip" title="代码用 Language 切分器">
+对源码做 RAG 时，用 `RecursiveCharacterTextSplitter.fromLanguage("js")` 能按函数/语法边界切，比按字符切效果好得多。
+</Callout>
+
+## 4. 切分质量要点
+
+- 块太小（小于 200 字）易丢失上下文；太大（超过 1000 字）检索精度下降，经验值 300–800 字
+- `chunkOverlap` 取 `chunkSize` 的 10%–20%
+- 切完建议打印块数分布，避免某一块异常巨大
+
+<Callout type="warn" title="别在切分后再做嵌入前丢失 metadata">
+切分后的小块会继承原 `metadata`。建议给每块追加 `chunkIndex`，方便回溯「答案来自第几块」。
+</Callout>
+
+## 小结
+
+- 切分让长文档既适配窗口又提升检索精度
+- `RecursiveCharacterTextSplitter` 是通用首选，按段落/句/词递归切
+- 关键参数 `chunkSize` 与 `chunkOverlap`
+- 代码/Markdown 用专用切分器效果更好
+- 下章把切块嵌入并存入向量库 →

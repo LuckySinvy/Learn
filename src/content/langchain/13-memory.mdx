@@ -1,0 +1,104 @@
+---
+title: 记忆 Memory
+order: 13
+description: 用 BufferMemory 与 ConversationSummaryMemory 让对话记住上下文
+---
+
+# 记忆 Memory
+
+默认每次 `model.invoke` 都是「金鱼记忆」——不记得上一句。要让应用有连贯对话，需要 **Memory（记忆）** 组件在轮次间保存上下文。
+
+## 1. BufferMemory：完整保留
+
+最简单：把历史消息原样存起来，每次拼回提示词。
+
+```ts
+import { BufferMemory } from "langchain/memory";
+import { ChatOpenAI } from "@langchain/openai";
+import { ConversationChain } from "langchain/chains";
+
+const memory = new BufferMemory();
+const chain = new ConversationChain({
+  llm: new ChatOpenAI({ model: "gpt-4o-mini" }),
+  memory,
+});
+
+await chain.call({ input: "我叫小明。" });
+const r = await chain.call({ input: "我刚才说我叫什么？" });
+console.log(r.response); // 小明
+```
+
+<Callout type="info" title="Token 会无限增长">
+BufferMemory 不做裁剪，聊得越久上下文越长，最终撞上窗口上限并烧钱。长对话务必用摘要式记忆。
+</Callout>
+
+## 2. ConversationSummaryMemory：摘要压缩
+
+当历史过长时，自动把旧对话**总结**成一段摘要，既保留要点又省 Token：
+
+```ts
+import { ConversationSummaryMemory } from "langchain/memory";
+import { ChatOpenAI } from "@langchain/openai";
+
+const memory = new ConversationSummaryMemory({
+  llm: new ChatOpenAI({ model: "gpt-4o-mini" }),
+  memoryKey: "chat_history",
+});
+
+const chain = new ConversationChain({ llm, memory });
+await chain.call({ input: "我是一名后端工程师，在用 Langchain.js 做客服机器人。" });
+await chain.call({ input: "根据我的背景，推荐下一步学什么？" });
+```
+
+## 3. 在 LCEL 中用记忆
+
+现代写法用 `RunnableWithMessageHistory` 把记忆挂到任意链上：
+
+```ts
+import { RunnableWithMessageHistory } from "@langchain/core/runnables";
+import { ChatMessageHistory } from "langchain/stores/message/in_memory";
+
+const store: Record<string, ChatMessageHistory> = {};
+const withHistory = new RunnableWithMessageHistory({
+  runnable: chain,
+  getMessageHistory: async (sessionId) => {
+    if (!store[sessionId]) store[sessionId] = new ChatMessageHistory();
+    return store[sessionId];
+  },
+  inputMessagesKey: "input",
+  historyMessagesKey: "history",
+});
+
+await withHistory.invoke(
+  { input: "你好" },
+  { configurable: { sessionId: "user-123" } }
+);
+```
+
+<Callout type="tip" title="用 sessionId 隔离用户">
+`getMessageHistory` 按 `sessionId` 返回不同历史，天然支持多用户并发对话，互不串台。
+</Callout>
+
+## 4. 选型对比
+
+| 记忆类型 | 优点 | 缺点 | 适用 |
+|---|---|---|---|
+| `BufferMemory` | 零丢失、最简单 | Token 无限涨 | 短对话 / 测试 |
+| `ConversationSummaryMemory` | 省 Token | 摘要可能丢细节 | 长对话 |
+| `BufferWindowMemory` | 只留最近 N 轮 | 忘记更早上下文 | 固定窗口场景 |
+
+<Callout type="warn" title="记忆要持久化">
+示例用内存存储，进程重启即丢失。生产应把历史存到 Redis / 数据库，并以 `sessionId` 索引。
+</Callout>
+
+<Callout type="exercise" title="练习">
+用 `RunnableWithMessageHistory` 写一个命令行多轮聊天，按 `sessionId` 区分两个「用户」，验证彼此历史不串。
+</Callout>
+
+## 小结
+
+- Memory 让对话跨轮次保持上下文
+- `BufferMemory` 全保留（Token 涨），`ConversationSummaryMemory` 摘要压缩
+- 现代用 `RunnableWithMessageHistory` + `sessionId` 隔离多用户
+- 生产记忆需持久化到外部存储
+- 下章学习用回调观测每一步 →

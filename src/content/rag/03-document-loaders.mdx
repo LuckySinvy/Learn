@@ -1,0 +1,108 @@
+---
+title: 文档加载
+order: 3
+description: 用常见 Loader 加载 PDF、Word、网页、Markdown 等格式的文档与元数据
+---
+
+# 文档加载
+
+RAG 的第一步是把原始文件变成**纯文本 + 元数据**。这一步看似简单，却直接决定了后续能检索到什么。不同格式有不同坑：PDF 的表格、Word 的批注、网页的导航噪声都需要在加载阶段处理。
+
+## 1. 什么是 Loader
+
+Loader 的核心职责：
+
+- 提取正文文本，尽量丢掉页眉/页脚/广告等噪声
+- 保留结构化信息（标题层级、表格）
+- 产出**元数据**（来源、页码、作者、修改时间），供后续过滤与引用
+
+统一的数据结构通常是一个 `Document`：`{ page_content: str, metadata: dict }`。
+
+## 2. 常见格式与对应方案
+
+| 格式 | 推荐方案 | 注意点 |
+|---|---|---|
+| PDF | `PyPDF`、`pdfplumber`、`unstructured` | 扫描件需 OCR；表格易乱 |
+| Word(.docx) | `python-docx`、LangChain `Docx2txtLoader` | 批注/修订可能混入 |
+| 网页/HTML | `BeautifulSoup`、`trafilatura`、`readability` | 先去 nav/footer/JS |
+| Markdown | 直接读，按标题切 | 天然带层级 |
+| 纯文本 | 直接读 | 编码问题（utf-8） |
+| CSV/JSON | 逐行/逐字段转文本 | 决定哪些列参与检索 |
+
+<Callout type="info" title="元数据是金矿">
+`metadata` 里尽量带上 `source`、`page`、`title`。后面做「按部门过滤」「引用到具体页码」都靠它。
+</Callout>
+
+## 3. 代码示例：多格式加载
+
+```python
+from langchain_community.document_loaders import (
+    PyPDFLoader, UnstructuredWordDocumentLoader,
+    WebBaseLoader, TextLoader
+)
+
+# PDF：每个 page 是一个 Document
+pdf = PyPDFLoader("手册.pdf")
+pdf_docs = pdf.load()
+print(pdf_docs[0].metadata)   # {'source': '手册.pdf', 'page': 0}
+
+# Word
+docx = UnstructuredWordDocumentLoader("合同.docx")
+docx_docs = docx.load()
+
+# 网页（自动去噪）
+web = WebBaseLoader("https://docs.example.com/intro")
+web_docs = web.load()
+
+# Markdown / 文本
+txt = TextLoader("README.md", encoding="utf-8")
+txt_docs = txt.load()
+```
+
+## 4. 网页加载的去噪技巧
+
+很多网站正文外裹着大量导航和脚本，直接喂进去会污染检索。
+
+```python
+from bs4 import BeautifulSoup
+import requests
+
+html = requests.get("https://blog.example.com/post").text
+soup = BeautifulSoup(html, "html.parser")
+for tag in soup(["nav", "footer", "script", "style"]):
+    tag.decompose()
+text = soup.get_text(separator="\n", strip=True)
+```
+
+<Callout type="warn" title="PDF 表格与扫描件">
+`PyPDFLoader` 对纯文字 PDF 友好，但遇到**扫描件图片**会读不到字，需要 OCR（如 `pdfplumber` + `tesseract`）；遇到**复杂表格**，文本顺序可能错乱，建议用 `unstructured` 或专门的表格抽取工具，详见第 15 章多模态 RAG。
+</Callout>
+
+## 5. 批量加载一个目录
+
+```python
+from langchain_community.document_loaders import DirectoryLoader
+
+loader = DirectoryLoader(
+    "./docs",
+    glob="**/*.{pdf,docx,md,txt}",
+    show_progress=True,
+)
+all_docs = loader.load()
+```
+
+<Callout type="tip" title="加载阶段就要想清楚切分">
+加载出的 `Document` 往往很长。下一步「切分」可以把一个大 `Document` 切成多个小 `chunk`，并且每个 `chunk` 都继承原 `Document` 的 `metadata`，这样引用时能直接回溯到源文件与页码。
+</Callout>
+
+<Callout type="exercise" title="练习">
+找一份你公司的真实 PDF 手册，用 `PyPDFLoader` 加载，打印第 1 页的 `page_content` 与 `metadata`，观察噪声（页眉/页脚）是否混入，想想怎么在切分前清洗。
+</Callout>
+
+## 小结
+
+- Loader 产出 `page_content` + `metadata`，尽量保留来源/页码
+- PDF/Word/网页各有适合的库，网页要先去噪
+- 扫描件需 OCR，复杂表格需专门抽取
+- 加载后得到的长 Document 是下一步「切分」的输入
+- 下一章讲如何把长文档切成检索友好的 chunk →

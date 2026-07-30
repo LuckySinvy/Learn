@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { Code2, Terminal, Coffee, BarChart3 } from 'lucide-react';
+import { Code2, Terminal, Coffee, BarChart3, Brain, Link2, Blocks } from 'lucide-react';
 import { LanguageCard } from '@/components/layout/LanguageCard';
 
 export default function HomePage() {
@@ -7,14 +7,17 @@ export default function HomePage() {
     <main className="mx-auto max-w-6xl px-6 py-16">
       <section className="text-center mb-16">
         <h1 className="text-4xl md:text-5xl font-bold tracking-tight mb-4">
-          编程语言与可观测性交互式学习
+          编程 · 可观测性 · AI 工程 交互式学习
         </h1>
         <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
-          从零开始掌握 Python、Go、Java 与 Grafana。 每章循序渐进，配有讲解、可运行示例与练习。
+          从零掌握 Python、Go、Java、Grafana，以及 RAG、Langchain.js、Dify。每章循序渐进，配有讲解、示例与实战。
         </p>
       </section>
 
-      <section className="grid md:grid-cols-2 lg:grid-cols-4 gap-6">
+      <Category
+        title="编程语言"
+        desc="通用与云原生编程语言，内置可运行 Playground，所见即可运行。"
+      >
         <LanguageCard
           href="/python"
           title="Python"
@@ -39,6 +42,12 @@ export default function HomePage() {
           accent="from-orange-400 to-red-500"
           chapters={18}
         />
+      </Category>
+
+      <Category
+        title="可观测性"
+        desc="以真实配置（YAML/JSON/PromQL）贯穿，附可复制示例。"
+      >
         <LanguageCard
           href="/grafana"
           title="Grafana"
@@ -47,12 +56,42 @@ export default function HomePage() {
           accent="from-orange-400 to-fuchsia-500"
           chapters={18}
         />
-      </section>
+      </Category>
+
+      <Category
+        title="AI 工程"
+        desc="检索增强生成与 LLM 应用开发，从原理到生产落地。"
+      >
+        <LanguageCard
+          href="/rag"
+          title="RAG"
+          description="检索增强生成：文档切分、向量检索、重排与评估的完整方法论。"
+          icon={<Brain className="w-8 h-8" />}
+          accent="from-violet-400 to-indigo-500"
+          chapters={18}
+        />
+        <LanguageCard
+          href="/langchain"
+          title="Langchain.js"
+          description="用 JavaScript/TypeScript 编排模型、链、检索与 Agent 构建 LLM 应用。"
+          icon={<Link2 className="w-8 h-8" />}
+          accent="from-emerald-400 to-green-500"
+          chapters={18}
+        />
+        <LanguageCard
+          href="/dify"
+          title="Dify"
+          description="低代码 LLMOps 平台：知识库、工作流、Agent 与 API 发布一站式。"
+          icon={<Blocks className="w-8 h-8" />}
+          accent="from-pink-400 to-rose-500"
+          chapters={18}
+        />
+      </Category>
 
       <section className="mt-20 grid md:grid-cols-3 gap-6 text-sm">
-        <Feature title="📚 渐进式课程" desc="每门语言 18 章，从语法到企业级项目，难度平滑上升。" />
-        <Feature title="▶ 在线运行" desc="内置 Playground（编程语言），所见即可运行，无需本地环境。" />
-        <Feature title="📊 实战教程" desc="Grafana 以真实配置（YAML/JSON/PromQL）贯穿，附可复制示例。" />
+        <Feature title="📚 渐进式课程" desc="每门课程 18 章，从基础到企业级项目，难度平滑上升。" />
+        <Feature title="▶ 在线运行" desc="编程语言内置 Playground，所见即可运行，无需本地环境。" />
+        <Feature title="🤖 AI 工程实战" desc="RAG / Langchain.js / Dify 以真实场景贯穿，附可复制示例。" />
       </section>
 
       <footer className="mt-20 text-center text-sm text-gray-500">
@@ -61,6 +100,26 @@ export default function HomePage() {
         </p>
       </footer>
     </main>
+  );
+}
+
+function Category({
+  title,
+  desc,
+  children,
+}: {
+  title: string;
+  desc: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="mt-12">
+      <div className="mb-6">
+        <h2 className="text-2xl font-bold tracking-tight">{title}</h2>
+        <p className="text-gray-600 dark:text-gray-400 mt-1">{desc}</p>
+      </div>
+      <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6">{children}</div>
+    </section>
   );
 }
 

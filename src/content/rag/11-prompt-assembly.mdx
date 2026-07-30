@@ -1,0 +1,111 @@
+---
+title: 上下文拼接与 Prompt 组装
+order: 11
+description: 检索片段的模板化拼接、token 预算控制与上下文压缩技巧
+---
+
+# 上下文拼接与 Prompt 组装
+
+检索到的片段最终要被「组装」成一段给 LLM 的 Prompt。组装得好，模型才知道怎么用这些证据；组装得差，再准的检索也白搭。
+
+## 1. 基本模板结构
+
+一个稳健的 RAG Prompt 通常含四部分：系统指令、上下文、问题、输出格式。
+
+```text
+你是一个严谨的助手。只能依据下方【资料】回答，
+若资料中没有相关信息，回答"我不知道"。
+
+【资料】
+1. {chunk_1}
+2. {chunk_2}
+...
+
+【问题】
+{question}
+
+【回答】
+```
+
+## 2. 代码化组装
+
+```python
+def build_prompt(question, chunks):
+    ctx = "\n".join(
+        f"[{i+1}] {c['text']}（来源：{c['metadata']['source']} 第{c['metadata']['page']}页）"
+        for i, c in enumerate(chunks)
+    )
+    return f"""你是严谨的助手，仅依据资料作答。
+【资料】
+{ctx}
+
+【问题】{question}
+【回答】"""
+```
+
+<Callout type="info" title="给每段编号，方便引用">
+为每段上下文加 `[1][2]` 编号，并在指令里要求模型回答时标注 `[1]`，能直接实现「可溯源」（呼应下一章 Citation）。
+</Callout>
+
+## 3. token 预算控制
+
+LLM 有上下文窗口上限，检索片段可能超预算：
+
+```python
+MAX_TOKENS = 3000
+est = lambda s: len(s) / 1.6   # 中文粗略 1 字≈1.6 token 估算
+
+budget, kept = MAX_TOKENS, []
+for c in ranked_chunks:        # 已按相关度排序
+    if est(c["text"]) > budget:
+        if not kept:           # 哪怕超也要留一段
+            kept.append(c)
+        break
+    kept.append(c); budget -= est(c["text"])
+```
+
+<Callout type="warn" title="预算超了别硬塞">
+把超出窗口的片段硬拼进去会被截断，反而丢掉了最关键的后段。应「按相关度从高到低截取」，并在超预算时提示模型「资料可能不完整」。
+</Callout>
+
+## 4. 上下文压缩
+
+当片段冗长但只需其中一句时，可先做压缩：
+
+- **句子级筛选**：只保留与问题 token 重叠高的句子
+- **LLM 摘要**：用一个小模型把长 chunk 压成关键句（适合超大文档）
+- **去重合并**：MMR 已去冗余，这里避免重复来源
+
+```python
+# 简单句子筛选
+import re
+def keep_relevant(text, question, top_n=3):
+    sents = re.split(r"[。！？]", text)
+    scored = [(s, overlap(s, question)) for s in sents if s.strip()]
+    return "。".join(s for s, _ in sorted(scored, key=lambda x: x[1], reverse=True)[:top_n])
+```
+
+## 5. 指令设计要点
+
+| 要点 | 说明 |
+|---|---|
+| 限定依据 | 「仅依据资料，不得编造」降低幻觉 |
+| 未知处理 | 「资料无则答不知道」避免瞎猜 |
+| 引用要求 | 「标注 [n] 来源」便于溯源 |
+| 语言风格 | 指定输出语言、长度、格式 |
+
+<Callout type="tip" title="把模板当配置管理">
+Prompt 模板会随效果调优频繁改。把它抽成独立配置（YAML/DB），和代码分离，方便 A/B 与版本管理，不要硬编码在逻辑里。
+</Callout>
+
+<Callout type="exercise" title="练习">
+写一个有 8 个 chunk（每段约 600 字）的测试，故意让总 token 超 3000，跑一遍你的预算控制逻辑，确认只保留了最相关的若干段且没报错。
+</Callout>
+
+## 小结
+
+- RAG Prompt = 指令 + 编号上下文 + 问题 + 格式
+- 按相关度从高到低截取，遵守 token 预算
+- 超预算别硬塞，提示资料可能不完整
+- 上下文可句子级筛选/摘要压缩；模板要配置化
+- 下一章讲如何让回答标注来源、可追溯 →

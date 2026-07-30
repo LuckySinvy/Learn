@@ -1,0 +1,110 @@
+---
+title: 发布与 API 集成
+order: 14
+description: 发布 WebApp、嵌入网页，并通过后端 API Key 在你的系统中调用 Dify 应用
+---
+
+# 发布与 API 集成
+
+应用调好了，怎么让真实用户用上？Dify 提供三种出口：**WebApp 网页**、**嵌入代码**、**后端 API**。本章讲清集成姿势。
+
+## 1. 发布 WebApp
+
+在编排页点「**发布**」，即可生成一个独立可访问的聊天网页。
+
+- 自动获得一个公开/受限访问的 URL
+- 可自定义品牌、开场白、建议问题
+- 适合内部试用、直接分享给同事
+
+<Callout type="tip" title="先发布再嵌入">
+嵌入组件引用的就是已发布的版本。改了草稿记得重新发布，否则用户看到的是旧版。
+</Callout>
+
+## 2. 嵌入你的网站
+
+Dify 提供 iframe / 脚本两种嵌入方式：
+
+```html
+<!-- 方式一：iframe 最简单 -->
+<iframe
+  src="https://your-dify.example.com/chatbot/APP_ID"
+  width="100%"
+  height="600"
+  frameborder="0">
+</iframe>
+```
+
+```html
+<!-- 方式二：JS 脚本，可定制触发器 -->
+<script src="https://your-dify.example.com/embed.js"></script>
+<script>
+  window.difyChatbot.init({ token: "APP_ID", baseUrl: "https://your-dify.example.com" });
+</script>
+```
+
+## 3. 后端 API 调用
+
+要在你自己的后端/App 里调用，用 Dify 的**服务端 API**。先到「应用 → API 访问」创建 **API Key**。
+
+```bash
+# 创建会话
+curl -X POST https://your-dify.example.com/v1/chat-messages \
+  -H "Authorization: Bearer app-xxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": { "user_name": "张三" },
+    "query": "如何申请报销？",
+    "response_mode": "blocking",
+    "user": "user-001"
+  }'
+```
+
+返回示例：
+
+```json
+{
+  "answer": "您可在「财务系统 → 报销」提交申请，需附发票……",
+  "conversation_id": "conv-abc123",
+  "message_id": "msg-xyz"
+}
+```
+
+<Callout type="warn" title="API Key 严禁放前端">
+API Key 拥有完整调用权限，**只能存在后端**。前端硬编码等于公开你的配额与数据。用后端代理转发，前端只持有你自己的会话令牌。
+</Callout>
+
+## 4. response_mode 两种模式
+
+| 模式 | 行为 | 适用 |
+|---|---|---|
+| `blocking` | 等完整回答一次性返回 | 简单调用、脚本 |
+| `streaming` | SSE 流式逐字返回 | 聊天界面、需打字机效果 |
+
+```bash
+# 流式：response_mode=streaming，用 SSE 接收
+curl -N -X POST ... -d '{ "response_mode": "streaming", ... }'
+```
+
+## 5. 多轮对话
+
+带上 `conversation_id` 即可延续上下文：
+
+```json
+{
+  "query": "那需要多久审批？",
+  "conversation_id": "conv-abc123",
+  "user": "user-001"
+}
+```
+
+<Callout type="exercise" title="动手做">
+为你的应用创建 API Key，用 curl 以 `blocking` 模式发一条消息，拿到 `conversation_id` 后，再带它发第二条消息，验证多轮上下文生效。
+</Callout>
+
+## 小结
+
+- 三种出口：WebApp 网页、嵌入代码、后端 API
+- 嵌入用 iframe 或 JS 脚本，引用已发布版本
+- 后端 API 用 Bearer API Key，Key 必须留在服务端
+- `blocking`/`streaming` 两模式；带 `conversation_id` 续上下文
+- 下一步：用日志与评估持续打磨效果 →

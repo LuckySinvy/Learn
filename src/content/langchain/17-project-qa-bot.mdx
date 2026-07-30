@@ -1,0 +1,117 @@
+---
+title: 项目实战：文档问答 Bot
+order: 17
+description: 端到端构建一个基于 RAG 的文档问答 Bot（加载→切分→向量→检索→回答）
+---
+
+# 项目实战：文档问答 Bot
+
+把前面学的 RAG 全链路（加载 → 切分 → 嵌入 → 检索 → 回答）串成一个**可运行的文档问答 Bot**。它能基于你提供的私有文档回答问题。
+
+## 1. 架构总览
+
+```
+文档(.md/.pdf) → Loader → Splitter → Embeddings → VectorStore
+                                                      ↓
+用户问题 → Retriever 取相关块 → Prompt(上下文+问题) → Model → 答案
+```
+
+## 2. 完整代码
+
+```ts
+// qa-bot.ts
+import "dotenv/config";
+import { TextLoader } from "langchain/document_loaders/fs/text";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings } from "@langchain/openai";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { RunnableSequence, RunnableMap } from "@langchain/core/runnables";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+async function buildChain(docsPath: string) {
+  // 1) 加载
+  const raw = await new TextLoader(docsPath).load();
+  // 2) 切分
+  const splits = await new RecursiveCharacterTextSplitter({
+    chunkSize: 500,
+    chunkOverlap: 50,
+  }).splitDocuments(raw);
+  // 3) 嵌入 + 入库
+  const vectorStore = await MemoryVectorStore.fromDocuments(
+    splits,
+    new OpenAIEmbeddings()
+  );
+  const retriever = vectorStore.asRetriever({ k: 4 });
+
+  // 4) 组装 RAG 链
+  const prompt = ChatPromptTemplate.fromTemplate(
+    "只根据下面的上下文回答，若上下文无答案就说不知道。\n" +
+    "上下文：\n{context}\n\n问题：{question}"
+  );
+
+  return RunnableSequence.from([
+    RunnableMap.from({
+      context: retriever,
+      question: (i: { question: string }) => i.question,
+    }),
+    prompt,
+    new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 }),
+    new StringOutputParser(),
+  ]);
+}
+
+// 使用
+const chain = await buildChain("./docs/handbook.md");
+const answer = await chain.invoke({ question: "如何申请测试环境？" });
+console.log(answer);
+```
+
+<Callout type="info" title="RunnableMap 的妙用">
+`RunnableMap.from({ context: retriever, question: ... })` 让「检索」和「透传问题」并行，下游提示词同时拿到两者。
+</Callout>
+
+## 3. 接入 Next.js（流式 API）
+
+```ts
+// app/api/qa/route.ts
+export const runtime = "nodejs";
+const chain = await buildChain("./docs/handbook.md"); // 启动时构建一次
+
+export async function POST(req: Request) {
+  const { question } = await req.json();
+  const stream = await chain.stream({ question });
+  return new Response(stream as any, {
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+```
+
+<Callout type="tip" title="提示词加「不知道就说不知道」">
+这是 RAG 防幻觉的关键一句。没有它，模型会用训练知识乱编，而不是承认文档里没有。
+</Callout>
+
+## 4. 上线的三个优化点
+
+| 问题 | 优化 |
+|---|---|
+| 内存库重启即丢 | 换 PGVector / Qdrant 持久化 |
+| 每次启动重建索引慢 | 预构建索引并缓存/落盘 |
+| 答案无出处 | 让模型附带引用块编号，前端可点击溯源 |
+
+<Callout type="warn" title="文档别带敏感信息入库前先脱敏">
+进向量库的每一块都会可能被检索并返回。上传前确认文档不含密钥、PII 等。
+</Callout>
+
+<Callout type="exercise" title="练习">
+为上面的 Bot 加上「引用来源」：让模型在答案后附上 `[来源: 第 N 块]`，并用 `retriever` 返回的 `metadata` 映射回原文位置。
+</Callout>
+
+## 小结
+
+- RAG 五步：加载 → 切分 → 嵌入入库 → 检索 → 带上下文回答
+- `RunnableMap` 让检索与问题并行进入提示词
+- 提示词约束「无答案就说不知道」可显著降低幻觉
+- 上线要补：持久化索引、来源引用、脱敏
+- 下章实战：多工具 Agent 助手 →

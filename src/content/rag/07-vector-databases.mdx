@@ -1,0 +1,86 @@
+---
+title: 向量数据库概览
+order: 7
+description: 对比 FAISS、Milvus、Qdrant、Pinecone、PGVector 的取舍与适用场景
+---
+
+# 向量数据库概览
+
+向量数据库专门解决「从百万级向量里快速找出最相似的 K 个」这个问题。它们用 **ANN（近似最近邻）索引** 把暴力检索的 O(N) 降到亚线性，支撑生产级规模。
+
+## 1. 为什么不能直接用 SQL LIKE
+
+- `LIKE` 是字符匹配，不懂语义（"车" 匹配不到 "汽车"）
+- 百万向量暴力算余弦，每次查询都要扫全库，延迟爆炸
+- 缺少面向向量的索引结构（HNSW、IVF 等）
+
+<Callout type="info" title="向量库做的是 ANN 搜索">
+精确最近邻（Exact NN）太慢，工程上接受「近似但够快」的结果，即 ANN。常用算法：HNSW（图）、IVF（倒排）、PQ（量化压缩）。
+</Callout>
+
+## 2. 主流方案对比
+
+| 方案 | 形态 | 部署 | 适用规模 | 特点 |
+|---|---|---|---|---|
+| **FAISS** | 库（CPU/GPU） | 嵌入进程 | 单机百万级 | 极快、轻量、无服务化 |
+| **Milvus** | 独立服务 | 容器/K8s | 十亿级 | 分布式、功能全、运维重 |
+| **Qdrant** | 独立服务 | 容器 | 百万~亿级 | Rust、易用、过滤强 |
+| **Pinecone** | 全托管 SaaS | 云端 | 弹性 | 免运维、按量付费、数据出网 |
+| **PGVector** | Postgres 插件 | 已有 PG | 百万级 | 复用现有 DB、事务一致 |
+
+## 3. 各自的取舍
+
+```text
+FAISS      → 原型 / 单机 / 不想起服务，但需自己管持久化与并发
+Milvus     → 超大规模、需要分布式与多租户，能接受较重运维
+Qdrant     → 想要独立服务又怕运维重，过滤与元数据支持好
+Pinecone   → 不想碰基础设施，接受 SaaS 成本与数据出网
+PGVector   → 已经用 Postgres，希望事务+向量一把梭，规模不大
+```
+
+<Callout type="warn" title="规模决定选型">
+个人项目或百万以内：FAISS / PGVector 足够。千万到十亿级、要水平扩展：Milvus / Qdrant 集群。别为小项目上重武器，也别用单机方案硬扛海量数据。
+</Callout>
+
+## 4. FAISS 最小示例
+
+```python
+import faiss
+import numpy as np
+
+dim = 768
+index = faiss.IndexFlatL2(dim)        # 精确 L2；生产用 IndexHNSWFlat
+xb = np.random.rand(10000, dim).astype("float32")
+index.add(xb)
+
+xq = np.random.rand(5, dim).astype("float32")
+D, I = index.search(xq, k=4)          # 最近 4 个的 距离D 与 下标I
+```
+
+## 5. PGVector 最小示例
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE docs (id serial, content text, emb vector(768));
+
+INSERT INTO docs (content, emb)
+VALUES ('退款政策', '[0.1,0.2,...,0.3]');
+
+SELECT id, content, emb <-> '[0.1,0.2,...,0.3]' AS dist
+FROM docs ORDER BY emb <-> '[0.1,0.2,...,0.3]' LIMIT 5;
+```
+
+<Callout type="tip" title="元数据过滤很关键">
+真实系统常需「只在技术文档里搜」「只搜 2024 年后的」。Qdrant、Milvus、PGVector 都支持在向量检索的同时按元数据过滤，选型时确认过滤能力是否满足。
+</Callout>
+
+<Callout type="exercise" title="练习">
+估算你的知识库规模：文档数 × 每文档 chunk 数 ≈ 向量总数。对照上表，选出你的第一候选数据库，并说明理由（规模 / 运维 / 合规）。
+</Callout>
+
+## 小结
+
+- 向量库用 ANN 索引做快速相似搜索，LIKE 做不到语义检索
+- FAISS 轻量单机；Milvus 海量分布式；Qdrant 易用；Pinecone 免运维；PGVector 复用 PG
+- 选型由规模、运维成本、合规共同决定
+- 下一章深入索引与向量存储的写入、持久化、过滤 →

@@ -1,0 +1,112 @@
+---
+title: 索引与向量存储
+order: 8
+description: 向量的写入、持久化、元数据过滤，以及索引类型对召回与性能的影响
+---
+
+# 索引与向量存储
+
+上一章选了数据库，这章讲怎么把「向量 + 原文 + 元数据」真正落进去并高效查出来。存储设计直接决定检索质量与运维复杂度。
+
+## 1. 一条记录里该存什么
+
+向量库里的每条数据建议包含三部分：
+
+```text
+{
+  "id": "chunk_1024",
+  "vector": [0.12, -0.33, ...],   # Embedding
+  "text": "原始 chunk 文本",        # 检索命中后要回传给 LLM
+  "metadata": {                    # 用于过滤 + 引用溯源
+    "source": "员工手册.pdf",
+    "page": 12,
+    "category": "HR",
+    "updated_at": "2024-08-01"
+  }
+}
+```
+
+<Callout type="info" title="原文必须存回去">
+向量只用于「找」，真正喂给 LLM 的是 `text` 原文。很多新手只存向量，检索命中后却拿不到内容，无法组装 Prompt。
+</Callout>
+
+## 2. 写入（Upsert）
+
+「Upsert」= 存在则更新、不存在则插入，便于增量更新文档。
+
+```python
+# 以 Qdrant 风格为例
+points = [
+    {
+        "id": i,
+        "vector": vecs[i],
+        "payload": {"text": texts[i], "source": sources[i], "page": pages[i]},
+    }
+    for i in range(len(vecs))
+]
+client.upsert(collection_name="kb", points=points)
+```
+
+## 3. 持久化
+
+不同方案持久化方式不同：
+
+| 方案 | 持久化要点 |
+|---|---|
+| FAISS | `index.write_index()` 落盘为文件，重启 `read_index` 读回 |
+| Qdrant | 挂载卷 + 快照（snapshot），或启用持久化模式 |
+| Milvus | 独立存储（对象存储/ETCD），配置副本 |
+| PGVector | 就是 Postgres 表，靠数据库备份保证持久 |
+
+```python
+# FAISS 持久化
+faiss.write_index(index, "kb.index")
+index = faiss.read_index("kb.index")
+```
+
+<Callout type="warn" title="别忘了增量更新">
+文档改了，要删旧 chunk 再插新 chunk，否则库里会有过期内容。用稳定 `id`（如 `文件 hashes + 页码 + 段号`）做 upsert key，能避免重复与泄漏。
+</Callout>
+
+## 4. 元数据过滤
+
+只在某些范围内检索，既提升精度也降成本：
+
+```python
+# Qdrant：只在 HR 分类且 2024 后的文档里搜
+hits = client.search(
+    collection_name="kb",
+    query_vector=q_vec,
+    query_filter=models.Filter(
+        must=[
+            models.FieldCondition(key="category", match=models.MatchValue(value="HR")),
+            models.FieldCondition(key="updated_at", range=models.Range(gte="2024-01-01")),
+        ]
+    ),
+    limit=5,
+)
+```
+
+## 5. 索引类型与权衡
+
+```text
+IndexFlatL2  精确检索，慢，适合小库验证
+IndexIVF    倒排聚类，快，需训练，recall 略降
+IndexHNSW   图索引，快且 recall 高，占内存，生产常用
+```
+
+<Callout type="tip" title="先用精确索引调通，再上 ANN">
+开发期用 `IndexFlat`（精确）确认检索逻辑正确；上线前再换 HNSW/IVF 做性能压测，对比召回率是否可接受。
+</Callout>
+
+<Callout type="exercise" title="练习">
+给你的向量库加上 `category` 和 `updated_at` 两个元数据字段，写一条「只检索技术类且半年内更新」的过滤查询，验证结果确实被过滤了。
+</Callout>
+
+## 小结
+
+- 每条记录 = vector + text + metadata，原文务必存回
+- Upsert 用稳定 id 实现增量更新，避免过期数据
+- 持久化按数据库类型落盘/快照/备份
+- 元数据过滤提升精度，索引类型在速度与召回间权衡
+- 下一章进入检索策略本身：相似度、混合检索、MMR →

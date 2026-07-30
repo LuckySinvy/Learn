@@ -1,0 +1,100 @@
+---
+title: 回调与可观测性 Callbacks
+order: 14
+description: 用 CallbackHandler 监听链条事件，并接入 LangSmith 做全链路追踪
+---
+
+# 回调与可观测性 Callbacks
+
+当链变长、Agent 多步调用时，你一定想知道：「每一步花了多久？用了多少 Token？哪一步报错了？」**Callbacks（回调）** 就是 Langchain.js 的「事件钩子」机制。
+
+## 1. 自定义 CallbackHandler
+
+继承 `BaseCallbackHandler`，重写你关心的事件方法：
+
+```ts
+import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
+
+class LogHandler extends BaseCallbackHandler {
+  name = "LogHandler";
+
+  async handleLLMStart(llm, prompts) {
+    console.log("▶ 模型开始，prompt 长度:", prompts[0].length);
+  }
+  async handleLLMEnd(output) {
+    const tokens = output.llmOutput?.usage?.total_tokens;
+    console.log("■ 模型结束，Token:", tokens);
+  }
+  async handleChainError(err) {
+    console.error("✗ 链报错:", err.message);
+  }
+}
+
+// 挂到调用上
+await chain.invoke(input, { callbacks: [new LogHandler()] });
+```
+
+<Callout type="info" title="常用事件">
+`handleLLMStart/End`、`handleChainStart/End`、`handleToolStart/End`、`handleRetrieverStart/End`——几乎每个组件都有 start/end/error 三件套。
+</Callout>
+
+## 2. 全局 vs 局部回调
+
+```ts
+// 全局：所有调用生效
+import { configureCallbacks } from "@langchain/core/callbacks";
+// 或在构造模型时传 callbacks
+
+// 局部：仅本次生效（推荐，影响最小）
+await chain.invoke(input, { callbacks: [handler] });
+```
+
+## 3. 接入 LangSmith
+
+LangSmith 是官方可观测性平台，靠回调自动上报每一次调用链路：
+
+```bash
+npm install langsmith
+```
+
+```bash
+# .env
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=lsv2_xxxxxxxx
+LANGCHAIN_PROJECT=my-langchain-app
+```
+
+```ts
+import "dotenv/config";
+// 配置好环境变量后，无需改业务代码，
+// 所有 invoke/stream 会自动上报到 LangSmith 控制台
+await chain.invoke({ question: "什么是 RAG？" });
+```
+
+<Callout type="tip" title="为什么值得接">
+LangSmith 帮你可视化「提示词 → 模型 → 工具 → 检索」的完整瀑布图，逐层看 Token、耗时、输入输出，是调试 Agent 与 RAG 的利器。
+</Callout>
+
+## 4. 典型用途
+
+| 用途 | 做法 |
+|---|---|
+| 计费/审计 | `handleLLMEnd` 累加 Token |
+| 性能监控 | 记录每步耗时，定位慢环节 |
+| 日志告警 | `handleChainError` 上报错误 |
+| 调试 | LangSmith 全链路回放 |
+
+<Callout type="warn" title="别在回调里做重活">
+回调在关键路径上执行。写数据库、发网络请求要异步且快速，避免拖慢主链路或造成阻塞。
+</Callout>
+
+<Callout type="exercise" title="练习">
+写一个回调，统计一次 `ragChain.invoke` 中「检索」与「模型生成」各自耗时，并打印总 Token 消耗。
+</Callout>
+
+## 小结
+
+- Callbacks 是 Langchain 的事件钩子，可监听每一步 start/end/error
+- 自定义 `BaseCallbackHandler` 实现日志、计费、监控
+- 配置 `LANGCHAIN_*` 环境变量即可零代码接入 LangSmith
+- 下章学习在 Next.js 中安全集成 →

@@ -1,0 +1,94 @@
+---
+title: 生成与引用溯源（Citation）
+order: 12
+description: 让 LLM 回答标注来源，实现可追溯到原文、可问责的 RAG 输出
+---
+
+# 生成与引用溯源（Citation）
+
+RAG 的最大价值之一是**可溯源**：每个结论都能指回原始文档。如果用户问「凭什么这么说」，系统应能拿出依据。本章讲如何在生成阶段落地引用。
+
+## 1. 为什么需要引用
+
+- **可信度**：医生/法务/客服场景下，无来源的回答不可用
+- **可纠错**：引用让人工快速核对，发现检索错误
+- **合规**：金融、医疗等受监管行业常强制要求留痕
+
+<Callout type="info" title="引用是 RAG 的「护城河」">
+纯 LLM 回答无法证明来源，RAG 的引用能力正是它区别于「裸模型」的核心竞争力，也是企业敢用的前提。
+</Callout>
+
+## 2. 基础做法：编号 + 显式要求
+
+在第 11 章已给上下文编号，这里在指令里强制引用：
+
+```text
+【资料】
+[1] 年假规定：满一年享 5 天，满十年享 10 天。（员工手册.pdf 第 3 页）
+[2] 病假需提供医院证明。（员工手册.pdf 第 5 页）
+
+【问题】年假怎么算？
+【回答】请仅在句末用 [n] 标注依据。
+```
+
+期望输出：满一年可享 5 天年假 [1]。
+
+## 3. 解析与校验引用
+
+让模型输出结构化 JSON，便于前端渲染可点击来源：
+
+```python
+import json
+prompt = build_prompt(q, chunks) + "\n以 JSON 返回：{\"answer\": str, \"citations\": [int]}"
+raw = llm(prompt)
+obj = json.loads(raw)
+cited = [chunks[i-1] for i in obj["citations"]]   # 回带真实来源
+```
+
+<Callout type="warn" title="模型会「编」引用编号">
+LLM 可能引用不存在的 `[7]`。务必做**边界校验**：只接受 1..N 范围内的编号，超出的丢弃或提示模型重写。
+</Callout>
+
+## 4. 程序化强制溯源（更可靠）
+
+不依赖模型自觉，而是用检索证据反查：
+
+```python
+def verify(answer, chunks, threshold=0.6):
+    """检查 answer 中每个论断是否能在 chunks 找到支撑"""
+    cited = []
+    for c in chunks:
+        # 用重叠度 / 重排分判断该段是否被用到
+        if sentence_overlap(answer, c["text"]) > threshold:
+            cited.append(c["metadata"])
+    return cited
+```
+
+## 5. 前端展示建议
+
+```json
+{
+  "answer": "满一年可享 5 天年假。",
+  "citations": [
+    {"source": "员工手册.pdf", "page": 3, "snippet": "满一年享 5 天"}
+  ]
+}
+```
+
+把 `snippet` 做成可点击气泡，用户一点就跳到原文位置。
+
+<Callout type="tip" title="片段级引用优于文档级">
+只标「来自员工手册.pdf」太粗，用户还要自己找。标到「页码 + 原句片段」才真正可用。这要求 chunk 的 `metadata` 里带 page 与精确定位（见第 3、8 章）。
+</Callout>
+
+<Callout type="exercise" title="练习">
+构造一个会让模型「引用不存在编号」的问题，观察输出，然后实现边界校验逻辑，把非法编号过滤掉，再让模型在尾部补一句「部分依据无法定位」。
+</Callout>
+
+## 小结
+
+- 引用让 RAG 输出可信、可纠错、合规
+- 编号上下文 + 指令强制 [n] 是最简落地
+- 必须校验引用编号，防止模型编造
+- 片段级（页码+原句）引用最实用，需 metadata 支撑
+- 下一章看如何量化评估整个 RAG 管线的质量 →

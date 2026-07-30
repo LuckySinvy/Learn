@@ -1,0 +1,105 @@
+---
+title: 主流 Embedding 模型选型
+order: 6
+description: 对比 OpenAI text-embedding、BGE、M3E 等模型，以及本地部署的取舍
+---
+
+# 主流 Embedding 模型选型
+
+选对 Embedding 模型，检索效果能差出一大截。本章对比常见中文场景下的主流选择，并给出选型建议。
+
+## 1. 选型的关键维度
+
+- **语言覆盖**：是否对中文友好（很多英文模型中文效果差）
+- **维度与性能**：维度越高越准但越慢/越占空间
+- **部署方式**：API 托管 vs 本地自部署
+- **成本与合规**：是否允许数据出公网（企业敏感数据需注意）
+- **最大输入长度**：能否吃下你设定的 chunk size
+
+## 2. 主流模型对比
+
+| 模型 | 提供方 | 维度 | 特点 |
+|---|---|---|---|
+| `text-embedding-3-small/large` | OpenAI | 1536 | 通用强、中文尚可、需联网 |
+| `bge-large-zh` / `bge-m3` | 智源 BAAI | 1024 | 中文 SOTA 之一、可本地 |
+| `m3e-base` / `m3e-large` | 开源社区 | 768 | 中文优化、轻量、易本地 |
+| `gte-large-zh` | 阿里 | 1024 | 中文强、可本地 |
+| `e5-mistral` | 微软 | 4096 | 多语言、指令式 |
+
+<Callout type="info" title="BGE 系列值得重点关注">
+BAAI 的 `bge` 系列（尤其 `bge-m3`，支持稠密/稀疏/多向量）在中文检索榜单长期领先，且提供开源权重，是兼顾效果与数据合规的首选。
+</Callout>
+
+## 3. 调用示例
+
+OpenAI（API 托管）：
+
+```python
+from openai import OpenAI
+client = OpenAI()
+
+def embed(texts):
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts,
+    )
+    return [d.embedding for d in resp.data]
+
+vec = embed(["今天天气不错"])
+```
+
+本地模型（用 `sentence-transformers`，数据不出本机）：
+
+```python
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("BAAI/bge-large-zh")
+vecs = model.encode(
+    ["退款政策：七天内可退", "年假规定：满一年五天"],
+    normalize_embeddings=True,   # 归一化，便于余弦=点积
+)
+```
+
+<Callout type="warn" title="中文别直接用纯英文模型">
+很多英文 Embedding 模型对中文分词和语义建模很差，检索召回率会显著下降。务必选中文优化过的模型，或在你的语料上做过评测。
+</Callout>
+
+## 4. API 托管 vs 本地部署
+
+```text
+API 托管 (OpenAI/通义等)
+  + 免运维、效果稳定
+  - 数据出公网、按量付费、有速率限制
+
+本地部署 (bge/m3e + GPU)
+  + 数据不离场、可控成本、低延迟
+  - 需显存与运维、需自己保证效果
+```
+
+<Callout type="tip" title="混合部署很常见">
+离线建索引时量大，可用本地模型批处理省钱；在线查询量小但要求低延迟，亦可本地部署。数据敏感场景一律本地。
+</Callout>
+
+## 5. 一个小评测写法
+
+```python
+# 准备 (问题, 应命中文档) 对，算召回率
+correct = 0
+for q, gold in eval_pairs:
+    hits = search(embed([q]), k=5)
+    if gold in hits:
+        correct += 1
+print("recall@5 =", correct / len(eval_pairs))
+```
+
+<Callout type="exercise" title="练习">
+在同一个中文问答数据集上，分别用 `text-embedding-3-small` 和 `bge-large-zh` 跑一遍 `recall@5`，对比两者在你业务语料上的差距，作为选型依据。
+</Callout>
+
+## 小结
+
+- 选型看语言、维度、部署、合规、长度五要素
+- 中文优先 bge / m3e / gte 等中文优化模型
+- API 托管省心但数据出网；本地部署合规可控
+- 用 recall@k 在自有语料上做实测对比
+- 下一章看向量数据库如何存储与检索这些向量 →

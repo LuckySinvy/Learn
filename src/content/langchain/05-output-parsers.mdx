@@ -1,0 +1,100 @@
+---
+title: 输出解析器 Output Parsers
+order: 5
+description: 用 String / JSON / Structured 解析器把模型文本转为可用数据结构
+---
+
+# 输出解析器 Output Parsers
+
+输出解析器（Output Parsers）是 Model I/O 中的 **Output** 部分——把模型返回的纯文本，转换成你的代码能直接消费的结构。
+
+## 1. StringOutputParser
+
+最常用：剥掉多余包装，直接拿到字符串。
+
+```ts
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { ChatOpenAI } from "@langchain/openai";
+
+const chain = ChatPromptTemplate.fromTemplate("{q}")
+  .pipe(new ChatOpenAI())
+  .pipe(new StringOutputParser());
+
+const text = await chain.invoke({ q: "用一句话解释 Token" });
+```
+
+<Callout type="info" title="为什么需要它">
+模型 `invoke` 返回的是 `AIMessage` 对象，`.content` 才是文本。`StringOutputParser` 帮你省掉 `.content` 这一步，并兼容流式。
+</Callout>
+
+## 2. JsonOutputParser
+
+当模型应返回 JSON（如提取字段、生成配置）时使用，自动 `JSON.parse` 并可选 schema 校验：
+
+```ts
+import { JsonOutputParser } from "@langchain/core/output_parsers";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { ChatOpenAI } from "@langchain/openai";
+
+const parser = new JsonOutputParser();
+
+const prompt = ChatPromptTemplate.fromTemplate(
+  "提取以下句子的信息，返回 JSON：\n{text}\n{format_instructions}"
+);
+
+const chain = prompt.pipe(new ChatOpenAI()).pipe(parser);
+
+const result = await chain.invoke({
+  text: "张三，28 岁，来自上海。",
+  format_instructions: parser.getFormatInstructions(),
+});
+
+console.log(result); // { name: "张三", age: 28, city: "上海" }
+```
+
+`parser.getFormatInstructions()` 会自动把「请输出如下 JSON 格式」的指令注入提示词，降低模型跑偏概率。
+
+## 3. StructuredOutputParser
+
+基于 Zod schema 定义结构，并生成人类可读的格式说明：
+
+```ts
+import { StructuredOutputParser } from "@langchain/core/output_parsers";
+import { z } from "zod";
+
+const parser = StructuredOutputParser.fromZodSchema(
+  z.object({
+    sentiment: z.enum(["正面", "负面", "中性"]),
+    confidence: z.number().min(0).max(1),
+  })
+);
+
+const chain = prompt.pipe(model).pipe(parser);
+const out = await chain.invoke({ text: "这家店服务太差了" });
+// { sentiment: "负面", confidence: 0.96 }
+```
+
+<Callout type="warn" title="别完全信任模型 JSON">
+模型偶尔会输出非法 JSON 或字段不符。生产环境务必包裹 try/catch，并对关键字段做二次校验（如 Zod `.safeParse`）。
+</Callout>
+
+## 4. 解析器对比
+
+| 解析器 | 适用场景 | 关键点 |
+|---|---|---|
+| `StringOutputParser` | 普通文本、流式 | 最轻量 |
+| `JsonOutputParser` | 返回 JSON | 自动 parse + 格式指令 |
+| `StructuredOutputParser` | 强结构 + 校验 | 依赖 Zod schema |
+
+<Callout type="exercise" title="练习">
+用 `StructuredOutputParser` + Zod，写一个「从用户评价里抽取 商品、评分、是否推荐」的链。
+</Callout>
+
+## 小结
+
+- `StringOutputParser`：文本 → 字符串，最常用的收尾一环
+- `JsonOutputParser`：自动解析 JSON，配合 `getFormatInstructions()`
+- `StructuredOutputParser` + Zod：强类型结构化输出
+- 解析结果务必做容错校验
+- 下章把多个组件串成完整 Chain →

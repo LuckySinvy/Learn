@@ -1,0 +1,131 @@
+---
+title: 项目实战：多工具 Agent 助手
+order: 18
+description: 端到端构建一个能查天气、算账、搜文档的多工具 Agent 助手
+---
+
+# 项目实战：多工具 Agent 助手
+
+最后一章，把 Agent（第 12 章）、工具、记忆（第 13 章）、RAG（第 17 章） combines 成一个**能自主调用多种能力**的助手：它会判断该查天气、该算账，还是该去知识库找答案。
+
+## 1. 架构总览
+
+```
+用户输入 → Agent(LLM 决策) → 自主选择工具
+   ├─ calculator   计算
+   ├─ getWeather   查天气
+   └─ ragRetriever 搜私有文档
+      ↓
+   汇总成自然语言回答（带记忆多轮）
+```
+
+## 2. 完整代码
+
+```ts
+// agent-assistant.ts
+import "dotenv/config";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+import { ChatOpenAI } from "@langchain/openai";
+import { createToolCallingAgent, AgentExecutor } from "langchain/agents";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { BufferMemory } from "langchain/memory";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+// 工具 1：计算器
+const calculator = tool(
+  async ({ expr }: { expr: string }) => String(eval(expr)),
+  { name: "calculator", description: "计算数学表达式，如 '23*7+4'", schema: z.object({ expr: z.string() }) }
+);
+
+// 工具 2：查天气（演示用假数据）
+const getWeather = tool(
+  async ({ city }: { city: string }) => `${city} 当前 22℃，晴。`,
+  { name: "getWeather", description: "查询城市当前天气，如 '北京'", schema: z.object({ city: z.string() }) }
+);
+
+// 工具 3：RAG 检索（复用上一章的知识库）
+function makeRetriever() {
+  // 假设已 builtVectorStore；这里直接 asRetriever
+  return builtVectorStore.asRetriever({ k: 3 });
+}
+const retrieverTool = tool(
+  async ({ q }: { q: string }) => {
+    const docs = await makeRetriever().getRelevantDocuments(q);
+    return docs.map((d) => d.pageContent).join("\n---\n");
+  },
+  { name: "knowledgeBase", description: "从公司手册检索答案，如 '报销流程'", schema: z.object({ q: z.string() }) }
+);
+
+const tools = [calculator, getWeather, retrieverTool];
+
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", "你是全能助手，必要时使用工具。涉及公司内部问题用 knowledgeBase。"],
+  ["placeholder", "{chat_history}"],
+  ["human", "{input}"],
+  ["placeholder", "{agent_scratchpad}"],
+]);
+
+const agent = createToolCallingAgent({
+  llm: new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 }),
+  tools,
+  prompt,
+});
+
+const executor = new AgentExecutor({
+  agent,
+  tools,
+  memory: new BufferMemory({ memoryKey: "chat_history", returnMessages: true }),
+  verbose: true,
+  maxIterations: 6,
+});
+
+// 使用
+const r1 = await executor.invoke({ input: "北京比上海温度高多少？" });
+const r2 = await executor.invoke({ input: "顺便算一下 (22-19)*3" });
+console.log(r1.output, r2.output);
+```
+
+<Callout type="info" title="Agent 自动编排">
+你没写任何 if/else。模型看到「北京比上海温度高多少」会先调两次 `getWeather`，再调 `calculator` 算差值——全部由 LLM 自主决定。
+</Callout>
+
+## 3. 接入 Next.js 流式
+
+```ts
+// app/api/assistant/route.ts
+export const runtime = "nodejs";
+export async function POST(req: Request) {
+  const { input } = await req.json();
+  const stream = await executor.stream({ input }); // AgentExecutor 支持 stream
+  return new Response(stream as any, {
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+```
+
+## 4. 生产加固清单
+
+| 风险 | 对策 |
+|---|---|
+| 提示注入 | 工具返回做长度/格式限制，危险操作人工确认 |
+| 死循环 | `maxIterations` 设上限 |
+| 记忆膨胀 | 换 `ConversationSummaryMemory` |
+| 工具越权 | 每个工具最小权限，日志审计 |
+
+<Callout type="warn" title="Agent 不等于可信执行器">
+Agent 可能误调工具或被恶意提示词诱导。涉及写操作（发邮件、改数据库）务必加确认门槛与审计日志，切勿授予裸权限。
+</Callout>
+
+<Callout type="exercise" title="练习">
+给助手再加一个 `searchWeb` 工具（可返回假数据），并观察当问题既有「实时信息」又有「内部知识」时，Agent 是否会组合多个工具分步求解。
+</Callout>
+
+## 小结
+
+- 多工具 Agent = LLM 决策 + 多个 `@tool` 能力 + 记忆
+- `createToolCallingAgent` + `AgentExecutor` 是标准骨架
+- RAG 检索器也能封装成工具，让 Agent 随时查私有知识
+- 生产需加固：提示注入防护、循环上限、最小权限、审计
+- 至此 18 章完结，你已具备用 Langchain.js 构建 LLM 应用的完整能力 🎉

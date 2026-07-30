@@ -1,0 +1,107 @@
+---
+title: 安装与部署
+order: 2
+description: 用 Docker Compose 本地一键部署 Dify，理解关键环境变量与控制台访问方式
+---
+
+# 安装与部署
+
+Dify 官方推荐使用 **Docker Compose** 部署，一条命令拉起包括 Web 前端、API 服务、Worker、数据库、向量库、Redis 在内的完整栈。本章带你从零跑起一个本地 Dify 实例。
+
+## 1. 环境准备
+
+开始前确认本机具备：
+
+- Docker ≥ 20.10，且已安装 Docker Compose v2（`docker compose version` 可查）
+- 可用内存建议 ≥ 4GB（向量库与模型推理较吃内存）
+- 端口 `80`、`443`、`5432`、`6379` 未被占用
+
+<Callout type="warn" title="端口冲突最常见">
+启动失败先看日志 `docker compose logs`。若提示端口被占用，多半是本地已跑着 PostgreSQL(5432) 或 Redis(6379)，可在 `.env` 中修改映射端口。
+</Callout>
+
+## 2. 拉取并启动
+
+```bash
+# 克隆官方仓库（或下载 release 的源码包）
+git clone https://github.com/langgenius/dify.git
+cd dify/docker
+
+# 复制环境变量模板
+cp .env.example .env
+
+# 一键启动（后台运行）
+docker compose up -d
+```
+
+启动后等待约 1 分钟，容器状态应为 `healthy`：
+
+```bash
+docker compose ps
+# 期望看到 api / web / db / redis / weaviate(或 qdrant) 等均为 running/healthy
+```
+
+## 3. 访问控制台
+
+默认通过 80 端口访问：
+
+```text
+http://localhost/install
+```
+
+首次访问会进入初始化引导：设置管理员邮箱、用户名与密码，之后即可登录主控制台。
+
+<Callout type="tip" title="改端口很简单">
+若 80 端口要留给别的程序，编辑 `.env` 设置 `EXPOSE_NGINX_PORT=8080`，再 `docker compose up -d` 重启，访问 `http://localhost:8080`。
+</Callout>
+
+## 4. 关键环境变量
+
+Dify 通过 `.env` 控制行为，常用项如下：
+
+```bash
+# --- 服务暴露 ---
+EXPOSE_NGINX_PORT=80
+EXPOSE_NGINX_SSL_PORT=443
+
+# --- 安全密钥（生产务必改！）---
+SECRET_KEY=请换成随机长字符串
+INIT_PASSWORD=管理员初始密码（仅首次生效）
+
+# --- 向量数据库选型 ---
+VECTOR_STORE=weaviate        # 可选 weaviate / qdrant / milvus / pgvector
+
+# --- 文件上传限制 ---
+UPLOAD_FILE_SIZE_LIMIT=15    # 单位 MB
+
+# --- 模型服务商密钥（也可在 UI 里配）---
+OPENAI_API_KEY=sk-xxx
+```
+
+<Callout type="warn" title="SECRET_KEY 不能丢">
+`SECRET_KEY` 用于加密会话与敏感信息。一旦设置并写入数据后**不要随意更换**，否则已加密内容无法解密。生产环境用强随机值。
+</Callout>
+
+## 5. 升级与停止
+
+```bash
+# 升级：拉取最新镜像后重启
+docker compose pull
+docker compose up -d
+
+# 停止（保留数据卷）
+docker compose down
+
+# 停止并清空所有数据（危险！）
+docker compose down -v
+```
+
+数据持久化在 Docker 卷中（PostgreSQL、向量库），默认 `docker compose down` 不会删除，可放心重启。
+
+## 小结
+
+- 用官方 `docker/docker-compose.yml` 一键拉起完整栈
+- 首访 `/install` 完成管理员初始化
+- 通过 `.env` 调整端口、密钥、向量库与模型 Key
+- `SECRET_KEY` 设置后勿改；升级用 `pull` + `up -d`
+- 下一步：理解工作区与应用等核心概念 →

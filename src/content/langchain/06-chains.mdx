@@ -1,0 +1,99 @@
+---
+title: 链 Chains
+order: 6
+description: 理解 LLMChain 与 SequentialChain，把多个步骤组合成可复用流程
+---
+
+# 链 Chains
+
+**Chain（链）** 把「提示模板 → 模型 → 解析器」等组件按顺序串起来，封装成一个可整体调用的单元。在 LCEL 普及前，`LLMChain` 是主要写法；现在推荐用 LCEL（第 7 章），但理解 Chain 有助于维护老代码。
+
+## 1. LLMChain（经典写法）
+
+```ts
+import { LLMChain } from "langchain/chains";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+const llm = new ChatOpenAI({ model: "gpt-4o-mini" });
+const prompt = ChatPromptTemplate.fromTemplate(
+  "把下面句子翻译成英文：\n{sentence}"
+);
+
+const chain = new LLMChain({ llm, prompt });
+const res = await chain.call({ sentence: "今天天气真好" });
+console.log(res.text);
+```
+
+<Callout type="info" title="LLMChain 的局限">
+它只封装「单提示 + 单模型 + 文本输出」这一固定形状，难以表达分支、并行、回退。新项目直接用 LCEL 的 `pipe` 更灵活。
+</Callout>
+
+## 2. SequentialChain：串联多步
+
+需要「上一步输出作为下一步输入」时，用 `SequentialChain`：
+
+```ts
+import { SequentialChain, LLMChain } from "langchain/chains";
+
+// 第一步：生成大纲
+const outlineChain = new LLMChain({
+  llm,
+  prompt: ChatPromptTemplate.fromTemplate("为《{topic}》写三条要点"),
+  outputKey: "outline",
+});
+
+// 第二步：根据大纲扩写
+const expandChain = new LLMChain({
+  llm,
+  prompt: ChatPromptTemplate.fromTemplate("根据要点扩写：{outline}"),
+  outputKey: "essay",
+});
+
+const overall = new SequentialChain({
+  chains: [outlineChain, expandChain],
+  inputVariables: ["topic"],
+  outputVariables: ["essay"],
+});
+
+const result = await overall.call({ topic: "向量数据库" });
+console.log(result.essay);
+```
+
+## 3. 用 LCEL 等价重写
+
+上面的顺序链用 LCEL 一行就能表达，且天然支持流式与并行：
+
+```ts
+import { RunnableSequence } from "@langchain/core/runnables";
+
+const chain = RunnableSequence.from([
+  ChatPromptTemplate.fromTemplate("为《{topic}》写三条要点"),
+  llm,
+  new StringOutputParser(),
+  // 再接一个「扩写」子链……
+]);
+```
+
+<Callout type="tip" title="新项目用 LCEL">
+`RunnableSequence.from([...])` 可读性更好，且默认具备 `.stream()`、`.batch()`、`.withConfig()` 等能力，无需额外封装。
+</Callout>
+
+## 4. 选型建议
+
+| 需求 | 推荐 |
+|---|---|
+| 单提示模板 + 模型 | `prompt.pipe(model)` |
+| 多步顺序 | `RunnableSequence` |
+| 维护旧代码 | `LLMChain` / `SequentialChain` 仍可运行 |
+
+<Callout type="exercise" title="练习">
+把「翻译 → 润色」两步走用 `RunnableSequence` 重写，并试着对最终结果调用 `.stream()`。
+</Callout>
+
+## 小结
+
+- `LLMChain` 是经典单步封装，现已推荐用 LCEL 替代
+- `SequentialChain` 串联多步，上一步 `outputKey` 作为下一步输入
+- 新代码优先 `RunnableSequence.from([...])`
+- 下章深入 LCEL 表达式语言 →

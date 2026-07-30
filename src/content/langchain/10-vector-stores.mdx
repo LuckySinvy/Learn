@@ -1,0 +1,96 @@
+---
+title: 向量库与嵌入 Vector Stores
+order: 10
+description: 用 Embeddings 把文本转为向量，并存入 MemoryVectorStore / PGVector 等向量库
+---
+
+# 向量库与嵌入 Vector Stores
+
+RAG 的「检索」依赖**嵌入（Embeddings）**：把文本映射成高维向量，语义相近的文本向量距离也更近。Vector Store 负责存储这些向量并提供相似度搜索。
+
+## 1. Embeddings 模型
+
+```ts
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+const embeddings = new OpenAIEmbeddings({
+  model: "text-embedding-3-small", // 1536 维
+});
+
+const vector = await embeddings.embedQuery("什么是向量检索？");
+console.log(vector.length); // 1536
+```
+
+`embedDocuments(texts[])` 批量嵌入文档，`embedQuery(text)` 嵌入查询——二者常分开计费/处理。
+
+## 2. 内存向量库 MemoryVectorStore
+
+原型与测试首选，数据存内存，进程退出即丢失：
+
+```ts
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings } from "@langchain/openai";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { TextLoader } from "langchain/document_loaders/fs/text";
+
+const docs = await new TextLoader("./docs/intro.md").load();
+const splits = await new RecursiveCharacterTextSplitter({
+  chunkSize: 500,
+  chunkOverlap: 50,
+}).splitDocuments(docs);
+
+const vectorStore = await MemoryVectorStore.fromDocuments(
+  splits,
+  new OpenAIEmbeddings()
+);
+
+const results = await vectorStore.similaritySearch("如何安装？", 3);
+console.log(results[0].pageContent);
+```
+
+<Callout type="info" title="fromDocuments vs addDocuments">
+`fromDocuments` 一步创建并填充；已建好的 `vectorStore` 可用 `addDocuments(...)` 增量追加。
+</Callout>
+
+## 3. 生产级向量库
+
+内存库不适合生产，常用外部向量库：
+
+| 向量库 | 包 | 特点 |
+|---|---|---|
+| **PGVector** | `@langchain/community` | 复用 PostgreSQL，事务/备份方便 |
+| **Qdrant** | `@langchain/community` | 高性能专用向量库 |
+| **Chroma** | `@langchain/community` | 轻量、本地优先 |
+| **Milvus / Pinecone** | 对应集成 | 大规模云原生 |
+
+```ts
+import { PGVectorStore } from "@langchain/community/vectorstores/pgvector";
+import { Pool } from "pg";
+
+const store = await PGVectorStore.initialize(
+  new OpenAIEmbeddings(),
+  { pool: new Pool({ connectionString: process.env.DATABASE_URL }) }
+);
+await store.addDocuments(splits);
+```
+
+<Callout type="warn" title="嵌入模型必须一致">
+写入和查询必须用**同一个嵌入模型**。换了模型维度/语义都变了，旧向量会全部失准。
+</Callout>
+
+## 4. 相似度搜索变体
+
+- `similaritySearch(query, k)`：返回最相似的 k 个文档
+- `similaritySearchWithScore`：额外返回距离分数
+- `maxMarginalRelevanceSearch`（MMR）：在相关与多样间平衡，减少冗余
+
+<Callout type="exercise" title="练习">
+用 MemoryVectorStore 装入一份你自己的笔记，分别用 `similaritySearch` 与 `maxMarginalRelevanceSearch` 查询同一问题，对比返回结果差异。
+</Callout>
+
+## 小结
+
+- 嵌入把文本转成向量，语义相近则距离近
+- `MemoryVectorStore` 适合原型；生产用 PGVector/Qdrant 等
+- 写入与查询必须同一嵌入模型
+- 下章用 Retriever 把向量库接进链 →

@@ -1,0 +1,103 @@
+---
+title: 项目实战：RAG + Agent 客服系统
+order: 18
+description: 在 RAG 基础上引入 Agent 与工具调用，搭建能多步检索、查询订单的客服系统
+---
+
+# 项目实战：RAG + Agent 客服系统
+
+基础 RAG 是「一问一答」。真实客服往往需要**多步推理**：先检索政策，再查用户订单，再算退款金额。本章引入 **Agent（智能体）**，让 LLM 自主决定调用哪些工具。
+
+## 1. 为什么需要 Agent
+
+```text
+用户: "我上周买的耳机能退吗？"
+需要:
+  1. 检索「退货政策」(RAG)
+  2. 查该用户订单的购买时间 (API/DB 工具)
+  3. 判断是否在 7 天无理由期内 (推理)
+  4. 组织回答并给退款指引
+```
+单轮 RAG 做不了第 2、3 步。Agent 通过**工具调用（Function Calling）**把 RAG 和业务流程串起来。
+
+<Callout type="info" title="RAG 是 Agent 的一个工具">
+在 Agent 架构里，知识库检索只是众多工具之一（还有查订单、算价格、建工单）。Agent 决定「何时检索、检索什么」。
+</Callout>
+
+## 2. 定义工具
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def search_knowledge(query: str) -> str:
+    """检索企业知识库，返回相关政策原文片段。"""
+    return rag_answer(query)            # 复用第 17 章的检索生成
+
+@tool
+def get_order(user_id: str, order_id: str) -> dict:
+    """查询用户订单：下单时间、商品、状态。"""
+    # 实际调用订单系统 API
+    return {"created_at": "2024-08-01", "item": "耳机", "status": "已发货"}
+
+tools = [search_knowledge, get_order]
+```
+
+## 3. 用 Agent 编排
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_openai_tools_agent, AgentExecutor
+from langchain import hub
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+prompt = hub.pull("hwchase17/openai-tools-agent")
+agent = create_openai_tools_agent(llm, tools, prompt)
+executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+result = executor.invoke({
+    "input": "用户 U123 上周买的耳机能退吗？订单号 O456。"
+})
+print(result["output"])
+```
+
+运行时会看到 Agent 自主决定：先 `get_order` 拿购买时间 → 再 `search_knowledge` 查退货政策 → 综合给出结论。
+
+## 4. 让 RAG 与工具协同
+
+Agent 可能多轮调用 RAG。注意：
+
+```text
+第1轮: get_order(O456) → 购买于 8/1
+第2轮: search_knowledge("耳机 7天无理由退货") → 政策原文
+第3轮: LLM 综合 → "在 7 天期内，可申请退货"
+```
+
+<Callout type="warn" title="防止工具被滥用/循环">
+给 Agent 加 `max_iterations`（如 5）防死循环；对 `get_order` 等写操作加权限校验；所有工具调用留审计日志，便于追溯。
+</Callout>
+
+## 5. 生产化要点
+
+| 关注点 | 做法 |
+|---|---|
+| 成本控制 | 限制 `max_iterations`、缓存工具结果 |
+| 稳定性 | 每个工具独立 try/except，失败有降级 |
+| 安全 | 用户身份校验，工具按角色授权 |
+| 可观测 | 记录每轮决策链路，便于复盘 |
+
+<Callout type="tip" title="RAG 与 Agent 的边界">
+简单问答直接 RAG 即可，别为「一句话能答」的需求上 Agent（更慢更贵）。只有当问题需要**多步、跨系统**时，才引入 Agent。
+</Callout>
+
+<Callout type="exercise" title="练习">
+在上面的客服 Agent 里再加一个 `create_ticket(user_id, reason)` 工具，让 Agent 在确认无法自助解决时自动建工单，并验证它不会在能直接回答时误建单。
+</Callout>
+
+## 小结
+
+- Agent 让 LLM 自主调度工具，RAG 只是其中之一
+- 用 Function Calling 定义检索/查单/建单等工具
+- 控制 max_iterations 与权限，防循环与越权
+- 简单问题用 RAG，多步跨系统才上 Agent
+- 恭喜完成 RAG 全 18 章！从概念、组件到两个实战项目，你已具备搭建生产级 RAG 的能力。

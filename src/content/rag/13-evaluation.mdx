@@ -1,0 +1,96 @@
+---
+title: 评估 RAG
+order: 13
+description: 用忠实度、答案相关性、上下文相关性三大指标与 Ragas 框架量化 RAG 质量
+---
+
+# 评估 RAG
+
+「感觉回答还行」不是工程。RAG 需要可量化的指标来指导每一处调优。本章介绍核心指标与 Ragas 实战。
+
+## 1. 三个核心指标
+
+| 指标 | 衡量什么 | 失败信号 |
+|---|---|---|
+| **忠实度 Faithfulness** | 答案是否只基于检索到的上下文（没幻觉） | 答案出现上下文没有的内容 |
+| **答案相关性 Answer Relevancy** | 答案是否切题、回应了问题 | 答非所问、绕圈子 |
+| **上下文相关性 Context Relevancy** | 检索到的片段是否真相关 | 召回了大量噪声 chunk |
+
+<Callout type="info" title="两个环节，两套指标">
+上下文相关性评「检索」；忠实度 + 答案相关性评「生成」。定位问题是出在检索还是生成，才能对症下药。
+</Callout>
+
+## 2. 用 Ragas 跑评估
+
+Ragas 是 RAG 评估的主流框架，用 LLM 当裁判（LLM-as-judge）自动打分。
+
+```python
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness, answer_relevancy,
+    context_relevancy, context_precision,
+)
+from datasets import Dataset
+
+data = Dataset.from_dict({
+    "question":      ["如何申请年假？"],
+    "answer":        [answer],
+    "contexts":      [[c["text"] for c in chunks]],
+    "reference":     ["满一年可享 5 天，需提前申请"],   # 可选标准答案
+})
+
+result = evaluate(
+    data,
+    metrics=[faithfulness, answer_relevancy, context_relevancy],
+)
+print(result)
+```
+
+## 3. 指标含义速记
+
+```text
+faithfulness      ∈ [0,1] 越高越不幻觉
+answer_relevancy  ∈ [0,1] 越高越切题
+context_relevancy ∈ [0,1] 越高说明召回越干净
+context_precision ∈ [0,1] 召回里相关片段排得越靠前越高
+```
+
+<Callout type="warn" title="LLM 裁判也有偏">
+Ragas 用 GPT/Claude 当裁判，本身可能误判。重要结论要结合人工抽检，别把评分当绝对真理。
+</Callout>
+
+## 4. 回归测试集
+
+把评估沉淀成一个固定数据集，每次改动（换 chunk size、换模型、加重排）都重跑，对比分数：
+
+```python
+# 伪代码：CI 中对比前后分数
+baseline = load_prev_scores()
+new = evaluate(dataset, metrics)
+assert new["faithfulness"] >= baseline["faithfulness"] - 0.02
+```
+
+## 5. 端到端人工评估维度
+
+除自动化指标外，上线前人工看：
+
+- 是否漏答（该召回的没召回）
+- 是否幻觉（凭空编造条款）
+- 引用是否准确（指错页码）
+- 延迟与成本是否可接受
+
+<Callout type="tip" title="先建 50 条黄金集">
+不需要上千条。先手工准备 30–50 条「问题 + 标准答案 + 应命中片段」的黄金集，就足以支撑日常迭代的回归对比。
+</Callout>
+
+<Callout type="exercise" title="练习">
+用你手头已有问答对，搭一个 10 条的最小 Ragas 数据集，跑一遍三个核心指标。挑分数最低的一项，它就是下一步优化重点。
+</Callout>
+
+## 小结
+
+- 三大指标：忠实度（不幻觉）、答案相关性（切题）、上下文相关性（召回干净）
+- Ragas 用 LLM 当裁判自动打分，可回归对比
+- 检索差看上下文相关性，生成差看忠实度/答案相关性
+- 沉淀黄金测试集，每次改动都重跑对比
+- 下一章进入高级 RAG 模式，进一步提升召回 →

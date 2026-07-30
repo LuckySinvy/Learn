@@ -1,0 +1,96 @@
+---
+title: 接入大模型
+order: 13
+description: 配置 OpenAI、Azure 与本地模型（Ollama/vLLM）等模型供应商，统一切换底层模型
+---
+
+# 接入大模型
+
+Dify 把「用哪家模型」抽象成**模型供应商（Model Provider）**。接入后，所有应用都能像下拉菜单一样切换模型，无需改业务代码。本章覆盖主流接入方式。
+
+## 1. 模型分类
+
+Dify 区分三类模型，分别在不同的地方被使用：
+
+| 类型 | 用途 | 例子 |
+|---|---|---|
+| **LLM（生成模型）** | 对话、生成 | GPT-4o、Claude、Qwen、本地模型 |
+| **Embedding** | 知识库向量化 | text-embedding-3、bge-large-zh |
+| **Rerank** | 检索重排 | bge-reranker |
+
+<Callout type="info" title="三者可能来自不同供应商">
+为了省钱，常见组合：生成用云端 GPT/通义，Embedding 与 Rerank 用本地中文模型。Dify 允许混搭，互不影响。
+</Callout>
+
+## 2. 接入 OpenAI
+
+「设置 → 模型供应商 → OpenAI → 设置 API Key」：
+
+```bash
+# 环境变量方式（docker/.env），避免在前端明文
+OPENAI_API_KEY=sk-xxx
+OPENAI_API_BASE=https://api.openai.com/v1
+```
+
+添加后即可在应用中选择 `gpt-4o`、`gpt-4o-mini` 等，并配置温度、最大 token。
+
+<Callout type="warn" title="密钥走环境变量更安全">
+把 API Key 写进 `.env` 或部署 Secret，而不是在多人可见的 UI 里反复粘贴。轮换密钥时只改环境变量、重启即可。
+</Callout>
+
+## 3. 接入 Azure OpenAI
+
+企业常用 Azure 以获得合规与区域部署：
+
+```bash
+AZURE_OPENAI_API_KEY=xxx
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_API_VERSION=2024-02-01
+# 还需在 UI 配置 Deployment 名称映射
+```
+
+Azure 的优势是数据留在指定区域、可走企业协议，适合合规要求高的场景。
+
+## 4. 接入本地模型（Ollama / vLLM）
+
+不想把数据出网？用本地推理：
+
+```bash
+# Ollama 启动一个模型
+ollama pull qwen2.5:7b
+ollama serve   # 默认 http://localhost:11434
+```
+
+在 Dify 选择「Ollama」供应商，填入 base URL：
+
+```bash
+OLLAMA_API_BASE=http://host.docker.internal:11434
+# 若 Dify 与 Ollama 同主机 docker，用宿主机地址而非 127.0.0.1
+```
+
+```bash
+# vLLM 提供 OpenAI 兼容接口
+vllm serve Qwen/Qwen2.5-7B-Instruct --port 8000
+# 在 Dify 以「OpenAI 兼容」类型接入，base 指向 http://host:8000/v1
+```
+
+<Callout type="tip" title="本地模型选型建议">
+中文场景优先 Qwen2.5、ChatGLM、InternLM 等中文友好模型；Embedding 用 bge/m3e。注意本地模型对显存有要求，7B 模型约需 8–16GB 显存。
+</Callout>
+
+## 5. 验证与切换
+
+- 接入后在编排页「模型」下拉应能看到新模型
+- 用预览窗口发一条消息，确认调用成功
+- 多模型对比：同一提示词切不同模型，观察质量/速度/成本
+
+<Callout type="exercise" title="动手做">
+分别接入一个云端模型（如 OpenAI）和一个本地模型（Ollama），在同一个应用里切换，对比回答质量与响应速度，选出你的默认模型。
+</Callout>
+
+## 小结
+
+- Dify 统一管理 LLM / Embedding / Rerank 三类模型
+- OpenAI 走 API Key；Azure 适合合规；本地 Ollama/vLLM 保数据不出网
+- 密钥优先用环境变量；本地模型注意显存
+- 应用内可随时切换模型做对比；下一步发布与 API 集成 →

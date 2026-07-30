@@ -1,0 +1,90 @@
+---
+title: 重排序（Re-ranking）
+order: 10
+description: 用 Cross-Encoder 对召回结果精排，以及多路分数的融合策略
+---
+
+# 重排序（Re-ranking）
+
+检索（retrieval）追求**快而广**，召回一堆可能相关的候选；重排序（rerank）追求**准而精**，从中挑出真正和问题最匹配的少数几段。两步结合，是高质量 RAG 的关键。
+
+## 1. 为什么需要重排序
+
+向量检索（Bi-Encoder）把问题 and 文档各自编码，**没有让两者真正「互相看」**，容易召回「语义接近但答非所问」的片段。重排序器（Cross-Encoder）则把「问题 + 文档」拼在一起联合打分，精度高得多。
+
+```text
+召回 Top-20 (快, 可能含噪声)
+        │  rerank
+        ▼
+精排 Top-5  (准, 真正相关)
+```
+
+<Callout type="info" title="两段式是性价比最高的做法">
+先用便宜的向量检索广撒网（召回 20–50），再用稍贵的 Cross-Encoder 精排取 5。比「直接向量检索取 5」效果更好，又比「直接精排全库」便宜得多。
+</Callout>
+
+## 2. 用 Cross-Encoder 重排
+
+```python
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("BAAI/bge-reranker-large")
+
+pairs = [(question, chunk["text"]) for chunk in candidates]
+scores = reranker.predict(pairs)     # 每个 (问题, 文档) 的相关性分
+
+ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+top5 = [c for c, s in ranked[:5]]
+```
+
+## 3. 常见重排模型
+
+| 模型 | 提供方 | 特点 |
+|---|---|---|
+| `bge-reranker-large/base` | BAAI | 中文强、开源、可本地 |
+| `gte-reranker` | 阿里 | 中文友好 |
+| `cohere-rerank` | Cohere | API 托管、效果稳定、需联网 |
+| `jina-reranker` | Jina | 多语言、API |
+
+<Callout type="warn" title="重排是同步瓶颈">
+Cross-Encoder 对每对 (问题, 候选) 都要一次前向，候选越多越慢。因此先靠向量检索把候选压到 20–50 再重排，避免对全库精排拖垮延迟。
+</Callout>
+
+## 4. 分数融合策略
+
+如果同时有向量分、BM25 分、重排分，可加权融合：
+
+```python
+final_score = (
+    0.2 * normalize(dense_score)
+    + 0.2 * normalize(bm25_score)
+    + 0.6 * normalize(rerank_score)
+)
+```
+
+经验：重排分权重最高，因为它最准。
+
+## 5. 一个完整的两段式流程
+
+```python
+candidates = vector_store.search(q_vec, top_k=30)   # 广召回
+pairs = [(question, c["text"]) for c in candidates]
+scores = reranker.predict(pairs)
+top = [candidates[i] for i in argsort(scores)[-5:][::-1]]
+```
+
+<Callout type="tip" title="重排后一定要回带原文">
+重排只是给候选排序，最终喂给 LLM 的还是 `text` 原文 + `metadata`。排序只是决定「哪几段进上下文、以及先后」。
+</Callout>
+
+<Callout type="exercise" title="练习">
+取一个你常被「答非所问」召回困扰的问题，先向量检索 Top-20，再重排取 Top-5，对比前后两次进 LLM 的片段，看重排是否剔掉了无关的。
+</Callout>
+
+## 小结
+
+- 检索广而快，重排准而精，两段结合性价比最高
+- Cross-Encoder 联合打分，比 Bi-Encoder 精度高
+- 先向量召回 20–50，再重排取 5，避免全库精排
+- 多路分数可加权融合，重排分权重最高
+- 下一章讲如何把检索结果组装成 Prompt →

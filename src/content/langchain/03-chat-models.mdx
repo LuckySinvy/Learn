@@ -1,0 +1,82 @@
+---
+title: 聊天模型 Chat Models
+order: 3
+description: 理解 Chat Models 的消息类型、常用参数与流式调用
+---
+
+# 聊天模型 Chat Models
+
+Chat Models 是 Model I/O 中的 **Model** 部分——负责把「消息」喂给 LLM 并拿回回复。Langchain.js 用统一的 `BaseChatModel` 接口屏蔽了各家差异。
+
+## 1. 基础调用
+
+以 OpenAI 为例，所有聊天模型都暴露 `invoke`（单条）和 `stream`（流式）等方法：
+
+```ts
+import { ChatOpenAI } from "@langchain/openai";
+
+const model = new ChatOpenAI({
+  model: "gpt-4o-mini",
+  temperature: 0.7,   // 随机性，0=确定性
+  maxTokens: 512,      // 最大生成长度
+});
+
+const message = await model.invoke("用一句话解释什么是向量检索");
+console.log(message.content);        // 文本
+console.log(message.response_metadata); // 含 usage(Token) 等元信息
+```
+
+## 2. 消息类型
+
+聊天模型不吃裸字符串，而是吃**消息对象**。`@langchain/core/messages` 提供四种：
+
+| 类型 | 角色 | 用途 |
+|---|---|---|
+| `SystemMessage` | 系统 | 设定人设 / 规则 |
+| `HumanMessage` | 用户 | 用户输入 |
+| `AIMessage` | 助手 | 模型回复 |
+| `ToolMessage` | 工具 | 工具返回结果（第 12 章用） |
+
+```ts
+import { SystemMessage, HumanMessage } from "@langchain/core/messages";
+
+const res = await model.invoke([
+  new SystemMessage("你是一名严谨的数据库专家。"),
+  new HumanMessage("PostgreSQL 和 MySQL 该怎么选？"),
+]);
+```
+
+<Callout type="tip" title="提示词模板里写角色">
+用 `ChatPromptTemplate.fromMessages([["system", "..."], ["human", "{input}"]])` 比手动 new 消息更可复用，且能与 LCEL 串联（见第 4 章）。
+</Callout>
+
+## 3. 常用参数
+
+- `temperature`：采样温度，越低越确定。写代码/抽取用 0，创意写作用 0.8+。
+- `maxTokens`：控制回复长度，避免无限生成。
+- `topP` / `stop`：核采样与停止词。
+- `model`：指定模型名，如 `gpt-4o`、`gpt-4o-mini`、`claude-3-5-sonnet-latest`。
+
+<Callout type="warn" title="注意 Token 上限">
+`maxTokens` 指的是**生成**上限，不含输入。长上下文任务要同时考虑模型总窗口（如 128k）与费用。
+</Callout>
+
+## 4. 多轮对话与流式
+
+多轮就是把历史消息数组继续往下传；流式用 `.stream()` 逐块产出：
+
+```ts
+// 流式：AIMessageChunk 逐个到达
+const stream = await model.stream("给我讲个关于缓存的冷笑话");
+for await (const chunk of stream) {
+  process.stdout.write(chunk.content as string);
+}
+```
+
+## 小结
+
+- Chat Models 统一了各家接口，核心是 `invoke` / `stream`
+- 消息分 `System/Human/AI/Tool` 四种角色
+- 关键参数：`temperature`、`maxTokens`、`model`
+- 流式用 `.stream()` 拿到分块 `AIMessageChunk`
+- 下章学习如何把用户输入模板化 →

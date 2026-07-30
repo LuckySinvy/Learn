@@ -1,0 +1,99 @@
+---
+title: 检索策略
+order: 9
+description: 余弦相似度检索、BM25 关键词检索、混合检索与 MMR 去冗余
+---
+
+# 检索策略
+
+光有向量库还不够——**怎么检索**决定了召回的上限。本章覆盖从基础向量检索到混合检索、再到去冗余的完整策略。
+
+## 1. 纯向量检索（Dense Retrieval）
+
+把问题向量化，取余弦最近的 K 个 chunk：
+
+```python
+hits = vector_store.search(query_vector, top_k=5)
+# 返回与问题语义最相近的 5 段
+```
+
+优点：能懂同义改写（"怎么退钱" 命中 "退款流程"）。
+缺点：对**专有名词、编号、精确关键词**不敏感（"错误码 504" 可能搜不到含 "504" 的文档）。
+
+## 2. BM25 关键词检索（Sparse）
+
+基于词频的统计检索，传统搜索引擎的核心：
+
+```python
+from rank_bm25 import BM25Okapi
+
+corpus = [doc.split() for doc in texts]
+bm25 = BM25Okapi(corpus)
+scores = bm25.get_scores("错误码 504 怎么解决".split())
+top = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:5]
+```
+
+优点：精确匹配关键词、编号、术语，零向量化成本。
+缺点：不懂语义，查不到同义表达。
+
+<Callout type="info" title="Dense + Sparse 互补">
+向量检索擅长「意会」，BM25 擅长「言传」。两者结合（混合检索）能同时覆盖语义与关键词，是生产系统的标配。
+</Callout>
+
+## 3. 混合检索（Hybrid Search）
+
+把两种分数归一化后融合（如 RRF 倒数排名融合）：
+
+```python
+def rrf(rank_lists, k=60):
+    score = {}
+    for ranks in rank_lists:          # 每个 rank_lists 是一个 id 列表
+        for i, doc_id in enumerate(ranks):
+            score[doc_id] = score.get(doc_id, 0) + 1 / (k + i + 1)
+    return sorted(score, key=score.get, reverse=True)
+
+final = rrf([dense_top_ids, bm25_top_ids])
+```
+
+很多向量库（Qdrant、Milvus、Elasticsearch）已内置混合检索，直接开启即可。
+
+## 4. MMR 去冗余（最大边际相关）
+
+Top-K 经常返回「高度相似的好几段」，挤占上下文。MMR 在保证相关的前提下引入多样性：
+
+```python
+# 伪代码：每选一个， penalize 与已选过于相似的候选
+selected, candidates = [], all_ranked
+while len(selected) < k:
+    best = max(candidates, key=lambda c:
+        lambda1 * rel(c) - lambda2 * max(sim(c, s) for s in selected))
+    selected.append(best); candidates.remove(best)
+```
+
+<Callout type="warn" title="别让相似 chunk 占满窗口">
+如果 5 个召回里有 4 个来自同一段落，模型看到的信息量其实只有 1 段。MMR 或「按来源去重」能显著提升上下文利用率。
+</Callout>
+
+## 5. 检索参数小结
+
+| 参数 | 作用 | 经验 |
+|---|---|---|
+| top_k | 召回数量 | 5–10，配合重排精筛 |
+| score_threshold | 相似度下限 | 过滤无关召回，防噪声 |
+| MMR λ | 相关/多样权衡 | λ 偏大更相关，偏小更多样 |
+
+<Callout type="tip" title="先混合，再加阈值">
+上线顺序：纯向量 → 加 BM25 混合 → 加 score 阈值过滤明显无关的 → 加 MMR 去重。每步用第 13 章的评估指标验证是否变好。
+</Callout>
+
+<Callout type="exercise" title="练习">
+构造一个含精确编号（如 "ERR-502"）的问题，分别用纯向量和 BM25 检索，观察哪种能命中。再实现一次 RRF 融合，看是否两全。
+</Callout>
+
+## 小结
+
+- 纯向量懂语义但不懂精确关键词；BM25 反之
+- 混合检索融合两者，生产标配
+- RRF 是常用的无权重融合算法
+- MMR 去冗余，提升上下文信息密度
+- 下一章用 Re-ranking 对召回结果做精排 →

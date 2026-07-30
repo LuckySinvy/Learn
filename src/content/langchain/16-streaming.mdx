@@ -1,0 +1,112 @@
+---
+title: 流式输出 Streaming
+order: 16
+description: 用 streamEvents / .stream() 实现逐字渲染，提升用户体验
+---
+
+# 流式输出 Streaming
+
+LLM 生成一个完整回答常需数秒。同步等待会让用户对着转圈。**流式（Streaming）** 让模型边生成边返回，前端逐字渲染，体验质的提升。
+
+## 1. 基础：.stream()
+
+```ts
+import { ChatOpenAI } from "@langchain/openai";
+
+const model = new ChatOpenAI({ model: "gpt-4o-mini", streaming: true });
+
+const stream = await model.stream("讲一个关于单元测试的短故事");
+for await (const chunk of stream) {
+  process.stdout.write(chunk.content as string);
+}
+```
+
+<Callout type="info" title="streaming 开关">
+`streaming: true` 让底层走 SSE/分块接口。接了 `StringOutputParser` 的链也能 `.stream()`，解析器会逐块吐字符串。
+</Callout>
+
+## 2. LCEL 链的流式
+
+```ts
+const chain = prompt.pipe(model).pipe(new StringOutputParser());
+const stream = await chain.stream({ topic: "向量数据库" });
+for await (const text of stream) {
+  process.stdout.write(text);
+}
+```
+
+## 3. streamEvents：细粒度事件
+
+想要「检索了哪些文档」「工具调用了什么」这类中间事件，用 `streamEvents`：
+
+```ts
+const stream = chain.streamEvents({ topic: "RAG" }, { version: "v2" });
+
+for await (const event of stream) {
+  if (event.event === "on_llm_stream") {
+    process.stdout.write(event.data.chunk.content as string);
+  }
+  if (event.event === "on_retriever_end") {
+    console.log("检索到:", event.data.output.length, "块");
+  }
+}
+```
+
+<Callout type="tip" title="事件名速查">
+`on_llm_start/stream/end`、`on_chain_*`、`on_tool_*`、`on_retriever_*`。配合第 14 章回调做可视化。
+</Callout>
+
+## 4. 在 Next.js 中逐字推到前端
+
+用 `ReadableStream` 把链流式结果转发给浏览器：
+
+```ts
+// app/api/chat/route.ts
+export const runtime = "nodejs";
+
+export async function POST(req: Request) {
+  const { topic } = await req.json();
+  const stream = await chain.stream({ topic });
+
+  const encoder = new TextEncoder();
+  const readable = new ReadableStream({
+    async start(controller) {
+      for await (const chunk of stream) {
+        controller.enqueue(encoder.encode(chunk));
+      }
+      controller.close();
+    },
+  });
+  return new Response(readable, {
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+```
+
+```ts
+// 前端
+const res = await fetch("/api/chat", { method: "POST", body: JSON.stringify({ topic }) });
+const reader = res.body!.getReader();
+const dec = new TextDecoder();
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  document.body.append(dec.decode(value)); // 逐字追加
+}
+```
+
+<Callout type="warn" title="流式下错误处理要小心">
+流式响应已 `200` 发出后无法再改状态码。业务逻辑错误应在开始流之前校验，或用特殊标记（如 `[ERROR]`）在前端识别。
+</Callout>
+
+<Callout type="exercise" title="练习">
+把第 15 章的 `/api/chat` 改成流式返回，并在前端用 `reader.read()` 逐字渲染到页面。
+</Callout>
+
+## 小结
+
+- `streaming: true` + `.stream()` 实现基础逐字输出
+- `streamEvents(version:"v2")` 暴露检索/工具等中间事件
+- Next.js 用 `ReadableStream` 把链结果转发到浏览器
+- 流式响应的错误要前置校验或用标记识别
+- 下章实战：端到端文档问答 Bot →

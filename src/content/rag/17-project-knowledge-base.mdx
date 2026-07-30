@@ -1,0 +1,120 @@
+---
+title: 项目实战：企业知识库问答
+order: 17
+description: 端到端搭建一个可运行的企业知识库问答系统，含加载、索引、检索、生成完整代码
+---
+
+# 项目实战：企业知识库问答
+
+把前 16 章串起来，搭一个**端到端可运行**的企业知识库问答系统。目标是：丢进一堆内部文档，员工用自然语言提问，系统给出带引用的答案。
+
+## 1. 系统目标与依赖
+
+功能：多格式文档加载 → 切分 → 本地向量化 → 混合检索+重排 → 带引用生成。
+依赖（pip）：
+
+```bash
+pip install langchain langchain-community \
+            sentence-transformers faiss-cpu \
+            rank_bm25 openai
+```
+
+## 2. 离线建库
+
+```python
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
+import faiss, numpy as np, pickle
+
+embedder = SentenceTransformer("BAAI/bge-large-zh")
+
+# 1) 加载
+loader = DirectoryLoader("./kb_docs", glob="**/*.{pdf,md,txt,docx}")
+docs = loader.load()
+
+# 2) 切分
+splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)
+chunks = splitter.split_documents(docs)
+
+# 3) 向量化 + 建 FAISS 索引
+texts = [c.page_content for c in chunks]
+metas = [c.metadata for c in chunks]
+vecs = embedder.encode(texts, normalize_embeddings=True)
+index = faiss.IndexFlatIP(vecs.shape[1])   # 归一化后内积=余弦
+index.add(np.array(vecs, dtype="float32"))
+
+# 4) 持久化
+faiss.write_index(index, "kb.index")
+pickle.dump({"texts": texts, "metas": metas}, open("kb.pkl", "wb"))
+```
+
+<Callout type="info" title="选用 FAISS + 本地模型">
+本实战用 FAISS（轻量单机）和 bge 本地模型（数据不出网），适合中小企业知识库。规模上来后把 FAISS 换成 Qdrant/Milvus 即可，接口几乎不变。
+</Callout>
+
+## 3. 在线问答
+
+```python
+import openai, json
+client = openai.OpenAI()
+
+def answer(question, k=5):
+    # 检索
+    qv = embedder.encode([question], normalize_embeddings=True)
+    D, I = index.search(np.array(qv, dtype="float32"), k=20)
+    cand = [{"text": texts[i], "meta": metas[i]} for i in I[0]]
+
+    # 组装上下文（带编号）
+    ctx = "\n".join(
+        f"[{i+1}] {c['text']}（来源：{c['meta'].get('source')}）"
+        for i, c in enumerate(cand[:k])
+    )
+    prompt = f"""你是企业知识库助手，仅依据资料作答，未知则说不知道，句末标 [n]。
+【资料】
+{ctx}
+【问题】{question}
+【回答】"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}],
+        max_tokens=512,
+    )
+    return resp.choices[0].message.content
+```
+
+## 4. 加重排（可选增强）
+
+```python
+from sentence_transformers import CrossEncoder
+reranker = CrossEncoder("BAAI/bge-reranker-large")
+
+def rerank(question, cand, k=5):
+    pairs = [(question, c["text"]) for c in cand]
+    scores = reranker.predict(pairs)
+    return [cand[i] for i in np.argsort(scores)[::-1][:k]]
+```
+
+<Callout type="warn" title="生产别把 API Key 硬编码">
+示例为简洁直接写变量。真实项目用环境变量 `OPENAI_API_KEY` 或密钥管理服务，切勿提交到 Git。
+</Callout>
+
+## 5. 验证与迭代
+
+用第 13 章的 Ragas 跑 `faithfulness` 与 `context_relevancy`，针对低分项调 `chunk_size`、加混合检索或重排。
+
+<Callout type="tip" title="先纵向打通一条文档">
+别一次性灌入全公司资料。先选一个部门的 10 份文档跑通，调好指标，再横向扩展并加上增量更新（用稳定 id 做 upsert）。
+</Callout>
+
+<Callout type="exercise" title="练习">
+用你自己的 3–5 份文档建库，问一个跨文档的问题（如「年假和病假能否同时休？」），检查答案是否综合了多来源，并标注了各自出处。
+</Callout>
+
+## 小结
+
+- 端到端：加载 → 切分 → 本地向量化 → FAISS 入库 → 检索+重排 → 带引用生成
+- FAISS + bge 本地方案适合中小企业，数据不出网
+- 用编号上下文 + 指令实现引用溯源
+- 用 Ragas 量化迭代，先小范围打通再扩展
+- 下一章升级为 RAG + Agent 客服系统 →

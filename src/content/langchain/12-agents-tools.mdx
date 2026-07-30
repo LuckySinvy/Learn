@@ -1,0 +1,93 @@
+---
+title: Agent 与工具 Agents & Tools
+order: 12
+description: 用 createToolCallingAgent 与自定义 Tool，让模型自主决定调用外部能力
+---
+
+# Agent 与工具 Agents & Tools
+
+**Agent（智能体）** 不像固定链那样写死步骤，而是让 LLM **自己决定**：该调哪个工具、调几次、怎么组合，直到回答问题。工具（Tool）是 Agent 能使用的外部能力（查天气、算数、搜库等）。
+
+## 1. 用 @tool 定义工具
+
+```ts
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+
+const calculator = tool(
+  async ({ expression }: { expression: string }) => {
+    // 演示用 eval，真实场景请用安全表达式引擎
+    return String(eval(expression));
+  },
+  {
+    name: "calculator",
+    description: "计算数学表达式，如 '23 * 7 + 4'",
+    schema: z.object({ expression: z.string() }),
+  }
+);
+```
+
+`description` 至关重要——模型靠它判断「什么时候该用这个工具」。写得越清楚，误调用越少。
+
+## 2. createToolCallingAgent
+
+基于「工具调用（tool calling）」模型的现代 Agent 写法：
+
+```ts
+import { createToolCallingAgent, AgentExecutor } from "langchain/agents";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+const llm = new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 });
+const tools = [calculator];
+
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", "你是一个会算账的助手，必要时使用工具。"],
+  ["placeholder", "{chat_history}"],
+  ["human", "{input}"],
+  ["placeholder", "{agent_scratchpad}"],
+]);
+
+const agent = createToolCallingAgent({ llm, tools, prompt });
+const executor = new AgentExecutor({ agent, tools, verbose: true });
+
+const res = await executor.invoke({ input: "帮我算 23*7，再加 4 等于多少？" });
+console.log(res.output);
+```
+
+<Callout type="info" title="占位符不能省">
+`{agent_scratchpad}` 是 Agent 记录「中间思考/工具调用」的地方；`{chat_history}` 用于多轮。缺了会报错或丧失记忆。
+</Callout>
+
+## 3. 多工具协作
+
+Agent 的强大在于**自主选择**多个工具组合：
+
+```ts
+const tools = [calculator, webSearch, dbQuery];
+// 模型会自行判断：先搜天气，再算温差，无需你写 if/else
+```
+
+## 4. 注意事项
+
+<Callout type="warn" title="工具调用要设边界">
+Agent 能执行任意工具代码，存在「提示注入」与「越权」风险。务必：①工具内部做输入校验；②限制可访问资源；③高危险操作（删库、发消息）人工确认。不要给 Agent 裸 Shell 权限。
+</Callout>
+
+| 实践 | 建议 |
+|---|---|
+| 工具描述 | 写清「何时用、参数含义、返回什么」 |
+| 模型温度 | Agent 用 `temperature: 0` 更稳 |
+| 循环保护 | `maxIterations` 限制步数，防死循环 |
+
+<Callout type="exercise" title="练习">
+定义一个 `getWeather(city)` 工具（可返回假数据），和 `calculator` 组合成 Agent，让它回答「北京比上海温度高多少？」（假设两城温度已知）。
+</Callout>
+
+## 小结
+
+- Agent 让模型自主决定调用哪些工具、调几次
+- `@tool` 装饰器 + Zod schema 定义工具，`description` 决定调用准确率
+- `createToolCallingAgent` + `AgentExecutor` 是现代标准写法
+- 工具必须做安全边界与输入校验
+- 下章学习给对话加上记忆 →
