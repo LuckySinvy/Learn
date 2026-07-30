@@ -1,8 +1,8 @@
 export type Language = 'python' | 'go' | 'java' | 'grafana' | 'rag' | 'langchain' | 'dify' | 'k8s' | 'rust';
 
-// 可在 Docker 沙箱中执行的“编程语言”。Grafana 是可视化/可观测性平台，
-// 其教程以配置（YAML/JSON/PromQL 等）为主，不在沙箱中执行。
-export type ExecutableLanguage = 'python' | 'go' | 'java';
+// 可在 Docker 沙箱中执行的“编程语言”。Grafana 等以配置（YAML/JSON/PromQL 等）
+// 为主，不在沙箱中执行；Rust 用 rustc 单文件编译后运行（仅标准库可用）。
+export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust';
 
 export type ExecuteRequest = {
   language: Language;

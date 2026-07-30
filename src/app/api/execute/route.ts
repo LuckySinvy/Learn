@@ -6,7 +6,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const MAX_CODE_LEN = 50_000;
-const VALID_LANGS: Language[] = ['python', 'go', 'java'];
+const VALID_LANGS: Language[] = ['python', 'go', 'java', 'rust'];
 
 // 简单限流：进程并发上限 5
 let inFlight = 0;
@@ -68,6 +68,9 @@ export async function POST(req: NextRequest) {
     else if (result.exitCode !== 0) {
       // 启发式：stderr 包含 javac 错误 → compile_error
       if (body.language === 'java' && /Main\.java|error:/i.test(result.stderr)) {
+        status = 'compile_error';
+      } else if (body.language === 'rust' && /error(\[\d+]|[:,])/.test(result.stderr)) {
+        // rustc 编译错误形如 `error[E0382]: ...` 或 `error: ...`
         status = 'compile_error';
       } else {
         status = 'runtime_error';

@@ -10,8 +10,11 @@ Rust 标准库 `std::collections` 提供运行时动态的集合。它们都在*
 
 ## 1. Vec 动态数组
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-11-vec"
+  title="Vec 动态数组"
+  code={`fn main() {
     let mut v: Vec<i32> = Vec::new();
     v.push(1);
     v.push(2);
@@ -23,8 +26,11 @@ fn main() {
     for x in &v2 {
         println!("{}", x);
     }
-}
-```
+    println!("第三个 = {}", third);
+    println!("maybe = {:?}", maybe);
+}`}
+  expectedOutput={`10\n20\n30\n第三个 = 30\nmaybe = Some(30)`}
+/>
 
 <Callout type="warn" title="下标访问 vs get">
 `v[i]` 越界直接 panic；`v.get(i)` 返回 `Option<&T>`，应优先用于不确定是否越界的场景。
@@ -44,8 +50,11 @@ for w in &words { println!("{}", w); }
 
 `String` 是堆上可增长的 UTF-8 字符串。常用操作：
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-11-string"
+  title="String 拼接"
+  code={`fn main() {
     let mut s = String::from("Hello");
     s.push_str(", ");
     s.push('R');                  // push 单字符
@@ -53,8 +62,10 @@ fn main() {
 
     let s2 = format!("{}-{}", s, 2024);   // format! 不获取所有权
     println!("{}", s2);
-}
-```
+    println!("原串仍可用：{}", s);
+}`}
+  expectedOutput={`Hello, Rust-2024\n原串仍可用：Hello, Rust`}
+/>
 
 <Callout type="tip" title="format! 不转移所有权">
 `format!` 很像 `println!`，但返回 `String`，且不获取参数所有权，适合构造新字符串。
@@ -62,8 +73,11 @@ fn main() {
 
 ## 4. HashMap 键值对
 
-```rust
-use std::collections::HashMap;
+<Playground
+  language="rust"
+  id="rust-11-hashmap"
+  title="HashMap 键值对"
+  code={`use std::collections::HashMap;
 
 fn main() {
     let mut scores = HashMap::new();
@@ -71,13 +85,20 @@ fn main() {
     scores.insert(String::from("red"), 20);
 
     let v = scores.get("blue");   // Option<&i32>
-    scores.entry(String::from("green")).or_insert(0);  // 不存在才插入
+    println!("blue = {:?}", v);
 
-    for (k, val) in &scores {
+    scores.entry(String::from("green")).or_insert(0);  // 不存在才插入
+    scores.entry(String::from("blue")).or_insert(999); // 已存在，不覆盖
+
+    // HashMap 遍历顺序不固定，这里排序后输出以保证结果稳定
+    let mut pairs: Vec<_> = scores.iter().collect();
+    pairs.sort();
+    for (k, val) in pairs {
         println!("{}: {}", k, val);
     }
-}
-```
+}`}
+  expectedOutput={`blue = Some(10)\nblue: 10\ngreen: 0\nred: 20`}
+/>
 
 <Callout type="info" title="entry API 很实用">
 `entry(key).or_insert(default)` 是「存在就用、不存在就插入默认值」的惯用法，避免先 `get` 再 `insert` 的两次查找。

@@ -10,8 +10,11 @@ description: 理解 & 引用、不可变借用与可变借用的规则，以及�
 
 ## 1. 不可变引用 &T
 
-```rust
-fn print_len(s: &String) {
+<Playground
+  language="rust"
+  id="rust-06-immutable-ref"
+  title="不可变引用 &T"
+  code={`fn print_len(s: &String) {
     println!("长度 = {}", s.len());
 }   // s 只是借用，不会 drop 原数据
 
@@ -19,13 +22,17 @@ fn main() {
     let s = String::from("hello");
     print_len(&s);          // 传引用，s 仍可用
     println!("{}", s);
-}
-```
+}`}
+  expectedOutput={`长度 = 5\nhello`}
+/>
 
 ## 2. 可变引用 &mut T
 
-```rust
-fn append(s: &mut String) {
+<Playground
+  language="rust"
+  id="rust-06-mutable-ref"
+  title="可变引用 &mut T"
+  code={`fn append(s: &mut String) {
     s.push_str(" world");
 }
 
@@ -33,8 +40,9 @@ fn main() {
     let mut s = String::from("hello");
     append(&mut s);
     println!("{}", s);   // hello world
-}
-```
+}`}
+  expectedOutput={`hello world`}
+/>
 
 <Callout type="warn" title="借用检查器的核心规则">
 1. 同一时刻可以有**多个不可变借用** `&T`；
@@ -45,8 +53,11 @@ fn main() {
 
 ## 3. 借用规则实战
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-06-borrow-rules"
+  title="借用规则实战"
+  code={`fn main() {
     let mut s = String::from("hi");
     let r1 = &s;          // 不可变借用
     let r2 = &s;          // 多个不可变借用，OK
@@ -55,8 +66,10 @@ fn main() {
     // 借用结束后，才能再借可变
     let r3 = &mut s;      // OK，因为 r1/r2 已不再使用
     r3.push_str("!");
-}
-```
+    println!("{}", r3);
+}`}
+  expectedOutput={`hi hi\nhi!`}
+/>
 
 <Callout type="tip" title="非词法生命周期（NLL）">
 现代 Rust 用 NLL：借用在「最后一次使用处」就结束，不必等到作用域末尾。上面例子能编译通过正是这个原因。

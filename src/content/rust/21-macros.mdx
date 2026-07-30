@@ -12,8 +12,11 @@ description: 声明宏 macro_rules! 的写法、常用内置宏，以及过程�
 
 用 `macro_rules!` 写匹配模式的宏：
 
-```rust
-macro_rules! say_hello {
+<Playground
+  language="rust"
+  id="rust-21-macro-rules"
+  title="声明宏"
+  code={`macro_rules! say_hello {
     () => {
         println!("你好！");
     };
@@ -25,8 +28,10 @@ macro_rules! say_hello {
 fn main() {
     say_hello!();
     say_hello!("小明");
-}
-```
+}`}
+  expectedOutput={`你好！
+你好，小明！`}
+/>
 
 <Callout type="info" title="宏是模式匹配">
 宏体由「匹配器 => 展开体」组成。`$name:expr` 表示捕获一个表达式，`$name` 在右侧可重复引用。类似 `match`，按首匹配生效。
@@ -34,8 +39,11 @@ fn main() {
 
 ## 2. 重复捕获
 
-```rust
-macro_rules! vec_of {
+<Playground
+  language="rust"
+  id="rust-21-macro-repeat"
+  title="重复捕获"
+  code={`macro_rules! vec_of {
     ($($x:expr),*) => {
         {
             let mut v = Vec::new();
@@ -48,8 +56,9 @@ macro_rules! vec_of {
 fn main() {
     let v = vec_of![1, 2, 3];
     println!("{:?}", v);
-}
-```
+}`}
+  expectedOutput={`[1, 2, 3]`}
+/>
 
 `$($x:expr),*` 表示「重复零次或多次，用逗号分隔」，右侧 `$(...)*` 同步展开。
 

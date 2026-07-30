@@ -29,11 +29,15 @@ cargo --version
 
 不用 cargo 也能直接编译单个文件，适合快速验证：
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-01-hello"
+  title="Hello World"
+  code={`fn main() {
     println!("Hello, world!");
-}
-```
+}`}
+  expectedOutput={`Hello, world!`}
+/>
 
 ```bash
 rustc main.rs      # 编译生成可执行文件 main

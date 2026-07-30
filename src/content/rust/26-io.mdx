@@ -61,18 +61,43 @@ w.flush()?;    // 确保缓冲全部写入
 
 ## 4. 路径与目录
 
-```rust
-use std::path::Path;
-let p = Path::new("a/b.txt");
-println!("{:?}", p.parent());
-println!("{:?}", p.file_name());
+<Playground
+  language="rust"
+  id="rust-26-path"
+  title="Path 路径操作"
+  code={`use std::path::Path;
 
-fs::create_dir_all("logs")?;
+fn main() {
+    let p = Path::new("a/b.txt");
+    println!("{:?}", p.parent());
+    println!("{:?}", p.file_name());
+}`}
+  expectedOutput={`Some("a")
+Some("b.txt")`}
+/>
+
+```rust
+fs::create_dir_all("logs")?;   // 递归创建目录
 ```
 
 <Callout type="warn" title="IO 错误必须用 ? 或 match 处理">
 `File::open` 返回 `Result`，文件不存在时是 `Err`。务必传播或处理，不能 `unwrap` 进生产代码（库场景）。
 </Callout>
+
+<Playground
+  language="rust"
+  id="rust-26-io-error"
+  title="IO 错误处理"
+  code={`use std::fs::File;
+
+fn main() {
+    match File::open("missing.txt") {
+        Ok(_) => println!("打开成功"),
+        Err(e) => println!("打开失败: {:?}", e.kind()),
+    }
+}`}
+  expectedOutput={`打开失败: NotFound`}
+/>
 
 ## 5. 标准输入输出
 

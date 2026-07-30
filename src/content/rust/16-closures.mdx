@@ -10,15 +10,19 @@ description: 闭包语法、Fn/FnMut/FnOnce 三个 trait，以及闭包如何捕
 
 ## 1. 闭包语法
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-16-closure-syntax"
+  title="闭包语法"
+  code={`fn main() {
     let add_one = |x: i32| x + 1;        // 单表达式
     let sum = |a, b| {                   // 多语句用花括号
         a + b
     };
     println!("{} {}", add_one(5), sum(2, 3));
-}
-```
+}`}
+  expectedOutput={`6 5`}
+/>
 
 <Callout type="tip" title="类型通常可省略">
 闭包参数与返回类型大多能被编译器推断，比 `fn` 更省标注。仅在你想限定类型时才写。
@@ -28,13 +32,17 @@ fn main() {
 
 闭包能从定义处「借用」周围变量：
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-16-closure-capture"
+  title="捕获环境"
+  code={`fn main() {
     let factor = 3;
     let scale = |x| x * factor;     // 捕获 factor
     println!("{}", scale(10));      // 30
-}
-```
+}`}
+  expectedOutput={`30`}
+/>
 
 ## 3. Fn / FnMut / FnOnce
 
@@ -61,8 +69,11 @@ println!("{}", count);
 
 用泛型 + trait bound 接收闭包：
 
-```rust
-fn apply<F>(f: F)
+<Playground
+  language="rust"
+  id="rust-16-closure-param"
+  title="闭包作为参数"
+  code={`fn apply<F>(f: F)
 where
     F: Fn(i32) -> i32,
 {
@@ -71,8 +82,9 @@ where
 
 fn main() {
     apply(|x| x * 2);
-}
-```
+}`}
+  expectedOutput={`10`}
+/>
 
 ## 5. 返回闭包
 

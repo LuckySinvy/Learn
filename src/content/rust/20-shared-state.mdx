@@ -12,8 +12,11 @@ description: 用 Mutex 保护共享数据、Arc 实现线程间引用计数，�
 
 `Mutex<T>` 保证同一时刻只有一个线程能访问内部数据：
 
-```rust
-use std::sync::Mutex;
+<Playground
+  language="rust"
+  id="rust-20-mutex"
+  title="Mutex 互斥锁"
+  code={`use std::sync::Mutex;
 
 fn main() {
     let m = Mutex::new(5);
@@ -22,8 +25,9 @@ fn main() {
         *num += 1;                          // 通过解引用修改
     }                                        // 离开作用域自动释放锁
     println!("{}", m.lock().unwrap());
-}
-```
+}`}
+  expectedOutput={`6`}
+/>
 
 <Callout type="warn" title="锁要尽快释放">
 `lock()` 返回守卫（guard），其作用域结束即自动解锁。务必把修改逻辑包在小作用域里，别长时间持锁，否则阻塞其他线程。
@@ -33,8 +37,11 @@ fn main() {
 
 `Rc` 不是 `Send`，不能跨线程。`Arc`（原子引用计数）是线程安全版：
 
-```rust
-use std::sync::{Arc, Mutex};
+<Playground
+  language="rust"
+  id="rust-20-arc-mutex"
+  title="Arc + Mutex 共享计数"
+  code={`use std::sync::{Arc, Mutex};
 use std::thread;
 
 fn main() {
@@ -52,8 +59,9 @@ fn main() {
 
     for h in handles { h.join().unwrap(); }
     println!("结果 = {}", *counter.lock().unwrap());   // 3
-}
-```
+}`}
+  expectedOutput={`结果 = 3`}
+/>
 
 <Callout type="info" title="Arc<Mutex<T>> 是经典组合">
 `Arc` 解决「多所有者共享」，但只读；`Mutex` 解决「内部可变但互斥」。二者结合 = 多线程安全修改共享状态。

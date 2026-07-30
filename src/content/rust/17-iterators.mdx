@@ -21,21 +21,29 @@ trait Iterator {
 
 `next` 每次返回 `Some(元素)`，遍历完返回 `None`。
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-17-iterator-next"
+  title="Iterator::next"
+  code={`fn main() {
     let v = vec![1, 2, 3];
     let mut it = v.iter();
     println!("{:?}", it.next());   // Some(&1)
     println!("{:?}", it.next());   // Some(&2)
-}
-```
+}`}
+  expectedOutput={`Some(1)
+Some(2)`}
+/>
 
 ## 2. 适配器：map / filter
 
 适配器是**惰性**的——定义转换但不立即执行，直到被「消费」：
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-17-map-filter"
+  title="map / filter 适配器"
+  code={`fn main() {
     let v = vec![1, 2, 3, 4, 5];
     let evens_sq: Vec<i32> = v
         .iter()
@@ -43,8 +51,9 @@ fn main() {
         .map(|&x| x * x)
         .collect();
     println!("{:?}", evens_sq);   // [4, 16]
-}
-```
+}`}
+  expectedOutput={`[4, 16]`}
+/>
 
 <Callout type="info" title="惰性求值的威力">
 `map`/`filter` 不会立刻产生新集合，只构建一条「处理流水线」。只有 `collect`/`sum` 等消费型方法触发时，才真正逐个计算，避免中间 Vec 分配。
@@ -82,8 +91,11 @@ for x in v.iter_mut() { *x *= 2; }
 
 ## 5. 实现自定义迭代器
 
-```rust
-struct Counter { n: u32 }
+<Playground
+  language="rust"
+  id="rust-17-custom-iterator"
+  title="自定义迭代器"
+  code={`struct Counter { n: u32 }
 impl Iterator for Counter {
     type Item = u32;
     fn next(&mut self) -> Option<u32> {
@@ -91,7 +103,14 @@ impl Iterator for Counter {
         if self.n <= 3 { Some(self.n) } else { None }
     }
 }
-```
+
+fn main() {
+    let c = Counter { n: 0 };
+    let all: Vec<u32> = c.collect();
+    println!("{:?}", all);
+}`}
+  expectedOutput={`[1, 2, 3]`}
+/>
 
 <Callout type="exercise" title="练习">
 用迭代器把 `Vec<String>` 里所有长度大于 3 的单词转成大写，收集成新 `Vec<String>`（提示：`filter` + `map` + `to_uppercase` + `collect`）。再统计其中字符总数。

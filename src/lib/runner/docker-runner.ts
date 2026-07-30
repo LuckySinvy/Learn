@@ -127,4 +127,12 @@ export const LANG_CONFIG: Record<ExecutableLanguage, Omit<DockerRunConfig, 'cmd'
     cpus: 1.0,
     filename: 'Main.java',
   },
+  rust: {
+    image: 'rust:slim',
+    cmd: 'rustc -O /code/main.rs -o /code/main && /code/main',
+    timeoutMs: 20000,
+    memoryMb: 256,
+    cpus: 1.0,
+    filename: 'main.rs',
+  },
 };

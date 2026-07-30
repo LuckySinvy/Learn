@@ -10,19 +10,28 @@ description: mod/use 组织代码、路径与 crate 根、可见性 pub 规则�
 
 ## 1. 用 mod 定义模块
 
-```rust
-mod network {
+<Playground
+  language="rust"
+  id="rust-10-mod"
+  title="mod 与可见性"
+  code={`mod network {
     pub fn connect() {
         println!("连接中...");
+        status();
     }
 
-    fn secret() { /* 默认私有，仅模块内可见 */ }
+    // 默认私有，仅模块内可见
+    fn status() {
+        println!("状态：已就绪");
+    }
 }
 
 fn main() {
     network::connect();
-}
-```
+    // network::status();  // 编译错误：private function
+}`}
+  expectedOutput={`连接中...\n状态：已就绪`}
+/>
 
 <Callout type="info" title="默认私有">
 模块内项默认是 `私有的`（仅本模块及子模块可见）。加 `pub` 才对外暴露。这与「变量默认不可变」一样，都是 Rust「默认收紧」哲学的体现。
@@ -30,13 +39,26 @@ fn main() {
 
 ## 2. 用 use 引入路径
 
-```rust
-use crate::network::connect;
+<Playground
+  language="rust"
+  id="rust-10-use"
+  title="use 引入路径"
+  code={`mod geometry {
+    pub mod shapes {
+        pub fn area(w: f64, h: f64) -> f64 {
+            w * h
+        }
+    }
+}
+
+use crate::geometry::shapes::area;
 
 fn main() {
-    connect();   // 不必写全路径
-}
-```
+    println!("面积 = {}", area(3.0, 4.0));   // 不必写全路径
+    // 也可用 as 改名：use ... as rect_area;
+}`}
+  expectedOutput={`面积 = 12`}
+/>
 
 也可用 `as` 改名避免冲突：`use std::io::Result as IoResult;`。
 

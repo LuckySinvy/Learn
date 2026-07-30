@@ -10,8 +10,11 @@ Rust 的标准库直接提供操作系统线程，并靠**所有权**在编译�
 
 ## 1. 创建线程
 
-```rust
-use std::thread;
+<Playground
+  language="rust"
+  id="rust-19-thread-spawn"
+  title="创建线程"
+  code={`use std::thread;
 
 fn main() {
     let handle = thread::spawn(|| {
@@ -22,8 +25,12 @@ fn main() {
 
     handle.join().unwrap();   // 等待子线程结束
     println!("主线程结束");
-}
-```
+}`}
+  expectedOutput={`子线程: 1
+子线程: 2
+子线程: 3
+主线程结束`}
+/>
 
 <Callout type="info" title="join 阻塞等待">
 `spawn` 返回 `JoinHandle`。`join()` 会阻塞当前线程直到它结束。不调用 `join` 可能主线程先退出，子线程被强制终止。
@@ -33,8 +40,11 @@ fn main() {
 
 子线程可能比当前栈活得久，所以必须用 `move` 把数据所有权移进去：
 
-```rust
-use std::thread;
+<Playground
+  language="rust"
+  id="rust-19-thread-move"
+  title="move 闭包"
+  code={`use std::thread;
 
 fn main() {
     let msg = String::from("你好");
@@ -42,8 +52,9 @@ fn main() {
         println!("{}", msg);   // msg 被 move 进闭包
     });
     handle.join().unwrap();
-}
-```
+}`}
+  expectedOutput={`你好`}
+/>
 
 <Callout type="warn" title="忘记 move 会编译失败">
 若直接捕获 `msg`（非 move），闭包借用了可能已 drop 的变量，编译期就被拒绝。这正是 Rust 防止悬垂引用的体现。
@@ -53,8 +64,11 @@ fn main() {
 
 `mpsc`（多生产者单消费者）通道在线程间传递数据：
 
-```rust
-use std::sync::mpsc;
+<Playground
+  language="rust"
+  id="rust-19-channel"
+  title="channel 消息传递"
+  code={`use std::sync::mpsc;
 use std::thread;
 
 fn main() {
@@ -64,8 +78,9 @@ fn main() {
     });
     let received = rx.recv().unwrap();   // 阻塞接收
     println!("收到: {}", received);
-}
-```
+}`}
+  expectedOutput={`收到: 来自子线程`}
+/>
 
 <Callout type="tip" title="channel 转移所有权">
 `send` 把值的**所有权**移交到另一线程，接收方独占它。无需锁，天然避免竞争。

@@ -32,6 +32,30 @@ mod tests {
 `cfg(test)` 让这段模块只在 `cargo test` 时编译。发布构建 `cargo build` 时它完全不存在，零体积成本。
 </Callout>
 
+<Playground
+  language="rust"
+  id="rust-23-test-sim"
+  title="在 main 中模拟测试（沙盒不支持 cargo test）"
+  code={`fn add(a: i32, b: i32) -> i32 { a + b }
+
+fn check(name: &str, pass: bool) {
+    if pass {
+        println!("[ok] {}", name);
+    } else {
+        println!("[FAIL] {}", name);
+    }
+}
+
+fn main() {
+    check("add(2,3)==5", add(2, 3) == 5);
+    check("add(2,2)!=5", add(2, 2) != 5);
+    println!("测试结束");
+}`}
+  expectedOutput={`[ok] add(2,3)==5
+[ok] add(2,2)!=5
+测试结束`}
+/>
+
 ## 2. 断言宏
 
 | 宏 | 用途 |
@@ -48,6 +72,20 @@ fn test_panic() {
     panic!("boom");
 }
 ```
+
+<Playground
+  language="rust"
+  id="rust-23-assert"
+  title="断言宏（在 main 中演示）"
+  code={`fn main() {
+    let add = |a: i32, b: i32| a + b;
+    assert_eq!(add(2, 3), 5);
+    assert_ne!(add(2, 2), 5);
+    assert!(add(0, 0) == 0);
+    println!("全部断言通过！");
+}`}
+  expectedOutput={`全部断言通过！`}
+/>
 
 ## 3. 集成测试
 

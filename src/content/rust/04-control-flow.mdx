@@ -10,16 +10,20 @@ Rust 中**控制流也是表达式**——它们能返回值，这让代码更�
 
 ## 1. 函数 fn
 
-```rust
-fn add(a: i32, b: i32) -> i32 {
+<Playground
+  language="rust"
+  id="rust-04-fn"
+  title="函数 fn"
+  code={`fn add(a: i32, b: i32) -> i32 {
     a + b          // 无分号 = 返回值（表达式）
 }
 
 fn main() {
     let r = add(2, 3);
     println!("{}", r);
-}
-```
+}`}
+  expectedOutput={`5`}
+/>
 
 <Callout type="tip" title="表达式 vs 语句">
 以分号结尾是「语句」（无返回值）；不加结尾分号的最后一个表达式就是返回值。也可以显式 `return x;`，但通常省略更地道。
@@ -41,8 +45,11 @@ fn main() {
 
 ## 3. 循环：loop / while / for
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-04-loops"
+  title="循环"
+  code={`fn main() {
     // loop：无限循环，用 break 退出并可带值
     let mut i = 0;
     let result = loop {
@@ -61,15 +68,19 @@ fn main() {
     for x in 0..3 {
         println!("x = {}", x);
     }
-}
-```
+}`}
+  expectedOutput={`loop 结果 = 50\nx = 0\nx = 1\nx = 2`}
+/>
 
 ## 4. match 穷尽匹配
 
 `match` 类似增强版 `switch`，但**必须覆盖所有可能**：
 
-```rust
-fn describe(n: i32) -> &'static str {
+<Playground
+  language="rust"
+  id="rust-04-match"
+  title="match 穷尽匹配"
+  code={`fn describe(n: i32) -> &'static str {
     match n {
         0 => "零",
         1 | 2 => "小",
@@ -79,9 +90,13 @@ fn describe(n: i32) -> &'static str {
 }
 
 fn main() {
+    println!("{}", describe(0));
+    println!("{}", describe(2));
     println!("{}", describe(5));
-}
-```
+    println!("{}", describe(100));
+}`}
+  expectedOutput={`零\n小\n个位数\n其他`}
+/>
 
 <Callout type="info" title="为什么 match 安全">
 编译器强制「穷尽性」：漏掉任何分支（包括通配 `_`）都会编译报错。这避免了「忘了处理某种情况」的 bug。

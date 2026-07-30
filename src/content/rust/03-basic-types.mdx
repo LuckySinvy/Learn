@@ -52,23 +52,36 @@ let emoji = '😊';         // char 可存任意 Unicode 字符
 
 固定长度、可异类型的组合：
 
-```rust
-let tup: (i32, f64, char) = (500, 6.4, 'z');
-let (a, b, c) = tup;       // 解构
-println!("{} {} {}", a, b, c);
-println!("第一个 = {}", tup.0);  // 用 .索引 访问
-```
+<Playground
+  language="rust"
+  id="rust-03-tuple"
+  title="元组"
+  code={`fn main() {
+    let tup: (i32, f64, char) = (500, 6.4, 'z');
+    let (a, b, c) = tup;       // 解构
+    println!("{} {} {}", a, b, c);
+    println!("第一个 = {}", tup.0);  // 用 .索引 访问
+}`}
+  expectedOutput={`500 6.4 z\n第一个 = 500`}
+/>
 
 ### 2.2 数组（array）
 
 同类型、固定长度，栈上连续存储：
 
-```rust
-let arr = [1, 2, 3, 4, 5];
-let same = [0; 3];         // [0, 0, 0]
-println!("长度 = {}", arr.len());
-println!("第二个 = {}", arr[1]);
-```
+<Playground
+  language="rust"
+  id="rust-03-array"
+  title="数组"
+  code={`fn main() {
+    let arr = [1, 2, 3, 4, 5];
+    let same = [0; 3];         // [0, 0, 0]
+    println!("长度 = {}", arr.len());
+    println!("第二个 = {}", arr[1]);
+    println!("same = {:?}", same);
+}`}
+  expectedOutput={`长度 = 5\n第二个 = 2\nsame = [0, 0, 0]`}
+/>
 
 <Callout type="warn" title="越界访问会 panic">
 用越界下标 `arr[99]` 访问数组，运行时会触发 panic 并安全退出，不会像 C 那样读到脏内存。这正是 Rust 安全性的体现。

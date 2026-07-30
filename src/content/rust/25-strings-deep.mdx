@@ -26,11 +26,19 @@ let borrowed: &str = "你好";                 // 只读、借用（字面量在
 
 一个字符可能占多个字节。按**字节**索引会出错：
 
-```rust
-let s = String::from("你好");
-// println!("{}", &s[0..1]);   // 编译/运行错误：切在字符中间
-println!("字符数 = {}", s.chars().count());   // 2，按 Unicode 字符
-```
+<Playground
+  language="rust"
+  id="rust-25-utf8"
+  title="UTF-8 字节与字符"
+  code={`fn main() {
+    let s = String::from("你好");
+    // println!("{}", &s[0..1]);   // 运行错误：切在字符中间
+    println!("字节数 = {}", s.len());              // 6，UTF-8 字节
+    println!("字符数 = {}", s.chars().count());   // 2，按 Unicode 字符
+}`}
+  expectedOutput={`字节数 = 6
+字符数 = 2`}
+/>
 
 <Callout type="warn" title="不要按字节切字符串">
 中文字符在 UTF-8 中占 3 字节。对 `String` 用 `[0..1]` 切片极易落在字符中间，Rust 会直接 panic 来阻止产生非法 UTF-8。
@@ -38,12 +46,22 @@ println!("字符数 = {}", s.chars().count());   // 2，按 Unicode 字符
 
 ## 3. 遍历字符
 
-```rust
-for c in "你好abc".chars() {
-    println!("{}", c);
-}
-// 若要字节：.bytes()
-```
+<Playground
+  language="rust"
+  id="rust-25-chars"
+  title="遍历字符"
+  code={`fn main() {
+    for c in "你好abc".chars() {
+        println!("{}", c);
+    }
+    // 若要字节：.bytes()
+}`}
+  expectedOutput={`你
+好
+a
+b
+c`}
+/>
 
 ## 4. 拼接与转换
 

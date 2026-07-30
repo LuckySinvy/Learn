@@ -17,6 +17,30 @@ enum Result<T, E> {
 }
 ```
 
+<Playground
+  language="rust"
+  id="rust-12-result"
+  title="Result 与 match"
+  code={`fn parse_age(s: &str) -> Result<u32, std::num::ParseIntError> {
+    s.parse::<u32>()
+}
+
+fn main() {
+    match parse_age("30") {
+        Ok(n) => println!("年龄 = {}", n),
+        Err(e) => println!("失败: {}", e),
+    }
+
+    match parse_age("abc") {
+        Ok(n) => println!("年龄 = {}", n),
+        Err(e) => println!("失败: {}", e),
+    }
+}`}
+  expectedOutput={`年龄 = 30\n失败: invalid digit found in string`}
+/>
+
+文件操作同理，`File::open` 返回的也是 `Result`：
+
 ```rust
 use std::fs::File;
 
@@ -73,6 +97,32 @@ fn read_text() -> Result<String, io::Error> {
     Ok(s)
 }
 ```
+
+同样的模式用在解析上，可在沙箱里直接运行：
+
+<Playground
+  language="rust"
+  id="rust-12-question-mark"
+  title="? 运算符传播错误"
+  code={`use std::num::ParseIntError;
+
+fn sum_two(a: &str, b: &str) -> Result<i32, ParseIntError> {
+    let x: i32 = a.parse()?;   // 失败则提前返回 Err
+    let y: i32 = b.parse()?;
+    Ok(x + y)
+}
+
+fn main() {
+    println!("{:?}", sum_two("3", "4"));
+    println!("{:?}", sum_two("3", "oops"));
+
+    match sum_two("10", "20") {
+        Ok(v) => println!("和 = {}", v),
+        Err(e) => println!("出错: {}", e),
+    }
+}`}
+  expectedOutput={`Ok(7)\nErr(ParseIntError { kind: InvalidDigit })\n和 = 30`}
+/>
 
 ## 5. 自定义错误类型
 

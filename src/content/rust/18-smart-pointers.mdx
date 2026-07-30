@@ -10,12 +10,16 @@ description: Box 堆分配、Rc 引用计数共享，以及 RefCell 提供的运
 
 ## 1. `Box<T>`：最简单的堆分配
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-18-box"
+  title="Box 堆分配"
+  code={`fn main() {
     let b = Box::new(5);          // 把值放到堆上
     println!("{}", b);            // 像普通值一样用（Deref）
-}
-```
+}`}
+  expectedOutput={`5`}
+/>
 
 常见用途：递归类型、特大对象、trait 对象。
 
@@ -34,8 +38,11 @@ enum List {
 
 单所有权不够用时，`Rc` 允许多个地方共享同一份只读数据：
 
-```rust
-use std::rc::Rc;
+<Playground
+  language="rust"
+  id="rust-18-rc"
+  title="Rc 引用计数"
+  code={`use std::rc::Rc;
 
 fn main() {
     let shared = Rc::new(String::from("hi"));
@@ -43,8 +50,9 @@ fn main() {
     let b = Rc::clone(&shared);
     println!("引用计数 = {}", Rc::strong_count(&shared));
     // a、b、shared 都指向同一数据
-}
-```
+}`}
+  expectedOutput={`引用计数 = 3`}
+/>
 
 <Callout type="warn" title="Rc 只能单线程">
 `Rc` 不是线程安全的（无 `Sync`）。多线程共享用 `Arc`。且 `Rc` 内部数据默认不可变——要可变需配合 `RefCell`。
@@ -54,15 +62,19 @@ fn main() {
 
 普通借用检查在编译期；`RefCell` 把检查推迟到**运行时**，从而能在「看似不可变」的 API 里做可变操作：
 
-```rust
-use std::cell::RefCell;
+<Playground
+  language="rust"
+  id="rust-18-refcell"
+  title="RefCell 内部可变性"
+  code={`use std::cell::RefCell;
 
 fn main() {
     let cell = RefCell::new(5);
     *cell.borrow_mut() += 1;       // 运行时可变借用
     println!("{}", cell.borrow()); // 运行时不可变借用
-}
-```
+}`}
+  expectedOutput={`6`}
+/>
 
 <Callout type="tip" title="Rc + RefCell 组合很常见">
 `Rc<RefCell<T>>` = 多所有者 + 可内部可变。这是 Rust 中「共享可变状态」的常见模式，但违反借用规则会在运行时 panic。

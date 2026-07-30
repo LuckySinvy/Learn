@@ -10,14 +10,18 @@ description: 字符串切片与数组切片，理解切片本质是对数据的�
 
 ## 1. 字符串切片 &str
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-07-str-slice"
+  title="字符串切片"
+  code={`fn main() {
     let s = String::from("hello world");
     let hello = &s[0..5];     // "hello"
     let world = &s[6..11];    // "world"
     println!("{} + {}", hello, world);
-}
-```
+}`}
+  expectedOutput={`hello + world`}
+/>
 
 `&str` 是「字符串切片」：一个指针 + 长度。字符串字面量 `"abc"` 的类型就是 `&'static str`——指向二进制里的只读数据。
 
@@ -29,8 +33,11 @@ fn main() {
 
 对 `s` 取切片时，同时持有一个不可变借用。因此切片存活期间，不能对 `s` 做可变操作：
 
-```rust
-fn first_word(s: &str) -> &str {
+<Playground
+  language="rust"
+  id="rust-07-first-word"
+  title="取第一个单词"
+  code={`fn first_word(s: &str) -> &str {
     let bytes = s.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         if b == b' ' {
@@ -39,7 +46,13 @@ fn first_word(s: &str) -> &str {
     }
     &s[..]
 }
-```
+
+fn main() {
+    println!("{}", first_word("hello world"));
+    println!("{}", first_word("single"));
+}`}
+  expectedOutput={`hello\nsingle`}
+/>
 
 <Callout type="warn" title="切片的边界检查">
 `&s[0..100]` 若越界会 panic。切片必须在 UTF-8 字符边界上切，否则编译/运行报错——Rust 不会让你把一个多字节字符劈成两半。
@@ -47,14 +60,19 @@ fn first_word(s: &str) -> &str {
 
 ## 3. 数组切片
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-07-array-slice"
+  title="数组切片"
+  code={`fn main() {
     let arr = [1, 2, 3, 4, 5];
     let mid = &arr[1..4];     // [2, 3, 4]，类型 &[i32]
     let sum: i32 = mid.iter().sum();
+    println!("{:?}", mid);
     println!("{}", sum);
-}
-```
+}`}
+  expectedOutput={`[2, 3, 4]\n9`}
+/>
 
 数组切片 `&[T]` 与 `Vec<T>` 的切片同理，都是「指针 + 长度」的胖指针。
 

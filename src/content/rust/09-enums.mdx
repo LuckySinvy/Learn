@@ -25,18 +25,34 @@ fn main() {
 
 ## 2. 携带数据的枚举
 
-```rust
-enum Message {
+<Playground
+  language="rust"
+  id="rust-09-enum-data"
+  title="携带数据的枚举"
+  code={`enum Message {
     Quit,                        // 无数据
     Move { x: i32, y: i32 },     // 具名字段
     Write(String),               // 元组式
     ChangeColor(i32, i32, i32),
 }
 
-fn main() {
-    let m = Message::Write(String::from("hi"));
+fn handle(m: &Message) {
+    match m {
+        Message::Quit => println!("退出"),
+        Message::Move { x, y } => println!("移动到 ({}, {})", x, y),
+        Message::Write(text) => println!("写入: {}", text),
+        Message::ChangeColor(r, g, b) => println!("变色 {} {} {}", r, g, b),
+    }
 }
-```
+
+fn main() {
+    handle(&Message::Write(String::from("hi")));
+    handle(&Message::Move { x: 3, y: 4 });
+    handle(&Message::ChangeColor(255, 0, 0));
+    handle(&Message::Quit);
+}`}
+  expectedOutput={`写入: hi\n移动到 (3, 4)\n变色 255 0 0\n退出`}
+/>
 
 ## 3. Option：没有 null 的世界
 
@@ -51,8 +67,11 @@ enum Option<T> {
 
 用它彻底消灭空指针异常：
 
-```rust
-fn divide(a: f64, b: f64) -> Option<f64> {
+<Playground
+  language="rust"
+  id="rust-09-option"
+  title="Option 与 match"
+  code={`fn divide(a: f64, b: f64) -> Option<f64> {
     if b == 0.0 { None } else { Some(a / b) }
 }
 
@@ -61,8 +80,14 @@ fn main() {
         Some(v) => println!("结果 {}", v),
         None => println!("除零错误"),
     }
-}
-```
+
+    match divide(1.0, 0.0) {
+        Some(v) => println!("结果 {}", v),
+        None => println!("除零错误"),
+    }
+}`}
+  expectedOutput={`结果 5\n除零错误`}
+/>
 
 <Callout type="warn" title="Option 强制你处理 None">
 因为 `Option<T>` 不是 `T`，你**必须**用 `match`/`if let` 把它拆开才能拿到里面的值。编译器逼你处理「没有值」的情况，从根上避免空引用崩溃。
@@ -72,8 +97,11 @@ fn main() {
 
 只关心一个分支时，不必写完整 `match`：
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-09-if-let"
+  title="if let / while let"
+  code={`fn main() {
     let some = Some(7);
     if let Some(n) = some {
         println!("得到 {}", n);
@@ -83,8 +111,9 @@ fn main() {
     while let Some(v) = stack.pop() {
         println!("{:?}", v);
     }
-}
-```
+}`}
+  expectedOutput={`得到 7\nSome(2)\nNone\nSome(1)`}
+/>
 
 <Callout type="tip" title="match 还是 if let">
 需要穷尽处理所有变体用 `match`；只关心某个变体、其余忽略时用 `if let`，更简洁。

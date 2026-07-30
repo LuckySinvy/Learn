@@ -10,8 +10,11 @@ description: 定义与实现 trait、默认方法、trait 对象实现多态，�
 
 ## 1. 定义与实现 trait
 
-```rust
-trait Summary {
+<Playground
+  language="rust"
+  id="rust-14-trait"
+  title="定义与实现 trait"
+  code={`trait Summary {
     fn summarize(&self) -> String;
 }
 
@@ -24,7 +27,13 @@ impl Summary for News {
         format!("头条: {}", self.headline)
     }
 }
-```
+
+fn main() {
+    let n = News { headline: String::from("Rust 1.0 发布") };
+    println!("{}", n.summarize());
+}`}
+  expectedOutput={`头条: Rust 1.0 发布`}
+/>
 
 <Callout type="info" title="trait 是能力契约">
 trait 只声明「有哪些方法」。一个类型 `impl` 了某 trait，就意味着它具备该能力，可被要求该能力的泛型/trait bound 接受。
@@ -63,14 +72,40 @@ fn notify<T: Summary>(item: &T) {
 
 用 `&dyn Trait` 存放「任何实现了该 trait 的类型」，在运行时动态分发：
 
-```rust
+<Playground
+  language="rust"
+  id="rust-14-dyn"
+  title="trait 对象与多态"
+  code={`trait Summary {
+    fn summarize(&self) -> String;
+}
+
+struct News { headline: String }
+struct Tweet { user: String }
+
+impl Summary for News {
+    fn summarize(&self) -> String {
+        format!("头条: {}", self.headline)
+    }
+}
+
+impl Summary for Tweet {
+    fn summarize(&self) -> String {
+        format!("@{} 发推", self.user)
+    }
+}
+
 fn main() {
+    let news = News { headline: String::from("Rust 很快") };
+    let tweet = Tweet { user: String::from("alice") };
+
     let items: Vec<&dyn Summary> = vec![&news, &tweet];
     for i in items {
         println!("{}", i.summarize());
     }
-}
-```
+}`}
+  expectedOutput={`头条: Rust 很快\n@alice 发推`}
+/>
 
 <Callout type="warn" title="dyn 有运行时开销">
 `dyn Trait` 通过虚表（vtable）动态调用，有轻微开销且大小不固定（需指针）。若编译期多态够用，优先用泛型 + trait bound（静态分发，零开销）。

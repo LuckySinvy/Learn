@@ -22,11 +22,22 @@ description: 理解生命周期标注 'a、编译器省略规则，以及如何�
 
 ## 2. 生命周期标注 'a
 
-```rust
-fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
+<Playground
+  language="rust"
+  id="rust-15-longest"
+  title="生命周期标注 'a"
+  code={`fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
     if x.len() > y.len() { x } else { y }
 }
-```
+
+fn main() {
+    let a = String::from("hello world");
+    let b = String::from("hi");
+    println!("较长的是: {}", longest(&a, &b));
+    println!("较长的是: {}", longest("abc", "abcdef"));
+}`}
+  expectedOutput={`较长的是: hello world\n较长的是: abcdef`}
+/>
 
 `'a` 是一个**名字**（任意名称，习惯用 `'a`/`'b`）。含义是：返回的引用，活得不超过 `x` 与 `y` 中**较短**的那个。
 
@@ -38,17 +49,30 @@ fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
 
 当结构体持有引用，必须标注其生命周期：
 
-```rust
-struct Excerpt<'a> {
+<Playground
+  language="rust"
+  id="rust-15-struct-lifetime"
+  title="结构体中的生命周期"
+  code={`struct Excerpt<'a> {
     part: &'a str,   // 引用必须活得比结构体久
+}
+
+impl<'a> Excerpt<'a> {
+    // 规则3：&self 的生命周期赋给输出，无需手写标注
+    fn announce(&self, msg: &str) -> &str {
+        println!("注意: {}", msg);
+        self.part
+    }
 }
 
 fn main() {
     let s = String::from("hello world");
     let ex = Excerpt { part: &s[0..5] };
     println!("{}", ex.part);
-}
-```
+    println!("{}", ex.announce("请阅读摘录"));
+}`}
+  expectedOutput={`hello\n注意: 请阅读摘录\nhello`}
+/>
 
 <Callout type="warn" title="结构体引用不能比数据活得久">
 若 `s` 在 `ex` 之前 drop，就悬垂了。编译器用 `'a` 强制「`s` 至少活到 `ex` 用完」。

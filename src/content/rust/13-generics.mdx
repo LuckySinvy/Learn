@@ -10,8 +10,11 @@ description: 泛型函数、结构体与枚举，单态化（monomorphization）
 
 ## 1. 泛型函数
 
-```rust
-fn largest<T: PartialOrd + Copy>(list: &[T]) -> T {
+<Playground
+  language="rust"
+  id="rust-13-generic-fn"
+  title="泛型函数"
+  code={`fn largest<T: PartialOrd + Copy>(list: &[T]) -> T {
     let mut max = list[0];
     for &item in list {
         if item > max {
@@ -25,8 +28,10 @@ fn main() {
     let a = largest(&[1, 5, 3]);      // T = i32
     let b = largest(&[1.0, 2.5]);     // T = f64
     println!("{} {}", a, b);
-}
-```
+    println!("{}", largest(&['a', 'z', 'm']));   // T = char
+}`}
+  expectedOutput={`5 2.5\nz`}
+/>
 
 <Callout type="info" title="trait bound 限制能力">
 `T: PartialOrd` 表示 T 必须可比较（才能用 `>`）；`+ Copy` 表示可复制（避免所有权移动）。泛型不会凭空获得操作能力。
@@ -34,12 +39,36 @@ fn main() {
 
 ## 2. 泛型结构体与枚举
 
-```rust
-struct Point<T> {
+<Playground
+  language="rust"
+  id="rust-13-generic-struct"
+  title="泛型结构体"
+  code={`struct Point<T> {
     x: T,
     y: T,
 }
 
+// 需要不同类型时用两个参数
+struct Pair<T, U> {
+    first: T,
+    second: U,
+}
+
+fn main() {
+    let int_point = Point { x: 5, y: 10 };
+    let float_point = Point { x: 1.5, y: 2.5 };
+    println!("整数点 ({}, {})", int_point.x, int_point.y);
+    println!("浮点点 ({}, {})", float_point.x, float_point.y);
+
+    let p = Pair { first: 1, second: String::from("one") };
+    println!("{} -> {}", p.first, p.second);
+}`}
+  expectedOutput={`整数点 (5, 10)\n浮点点 (1.5, 2.5)\n1 -> one`}
+/>
+
+标准库的 `Option` 与 `Result` 正是泛型枚举：
+
+```rust
 enum Result<T, E> {
     Ok(T),
     Err(E),

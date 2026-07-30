@@ -37,14 +37,18 @@ Rust 用「资源获取即初始化」思路：值离开作用域就自动清理
 
 把值赋给另一个变量（或传参）时，对于堆数据会**转移所有权（move）**，而非深拷贝：
 
-```rust
-fn main() {
+<Playground
+  language="rust"
+  id="rust-05-move"
+  title="move 语义"
+  code={`fn main() {
     let s1 = String::from("hello");
     let s2 = s1;          // 所有权从 s1 移到 s2
     // println!("{}", s1); // 编译错误：s1 已失效，避免双重释放
     println!("{}", s2);
-}
-```
+}`}
+  expectedOutput={`hello`}
+/>
 
 <Callout type="warn" title="浅拷贝 + 失效旧绑定">
 `let s2 = s1` 只复制了栈上的指针，但 Rust 让 s1 失效，保证不会有两个变量同时释放同一块堆内存。这就是「move」的本质。

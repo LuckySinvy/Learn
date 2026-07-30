@@ -13,8 +13,11 @@ Rust 标准库提供一批**标记性/工具性 trait**，多数可用 `#[derive
 - `Debug`（`{:?}`）：面向程序员的调试输出，`derive` 即可。
 - `Display`（`{}`）：面向用户的友好输出，需手动 `impl`。
 
-```rust
-use std::fmt;
+<Playground
+  language="rust"
+  id="rust-24-debug-display"
+  title="Debug 与 Display"
+  code={`use std::fmt;
 
 #[derive(Debug)]
 struct Point { x: i32, y: i32 }
@@ -29,8 +32,10 @@ fn main() {
     let p = Point { x: 1, y: 2 };
     println!("{:?}", p);   // Debug
     println!("{}", p);     // Display
-}
-```
+}`}
+  expectedOutput={`Point { x: 1, y: 2 }
+(1, 2)`}
+/>
 
 <Callout type="info" title="Display 必须手写">
 `Debug` 能 derive，但 `Display` 表达「如何展示给用户」，语义各异，所以必须自己实现，且它不自动附带 `Debug`。
@@ -54,27 +59,38 @@ struct Pixel { r: u8, g: u8, b: u8 }
 
 提供「缺省值」：
 
-```rust
-#[derive(Default)]
+<Playground
+  language="rust"
+  id="rust-24-default"
+  title="Default 缺省值"
+  code={`#[derive(Debug, Default)]
 struct Config { port: u16, debug: bool }
+
 fn main() {
     let c = Config::default();   // port=0, debug=false
-}
-```
+    println!("port={}, debug={}", c.port, c.debug);
+}`}
+  expectedOutput={`port=0, debug=false`}
+/>
 
 ## 4. From / Into
 
 `From<T>` 定义「从 T 转换」，有了 `From` 编译器自动免费获得 `Into`：
 
-```rust
-struct Meter(f64);
+<Playground
+  language="rust"
+  id="rust-24-from-into"
+  title="From / Into 转换"
+  code={`struct Meter(f64);
 impl From<f64> for Meter {
     fn from(v: f64) -> Self { Meter(v) }
 }
 fn main() {
     let m: Meter = 3.0.into();   // 自动获得 Into
-}
-```
+    println!("{}", m.0);
+}`}
+  expectedOutput={`3`}
+/>
 
 <Callout type="tip" title="优先实现 From">
 实现 `From<T>` 后，`Into<T>` 自动可用，调用方选哪个都行。标准库转换（如 `String::from("x")`）都走 `From`。

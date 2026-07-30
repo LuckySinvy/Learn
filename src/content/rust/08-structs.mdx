@@ -10,8 +10,11 @@ description: 定义与实例化结构体、字段可变性、为结构体实现�
 
 ## 1. 定义与实例化
 
-```rust
-struct User {
+<Playground
+  language="rust"
+  id="rust-08-struct"
+  title="定义与实例化"
+  code={`struct User {
     username: String,
     email: String,
     active: bool,
@@ -27,8 +30,10 @@ fn main() {
     };
     u.sign_in_count += 1;   // 整个结构体 mut 才能改字段
     println!("{} 登录 {} 次", u.username, u.sign_in_count);
-}
-```
+    println!("邮箱 {}，活跃 {}", u.email, u.active);
+}`}
+  expectedOutput={`alice 登录 2 次\n邮箱 a@x.com，活跃 true`}
+/>
 
 <Callout type="tip" title="用 .. 复用字段">
 `let u2 = User { email: ..., ..u };` 可把 `u` 其余字段搬过来，省去重复书写。
@@ -69,8 +74,20 @@ impl User {
 
 不带 `self` 的函数称为关联函数，常用于构造器，调用时用 `::`：
 
-```rust
+<Playground
+  language="rust"
+  id="rust-08-impl"
+  title="方法与关联函数"
+  code={`#[derive(Debug)]
+struct User {
+    username: String,
+    email: String,
+    active: bool,
+    sign_in_count: u64,
+}
+
 impl User {
+    // 关联函数：无 self，常用作构造器
     fn new(username: String, email: String) -> User {
         User {
             username,
@@ -79,12 +96,24 @@ impl User {
             sign_in_count: 1,
         }
     }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn change_email(&mut self, email: String) {
+        self.email = email;
+    }
 }
 
 fn main() {
-    let u = User::new(String::from("bob"), String::from("b@x.com"));
-}
-```
+    let mut u = User::new(String::from("bob"), String::from("b@x.com"));
+    println!("活跃：{}", u.is_active());
+    u.change_email(String::from("bob@new.com"));
+    println!("{:?}", u);
+}`}
+  expectedOutput={`活跃：true\nUser { username: "bob", email: "bob@new.com", active: true, sign_in_count: 1 }`}
+/>
 
 ## 6. 打印结构体
 
