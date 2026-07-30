@@ -1,0 +1,213 @@
+---
+title: 安全：加密、认证与授权
+order: 18
+description: SSL/TLS 加密、SASL 认证机制选型、ACL 授权、配额与多租户实践
+---
+
+# 安全：加密、认证与授权
+
+默认配置的 Kafka 是"裸奔"的：任何能连上 9092 的人都能读写所有 topic。生产集群的安全体系由四层组成：**加密**（防窃听）、**认证**（你是谁）、**授权**（你能干什么）、**配额**（你能用多少）。本章逐层配置。
+
+## 1. 安全模型总览
+
+```text
+客户端 ──连接──> Broker
+   |               |
+   1. 加密: SSL/TLS 通道, 防窃听篡改
+   2. 认证: SASL (或 mTLS 证书) 验明身份 -> principal (如 User:order-svc)
+   3. 授权: ACL 检查 principal 对资源的操作权限
+   4. 配额: 按 principal/client.id 限制带宽与请求速率
+
+安全协议 = 加密方式 x 认证方式:
+  PLAINTEXT        不加密不认证 (仅限隔离内网/开发)
+  SSL              加密, 可选证书认证 (mTLS)
+  SASL_PLAINTEXT   认证但不加密 (不推荐)
+  SASL_SSL         加密 + 认证 (生产标准)
+```
+
+## 2. SSL/TLS 加密
+
+### 2.1 生成证书
+
+```bash
+# 1. 生成 CA
+openssl req -new -x509 -keyout ca-key -out ca-cert -days 3650 \
+  -subj "/CN=kafka-ca" -nodes
+
+# 2. 每个 broker: 生成 keystore + 证书签名请求
+keytool -keystore kafka1.keystore.jks -alias kafka1 -validity 3650 \
+  -genkey -keyalg RSA -storepass changeit \
+  -dname "CN=kafka1.internal" \
+  -ext SAN=DNS:kafka1.internal,IP:10.0.0.11     # SAN 必须含实际访问地址
+keytool -keystore kafka1.keystore.jks -alias kafka1 -certreq -file cert-req -storepass changeit
+
+# 3. CA 签发并导回
+openssl x509 -req -CA ca-cert -CAkey ca-key -in cert-req -out cert-signed \
+  -days 3650 -CAcreateserial
+keytool -keystore kafka1.keystore.jks -alias CARoot -import -file ca-cert -storepass changeit -noprompt
+keytool -keystore kafka1.keystore.jks -alias kafka1 -import -file cert-signed -storepass changeit
+
+# 4. truststore: 所有节点与客户端信任这个 CA
+keytool -keystore truststore.jks -alias CARoot -import -file ca-cert -storepass changeit -noprompt
+```
+
+### 2.2 Broker 配置
+
+```properties
+listeners=SASL_SSL://:9093
+advertised.listeners=SASL_SSL://kafka1.internal:9093
+ssl.keystore.location=/etc/kafka/ssl/kafka1.keystore.jks
+ssl.keystore.password=changeit
+ssl.truststore.location=/etc/kafka/ssl/truststore.jks
+ssl.truststore.password=changeit
+# 要求客户端也出示证书 (mTLS) 时: ssl.client.auth=required
+```
+
+注意：SSL 使零拷贝失效（第 12 章），吞吐一般下降 20-30%，容量规划要留余量。
+
+## 3. SASL 认证机制选型
+
+| 机制 | 原理 | 优点 | 缺点 | 适用 |
+|---|---|---|---|---|
+| PLAIN | 明文账号密码（配置文件写死） | 最简单 | 改密码要重启；必须配 SSL | 小规模、静态账号 |
+| **SCRAM-SHA-256/512** | 挑战响应，凭据存 Kafka 元数据 | 动态增删账号、不传明文 | 需初始化凭据 | **生产推荐** |
+| GSSAPI (Kerberos) | 企业 KDC 域认证 | 与 AD/大数据体系统一 | 运维复杂 | 已有 Kerberos 的企业 |
+| OAUTHBEARER | OAuth2/OIDC 令牌 | 与云身份体系集成、短时令牌 | 需要 IdP | 云原生/多租户平台 |
+
+### 3.1 SCRAM 配置（生产推荐）
+
+```bash
+# 创建用户凭据 (KRaft 下用 --bootstrap-server 即可)
+bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --add-config 'SCRAM-SHA-512=[password=admin-secret]' \
+  --entity-type users --entity-name admin
+
+bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --add-config 'SCRAM-SHA-512=[password=order-secret]' \
+  --entity-type users --entity-name order-svc
+```
+
+```properties
+# broker
+sasl.enabled.mechanisms=SCRAM-SHA-512
+sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512
+security.inter.broker.protocol=SASL_SSL
+listener.name.sasl_ssl.scram-sha-512.sasl.jaas.config=\
+  org.apache.kafka.common.security.scram.ScramLoginModule required \
+  username="admin" password="admin-secret";
+```
+
+### 3.2 客户端配置
+
+```properties
+# client.properties (Java 生态通用)
+security.protocol=SASL_SSL
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required \
+  username="order-svc" password="order-secret";
+ssl.truststore.location=/etc/kafka/ssl/truststore.jks
+ssl.truststore.password=changeit
+```
+
+```python
+# Python confluent-kafka
+producer = Producer({
+    "bootstrap.servers": "kafka1.internal:9093",
+    "security.protocol": "SASL_SSL",
+    "sasl.mechanism": "SCRAM-SHA-512",
+    "sasl.username": "order-svc",
+    "sasl.password": "order-secret",
+    "ssl.ca.location": "/etc/kafka/ssl/ca-cert",
+})
+```
+
+CLI 工具统一加 `--command-config client.properties`。
+
+## 4. ACL 授权
+
+```properties
+# broker 开启授权 (KRaft 用 StandardAuthorizer)
+authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+super.users=User:admin
+allow.everyone.if.no.acl.found=false     # 默认拒绝, 白名单模式
+```
+
+按"最小权限"给服务授权：
+
+```bash
+# 生产者: 只允许写 orders
+bin/kafka-acls.sh --bootstrap-server localhost:9093 \
+  --command-config admin.properties \
+  --add --allow-principal User:order-svc \
+  --operation Write --operation Describe --topic orders
+
+# 消费者: 读 orders + 使用自己的消费组
+bin/kafka-acls.sh --bootstrap-server localhost:9093 \
+  --command-config admin.properties \
+  --add --allow-principal User:inventory-svc \
+  --operation Read --operation Describe --topic orders \
+  --group inventory-service
+
+# 前缀模式: 授权 team-a 开头的所有 topic
+bin/kafka-acls.sh --bootstrap-server localhost:9093 \
+  --command-config admin.properties \
+  --add --allow-principal User:team-a-svc \
+  --operation All --topic team-a- --resource-pattern-type prefixed
+
+# 查看 / 删除
+bin/kafka-acls.sh --bootstrap-server localhost:9093 \
+  --command-config admin.properties --list --topic orders
+```
+
+常见权限组合：生产者要 topic 的 Write+Describe；消费者要 topic 的 Read+Describe 加 group 的 Read；事务生产者还要 transactional-id 的 Write。
+
+## 5. 配额 Quota
+
+防止单个客户端拖垮集群（多租户必备）：
+
+```bash
+# 限制 user=team-b 生产 10MB/s, 消费 20MB/s, 请求处理时间占比 50%
+bin/kafka-configs.sh --bootstrap-server localhost:9093 \
+  --command-config admin.properties \
+  --alter --entity-type users --entity-name team-b-svc \
+  --add-config 'producer_byte_rate=10485760,consumer_byte_rate=20971520,request_percentage=50'
+
+# 默认配额兜底: 未单独配置的所有用户
+bin/kafka-configs.sh --bootstrap-server localhost:9093 \
+  --command-config admin.properties \
+  --alter --entity-type users --entity-default \
+  --add-config 'producer_byte_rate=5242880'
+```
+
+超配额的客户端会被 broker **延迟响应**（throttle）而非报错——客户端表现为吞吐被压平。JMX 的 throttle-time 指标可确认是否被限流。
+
+## 6. 多租户实践清单
+
+| 层面 | 做法 |
+|---|---|
+| 命名 | topic 强制前缀（team-a-orders），配前缀 ACL |
+| 认证 | 每服务一个账号（SCRAM），禁止共享 |
+| 授权 | 默认拒绝 + 最小权限；CI 流水线统一申请 ACL |
+| 配额 | 默认配额兜底 + 大户单独配置 |
+| 隔离 | 核心业务与日志类分集群，而不是无限堆一个集群 |
+
+<Callout type="warn" title="安全改造的坑">
+1. **一把梭切协议**：直接把 listener 从 PLAINTEXT 换成 SASL_SSL 会瞬间断掉所有旧客户端。正确做法是双 listener 并行（9092 旧 + 9093 新），客户端分批迁移后再关旧口。
+2. **证书 SAN 不含实际地址**：客户端报 hostname verification failed。签证书时必须把所有访问用的域名/IP 写进 SAN。
+3. **忘记给 broker 间通信配认证**：security.inter.broker.protocol 没同步改，集群内部复制直接中断。
+4. **证书过期无监控**：给证书有效期设告警（如剩 30 天），到期日全集群瘫痪的事故并不少见。
+</Callout>
+
+## 小结
+
+- 四层安全：SSL 加密、SASL 认证、ACL 授权、Quota 配额；生产标准是 SASL_SSL
+- 认证机制选型：生产首选 SCRAM-SHA-512；有 Kerberos 用 GSSAPI；云原生用 OAUTHBEARER
+- ACL 白名单模式 + 最小权限：生产者 Write、消费者 Read+group Read
+- 配额通过 throttle 生效，多租户必配默认配额
+- 迁移用双 listener 灰度，证书 SAN 与有效期是高频翻车点
+
+<Callout type="exercise" title="练习">
+1. 给本地集群配置 SASL_PLAINTEXT + SCRAM（先不上 SSL 降低难度），创建 admin 与 app 两个用户，验证无凭据的客户端被拒绝。
+2. 开启 StandardAuthorizer，给 app 用户只授 orders 的 Write 权限，验证它能写不能读，且访问其他 topic 报 TopicAuthorizationException。
+3. 给 app 用户设 producer_byte_rate=1MB/s，用 producer-perf-test 压测验证吞吐被限制在 1MB/s 附近。
+</Callout>

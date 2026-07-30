@@ -1,0 +1,322 @@
+---
+title: 基础类型与类型注解
+order: 2
+description: 七种原始类型、any/unknown/never/void 四个特殊类型，以及类型推断与类型注解的取舍
+---
+
+# 基础类型与类型注解
+
+TypeScript 的类型系统建立在 JavaScript 的运行时类型之上。这一章先把「地基」铺好：七种原始类型、四个容易混淆的特殊类型，以及什么时候该写注解、什么时候该交给推断。
+
+## 1. 类型注解的语法
+
+注解写在标识符后面，用冒号分隔：
+
+```ts
+let count: number = 0;
+const label: string = "总计";
+
+function add(a: number, b: number): number {
+  return a + b;
+}
+```
+
+这种「后置类型」写法来自 Pascal / Go / Rust 一系，好处是变量名对齐、易读，也便于省略——因为类型可以推断出来时可以整段不写。
+
+## 2. 七种原始类型
+
+JavaScript 有七种原始值，TypeScript 为每一种提供了对应的类型名（全部**小写**）。
+
+| 类型 | 示例值 | 说明 |
+|---|---|---|
+| `string` | `"hi"` | UTF-16 字符串，没有单独的 char 类型 |
+| `number` | `42`、`3.14`、`NaN` | 全部是 IEEE 754 双精度浮点，没有 int/float 之分 |
+| `boolean` | `true` | — |
+| `null` | `null` | 「显式的空」 |
+| `undefined` | `undefined` | 「未赋值」 |
+| `symbol` | `Symbol("id")` | 唯一标识符，常用作对象的隐藏键 |
+| `bigint` | `9007199254740993n` | 任意精度整数，不能与 number 混算 |
+
+<Callout type="warn" title="不要用 String / Number / Boolean">
+首字母大写的 `String`、`Number`、`Boolean` 指的是**包装对象**，不是原始类型。写 `let s: String` 语法上能过，但会带来一堆奇怪的兼容性问题。任何时候都用小写形式。
+</Callout>
+
+### 2.1 number 只有一种
+
+TypeScript 没有 `int`、`long`、`float`。所有数字都是双精度浮点，安全整数范围是正负 2 的 53 次方减一。超出这个范围要用 `bigint`。
+
+### 2.2 null 与 undefined
+
+在 `strict` 模式（准确说是 `strictNullChecks`）下，这两个值**不能**随便赋给别的类型：
+
+```ts
+let s: string = null;        // 错误：不能将 null 分配给 string
+let t: string | null = null; // 正确：显式声明可能为空
+```
+
+这是 TypeScript 最有价值的检查之一。关闭 `strictNullChecks` 后，`null` 可以赋给任何类型，类型系统立刻失去一大半意义。
+
+<Playground
+  language="typescript"
+  id="ts-02-primitives"
+  title="七种原始类型"
+  code={`const title: string = "TypeScript";
+const version: number = 5.6;
+const stable: boolean = true;
+const empty: null = null;
+const missing: undefined = undefined;
+const key: symbol = Symbol("userId");
+const huge: bigint = 9007199254740993n;
+
+console.log(title + " v" + version + " stable=" + stable);
+console.log("null 的 typeof 是 " + typeof empty);
+console.log("undefined 的 typeof 是 " + typeof missing);
+console.log("symbol 描述: " + String(key.description));
+console.log("bigint: " + huge.toString());
+
+// strictNullChecks 下必须显式声明可空
+let nickname: string | null = null;
+console.log("nickname = " + String(nickname));
+nickname = "Ada";
+console.log("nickname = " + nickname);`}
+  expectedOutput={`TypeScript v5.6 stable=true\nnull 的 typeof 是 object\nundefined 的 typeof 是 undefined\nsymbol 描述: userId\nbigint: 9007199254740993\nnickname = null\nnickname = Ada`}
+/>
+
+## 3. 四个特殊类型
+
+### 3.1 any：关闭类型检查
+
+`any` 表示「我不知道也不想让编译器管」。它可以赋给任何类型，也可以接收任何值，任何属性访问都不报错。
+
+```ts
+let x: any = 42;
+x.foo.bar.baz();   // 编译通过，运行时炸
+x = "现在是字符串";
+```
+
+`any` 像一个洞：它会**沿着数据流扩散**，把途经的所有类型检查都关掉。
+
+<Callout type="warn" title="any 是最后手段">
+每写一个 `any`，你就放弃了这一处的所有类型保护。真正类型未知时，请优先用 `unknown`。团队项目里建议开启 `noImplicitAny`（`strict` 已包含），禁止参数类型被隐式推断为 any。
+</Callout>
+
+### 3.2 unknown：安全版的 any
+
+`unknown` 同样能接收任何值，但**在收窄之前你什么都不能对它做**。它把「校验类型」这件事从可选变成了强制。
+
+| 操作 | `any` | `unknown` |
+|---|---|---|
+| 接收任意值 | 可以 | 可以 |
+| 直接访问属性 | 可以（不检查） | 不可以 |
+| 赋给别的类型 | 可以 | 只能赋给 `unknown` 与 `any` |
+| 需要先收窄 | 不需要 | 需要 |
+
+<Playground
+  language="typescript"
+  id="ts-02-unknown"
+  title="unknown 与类型收窄"
+  code={`function describe(value: unknown): string {
+  if (typeof value === "string") {
+    return "字符串，长度 " + value.length;
+  }
+  if (typeof value === "number") {
+    return "数字，两倍是 " + value * 2;
+  }
+  if (Array.isArray(value)) {
+    return "数组，元素个数 " + value.length;
+  }
+  if (value === null) {
+    return "空值";
+  }
+  return "其他类型: " + typeof value;
+}
+
+console.log(describe("hello"));
+console.log(describe(21));
+console.log(describe([1, 2, 3]));
+console.log(describe(null));
+console.log(describe(true));
+
+// 下面这行会被类型检查拦下，因为 unknown 未收窄不能访问属性
+// function bad(v: unknown) { return v.length; }`}
+  expectedOutput={`字符串，长度 5\n数字，两倍是 42\n数组，元素个数 3\n空值\n其他类型: boolean`}
+/>
+
+### 3.3 void：函数不返回有意义的值
+
+```ts
+function log(msg: string): void {
+  console.log(msg);
+}
+```
+
+`void` 只用在函数返回位置。它和 `undefined` 的区别在于：声明返回 `void` 的函数**可以**返回任意值，调用方只是承诺不使用这个值。这条规则让 `arr.forEach(x => arr2.push(x))` 这类代码得以通过——`push` 返回 number，但 `forEach` 的回调签名是 `void`。
+
+### 3.4 never：永远不会有值
+
+`never` 表示「不可能发生」，出现在三种场景：
+
+1. 函数永远不会正常返回（抛异常或死循环）。
+2. 类型收窄到穷尽后剩下的分支。
+3. 不可能成立的类型运算结果，如 `string & number`。
+
+`never` 是所有类型的子类型，可以赋给任何类型，但没有任何值能赋给它。这个特性可以用来做**穷尽性检查**：
+
+<Playground
+  language="typescript"
+  id="ts-02-never"
+  title="never 与穷尽性检查"
+  code={`type Shape = "circle" | "square" | "triangle";
+
+function fail(x: never): never {
+  throw new Error("未处理的分支: " + String(x));
+}
+
+function sides(shape: Shape): number {
+  switch (shape) {
+    case "circle":
+      return 0;
+    case "square":
+      return 4;
+    case "triangle":
+      return 3;
+    default:
+      // 到这里 shape 的类型已被收窄为 never
+      // 如果将来给 Shape 加了新成员却忘了处理，这里会立刻报类型错误
+      return fail(shape);
+  }
+}
+
+console.log("circle -> " + sides("circle"));
+console.log("square -> " + sides("square"));
+console.log("triangle -> " + sides("triangle"));
+
+function loopForever(): never {
+  throw new Error("这个函数永远不会正常返回");
+}
+try {
+  loopForever();
+} catch (e) {
+  console.log("捕获到: " + (e instanceof Error ? e.message : "未知"));
+}`}
+  expectedOutput={`circle -> 0\nsquare -> 4\ntriangle -> 3\n捕获到: 这个函数永远不会正常返回`}
+/>
+
+<Callout type="tip" title="穷尽性检查是联合类型的护身符">
+上面 `fail(shape)` 这个模式非常值得养成习惯。只要哪天有人给 `Shape` 加了 `"hexagon"`，编译器会准确告诉你「哪些 switch 忘了更新」，而不是等到运行时返回 `undefined`。
+</Callout>
+
+## 4. 类型推断：少写注解
+
+TypeScript 会尽力自己推断类型，绝大多数局部变量都不需要写注解：
+
+```ts
+let n = 42;             // 推断为 number
+const s = "hi";         // 推断为字面量类型 "hi"
+let arr = [1, 2, 3];    // 推断为 number[]
+```
+
+### 4.1 let 与 const 的推断差异
+
+这是初学者最容易困惑的一点：
+
+| 声明 | 推断结果 | 原因 |
+|---|---|---|
+| `let s = "hi"` | `string` | 变量还能改，取更宽的类型 |
+| `const s = "hi"` | `"hi"` | 常量不会变，取最精确的字面量类型 |
+
+后者叫**字面量类型（literal type）**，是联合类型和可辨识联合的基础，第 5 章会展开。
+
+### 4.2 上下文类型推断
+
+当表达式的位置已经决定了它该是什么类型时，参数注解可以省略：
+
+```ts
+const names = ["ada", "alan"];
+names.forEach((n) => console.log(n.toUpperCase()));
+// n 被上下文推断为 string，不需要写 (n: string)
+```
+
+### 4.3 什么时候必须写注解
+
+- **函数参数**：没有上下文时无法推断，不写就是隐式 `any`（strict 下报错）。
+- **导出的 API**：显式写返回类型，能防止内部改动悄悄改变对外契约。
+- **推断结果不是你想要的**：例如想要 `string | null` 而不是 `null`。
+
+<Playground
+  language="typescript"
+  id="ts-02-inference"
+  title="类型推断实验"
+  code={`let mutable = "hi";        // string
+const fixed = "hi";        // 字面量类型 "hi"
+const nums = [1, 2, 3];    // number[]
+const mixed = [1, "two"];  // (string | number)[]
+
+mutable = "bye";
+console.log(mutable + " / " + fixed);
+console.log("nums 求和 = " + nums.reduce((a, b) => a + b, 0));
+console.log("mixed 长度 = " + mixed.length);
+
+// 上下文推断：这里的 item 自动是 string
+const words = ["alpha", "beta", "gamma"];
+words.forEach((item, index) => {
+  console.log(index + ": " + item.toUpperCase());
+});
+
+// 返回类型也能推断，但导出 API 建议显式写出
+function double(n: number) {
+  return n * 2;               // 推断返回 number
+}
+console.log("double(21) = " + double(21));`}
+  expectedOutput={`bye / hi\nnums 求和 = 6\nmixed 长度 = 2\n0: ALPHA\n1: BETA\n2: GAMMA\ndouble(21) = 42`}
+/>
+
+<Callout type="warn" title="别给所有变量都加注解">
+`const total: number = prices.reduce(...)` 这类注解是噪音，推断已经给出同样的结果。过度注解还有个隐患：注解会「盖住」推断，一旦实现改了而注解忘了改，反而掩盖问题。原则是**在边界处注解，在内部靠推断**。
+</Callout>
+
+## 5. 类型断言：告诉编译器「相信我」
+
+有时候你确实比编译器知道得更多。这时可以用 `as` 做**类型断言**：
+
+```ts
+const el = document.getElementById("app") as HTMLDivElement;
+const data = JSON.parse(text) as { id: number };
+```
+
+断言**不做任何运行时转换**，它只是让编译器改变看法。所以它既是逃生舱，也是风险来源——断错了，编译器不会救你。
+
+### 5.1 三条使用原则
+
+1. **只在编译器确实不可能推断出来时使用**，比如 DOM 查询、`JSON.parse` 的结果。
+2. **断言的范围要尽可能小**。断言一个属性，好过断言整个对象。
+3. **能用收窄就别用断言**。`if (typeof x === "string")` 是有运行时依据的，`as string` 没有。
+
+### 5.2 非空断言
+
+后缀 `!` 表示「我保证这里不是 null 或 undefined」：
+
+```ts
+const el = document.getElementById("app")!;   // 去掉 null
+```
+
+它非常方便，也非常容易被滥用。每一个 `!` 都是一处潜在的运行时崩溃点，代码评审时值得多看一眼。
+
+<Callout type="warn" title="双重断言是危险信号">
+`x as unknown as Foo` 这种写法能绕过 TypeScript 的所有检查（因为直接 `as` 不相干的类型会被拒绝）。它偶尔在写测试桩或对接极不规范的第三方库时有用，但在业务代码里出现，几乎总意味着类型建模出了问题。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 写一个函数 `parseAge(input: unknown): number | null`：输入是字符串就尝试转数字，是数字就直接返回，其他情况返回 `null`。用几组不同类型的值验证。
+2. 定义 `type Level = "debug" | "info" | "error"`，写一个 `weight(l: Level): number`，用 switch 加 `never` 穷尽性检查；然后给 `Level` 加一个成员，观察编译器在哪里报错。
+</Callout>
+
+## 小结
+
+- 七种原始类型全部小写：`string` `number` `boolean` `null` `undefined` `symbol` `bigint`
+- `strictNullChecks` 下 `null` / `undefined` 必须显式出现在类型里
+- `any` 关闭检查且会扩散；`unknown` 是它的安全替代，使用前必须收窄
+- `void` 用于「返回值无意义」，`never` 用于「不可能有值」，后者是穷尽性检查的关键
+- `let` 推断出宽类型，`const` 推断出字面量类型
+- 注解写在边界（参数、导出 API），内部尽量依赖推断
+- 下一章讲数组、元组与枚举 →

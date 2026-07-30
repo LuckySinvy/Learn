@@ -1,0 +1,402 @@
+---
+title: 安装与客户端
+order: 2
+description: Docker 与包管理器安装 ClickHouse，掌握 client、HTTP 接口与配置文件结构
+---
+
+# 安装与客户端
+
+这一章把 ClickHouse 跑起来，并搞清楚它有哪些访问入口、配置文件放在哪、改哪个文件才生效。这些看似琐碎，但后面每一章的实验都依赖它。
+
+## 1. 三种安装方式
+
+### 1.1 Docker（推荐用于学习）
+
+```bash
+docker run -d \
+  --name ch \
+  --ulimit nofile=262144:262144 \
+  -p 8123:8123 \
+  -p 9000:9000 \
+  -v ch_data:/var/lib/clickhouse \
+  -e CLICKHOUSE_DB=demo \
+  -e CLICKHOUSE_USER=analyst \
+  -e CLICKHOUSE_PASSWORD=analyst123 \
+  clickhouse/clickhouse-server:24.8
+```
+
+几个参数的含义：
+
+| 参数 | 作用 |
+|---|---|
+| `8123` | HTTP 接口端口，给 BI 工具、curl、JDBC 用 |
+| `9000` | Native TCP 协议端口，给 `clickhouse-client` 用，性能更好 |
+| `--ulimit nofile` | ClickHouse 每列一个文件，文件句柄消耗巨大，必须调高 |
+| `-v ch_data` | 数据卷，否则容器删掉数据就没了 |
+
+进入客户端：
+
+```bash
+docker exec -it ch clickhouse-client --user analyst --password analyst123 --database demo
+```
+
+### 1.2 Debian / Ubuntu 包管理器
+
+```bash
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/clickhouse.list
+
+sudo apt-get update
+sudo apt-get install -y clickhouse-server clickhouse-client
+
+sudo systemctl start clickhouse-server
+sudo systemctl status clickhouse-server
+```
+
+安装过程会提示你为 `default` 用户设置密码，留空表示无密码（仅本地可连）。
+
+### 1.3 单机绿色版（不需要 root）
+
+```bash
+curl https://clickhouse.com/ | sh     # 下载单个二进制 clickhouse
+./clickhouse server                    # 前台启动服务端
+./clickhouse client                    # 另开终端启动客户端
+```
+
+这个二进制同时包含 server、client、local 等所有功能，非常适合临时验证。
+
+<Callout type="tip" title="clickhouse-local：不用起服务也能查文件">
+`clickhouse-local` 让你直接用 SQL 查询本地 CSV/Parquet，像 awk 一样用：
+
+```bash
+clickhouse-local --query "
+  SELECT country, count() FROM file('events.csv', CSVWithNames)
+  GROUP BY country ORDER BY 2 DESC LIMIT 5"
+```
+</Callout>
+
+## 2. clickhouse-client 常用姿势
+
+### 2.1 交互模式
+
+```bash
+clickhouse-client --host 127.0.0.1 --port 9000 \
+  --user default --password '' --database default
+```
+
+进去以后：
+
+```text
+ClickHouse client version 24.8.4.13.
+Connecting to default database at localhost:9000 as user default.
+Connected to ClickHouse server version 24.8.4.
+
+ch :) SELECT version();
+
+┌─version()─┐
+│ 24.8.4.13 │
+└───────────┘
+
+1 row in set. Elapsed: 0.001 sec.
+```
+
+几个必备快捷方式：
+
+| 输入 | 作用 |
+|---|---|
+| `SHOW DATABASES` | 列出数据库 |
+| `USE demo` | 切换数据库 |
+| `SHOW TABLES` | 列出当前库的表 |
+| `DESCRIBE TABLE events` | 查看表结构 |
+| `SHOW CREATE TABLE events` | 查看完整建表语句（最常用） |
+| `Ctrl+C` | 中断当前查询 |
+| `exit` 或 `Ctrl+D` | 退出 |
+
+### 2.2 命令行一次性执行
+
+```bash
+# 直接执行 SQL
+clickhouse-client --query "SELECT count() FROM system.tables"
+
+# 输出为 CSV 便于管道处理
+clickhouse-client --query "SELECT country, count() FROM events GROUP BY country" \
+  --format CSVWithNames > result.csv
+
+# 从文件导入（后面第 10 章详解）
+clickhouse-client --query "INSERT INTO events FORMAT CSVWithNames" < events.csv
+
+# 执行 SQL 文件
+clickhouse-client --multiquery < schema.sql
+```
+
+`--format` 支持几十种输出格式，日常最有用的几个：
+
+| 格式 | 场景 |
+|---|---|
+| `PrettyCompact` | 默认，终端表格 |
+| `TSV` / `CSVWithNames` | 管道给其他工具 |
+| `JSONEachRow` | 每行一个 JSON，给程序消费 |
+| `Vertical` | 列很多时竖排显示，肉眼友好 |
+
+<Callout type="tip" title="查询末尾加 \G 竖排输出">
+在客户端里，把分号换成 `\G` 就会用 Vertical 格式输出，宽表调试神器：
+
+```sql
+SELECT * FROM system.parts LIMIT 1 \G
+```
+</Callout>
+
+## 3. HTTP 接口（8123）
+
+HTTP 接口是最通用的入口，所有 BI 工具和语言 SDK 底层都可以走它。
+
+```bash
+# 健康检查
+curl 'http://localhost:8123/ping'
+# → Ok.
+
+# GET 方式执行查询
+curl 'http://localhost:8123/?query=SELECT%201'
+
+# POST 方式（推荐，SQL 不受 URL 长度限制）
+curl -X POST 'http://localhost:8123/' -d 'SELECT version()'
+
+# 带认证与数据库
+curl -X POST 'http://localhost:8123/?database=demo' \
+  -H 'X-ClickHouse-User: analyst' \
+  -H 'X-ClickHouse-Key: analyst123' \
+  -d 'SELECT count() FROM events'
+
+# 指定输出格式
+curl -X POST 'http://localhost:8123/' \
+  -d 'SELECT country, count() FROM events GROUP BY country FORMAT JSONEachRow'
+```
+
+甚至可以通过 URL 参数传设置项：
+
+```bash
+curl -X POST 'http://localhost:8123/?max_execution_time=10&max_threads=4' \
+  -d 'SELECT count() FROM events'
+```
+
+### 3.1 Play UI
+
+浏览器打开 `http://localhost:8123/play`，会得到一个内置的 Web SQL 编辑器：
+
+```text
+┌────────────────────────────────────────────────┐
+│  ClickHouse Play                                │
+│  ┌──────────────────────────────────────────┐  │
+│  │ SELECT country, count() AS pv            │  │
+│  │ FROM events GROUP BY country             │  │
+│  └──────────────────────────────────────────┘  │
+│  [Run]  ☐ Pretty  ☐ Compress                   │
+│  ─────────────────────────────────────────────  │
+│  country │ pv                                   │
+│  CN      │ 128394                               │
+│  US      │  84021                               │
+└────────────────────────────────────────────────┘
+```
+
+它不需要任何额外安装，写 SQL、看结果、看执行统计都够用，学习阶段完全可以只用它。
+
+## 4. 配置文件结构
+
+这是新手最容易踩坑的地方。ClickHouse 的配置分成两大块，**改错文件不生效**。
+
+```text
+/etc/clickhouse-server/
+├── config.xml          ← 服务端配置（端口/路径/日志/集群），不要直接改
+├── users.xml           ← 用户、密码、权限、profile 配额，不要直接改
+├── config.d/           ← 服务端配置覆盖片段（推荐改这里）
+│   ├── listen.xml
+│   └── cluster.xml
+└── users.d/            ← 用户配置覆盖片段（推荐改这里）
+    └── analyst.xml
+```
+
+### 4.1 为什么要用 config.d 而不是改 config.xml
+
+`config.xml` 会在升级软件包时被覆盖。`config.d/*.xml` 里的内容会被自动合并进主配置，升级时保留。合并规则是按 XML 路径覆盖同名节点。
+
+举个例子，默认 ClickHouse 只监听 localhost。要让它监听所有网卡：
+
+```xml
+<!-- /etc/clickhouse-server/config.d/listen.xml -->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>
+```
+
+再比如调整数据目录和日志级别：
+
+```xml
+<!-- /etc/clickhouse-server/config.d/paths.xml -->
+<clickhouse>
+    <path>/data/clickhouse/</path>
+    <tmp_path>/data/clickhouse/tmp/</tmp_path>
+    <logger>
+        <level>information</level>
+        <size>500M</size>
+        <count>10</count>
+    </logger>
+</clickhouse>
+```
+
+### 4.2 用户配置
+
+```xml
+<!-- /etc/clickhouse-server/users.d/analyst.xml -->
+<clickhouse>
+    <users>
+        <analyst>
+            <!-- 密码用 SHA256，明文可用 <password> 但不推荐 -->
+            <password_sha256_hex>8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92</password_sha256_hex>
+            <networks>
+                <ip>10.0.0.0/8</ip>
+            </networks>
+            <profile>readonly_profile</profile>
+            <quota>default</quota>
+        </analyst>
+    </users>
+    <profiles>
+        <readonly_profile>
+            <readonly>1</readonly>
+            <max_memory_usage>10000000000</max_memory_usage>
+            <max_execution_time>60</max_execution_time>
+        </readonly_profile>
+    </profiles>
+</clickhouse>
+```
+
+生成密码哈希：
+
+```bash
+echo -n '123456' | sha256sum | tr -d '  -'
+```
+
+<Callout type="info" title="XML 配置与 SQL 配置两套体系">
+ClickHouse 24.x 同时支持用 SQL 管理用户（RBAC），并且这是官方推荐方向：
+
+```sql
+CREATE USER analyst IDENTIFIED WITH sha256_password BY 'analyst123';
+GRANT SELECT ON demo.* TO analyst;
+CREATE SETTINGS PROFILE readonly_profile SETTINGS max_memory_usage = 10000000000;
+ALTER USER analyst SETTINGS PROFILE readonly_profile;
+```
+
+SQL 方式的用户存在 `/var/lib/clickhouse/access/`，XML 方式的用户只读且不能被 SQL 修改。两套可以共存，但同名会冲突。
+</Callout>
+
+## 5. 查看与临时修改设置
+
+ClickHouse 有上千个 setting，全部可以在会话级别临时改：
+
+```sql
+-- 查看当前所有非默认设置
+SELECT name, value, description
+FROM system.settings
+WHERE changed
+FORMAT Vertical;
+
+-- 会话级修改
+SET max_threads = 8;
+SET max_memory_usage = 20000000000;
+
+-- 单条查询级修改（最推荐，不污染会话）
+SELECT count() FROM events SETTINGS max_threads = 4;
+```
+
+几个日常最常调的：
+
+| Setting | 默认 | 说明 |
+|---|---|---|
+| `max_threads` | CPU 核数 | 单查询并行线程数 |
+| `max_memory_usage` | 10 GB | 单查询内存上限 |
+| `max_execution_time` | 0（不限） | 查询超时秒数 |
+| `max_result_rows` | 0 | 结果集行数上限，防误查 |
+| `send_logs_level` | fatal | 设为 `trace` 可在客户端看到服务端执行日志，调优必备 |
+
+```sql
+-- 看看查询内部到底做了什么
+SET send_logs_level = 'trace';
+SELECT count() FROM events WHERE country = 'CN';
+```
+
+<Callout type="warn" title="常见启动失败原因">
+1. **文件句柄不够**：日志报 `Too many open files`。列存每列一个文件，必须设 `nofile` 到 262144 以上。
+2. **端口被占**：9000 端口和 Hadoop NameNode、PHP-FPM 冲突很常见，用 `ss -lntp | grep 9000` 排查。
+3. **内存不足直接 OOM**：ClickHouse 默认 `max_server_memory_usage` 是物理内存的 90%，小内存机器（低于 4 GB）容易被系统杀掉，需要显式调小。
+4. **改了 config.xml 没重启**：绝大多数服务端配置需要 `systemctl restart clickhouse-server` 才生效，只有少数（如日志级别、users）支持热加载。
+</Callout>
+
+## 6. 建立课程实验环境
+
+现在把贯穿全课程的库和表建出来（表引擎细节第 4 章讲）：
+
+```sql
+CREATE DATABASE IF NOT EXISTS demo;
+
+USE demo;
+
+CREATE TABLE events
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+```
+
+插入一批随机测试数据（100 万行，几秒完成）：
+
+```sql
+INSERT INTO events
+SELECT
+    toDateTime('2024-06-01 00:00:00') + number % 2592000            AS event_time,
+    1 + rand(1) % 50000                                             AS user_id,
+    ['view','click','purchase','signup'][1 + rand(2) % 4]           AS event_type,
+    concat('/p/', toString(rand(3) % 500))                          AS page,
+    ['CN','US','JP','DE','IN'][1 + rand(4) % 5]                     AS country,
+    ['ios','android','web'][1 + rand(5) % 3]                        AS device,
+    50 + rand(6) % 5000                                             AS duration_ms
+FROM numbers(1000000);
+```
+
+验证：
+
+```sql
+SELECT count(), min(event_time), max(event_time) FROM events;
+```
+
+```text
+┌─count()─┬───────min(event_time)─┬───────max(event_time)─┐
+│ 1000000 │   2024-06-01 00:00:00 │   2024-06-30 23:59:59 │
+└─────────┴───────────────────────┴───────────────────────┘
+```
+
+<Callout type="exercise" title="练习">
+1. 用 Docker 启动 ClickHouse，创建 `demo` 库并执行上面的建表与灌数据脚本。
+2. 分别用 `clickhouse-client`、`curl` HTTP 接口、浏览器 Play UI 三种方式执行 `SELECT count() FROM demo.events`，确认三条路都通。
+3. 在 `config.d/` 下新建一个 XML 把日志级别改成 `debug`，重启后用 `SELECT * FROM system.settings WHERE name LIKE '%log%'` 或查看日志文件确认生效，然后改回 `information`。
+</Callout>
+
+## 小结
+
+- Docker 适合学习，包管理器适合生产，单二进制适合临时验证
+- 两个端口：9000 是 Native 协议给 client 用，8123 是 HTTP 给工具和程序用
+- `/play` 提供零安装的 Web SQL 编辑器
+- 配置改 `config.d/` 和 `users.d/` 而不是主文件，升级不会丢
+- 用户管理优先用 SQL 的 RBAC 而不是 XML
+- 每条查询末尾都能用 `SETTINGS` 临时调参，是最安全的调优方式
+- 下一章深入数据类型，选错类型会让存储和查询都变慢 →

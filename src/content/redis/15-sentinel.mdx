@@ -1,0 +1,182 @@
+---
+title: 哨兵：自动故障转移
+order: 15
+description: Sentinel 架构、主观/客观下线、Raft 式选举、故障转移四步流程、客户端如何感知新主库
+---
+
+# 哨兵：自动故障转移
+
+主从复制解决了数据冗余，但主库挂了仍需人工执行 `REPLICAOF NO ONE` 切换——凌晨三点的告警电话不是高可用。**Sentinel（哨兵）** 是 Redis 官方的自动故障转移方案：一组哨兵进程持续监控主从，主库故障时自动选出新主库并通知客户端。
+
+## 1. 架构
+
+哨兵本身是特殊模式的 Redis 进程，**必须部署至少 3 个、奇数个、分布在不同机器**：
+
+```text
+   +----------+   +----------+   +----------+
+   | Sentinel1|   | Sentinel2|   | Sentinel3|     互相通信, 交换对节点的看法
+   +----+-----+   +----+-----+   +----+-----+
+        |  \        /  |  \        /  |
+        |   监控主库+从库（PING、INFO）  |
+        v              v              v
+    +-------+      +-------+      +-------+
+    | Master| ---> |Replica| ---> |Replica|
+    +-------+      +-------+      +-------+
+```
+
+为什么至少 3 个？故障判定和选举都需要**多数派**投票——2 个哨兵挂 1 个就凑不齐多数，1 个哨兵则自身就是单点，还容易因网络分区误判。
+
+### 1.1 配置与启动
+
+```conf
+# sentinel.conf
+port 26379
+# 监控名为 mymaster 的主库, quorum=2 (2 个哨兵认为它挂了才算真挂)
+sentinel monitor mymaster 192.168.1.10 6379 2
+sentinel auth-pass mymaster Your_Strong_Pass123
+sentinel down-after-milliseconds mymaster 5000    # 5 秒无响应视为主观下线
+sentinel failover-timeout mymaster 60000
+sentinel parallel-syncs mymaster 1     # 切换后同时向新主同步的从库数
+```
+
+```bash
+redis-sentinel /etc/redis/sentinel.conf
+# 或 redis-server /etc/redis/sentinel.conf --sentinel
+```
+
+只需配置主库地址：哨兵通过 `INFO replication` 自动发现从库，通过主库上的 `__sentinel__:hello` 频道自动发现其他哨兵。
+
+```bash
+# 哨兵管理命令
+$ redis-cli -p 26379
+127.0.0.1:26379> SENTINEL get-master-addr-by-name mymaster
+1) "192.168.1.10"
+2) "6379"
+127.0.0.1:26379> SENTINEL replicas mymaster
+...
+127.0.0.1:26379> SENTINEL sentinels mymaster
+...
+```
+
+## 2. 故障判定：主观下线与客观下线
+
+### 2.1 主观下线（SDOWN）
+
+每个哨兵每秒 PING 所有被监控节点。某哨兵在 `down-after-milliseconds` 内收不到有效回复，就**单方面**标记该节点主观下线（Subjectively Down）——"我觉得它挂了"。
+
+### 2.2 客观下线（ODOWN）
+
+主观下线可能是这个哨兵自己网络不好。于是它询问其他哨兵：
+
+```text
+Sentinel1: "你们看 master 挂了吗?"  (SENTINEL is-master-down-by-addr)
+Sentinel2: "挂了+1"
+Sentinel3: "挂了+1"
+
+同意数 >= quorum (2)  =>  客观下线 (Objectively Down)
+                          可以启动故障转移了
+```
+
+只有**主库**才有客观下线的概念（从库和哨兵 SDOWN 即可，不触发转移）。quorum 设为"哨兵总数的多数"（3 个哨兵设 2）是常规做法。
+
+## 3. 领导者选举：谁来执行切换
+
+多个哨兵同时发起切换会打架，必须选一个**领导者**独自执行。选举是 Raft 风格：
+
+```text
+1. 发现 ODOWN 的哨兵把自己的"纪元(epoch)"+1, 请求其他哨兵投票给自己
+2. 每个哨兵在每个纪元里只有一票, 先到先得
+3. 拿到 多数派(超过半数) 且 >= quorum 票的哨兵当选
+4. 平票/超时? 纪元再+1, 随机延迟后重新拉票
+```
+
+这就是"哨兵要奇数个"的原因：偶数个更容易平票，且 4 个哨兵的容错能力（可挂 1 个）和 3 个一样，纯浪费。
+
+## 4. 故障转移四步流程
+
+领导者哨兵按以下顺序执行：
+
+```text
+第 1 步: 挑选新主库。从库候选按优先级过滤与排序:
+         ① 剔除: 已下线/断连时间过长的
+         ② 比较 replica-priority (配置项, 越小越优先, 0 = 永不当选)
+         ③ 比较复制偏移量 offset (数据最全的赢)
+         ④ 比较 runid (最后的平局裁决)
+
+第 2 步: 对选中的从库执行 REPLICAOF NO ONE, 使其成为主库
+
+第 3 步: 对其余从库执行 REPLICAOF 新主库地址
+         (parallel-syncs 控制同时切几个, 防止新主库被同步请求打垮)
+
+第 4 步: 把旧主库标记为新主库的从库
+         (它恢复后, 哨兵会命令它 REPLICAOF 新主库, 自动归队)
+```
+
+```bash
+# 手动触发一次故障转移（演练/维护时用）
+127.0.0.1:26379> SENTINEL failover mymaster
+OK
+```
+
+## 5. 客户端如何感知新主库
+
+主库地址变了，应用怎么知道？**客户端不能写死主库 IP**，正确姿势是"问哨兵"：
+
+```text
+应用启动/重连时:
+  1. 连任意一个哨兵
+  2. SENTINEL get-master-addr-by-name mymaster -> 得到当前主库地址
+  3. 连接主库, 校验其 role 确实是 master
+运行中:
+  订阅哨兵的 +switch-master 事件频道, 收到即重建连接
+```
+
+主流客户端库都内置了 Sentinel 支持，只需配置哨兵地址列表：
+
+```python
+# Python redis-py
+from redis.sentinel import Sentinel
+sentinel = Sentinel([('10.0.0.1', 26379), ('10.0.0.2', 26379), ('10.0.0.3', 26379)],
+                    socket_timeout=0.5)
+master = sentinel.master_for('mymaster', password='xxx')   # 写走主库
+replica = sentinel.slave_for('mymaster', password='xxx')   # 读走从库
+master.set('k', 'v')
+```
+
+```java
+// Java Jedis
+Set<String> sentinels = Set.of("10.0.0.1:26379", "10.0.0.2:26379", "10.0.0.3:26379");
+JedisSentinelPool pool = new JedisSentinelPool("mymaster", sentinels, "xxx");
+try (Jedis jedis = pool.getResource()) {
+    jedis.set("k", "v");    // 池自动指向当前主库, 切换后自动更新
+}
+```
+
+<Callout type="warn" title="脑裂：切换后旧主库还在收写入">
+网络分区时可能出现：哨兵和多数从库在 A 侧，选出了新主库；旧主库孤零零在 B 侧**还活着**，不知情的客户端继续往它写。分区恢复后旧主库被降级为从库、清空重新同步——**B 侧期间的写入全部丢失**。缓解手段：主库配置 `min-replicas-to-write 1` + `min-replicas-max-lag 10`，孤立的旧主库因为连不上任何从库会自动拒绝写入，把丢失窗口压缩到 10 秒左右。
+</Callout>
+
+<Callout type="info" title="哨兵不做数据分片">
+哨兵集群管理的是"一主多从"的单份数据，解决的是**可用性**。数据量超过单机内存、写入吞吐超过单主上限时，哨兵无能为力——那是 Cluster 的领域（下一章）。经验：数据 10 GB 以内、写 QPS 单机可承载，用哨兵（架构简单）；超出则上 Cluster。
+</Callout>
+
+## 6. 部署清单
+
+- 3 或 5 个哨兵，跨机器/机架/可用区部署，绝不与主库同机全灭；
+- `down-after-milliseconds`：太短容易误判（网络抖动就切换），太长故障恢复慢，常用 5~30 秒；
+- 所有哨兵的配置保持一致；哨兵会自动改写自己的配置文件（记录纪元、发现的节点），这是正常现象；
+- 定期演练 `SENTINEL failover` ，验证客户端能自动跟随切换——**没演练过的高可用等于没有高可用**。
+
+## 小结
+
+- 哨兵 = 监控 + 多数派故障判定（SDOWN 到 ODOWN）+ Raft 式领导者选举 + 自动切换
+- 至少 3 个、奇数个、跨机器部署；quorum 通常设为多数
+- 新主库按"优先级、复制偏移量、runid"三级挑选，数据最全者优先
+- 客户端通过哨兵发现主库地址，切换事件驱动重连；防脑裂靠 min-replicas-to-write
+- 数据超单机容量？下一章 Cluster 分片 →
+
+<Callout type="exercise" title="练习">
+1. 用 Docker Compose 搭 1 主 2 从 + 3 哨兵，kill 掉主库，观察哨兵日志中 sdown、odown、vote-for-leader、switch-master 事件序列。
+2. 故障转移完成后重启旧主库，用 INFO replication 确认它自动变成了新主库的从库。
+3. 解释：为什么 quorum=1 很危险？为什么 2 个哨兵无法构成可靠的故障转移系统？
+</Callout>

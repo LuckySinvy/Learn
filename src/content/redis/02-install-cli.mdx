@@ -1,0 +1,204 @@
+---
+title: 安装与 redis-cli 基础
+order: 2
+description: Docker 与源码安装、redis.conf 关键配置、redis-cli 连接与通用命令
+---
+
+# 安装与 redis-cli 基础
+
+本章把环境搭起来，并掌握 redis-cli 和一批"对所有 key 通用"的命令：SCAN、TYPE、TTL、DEL 等。这些命令后面每一章都会用到。
+
+## 1. 安装 Redis 7
+
+### 1.1 Docker（推荐，最快）
+
+```bash
+# 拉取并启动，映射端口 + 挂载数据目录
+docker run -d --name redis7 \
+  -p 6379:6379 \
+  -v redis-data:/data \
+  redis:7.2 redis-server --appendonly yes
+
+# 进入容器内的 redis-cli
+docker exec -it redis7 redis-cli
+```
+
+### 1.2 源码编译（Linux 生产常用）
+
+```bash
+wget https://download.redis.io/releases/redis-7.2.4.tar.gz
+tar xzf redis-7.2.4.tar.gz && cd redis-7.2.4
+make -j4 && sudo make install
+# 产物: redis-server / redis-cli / redis-benchmark / redis-sentinel
+
+redis-server /path/to/redis.conf   # 指定配置文件启动
+```
+
+macOS 可以 `brew install redis`，Ubuntu 可以 `apt install redis-server`（注意发行版仓库的版本可能偏旧）。
+
+## 2. redis.conf 关键配置
+
+配置文件几百行，初期只需要关注这几项：
+
+```conf
+# 网络
+bind 127.0.0.1          # 监听地址。生产改为内网 IP，绝不要裸奔 0.0.0.0
+port 6379
+protected-mode yes      # 保护模式：无密码时拒绝非本机连接
+
+# 安全
+requirepass Your_Strong_Pass123   # 访问密码，务必设置
+
+# 通用
+daemonize yes           # 后台运行（Docker 里要保持 no）
+logfile /var/log/redis/redis.log
+dir /var/lib/redis      # 工作目录，RDB/AOF 文件都放这里
+databases 16            # 逻辑库数量，默认 16 个（0~15）
+
+# 内存
+maxmemory 4gb                    # 最大内存，强烈建议设置
+maxmemory-policy allkeys-lru     # 内存满时的淘汰策略（第 10 章详解）
+
+# 持久化
+appendonly yes          # 开启 AOF（第 11 章详解）
+```
+
+修改配置后可以重启生效，部分参数也支持在线修改：
+
+```bash
+127.0.0.1:6379> CONFIG GET maxmemory
+1) "maxmemory"
+2) "4294967296"
+127.0.0.1:6379> CONFIG SET maxmemory 8gb
+OK
+```
+
+<Callout type="warn" title="安全三件套，一个都不能少">
+历史上大量 Redis 被入侵挖矿，原因都是"公网可访问 + 无密码"。生产必须：1）bind 内网地址；2）设置强密码 requirepass；3）云上配安全组只放行应用服务器。此外可用 `rename-command FLUSHALL ""` 禁用危险命令。
+</Callout>
+
+## 3. redis-cli 连接与常用姿势
+
+```bash
+# 基本连接
+redis-cli -h 127.0.0.1 -p 6379 -a Your_Strong_Pass123
+
+# 不想密码出现在命令行历史里，用交互式 AUTH
+redis-cli -h 127.0.0.1
+127.0.0.1:6379> AUTH Your_Strong_Pass123
+OK
+
+# 非交互模式：直接执行一条命令
+redis-cli -a xxx GET greeting
+
+# 其他实用参数
+redis-cli --stat          # 每秒刷新实例概况
+redis-cli --bigkeys       # 扫描大 key
+redis-cli --latency       # 测量延迟
+redis-cli monitor         # 实时打印所有命令（调试用，生产慎用）
+```
+
+## 4. 通用命令实操
+
+### 4.1 键的增删查
+
+```bash
+127.0.0.1:6379> SET user:1001:name "Ada"
+OK
+127.0.0.1:6379> EXISTS user:1001:name
+(integer) 1
+127.0.0.1:6379> TYPE user:1001:name
+string
+127.0.0.1:6379> DEL user:1001:name
+(integer) 1
+127.0.0.1:6379> EXISTS user:1001:name
+(integer) 0
+```
+
+key 的命名建议用冒号分层：`业务:对象:ID:属性`，如 `shop:user:1001:profile`，便于按前缀管理。
+
+### 4.2 KEYS 与 SCAN
+
+```bash
+127.0.0.1:6379> MSET user:1 a user:2 b order:1 c
+OK
+127.0.0.1:6379> KEYS user:*
+1) "user:2"
+2) "user:1"
+```
+
+`KEYS` 会一次性遍历整个键空间，**百万级 key 时会阻塞主线程数百毫秒**，生产禁用。替代方案是游标式的 `SCAN`：
+
+```bash
+127.0.0.1:6379> SCAN 0 MATCH user:* COUNT 100
+1) "0"                # 返回的游标，为 0 表示遍历结束
+2) 1) "user:2"
+   2) "user:1"
+```
+
+用法：以游标 0 开始，每次调用把上次返回的游标传进去，直到游标再次为 0。`COUNT` 是每次扫描桶数量的**提示值**而非精确条数。SCAN 保证：遍历开始前就存在且一直存在的 key 一定会被返回（可能重复），遍历过程中新增的 key 可能返回也可能不返回。
+
+### 4.3 过期时间 TTL
+
+```bash
+127.0.0.1:6379> SET session:abc "token-data"
+OK
+127.0.0.1:6379> EXPIRE session:abc 300
+(integer) 1
+127.0.0.1:6379> TTL session:abc
+(integer) 297           # 剩余 297 秒
+127.0.0.1:6379> PERSIST session:abc
+(integer) 1             # 移除过期时间，变为永不过期
+127.0.0.1:6379> TTL session:abc
+(integer) -1            # -1 = 永不过期; -2 = key 不存在
+```
+
+### 4.4 其他高频命令
+
+```bash
+127.0.0.1:6379> RENAME user:1 member:1     # 重命名（目标存在会覆盖）
+OK
+127.0.0.1:6379> DBSIZE                     # 当前库 key 总数
+(integer) 4
+127.0.0.1:6379> SELECT 1                   # 切换到 1 号库
+OK
+127.0.0.1:6379[1]> SELECT 0
+OK
+127.0.0.1:6379> RANDOMKEY
+"order:1"
+127.0.0.1:6379> OBJECT ENCODING user:2     # 查看底层编码，后面章节常用
+"embstr"
+```
+
+<Callout type="info" title="多数据库是历史包袱">
+SELECT 切换的 16 个逻辑库共享同一个进程和内存，无法独立设置密码与容量，Cluster 模式下只允许用 0 号库。官方建议**不同业务用不同实例**，而不是塞进不同 DB。
+</Callout>
+
+### 4.5 DEL 与 UNLINK
+
+```bash
+127.0.0.1:6379> DEL big:hash        # 同步删除，主线程释放内存
+(integer) 1
+127.0.0.1:6379> UNLINK big:hash2    # 异步删除，后台线程释放内存
+(integer) 1
+```
+
+删除包含百万成员的集合时，`DEL` 需要逐个释放成员内存，可能阻塞数百毫秒；`UNLINK` 只把 key 从键空间摘除（微秒级），实际内存释放交给后台线程。**删大 key 一律用 UNLINK**。
+
+<Callout type="warn" title="FLUSHALL 是删库跑路命令">
+`FLUSHALL` 清空所有库、`FLUSHDB` 清空当前库，且默认同步执行。生产环境建议用 `rename-command` 重命名或禁用它们；确需清空时用 `FLUSHALL ASYNC` 异步执行。
+</Callout>
+
+## 小结
+
+- Docker 一条命令即可跑起 Redis 7，生产用源码或包管理器安装
+- redis.conf 先关注：bind、requirepass、maxmemory、appendonly 四件事
+- 生产红线：KEYS 换 SCAN，DEL 大 key 换 UNLINK，FLUSHALL 重命名禁用
+- TTL 返回值：正数为剩余秒数，-1 永不过期，-2 不存在
+- 下一章进入第一个数据结构 String →
+
+<Callout type="exercise" title="练习">
+1. 用 Docker 启动一个 Redis 7，设置密码，并用 redis-cli 完成连接认证。
+2. 写入 100 个形如 `test:N` 的 key（可用 `for i in $(seq 1 100); do redis-cli set test:$i $i; done`），然后用 SCAN 分批遍历出来，观察游标变化。
+3. 给一个 key 设置 60 秒过期，分别在过期前后执行 TTL 和 GET，记录返回值。
+</Callout>

@@ -1,0 +1,200 @@
+---
+title: Hash：字段级操作的对象存储
+order: 4
+description: HSET/HGETALL/HINCRBY/HSCAN、listpack 与 hashtable 编码、对象缓存与大 key 风险
+---
+
+# Hash：字段级操作的对象存储
+
+用 String 缓存对象时，改一个字段就要整体读出再写回。Hash 把一个 key 内部再分成多个 field-value 对，支持**字段级**的读写与自增，是存储"对象"的更自然选择。
+
+## 1. 数据模型
+
+```text
+key: user:1001
++----------+------------------+
+| field    | value            |
++----------+------------------+
+| name     | Ada              |
+| age      | 30               |
+| city     | Shanghai         |
+| balance  | 999              |
++----------+------------------+
+```
+
+一个 Hash 最多可容纳 2^32 - 1 个 field，但实践中应远小于这个数（后面讲大 key 风险）。
+
+## 2. 核心命令实操
+
+### 2.1 写入与读取
+
+```bash
+127.0.0.1:6379> HSET user:1001 name "Ada" age 30 city "Shanghai"
+(integer) 3             # 新建的 field 数量
+127.0.0.1:6379> HGET user:1001 name
+"Ada"
+127.0.0.1:6379> HMGET user:1001 name age nonexist
+1) "Ada"
+2) "30"
+3) (nil)
+127.0.0.1:6379> HGETALL user:1001
+1) "name"
+2) "Ada"
+3) "age"
+4) "30"
+5) "city"
+6) "Shanghai"
+```
+
+Redis 4 之后 `HSET` 支持一次写多个 field，`HMSET` 已废弃。
+
+### 2.2 存在性、删除与遍历
+
+```bash
+127.0.0.1:6379> HEXISTS user:1001 age
+(integer) 1
+127.0.0.1:6379> HDEL user:1001 city
+(integer) 1
+127.0.0.1:6379> HLEN user:1001
+(integer) 2
+127.0.0.1:6379> HKEYS user:1001
+1) "name"
+2) "age"
+127.0.0.1:6379> HVALS user:1001
+1) "Ada"
+2) "30"
+```
+
+### 2.3 字段级自增
+
+```bash
+127.0.0.1:6379> HINCRBY user:1001 balance 100
+(integer) 100
+127.0.0.1:6379> HINCRBY user:1001 balance -30
+(integer) 70
+127.0.0.1:6379> HINCRBYFLOAT user:1001 score 0.5
+"0.5"
+```
+
+一个 key 管理一组相关计数器（如商品的浏览数/收藏数/销量），比一堆独立 String key 更好维护。
+
+### 2.4 HSETNX 与 HRANDFIELD
+
+```bash
+127.0.0.1:6379> HSETNX user:1001 name "Bob"
+(integer) 0             # field 已存在，不覆盖
+127.0.0.1:6379> HRANDFIELD user:1001 2 WITHVALUES
+1) "age"
+2) "30"
+3) "name"
+4) "Ada"
+```
+
+### 2.5 HSCAN：安全遍历大 Hash
+
+`HGETALL` 会一次返回全部 field，对上万 field 的 Hash 是危险操作。用 `HSCAN` 分批：
+
+```bash
+127.0.0.1:6379> HSCAN user:1001 0 MATCH * COUNT 100
+1) "0"
+2) 1) "name"
+   2) "Ada"
+   3) "age"
+   4) "30"
+   5) "balance"
+   6) "70"
+```
+
+用法与 SCAN 相同：游标从 0 开始，返回 0 结束。
+
+## 3. 底层编码：listpack 与 hashtable
+
+```bash
+127.0.0.1:6379> OBJECT ENCODING user:1001
+"listpack"
+```
+
+| 编码 | 条件 | 结构与代价 |
+|---|---|---|
+| `listpack` | field 数 ≤ 128 **且** 每个 field/value ≤ 64 字节 | 连续内存紧凑排列，省内存；查找 O(n) |
+| `hashtable` | 任一条件超出 | 真正的哈希表；查找 O(1)，内存开销大数倍 |
+
+阈值可配置：
+
+```conf
+hash-max-listpack-entries 128
+hash-max-listpack-value 64
+```
+
+```text
+listpack（连续内存，顺序扫描）:
++------+-----+------+-----+------+------+
+| name | Ada | age  | 30  | city | ...  |
++------+-----+------+-----+------+------+
+
+hashtable（桶数组 + 链表）:
+bucket[0] -> (age, 30)
+bucket[1] -> (name, Ada) -> (city, Shanghai)
+bucket[2] -> ...
+```
+
+Redis 7 用 listpack 全面替换了旧的 ziplist：两者思路一致（连续内存省空间），但 listpack 每个元素只记录自身长度，修复了 ziplist 级联更新的隐患。编码转换是**单向的**：一旦升级为 hashtable，即使删到只剩 1 个 field 也不会降回 listpack。
+
+小对象用 listpack 有多省内存？存 100 万个"含 3 个短字段的对象"，Hash+listpack 通常只需要 String+JSON 方案 60% 左右的内存——这是 Hash 的隐藏优势。
+
+## 4. 场景：对象缓存的两种方案对比
+
+| 维度 | String + JSON | Hash |
+|---|---|---|
+| 读整个对象 | GET，一次搞定 | HGETALL |
+| 读单个字段 | 取整串再解析，浪费 | HGET，精准 |
+| 改单个字段 | 读-改-写，非原子 | HSET/HINCRBY，原子 |
+| 嵌套结构 | 天然支持 | 只支持一层平铺 |
+| 给单个字段设 TTL | 不支持 | 同样不支持（TTL 是 key 级的） |
+| 内存 | 序列化有冗余 | listpack 编码更省 |
+
+经验法则：**字段会被单独读写、或需要字段级原子自增，用 Hash；对象整存整取、含嵌套结构，用 String + JSON**。
+
+```bash
+# 购物车是 Hash 的经典场景: field=商品ID, value=数量
+127.0.0.1:6379> HSET cart:u1001 sku:2001 1 sku:2002 3
+(integer) 2
+127.0.0.1:6379> HINCRBY cart:u1001 sku:2001 1     # 商品数量 +1
+(integer) 2
+127.0.0.1:6379> HDEL cart:u1001 sku:2002          # 移除商品
+(integer) 1
+127.0.0.1:6379> HGETALL cart:u1001                # 结算时取整车
+1) "sku:2001"
+2) "2"
+```
+
+## 5. 大 key 风险
+
+Hash 很容易被滥用成"把一整类数据塞进一个 key"，比如把全站 1000 万用户都放进 `all:users` 一个 Hash：
+
+- **读写放大**：HGETALL 返回几百 MB，打爆网络与客户端内存；
+- **阻塞**：对它执行 DEL、HGETALL 会卡主线程；
+- **无法分片**：Cluster 按 key 分片，单个巨型 key 无法拆到多个节点，造成数据倾斜；
+- **过期集中**：整个 Hash 只有一个 TTL，无法按 field 过期。
+
+<Callout type="warn" title="大 key 判定的经验值">
+Hash/Set/ZSet/List 的元素数超过 5000，或单 key 序列化体积超过 1 MB，就应视为大 key。治理方法是**拆分**：如把 `all:users` 按用户 ID 取模拆成 `users:0` 到 `users:99` 共 100 个 Hash。定位大 key 用 `redis-cli --bigkeys`（第 19 章详解）。
+</Callout>
+
+<Callout type="info" title="field 没有独立 TTL">
+TTL 只能设在整个 key 上。若业务需要"每个字段独立过期"（如各用户的验证码），应该用独立的 String key 而不是共享一个 Hash。Redis 7.4 开始提供 HEXPIRE 支持 field 级过期，但使用前需确认你的服务端版本。
+</Callout>
+
+## 小结
+
+- Hash 提供字段级读写与原子自增，适合购物车、对象属性、计数器组
+- 编码两段式：小而短用 listpack（省内存），超阈值转 hashtable（O(1) 查找），单向不可逆
+- HGETALL 只用于确认较小的 Hash，大 Hash 遍历一律 HSCAN
+- 大 key 是 Hash 的头号陷阱：元素超 5000 就要考虑拆分
+- 下一章 List：队列与时间线 →
+
+<Callout type="exercise" title="练习">
+1. 创建一个 Hash，先写 100 个短 field 确认编码为 listpack，再写入一个 100 字节的 value，验证编码转为 hashtable 且不可逆。
+2. 用 Hash 实现购物车：加购、改数量、删商品、结算取全量，写出完整命令序列。
+3. 假设要缓存 500 万用户的资料（每人 5 个字段），设计拆分方案避免大 key，并说明如何根据用户 ID 定位到对应的 key。
+</Callout>

@@ -1,0 +1,333 @@
+---
+title: 函数类型
+order: 6
+description: 函数类型表达式、可选参数与默认值、剩余参数、函数重载、this 类型，以及调用签名与构造签名
+---
+
+# 函数类型
+
+函数是 JavaScript 的一等公民，自然也是 TypeScript 类型系统着墨最多的地方。这一章讲怎么给函数本身标类型、怎么处理参数的各种形态，以及重载、`this`、调用签名这些进阶话题。
+
+## 1. 给函数标类型
+
+### 1.1 声明式函数
+
+参数逐个注解，返回类型写在参数列表之后：
+
+```ts
+function add(a: number, b: number): number {
+  return a + b;
+}
+```
+
+返回类型通常可以省略，交给推断。但**导出的函数建议显式写出**：一是作为文档，二是防止内部实现的改动悄悄改变对外契约。
+
+### 1.2 函数类型表达式
+
+把「函数本身」当成一个类型来描述，用箭头语法：
+
+```ts
+type BinaryOp = (a: number, b: number) => number;
+
+const sub: BinaryOp = (a, b) => a - b;   // 参数类型由上下文推断出来
+```
+
+注意这里的 `=>` 是**类型语法**，不是箭头函数。参数名在类型里只起文档作用，可以和实现不同。
+
+### 1.3 函数是「双向」兼容的
+
+赋值时，参数少的函数可以赋给参数多的类型：
+
+```ts
+type Handler = (value: string, index: number) => void;
+const h: Handler = (value) => console.log(value);   // 少写 index，合法
+```
+
+这符合 JS 的直觉——`arr.forEach(x => ...)` 天天这么写。反过来则不行：多要参数的函数不能赋给少给参数的类型。
+
+## 2. 参数的四种形态
+
+### 2.1 可选参数
+
+```ts
+function greet(name: string, title?: string): string {
+  return title !== undefined ? title + " " + name : name;
+}
+```
+
+`title` 的类型是 `string | undefined`，用之前必须判空。可选参数只能放在必选参数之后。
+
+### 2.2 默认值
+
+```ts
+function repeat(text: string, times: number = 2): string {
+  return text.repeat(times);
+}
+```
+
+有默认值的参数自动变成可选的，而且在函数体内它的类型**不含** `undefined`（因为默认值已经兜底）。调用方显式传 `undefined` 也会触发默认值。
+
+<Callout type="tip" title="默认值优于可选参数">
+能用默认值就别用可选参数：函数体里少一次判空，调用方的心智负担也更小。默认参数还可以放在必选参数前面（虽然调用时必须显式传 `undefined`，一般不这么做）。
+</Callout>
+
+### 2.3 剩余参数
+
+```ts
+function sum(...nums: number[]): number {
+  return nums.reduce((a, b) => a + b, 0);
+}
+```
+
+剩余参数的类型必须是数组或元组。用**元组**类型时可以精确描述「前几个是什么、后面是什么」。
+
+### 2.4 参数解构
+
+```ts
+function draw({ x, y, color = "red" }: { x: number; y: number; color?: string }): void {}
+```
+
+类型注解写在解构模式之后，这也是为什么解构参数的类型往往显得笨重——多数情况下会先定义一个 `interface`。
+
+<Playground
+  language="typescript"
+  id="ts-06-params"
+  title="参数的四种形态"
+  code={`// 可选参数
+function greet(name: string, title?: string): string {
+  return title !== undefined ? title + " " + name : "你好，" + name;
+}
+console.log(greet("Ada"));
+console.log(greet("Ada", "女士"));
+
+// 默认值：函数体内 sep 的类型是 string，不含 undefined
+function join(items: string[], sep: string = ", "): string {
+  return items.join(sep);
+}
+console.log(join(["a", "b", "c"]));
+console.log(join(["a", "b", "c"], " | "));
+console.log(join(["a", "b", "c"], undefined));   // 显式 undefined 也走默认值
+
+// 剩余参数
+function sum(...nums: number[]): number {
+  return nums.reduce((acc, n) => acc + n, 0);
+}
+console.log("sum = " + sum(1, 2, 3, 4));
+
+// 剩余参数用元组类型：第一个必须是 string
+type LogArgs = [level: string, ...messages: string[]];
+function log(...args: LogArgs): string {
+  const [level, ...rest] = args;
+  return "[" + level.toUpperCase() + "] " + rest.join(" ");
+}
+console.log(log("info", "服务", "启动成功"));
+
+// 参数解构 + 默认值
+interface DrawOpts {
+  x: number;
+  y: number;
+  color?: string;
+}
+function draw({ x, y, color = "red" }: DrawOpts): string {
+  return "在 (" + x + "," + y + ") 画了一个" + color + "点";
+}
+console.log(draw({ x: 1, y: 2 }));
+console.log(draw({ x: 3, y: 4, color: "blue" }));`}
+  expectedOutput={`你好，Ada\n女士 Ada\na, b, c\na | b | c\na, b, c\nsum = 10\n[INFO] 服务 启动成功\n在 (1,2) 画了一个red点\n在 (3,4) 画了一个blue点`}
+/>
+
+## 3. 函数重载
+
+有些函数的参数与返回值之间存在**联动关系**，单一签名表达不了。这时可以写多个「重载签名」，再加一个兼容所有情况的「实现签名」。
+
+```ts
+function pick(v: string): string;      // 重载签名 1
+function pick(v: number): number;      // 重载签名 2
+function pick(v: string | number) {    // 实现签名：调用方看不见
+  return v;
+}
+```
+
+规则要点：
+
+1. 实现签名**不参与**重载解析，外部只能按重载签名调用。
+2. 实现签名必须**兼容**所有重载签名。
+3. 解析时**从上往下**匹配第一个符合的签名，所以更具体的签名要放前面。
+
+<Callout type="warn" title="能用联合就别用重载">
+如果不同参数不会影响返回类型，`function f(x: string | number): string` 比两个重载更简单，报错信息也更友好。重载还有一个坑：它不支持「参数为联合」的调用——上面的 `pick` 不能传 `string | number` 类型的变量，因为没有任何一个重载签名能匹配。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-06-overload"
+  title="函数重载"
+  code={`// 参数个数不同，语义也不同
+function makeDate(timestamp: number): Date;
+function makeDate(year: number, month: number, day: number): Date;
+function makeDate(a: number, b?: number, c?: number): Date {
+  if (b !== undefined && c !== undefined) {
+    return new Date(Date.UTC(a, b - 1, c));
+  }
+  return new Date(a);
+}
+
+console.log(makeDate(0).toISOString());
+console.log(makeDate(2024, 6, 1).toISOString());
+// makeDate(2024, 6);   // 错误：没有匹配的重载
+
+// 参数类型决定返回类型
+function wrap(v: string): string[];
+function wrap(v: number): number[];
+function wrap(v: string | number): string[] | number[] {
+  return typeof v === "string" ? [v] : [v];
+}
+
+const a = wrap("hi");    // 推断为 string[]
+const b = wrap(42);      // 推断为 number[]
+console.log("a[0] 大写 = " + a[0].toUpperCase());
+console.log("b[0] 加一 = " + (b[0] + 1));
+
+// 对比：不需要联动时，直接用联合参数更简单
+function describe(v: string | number): string {
+  return typeof v === "string" ? "文本 " + v : "数字 " + v;
+}
+console.log(describe("x") + " / " + describe(9));`}
+  expectedOutput={`1970-01-01T00:00:00.000Z\n2024-06-01T00:00:00.000Z\na[0] 大写 = HI\nb[0] 加一 = 43\n文本 x / 数字 9`}
+/>
+
+## 4. this 类型
+
+JavaScript 里 `this` 的指向取决于调用方式，是经典坑点。TypeScript 允许把 `this` 声明成**第一个形参**，它只存在于类型层面，编译后消失，也不占用实际参数位置。
+
+```ts
+interface Counter {
+  count: number;
+  inc(this: Counter, step: number): number;
+}
+```
+
+### 4.1 箭头函数没有自己的 this
+
+```ts
+const obj = {
+  count: 0,
+  // 错误做法：箭头函数的 this 来自外层作用域，不是 obj
+  bad: () => { /* this 不是 obj */ },
+  // 正确做法：普通方法
+  good(): number { return this.count; },
+};
+```
+
+反过来，在回调里想保留外层 `this` 时，箭头函数正是解药。规则可以记成：**对象方法用普通函数，回调用箭头函数**。
+
+开启 `noImplicitThis`（`strict` 已包含）后，`this` 类型无法推断的地方会直接报错，能挡下相当一部分这类问题。
+
+<Playground
+  language="typescript"
+  id="ts-06-this"
+  title="this 类型与调用签名"
+  code={`interface Counter {
+  count: number;
+  inc(this: Counter, step: number): number;
+}
+
+const counter: Counter = {
+  count: 0,
+  inc(step) {
+    this.count += step;
+    return this.count;
+  },
+};
+
+console.log("加 3 后 = " + counter.inc(3));
+console.log("再加 5 后 = " + counter.inc(5));
+
+// 调用签名：一个「既能被调用，又带属性」的对象
+interface Formatter {
+  (value: number): string;      // 调用签名
+  unit: string;                 // 附加属性
+}
+
+function makeFormatter(unit: string): Formatter {
+  const fn = (value: number): string => value.toFixed(1) + unit;
+  const f = fn as Formatter;
+  f.unit = unit;
+  return f;
+}
+
+const kg = makeFormatter(" kg");
+console.log(kg(72.35));
+console.log("单位是 " + kg.unit);
+
+// 构造签名：描述「可以被 new 的东西」
+class Point {
+  constructor(public x: number, public y: number) {}
+  toString(): string {
+    return "(" + this.x + "," + this.y + ")";
+  }
+}
+
+interface PointCtor {
+  new (x: number, y: number): Point;
+}
+
+function build(Ctor: PointCtor, x: number, y: number): Point {
+  return new Ctor(x, y);
+}
+console.log("构造出 " + build(Point, 3, 4).toString());`}
+  expectedOutput={`加 3 后 = 3\n再加 5 后 = 8\n72.3 kg\n单位是  kg\n构造出 (3,4)`}
+/>
+
+## 5. 调用签名与构造签名
+
+### 5.1 调用签名
+
+函数在 JS 里也是对象，可以挂属性。要同时描述「能被调用」和「有哪些属性」，就得用带调用签名的对象类型：
+
+```ts
+interface Formatter {
+  (value: number): string;    // 注意：没有属性名，直接是参数列表
+  unit: string;
+}
+```
+
+对比一下两种写法的适用场景：
+
+| 写法 | 语法 | 能否附加属性 |
+|---|---|---|
+| 函数类型表达式 | `(v: number) => string` | 不能 |
+| 调用签名 | `{ (v: number): string; unit: string }` | 能 |
+
+### 5.2 构造签名
+
+在参数列表前加 `new`，表示这个类型可以被 `new` 调用：
+
+```ts
+interface DateCtor {
+  new (value: number): Date;
+}
+```
+
+典型用途是工厂函数——把「类本身」当参数传进去。第 8 章讲泛型后，这个模式会变得更实用。
+
+<Callout type="warn" title="返回类型 void 的特殊含义">
+把回调声明为返回 `void`，并不意味着实现必须什么都不返回，而是「调用方承诺不使用返回值」。所以 `const fn: () => void = () => 42` 是合法的。这条规则让 `arr.forEach(x => set.add(x))` 能正常工作——`add` 有返回值，但没人关心。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 写一个 `clamp(value: number, min?: number, max?: number): number`，缺省时分别用 0 和 100；再改成用默认参数实现，比较两版函数体的复杂度。
+2. 给 `query` 写重载：传 `string` 返回单个结果对象，传 `string[]` 返回结果数组。实现签名用联合参数并在内部收窄。
+3. 定义一个带调用签名的类型 `Memoized`，它既能被调用，又有一个 `cacheSize` 属性；写一个函数返回这样的对象。
+</Callout>
+
+## 小结
+
+- 函数类型表达式用 `=>`；实现的参数类型可由上下文推断
+- 参数少的函数可以赋给参数多的函数类型，反之不行
+- 可选参数带 `undefined`，默认值参数不带；能用默认值就用默认值
+- 剩余参数可以用元组类型精确描述前几位
+- 重载适合「参数决定返回类型」的场景，注意实现签名对外不可见、联合参数调用不了重载
+- `this` 可以声明为第一个形参，只存在于类型层面
+- 调用签名让函数类型可以附带属性，构造签名描述可 `new` 的类型
+- 下一章讲类 →

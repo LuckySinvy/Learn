@@ -1,0 +1,219 @@
+---
+title: 副本与 ReplicatedMergeTree
+order: 18
+description: ClickHouse Keeper 与 ZooKeeper、复制原理、shard/replica 宏、故障恢复与脑裂防护
+---
+
+# 副本与 ReplicatedMergeTree
+
+分片解决"容量不够"，副本解决"挂了怎么办"。ClickHouse 的副本通过 `ReplicatedMergeTree` 系列引擎实现，它依赖一个外部协调服务来记录元数据、选主和同步日志。这一章讲清复制的原理、配置和故障恢复。
+
+## 1. 复制依赖什么：Keeper
+
+ClickHouse 的副本**自己不实现共识协议**，而是把"谁主谁从、part 列表、mutation 进度"这些信息交给一个协调服务保管。两个选择：
+
+- **ClickHouse Keeper**：ClickHouse 官方用 C++ 重写的 ZooKeeper 兼容实现（基于 Raft），24.x 推荐首选，少一个外部依赖。
+- **ZooKeeper**：传统选择，生态成熟，但要多维护一套 Java 服务。
+
+```text
+      ClickHouse Keeper 集群 (Raft, 建议 3 或 5 节点)
+      ┌─────────┐   ┌─────────┐   ┌─────────┐
+      │ keeper1 │───│ keeper2 │───│ keeper3 │   ← 存的是"协调元数据"
+      └─────────┘   └─────────┘   └─────────┘
+           ▲              ▲              ▲
+           │ 读写 znode    │              │
+      ┌────┴────┐    ┌────┴────┐    ┌────┴────┐
+      │ ch-rep1 │    │ ch-rep2 │    │ ch-rep3 │   ← 真正存数据的副本
+      └─────────┘    └─────────┘    └─────────┘
+```
+
+<Callout type="info" title="Keeper 里只存「元信息」，不存你的业务数据">
+很多人担心 Keeper 成为瓶颈——其实它**不存表数据**，只存：表结构版本、每个 part 的校验和和状态、复制队列、mutation 进度、谁是当前主副本（leader）。真正的几 GB/几 TB 数据在各 ClickHouse 节点的磁盘上。所以 Keeper 的磁盘占用通常很小。
+</Callout>
+
+## 2. ReplicatedMergeTree 怎么用
+
+把第 4 章的 `MergeTree` 换成 `ReplicatedMergeTree`，并传入两个参数：**zookeeper 路径** 和 **副本名**。
+
+```sql
+CREATE TABLE events_local ON CLUSTER my_cluster
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = ReplicatedMergeTree(
+    '/clickhouse/tables/{shard}/default/events',   -- ZK 路径，{shard} 由 macros 替换
+    '{replica}'                                    -- 副本名，{replica} 由 macros 替换
+)
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+```
+
+两个宏参数必须用反引号包裹（MDX 中裸 `{` 会破坏语法）：`` `{shard}` `` 和 `` `{replica}` ``。
+
+- 第一个参数是**该表在 Keeper 中的路径**。同一分片的多个副本必须填**相同**的路径（这样它们才能"看到"彼此），不同分片必须填**不同**的路径。
+- 第二个参数是**副本名**，同一分片内的不同副本必须**各不相同**（否则它们会互相覆盖）。
+
+## 3. macros：每个节点自己的身份
+
+`{shard}` 和 `{replica}` 的具体值，来自每个节点 `config.d/` 里的 `macros` 配置。这正是"同一份建表 SQL 能在所有节点执行"的原因——差异被 macros 吸收了。
+
+```xml
+<!-- ch-node1 的 /etc/clickhouse-server/config.d/macros.xml -->
+<clickhouse>
+    <macros>
+        <shard>01</shard>
+        <replica>ch-node1</replica>
+    </macros>
+</clickhouse>
+
+<!-- ch-node2（同一分片的另一个副本） -->
+<clickhouse>
+    <macros>
+        <shard>01</shard>          <!-- 同分片：shard 相同 -->
+        <replica>ch-node2</replica> <!-- 不同副本：replica 不同 -->
+    </macros>
+</clickhouse>
+
+<!-- ch-node3（第二个分片） -->
+<clickhouse>
+    <macros>
+        <shard>02</shard>          <!-- 不同分片：shard 不同 -->
+        <replica>ch-node3</replica>
+    </macros>
+</clickhouse>
+```
+
+```text
+建表语句里的宏         ch-node1          ch-node2          ch-node3
+──────────────────────────────────────────────────────────────
+{shard}              01                01                02
+{replica}            ch-node1          ch-node2          ch-node3
+
+→ node1、node2 的 ZK 路径都是 /clickhouse/tables/01/... → 互为副本
+→ node3 的 ZK 路径是 /clickhouse/tables/02/...          → 属于另一个分片
+```
+
+<Callout type="tip" title="用 ON CLUSTER + macros 一套 SQL 建全集群">
+结合 17 章的 `ON CLUSTER my_cluster`，你在任意一个节点执行一次 `CREATE TABLE ... ON CLUSTER`，集群里每台机器都会用**自己**的 macros 把 `{shard}`/`{replica}` 替换成正确值，建出结构一致、身份正确的副本表。无需逐台改 SQL。
+</Callout>
+
+## 4. 复制原理：主副本 + 日志
+
+副本之间不是"互相同步"，而是"都听 Keeper 的"。机制如下：
+
+```text
+写入节点（假设是 Leader 副本）            跟随副本（Follower）
+        │                                       │
+   INSERT 一批数据                         监听 Keeper 路径
+        │                                       │
+   1. 本地落盘生成 part                        │
+   2. 在 Keeper 的 /log 下挂一条记录           │
+      "新增 part xxx，校验和=yyy"    ──────►  3. 收到通知，拉取该 part
+                                             4. 校验和一致 → 本地写入
+                                             5. 在 Keeper 的 /blocks 登记"我也有这个 part"
+```
+
+核心三点：
+
+1. **只有一个 Leader 副本负责写 Keeper 的复制日志**（Leader 由 Keeper 选举，谁先注册谁当；任何副本都能接收写入，但收到写的副本会先成为该 part 的 Leader）。
+2. **Follower 是"拉"模型**：它持续监听 Keeper，发现新日志就去 Leader 那里把 part 文件拉过来，比对校验和。
+3. **复制是异步的**：写入在 Leader 本地落盘成功即返回客户端；Follower 通常在毫秒~秒级内追上。所以副本之间是**最终一致**，不是强一致。
+
+```sql
+-- 验证复制是否到位：在两台节点分别执行，数字应一致
+SELECT
+    hostName() AS node,
+    count()    AS parts,
+    sum(rows)  AS rows
+FROM system.parts
+WHERE table = 'events_local' AND active;
+```
+
+<Callout type="warn" title="副本不一致时不要手动删 part">
+如果发现某副本落后，不要去 `DROP` 它的 part 文件。正确做法是排查网络/Keeper 连接，必要时用 `SYSTEM RESTORE REPLICA` 从 Keeper 的元信息重新拉全量。直接删本地文件可能让该副本与 Keeper 记录彻底错位。
+</Callout>
+
+## 5. 故障恢复：一台挂了怎么办
+
+副本的最大价值就在容灾。假设 `ch-node1`（shard 1 的 replica 1）宕机：
+
+```text
+正常：   shard1 = {node1(leader), node2}   读/写都能选 node1 或 node2
+宕机：   shard1 = {node1 ✗, node2}          写转到 node2，读自动避开 node1
+恢复：   node1 重启 → 监听 Keeper 日志 → 把宕机期间 node2 产生的 part 拉回来
+```
+
+几条关键行为：
+
+- **写入**：Distributed 引擎发现某副本不可达，会自动把写入转发到同分片的其他副本（由 `internal_replication` 配置决定：为 `true` 时只写一份副本，由副本自行复制；为 `false` 时协调节点写同分片所有副本）。推荐 `internal_replication = true`，避免协调节点重复发数据。
+- **读取**：`load_balancing` 策略会自动把查询导向存活且误差（数据新鲜度）最小的副本。
+- **副本重启后自愈**：落后期间产生的数据会在重启后自动从其他副本补齐，无需人工干预。
+
+<Callout type="warn" title="internal_replication 必须配合副本使用">
+如果用了 `ReplicatedMergeTree` 却把 `internal_replication` 设成 `false`，协调节点会把同一份数据写进同分片的所有副本——而副本之间**又会**互相复制一次，导致重复写入和 part 冲突。用了副本就老老实实设 `internal_replication = true`。
+</Callout>
+
+## 6. 脑裂与 Keeper 高可用
+
+既然复制依赖 Keeper，Keeper 自己也必须高可用。Keeper 用 Raft 选主：
+
+- 部署 **奇数个**（3 或 5）Keeper 节点。
+- 只要多数派存活（3 节点容忍 1 台挂，5 节点容忍 2 台挂），集群就正常服务。
+- 若 Keeper **整体不可用**：已存在的副本**仍能继续读写本地数据**，只是**新 part 无法复制**、Keeper 依赖的 DDL 会挂起。所以 Keeper 挂掉 = 失去复制能力，但不等于 ClickHouse 立刻停服。
+
+```text
+Keeper 节点数    容忍宕机数    是否推荐
+   1               0           ✗ 单点，挂了全停
+   3               1           ✓ 最小可用
+   5               2           ✓✓ 生产推荐
+```
+
+<Callout type="tip" title="ClickHouse Keeper 比外挂 ZooKeeper 省心">
+老架构用 ZooKeeper，需要单独维护 JVM 堆内存，且大量小表时 ZK 的 znode 数量会爆。ClickHouse Keeper 用 C++ 实现、内存占用低、对 ClickHouse 的复制协议做了针对性优化，新项目直接用 Keeper 即可。
+</Callout>
+
+## 7. 常用运维命令
+
+```sql
+-- 查看表的复制队列是否堆积（waiting > 0 表示有 part 还没复制出去）
+SELECT database, table,
+       queue_size, inserts_in_queue, mutations_in_queue
+FROM system.replicas
+WHERE table = 'events_local';
+
+-- 手动触发与某个副本的全量同步（数据严重错位时）
+SYSTEM RESTORE REPLICA events_local;
+
+-- 重新拉取 Keeper 中的表结构（结构冲突时）
+SYSTEM SYNC REPLICA events_local;
+
+-- 查看副本延迟（相对 Leader 落后多少）
+SELECT database, table, is_leader, absolute_delay
+FROM system.replicas;
+```
+
+<Callout type="warn" title="不要用 OPTIMIZE FINAL 触发跨副本的频繁 merge">
+`OPTIMIZE TABLE ... FINAL` 会在每个副本上分别触发一次大 merge，且 merge 结果在各副本间**不会**互相复制（因为 part 名不同）。这会导致副本之间产生大量"等价但不相同"的 part。需要去重时优先用查询时 `FINAL`（见 7 章），或接受最终一致。
+</Callout>
+
+## 8. 小结
+
+- 副本靠 `ReplicatedMergeTree` + Keeper/Keeper 实现，解决高可用与读扩展。
+- Keeper 只存协调元数据，不存业务数据，所以不会成为存储瓶颈。
+- `` `{shard}` `` / `` `{replica}` `` 宏来自每个节点的 `macros` 配置：同分片 `shard` 相同、副本名不同。
+- 复制是"Leader 写日志、Follower 拉 part"的异步最终一致模型。
+- `internal_replication = true` + Keeper 奇数节点（3/5）是生产标配。
+- Keeper 全挂不意味 ClickHouse 停服，只是失去复制能力；副本宕机可自愈。
+
+<Callout type="exercise" title="动手练习">
+1. 用 3 个 ClickHouse 容器 + 1 个 ClickHouse Keeper 容器，配置 `2 分片 × 2 副本`（共 4 个 CH 节点，shard 01/02 各 2 副本，macros 各不相同）。
+2. 建 `ReplicatedMergeTree` 的 `events_local` 和对应的 `Distributed` 表，往分布式表插 50 万行。
+3. 停掉 shard 1 的 `replica 1` 容器，确认写入/查询仍能成功（落到 replica 2）；重启该容器后，用 `system.replicas` 的 `absolute_delay` 确认它已自动追上。
+4. 在 Keeper 节点上用 `SELECT count() FROM system.zookeeper WHERE path = '/clickhouse/tables'` 观察复制元数据路径（若开启 zookeeper 表引擎）。
+</Callout>

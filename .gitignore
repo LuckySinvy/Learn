@@ -12,3 +12,6 @@ dist
 .deploy
 *.tar.gz
 *.tsbuildinfo
+
+# 本地 MDX 语法自检脚本（依赖 pnpm 目录布局，不入库）
+mdxcheck.mjs

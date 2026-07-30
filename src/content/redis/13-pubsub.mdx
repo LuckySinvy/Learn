@@ -1,0 +1,182 @@
+---
+title: 发布订阅：即发即失的消息广播
+order: 13
+description: SUBSCRIBE/PUBLISH/模式订阅、Cluster 分片订阅 SSUBSCRIBE、消息丢失问题与 Stream 取舍
+---
+
+# 发布订阅：即发即失的消息广播
+
+Pub/Sub 是 Redis 里最轻量的消息机制：发布者往频道扔消息，**当前在线**的订阅者立刻收到——没有存储、没有确认、没有回放。它是广播喇叭，不是收件箱。理解这个定位，就知道它该用在哪、绝不能用在哪。
+
+## 1. 基本使用
+
+### 1.1 订阅与发布
+
+```bash
+# 终端 A: 订阅频道（可同时订阅多个）
+127.0.0.1:6379> SUBSCRIBE news:tech news:sport
+1) "subscribe"
+2) "news:tech"
+3) (integer) 1          # 当前已订阅 1 个频道
+1) "subscribe"
+2) "news:sport"
+3) (integer) 2
+（进入订阅态, 等待消息...）
+```
+
+```bash
+# 终端 B: 发布
+127.0.0.1:6379> PUBLISH news:tech "Redis 8 released"
+(integer) 1             # 返回收到消息的订阅者数量
+```
+
+```bash
+# 终端 A 立即收到:
+1) "message"            # 消息类型
+2) "news:tech"          # 来源频道
+3) "Redis 8 released"   # 内容
+```
+
+`PUBLISH` 的返回值很有用：0 表示当前没人订阅，**这条消息已经凭空消失了**。
+
+### 1.2 模式订阅：PSUBSCRIBE
+
+用 glob 通配符订阅一批频道：
+
+```bash
+127.0.0.1:6379> PSUBSCRIBE news:*
+1) "psubscribe"
+2) "news:*"
+3) (integer) 1
+# 任何 news: 前缀频道的消息都会送达:
+1) "pmessage"
+2) "news:*"             # 匹配的模式
+3) "news:finance"       # 实际频道
+4) "CPI data out"
+```
+
+注意：一个客户端同时用 SUBSCRIBE news:tech 和 PSUBSCRIBE news:* 时，一条发到 news:tech 的消息会**收到两次**（一次 message 一次 pmessage）。
+
+### 1.3 观察命令
+
+```bash
+127.0.0.1:6379> PUBSUB CHANNELS          # 有订阅者的频道列表
+1) "news:tech"
+127.0.0.1:6379> PUBSUB NUMSUB news:tech
+1) "news:tech"
+2) (integer) 3          # 3 个订阅者
+127.0.0.1:6379> PUBSUB NUMPAT
+(integer) 1             # 模式订阅的数量
+```
+
+进入订阅态的连接只能执行 SUBSCRIBE/UNSUBSCRIBE/PING/QUIT 等少数命令，**业务里必须用独立连接做订阅**，不能复用普通命令的连接池连接。
+
+## 2. 消息为什么会丢
+
+Pub/Sub 的投递模型是**纯内存转发**：
+
+```text
+PUBLISH ch msg
+     |
+     v
+遍历 ch 的订阅者连接 -> 把消息写进各连接的输出缓冲区 -> 完事
+     |
+     +-- 没有订阅者?      消息直接丢弃
+     +-- 订阅者断线中?    收不到, 重连后也没有
+     +-- 订阅者处理太慢?  输出缓冲区超限, 连接被强制断开
+```
+
+三种丢消息的姿势：
+
+1. **离线即丢**：订阅者网络抖动重连的几秒里，所有消息永久错过；
+2. **无确认**：消息写进 socket 就算送达，订阅者崩在处理中也无从得知；
+3. **慢消费者被踢**：输出缓冲区超过 `client-output-buffer-limit pubsub 32mb 8mb 60` 的限制，Redis 直接断开该订阅者连接（防止内存被慢客户端拖爆）。
+
+此外主从切换时，订阅关系不会迁移，客户端必须自己重新 SUBSCRIBE。
+
+<Callout type="warn" title="绝不能用 Pub/Sub 传业务关键消息">
+订单支付成功通知、库存变更事件这类"丢一条就出事故"的消息，用 Pub/Sub 等于埋雷。它只适合**丢了无所谓**的场景：实时弹幕、在线状态广播、配置刷新通知（丢了还有下次全量兜底）、多实例本地缓存失效通知（配合定期全量校验）。
+</Callout>
+
+## 3. Cluster 下的分片订阅：SSUBSCRIBE
+
+普通 Pub/Sub 在 Cluster 里的实现是**广播到所有节点**——任何节点收到 PUBLISH 都要转发给集群其他节点，因为订阅者可能连在任何节点上。节点越多，内部广播流量越大，严重制约扩展性。
+
+Redis 7 引入 **Sharded Pub/Sub**：频道按 key 的槽位规则归属某个分片，发布与订阅都必须发生在该分片上，不再全集群广播：
+
+```bash
+# 分片订阅（客户端会被路由/重定向到该频道所属分片）
+127.0.0.1:6379> SSUBSCRIBE orders:events
+1) "ssubscribe"
+2) "orders:events"
+3) (integer) 1
+
+# 分片发布
+127.0.0.1:6379> SPUBLISH orders:events "order 8801 paid"
+(integer) 1
+```
+
+```text
+普通 Pub/Sub in Cluster:        Sharded Pub/Sub:
+PUBLISH 到节点 A                 SPUBLISH 到频道所属分片 B
+  A -> 广播给 B, C, D...           只有 B 处理, 无跨节点广播
+  订阅者连哪都行                    订阅者必须连 B（或其副本）
+```
+
+代价是客户端需要感知路由（智能客户端处理 MOVED），收益是集群水平扩展时 Pub/Sub 流量不再爆炸。
+
+## 4. Pub/Sub、Stream、List 终极对比
+
+| 维度 | Pub/Sub | Stream | List |
+|---|---|---|---|
+| 消息存储 | 无 | 持久保留 | 保留到弹出 |
+| 离线补收 | 不可能 | 可以（按 ID 续读） | 可以 |
+| 广播（多方全量收） | 天然支持 | 多消费组支持 | 不支持 |
+| 分摊（多方分工收） | 不支持 | 消费组支持 | 天然支持 |
+| ACK / 重试 | 无 | 有 | 无 |
+| 延迟 | 最低（直接转发） | 低 | 低 |
+| 内存压力 | 几乎无 | 需 MAXLEN 控制 | 需消费及时 |
+
+决策树：
+
+```text
+消息丢了会出业务事故吗?
+├── 会  -> Stream（要广播就开多个消费组）
+└── 不会 -> 需要最低延迟的纯实时广播?
+          ├── 是 -> Pub/Sub（Cluster 上用 SSUBSCRIBE）
+          └── 否 -> 简单任务分发用 List, 否则仍建议 Stream
+```
+
+一个常见的组合拳：**Stream 存事件 + Pub/Sub 发"有新事件"的信号**——订阅者收到信号后去 Stream 拉取，即使信号丢了，定时轮询 Stream 也能兜底。
+
+## 5. 实战：多实例本地缓存失效
+
+微服务多实例各自有进程内缓存（Caffeine/本地 map），某实例更新数据后要通知所有实例清掉本地缓存：
+
+```bash
+# 更新方:
+127.0.0.1:6379> DEL cache:user:1001            # 先删 Redis 缓存
+(integer) 1
+127.0.0.1:6379> PUBLISH cache:invalidate "user:1001"
+(integer) 4             # 4 个实例在线收到
+
+# 每个实例启动时:
+127.0.0.1:6379> SUBSCRIBE cache:invalidate
+# 收到消息 -> 删除本地缓存中的 user:1001
+```
+
+这是 Pub/Sub 的舒适区：消息偶尔丢失的后果只是"本地缓存多存活一会"，配合较短的本地 TTL 即可兜底。
+
+## 小结
+
+- Pub/Sub 是即发即失的广播：无存储、无 ACK、离线即丢、慢消费者会被断开
+- PSUBSCRIBE 模式订阅注意与普通订阅叠加时的重复投递
+- Cluster 用 SSUBSCRIBE/SPUBLISH 分片订阅，避免全集群广播
+- 只用于"丢了无所谓"的场景；关键消息一律 Stream
+- 下一章开始高可用三部曲：主从复制 →
+
+<Callout type="exercise" title="练习">
+1. 开三个终端：一个 PSUBSCRIBE news:*，一个 SUBSCRIBE news:tech，一个发布消息，观察两个订阅者收到的消息格式差异。
+2. 验证"离线即丢"：订阅者 Ctrl+C 断开，发布 3 条消息，重新订阅后确认收不到。
+3. 设计"本地缓存失效广播"方案：写出发布方与订阅方的命令流程，并说明如何兜底 Pub/Sub 丢消息的情况。
+</Callout>

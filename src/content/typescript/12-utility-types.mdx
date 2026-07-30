@@ -1,0 +1,255 @@
+---
+title: 内置工具类型
+order: 12
+description: 掌握 Partial/Pick/Omit/Record/Exclude/ReturnType 等内置工具类型，并亲手实现它们
+---
+
+# 内置工具类型
+
+前面几章我们学会了写类型：接口、联合、泛型、映射类型、条件类型。但真实项目里，很多类型不是「从零写出来」的，而是**从已有类型变换出来**的：
+
+- 表单提交时要求所有字段齐全，草稿保存时允许只填一部分；
+- 数据库返回完整的 `User`，但接口只想暴露其中三个字段；
+- 一个函数已经写好了，我想拿到它的返回值类型，而不是手抄一遍。
+
+TypeScript 在 `lib.es5.d.ts` 里内置了一批**工具类型（Utility Types）**，专门做这些变换。它们不需要 import，全局可用。
+
+<Callout type="info" title="工具类型没有魔法">
+本章的每个工具类型，你都能用前面学过的映射类型 + 条件类型 + `infer` 亲手实现。会用是及格，能手写实现才算真正理解。
+</Callout>
+
+## 1. 属性修饰类：Partial / Required / Readonly
+
+这三个只改**修饰符**，不改属性集合。
+
+```ts
+type Partial<T>  = { [K in keyof T]?: T[K] };
+type Required<T> = { [K in keyof T]-?: T[K] };
+type Readonly<T> = { readonly [K in keyof T]: T[K] };
+```
+
+关键在映射类型的修饰符语法：`?` 表示加上可选，`-?` 表示**去掉**可选，同理还有 `readonly` 与 `-readonly`。
+
+典型用途是「更新补丁」：更新用户时，客户端只传改动的字段。
+
+<Playground
+  language="typescript"
+  id="ts-12-partial"
+  title="Partial / Required / Readonly"
+  code={`type User = { id: number; name: string; email?: string };
+
+// 1) Partial: 全部变可选，适合「补丁对象」
+const patch: Partial<User> = { name: "Ada" };
+console.log("Partial:", JSON.stringify(patch));
+
+// 2) Required: 全部变必填，email 也不能少了
+const full: Required<User> = { id: 1, name: "Ada", email: "ada@example.com" };
+console.log("Required:", JSON.stringify(full));
+
+// 3) Readonly: 全部只读
+const frozen: Readonly<User> = full;
+// frozen.id = 2;  // 若取消注释会报错：无法为只读属性赋值
+console.log("Readonly id:", frozen.id);
+
+// 4) 手写实现
+type MyPartial<T> = { [K in keyof T]?: T[K] };
+type MyRequired<T> = { [K in keyof T]-?: T[K] };
+type MyReadonly<T> = { readonly [K in keyof T]: T[K] };
+
+const mine: MyPartial<User> = { email: "x@y.z" };
+console.log("MyPartial:", JSON.stringify(mine));
+
+function applyPatch(base: User, p: Partial<User>): User {
+  return Object.assign({}, base, p);
+}
+console.log("merged:", JSON.stringify(applyPatch(full, { name: "Grace" })));`}
+/>
+
+<Callout type="warn" title="Partial 是浅层的">
+`Partial` 只处理第一层属性。嵌套对象里的字段仍然是必填的。需要递归时要自己写 `DeepPartial`，我们在下一章会实现它。
+</Callout>
+
+## 2. 属性筛选类：Pick / Omit / Record
+
+### 2.1 `Pick<T, K>` 挑出若干键
+
+```ts
+type Pick<T, K extends keyof T> = { [P in K]: T[P] };
+```
+
+`K extends keyof T` 这个约束很重要：它保证你只能挑存在的键，写错字段名会立即报错。
+
+### 2.2 `Omit<T, K>` 排除若干键
+
+```ts
+type Omit<T, K extends keyof any> = Pick<T, Exclude<keyof T, K>>;
+```
+
+注意 `Omit` 的第二个参数约束是 `keyof any`（即 `string | number | symbol`）而不是 `keyof T`。这是官方有意为之的宽松设计：排除一个不存在的键不算错误。代价是拼错字段名不会被发现。
+
+### 2.3 `Record<K, V>` 造一张表
+
+```ts
+type Record<K extends keyof any, V> = { [P in K]: V };
+```
+
+`Record` 是构造「字典」最常用的方式。当 `K` 是字面量联合时，它还能强制你**穷尽所有 key**——少写一个就编译不过，这在做多语言文案、状态机配置表时非常有用。
+
+<Playground
+  language="typescript"
+  id="ts-12-pick-omit"
+  title="Pick / Omit / Record"
+  code={`type Todo = { id: number; title: string; done: boolean; owner: string };
+
+type TodoPreview = Pick<Todo, "id" | "title">;
+const preview: TodoPreview = { id: 1, title: "写 TS 教程" };
+console.log("Pick:", JSON.stringify(preview));
+
+type PublicTodo = Omit<Todo, "owner">;
+const pub: PublicTodo = { id: 2, title: "复习类型", done: false };
+console.log("Omit:", JSON.stringify(pub));
+
+type Page = "home" | "about" | "contact";
+// 少写一个 key 就会编译报错，天然的穷尽性检查
+const titles: Record<Page, string> = {
+  home: "首页",
+  about: "关于我们",
+  contact: "联系我们",
+};
+console.log("Record:", JSON.stringify(titles));
+
+// 手写实现
+type MyPick<T, K extends keyof T> = { [P in K]: T[P] };
+type MyRecord<K extends keyof any, V> = { [P in K]: V };
+type MyOmit<T, K extends keyof any> = MyPick<T, Exclude<keyof T, K>>;
+
+const slim: MyOmit<Todo, "owner" | "done"> = { id: 3, title: "手写 Omit" };
+console.log("MyOmit:", JSON.stringify(slim));
+
+function pick<T extends object, K extends keyof T>(obj: T, keys: K[]): Pick<T, K> {
+  const out = {} as Pick<T, K>;
+  for (const k of keys) out[k] = obj[k];
+  return out;
+}
+const t: Todo = { id: 4, title: "运行一下", done: true, owner: "me" };
+console.log("运行时 pick:", JSON.stringify(pick(t, ["id", "done"])));`}
+/>
+
+<Callout type="tip" title="Omit 的类型安全增强版">
+如果你希望排除不存在的键时报错，可以自己写一个更严格的版本：`type StrictOmit<T, K extends keyof T> = Pick<T, Exclude<keyof T, K>>`。在自己的项目里用它替代 `Omit`，能少踩很多重构时的坑。
+</Callout>
+
+## 3. 联合筛选类：Exclude / Extract / NonNullable
+
+这三个作用在**联合类型**上，靠的是条件类型的**分发（distributive）**特性：当条件类型作用于裸类型参数且实参是联合时，会逐个成员分别求值再合并。
+
+```ts
+type Exclude<T, U>   = T extends U ? never : T;
+type Extract<T, U>   = T extends U ? T : never;
+type NonNullable<T>  = T & {};   // TS 4.9 起改成了交叉写法
+```
+
+以 `Exclude<"a" | "b", "a">` 为例，它会展开成 `("a" extends "a" ? never : "a") | ("b" extends "a" ? never : "b")`，也就是 `never | "b"`，最终得到 `"b"`。
+
+| 工具类型 | 含义 | 例子 |
+|---|---|---|
+| `Exclude<T, U>` | 从联合 T 中去掉能赋给 U 的成员 | `Exclude<"a" \| "b", "a">` 得 `"b"` |
+| `Extract<T, U>` | 只保留能赋给 U 的成员 | `Extract<string \| number, string>` 得 `string` |
+| `NonNullable<T>` | 去掉 `null` 与 `undefined` | `NonNullable<string \| null>` 得 `string` |
+
+## 4. 函数相关类：ReturnType / Parameters / Awaited
+
+这一组的核心是 `infer`：在条件类型里「挖一个洞」，让编译器把匹配到的类型填进来。
+
+```ts
+type ReturnType<T extends (...a: any) => any> = T extends (...a: any) => infer R ? R : any;
+type Parameters<T extends (...a: any) => any> = T extends (...a: infer P) => any ? P : never;
+```
+
+`Parameters` 返回的是一个**元组类型**，可以配合展开运算符调用函数，这是写包装器（缓存、重试、日志）的基础。
+
+`Awaited<T>` 则会递归地剥掉 `Promise`：`Awaited<Promise<Promise<number>>>` 就是 `number`。它取代了早年大家手写的 `UnwrapPromise`。
+
+<Playground
+  language="typescript"
+  id="ts-12-infer-utils"
+  title="ReturnType / Parameters / Awaited"
+  code={`function makeUser(id: number, name: string) {
+  return { id, name, createdAt: "2026-01-01" };
+}
+
+type UserShape = ReturnType<typeof makeUser>;
+type UserArgs = Parameters<typeof makeUser>;
+
+const args: UserArgs = [7, "Grace"];
+const u: UserShape = makeUser(...args);
+console.log("ReturnType:", JSON.stringify(u));
+
+async function fetchCount(): Promise<number> {
+  return 42;
+}
+type Count = Awaited<ReturnType<typeof fetchCount>>;
+const c: Count = 42;
+console.log("Awaited:", c);
+
+// 手写 ReturnType
+type MyReturnType<T extends (...a: never[]) => unknown> =
+  T extends (...a: never[]) => infer R ? R : never;
+const same: MyReturnType<typeof makeUser> = u;
+console.log("MyReturnType 通过:", same.name);
+
+// 用「参数元组 + 返回值」两个类型参数写一个通用日志包装器
+function withLog<A extends unknown[], R>(name: string, fn: (...a: A) => R) {
+  return (...args: A): R => {
+    console.log("调用", name, "参数:", JSON.stringify(args));
+    return fn(...args);
+  };
+}
+const logged = withLog("makeUser", makeUser);
+type LoggedArgs = Parameters<typeof logged>;
+const nextArgs: LoggedArgs = [9, "Linus"];
+console.log("结果:", JSON.stringify(logged(...nextArgs)));
+
+type Kind = "a" | "b" | 1 | 2;
+const onlyStr: Extract<Kind, string> = "a";
+const onlyNum: Exclude<Kind, string> = 2;
+const notNull: NonNullable<string | null | undefined> = "safe";
+console.log(onlyStr, onlyNum, notNull);`}
+/>
+
+<Callout type="warn" title="ReturnType 需要的是「类型」不是「值」">
+`ReturnType<makeUser>` 是错的，必须写成 `ReturnType<typeof makeUser>`。类型位置上的 `typeof` 是**类型查询**，和 JS 运行时的 `typeof` 运算符是两回事，只是复用了关键字。
+</Callout>
+
+## 5. 完整速查表
+
+| 工具类型 | 一句话 |
+|---|---|
+| `Partial<T>` | 全部属性变可选 |
+| `Required<T>` | 全部属性变必填 |
+| `Readonly<T>` | 全部属性变只读 |
+| `Pick<T, K>` | 只保留 K 这些键 |
+| `Omit<T, K>` | 去掉 K 这些键 |
+| `Record<K, V>` | 键为 K、值为 V 的对象 |
+| `Exclude<T, U>` | 联合中去掉 U |
+| `Extract<T, U>` | 联合中只留 U |
+| `NonNullable<T>` | 去掉 null 与 undefined |
+| `ReturnType<F>` | 函数返回值类型 |
+| `Parameters<F>` | 函数参数元组 |
+| `ConstructorParameters<C>` | 构造函数参数元组 |
+| `InstanceType<C>` | 构造函数的实例类型 |
+| `Awaited<T>` | 递归解开 Promise |
+
+<Callout type="exercise" title="练习">
+1. 手写 `MyExtract<T, U>` 与 `MyNonNullable<T>`，并用 `const` 变量验证它们和内置版本行为一致。
+2. 定义 `type Article = { id: number; title: string; body: string; authorId: number }`，用工具类型组合出「创建文章的入参类型」：不含 `id`，且 `body` 可选。提示：`Omit` 之后再和 `Partial<Pick<...>>` 做交叉。
+3. 写一个 `type DeepPartial<T>`，让嵌套对象的每一层属性都变成可选。
+</Callout>
+
+## 小结
+
+- 工具类型 = 映射类型 + 条件类型 + `infer` 的固定组合，全局可用无需 import
+- `Partial/Required/Readonly` 改修饰符；`Pick/Omit/Record` 改属性集合
+- `Exclude/Extract/NonNullable` 依赖条件类型的分发特性，作用在联合上
+- `ReturnType/Parameters/Awaited` 靠 `infer` 从已有函数或 Promise 里「反查」类型
+- 下一章进入模板字面量类型与类型体操 →

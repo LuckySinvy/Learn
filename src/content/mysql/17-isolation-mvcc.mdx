@@ -1,0 +1,146 @@
+---
+title: 隔离级别与 MVCC
+order: 17
+description: 四种隔离级别、脏读/不可重复读/幻读、ReadView 与版本链、当前读与快照读
+---
+
+# 隔离级别与 MVCC
+
+上一章讲了锁，但如果读也要加锁，读写就会互相阻塞，并发性能会很惨。InnoDB 的答案是 MVCC（多版本并发控制）：**写加锁，读走多版本快照，读写互不阻塞**。理解 MVCC，就理解了 InnoDB 高并发的秘密，也能解释「为什么我查不到别人已提交的数据」这类灵异现象。
+
+## 1. 并发读的三大异象
+
+| 异象 | 描述 |
+|---|---|
+| 脏读 | 读到了**别人未提交**的数据（对方一回滚，你读的就是不存在的数据） |
+| 不可重复读 | 同一事务内两次读**同一行**，值不一样（别人在中间提交了 UPDATE） |
+| 幻读 | 同一事务内两次**范围查询**，行数不一样（别人在中间提交了 INSERT） |
+
+## 2. 四种隔离级别
+
+| 级别 | 脏读 | 不可重复读 | 幻读 | 说明 |
+|---|---|---|---|---|
+| READ UNCOMMITTED | 可能 | 可能 | 可能 | 基本不用 |
+| READ COMMITTED (RC) | 避免 | 可能 | 可能 | Oracle/PG 默认，互联网公司常用 |
+| REPEATABLE READ (RR) | 避免 | 避免 | 基本避免* | **MySQL 默认** |
+| SERIALIZABLE | 避免 | 避免 | 避免 | 读全加锁，并发最差 |
+
+*InnoDB 的 RR 通过 MVCC（快照读）+ 临键锁（当前读）把幻读堵得七七八八，但混用快照读与当前读时仍有边缘场景，后文演示。
+
+```sql
+-- 查看与设置
+SELECT @@transaction_isolation;
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+RC vs RR 的工程取舍：
+
+- RR：一致性快照贯穿整个事务，适合有「事务内多次读要一致」诉求的场景；间隙锁多，锁冲突和死锁更多；
+- RC：每条语句一个新快照，总能读到最新已提交数据；几乎没有间隙锁，并发更好；binlog 必须用 ROW 格式。
+
+## 3. MVCC 的三块积木
+
+### 3.1 版本链
+
+第 12 章说过每行有两个隐藏列：`trx_id`（最后修改它的事务 ID）和 `roll_pointer`（指向 undo log 中的旧版本）。每次更新都把旧版本挂进 undo，形成链：
+
+```text
+最新行 (name='Pro Max', trx_id=103)
+        │ roll_pointer
+        ▼
+undo:  (name='Pro',     trx_id=102)
+        │ roll_pointer
+        ▼
+undo:  (name='Plus',    trx_id=101)
+```
+
+### 3.2 ReadView：我能看见谁
+
+事务做快照读时生成一个 ReadView，本质是「拍照瞬间活跃事务的名单」：
+
+```text
+ReadView 的四个字段：
+  m_ids        拍照时还活跃（未提交）的事务 ID 集合
+  min_trx_id   m_ids 里最小的
+  max_trx_id   拍照时下一个将分配的事务 ID
+  creator_trx_id 我自己
+```
+
+### 3.3 可见性判断
+
+沿版本链从最新往旧走，对每个版本的 trx_id 做判断，取第一个可见的版本：
+
+```text
+trx_id == 我自己          → 可见（自己改的）
+trx_id <  min_trx_id      → 可见（拍照前已提交）
+trx_id >= max_trx_id      → 不可见（拍照后才开的事务）
+在 m_ids 里               → 不可见（拍照时还没提交）
+不在 m_ids 里且在区间内    → 可见（拍照时已提交）
+```
+
+**RC 与 RR 的全部区别就一句话**：RC **每条语句**生成新 ReadView（总能看到最新已提交）；RR 只在**事务第一次快照读**时生成一次，之后一直复用（整个事务看到同一张照片）。前面所有可见性行为差异都由此推导。
+
+## 4. 快照读 vs 当前读
+
+| 类型 | 语句 | 读什么 | 加锁 |
+|---|---|---|---|
+| 快照读 | 普通 SELECT | ReadView 判定的历史版本 | 不加锁 |
+| 当前读 | UPDATE / DELETE / INSERT / SELECT FOR UPDATE / FOR SHARE | **最新已提交版本** | 加锁 |
+
+UPDATE 必须是当前读——你不能基于一张旧照片去改数据，否则会覆盖别人已提交的修改。这带来一个著名的「灵异现象」：
+
+```sql
+-- RR 级别。初始 stock = 100
+-- 会话 A                                  -- 会话 B
+BEGIN;
+SELECT stock FROM products WHERE id=1;    
+-- 看到 100（生成 ReadView）
+                                           BEGIN;
+                                           UPDATE products SET stock = 90 WHERE id=1;
+                                           COMMIT;
+SELECT stock FROM products WHERE id=1;
+-- 还是 100（快照读，复用 ReadView）✓ 可重复读
+UPDATE products SET stock = stock - 1 WHERE id = 1;
+-- 当前读！基于最新值 90 计算
+SELECT stock FROM products WHERE id=1;
+-- 89！不是 99 ——快照里的 100「被穿透」了
+COMMIT;
+```
+
+自己 UPDATE 过的行，之后的快照读能看到自己的修改（trx_id 是自己），于是读到 89。**「可重复读」只对快照读成立，当前读永远面向最新数据**——这个例子吃透了，MVCC 就毕业了。
+
+同理可见 RR 下防幻读的边界：两次快照读之间行数确实不变，但若中间夹了一次当前读（如 UPDATE 碰到了别人新插入并提交的行），那行的 trx_id 变成了自己，快照读也会「见鬼」地看到它。想彻底防幻读，范围操作要用 `SELECT ... FOR UPDATE`（临键锁把间隙锁住，别人根本插不进来）。
+
+## 5. 长事务与 undo 膨胀（再次强调）
+
+ReadView 存在期间，它可能读到的所有旧版本都不能从 undo 清除。一个开了 8 小时的只读长事务，会让全库 8 小时内所有被改行的旧版本全部滞留，undo 表空间暴涨、版本链越走越长、查询越来越慢。监控长事务不是可选项：
+
+```sql
+SELECT trx_id, trx_started, trx_mysql_thread_id,
+       TIME_TO_SEC(TIMEDIFF(NOW(), trx_started)) AS seconds
+FROM information_schema.innodb_trx
+ORDER BY trx_started;
+```
+
+<Callout type="warn" title="RC 级别 binlog 必须是 ROW 格式">
+STATEMENT 格式记录的是 SQL 语句原文，RC 下语句在主从重放时可能因并发时序不同产生不同结果，导致主从数据不一致。MySQL 会直接拒绝 RC + STATEMENT 的组合写 binlog。8.0 默认 ROW 格式，无需担心，但接手老系统时要检查（binlog 格式详见第 19 章）。
+</Callout>
+
+<Callout type="tip" title="怎么选隔离级别">
+没有历史包袱的新系统：高并发写入场景选 RC（锁少、死锁少），需要事务内一致性快照或依赖间隙锁防插入的场景用默认 RR。同一系统内保持统一，别让不同服务用不同级别连同一个库。
+</Callout>
+
+## 小结
+
+- 三异象递进：脏读 → 不可重复读 → 幻读；四级别逐级消灭
+- MVCC = 版本链（undo + roll_pointer）+ ReadView（活跃事务名单）+ 可见性规则
+- RC 每语句一个 ReadView，RR 每事务一个——两者区别的全部
+- 普通 SELECT 是快照读不加锁；增删改和 FOR UPDATE 是当前读，永远面向最新数据
+- RR 防幻读 = 快照读靠 MVCC + 当前读靠临键锁；混用时有边缘穿透
+- 长事务让 undo 无法回收，必须监控
+
+<Callout type="exercise" title="练习">
+1. 用两个会话完整复现本章「100 → 还是 100 → UPDATE 后变 89」的实验，并逐步用 ReadView 规则解释每次读到的值。
+2. 把隔离级别切成 RC 重做实验 1，指出哪几步结果变了、为什么。
+3. 设计一个实验证明：RR 下用 `SELECT ... FOR UPDATE` 做范围当前读后，其他会话无法向该范围插入新行（结合第 16 章的临键锁解释）。
+</Callout>

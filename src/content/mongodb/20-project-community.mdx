@@ -1,0 +1,953 @@
+---
+title: 项目实战：内容社区
+order: 20
+description: 完整的数据层设计——建模、索引、聚合统计、分页、分片规划与初始化脚本
+---
+
+# 项目实战：内容社区
+
+前面 19 章的每个知识点都在这一章汇合。我们要为一个内容社区（用户发帖、评论、关注、看信息流）设计完整的 MongoDB 数据层，从建模到索引到分片规划，每个决策都写清楚理由。
+
+## 1. 需求与规模假设
+
+### 1.1 功能清单
+
+| 模块 | 核心功能 |
+|---|---|
+| 用户 | 注册登录、个人主页、修改资料 |
+| 帖子 | 发布/编辑/删除、按标签浏览、详情页 |
+| 评论 | 发表评论、多级回复、点赞 |
+| 关注 | 关注/取关、粉丝列表、关注列表 |
+| 信息流 | 首页热门流、关注流 |
+| 通知 | 被评论、被点赞、被关注 |
+
+### 1.2 规模假设（一年后）
+
+```text
+  用户       500 万
+  帖子       2000 万        平均每天新增 5 万
+  评论       2 亿           平均每帖 10 条，爆款可达 5 万
+  关注关系   5 亿           平均每人关注 100 人
+  通知       10 亿          保留 30 天
+
+  读写比     100:1
+  峰值 QPS   读 3 万 / 写 300
+```
+
+### 1.3 访问模式清单（建模的输入）
+
+这一步最关键。**先列查询，再设计文档**。
+
+| 编号 | 查询 | 频率 | 延迟要求 |
+|---|---|---|---|
+| Q1 | 首页热门流（分页） | 极高 | 50ms |
+| Q2 | 关注流（分页） | 高 | 100ms |
+| Q3 | 帖子详情 + 前 3 条热评 | 极高 | 30ms |
+| Q4 | 帖子的评论列表（分页） | 高 | 50ms |
+| Q5 | 某用户的帖子列表 | 中 | 100ms |
+| Q6 | 按标签浏览 | 中 | 100ms |
+| Q7 | 用户主页（资料 + 计数） | 高 | 30ms |
+| Q8 | 关注/粉丝列表（分页） | 中 | 100ms |
+| Q9 | 判断 A 是否关注了 B | 极高 | 10ms |
+| Q10 | 我的通知列表 | 高 | 50ms |
+| Q11 | 每日运营报表 | 极低 | 分钟级 |
+
+## 2. 文档设计
+
+### 2.1 users
+
+```js
+{
+  _id: ObjectId("665f1a2b3c4d5e6f70819101"),
+  username: "alice",
+  email: "alice@example.com",
+  passwordHash: "$argon2id$...",
+
+  profile: {                                    // 一对一内嵌
+    displayName: "Alice",
+    avatar: "https://cdn.example.com/a/101.jpg",
+    bio: "后端工程师，写 Go 和 MongoDB",
+    city: "Beijing",
+    website: "https://alice.dev"
+  },
+
+  stats: {                                      // 预聚合计数（第 12 章）
+    posts: 42,
+    followers: 1280,
+    following: 96,
+    likesReceived: 8420
+  },
+
+  status: "active",                             // active | suspended | deleted
+  schemaVersion: 1,
+  createdAt: ISODate("2024-01-05T08:00:00Z"),
+  updatedAt: ISODate("2024-06-04T09:30:00Z")
+}
+```
+
+| 决策 | 理由 |
+|---|---|
+| `profile` 内嵌 | 一对一、总是一起读、大小固定（Q7） |
+| `stats` 预聚合 | 用户主页要显示计数，实时 count 5 亿关注关系不可行 |
+| 不内嵌 `following` 数组 | 大 V 有百万粉丝，数组会爆 16MB（第 12 章） |
+| `passwordHash` 在主文档 | 登录时要读，用视图对报表账号屏蔽（第 18 章） |
+
+### 2.2 posts
+
+```js
+{
+  _id: ObjectId("665f1a2b3c4d5e6f70819201"),
+  slug: "why-choose-mongodb",
+
+  title: "为什么选择 MongoDB",
+  summary: "从文档模型讲起……",
+  body: "……正文 markdown……",
+  coverUrl: "https://cdn.example.com/c/201.jpg",
+
+  author: {                                     // 扩展引用（第 12 章）
+    _id: ObjectId("665f1a2b3c4d5e6f70819101"),
+    username: "alice",
+    displayName: "Alice",
+    avatar: "https://cdn.example.com/a/101.jpg"
+  },
+
+  tags: ["mongodb", "database", "backend"],     // 一对少内嵌，多键索引
+
+  stats: {
+    views: 12045,
+    likes: 880,
+    comments: 152,
+    hotScore: 8823.4                            // 预计算的排序分
+  },
+
+  topComments: [                                // 子集模式（第 12 章）
+    { _id: ObjectId("...301"), username: "bob",   body: "好文", likes: 42 },
+    { _id: ObjectId("...305"), username: "carol", body: "学到了", likes: 30 },
+    { _id: ObjectId("...312"), username: "dave",  body: "赞", likes: 18 }
+  ],
+
+  status: "published",                          // draft | published | deleted
+  schemaVersion: 1,
+  publishedAt: ISODate("2024-06-01T10:00:00Z"),
+  createdAt: ISODate("2024-06-01T09:30:00Z"),
+  updatedAt: ISODate("2024-06-04T09:00:00Z")
+}
+```
+
+| 决策 | 理由 |
+|---|---|
+| `author` 冗余 4 个字段 | Q1/Q2/Q5/Q6 都是列表页，消灭 `$lookup`（第 11 章） |
+| `topComments` 只放 3 条 | Q3 一次查询搞定首屏，点「查看全部」才查 comments |
+| `hotScore` 预计算 | 热门排序不能在查询时算，第 5 节讲怎么维护 |
+| `body` 在主文档 | 详情页要读；如果正文可能很大（超过 1MB），应拆到 `post_bodies` |
+| `slug` 唯一 | SEO 友好的 URL |
+
+### 2.3 comments
+
+```js
+{
+  _id: ObjectId("665f1a2b3c4d5e6f70819301"),
+  postId: ObjectId("665f1a2b3c4d5e6f70819201"),
+
+  author: {                                     // 同样扩展引用
+    _id: ObjectId("665f1a2b3c4d5e6f70819102"),
+    username: "bob",
+    avatar: "https://cdn.example.com/a/102.jpg"
+  },
+
+  body: "写得很清楚，尤其是 ESR 那段",
+
+  parentId: null,                               // 顶级评论
+  ancestors: [],                                // 树形（第 12 章）
+  depth: 0,
+  replyCount: 3,
+
+  likes: 42,
+  status: "visible",                            // visible | hidden | deleted
+  createdAt: ISODate("2024-06-01T11:00:00Z")
+}
+```
+
+回复的文档：
+
+```js
+{
+  _id: ObjectId("665f1a2b3c4d5e6f70819302"),
+  postId: ObjectId("665f1a2b3c4d5e6f70819201"),
+  author: { _id: ObjectId("...103"), username: "carol", avatar: "..." },
+  body: "同感",
+  parentId: ObjectId("665f1a2b3c4d5e6f70819301"),
+  ancestors: [ObjectId("665f1a2b3c4d5e6f70819301")],
+  depth: 1,
+  replyCount: 0,
+  likes: 5,
+  status: "visible",
+  createdAt: ISODate("2024-06-01T11:05:00Z")
+}
+```
+
+### 2.4 follows
+
+```js
+{
+  _id: ObjectId(),
+  followerId: ObjectId("665f1a2b3c4d5e6f70819101"),   // 谁关注
+  followeeId: ObjectId("665f1a2b3c4d5e6f70819102"),   // 关注谁
+  createdAt: ISODate("2024-03-10T00:00:00Z")
+}
+```
+
+多对多中间集合。5 亿条文档，靠索引支撑 Q8 和 Q9。
+
+### 2.5 notifications
+
+多态模式（第 12 章）：
+
+```js
+{ _id: ObjectId(), userId: ObjectId("...101"), type: "comment",
+  actor: { _id: ObjectId("...102"), username: "bob", avatar: "..." },
+  postId: ObjectId("...201"), commentId: ObjectId("...301"),
+  excerpt: "写得很清楚……", read: false,
+  createdAt: ISODate(), expiresAt: ISODate("2024-07-04T00:00:00Z") }
+
+{ _id: ObjectId(), userId: ObjectId("...101"), type: "follow",
+  actor: { _id: ObjectId("...104"), username: "dave", avatar: "..." },
+  read: false, createdAt: ISODate(), expiresAt: ISODate("2024-07-04T00:00:00Z") }
+```
+
+用 `expiresAt` 配 TTL 索引自动清理 30 天前的通知（第 8 章）。
+
+### 2.6 dailyStats（预聚合报表）
+
+```js
+{
+  _id: { day: "2024-06-04" },
+  newUsers: 5210,
+  newPosts: 48210,
+  newComments: 482100,
+  activeUsers: 320481,
+  topTags: [ { tag: "mongodb", n: 3210 }, { tag: "go", n: 2840 } ],
+  updatedAt: ISODate()
+}
+```
+
+Q11 直接查这个集合，不做实时聚合。
+
+## 3. 索引方案
+
+### 3.1 users
+
+```js
+db.users.createIndex({ username: 1 }, { unique: true })
+db.users.createIndex({ email: 1 }, { unique: true })
+db.users.createIndex({ "profile.city": 1, createdAt: -1 })
+```
+
+`_id` 主键覆盖 Q7。
+
+### 3.2 posts
+
+```js
+const PUB = { partialFilterExpression: { status: "published" } }
+
+// Q1 首页热门流
+db.posts.createIndex({ hotScore: -1, _id: -1 }, PUB)
+
+// Q1 变体：最新流
+db.posts.createIndex({ publishedAt: -1, _id: -1 }, PUB)
+
+// Q2 关注流：按作者取最新
+db.posts.createIndex({ "author._id": 1, publishedAt: -1 }, PUB)
+
+// Q5 某用户的帖子（同上，复用）
+
+// Q6 按标签浏览
+db.posts.createIndex({ tags: 1, hotScore: -1 }, PUB)
+
+// Q3 详情页
+db.posts.createIndex({ slug: 1 }, { unique: true })
+```
+
+设计说明：
+
+| 索引 | ESR 分析 | 备注 |
+|---|---|---|
+| `hotScore` | E: status（部分索引）；S: hotScore；R: 无 | `_id` 做游标分页 tie-breaker |
+| `author._id` + `publishedAt` | E: status, author._id；S: publishedAt | 复合前缀能服务 Q5 |
+| `tags` + `hotScore` | E: status, tags；S: hotScore | 多键索引 |
+
+用部分索引把 `status` 从索引键里拿掉（第 9 章），2000 万帖子里假设 90% 已发布，节省的空间有限，但省掉了草稿的索引维护。
+
+### 3.3 comments
+
+```js
+// Q4 帖子的评论列表，游标分页
+db.comments.createIndex({ postId: 1, status: 1, createdAt: -1, _id: -1 })
+
+// 按热度排的评论
+db.comments.createIndex({ postId: 1, status: 1, likes: -1, _id: -1 })
+
+// 查某条评论的全部子孙（树形）
+db.comments.createIndex({ ancestors: 1 })
+
+// 用户的评论历史
+db.comments.createIndex({ "author._id": 1, createdAt: -1 })
+```
+
+### 3.4 follows
+
+```js
+// Q9 判断关注关系 + 唯一约束（防重复关注）
+db.follows.createIndex({ followerId: 1, followeeId: 1 }, { unique: true })
+
+// Q8 粉丝列表
+db.follows.createIndex({ followeeId: 1, createdAt: -1 })
+```
+
+第一个索引同时服务 Q9（等值查两个字段）和「我关注的人列表」（前缀 `followerId`），一举两得。
+
+### 3.5 notifications
+
+```js
+db.notifications.createIndex({ userId: 1, createdAt: -1 })
+db.notifications.createIndex({ userId: 1, read: 1, createdAt: -1 })
+db.notifications.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+```
+
+<Callout type="tip" title="索引数量核对">
+users 3 个、posts 5 个、comments 4 个、follows 2 个、notifications 3 个，都在第 9 章说的「5 到 8 个」范围内。每加一个索引前，先确认它对应哪个访问模式编号——找不到对应编号的索引，就不该建。
+</Callout>
+
+## 4. 核心查询实现
+
+### 4.1 Q1 首页热门流（游标分页）
+
+```js
+function hotFeed(cursor, size = 20) {
+  const filter = { status: "published" }
+  if (cursor) {
+    filter.$or = [
+      { hotScore: { $lt: cursor.score } },
+      { hotScore: cursor.score, _id: { $lt: cursor.id } }
+    ]
+  }
+  return db.posts.find(filter, {
+    slug: 1, title: 1, summary: 1, coverUrl: 1,
+    author: 1, tags: 1, "stats.likes": 1, "stats.comments": 1,
+    hotScore: 1, publishedAt: 1
+  })
+  .sort({ hotScore: -1, _id: -1 })
+  .limit(size)
+  .toArray()
+}
+```
+
+用复合游标（第 6 章 4.4 节），因为 `hotScore` 不唯一。`author` 已冗余，无需 `$lookup`。
+
+### 4.2 Q2 关注流
+
+```js
+async function followingFeed(userId, cursor, size = 20) {
+  // 第一步：拿到关注列表（可缓存到 Redis）
+  const followeeIds = await db.follows
+    .find({ followerId: userId }, { followeeId: 1, _id: 0 })
+    .limit(2000)
+    .map(d => d.followeeId)
+    .toArray()
+
+  // 第二步：查这些人的最新帖子
+  const filter = {
+    status: "published",
+    "author._id": { $in: followeeIds }
+  }
+  if (cursor) filter._id = { $lt: cursor.id }
+
+  return db.posts.find(filter)
+    .sort({ _id: -1 })
+    .limit(size)
+    .toArray()
+}
+```
+
+<Callout type="warn" title="关注流的扩展性瓶颈">
+`$in` 带 2000 个 id 时，MongoDB 要对每个 id 做一次索引查找再归并排序，延迟会明显上升。真正的大规模信息流需要「推模式」——发帖时把帖子 id 写入所有粉丝的收件箱集合（fan-out on write）。**读扩散（本节做法）适合关注数少的场景，写扩散适合读多写少但要注意大 V 的写放大**。这是社交系统的经典权衡。
+</Callout>
+
+### 4.3 Q3 帖子详情
+
+```js
+db.posts.findOne({ slug: "why-choose-mongodb", status: "published" })
+```
+
+一次查询返回正文、作者信息、标签、计数、3 条热评。**零关联**。这就是文档模型的收益。
+
+### 4.4 Q4 评论列表（游标分页）
+
+```js
+function comments(postId, cursor, size = 20) {
+  const filter = { postId, status: "visible", parentId: null }   // 只取顶级评论
+  if (cursor) filter._id = { $lt: cursor }
+
+  return db.comments.find(filter)
+    .sort({ _id: -1 })
+    .limit(size)
+    .toArray()
+}
+
+// 展开某条评论的全部回复
+function replies(rootCommentId) {
+  return db.comments.find({ ancestors: rootCommentId, status: "visible" })
+    .sort({ createdAt: 1 })
+    .toArray()
+}
+```
+
+### 4.5 Q9 判断关注关系（批量）
+
+```js
+// 单个
+db.follows.findOne({ followerId: me, followeeId: target }, { _id: 1 })
+
+// 批量：列表页要判断我对 20 个作者的关注状态
+const rows = db.follows.find(
+  { followerId: me, followeeId: { $in: authorIds } },
+  { followeeId: 1, _id: 0 }
+).toArray()
+const followingSet = new Set(rows.map(r => r.followeeId.toString()))
+```
+
+批量版本把 20 次查询变成 1 次，这是第 19 章讲的 N+1 改写。
+
+## 5. 写入流程与一致性
+
+### 5.1 发帖
+
+```js
+async function createPost(userId, data) {
+  const user = await db.users.findOne(
+    { _id: userId },
+    { username: 1, "profile.displayName": 1, "profile.avatar": 1 }
+  )
+
+  const post = {
+    _id: new ObjectId(),
+    slug: data.slug,
+    title: data.title,
+    summary: data.summary,
+    body: data.body,
+    author: {
+      _id: user._id,
+      username: user.username,
+      displayName: user.profile.displayName,
+      avatar: user.profile.avatar
+    },
+    tags: data.tags.slice(0, 10),
+    stats: { views: 0, likes: 0, comments: 0, hotScore: 0 },
+    topComments: [],
+    status: "published",
+    schemaVersion: 1,
+    publishedAt: new Date(),
+    createdAt: new Date(),
+    updatedAt: new Date()
+  }
+
+  await db.posts.insertOne(post, { writeConcern: { w: "majority" } })
+
+  // 计数器异步更新即可，不需要事务
+  await db.users.updateOne({ _id: userId }, { $inc: { "stats.posts": 1 } })
+
+  return post
+}
+```
+
+<Callout type="tip" title="为什么这里不用事务">
+帖子插入成功但计数器加一失败，后果是用户主页显示的帖子数少一。这个不一致完全可以接受，而且可以用定时任务对账修复。为它引入事务，代价是吞吐降低 3 到 10 倍（第 14 章）。**判断标准：不一致的后果能不能容忍、能不能补偿**。
+</Callout>
+
+### 5.2 发评论（需要事务的场景）
+
+```js
+await session.withTransaction(async () => {
+  const comment = { /* ... */ }
+  await db.comments.insertOne(comment, { session })
+
+  await db.posts.updateOne(
+    { _id: postId },
+    {
+      $inc: { "stats.comments": 1 },
+      $push: {
+        topComments: {
+          $each: [ { _id: comment._id, username, body: body.slice(0, 100), likes: 0 } ],
+          $sort: { likes: -1 },
+          $slice: 3
+        }
+      }
+    },
+    { session }
+  )
+
+  if (comment.parentId) {
+    await db.comments.updateOne(
+      { _id: comment.parentId },
+      { $inc: { replyCount: 1 } },
+      { session }
+    )
+  }
+})
+
+// 通知放在事务外，异步发送
+await db.notifications.insertOne({ /* ... */ })
+```
+
+这里用事务是因为 `topComments` 子集和 `stats.comments` 计数必须与评论文档保持一致，否则详情页会显示矛盾的数据。通知丢一条无所谓，移出事务缩短事务时长。
+
+### 5.3 关注（幂等设计）
+
+```js
+async function follow(followerId, followeeId) {
+  if (followerId.equals(followeeId)) throw new Error("CANNOT_FOLLOW_SELF")
+
+  const r = await db.follows.updateOne(
+    { followerId, followeeId },
+    { $setOnInsert: { createdAt: new Date() } },
+    { upsert: true }
+  )
+
+  // upsertedCount 为 1 才是新增关注，重复调用不会重复计数
+  if (r.upsertedCount === 1) {
+    await db.users.updateOne({ _id: followeeId }, { $inc: { "stats.followers": 1 } })
+    await db.users.updateOne({ _id: followerId }, { $inc: { "stats.following": 1 } })
+    await db.notifications.insertOne({ userId: followeeId, type: "follow", /* ... */ })
+  }
+}
+```
+
+关键在于用 `upsertedCount` 判断是否真的新增（第 5 章），配合唯一索引保证并发安全（第 8 章）。不需要事务。
+
+### 5.4 用户改名后同步冗余字段
+
+```js
+// Change Streams 消费者（第 15 章）
+const cs = db.users.watch([
+  { $match: {
+      operationType: "update",
+      $or: [
+        { "updateDescription.updatedFields.username": { $exists: true } },
+        { "updateDescription.updatedFields.profile.avatar": { $exists: true } },
+        { "updateDescription.updatedFields.profile.displayName": { $exists: true } }
+      ]
+  } }
+], { fullDocument: "updateLookup" })
+
+for (const change of cs) {
+  const u = change.fullDocument
+  const patch = {
+    "author.username": u.username,
+    "author.displayName": u.profile.displayName,
+    "author.avatar": u.profile.avatar
+  }
+  await db.posts.updateMany({ "author._id": u._id }, { $set: patch })
+  await db.comments.updateMany({ "author._id": u._id }, {
+    $set: { "author.username": u.username, "author.avatar": u.profile.avatar }
+  })
+  await saveResumeToken(change._id)
+}
+```
+
+### 5.5 hotScore 的维护
+
+热度分需要随时间衰减，不能只在点赞时更新。用定时任务批量重算最近 7 天的帖子：
+
+```js
+// 每 10 分钟跑一次
+db.posts.updateMany(
+  { status: "published", publishedAt: { $gte: sevenDaysAgo } },
+  [
+    { $set: {
+        ageHours: { $divide: [ { $subtract: ["$$NOW", "$publishedAt"] }, 3600000 ] }
+    } },
+    { $set: {
+        hotScore: {
+          $divide: [
+            { $add: [
+              { $multiply: ["$stats.likes", 5] },
+              { $multiply: ["$stats.comments", 8] },
+              "$stats.views"
+            ] },
+            { $pow: [ { $add: ["$ageHours", 2] }, 1.5 ] }     // 时间衰减
+          ]
+        }
+    } },
+    { $unset: "ageHours" }
+  ]
+)
+```
+
+用管道形式的更新（第 5 章），在服务端一次算完，不需要把数据拉到应用层。
+
+## 6. 聚合统计
+
+### 6.1 每日报表（$merge 增量物化）
+
+```js
+db.posts.aggregate([
+  { $match: { publishedAt: { $gte: todayStart, $lt: tomorrowStart } } },
+  { $group: {
+      _id: { day: { $dateToString: { date: "$publishedAt", format: "%Y-%m-%d", timezone: "Asia/Shanghai" } } },
+      newPosts: { $sum: 1 },
+      totalViews: { $sum: "$stats.views" },
+      totalLikes: { $sum: "$stats.likes" }
+  } },
+  { $merge: { into: "dailyStats", on: "_id", whenMatched: "merge", whenNotMatched: "insert" } }
+])
+```
+
+### 6.2 标签热度榜
+
+```js
+db.posts.aggregate([
+  { $match: { status: "published", publishedAt: { $gte: sevenDaysAgo } } },
+  { $unwind: "$tags" },
+  { $group: {
+      _id: "$tags",
+      posts: { $sum: 1 },
+      views: { $sum: "$stats.views" },
+      likes: { $sum: "$stats.likes" }
+  } },
+  { $set: { score: { $add: ["$views", { $multiply: ["$likes", 10] }] } } },
+  { $sort: { score: -1 } },
+  { $limit: 20 },
+  { $merge: { into: "hotTags", whenMatched: "replace", whenNotMatched: "insert" } }
+], { allowDiskUse: true })
+```
+
+### 6.3 作者排行（窗口函数）
+
+```js
+db.posts.aggregate([
+  { $match: { status: "published", publishedAt: { $gte: thirtyDaysAgo } } },
+  { $group: {
+      _id: "$author._id",
+      username: { $first: "$author.username" },
+      posts: { $sum: 1 },
+      views: { $sum: "$stats.views" },
+      likes: { $sum: "$stats.likes" }
+  } },
+  { $setWindowFields: {
+      sortBy: { views: -1 },
+      output: { rank: { $rank: {} } }
+  } },
+  { $match: { rank: { $lte: 100 } } },
+  { $merge: { into: "authorRanking", whenMatched: "replace", whenNotMatched: "insert" } }
+], { allowDiskUse: true })
+```
+
+### 6.4 用户成长漏斗（$facet）
+
+```js
+db.users.aggregate([
+  { $match: { createdAt: { $gte: thirtyDaysAgo } } },
+  { $facet: {
+      byCity: [
+        { $group: { _id: "$profile.city", n: { $sum: 1 } } },
+        { $sort: { n: -1 } },
+        { $limit: 10 }
+      ],
+      byPostCount: [
+        { $bucket: {
+            groupBy: "$stats.posts",
+            boundaries: [0, 1, 5, 20, 100],
+            default: "100+",
+            output: { n: { $sum: 1 } }
+        } }
+      ],
+      total: [ { $count: "n" } ]
+  } }
+])
+```
+
+```json
+[
+  {
+    "byCity": [ { "_id": "Beijing", "n": 42100 }, { "_id": "Shanghai", "n": 38200 } ],
+    "byPostCount": [
+      { "_id": 0,   "n": 98200 },
+      { "_id": 1,   "n": 42100 },
+      { "_id": 5,   "n": 12400 },
+      { "_id": 20,  "n": 3200 },
+      { "_id": 100, "n": 410 }
+    ],
+    "total": [ { "n": 156310 } ]
+  }
+]
+```
+
+## 7. 分片规划
+
+按第 17 章的原则，等到单复制集撑不住时再分片。先给出规划：
+
+| 集合 | 分片键 | 策略 | 理由 |
+|---|---|---|---|
+| `users` | `{ _id: "hashed" }` | 哈希 | 只按 id 查，无范围需求，分布均匀 |
+| `posts` | `{ "author._id": 1, _id: 1 }` | 范围组合 | Q2/Q5 能定向；`_id` 后缀避免大 V jumbo chunk |
+| `comments` | `{ postId: 1, _id: 1 }` | 范围组合 | Q4 定向；`_id` 后缀让爆款帖的评论能继续分裂 |
+| `follows` | `{ followerId: 1, followeeId: 1 }` | 范围组合 | Q9 定向；粉丝列表 Q8 会广播 |
+| `notifications` | `{ userId: 1, _id: 1 }` | 范围组合 | Q10 定向 |
+
+### 7.1 遗留问题与应对
+
+**问题一：`users` 用哈希 `_id` 后，`username` 和 `email` 的唯一索引建不了**（第 17 章 5.3 节）。
+
+应对：建两个注册表集合。
+
+```js
+// username_registry，分片键就是 _id
+{ _id: "alice", userId: ObjectId("...101"), createdAt: ISODate() }
+
+// 注册时先占位，失败说明已被占用
+db.username_registry.insertOne({ _id: username, userId, createdAt: new Date() })
+```
+
+**问题二：`follows` 查粉丝列表（Q8）会广播到所有分片**。
+
+应对：建一个反向集合 `followers`，分片键为 `{ followeeId: 1, followerId: 1 }`，用 Change Streams 保持同步。用空间换定向查询。
+
+**问题三：热门流 Q1 不带分片键，必然广播**。
+
+应对：热门流走缓存。热度榜前 1000 条帖子的 id 列表放 Redis，每 10 分钟刷新，用户请求时按 id 批量取（`$in` 带分片键 `_id`，仍是多分片但可控）。
+
+<Callout type="warn" title="分片会逼你重新审视每一个查询">
+上面三个问题在单复制集时代都不存在。这就是第 17 章说「不要过早分片」的具体含义——分片带来的不只是运维复杂度，还有对建模和查询的连锁约束。**在分片之前，先确认索引已优化到位、缓存已加、冷数据已归档**。
+</Callout>
+
+## 8. 完整初始化脚本
+
+```js
+// ============ init.js ============
+// 用法：mongosh "mongodb://localhost:27017/community?replicaSet=rs0" --file init.js
+
+const db = db.getSiblingDB("community")
+
+// ---------- 1. Schema 校验 ----------
+db.createCollection("users", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["username", "email", "passwordHash", "status", "createdAt"],
+      properties: {
+        username: { bsonType: "string", pattern: "^[a-zA-Z0-9_]{3,32}$" },
+        email: { bsonType: "string", pattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$" },
+        passwordHash: { bsonType: "string" },
+        profile: {
+          bsonType: "object",
+          properties: {
+            displayName: { bsonType: ["string", "null"] },
+            avatar: { bsonType: ["string", "null"] },
+            bio: { bsonType: ["string", "null"], maxLength: 500 },
+            city: { bsonType: ["string", "null"] }
+          }
+        },
+        stats: {
+          bsonType: "object",
+          properties: {
+            posts:     { bsonType: ["int", "long"], minimum: 0 },
+            followers: { bsonType: ["int", "long"], minimum: 0 },
+            following: { bsonType: ["int", "long"], minimum: 0 }
+          }
+        },
+        status: { enum: ["active", "suspended", "deleted"] },
+        createdAt: { bsonType: "date" }
+      }
+    }
+  },
+  validationLevel: "moderate",
+  validationAction: "error"
+})
+
+db.createCollection("posts", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["slug", "title", "author", "status", "createdAt"],
+      properties: {
+        slug: { bsonType: "string", pattern: "^[a-z0-9-]{1,120}$" },
+        title: { bsonType: "string", minLength: 1, maxLength: 200 },
+        author: {
+          bsonType: "object",
+          required: ["_id", "username"],
+          properties: {
+            _id: { bsonType: "objectId" },
+            username: { bsonType: "string" }
+          }
+        },
+        tags: {
+          bsonType: "array", maxItems: 10, uniqueItems: true,
+          items: { bsonType: "string", pattern: "^[a-z0-9-]{1,30}$" }
+        },
+        status: { enum: ["draft", "published", "deleted"] },
+        createdAt: { bsonType: "date" }
+      }
+    }
+  },
+  validationLevel: "moderate",
+  validationAction: "error"
+})
+
+db.createCollection("comments")
+db.createCollection("follows")
+db.createCollection("notifications")
+db.createCollection("dailyStats")
+
+// ---------- 2. 索引 ----------
+const PUB = { partialFilterExpression: { status: "published" } }
+
+db.users.createIndex({ username: 1 }, { unique: true })
+db.users.createIndex({ email: 1 }, { unique: true })
+db.users.createIndex({ "profile.city": 1, createdAt: -1 })
+
+db.posts.createIndex({ slug: 1 }, { unique: true })
+db.posts.createIndex({ hotScore: -1, _id: -1 }, PUB)
+db.posts.createIndex({ publishedAt: -1, _id: -1 }, PUB)
+db.posts.createIndex({ "author._id": 1, publishedAt: -1 }, PUB)
+db.posts.createIndex({ tags: 1, hotScore: -1 }, PUB)
+
+db.comments.createIndex({ postId: 1, status: 1, createdAt: -1, _id: -1 })
+db.comments.createIndex({ postId: 1, status: 1, likes: -1, _id: -1 })
+db.comments.createIndex({ ancestors: 1 })
+db.comments.createIndex({ "author._id": 1, createdAt: -1 })
+
+db.follows.createIndex({ followerId: 1, followeeId: 1 }, { unique: true })
+db.follows.createIndex({ followeeId: 1, createdAt: -1 })
+
+db.notifications.createIndex({ userId: 1, createdAt: -1 })
+db.notifications.createIndex({ userId: 1, read: 1, createdAt: -1 })
+db.notifications.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+
+// ---------- 3. 脱敏视图 ----------
+db.createView("users_public", "users", [
+  { $project: {
+      username: 1,
+      "profile.displayName": 1,
+      "profile.avatar": 1,
+      "profile.bio": 1,
+      "profile.city": 1,
+      stats: 1,
+      createdAt: 1
+  } }
+])
+
+// ---------- 4. 种子数据 ----------
+const now = new Date()
+const userIds = [new ObjectId(), new ObjectId(), new ObjectId()]
+
+db.users.insertMany([
+  { _id: userIds[0], username: "alice", email: "alice@example.com",
+    passwordHash: "x", profile: { displayName: "Alice", city: "Beijing", bio: "后端工程师" },
+    stats: { posts: 0, followers: 0, following: 0 }, status: "active", createdAt: now },
+  { _id: userIds[1], username: "bob", email: "bob@example.com",
+    passwordHash: "x", profile: { displayName: "Bob", city: "Shanghai", bio: "架构师" },
+    stats: { posts: 0, followers: 0, following: 0 }, status: "active", createdAt: now },
+  { _id: userIds[2], username: "carol", email: "carol@example.com",
+    passwordHash: "x", profile: { displayName: "Carol", city: "Beijing", bio: "前端" },
+    stats: { posts: 0, followers: 0, following: 0 }, status: "active", createdAt: now }
+])
+
+const tagPool = ["mongodb", "database", "backend", "go", "index", "performance"]
+const bulk = []
+for (let i = 0; i < 200; i++) {
+  const uid = userIds[i % 3]
+  const u = db.users.findOne({ _id: uid }, { username: 1, "profile.displayName": 1 })
+  const likes = Math.floor(Math.random() * 500)
+  const views = likes * 10 + Math.floor(Math.random() * 1000)
+  bulk.push({ insertOne: { document: {
+    slug: `seed-post-${i}`,
+    title: `示例帖子 ${i}`,
+    summary: "这是一篇种子数据帖子",
+    body: "正文内容……",
+    author: { _id: uid, username: u.username, displayName: u.profile.displayName },
+    tags: [tagPool[i % 6], tagPool[(i + 2) % 6]],
+    stats: { views, likes, comments: 0, hotScore: 0 },
+    topComments: [],
+    status: "published",
+    schemaVersion: 1,
+    publishedAt: new Date(now - i * 3600 * 1000),
+    createdAt: new Date(now - i * 3600 * 1000),
+    updatedAt: now
+  } } })
+}
+db.posts.bulkWrite(bulk, { ordered: false })
+
+db.users.updateMany({}, [
+  { $set: { "stats.posts": { $literal: 0 } } }
+])
+for (const uid of userIds) {
+  const n = db.posts.countDocuments({ "author._id": uid })
+  db.users.updateOne({ _id: uid }, { $set: { "stats.posts": n } })
+}
+
+// ---------- 5. 初始化 hotScore ----------
+db.posts.updateMany(
+  { status: "published" },
+  [
+    { $set: { ageHours: { $divide: [ { $subtract: ["$$NOW", "$publishedAt"] }, 3600000 ] } } },
+    { $set: { hotScore: { $round: [ { $divide: [
+        { $add: [ { $multiply: ["$stats.likes", 5] }, "$stats.views" ] },
+        { $pow: [ { $add: ["$ageHours", 2] }, 1.5 ] }
+    ] }, 2 ] } } },
+    { $unset: "ageHours" }
+  ]
+)
+
+print("init done:")
+printjson({
+  users: db.users.countDocuments(),
+  posts: db.posts.countDocuments(),
+  indexes: {
+    users: db.users.getIndexes().length,
+    posts: db.posts.getIndexes().length,
+    comments: db.comments.getIndexes().length
+  }
+})
+```
+
+运行结果：
+
+```text
+init done:
+{
+  "users": 3,
+  "posts": 200,
+  "indexes": { "users": 4, "posts": 6, "comments": 5 }
+}
+```
+
+## 9. 上线检查清单
+
+| 类别 | 检查项 |
+|---|---|
+| 部署 | 三节点复制集，无 Arbiter，跨三个可用区 |
+| 连接 | 连接串含 `replicaSet`、`w=majority`、`retryWrites=true`、`serverSelectionTimeoutMS` |
+| 安全 | 认证已开、`bindIp` 内网、按最小权限拆分账号、TLS 已启用 |
+| 索引 | 每个索引对应一个明确的访问模式编号，无冗余前缀索引 |
+| 校验 | 核心集合有 `$jsonSchema`，先用 warn 观察一周再收紧 |
+| 备份 | 每日快照 + oplog 归档 + 一个延迟 1 小时的隐藏节点；已做过恢复演练 |
+| 监控 | 复制延迟、cache 命中率、慢查询数、连接数、oplog 窗口 |
+| 容量 | 索引总大小小于 cache 的 50%，磁盘使用率低于 70% |
+| 应急 | 已演练过 `rs.stepDown()`，知道不可写窗口有多长 |
+
+<Callout type="exercise" title="综合练习">
+一、跑通第 8 节的初始化脚本，用 `db.posts.getIndexes()` 核对索引；二、实现 Q1 热门流的游标分页函数，翻到第 5 页，用 `explain` 确认没有 SORT 阶段且 `totalDocsExamined` 接近 20；三、造 5 万条评论（分布不均，让某一篇帖子有 2 万条），实现 Q4 的游标分页并测量耗时；四、实现 5.2 节的评论事务，故意在中途抛错，验证评论和计数都没有生效；五、写一个 Change Streams 消费者实现 5.4 节的改名同步，实测从改名到 posts 更新的延迟；六、用 6.3 节的聚合生成作者排行榜，并用 `$merge` 写入 `authorRanking`；七、为 `posts` 设计一个「按标签 + 时间」的新查询，判断现有索引够不够，不够就补一个并说明 ESR 分析；八、对照第 9 节的检查清单，列出你自己项目里还没做到的三项，并排出优先级。
+</Callout>
+
+## 小结
+
+- 建模的第一步是**列出访问模式清单**，而不是画 ER 图
+- 扩展引用（`author` 冗余）+ 子集（`topComments`）+ 预聚合（`stats`）三招，让 90% 的页面只需一次查询
+- 每个索引都要能对应到一个访问模式编号，找不到对应的就不该建
+- 游标分页 + 复合游标解决所有列表页的深分页问题
+- 只在「不一致会被用户直接看到」时才用事务，其余用幂等 + 补偿
+- 用 Change Streams 维护冗余字段的最终一致性
+- 分片规划要提前想，但不要提前做；分片会连锁约束唯一索引和查询路由
+- 上线前对照检查清单逐项确认，尤其是备份恢复演练和故障转移演练
+
+至此，20 章的 MongoDB 课程结束。从文档模型的心智转换开始，经过 CRUD、索引、聚合、建模、事务、复制、分片、运维，最后落到一个完整项目。回头看，所有性能与一致性问题的答案，几乎都能追溯到第 12 章的那三个问题：**一起读吗？一起写吗？会无限增长吗？**

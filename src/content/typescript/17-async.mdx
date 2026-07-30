@@ -1,0 +1,280 @@
+---
+title: 异步编程的类型
+order: 17
+description: Promise 的类型建模、async/await、Awaited、并发控制、AbortSignal 与异步迭代器
+---
+
+# 异步编程的类型
+
+JavaScript 的异步生态经历了回调、Promise、`async/await` 三代演进。TypeScript 给每一代都提供了精确的类型建模，其中最核心的一个泛型就是 `Promise<T>`——它表示「将来会得到一个 `T`」。
+
+本章我们把异步相关的类型工具串起来：怎么标注异步函数、`Awaited` 解决了什么、并发时元组类型如何保留、以及取消与流式数据怎么建模。
+
+## 1. `Promise<T>` 与 async 函数
+
+### 1.1 基本标注
+
+`async` 函数的返回类型**永远**是一个 Promise。你标注的是它 resolve 之后的类型：
+
+```ts
+async function getName(): Promise<string> {
+  return "Ada";        // 返回 string，会被自动包装成 Promise<string>
+}
+```
+
+写成 `async function getName(): string` 会直接报错：「异步函数的返回类型必须是 Promise」。
+
+### 1.2 三个泛型位置
+
+| 写法 | 含义 |
+|---|---|
+| `Promise<void>` | 完成但没有有意义的返回值 |
+| `Promise<never>` | 永远不会成功（只会 reject 或永不结束） |
+| `Promise<T>` 的 reject | **没有类型**，永远是 `any`／`unknown` |
+
+第三条是 TypeScript 一个长期的设计缺口：**Promise 的失败分支不可标注**。`.catch(e => ...)` 里的 `e` 永远是 `any`。第 18 章我们会讲用 Result 模式绕开它。
+
+<Callout type="warn" title="忘记 await 是最隐蔽的 bug">
+`if (checkAsync())` 里如果 `checkAsync` 是 async 函数，条件永远为真——因为 Promise 对象是真值。TS 本身不会报错，需要靠 ESLint 的 `no-misused-promises` 与 `no-floating-promises` 规则兜底。这两条规则强烈建议开启。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-17-basics"
+  title="async/await 与 Awaited"
+  code={`function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(() => {
+      resolve();
+    }, ms);
+  });
+}
+
+type UserDTO = { id: number; name: string };
+
+async function fetchUser(id: number): Promise<UserDTO> {
+  await delay(5);
+  return { id, name: "user-" + id };
+}
+
+// Awaited 递归剥掉 Promise 外壳
+type Fetched = Awaited<ReturnType<typeof fetchUser>>;   // UserDTO
+type Nested = Awaited<Promise<Promise<number>>>;        // number
+
+async function main(): Promise<void> {
+  const u: Fetched = await fetchUser(7);
+  console.log("用户:", JSON.stringify(u));
+
+  const n: Nested = 42;
+  console.log("Awaited 解开嵌套:", n);
+
+  const start = Date.now();
+  await delay(20);
+  console.log("至少等待了 20ms:", Date.now() - start >= 19);
+
+  // 顺序 await 会串行执行
+  const a = await fetchUser(1);
+  const b = await fetchUser(2);
+  console.log("串行结果:", a.name, b.name);
+}
+
+void main();`}
+/>
+
+## 2. 并发：Promise 的四个组合子
+
+| 方法 | 何时结束 | 返回 |
+|---|---|---|
+| `Promise.all` | 全部成功，或任一失败 | 结果**元组**（类型一一对应） |
+| `Promise.allSettled` | 全部结束（成功失败都算） | 状态对象数组 |
+| `Promise.race` | 第一个结束的（成功或失败） | 那一个的结果 |
+| `Promise.any` | 第一个**成功**的 | 那一个的值；全失败则抛 `AggregateError` |
+
+`Promise.all` 的类型定义非常精巧：传入元组时，它会保留每个位置的类型，而不是退化成联合数组。这让解构赋值也能拿到正确类型。
+
+<Callout type="tip" title="all 还是 allSettled">
+需要「全部成功才继续」用 `all`；需要「无论成败都收集结果」用 `allSettled`。给用户批量发通知这类场景，用 `all` 会因为一个失败而丢掉其它结果，几乎总是错的。
+</Callout>
+
+### 2.1 并发上限
+
+`Promise.all` 会一次性发起所有请求。当任务有几百个时，需要限制并发数。标准做法是开 N 个「worker」共享一个游标：
+
+<Playground
+  language="typescript"
+  id="ts-17-concurrency"
+  title="并发组合子与并发上限"
+  code={`function delay<T>(ms: number, value: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    setTimeout(() => {
+      resolve(value);
+    }, ms);
+  });
+}
+
+function fail(ms: number, msg: string): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    setTimeout(() => {
+      reject(new Error(msg));
+    }, ms);
+  });
+}
+
+async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array<R>(items.length);
+  let cursor = 0;
+
+  async function worker(): Promise<void> {
+    while (cursor < items.length) {
+      const i = cursor;
+      cursor += 1;
+      out[i] = await fn(items[i] as T, i);
+    }
+  }
+
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < Math.min(limit, items.length); w += 1) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  return out;
+}
+
+async function main(): Promise<void> {
+  // all 保留元组类型
+  const tuple = await Promise.all([delay(6, 1), delay(3, "two"), delay(1, true)]);
+  const [num, str, flag] = tuple;
+  console.log("all:", JSON.stringify(tuple));
+  console.log("元组类型保留:", typeof num, typeof str, typeof flag);
+
+  const settled = await Promise.allSettled([delay(1, "ok"), fail(1, "boom")]);
+  for (const r of settled) {
+    if (r.status === "fulfilled") console.log("成功:", r.value);
+    else console.log("失败:", (r.reason as Error).message);
+  }
+
+  console.log("race:", await Promise.race([delay(2, "fast"), delay(40, "slow")]));
+  console.log("any:", await Promise.any([fail(1, "x"), delay(3, "backup")]));
+
+  const squares = await mapLimit([1, 2, 3, 4, 5], 2, async (n) => {
+    await delay(2, null);
+    return n * n;
+  });
+  console.log("mapLimit 结果:", JSON.stringify(squares));
+}
+
+void main();`}
+/>
+
+## 3. 取消：AbortController 与 AbortSignal
+
+Promise 一旦创建就无法「撤回」。标准的取消方案是 `AbortController`：它产出一个 `AbortSignal`，把 signal 传给可取消的操作，调用 `controller.abort()` 时操作自行终止。
+
+`fetch`、Node 的 `fs.promises`、`setTimeout`（`timers/promises` 版本）都原生支持它。自己写的异步函数也应该接受一个可选的 `signal` 参数——这是现代 TS/JS 库的通用约定。
+
+## 4. 异步迭代器与 `for await...of`
+
+当数据是**逐块到达**的（分页 API、文件流、数据库游标），用 `AsyncIterable` 建模比一次性返回数组更合适。
+
+```ts
+async function* pages(total: number): AsyncGenerator<number[], void, unknown> {
+  for (let p = 0; p < total; p++) {
+    yield await fetchPage(p);
+  }
+}
+
+for await (const page of pages(3)) {
+  console.log(page.length);
+}
+```
+
+`AsyncGenerator<Y, R, N>` 的三个类型参数分别是：`yield` 出去的类型、`return` 的类型、外部通过 `next(v)` 传进来的类型。大多数时候只关心第一个。
+
+<Playground
+  language="typescript"
+  id="ts-17-async-iter"
+  title="异步迭代器与取消"
+  code={`function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(() => {
+      resolve();
+    }, ms);
+  });
+}
+
+// 模拟分页拉取
+async function* pages(total: number): AsyncGenerator<string[], void, unknown> {
+  for (let p = 1; p <= total; p += 1) {
+    await delay(3);
+    yield ["p" + p + "-a", "p" + p + "-b"];
+  }
+}
+
+// 可取消的等待
+function waitCancellable(ms: number, signal: AbortSignal): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      resolve("正常完成");
+    }, ms);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(new Error("操作已取消"));
+    });
+  });
+}
+
+async function main(): Promise<void> {
+  const all: string[] = [];
+  for await (const page of pages(3)) {
+    console.log("收到一页:", JSON.stringify(page));
+    all.push(...page);
+  }
+  console.log("共计:", all.length, "条");
+
+  const controller = new AbortController();
+  const pending = waitCancellable(5000, controller.signal);
+  controller.abort();
+  try {
+    await pending;
+  } catch (e) {
+    console.log("捕获:", (e as Error).message);
+  }
+
+  // 未取消的情况正常返回
+  const ok = new AbortController();
+  console.log(await waitCancellable(5, ok.signal));
+}
+
+void main();`}
+/>
+
+<Callout type="warn" title="别忘了清理监听">
+上面 `signal.addEventListener` 注册的回调，在 Promise 正常完成后仍挂在 signal 上。短生命周期的 signal 无所谓，但如果一个 signal 被复用于成千上万次操作，就会内存泄漏。生产代码应传 `{ once: true }` 并在 `finally` 里 `removeEventListener`。
+</Callout>
+
+## 5. 常见坑总结
+
+1. **`void` 返回的回调里用 async**。`arr.forEach(async (x) => { await f(x); })` 不会等待任何东西。要串行用 `for...of`，要并发用 `Promise.all(arr.map(...))`。
+2. **在 `try` 里 `return promise` 而不 `await`**。异常会逃出 `try/catch`。要么 `return await`，要么把 `await` 放进 try。
+3. **`Promise.all` 的失败会丢弃其它结果**，但其它 Promise 仍在跑，它们的错误可能变成未处理拒绝。
+4. **`async` 构造函数不存在**。需要异步初始化时用静态工厂方法 `static async create()`。
+5. **不要用 `Promise` 包裹已经是 Promise 的东西**，`new Promise(res => somePromise.then(res))` 是反模式。
+
+<Callout type="exercise" title="练习">
+1. 给 `mapLimit` 加上 `signal?: AbortSignal` 参数，取消时立即停止派发新任务并抛出错误。
+2. 实现 `withTimeout<T>(p: Promise<T>, ms: number): Promise<T>`，超时则 reject。提示：用 `Promise.race`。
+3. 写一个异步生成器 `chunk<T>(source: AsyncIterable<T>, size: number)`，把逐个到达的元素攒成定长数组再 yield 出去。
+</Callout>
+
+## 小结
+
+- `async` 函数返回 `Promise<T>`，`T` 是 resolve 的类型；reject 分支**没有类型**
+- `Awaited<T>` 递归解开 Promise，是标注异步返回值的利器
+- `Promise.all` 保留元组类型；`allSettled`／`race`／`any` 各有适用场景
+- 并发上限用「共享游标 + N 个 worker」实现；取消用 `AbortController`／`AbortSignal`
+- 流式数据用 `AsyncIterable` 与 `for await...of` 建模
+- 下一章讲错误处理与 Result 模式 →

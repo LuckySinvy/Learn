@@ -1,0 +1,380 @@
+---
+title: 联合类型与类型收窄
+order: 5
+description: 联合类型、交叉类型、字面量类型，以及 typeof/instanceof/in/真值收窄与可辨识联合
+---
+
+# 联合类型与类型收窄
+
+现实世界里的值经常「可能是这个，也可能是那个」：接口返回成功或失败，参数接受字符串或数字，用户可能已登录也可能没有。**联合类型**用来描述这种「或」的关系，而**类型收窄**是把宽泛的联合一步步缩小到可安全使用的具体类型的过程。这两件事合在一起，是 TypeScript 里最能体现「类型系统理解你的代码」的部分。
+
+## 1. 联合类型
+
+用 `|` 把多个类型连起来：
+
+```ts
+type Id = string | number;
+
+let id: Id = 101;
+id = "A-101";      // 都可以
+```
+
+联合类型的关键规则是：**你只能访问所有成员共有的成员**。
+
+```ts
+function print(id: string | number) {
+  // id.toUpperCase();   // 错误：number 上不存在 toUpperCase
+  console.log(id.toString());   // 可以：两者都有 toString
+}
+```
+
+这个限制不是刁难，而是必要的——编译器必须保证无论运行时拿到哪个分支的值，代码都不会崩。想用 `toUpperCase`，就得先证明它确实是字符串，这就是收窄。
+
+<Callout type="info" title="联合是「集合的并」，成员是「能力的交」">
+类型 `A | B` 的**取值范围**是 A 与 B 的并集，但它**能提供的能力**是 A 与 B 的交集。刚学时容易把方向搞反。
+</Callout>
+
+## 2. 字面量类型
+
+具体的值本身也可以当类型：
+
+```ts
+type Direction = "up" | "down";
+type Dice = 1 | 2 | 3 | 4 | 5 | 6;
+type Flag = true;
+```
+
+字面量联合是 TypeScript 里最常用的「枚举替代品」：它是纯类型，不生成运行时代码，还能享受自动补全和穷尽性检查。
+
+```ts
+// 比 boolean 参数好得多，调用处一眼看懂
+function setAlign(a: "left" | "center" | "right"): void {}
+```
+
+## 3. 交叉类型
+
+`&` 表示「同时满足」，常用于组合多个对象类型：
+
+```ts
+type WithId = { id: string };
+type WithTime = { createdAt: number };
+type Entity = WithId & WithTime;    // 两个属性都必须有
+```
+
+| 运算 | 含义 | 对象类型上的效果 |
+|---|---|---|
+| `A \| B` | 是 A 或是 B | 属性取交集（只能用共有的） |
+| `A & B` | 既是 A 又是 B | 属性取并集（两边的都要有） |
+
+<Callout type="warn" title="交叉冲突会得到 never">
+`{ a: string } & { a: number }` 里 `a` 的类型是 `string & number`，也就是 `never`——没有任何值能满足。编译器不会在定义处报错，只会在你试图构造这样一个对象时报错，排查起来很绕。用 `interface extends` 则会在定义处就报错。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-05-union-basic"
+  title="联合、字面量与交叉"
+  code={`type Id = string | number;
+type Align = "left" | "center" | "right";
+
+function showId(id: Id): string {
+  // 只能用共有成员
+  return "ID: " + id.toString();
+}
+console.log(showId(101));
+console.log(showId("A-101"));
+
+function pad(text: string, width: number, align: Align): string {
+  const gap = Math.max(0, width - text.length);
+  if (align === "left") return text + " ".repeat(gap);
+  if (align === "right") return " ".repeat(gap) + text;
+  const left = Math.floor(gap / 2);
+  return " ".repeat(left) + text + " ".repeat(gap - left);
+}
+console.log("[" + pad("hi", 6, "left") + "]");
+console.log("[" + pad("hi", 6, "right") + "]");
+console.log("[" + pad("hi", 6, "center") + "]");
+
+// 交叉类型：组合能力
+type WithId = { id: string };
+type WithTime = { createdAt: string };
+type Entity = WithId & WithTime;
+
+const e: Entity = { id: "u_1", createdAt: "2024-06-01" };
+console.log(e.id + " 创建于 " + e.createdAt);`}
+  expectedOutput={`ID: 101\nID: A-101\n[hi    ]\n[    hi]\n[  hi  ]\nu_1 创建于 2024-06-01`}
+/>
+
+## 4. 类型收窄
+
+TypeScript 会**跟踪控制流**：在 `if` 分支内部，它知道条件已经成立，于是把变量的类型缩小。这套机制叫控制流分析（control flow analysis）。
+
+### 4.1 typeof 收窄
+
+适用于原始类型：
+
+```ts
+function f(x: string | number) {
+  if (typeof x === "string") {
+    x.toUpperCase();     // 这里 x 是 string
+  } else {
+    x.toFixed(2);        // 这里 x 是 number
+  }
+}
+```
+
+<Callout type="warn" title="typeof null 是 object">
+JavaScript 的历史遗留 bug：`typeof null === "object"`。所以判断对象时不能只写 `typeof x === "object"`，必须额外排除 `null`，否则运行时会在 `null` 上访问属性而崩溃。
+</Callout>
+
+### 4.2 truthiness 真值收窄
+
+把值直接放进条件里，会排除所有假值（`0`、`""`、`NaN`、`null`、`undefined`、`false`）：
+
+```ts
+function greet(name?: string) {
+  if (name) {
+    console.log(name.toUpperCase());   // name 是 string
+  }
+}
+```
+
+注意它把空字符串也排除了。如果只想排除 `null` / `undefined`，写 `if (name != null)` 更准确（`!=` 的宽松比较同时覆盖两者，这是少数推荐用 `!=` 的场景）。
+
+### 4.3 相等性收窄
+
+`===`、`!==` 以及 `switch` 都能收窄，对字面量联合尤其有效。
+
+### 4.4 in 操作符收窄
+
+用于区分「有没有某个属性」的对象联合：
+
+```ts
+type Fish = { swim: () => void };
+type Bird = { fly: () => void };
+
+function move(a: Fish | Bird) {
+  if ("swim" in a) a.swim();
+  else a.fly();
+}
+```
+
+### 4.5 instanceof 收窄
+
+用于类的实例和内置对象（`Date`、`Error`、`Array` 等）。
+
+<Playground
+  language="typescript"
+  id="ts-05-narrowing"
+  title="四种收窄手段"
+  code={`// typeof 收窄
+function format(x: string | number | boolean): string {
+  if (typeof x === "string") return "字符串: " + x.toUpperCase();
+  if (typeof x === "number") return "数字: " + x.toFixed(2);
+  return "布尔: " + String(x);
+}
+console.log(format("ts"));
+console.log(format(3.14159));
+console.log(format(true));
+
+// 真值收窄 + 排除 null
+function nameLength(s: string | null | undefined): number {
+  if (s != null) return s.length;   // 同时排除 null 和 undefined
+  return 0;
+}
+console.log("长度 = " + nameLength("hello") + " / " + nameLength(null));
+
+// in 收窄
+type Fish = { name: string; swim: () => string };
+type Bird = { name: string; fly: () => string };
+
+function move(a: Fish | Bird): string {
+  if ("swim" in a) return a.name + " " + a.swim();
+  return a.name + " " + a.fly();
+}
+const nemo: Fish = { name: "尼莫", swim: () => "在游泳" };
+const tweety: Bird = { name: "崔弟", fly: () => "在飞" };
+console.log(move(nemo));
+console.log(move(tweety));
+
+// instanceof 收窄
+function describe(v: Date | Error | string[]): string {
+  if (v instanceof Date) return "日期，年份 " + v.getFullYear();
+  if (v instanceof Error) return "错误: " + v.message;
+  return "数组，共 " + v.length + " 项";
+}
+console.log(describe(new Date("2024-06-01T00:00:00Z")));
+console.log(describe(new Error("出错了")));
+console.log(describe(["a", "b"]));`}
+  expectedOutput={`字符串: TS\n数字: 3.14\n布尔: true\n长度 = 5 / 0\n尼莫 在游泳\n崔弟 在飞\n日期，年份 2024\n错误: 出错了\n数组，共 2 项`}
+/>
+
+## 5. 可辨识联合
+
+这是 TypeScript 里**最重要的建模模式**，没有之一。做法是：给联合中的每个成员加一个**公共的字面量属性**（叫 tag / kind / type 都行），编译器就能靠它精确区分分支。
+
+```ts
+type Circle = { kind: "circle"; radius: number };
+type Square = { kind: "square"; side: number };
+type Shape = Circle | Square;
+
+function area(s: Shape): number {
+  switch (s.kind) {
+    case "circle": return Math.PI * s.radius ** 2;   // s 是 Circle
+    case "square": return s.side ** 2;                // s 是 Square
+  }
+}
+```
+
+为什么它比「所有属性都可选」的写法好？对比一下：
+
+```ts
+// 反模式：无法表达「圆一定有半径」
+type BadShape = { kind: string; radius?: number; side?: number };
+```
+
+后者允许构造出 `{ kind: "circle" }` 这种非法状态，每次使用都得判空。可辨识联合让**非法状态无法被表示出来**，这正是类型建模的终极目标。
+
+配合上一章学过的 `never` 穷尽性检查，新增一个形状时编译器会精确指出所有需要更新的地方。
+
+<Playground
+  language="typescript"
+  id="ts-05-discriminated"
+  title="可辨识联合与穷尽性检查"
+  code={`type Circle = { kind: "circle"; radius: number };
+type Rect = { kind: "rect"; width: number; height: number };
+type Triangle = { kind: "triangle"; base: number; height: number };
+type Shape = Circle | Rect | Triangle;
+
+function assertNever(x: never): never {
+  throw new Error("未处理的形状: " + JSON.stringify(x));
+}
+
+function area(s: Shape): number {
+  switch (s.kind) {
+    case "circle":
+      return Math.PI * s.radius * s.radius;
+    case "rect":
+      return s.width * s.height;
+    case "triangle":
+      return (s.base * s.height) / 2;
+    default:
+      return assertNever(s);
+  }
+}
+
+const shapes: Shape[] = [
+  { kind: "circle", radius: 2 },
+  { kind: "rect", width: 3, height: 4 },
+  { kind: "triangle", base: 6, height: 5 },
+];
+
+for (const s of shapes) {
+  console.log(s.kind + " 面积 = " + area(s).toFixed(2));
+}
+
+// 另一个经典场景：请求状态机
+type Result =
+  | { status: "loading" }
+  | { status: "success"; data: string[] }
+  | { status: "error"; message: string };
+
+function render(r: Result): string {
+  switch (r.status) {
+    case "loading":
+      return "加载中...";
+    case "success":
+      return "拿到 " + r.data.length + " 条数据";
+    case "error":
+      return "失败: " + r.message;
+    default:
+      return assertNever(r);
+  }
+}
+
+console.log(render({ status: "loading" }));
+console.log(render({ status: "success", data: ["a", "b", "c"] }));
+console.log(render({ status: "error", message: "超时" }));`}
+  expectedOutput={`circle 面积 = 12.57\nrect 面积 = 12.00\ntriangle 面积 = 15.00\n加载中...\n拿到 3 条数据\n失败: 超时`}
+/>
+
+<Callout type="tip" title="用类型让非法状态无法表示">
+遇到「有 A 时一定有 B、有 C 时一定没有 D」这类约束，第一反应应该是拆成可辨识联合，而不是堆一堆可选属性再到处判空。数据结构对了，后面的代码会自动变简单。
+</Callout>
+
+## 6. 类型谓词：自定义收窄
+
+内置的收窄手段不够用时，可以写返回 `x is T` 的函数，编译器会把它当作收窄依据：
+
+```ts
+function isString(v: unknown): v is string {
+  return typeof v === "string";
+}
+```
+
+<Callout type="warn" title="类型谓词是一张「信任票」">
+编译器不会验证 `v is string` 的函数体是否真的判断对了。如果你写错了逻辑，类型系统会跟着一起错，而且错得毫无征兆。写类型谓词时要格外小心，能用内置收窄就别自己造。
+</Callout>
+
+## 7. 收窄会在什么时候「失效」
+
+控制流分析很聪明，但它有边界。了解这些边界能省下大量困惑的时间。
+
+### 7.1 跨越回调边界
+
+```ts
+function f(x: string | null) {
+  if (x === null) return;
+  // 这里 x 是 string
+  setTimeout(() => {
+    // x 仍然是 string —— 因为 x 是 const 语义的参数且没被重新赋值
+  }, 0);
+}
+```
+
+参数没被重新赋值时，收窄能穿过闭包。但如果变量是 `let` 且在别处被赋过值，编译器就无法保证回调执行时它还是那个类型，收窄会被丢弃。**把收窄后的值存进一个 `const` 局部变量**是最简单的解法。
+
+### 7.2 属性访问链
+
+对 `obj.a.b` 做收窄，只对这条完整路径有效。中途调用了任何函数，编译器都会保守地认为对象可能被改过，从而作废收窄结果——尤其是可选属性配合方法调用时：
+
+```ts
+if (config.retry !== undefined) {
+  doSomething();
+  // config.retry 的收窄可能已失效
+}
+```
+
+同样，先取出 `const retry = config.retry` 再判断即可。
+
+### 7.3 别名判断
+
+TypeScript 4.4 起支持「把判断结果存进 const 再用」的写法：
+
+```ts
+const isString = typeof value === "string";
+if (isString) {
+  value.toUpperCase();     // 4.4 起可以正确收窄
+}
+```
+
+这叫**别名条件（aliased condition）**，只对 `const` 声明生效。用 `let` 存判断结果就不行。
+
+<Callout type="tip" title="遇到收窄失效，先存成 const">
+「取出到 const 局部变量」几乎能解决所有收窄失效问题，而且代码往往更清晰。这比加 `as` 断言或者非空断言 `!` 安全得多——后者是在关闭检查，前者是在帮编译器把话说清楚。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 定义 `type Json = string | number | boolean | null | Json[] | { [k: string]: Json }`，写一个 `stringify(v: Json): string` 手动序列化（不用 `JSON.stringify`），练习对递归联合的收窄。
+2. 把一个「支付方式」建模成可辨识联合：现金（金额）、银行卡（卡号后四位、金额）、优惠券（券码）。写 `describe` 函数用 switch 处理，并加上 `never` 穷尽性检查；然后新增一种方式，观察编译器报错的位置。
+</Callout>
+
+## 小结
+
+- 联合 `|` 的取值是并集，可用成员是交集；交叉 `&` 反之
+- 字面量类型 + 联合是最常用的「枚举替代品」
+- 收窄手段：`typeof`（原始类型）、真值判断、`===` / `switch`（字面量）、`in`（属性存在）、`instanceof`（类实例）
+- `typeof null === "object"`，判断对象时必须单独排除 null
+- **可辨识联合**是核心建模模式：加一个字面量 tag，让非法状态无法被表示
+- 自定义类型谓词 `x is T` 很强大，但编译器不校验其正确性
+- 下一章讲函数类型与重载 →

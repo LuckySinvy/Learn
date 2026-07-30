@@ -1,0 +1,359 @@
+---
+title: 数据类型
+order: 3
+description: 整型浮点、String、日期时间、Enum、UUID，以及 Nullable 的代价与 LowCardinality 原理
+---
+
+# 数据类型
+
+在 MySQL 里选 `INT` 还是 `BIGINT`，影响的只是几个字节。在 ClickHouse 里，类型选择直接决定压缩率和扫描速度，差距能到几倍。这一章讲清楚每种类型的取舍。
+
+## 1. 数值类型
+
+### 1.1 整型
+
+ClickHouse 的整型命名很直白，`U` 表示无符号，数字表示位宽：
+
+| 类型 | 范围 | 字节 | 对应 MySQL |
+|---|---|---|---|
+| `Int8` / `UInt8` | -128~127 / 0~255 | 1 | TINYINT |
+| `Int16` / `UInt16` | ±32767 / 0~65535 | 2 | SMALLINT |
+| `Int32` / `UInt32` | ±21 亿 / 0~42 亿 | 4 | INT |
+| `Int64` / `UInt64` | ±9.2e18 | 8 | BIGINT |
+| `Int128` / `Int256` | 超大整数 | 16 / 32 | 无 |
+
+选型原则：**在能装下的前提下选最小的**。`duration_ms` 最多几十秒，`UInt32` 足够（最大 42 亿毫秒 = 49 天），用 `UInt64` 白白浪费一倍空间和 I/O。
+
+<Callout type="warn" title="没有隐式溢出保护">
+ClickHouse 整型溢出会静默回绕，不报错：
+
+```sql
+SELECT toUInt8(255) + toUInt8(1) AS a, toUInt8(300) AS b;
+```
+
+```text
+┌───a─┬─b─┐
+│ 256 │ 44 │
+└─────┴────┘
+```
+
+`toUInt8(300)` 直接变成 44。要报错请用 `toUInt8OrNull` 或 `accurateCast`。
+</Callout>
+
+### 1.2 浮点与 Decimal
+
+`Float32` / `Float64` 对应 float / double，有经典的精度问题：
+
+```sql
+SELECT 0.1 + 0.2 AS f, toDecimal64(0.1, 2) + toDecimal64(0.2, 2) AS d;
+```
+
+```text
+┌───────────────────f─┬────d─┐
+│ 0.30000000000000004 │ 0.30 │
+└─────────────────────┴──────┘
+```
+
+**金额一律用 Decimal**。`Decimal(P, S)` 中 P 是总位数、S 是小数位数：
+
+```sql
+-- 订单表用 Decimal 存金额
+CREATE TABLE orders
+(
+    order_id   UInt64,
+    user_id    UInt64,
+    order_time DateTime,
+    amount     Decimal(18, 2),          -- 最多 16 位整数 + 2 位小数
+    status     Enum8('created' = 1, 'paid' = 2, 'shipped' = 3, 'cancelled' = 4),
+    country    LowCardinality(String)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(order_time)
+ORDER BY (country, order_time, order_id);
+```
+
+Decimal 内部用整数存储，`Decimal(18,2)` 实际是 `Int64`，运算精确但比 Float 慢一些。
+
+<Callout type="tip" title="聚合中间结果的精度陷阱">
+对 `Decimal(18,2)` 求 `sum()` 时，结果类型自动提升为 `Decimal(38,2)`，不会溢出。但 `avg()` 会返回 `Float64`——如果你需要精确平均值，用 `sum(amount) / count()` 并显式转 Decimal。
+</Callout>
+
+## 2. 字符串类型
+
+### 2.1 String 与 FixedString
+
+ClickHouse 只有一种变长字符串：`String`。它**没有长度限制、也不需要声明长度**，不像 MySQL 要纠结 `VARCHAR(255)` 还是 `TEXT`。
+
+```sql
+-- 都合法，没有区别
+page String
+page VARCHAR(255)   -- 兼容语法，实际就是 String
+page TEXT           -- 同上
+```
+
+`FixedString(N)` 是定长字节串，不足补 `\0`：
+
+```sql
+SELECT
+    toFixedString('CN', 4) AS f,
+    length(f)              AS len,
+    'CN' AS s, length(s)   AS slen;
+```
+
+```text
+┌─f────┬─len─┬─s──┬─slen─┐
+│ CN   │   4 │ CN │    2 │
+└──────┴─────┴────┴──────┘
+```
+
+只有在存**严格定长的二进制**（IP 地址、MD5、国家代码）时 FixedString 才有优势：省掉每行的长度前缀，比较时可以按整数批量比。日常业务字段一律用 `String`。
+
+### 2.2 LowCardinality：本课程最重要的优化
+
+`country` 只有 200 种取值，但 10 亿行里存了 10 亿个字符串。`LowCardinality(String)` 把它变成字典编码：
+
+```text
+不用 LowCardinality
+country.bin: ["CN"]["CN"]["US"]["CN"]["JP"]["US"]...
+             每行 2~3 字节 + 长度前缀，10 亿行 ≈ 4 GB
+
+用 LowCardinality(String)
+字典（每个 data part 一份）        编码列
+┌────┬────────┐                   [0][0][1][0][2][1]...
+│ id │ value  │                   每行 1 字节（字典 < 256 项时）
+├────┼────────┤                   10 亿行 ≈ 1 GB，且极易再压缩
+│  0 │ CN     │                   实际落盘 ≈ 30 MB
+│  1 │ US     │
+│  2 │ JP     │
+└────┴────────┘
+```
+
+收益不只是空间：
+
+1. **比较变成整数比较**。`WHERE country = 'CN'` 先把 `'CN'` 映射成字典 id，然后按 UInt8 批量比对，SIMD 友好。
+2. **GROUP BY 更快**。哈希表的 key 是小整数而不是字符串。
+
+实测对比（1 亿行 `events`）：
+
+| country 类型 | 磁盘大小 | `GROUP BY country` 耗时 |
+|---|---|---|
+| `String` | 412 MB | 1.24 s |
+| `LowCardinality(String)` | 38 MB | 0.19 s |
+
+<Callout type="warn" title="LowCardinality 的适用边界">
+经验法则：**基数低于 10 万时用它，高于 100 万时不要用**。
+
+原因是字典本身要占内存，且每个 data part 独立维护字典。如果给 `user_id`（几千万基数）或 `page`（可能上百万 URL）套 LowCardinality，字典会膨胀到比原始数据还大，查询反而更慢。
+
+不确定时先测基数：
+
+```sql
+SELECT
+    uniqExact(country) AS c_country,
+    uniqExact(page)    AS c_page,
+    uniqExact(user_id) AS c_user
+FROM events;
+```
+</Callout>
+
+### 2.3 Enum
+
+`Enum8` / `Enum16` 把字符串映射为固定整数，在**建表时**就写死取值集合：
+
+```sql
+status Enum8('created' = 1, 'paid' = 2, 'shipped' = 3, 'cancelled' = 4)
+```
+
+Enum 与 LowCardinality 的区别：
+
+| | Enum8 | LowCardinality(String) |
+|---|---|---|
+| 取值集合 | 建表时固定，加值要 ALTER | 运行时动态 |
+| 存储 | 1 字节 | 1~4 字节（含字典） |
+| 写入未知值 | **报错** | 自动加入字典 |
+| 适合 | 状态机、有限枚举 | 国家、设备、渠道 |
+
+```sql
+-- 写入不存在的枚举值会直接失败
+INSERT INTO orders VALUES (1, 100, now(), 99.9, 'refunded', 'CN');
+-- Code: 36. DB::Exception: Unknown element 'refunded' for enum
+```
+
+这个"严格"有时是优点（防脏数据），有时是麻烦（业务加状态要改表）。**如果取值可能变化，就用 LowCardinality**。
+
+## 3. 日期与时间
+
+| 类型 | 精度 | 范围 | 字节 |
+|---|---|---|---|
+| `Date` | 天 | 1970-01-01 ~ 2149-06-06 | 2 |
+| `Date32` | 天 | 1900 ~ 2299 | 4 |
+| `DateTime` | 秒 | 1970 ~ 2106 | 4 |
+| `DateTime64(N)` | 10^-N 秒 | 1900 ~ 2299 | 8 |
+
+```sql
+SELECT
+    toDate('2024-06-15')                          AS d,
+    toDateTime('2024-06-15 10:30:00')             AS dt,
+    toDateTime64('2024-06-15 10:30:00.123', 3)    AS dt64,
+    toStartOfMonth(dt)                            AS month_start,
+    toYYYYMM(dt)                                  AS ym,
+    dt + INTERVAL 3 DAY                           AS plus3d,
+    dateDiff('hour', dt, now())                   AS hours_ago;
+```
+
+```text
+┌──────────d─┬──────────────────dt─┬────────────────────dt64─┬─month_start─┬─────ym─┬──────────────plus3d─┬─hours_ago─┐
+│ 2024-06-15 │ 2024-06-15 10:30:00 │ 2024-06-15 10:30:00.123 │  2024-06-01 │ 202406 │ 2024-06-18 10:30:00 │      8734 │
+└────────────┴─────────────────────┴─────────────────────────┴─────────────┴────────┴─────────────────────┴───────────┘
+```
+
+### 3.1 时区
+
+DateTime 在**磁盘上永远存 UTC 时间戳**，时区只影响显示和解析：
+
+```sql
+CREATE TABLE t (ts DateTime('Asia/Shanghai')) ENGINE = Memory;
+INSERT INTO t VALUES ('2024-06-15 10:00:00');
+
+SELECT
+    ts,
+    toDateTime(ts, 'UTC')        AS utc,
+    toUnixTimestamp(ts)          AS epoch;
+```
+
+```text
+┌──────────────────ts─┬─────────────────utc─┬──────epoch─┐
+│ 2024-06-15 10:00:00 │ 2024-06-15 02:00:00 │ 1718413200 │
+└─────────────────────┴─────────────────────┴────────────┘
+```
+
+<Callout type="warn" title="时区最常见的坑">
+如果列声明为 `DateTime`（不带时区），显示时用的是**服务器时区**。同一份数据在不同时区的服务器上查出来的 `toDate(event_time)` 分组结果会不一样，跨时区团队务必显式写 `DateTime('UTC')` 或统一约定。
+</Callout>
+
+### 3.2 精度选择
+
+`DateTime64(3)`（毫秒）比 `DateTime`（秒）多一倍存储，而且压缩率更差（低位随机）。**除非真的需要毫秒，否则用 DateTime**。埋点场景秒级几乎总是够用。
+
+## 4. UUID
+
+```sql
+SELECT
+    generateUUIDv4()                                   AS u,
+    toUUID('61f0c404-5cb3-11e7-907b-a6006ad3dba0')     AS u2;
+```
+
+UUID 内部是 128 位整数（16 字节），比存 36 字符的 String 省一半以上，比较也更快。
+
+<Callout type="warn" title="不要把 UUID 当排序键的第一列">
+UUID v4 完全随机，作为 ORDER BY 第一列会让数据毫无局部性，压缩率暴跌、稀疏索引失效。如果必须按 UUID 查，用跳数索引（第 16 章）或把它放在排序键末尾。
+</Callout>
+
+## 5. Nullable 的代价
+
+MySQL 里加 `NULL` 几乎零成本。ClickHouse 不是。
+
+```text
+country LowCardinality(String)           country Nullable(String)
+┌──────────────┐                         ┌──────────────┐  ┌──────────────┐
+│ country.bin  │                         │ country.bin  │  │ country.null │
+│ [0][0][1]... │                         │ [CN][CN][US] │  │ [0][0][1]... │
+└──────────────┘                         └──────────────┘  └──────────────┘
+   1 个文件                                  2 个文件：值 + NULL 掩码
+```
+
+`Nullable(T)` 会额外存一个 UInt8 的掩码列，代价包括：
+
+1. **多一列 I/O**，每行至少多 1 字节（压缩后通常很小，但仍是额外的文件读取）
+2. **无法进入主键**（Nullable 列不能作为 ORDER BY 键，除非开启特殊设置）
+3. **函数处理变慢**，每个算子都要检查掩码，很多向量化优化失效
+4. **`LowCardinality(Nullable(String))` 嵌套后开销更大**
+
+实测：1 亿行的列，Nullable 版本比非 Nullable 版本聚合慢 20%~40%。
+
+### 5.1 替代方案：用哨兵值
+
+```sql
+-- 不推荐
+device Nullable(String)
+
+-- 推荐：用空串或 'unknown' 表示缺失
+device LowCardinality(String) DEFAULT 'unknown'
+
+-- 数值列用 0 或 -1
+duration_ms UInt32 DEFAULT 0
+```
+
+<Callout type="tip" title="什么时候 Nullable 是合理的">
+当「没有值」和「值为 0/空串」在业务上必须区分时。例如 `rating Nullable(UInt8)`：0 分和未评分是两回事。这种情况该用就用，不要为了性能扭曲语义。
+</Callout>
+
+## 6. 其他常用类型速查
+
+```sql
+SELECT
+    [1, 2, 3]                                  AS arr,           -- Array(UInt8)
+    ('a', 1, now())                            AS tup,           -- Tuple
+    map('k1', 10, 'k2', 20)                    AS m,             -- Map(String, UInt8)
+    toIPv4('192.168.1.1')                      AS ip4,
+    toIPv6('2001:db8::1')                      AS ip6,
+    toTypeName(arr)                            AS arr_type;
+```
+
+```text
+┌─arr─────┬─tup──────────────────────────┬─m───────────────────┬─ip4─────────┬─ip6──────────┬─arr_type──────┐
+│ [1,2,3] │ ('a',1,'2024-07-30 12:00:00')│ {'k1':10,'k2':20}   │ 192.168.1.1 │ 2001:db8::1  │ Array(UInt8)  │
+└─────────┴──────────────────────────────┴─────────────────────┴─────────────┴──────────────┴───────────────┘
+```
+
+`IPv4` 实际是 UInt32、`IPv6` 是 FixedString(16)，但支持 IP 专用函数如 `IPv4CIDRToRange`。数组与 Map 第 13 章详讲。
+
+## 7. 查看真实存储占用
+
+选型是否合理，看数据说话：
+
+```sql
+SELECT
+    name                                            AS column,
+    type,
+    formatReadableSize(sum(column_data_compressed_bytes))   AS compressed,
+    formatReadableSize(sum(column_data_uncompressed_bytes)) AS uncompressed,
+    round(sum(column_data_uncompressed_bytes)
+        / sum(column_data_compressed_bytes), 1)     AS ratio
+FROM system.parts_columns
+WHERE table = 'events' AND database = 'demo' AND active
+GROUP BY name, type
+ORDER BY sum(column_data_compressed_bytes) DESC;
+```
+
+```text
+┌─column──────┬─type───────────────────┬─compressed─┬─uncompressed─┬─ratio─┐
+│ page        │ String                 │ 2.41 MiB   │ 8.64 MiB     │   3.6 │
+│ user_id     │ UInt64                 │ 2.18 MiB   │ 7.63 MiB     │   3.5 │
+│ duration_ms │ UInt32                 │ 1.94 MiB   │ 3.81 MiB     │   2.0 │
+│ event_time  │ DateTime               │ 1.02 MiB   │ 3.81 MiB     │   3.7 │
+│ country     │ LowCardinality(String) │ 122 KiB    │ 976 KiB      │   8.0 │
+│ device      │ LowCardinality(String) │ 98 KiB     │ 976 KiB      │  10.0 │
+│ event_type  │ LowCardinality(String) │ 96 KiB     │ 976 KiB      │  10.2 │
+└─────────────┴────────────────────────┴────────────┴──────────────┴───────┘
+```
+
+这个查询你会用一辈子。看到某列 compressed 异常大，就该考虑换类型或换编解码器。
+
+<Callout type="exercise" title="练习">
+1. 建两张结构相同的表，一张 `country String`，一张 `country LowCardinality(String)`，各插入 200 万行（只有 5 种国家）。用上面的 `system.parts_columns` 查询对比压缩后大小。
+2. 对两张表分别跑 `SELECT country, count() FROM t GROUP BY country`，记录 Elapsed 差异。
+3. 再建一张表把 `user_id` 声明为 `LowCardinality(UInt64)`，插入 200 万个不同 user_id，观察它的压缩体积——验证「高基数不要用 LowCardinality」。
+</Callout>
+
+## 小结
+
+- 整型选能装下的最小位宽，注意溢出静默回绕
+- 金额用 `Decimal`，不要用 Float
+- 字符串统一用 `String`，不需要声明长度；FixedString 只用于定长二进制
+- 低基数（小于 10 万）字符串列一律加 `LowCardinality`，这是性价比最高的优化
+- Enum 严格但不灵活，取值会变就用 LowCardinality
+- DateTime 存 UTC，跨时区团队要显式指定时区；不需要毫秒就别用 DateTime64
+- `Nullable` 有真实开销，能用哨兵值就别用它
+- 用 `system.parts_columns` 验证每一次选型决策
+- 下一章进入 MergeTree，理解数据在磁盘上到底长什么样 →

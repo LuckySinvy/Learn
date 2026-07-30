@@ -1,0 +1,179 @@
+---
+title: MongoDB 概览
+order: 1
+description: 文档模型与关系模型的差异、适用场景、整体架构与 WiredTiger 存储引擎
+---
+
+# MongoDB 概览
+
+如果你写了多年 MySQL，第一次接触 MongoDB 时最强烈的感受往往是「不适应」：没有表结构、没有 JOIN、没有 `ALTER TABLE`。这种不适应不是因为 MongoDB 更简陋，而是因为它把「数据的形状」这件事的决定权从数据库交还给了应用。本章先建立心智模型，后面 19 章都建立在这个模型之上。
+
+## 1. 为什么会有文档数据库
+
+### 1.1 关系模型的隐性成本
+
+假设你要存一篇博客文章，它有标题、正文、若干标签、若干评论。在 MySQL 里你至少要建三张表：
+
+```sql
+CREATE TABLE posts   (id BIGINT PRIMARY KEY, title VARCHAR(200), body TEXT);
+CREATE TABLE tags    (post_id BIGINT, tag VARCHAR(50));
+CREATE TABLE comments(id BIGINT PRIMARY KEY, post_id BIGINT, body TEXT);
+```
+
+读一篇文章的完整信息需要三次查询或两次 JOIN。而在应用内存里，它本来就是一个对象：一个有 `tags` 数组和 `comments` 数组的 Post。把对象拆成表、再把表拼回对象，这层来回翻译就是所谓的**阻抗失配**（impedance mismatch），ORM 存在的大半理由就是为了掩盖它。
+
+MongoDB 的答案很直接：既然应用里它是一个对象，那就按一个对象存。
+
+```js
+{
+  _id: ObjectId("665f1a2b3c4d5e6f70819200"),
+  title: "为什么选择文档模型",
+  body: "……",
+  tags: ["mongodb", "database"],
+  comments: [
+    { author: "alice", body: "写得不错", createdAt: ISODate("2024-06-01T10:00:00Z") }
+  ]
+}
+```
+
+一次读取拿到全部内容，没有 JOIN，没有拼装。
+
+### 1.2 术语对照
+
+先把词汇换过来，后面沟通会顺畅很多：
+
+| 关系型（MySQL） | MongoDB | 说明 |
+|---|---|---|
+| Database | Database | 概念一致 |
+| Table 表 | Collection 集合 | 集合不要求同构 |
+| Row 行 | Document 文档 | 文档是 BSON 对象 |
+| Column 列 | Field 字段 | 字段可有可无 |
+| Index 索引 | Index 索引 | 都是 B 树 |
+| JOIN | `$lookup` | 聚合阶段，非一等公民 |
+| Primary Key | `_id` | 强制存在且唯一 |
+| Schema DDL | 无（可选校验） | 见第 13 章 |
+| Transaction | Transaction | 4.0 起支持多文档 |
+
+<Callout type="info" title="Schema-less 不等于没有 schema">
+MongoDB 不强制 schema，但你的应用代码一定隐含着一个 schema——它只是从数据库移到了代码里。真正的区别是「schema on write」变成了「schema on read」，责任转移了，并没有消失。第 13 章会讲怎么用 `$jsonSchema` 把一部分责任交还给数据库。
+</Callout>
+
+## 2. 什么场景该用，什么场景不该用
+
+### 2.1 适合的场景
+
+- **数据天然是层级/文档形态**：CMS 文章、商品详情、订单快照、用户配置。这些数据「一起读、一起写」，内嵌能省掉大量 JOIN。
+- **schema 频繁演进**：早期产品每周都在加字段，MongoDB 加字段就是写入时多写一个键，不需要 `ALTER TABLE` 锁表。
+- **需要水平扩展写入**：内建分片，扩容是加机器而不是分库分表的应用层改造。
+- **多态数据**：同一个集合里存不同类型的事件、不同品类的商品，各自字段不同。
+- **地理位置、全文检索**：内建 2dsphere 与文本索引，省掉一套 ES。
+
+### 2.2 不适合的场景
+
+- **强关系、多表关联的分析型查询**：财务对账、复杂报表，五张表 JOIN 加 GROUP BY，SQL 引擎的优化器远比 `$lookup` 成熟。
+- **严格的多表事务一致性且并发极高**：MongoDB 支持多文档事务，但代价明显（第 14 章会量化），如果你的业务每个操作都要跨 5 个集合改数据，说明建模方式或选型有问题。
+- **数据高度规范化且写入分散**：如果一个字段被 20 个地方引用，内嵌会造成更新风暴，引用又退化成关系库，此时关系库更合适。
+
+<Callout type="tip" title="判断标准：读写单元">
+问自己一个问题——「这些数据是不是总是一起被读、一起被写？」如果是，放一个文档；如果不是，拆开。这条准则贯穿第 12 章数据建模的全部内容。
+</Callout>
+
+## 3. 整体架构
+
+### 3.1 三种进程
+
+MongoDB 部署里会出现三类进程，理解它们的分工能帮你看懂后面的复制集与分片章节：
+
+```text
+                    ┌──────────────┐
+   应用 driver ───▶  │    mongos    │  查询路由（仅分片集群需要）
+                    └──────┬───────┘
+                           │ 查元数据
+                    ┌──────▼────────┐
+                    │ config server │  存分片元数据（本身是复制集）
+                    └──────┬────────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+   ┌─────────┐        ┌─────────┐        ┌─────────┐
+   │ shard A │        │ shard B │        │ shard C │   每个分片是一个复制集
+   │ mongod  │        │ mongod  │        │ mongod  │
+   └─────────┘        └─────────┘        └─────────┘
+```
+
+- **mongod**：真正存数据的进程。单机开发时你只跑它一个。
+- **mongos**：分片集群的路由，无状态，负责把查询发到正确的分片并合并结果。应用连的是 mongos，不是 mongod。
+- **config server**：存放「哪个数据范围在哪个分片」的元数据，从 3.4 起必须部署为复制集。
+
+### 3.2 三种部署形态
+
+| 形态 | 组成 | 适用 |
+|---|---|---|
+| 单机 standalone | 1 个 mongod | 本地开发、测试 |
+| 复制集 replica set | 3 个及以上 mongod | 绝大多数生产环境 |
+| 分片集群 sharded cluster | mongos + config + 多个复制集 | 单机放不下或写入超过单机上限 |
+
+<Callout type="warn" title="单机模式没有事务和变更流">
+多文档事务（第 14 章）和 Change Streams（第 15 章）都依赖 oplog，而 oplog 只在复制集里存在。本地开发如果要用这两个特性，需要用单成员复制集（`--replSet rs0` 再 `rs.initiate()`），不能用纯 standalone。这是新手最常踩的第一个坑。
+</Callout>
+
+## 4. WiredTiger 存储引擎
+
+从 3.2 起 WiredTiger 是默认引擎，你不太需要调它，但要知道它的三个特性，因为它们解释了很多性能现象。
+
+### 4.1 文档级并发控制
+
+WiredTiger 用 MVCC 做并发：写操作只锁住被修改的文档，而不是整个集合。两个客户端同时更新同一集合的不同文档不会互相阻塞；同时更新**同一个文档**时，其中一个会遇到写冲突（write conflict），MongoDB 会自动重试。
+
+### 4.2 压缩
+
+集合数据默认用 snappy 压缩，索引用前缀压缩。这意味着磁盘占用通常显著小于原始 BSON 大小，但内存里的数据是解压后的——估算内存需求时要按未压缩体积算。
+
+### 4.3 缓存与检查点
+
+WiredTiger 有自己的 cache，默认大小是 `max(0.5 × (物理内存 - 1GB), 256MB)`。热数据（工作集）应当能装进这块 cache，否则每次查询都要读磁盘。每 60 秒或每 2GB journal 会做一次 checkpoint 落盘；两次 checkpoint 之间靠 journal 保证崩溃不丢数据。
+
+```text
+   写请求
+     │
+     ▼
+ ┌──────────────┐   同步刷盘（默认每 100ms）   ┌──────────┐
+ │  WT cache    │ ───────────────────────────▶ │ journal  │
+ │ （内存，MVCC）│                              └──────────┘
+ └──────┬───────┘
+        │ checkpoint（每 60s）
+        ▼
+   ┌──────────┐
+   │ 数据文件  │
+   └──────────┘
+```
+
+<Callout type="warn" title="不要把 cache 调到物理内存的 100%">
+WiredTiger cache 之外，操作系统的文件缓存、连接的栈空间、聚合排序缓冲都要占内存。把 `wiredTigerCacheSizeGB` 设成物理内存的 50%~60% 是安全区间，设太大会导致 OOM Killer 杀掉 mongod。
+</Callout>
+
+## 5. 贯穿全课程的示例数据
+
+从下一章开始，我们会围绕一个**内容社区**（类似简化版知乎/掘金）建库，四个核心集合：
+
+| 集合 | 含义 | 关键字段 |
+|---|---|---|
+| `users` | 用户 | `username`、`email`、`profile`、`stats` |
+| `posts` | 帖子 | `authorId`、`title`、`tags`、`stats` |
+| `comments` | 评论 | `postId`、`authorId`、`body`、`parentId` |
+| `follows` | 关注关系 | `followerId`、`followeeId` |
+
+数据库名统一叫 `community`。每一章的示例都在这套数据上做，你可以从第 3 章开始一路练到第 20 章的完整项目。
+
+<Callout type="exercise" title="练习">
+不用打开电脑，先用纸笔做一件事：把你现在维护的某个业务的核心表结构（3 到 5 张表）画出来，然后标注哪些表「总是一起读、一起写」。这份标注就是你把它迁到 MongoDB 时的内嵌候选清单，第 12 章我们会回来验证你的判断。
+</Callout>
+
+## 小结
+
+- 文档模型消除了对象与表之间的阻抗失配，代价是关联查询能力弱于 SQL
+- 集合对应表、文档对应行，但集合不要求文档同构，`_id` 是强制主键
+- 「总是一起读写的数据放一起」是建模的第一准则
+- mongod 存数据、mongos 路由、config server 存元数据；生产至少用复制集
+- WiredTiger 提供文档级 MVCC 并发、压缩与 checkpoint，cache 应为内存的一半左右
+- 下一章安装 MongoDB 与 mongosh，把 `community` 库跑起来 →

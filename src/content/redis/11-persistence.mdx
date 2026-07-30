@@ -1,0 +1,172 @@
+---
+title: 持久化：RDB 与 AOF
+order: 11
+description: RDB 快照与 fork/COW、AOF 三种 fsync 策略与重写、混合持久化、数据丢失窗口分析
+---
+
+# 持久化：RDB 与 AOF
+
+Redis 数据在内存里，进程一退全部蒸发。持久化回答一个问题：**重启之后，数据还能剩多少？** RDB 和 AOF 是两种答案，各自的丢失窗口、性能代价、恢复速度截然不同——理解机制才能按业务的容忍度做选择。
+
+## 1. RDB：某一时刻的全量快照
+
+RDB 把某个时间点的**全部数据**序列化成一个紧凑的二进制文件（dump.rdb）。
+
+### 1.1 触发方式
+
+```conf
+# redis.conf: 满足任一条件即自动触发 bgsave
+save 3600 1        # 3600 秒内至少 1 次修改
+save 300 100       # 300 秒内至少 100 次修改
+save 60 10000      # 60 秒内至少 10000 次修改
+dir /var/lib/redis
+dbfilename dump.rdb
+```
+
+```bash
+127.0.0.1:6379> BGSAVE          # 手动触发, 后台执行（生产用这个）
+Background saving started
+127.0.0.1:6379> SAVE            # 同步执行, 阻塞所有请求, 生产禁用
+OK
+127.0.0.1:6379> LASTSAVE        # 上次成功快照的时间戳
+(integer) 1722310000
+```
+
+### 1.2 fork + 写时复制（COW）
+
+BGSAVE 时主进程 fork 出一个子进程，由子进程遍历内存写文件。关键问题：**子进程写文件要几十秒，期间主进程还在改数据，快照会不会脏？**
+
+答案是不会，靠操作系统的写时复制（Copy-On-Write）：
+
+```text
+fork 瞬间: 父子进程共享同一批内存页(只读标记), 不复制数据
++--------+          +--------+
+| 父进程 | -共享页-> | 子进程 |     fork 本身只复制页表, 毫秒级
++--------+          +--------+
+
+父进程随后修改某页数据时:
+  内核先把该页复制一份 -> 父进程改"新页", 子进程仍看到"旧页"
+  => 子进程眼中的数据永远定格在 fork 那一刻, 快照是一致的
+```
+
+代价：
+
+- fork 复制页表的耗时与内存量成正比，10 GB 实例的 fork 可能卡主线程上百毫秒（`INFO stats` 里的 `latest_fork_usec`）；
+- 快照期间写入越多，被复制的页越多，**极端情况下内存翻倍**——这是"Redis 内存别超过物理内存一半"说法的来源。
+
+### 1.3 RDB 的优缺点
+
+- 优点：文件紧凑、恢复快（直接加载二进制）、对主进程性能影响集中在 fork 一瞬；适合定期备份、主从全量同步。
+- 缺点：**两次快照之间的数据全部会丢**。按默认配置，宕机可能丢几分钟数据。
+
+## 2. AOF：记录每一条写命令
+
+AOF（Append Only File）把每条写命令追加到日志文件，重启时**重放**所有命令恢复数据。
+
+```conf
+appendonly yes
+appendfsync everysec      # fsync 策略, 见下
+# Redis 7: AOF 拆分为多文件, 放在 appenddirname 目录下
+appenddirname "appendonlydir"
+```
+
+### 2.1 三种 fsync 策略：性能与丢失窗口的权衡
+
+写命令先进 AOF 内存缓冲区，何时刷到磁盘由 `appendfsync` 决定：
+
+| 策略 | 行为 | 丢失窗口 | 性能 |
+|---|---|---|---|
+| `always` | 每条命令都 fsync | 最多丢 1 条命令 | 差，受磁盘 IOPS 限制 |
+| `everysec` | 后台线程每秒 fsync 一次 | 最多丢约 1 秒 | 好（默认，推荐） |
+| `no` | 交给操作系统（约 30 秒） | 最多丢几十秒 | 最好 |
+
+```text
+写命令 -> AOF 缓冲区(内存) --fsync--> 磁盘
+              ^                        ^
+        这一步永远很快          everysec: 每秒刷一次
+                               宕机时缓冲区里未刷的部分 = 丢失窗口
+```
+
+`everysec` 是绝大多数场景的正确选择：性能接近无持久化，最坏丢 1~2 秒数据。
+
+### 2.2 AOF 重写：文件会无限膨胀
+
+对同一个 key 执行 1 万次 INCR，AOF 里就有 1 万条记录，但其实一条 `SET counter 10000` 就够。AOF 重写（rewrite）生成一份**等价但最小**的新 AOF：
+
+```bash
+127.0.0.1:6379> BGREWRITEAOF
+Background append only file rewriting started
+```
+
+```conf
+auto-aof-rewrite-percentage 100    # 比上次重写后大 100% 时自动触发
+auto-aof-rewrite-min-size 64mb     # 且至少 64MB
+```
+
+重写也走 fork + COW：子进程按当前内存数据生成新 AOF；期间新的写命令由主进程写入增量缓冲。Redis 7 的 Multi-Part AOF 把文件拆成"1 个基础文件 + N 个增量文件 + manifest 清单"，重写不再需要旧版"重写缓冲区拷贝"的复杂逻辑，内存开销更小。
+
+```text
+appendonlydir/
+├── appendonly.aof.1.base.rdb    # 基础文件(重写产物)
+├── appendonly.aof.1.incr.aof    # 增量命令
+└── appendonly.aof.manifest      # 清单
+```
+
+## 3. 混合持久化：两全其美
+
+纯 AOF 恢复慢（逐条重放命令），纯 RDB 丢得多。Redis 4 起的混合模式（7.x 默认开启）：
+
+```conf
+aof-use-rdb-preamble yes
+```
+
+AOF 重写时，基础文件直接存 **RDB 格式**（紧凑、加载快），此后的增量仍是 AOF 命令格式：
+
+```text
+恢复流程: 先加载 base.rdb (快) -> 再重放 incr.aof (少量) 
+        = RDB 的恢复速度 + AOF 的低丢失窗口
+```
+
+## 4. 方案选型与丢失窗口对照
+
+| 方案 | 宕机丢失窗口 | 恢复速度 | 适用 |
+|---|---|---|---|
+| 不持久化 | 全部 | - | 纯缓存，可全量重建 |
+| 仅 RDB | 上次快照以来（分钟级） | 快 | 能容忍分钟级丢失、要低开销 |
+| AOF everysec | 约 1 秒 | 慢 | - |
+| RDB + AOF 混合（推荐） | 约 1 秒 | 较快 | 大多数持久化需求 |
+| AOF always | 最多 1 条 | 慢 | 极端要求（性能损失大） |
+
+<Callout type="info" title="持久化不能替代备份与高可用">
+持久化解决"本机重启不丢（多）"；磁盘损坏要靠**异地备份**（定期把 RDB 传到对象存储）；机器宕机期间的可用性要靠**主从 + 哨兵/Cluster**（后续章节）。三者是三个层次的问题。
+</Callout>
+
+<Callout type="warn" title="生产常见的持久化事故">
+1）**fork 失败**：内存超物理内存一半且 `vm.overcommit_memory=0` 时 BGSAVE 报 Cannot allocate memory，需设置 `sysctl vm.overcommit_memory=1`；2）**RDB 失败阻断写入**：默认 `stop-writes-on-bgsave-error yes`，快照失败后所有写命令报错——监控必须盯住 `rdb_last_bgsave_status`；3）**AOF 重写风暴**：大实例重写时磁盘 IO 打满影响 everysec 的 fsync，出现 `aof_delayed_fsync` 增长，主线程可能被拖住。
+</Callout>
+
+```bash
+# 持久化状态巡检
+127.0.0.1:6379> INFO persistence
+rdb_last_bgsave_status:ok
+rdb_last_save_time:1722310000
+latest_fork_usec:8123           # 上次 fork 耗时(微秒)
+aof_enabled:1
+aof_last_bgrewrite_status:ok
+aof_last_write_status:ok
+aof_delayed_fsync:0             # fsync 被延迟的次数, 增长说明磁盘顶不住
+```
+
+## 小结
+
+- RDB：fork + COW 的全量快照，紧凑恢复快，丢失窗口是"两次快照之间"
+- AOF：追加写命令，everysec 策略把丢失窗口压到约 1 秒；重写解决膨胀
+- 混合持久化 = RDB 格式的基础 + AOF 增量，7.x 的默认最优解
+- fork 的代价与内存量成正比：控制单实例内存，盯住 latest_fork_usec
+- 持久化、备份、高可用是三件事；下一章讲事务与 Lua →
+
+<Callout type="exercise" title="练习">
+1. 开启混合持久化，写入数据后执行 BGREWRITEAOF，查看 appendonlydir 下的文件构成；然后 kill -9 杀掉 Redis 再启动，验证数据恢复。
+2. 写入 1 个 key 后立刻拔电（或 kill -9），分别在 appendfsync 为 always 与 everysec 下重复实验，对比数据是否幸存。
+3. 用 INFO persistence 找出你实例的 latest_fork_usec，估算它与数据量的关系；思考 32 GB 的实例 fork 一次大约要多久。
+</Callout>

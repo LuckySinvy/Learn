@@ -1,0 +1,260 @@
+---
+title: 模板字面量类型与类型体操
+order: 13
+description: 用模板字面量类型拼接字符串类型，配合递归与 infer 完成路径类型、驼峰转换等类型体操
+---
+
+# 模板字面量类型与类型体操
+
+TypeScript 4.1 引入了**模板字面量类型（Template Literal Types）**，它让类型系统第一次拥有了「拼字符串」的能力。听起来像是个小特性，但它配合条件类型的递归之后，直接把 TS 的类型层变成了一门**图灵完备的函数式语言**。
+
+这也是「类型体操」这个词的由来。别被吓到——你不需要成为体操运动员，但掌握基本套路能让你写出真正好用的 API：`onClick` 这类事件名、`user.profile.name` 这类路径字符串、下划线转驼峰的 ORM 映射，都能在编译期被精确检查。
+
+## 1. 模板字面量类型基础
+
+语法和 JS 的模板字符串一模一样，只是写在**类型位置**上：
+
+```ts
+type Greeting = `hello ${string}`;
+
+const a: Greeting = "hello world";   // OK
+// const b: Greeting = "hi world";   // 报错：不匹配 hello 前缀
+```
+
+当插槽里放的是**联合类型**时，会产生**笛卡尔积**：
+
+```ts
+type Lang = "zh" | "en";
+type Page = "home" | "about";
+
+type Route = `/${Lang}/${Page}`;
+// "/zh/home" | "/zh/about" | "/en/home" | "/en/about"
+```
+
+四个字符串字面量类型全部由编译器自动生成。这在写路由表、i18n key、CSS 变量名时非常好用。
+
+<Callout type="warn" title="联合爆炸">
+插槽是联合时会做笛卡尔积。三个插槽各 20 个成员就是 8000 个字面量类型，编译器会明显变慢，超过 10 万个成员时 TS 会直接报「表达式过于复杂」。类型体操要克制。
+</Callout>
+
+### 1.1 常见构造：事件名与前缀
+
+```ts
+type Events = "click" | "focus" | "blur";
+type Handlers = {
+  [K in Events as `on${Capitalize<K>}`]: (e: unknown) => void;
+};
+// 等价于 { onClick: ...; onFocus: ...; onBlur: ... }
+```
+
+这里出现了两个新东西：映射类型的 `as` 子句（**键重映射，key remapping**），以及内置的 `Capitalize`。
+
+## 2. 四个内置的字符串工具类型
+
+TypeScript 内置了四个**内在（intrinsic）**字符串类型，它们由编译器原生实现，无法用 TS 自身写出来：
+
+| 工具类型 | 作用 | 例子 |
+|---|---|---|
+| `Uppercase<S>` | 全部大写 | `"abc"` 得 `"ABC"` |
+| `Lowercase<S>` | 全部小写 | `"ABC"` 得 `"abc"` |
+| `Capitalize<S>` | 首字母大写 | `"abc"` 得 `"Abc"` |
+| `Uncapitalize<S>` | 首字母小写 | `"Abc"` 得 `"abc"` |
+
+它们只在类型层生效，**运行时不会帮你转换字符串**。要让运行时和类型层对上，需要写一个带类型断言的辅助函数。
+
+<Playground
+  language="typescript"
+  id="ts-13-case-utils"
+  title="Capitalize 与运行时对齐"
+  code={`type Ev = "click" | "focus";
+
+type Pretty = Capitalize<Ev>;   // "Click" | "Focus"
+type Loud = Uppercase<Ev>;      // "CLICK" | "FOCUS"
+
+const p: Pretty = "Click";
+const l: Loud = "FOCUS";
+console.log(p, l);
+
+// 让运行时函数的返回类型和 Capitalize 精确对应
+function capitalize<S extends string>(s: S): Capitalize<S> {
+  return (s.charAt(0).toUpperCase() + s.slice(1)) as Capitalize<S>;
+}
+
+const r = capitalize("hello");   // 类型被推断为 "Hello"，不是 string
+console.log(r);
+
+// 用键重映射造一个事件处理器表
+type Handlers = { [K in Ev as Capitalize<K>]: (n: number) => string };
+const handlers: Handlers = {
+  Click: (n) => "click:" + n,
+  Focus: (n) => "focus:" + n,
+};
+console.log(handlers.Click(1), handlers.Focus(2));`}
+/>
+
+<Callout type="tip" title="为什么必须加类型断言">
+`s.charAt(0).toUpperCase()` 在运行时确实做了转换，但 TS 只知道它返回 `string`。断言是在告诉编译器「我保证运行时行为与类型层一致」。这类断言应该被严格封装在一个小函数里，而不是散落各处。
+</Callout>
+
+## 3. 用 infer 拆解字符串
+
+模板字面量类型不只能拼，还能**拆**。在条件类型里配合 `infer`，可以匹配字符串的前缀、后缀、中缀：
+
+```ts
+type Prefix<S> = S extends `${infer P}-${string}` ? P : never;
+type A = Prefix<"foo-bar">;   // "foo"
+```
+
+### 3.1 下划线转驼峰
+
+这是最经典的练习题。思路是递归：每次匹配 `头部_剩余`，把剩余部分首字母大写后继续递归。
+
+```ts
+type SnakeToCamel<S extends string> =
+  S extends `${infer Head}_${infer Tail}`
+    ? `${Head}${Capitalize<SnakeToCamel<Tail>>}`
+    : S;
+
+type T1 = SnakeToCamel<"user_first_name">;   // "userFirstName"
+```
+
+配合键重映射，就能把整个接口从下划线风格转成驼峰风格：
+
+```ts
+type CamelKeys<T> = {
+  [K in keyof T as K extends string ? SnakeToCamel<K> : K]: T[K];
+};
+
+type Row = { user_id: number; created_at: string };
+type Model = CamelKeys<Row>;   // { userId: number; createdAt: string }
+```
+
+### 3.2 对象路径类型
+
+另一个高价值场景是「深层取值」。给定一个嵌套对象类型，生成它所有合法路径的联合：
+
+```ts
+type Path<T> = T extends object
+  ? { [K in keyof T & string]: K | `${K}.${Path<T[K]>}` }[keyof T & string]
+  : never;
+
+type Cfg = { server: { host: string; port: number }; debug: boolean };
+type CfgPath = Path<Cfg>;
+// "server" | "server.host" | "server.port" | "debug"
+```
+
+有了 `CfgPath`，你就能写出 `get(config, "server.host")` 这种既灵活又有补全的 API。
+
+<Callout type="warn" title="递归深度有上限">
+TS 对类型实例化深度有限制（默认 50 层，尾递归条件类型可到 1000 层）。处理超长字符串或深层对象时可能触发「类型实例化过深」错误。真遇到了，通常意味着这个抽象不适合放在类型层。
+</Callout>
+
+## 4. 递归元组：不用字符串也能体操
+
+字符串之外，**元组**也是递归的常见载体。这里的技巧是 `[infer Head, ...infer Rest]` 模式匹配。
+
+<Playground
+  language="typescript"
+  id="ts-13-recursive-tuple"
+  title="递归元组类型"
+  code={`// 反转元组
+type Reverse<T extends readonly unknown[]> =
+  T extends readonly [infer H, ...infer R] ? [...Reverse<R>, H] : [];
+
+const rev: Reverse<[1, 2, 3]> = [3, 2, 1];
+console.log("Reverse:", JSON.stringify(rev));
+
+// 取长度（元组的 length 是字面量类型）
+type Length<T extends readonly unknown[]> = T["length"];
+const n: Length<[string, number, boolean]> = 3;
+console.log("Length:", n);
+
+// 追加元素
+type Push<T extends readonly unknown[], V> = [...T, V];
+const pushed: Push<[1, 2], 3> = [1, 2, 3];
+console.log("Push:", JSON.stringify(pushed));
+
+// 取第一个 / 剩余
+type Head<T extends readonly unknown[]> = T extends readonly [infer H, ...unknown[]] ? H : never;
+type Tail<T extends readonly unknown[]> = T extends readonly [unknown, ...infer R] ? R : [];
+
+const h: Head<[string, number]> = "first";
+const t: Tail<[string, number, boolean]> = [7, true];
+console.log("Head:", h, "Tail:", JSON.stringify(t));
+
+// 运行时反转，类型层同步精确
+function reverse<T extends readonly unknown[]>(arr: T): Reverse<T> {
+  return arr.slice().reverse() as unknown as Reverse<T>;
+}
+console.log("运行时:", JSON.stringify(reverse([1, "a", true] as const)));`}
+/>
+
+## 5. 递归映射：DeepReadonly 与 DeepPartial
+
+上一章说过 `Partial` 是浅层的。有了递归条件类型，我们可以做深层版本：
+
+<Playground
+  language="typescript"
+  id="ts-13-deep-readonly"
+  title="DeepReadonly 与 DeepPartial"
+  code={`type DeepReadonly<T> =
+  T extends (infer U)[] ? readonly DeepReadonly<U>[]
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
+type DeepPartial<T> =
+  T extends (infer U)[] ? DeepPartial<U>[]
+  : T extends object ? { [K in keyof T]?: DeepPartial<T[K]> }
+  : T;
+
+type Config = {
+  name: string;
+  server: { host: string; port: number; tags: string[] };
+};
+
+const frozen: DeepReadonly<Config> = {
+  name: "app",
+  server: { host: "127.0.0.1", port: 8080, tags: ["a", "b"] },
+};
+// frozen.server.port = 1;  // 取消注释会报错：深层也是只读的
+console.log("DeepReadonly:", frozen.server.host, frozen.server.port);
+
+const patch: DeepPartial<Config> = { server: { port: 9090 } };
+console.log("DeepPartial:", JSON.stringify(patch));
+
+function deepFreeze<T>(o: T): DeepReadonly<T> {
+  if (o !== null && typeof o === "object") {
+    for (const v of Object.values(o as Record<string, unknown>)) deepFreeze(v);
+    Object.freeze(o);
+  }
+  return o as unknown as DeepReadonly<T>;
+}
+const cfg = deepFreeze({ a: { b: 1 } });
+console.log("已冻结:", Object.isFrozen(cfg.a), cfg.a.b);`}
+/>
+
+<Callout type="warn" title="别让类型体操侵入业务代码">
+类型体操应该沉淀在 `types/` 目录或一个内部工具包里，业务代码只消费结果类型。一旦业务文件里出现三层嵌套的条件类型，同事读代码的成本会陡增，编译速度也会下降。
+</Callout>
+
+## 6. 什么时候该停手
+
+判断标准很简单：**这个类型是否让调用方获得了真实收益？**
+
+- 值得写：路由参数提取、事件名生成、配置路径补全、ORM 字段映射——它们把运行时错误提前到了编译期。
+- 不值得写：为了炫技把简单的联合类型写成十行递归；用类型层实现四则运算；给只调用一次的函数写通用推导。
+
+<Callout type="exercise" title="练习">
+1. 实现 `type CamelToSnake<S extends string>`，把 `"userFirstName"` 变成 `"user_first_name"`。提示：逐字符递归，遇到大写字母就插入下划线。
+2. 实现 `type Split<S extends string, D extends string>`，把 `"a,b,c"` 按 `","` 拆成 `["a", "b", "c"]`。
+3. 基于本章的 `Path` 类型，写出 `type PathValue<T, P extends Path<T>>`，让它返回路径对应的值类型，并实现配套的运行时 `get` 函数。
+</Callout>
+
+## 小结
+
+- 模板字面量类型让类型层能拼接字符串，插槽为联合时产生笛卡尔积
+- `Uppercase / Lowercase / Capitalize / Uncapitalize` 是编译器内建，运行时需自己对齐
+- `infer` 既能拆字符串（前缀/中缀/后缀），也能拆元组（`[infer H, ...infer R]`）
+- 递归条件类型可实现 `DeepReadonly`、`DeepPartial`、路径类型、命名风格转换
+- 注意联合爆炸与递归深度上限，类型体操要沉淀到工具层
+- 下一章讲类型守卫与运行时类型收窄 →

@@ -1,0 +1,206 @@
+---
+title: 子查询与 CTE
+order: 10
+description: 标量/行/表子查询、EXISTS 与 IN 的选择、派生表、WITH 与递归 CTE
+---
+
+# 子查询与 CTE
+
+一条 SQL 解决不了的问题，往往可以「查询套查询」解决。子查询让 SQL 具备了组合能力，而 8.0 引入的 CTE（公共表表达式）则让复杂查询变得像搭积木一样清晰，递归 CTE 更是处理树形数据的杀手锏。
+
+## 1. 子查询的三种形态
+
+按返回结果的形状分类：
+
+### 1.1 标量子查询：返回单值
+
+可以出现在任何需要单个值的位置：
+
+```sql
+-- 价格高于平均价的商品
+SELECT name, price FROM products
+WHERE price > (SELECT AVG(price) FROM products);
+
+-- SELECT 列表里的标量子查询（每行执行一次，行多时要小心）
+SELECT u.username,
+       (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS order_count
+FROM users u;
+```
+
+标量子查询返回多行会直接报错 `Subquery returns more than 1 row`。
+
+### 1.2 列/行子查询：返回一列多行，配合 IN / ANY / ALL
+
+```sql
+-- 买过「技术书」分类商品的订单
+SELECT * FROM orders
+WHERE id IN (
+  SELECT oi.order_id
+  FROM order_items oi
+  JOIN products p ON p.id = oi.product_id
+  WHERE p.category_id = 5
+);
+
+-- 比「手机」分类所有商品都贵的商品
+SELECT name, price FROM products
+WHERE price > ALL (SELECT price FROM products WHERE category_id = 2);
+
+-- 比「手机」分类里任意一个商品贵即可
+SELECT name, price FROM products
+WHERE price > ANY (SELECT price FROM products WHERE category_id = 2);
+```
+
+### 1.3 表子查询（派生表）：FROM 里的子查询
+
+```sql
+-- 每个用户的消费总额，再取平均：分两步的问题分两层写
+SELECT AVG(total_spent) AS avg_user_spent
+FROM (
+  SELECT user_id, SUM(total_amount) AS total_spent
+  FROM orders
+  WHERE status IN (1,2,3)
+  GROUP BY user_id
+) AS t;   -- 派生表必须起别名
+```
+
+派生表在「先聚合、再对聚合结果做二次计算」的场景中不可替代。
+
+## 2. EXISTS vs IN
+
+两者都能表达「存在性」，语义与性能特征不同：
+
+```sql
+-- IN：先把子查询结果算出来，再逐行比对
+SELECT * FROM users u
+WHERE u.id IN (SELECT user_id FROM orders);
+
+-- EXISTS：对外层每一行，探测子查询是否至少有一行（短路，找到即停）
+SELECT * FROM users u
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+```
+
+选择建议：
+
+| 场景 | 建议 |
+|---|---|
+| 子查询结果集小、外层表大 | IN（子查询物化后可当查找表） |
+| 子查询结果集大、外层表小且相关列有索引 | EXISTS（每行一次索引探测，短路） |
+| 8.0 实际情况 | 优化器会做半连接（semijoin）改写，两者常被优化成同一个计划，以 EXPLAIN 为准 |
+
+**真正要小心的是 NOT IN**：
+
+```sql
+-- 如果子查询结果里有 NULL，NOT IN 永远返回空集！
+SELECT * FROM users
+WHERE id NOT IN (SELECT user_id FROM orders);  -- user_id 有 NULL 时整条查询无结果
+```
+
+原因是三值逻辑：`x NOT IN (1, NULL)` 等价于 `x != 1 AND x != NULL`，后者是 UNKNOWN，整个条件永远无法为 TRUE。
+
+<Callout type="warn" title="NOT IN 遇到 NULL 返回空集">
+「找不存在的行」优先用 `NOT EXISTS`（对 NULL 免疫）或 `LEFT JOIN ... IS NULL`。用 NOT IN 时必须确保子查询列 NOT NULL，或在子查询里加 `WHERE col IS NOT NULL`。
+</Callout>
+
+## 3. CTE：WITH 子句（8.0+）
+
+CTE（Common Table Expression）给子查询起名字，让嵌套结构变成线性步骤：
+
+```sql
+WITH paid_orders AS (
+  SELECT * FROM orders WHERE status IN (1,2,3)
+),
+user_spent AS (
+  SELECT user_id, COUNT(*) AS cnt, SUM(total_amount) AS spent
+  FROM paid_orders
+  GROUP BY user_id
+)
+SELECT u.username, s.cnt, s.spent
+FROM user_spent s
+JOIN users u ON u.id = s.user_id
+WHERE s.spent > 3000
+ORDER BY s.spent DESC;
+```
+
+对比多层嵌套的派生表，CTE 的优势：
+
+- **自上而下读**，每一步有名字，像变量赋值一样清晰；
+- 同一个 CTE 可以在后面被**引用多次**（派生表写两遍就要执行两遍逻辑）；
+- 是递归查询的唯一入口。
+
+CTE 只在本条语句内有效，不是临时表，也不会自动物化（优化器可能合并进主查询，也可能物化，视引用情况而定）。
+
+## 4. 递归 CTE：处理树形结构
+
+分类表是典型的邻接表模型（parent_id 指向父节点），「查某节点的所有后代」用普通 SQL 写不出来，递归 CTE 专治这个：
+
+```sql
+WITH RECURSIVE category_tree AS (
+  -- 锚点：起始节点
+  SELECT id, name, parent_id, 1 AS depth,
+         CAST(name AS CHAR(200)) AS path
+  FROM categories
+  WHERE id = 1                        -- 从「电子产品」开始
+
+  UNION ALL
+
+  -- 递归部分：不断用上一轮结果去找子节点
+  SELECT c.id, c.name, c.parent_id, t.depth + 1,
+         CONCAT(t.path, ' > ', c.name)
+  FROM categories c
+  JOIN category_tree t ON c.parent_id = t.id
+)
+SELECT * FROM category_tree;
+```
+
+```text
++----+----------+-----------+-------+---------------------+
+| id | name     | parent_id | depth | path                |
++----+----------+-----------+-------+---------------------+
+|  1 | 电子产品  |         0 |     1 | 电子产品             |
+|  2 | 手机     |         1 |     2 | 电子产品 > 手机       |
+|  3 | 笔记本    |         1 |     2 | 电子产品 > 笔记本     |
++----+----------+-----------+-------+---------------------+
+```
+
+执行模型：先执行锚点得到第 1 层；然后反复执行递归部分——每轮拿**上一轮新增的行**去 JOIN，直到某轮没有新行为止；所有轮次 UNION ALL 起来就是结果。
+
+递归 CTE 还能生成序列（造测试数据、补日期空洞都靠它）：
+
+```sql
+-- 生成 2026-07 整月的日期序列
+WITH RECURSIVE dates AS (
+  SELECT DATE('2026-07-01') AS d
+  UNION ALL
+  SELECT d + INTERVAL 1 DAY FROM dates WHERE d < '2026-07-31'
+)
+SELECT d FROM dates;
+```
+
+配合 LEFT JOIN 订单日报，就能让「没有订单的日期」也显示为 0，报表不再断档。
+
+<Callout type="tip" title="防止无限递归">
+数据里若有环（A 的父亲是 B，B 的父亲是 A），递归会跑不完。MySQL 用 `cte_max_recursion_depth`（默认 1000）兜底，超过报错。也可以在递归部分加 `WHERE depth < 10` 显式限深。
+</Callout>
+
+## 5. 子查询 vs JOIN：怎么选
+
+很多子查询都能改写成 JOIN，反之亦然。经验法则：
+
+- **要取另一张表的列** → 用 JOIN（子查询拿不出多列）；
+- **只做存在性判断、不取列** → EXISTS/IN 语义更直白，且不会引起行数放大；
+- **先聚合再关联** → 派生表或 CTE；
+- 性能纠结时，8.0 优化器对 IN/EXISTS 的半连接优化已经很成熟，**先把语义写对，再用 EXPLAIN 验证**，不要凭老经验说「子查询一定慢」。
+
+## 小结
+
+- 子查询三形态：标量（单值）、列（配 IN/ANY/ALL）、派生表（FROM 里）
+- NOT IN 遇 NULL 返回空集，「找没有」用 NOT EXISTS 或 LEFT JOIN IS NULL
+- CTE 把嵌套变线性、可复用，还支持递归
+- 递归 CTE = 锚点 + UNION ALL + 引用自身，是树形遍历和序列生成的标准解
+- 子查询与 JOIN 的取舍：取列用 JOIN，判存在用 EXISTS，先聚合用 CTE
+
+<Callout type="exercise" title="练习">
+1. 分别用 NOT EXISTS 和 LEFT JOIN 两种写法找出「从没被买过的商品」，用 EXPLAIN 对比执行计划。
+2. 用 CTE 分两步计算：每个分类的销售额（明细价 × 数量汇总），再筛出销售额最高的分类。
+3. 给 categories 加一层数据（如「手机」下加「旗舰机」「千元机」），用递归 CTE 打印从根到叶的完整路径。
+</Callout>

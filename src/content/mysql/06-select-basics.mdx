@@ -1,0 +1,191 @@
+---
+title: SELECT 基础
+order: 6
+description: 列选择、别名、WHERE 条件、比较与逻辑运算、IN/BETWEEN/LIKE 与 NULL 判断
+---
+
+# SELECT 基础
+
+SELECT 是使用频率最高的语句，也是最容易「会用但用不精」的。本章系统过一遍查询基础，重点讲清那些影响正确性的细节：NULL 的三值逻辑、LIKE 的通配规则、隐式类型转换。
+
+## 1. 列选择与别名
+
+```sql
+-- 指定列，别用 SELECT *
+SELECT id, name, price FROM products;
+
+-- 别名：AS 可省略，但建议保留可读性
+SELECT p.name AS product_name,
+       p.price * 0.9 AS discount_price
+FROM products AS p;
+
+-- 常量与表达式也能 SELECT（调试常用）
+SELECT NOW(), 1 + 1, CONCAT('hello', ' ', 'mysql');
+```
+
+为什么不推荐 `SELECT *`：
+
+1. 取回不需要的列浪费网络与内存，还可能让覆盖索引失效（第 13 章）；
+2. 表加列后应用取到的列会悄悄变化，容易踩序号取值的坑；
+3. 代码可读性差，看不出到底用了哪些字段。
+
+## 2. WHERE 与比较运算
+
+```sql
+SELECT id, name, price, stock FROM products WHERE price > 5000;
+SELECT * FROM orders WHERE status = 1;
+SELECT * FROM users  WHERE created_at >= '2026-01-01';
+```
+
+比较运算符：`=`、`!=`（等价于 `<>`）、`>`、`>=`、`<`、`<=`。
+
+字符串比较受排序规则影响：默认 `utf8mb4_0900_ai_ci` 下 `'Alice' = 'alice'` 为真（不区分大小写）。需要区分时：
+
+```sql
+SELECT 'Alice' = 'alice' COLLATE utf8mb4_0900_as_cs;   -- 0
+SELECT BINARY 'Alice' = 'alice';                        -- 0
+```
+
+<Callout type="warn" title="隐式类型转换会让索引失效">
+`phone` 是 VARCHAR 列，写 `WHERE phone = 13800000001`（数字没加引号）时，MySQL 会把**列值**转成数字再比较——函数作用在列上，索引直接失效变全表扫描，还可能因 `'138abc'` 转成 138 而误匹配。规则：字符串列的条件值永远加引号。
+</Callout>
+
+## 3. 逻辑运算：AND / OR / NOT
+
+```sql
+-- AND 优先级高于 OR，混用时必须加括号
+SELECT * FROM products
+WHERE (category_id = 2 OR category_id = 3)
+  AND price < 9000
+  AND status = 1;
+```
+
+不加括号时 `a OR b AND c` 实际是 `a OR (b AND c)`，与直觉相反的结果常由此而来。**只要 AND 和 OR 同时出现，就写括号**。
+
+## 4. IN 与 BETWEEN
+
+```sql
+-- IN：离散值集合，等价于一串 OR 但更清晰
+SELECT * FROM products WHERE category_id IN (2, 3, 5);
+
+-- NOT IN
+SELECT * FROM orders WHERE status NOT IN (3, 4);
+
+-- BETWEEN：闭区间，含两端
+SELECT * FROM products WHERE price BETWEEN 100 AND 5000;
+-- 等价于 price >= 100 AND price <= 5000
+```
+
+日期范围的坑：`created_at BETWEEN '2026-07-01' AND '2026-07-31'` 会**丢掉 7 月 31 日白天的数据**，因为 `'2026-07-31'` 等于 `'2026-07-31 00:00:00'`。正确写法：
+
+```sql
+SELECT * FROM orders
+WHERE created_at >= '2026-07-01'
+  AND created_at <  '2026-08-01';   -- 左闭右开，永远不会错
+```
+
+## 5. LIKE 模糊匹配
+
+| 通配符 | 含义 |
+|---|---|
+| `%` | 任意长度任意字符（含空串） |
+| `_` | 恰好一个字符 |
+
+```sql
+SELECT * FROM products WHERE name LIKE 'iPhone%';   -- 前缀匹配，能走索引
+SELECT * FROM products WHERE name LIKE '%Pro%';     -- 包含匹配，索引失效
+SELECT * FROM users    WHERE phone LIKE '138________';  -- 138 开头共 11 位
+```
+
+要点：
+
+- **前缀匹配（`abc%`）可以用索引，前导 `%` 不行**——B+ 树按前缀有序，开头不确定就没法定位（第 12 章会讲原因）；
+- 要匹配字面的 `%` 或 `_`，用 `\%`、`\_` 转义；
+- 大文本的全文搜索别用 `LIKE '%kw%'` 硬扛，考虑 FULLTEXT 索引或 Elasticsearch。
+
+## 6. NULL 与三值逻辑
+
+SQL 的布尔逻辑有三个值：TRUE、FALSE、**UNKNOWN**。任何值与 NULL 做比较，结果都是 UNKNOWN，而 WHERE 只保留 TRUE 的行：
+
+```sql
+SELECT NULL = NULL, NULL != 1, NULL IS NULL;
+```
+
+```text
++-------------+-----------+--------------+
+| NULL = NULL | NULL != 1 | NULL IS NULL |
++-------------+-----------+--------------+
+|        NULL |      NULL |            1 |
++-------------+-----------+--------------+
+```
+
+判断 NULL 只能用 `IS NULL` / `IS NOT NULL`：
+
+```sql
+SELECT * FROM users WHERE phone IS NULL;
+SELECT * FROM users WHERE phone IS NOT NULL;
+```
+
+最阴险的坑在**否定条件**：假设某列有 NULL，`WHERE col != 'x'` 不会返回 col 为 NULL 的行——因为 `NULL != 'x'` 是 UNKNOWN，被 WHERE 过滤掉了。想包含 NULL 要显式写：
+
+```sql
+SELECT * FROM users WHERE phone != '13800000001' OR phone IS NULL;
+```
+
+处理 NULL 的常用函数：
+
+```sql
+SELECT IFNULL(phone, '未填写')          FROM users;  -- 两参
+SELECT COALESCE(phone, email, '无联系方式') FROM users;  -- 取第一个非 NULL
+SELECT NULLIF(a, b);                                  -- a=b 时返回 NULL，防除零：x / NULLIF(y,0)
+```
+
+<Callout type="tip" title="NULL 安全等值比较">
+运算符 `<=>` 是 NULL 安全的等于：`NULL <=> NULL` 返回 1。写「两列可能都为 NULL 的相等判断」时很有用，但可读性一般，团队内先约定再用。
+</Callout>
+
+## 7. 条件表达式 CASE
+
+```sql
+SELECT order_no, total_amount,
+       CASE status
+         WHEN 0 THEN '待支付'
+         WHEN 1 THEN '已支付'
+         WHEN 2 THEN '已发货'
+         WHEN 3 THEN '已完成'
+         ELSE '已取消'
+       END AS status_text,
+       CASE
+         WHEN total_amount >= 5000 THEN '大额'
+         WHEN total_amount >= 500  THEN '中等'
+         ELSE '小额'
+       END AS amount_level
+FROM orders;
+```
+
+```text
++---------------+--------------+-------------+--------------+
+| order_no      | total_amount | status_text | amount_level |
++---------------+--------------+-------------+--------------+
+| SO20260701001 |      8127.00 | 已完成       | 大额         |
+| SO20260702002 |      3999.00 | 已支付       | 中等         |
+| SO20260703003 |       177.00 | 待支付       | 小额         |
+| SO20260704004 |      8999.00 | 已取消       | 大额         |
++---------------+--------------+-------------+--------------+
+```
+
+CASE 是 SQL 里的 if/else，在行转列、条件聚合（第 8 章）里是主力工具。
+
+## 小结
+
+- 明确列名代替 `SELECT *`；表达式和函数可直接出现在选择列表
+- AND/OR 混用必加括号；字符串条件值必加引号防隐式转换
+- 日期范围用「左闭右开」（`>=` 加 `<`），不用 BETWEEN 踩边界坑
+- LIKE 前缀匹配可走索引，前导 `%` 不行
+- NULL 是三值逻辑：判断用 IS NULL，否定条件记得 NULL 会被漏掉
+
+<Callout type="exercise" title="练习">
+1. 查询所有「在售且价格在 100 到 9000 之间」、名称以 iPhone 或 Mac 开头的商品。
+2. 给 users 表插入一行 phone 为 NULL 的数据，然后分别执行 `phone != '13800000001'` 和补上 `OR phone IS NULL` 的两个查询，对比行数差异。
+3. 用 CASE 给 products 写一个查询：输出商品名和库存等级（0 为无货、小于 50 为紧张、其余为充足）。
+</Callout>

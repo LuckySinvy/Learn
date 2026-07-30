@@ -1,0 +1,180 @@
+---
+title: 锁机制
+order: 16
+description: 全局锁/表锁/行锁、共享与排他锁、间隙锁与临键锁、意向锁、死锁分析与避免
+---
+
+# 锁机制
+
+并发写同一行会怎样？答案是：锁。锁是隔离性的实现手段之一，也是线上「更新卡住不动」「Deadlock found」报错的根源。本章按粒度从大到小讲清 MySQL 的锁体系，最后给出死锁的分析方法与预防守则。
+
+## 1. 锁的全景图
+
+```text
+按粒度：
+  全局锁 ──▶ 表级锁 ──▶ 行级锁
+  (整库)     (表锁/MDL/意向锁)   (记录锁/间隙锁/临键锁)
+
+按模式：
+  S 锁（共享/读锁）：可以多个事务同时持有
+  X 锁（排他/写锁）：独占，与任何锁互斥
+```
+
+兼容矩阵（行锁层面）：
+
+| 已持有 \ 想加 | S | X |
+|---|---|---|
+| S | 兼容 | 冲突 |
+| X | 冲突 | 冲突 |
+
+## 2. 全局锁与表级锁
+
+### 2.1 全局锁
+
+```sql
+FLUSH TABLES WITH READ LOCK;   -- 整库只读，逻辑备份老方案
+UNLOCK TABLES;
+```
+
+整库只读期间所有写入阻塞，主库上代价极大。现代备份用 `mysqldump --single-transaction`（靠 MVCC 快照，不锁库，第 19 章）或物理备份代替。
+
+### 2.2 表锁与 MDL
+
+```sql
+LOCK TABLES orders READ;    -- 显式表锁，InnoDB 时代很少手动用
+UNLOCK TABLES;
+```
+
+更常打交道的是 **MDL（元数据锁）**，它是自动的：任何增删改查都持有 MDL 读锁，DDL 需要 MDL 写锁。第 4 章讲过的「长事务堵 DDL、DDL 再堵所有查询」连锁事故就是 MDL 排队造成的。
+
+### 2.3 意向锁：表级与行级的协调员
+
+事务要给某行加 X 锁前，会先给**表**加 IX（意向排他）锁；加行 S 锁前先加表 IS 锁。意向锁之间几乎全兼容，它存在的唯一目的：**让「给整表加锁」的操作不用逐行检查**——看到表上有 IX，就知道里面有行被写锁着，直接等待即可。你几乎不用管它，但死锁日志里会出现它的名字，认识即可。
+
+## 3. 行锁：InnoDB 的核心
+
+**行锁加在索引记录上**——这句话是理解一切行锁行为的钥匙。
+
+```sql
+-- 会话 A
+BEGIN;
+UPDATE products SET stock = stock - 1 WHERE id = 1;   -- 对 id=1 的索引记录加 X 锁
+
+-- 会话 B（阻塞，直到 A 提交或锁等待超时）
+UPDATE products SET stock = stock - 1 WHERE id = 1;
+```
+
+锁等待超时由 `innodb_lock_wait_timeout` 控制（默认 50 秒），超时报错 `Lock wait timeout exceeded`。
+
+### 3.1 没走索引 = 锁全表的行
+
+```sql
+-- phone 列没有索引：
+UPDATE users SET status = 2 WHERE phone = '13800000001';
+```
+
+InnoDB 只能全表扫描，**扫过的每一行都会加锁**（RR 级别下还加间隙锁），效果接近锁全表。这是「一条不起眼的 UPDATE 让整个系统卡死」的经典案例——**UPDATE/DELETE 的 WHERE 条件必须能走索引**。
+
+### 3.2 显式加锁读
+
+```sql
+SELECT * FROM products WHERE id = 1 LOCK IN SHARE MODE;  -- S 锁（8.0 写法 FOR SHARE）
+SELECT * FROM products WHERE id = 1 FOR UPDATE;          -- X 锁
+
+-- 8.0 新姿势：抢不到锁怎么办
+SELECT * FROM products WHERE id = 1 FOR UPDATE NOWAIT;       -- 立即报错
+SELECT * FROM products WHERE id = 1 FOR UPDATE SKIP LOCKED;  -- 跳过被锁的行
+```
+
+`FOR UPDATE` 是「先锁再改」的悲观并发控制；`SKIP LOCKED` 是实现「多个 worker 抢任务队列」的利器（谁锁到算谁的，其他 worker 跳过去拿下一条）。
+
+## 4. 间隙锁与临键锁（RR 级别）
+
+在默认隔离级别 REPEATABLE READ 下，锁不仅加在记录上，还加在记录**之间的空隙**上，用来阻止幻读（防止有人在范围里插入新行）：
+
+```text
+索引上现有值：      5        10        15
+可锁对象：
+  记录锁 Record Lock：  锁住 10 本身
+  间隙锁 Gap Lock：     锁住 (5,10) 这个开区间——不能往里插新值
+  临键锁 Next-Key Lock：记录+前面的间隙 = (5,10]，InnoDB 的默认单位
+```
+
+示例：
+
+```sql
+-- 会话 A（RR 级别）
+BEGIN;
+SELECT * FROM products WHERE id BETWEEN 5 AND 15 FOR UPDATE;
+-- 锁住范围内所有记录 + 间隙
+
+-- 会话 B：阻塞！id=7 落在被锁的间隙里
+INSERT INTO products (id, category_id, name, price) VALUES (7, 2, 'X', 1.00);
+```
+
+规则速记（细节繁多，记住主干）：
+
+- 加锁基本单位是**临键锁**（左开右闭区间）；
+- 等值查询命中**唯一索引的存在记录**时，退化为纯记录锁；
+- 等值查询未命中时，退化为**间隙锁**；
+- 范围查询会锁住覆盖范围的一串临键锁。
+
+<Callout type="warn" title="间隙锁是死锁与阻塞的高发区">
+两个事务可以**同时持有同一个间隙的间隙锁**（间隙锁之间互相兼容），但都想往里 INSERT 时就互相等待对方释放——这是线上最常见的死锁模式之一（先 SELECT FOR UPDATE 不存在的行再 INSERT）。绕法：用唯一索引 + `INSERT ... ON DUPLICATE KEY UPDATE` 代替「查了再插」；或将隔离级别降为 READ COMMITTED（间隙锁基本消失，第 17 章讨论代价）。
+</Callout>
+
+## 5. 死锁：分析与避免
+
+### 5.1 一个最小死锁
+
+```sql
+-- 会话 A                          -- 会话 B
+BEGIN;                             BEGIN;
+UPDATE products SET stock=stock-1  UPDATE products SET stock=stock-1
+  WHERE id = 1;   -- 锁住行1        WHERE id = 2;   -- 锁住行2
+
+UPDATE products SET stock=stock-1  UPDATE products SET stock=stock-1
+  WHERE id = 2;   -- 等 B 的行2      WHERE id = 1;   -- 等 A 的行1
+                                   -- ERROR 1213: Deadlock found...
+```
+
+A 等 B、B 等 A，构成环。InnoDB 的死锁检测（`innodb_deadlock_detect=ON`）会立刻发现并**回滚代价较小的一方**，另一方继续执行——所以死锁报错不是灾难，但频繁死锁说明设计有问题。
+
+### 5.2 看死锁日志
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+-- 找 LATEST DETECTED DEADLOCK 段落：
+-- 两个事务各自「HOLDS THE LOCK(S)」和「WAITING FOR THIS LOCK TO BE GRANTED」
+-- 精确到哪个索引的哪条记录，照着还原业务时序即可定位
+```
+
+也可以查实时锁等待：
+
+```sql
+SELECT * FROM performance_schema.data_lock_waits;   -- 谁在等谁
+SELECT * FROM sys.innodb_lock_waits;                -- 可读性更好的视图
+```
+
+### 5.3 避免死锁的守则
+
+1. **统一加锁顺序**：所有代码路径按同样的顺序更新多行/多表（比如永远按主键升序处理），环就构不成；
+2. **事务小而短**：持锁时间越短，撞车概率越低；
+3. **一次锁够**：批量更新用一条带 IN 的语句（按主键排序）代替循环多条；
+4. WHERE 走索引，缩小加锁范围；
+5. 热点行争抢（秒杀库存）考虑：队列串行化、Redis 预扣、或拆分热点行；
+6. 应用层**捕获 1213 错误自动重试**（幂等前提下）——死锁回滚是常态化事件，代码要兜住。
+
+## 小结
+
+- 锁粒度：全局 → 表（表锁/MDL/意向锁）→ 行；模式分 S/X
+- 行锁加在**索引记录**上；WHERE 不走索引等于锁全表的行
+- RR 级别默认临键锁（记录 + 间隙），阻止幻读也带来更多阻塞与死锁
+- SKIP LOCKED / NOWAIT 是 8.0 处理锁竞争的新工具
+- 死锁被自动检测并回滚一方；预防靠统一顺序 + 短事务，应用要重试 1213
+
+<Callout type="exercise" title="练习">
+1. 复现本章的最小死锁，在 `SHOW ENGINE INNODB STATUS` 输出里找到 LATEST DETECTED DEADLOCK 段落，指出各自持有和等待的锁。
+2. 在 RR 级别下用 `SELECT ... WHERE id BETWEEN 5 AND 15 FOR UPDATE` 锁一个范围，另开会话向间隙中 INSERT 验证被阻塞；切到 READ COMMITTED 再试一次对比。
+3. 用两个会话模拟任务队列：表里 5 条待处理任务，两个 worker 各自 `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1` 抢任务，观察互不阻塞。
+</Callout>

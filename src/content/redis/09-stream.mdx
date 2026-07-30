@@ -1,0 +1,208 @@
+---
+title: Stream：可靠消息队列
+order: 9
+description: XADD/XREAD/消费组/XACK/XPENDING/XAUTOCLAIM，与 List、PubSub 的对比
+---
+
+# Stream：可靠消息队列
+
+List 做队列丢消息、不支持多消费组；Pub/Sub 不在线就收不到。Redis 5 引入的 Stream 补齐了这些短板：**消息持久保留、消费组分摊、ACK 确认、故障转移认领**——一个接近 Kafka 核心语义的日志结构。
+
+## 1. 数据模型
+
+Stream 是一个**只追加**的消息日志，每条消息有全局有序的 ID 和一组 field-value：
+
+```text
+stream: orders
++---------------------+----------------------------+
+| ID                  | fields                     |
++---------------------+----------------------------+
+| 1722310000000-0     | action=create sku=2001     |
+| 1722310000000-1     | action=pay   order=8801    |   <- 同毫秒第二条, 序号+1
+| 1722310005123-0     | action=ship  order=8801    |
++---------------------+----------------------------+
+        ID 格式: 毫秒时间戳-序号, 严格递增
+```
+
+## 2. 生产与独立消费
+
+### 2.1 XADD 写入
+
+```bash
+127.0.0.1:6379> XADD orders * action create sku 2001
+"1722310000000-0"       # * 表示让 Redis 自动生成 ID
+127.0.0.1:6379> XADD orders * action pay order 8801
+"1722310000000-1"
+127.0.0.1:6379> XLEN orders
+(integer) 2
+# 控制长度: 近似裁剪到 1 万条（~ 表示允许略多，性能好）
+127.0.0.1:6379> XADD orders MAXLEN ~ 10000 * action ship order 8801
+"1722310005123-0"
+```
+
+### 2.2 XRANGE / XREAD 读取
+
+```bash
+127.0.0.1:6379> XRANGE orders - +
+1) 1) "1722310000000-0"
+   2) 1) "action"
+      2) "create"
+      3) "sku"
+      4) "2001"
+2) 1) "1722310000000-1"
+   2) 1) "action"
+      2) "pay"
+      3) "order"
+      4) "8801"
+# - 和 + 是最小/最大 ID; 也可以传具体 ID 做范围查询
+
+# 阻塞读取新消息: $ 表示"只要从现在开始的新消息"
+127.0.0.1:6379> XREAD BLOCK 5000 STREAMS orders $
+（挂起, 等到新消息或 5 秒超时）
+```
+
+XREAD 模式下每个消费者独立维护自己读到的位置，适合"每个消费者都要全量消息"的广播场景。
+
+## 3. 消费组：分摊与确认
+
+消费组让多个消费者**分摊**同一个 Stream 的消息（同组内一条消息只给一个消费者），并提供 ACK 机制。
+
+### 3.1 创建组与消费
+
+```bash
+127.0.0.1:6379> XGROUP CREATE orders g1 0
+OK                      # 从头(0)开始消费; 用 $ 则只消费此后的新消息
+
+# 消费者 c1 领取 2 条新消息（"新"指该组内从未投递过的）
+127.0.0.1:6379> XREADGROUP GROUP g1 c1 COUNT 2 BLOCK 5000 STREAMS orders >
+1) 1) "orders"
+   2) 1) 1) "1722310000000-0"
+         2) 1) "action"
+            2) "create"
+            3) "sku"
+            4) "2001"
+      2) 1) "1722310000000-1"
+         2) 1) "action"
+            2) "pay"
+            3) "order"
+            4) "8801"
+```
+
+`>` 是特殊 ID，表示"给我从未投递给本组的新消息"。消息投递后进入该消费者的 **PEL（Pending Entries List，待确认列表）**，直到被 ACK。
+
+### 3.2 确认与查看积压
+
+```bash
+# 处理完成, 确认消息
+127.0.0.1:6379> XACK orders g1 1722310000000-0
+(integer) 1
+
+# 查看组内待确认消息概况
+127.0.0.1:6379> XPENDING orders g1
+1) (integer) 1          # 待确认总数
+2) "1722310000000-1"    # 最小待确认 ID
+3) "1722310000000-1"    # 最大待确认 ID
+4) 1) 1) "c1"
+      2) "1"            # 消费者 c1 有 1 条未确认
+
+# 详细列表: 每条的消费者、空闲时长、投递次数
+127.0.0.1:6379> XPENDING orders g1 - + 10
+1) 1) "1722310000000-1"
+   2) "c1"
+   3) (integer) 45210   # 已挂起 45 秒
+   4) (integer) 1       # 投递过 1 次
+```
+
+### 3.3 故障转移：XAUTOCLAIM
+
+消费者 c1 崩溃后，它 PEL 里的消息不会自动重投。其他消费者用 `XAUTOCLAIM` 把"挂起超过一定时间"的消息认领过来：
+
+```bash
+# c2 认领 g1 组内空闲超过 60000ms 的消息
+127.0.0.1:6379> XAUTOCLAIM orders g1 c2 60000 0
+1) "0-0"                # 下一轮扫描的起始游标
+2) 1) 1) "1722310000000-1"
+      2) 1) "action"
+         2) "pay"
+         3) "order"
+         4) "8801"      # 这条消息现在归 c2 处理
+3) (empty array)
+```
+
+消费者应定期跑 XAUTOCLAIM 作为"补偿任务"。投递次数（delivery count）随每次认领递增，超过阈值（如 5 次）仍失败的消息应转入死信队列（另一个 Stream）人工处理，避免毒消息无限循环。
+
+### 3.4 完整消费循环（伪代码）
+
+```python
+while True:
+    # 1. 优先处理新消息
+    msgs = XREADGROUP GROUP g1 c1 COUNT 10 BLOCK 2000 STREAMS orders >
+    for id, fields in msgs:
+        try:
+            process(fields)
+            XACK orders g1 id
+        except Exception:
+            pass          # 不 ACK, 留在 PEL 等待重试/认领
+    # 2. 周期性认领僵尸消息（也可由独立任务做）
+    XAUTOCLAIM orders g1 c1 60000 0
+```
+
+## 4. 三种消息方案对比
+
+| 能力 | List | Pub/Sub | Stream |
+|---|---|---|---|
+| 消息持久化 | 是（弹出即删） | 否，即发即失 | 是，可回溯 |
+| 离线消息 | 保留 | 丢失 | 保留 |
+| ACK 确认 | 无 | 无 | 有 |
+| 消费组分摊 | 无 | 无 | 有 |
+| 多组独立消费（广播） | 无 | 有 | 有（多个 group） |
+| 阻塞消费 | BLPOP | SUBSCRIBE | XREAD BLOCK |
+| 适用 | 简单任务队列 | 实时通知，可容忍丢失 | 可靠队列、事件流 |
+
+选型直觉：**能容忍丢消息的实时广播用 Pub/Sub；一切"不能丢"的异步任务用 Stream**；List 只在极简单场景且不想引入消费组概念时使用。
+
+## 5. 管理命令
+
+```bash
+127.0.0.1:6379> XINFO STREAM orders
+ 1) "length"
+ 2) (integer) 3
+ 3) "radix-tree-keys"
+ 4) (integer) 1
+ ...
+127.0.0.1:6379> XINFO GROUPS orders
+1) 1) "name"
+   2) "g1"
+   3) "consumers"
+   4) (integer) 2
+   5) "pending"
+   6) (integer) 1
+   7) "last-delivered-id"
+   8) "1722310000000-1"
+127.0.0.1:6379> XDEL orders 1722310000000-0     # 删除指定消息
+(integer) 1
+127.0.0.1:6379> XTRIM orders MAXLEN ~ 1000      # 手动裁剪
+(integer) 0
+```
+
+<Callout type="warn" title="Stream 不裁剪会吃光内存">
+Stream 消息 ACK 之后也**不会被删除**（这是它能多组消费、可回溯的原因）。必须通过 XADD 的 MAXLEN/MINID 参数或定期 XTRIM 控制长度，否则一个高吞吐 Stream 会无限增长直至 OOM。带波浪号的 `MAXLEN ~ N` 是近似裁剪，按宏节点整块删除，性能远好于精确裁剪。
+</Callout>
+
+<Callout type="info" title="和 Kafka 的差距">
+Stream 有消费组与 ACK，但没有分区（单 key 单线程处理，吞吐有单机上限）、没有多副本 ISR 语义（可靠性依赖 Redis 自身持久化与主从复制，主从切换仍可能丢尾部消息）。十万级 QPS 以下的业务队列足够；金融级或超大吞吐场景仍需 Kafka/Pulsar。
+</Callout>
+
+## 小结
+
+- Stream 是只追加日志：XADD 生产，XRANGE 回溯，XREAD 独立消费
+- 消费组三件套：XREADGROUP 领取（进入 PEL）、XACK 确认、XAUTOCLAIM 认领僵尸消息
+- 投递次数超限的消息应转死信 Stream，防止毒消息循环
+- 必须用 MAXLEN/XTRIM 控制长度；ACK 不等于删除
+- 下一章回到 key 的生命周期：过期与内存淘汰 →
+
+<Callout type="exercise" title="练习">
+1. 创建一个 Stream 和消费组，用两个 redis-cli 窗口模拟两个消费者，验证消息被分摊而不是都收到。
+2. 一个消费者领取消息后不 ACK，用 XPENDING 观察其挂起状态，再用 XAUTOCLAIM 从另一个消费者身份认领它。
+3. 对比实验：Pub/Sub 的订阅者断开期间发布消息，重连后收不到；Stream 消费组的消费者离线期间的消息重连后仍能领取。
+</Callout>

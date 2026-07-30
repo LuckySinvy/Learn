@@ -1,0 +1,164 @@
+---
+title: 索引设计
+order: 13
+description: 最左前缀、覆盖索引、索引下推、前缀索引、函数索引，以及什么时候不该建索引
+---
+
+# 索引设计
+
+上一章懂了 B+ 树，这一章解决实际问题：**给什么列建索引、怎么组合、建几个**。索引设计是有章法的，掌握最左前缀和覆盖索引两个核心概念，就能应对 90% 的场景。
+
+## 1. 联合索引与最左前缀
+
+联合索引 `(a, b, c)` 是**一棵**B+ 树，键按「先 a、a 相同比 b、b 相同比 c」的顺序排列——像字典先按首字母、再按第二个字母排序：
+
+```text
+索引 (user_id, created_at) 的叶子节点排列：
+(1, 07-01) → (1, 07-03) → (1, 07-15) → (2, 07-02) → (3, 07-04)
+ └── user_id=1 的行连续存放，且组内按 created_at 有序 ──┘
+```
+
+**最左前缀原则**：查询条件必须从索引最左列开始、连续命中，才能用上索引。对 `(a, b, c)`：
+
+| WHERE 条件 | 能用到的部分 |
+|---|---|
+| a = 1 | a ✓ |
+| a = 1 AND b = 2 | a, b ✓ |
+| a = 1 AND b = 2 AND c = 3 | 全部 ✓ |
+| b = 2（缺 a） | 用不上 |
+| a = 1 AND c = 3（跳过 b） | 只有 a（c 无法定位，但见下文 ICP） |
+| `a = 1 AND b > 2 AND c = 3` | a, b（**范围之后的列失效**） |
+
+「范围之后失效」的原因：b 是范围时，满足条件的行里 c 不再有序，无法继续二分。
+
+由此得出联合索引的**列顺序设计口诀**：
+
+1. **等值条件列放前面，范围条件列放最后**；
+2. 排序需求也算「有序性消费」：`WHERE a = ? ORDER BY b` 完美匹配 `(a, b)`；
+3. 区分度高（不同值多）的等值列优先——但要服从查询模式，别死背。
+
+```sql
+-- 典型订单查询：WHERE user_id = ? AND created_at >= ? ORDER BY created_at DESC
+-- 正确索引：(user_id, created_at) —— 等值在前、范围/排序在后
+ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at);
+```
+
+另一个推论：**有了 `(a, b)` 就不需要单独的 `(a)`**——前者完全覆盖后者的能力，冗余索引白白增加写入成本。
+
+## 2. 覆盖索引：消灭回表
+
+上一章讲过：二级索引查到主键后要**回表**取整行。如果查询需要的列全部在索引里（索引列 + 主键），就不用回表——这就是覆盖索引：
+
+```sql
+-- 索引 (user_id, created_at)，主键 id
+-- 覆盖：三列全在索引里，EXPLAIN Extra 显示 Using index
+SELECT id, user_id, created_at FROM orders WHERE user_id = 1;
+
+-- 不覆盖：total_amount 不在索引里，每行都要回表
+SELECT id, user_id, total_amount FROM orders WHERE user_id = 1;
+```
+
+实战手法：把 SELECT 里少数几个额外列**追加进联合索引尾部**，专门喂高频查询：
+
+```sql
+-- 订单列表页只展示这几个字段，建一个「宽」索引把它们全包住
+ALTER TABLE orders ADD INDEX idx_user_list (user_id, created_at, status, total_amount);
+```
+
+这是「用空间换时间」的典型手法，只对高频核心查询这么做，别滥用。这也是不写 `SELECT *` 的最硬理由——多取一个不需要的列，覆盖索引就废了。
+
+## 3. 索引下推（ICP，5.6+）
+
+对索引 `(name, phone)` 执行：
+
+```sql
+SELECT * FROM users WHERE name LIKE '张%' AND phone = '13800000001';
+```
+
+`LIKE '张%'` 是范围，phone 无法用于树上定位。没有 ICP 时：索引层找出所有姓张的主键 → 逐个回表 → Server 层再过滤 phone，回表次数 = 姓张的人数。
+
+**索引下推**（Index Condition Pushdown）：phone 虽不能定位，但它的值**就在索引里**，存储引擎在遍历索引时顺手把 `phone = ?` 过滤掉，只有通过的才回表。回表次数从「姓张的人数」降到「姓张且手机号匹配的人数」。EXPLAIN Extra 显示 `Using index condition`。
+
+ICP 是自动的，你要做的是理解它：**联合索引里「用不上定位」的列并非无用，还能减少回表**。
+
+## 4. 前缀索引
+
+长字符串列（URL、邮箱）整列建索引太占空间，可以只索引前 N 个字符：
+
+```sql
+-- 先测算不同前缀长度的区分度
+SELECT COUNT(DISTINCT LEFT(email, 8)) / COUNT(DISTINCT email) AS sel8,
+       COUNT(DISTINCT LEFT(email, 12)) / COUNT(DISTINCT email) AS sel12
+FROM users;
+
+-- 选一个区分度接近 1 的最短长度
+ALTER TABLE users ADD INDEX idx_email_prefix (email(12));
+```
+
+代价：前缀索引**不能做覆盖索引**（索引里不是完整值，必须回表核对），也不能支持 `ORDER BY email` 免排序。区分度够就尽量短，但核心唯一列（如登录邮箱）通常还是全列唯一索引。
+
+## 5. 函数索引与生成列（8.0.13+）
+
+对列做函数运算会让普通索引失效：
+
+```sql
+-- 索引失效：函数包住了列
+SELECT * FROM orders WHERE DATE(created_at) = '2026-07-01';
+
+-- 改写成范围（首选方案，第 6 章讲过的左闭右开）
+SELECT * FROM orders
+WHERE created_at >= '2026-07-01' AND created_at < '2026-07-02';
+```
+
+改写不了的场景用**函数索引**：
+
+```sql
+ALTER TABLE users ADD INDEX idx_email_lower ((LOWER(email)));
+SELECT * FROM users WHERE LOWER(email) = 'alice@ex.com';   -- 能走 idx_email_lower
+```
+
+注意查询表达式必须与索引定义**完全一致**才会命中。函数索引本质是隐藏的生成列 + 普通索引。
+
+## 6. 什么时候不该建索引
+
+索引不是越多越好——每个索引都是一棵要随 DML 同步维护的 B+ 树：
+
+1. **区分度极低的列**：`status` 只有 3 个值、`gender` 只有 2 个值，单独建索引筛完还剩 30%+ 的行，优化器多半不用，还不如全扫。（但作为联合索引的**一员**可以有价值。）
+2. **写多读少的表**：日志表、流水表，每个索引都在拖慢 INSERT。
+3. **小表**：几百行全扫也就一两个页的事。
+4. **不出现在 WHERE/JOIN/ORDER BY 的列**：纯展示列建索引毫无意义。
+5. **已被联合索引最左覆盖的单列**：`(a,b)` 存在时 `(a)` 是冗余。
+
+```sql
+-- 找冗余和从未使用的索引
+SELECT * FROM sys.schema_redundant_indexes;
+SELECT * FROM sys.schema_unused_indexes;
+```
+
+<Callout type="warn" title="索引失效的高频原因清单">
+1. 列上有函数/运算：`WHERE id + 1 = 10`、`DATE(created_at) = ...`；
+2. 隐式类型转换：字符串列不加引号、两表 JOIN 列字符集不同；
+3. 前导通配 `LIKE '%x'`；
+4. 违反最左前缀；
+5. OR 两侧有一侧无索引（整条退化全扫，可拆成 UNION）；
+6. 优化器估算回表太多主动放弃（不算失效，是理性选择——见第 14 章用 EXPLAIN 确认）。
+</Callout>
+
+<Callout type="tip" title="不可见索引：安全下线索引的姿势">
+怀疑某索引没用想删掉？先设为不可见观察一段时间：`ALTER TABLE t ALTER INDEX idx_x INVISIBLE;` 优化器立刻不再使用它，但索引数据还在——线上出问题一秒改回 VISIBLE，比删了重建（大表建索引可能几小时）安全得多。
+</Callout>
+
+## 小结
+
+- 联合索引一棵树、按列顺序逐级有序；最左前缀 + 「范围之后失效」决定命中范围
+- 列顺序：等值在前、范围/排序在后；`(a,b)` 覆盖 `(a)` 的能力
+- 覆盖索引免回表，是高频查询的大杀器；`SELECT *` 是它的天敌
+- ICP 让索引里的「非定位列」也能减少回表
+- 长字符串用前缀索引省空间；函数条件用改写或函数索引
+- 低区分度、写多读少、小表、冗余——四类情况不建索引；删索引前先 INVISIBLE
+
+<Callout type="exercise" title="练习">
+1. 针对查询 `WHERE status = 1 AND created_at >= ? ORDER BY created_at DESC LIMIT 20`，设计 orders 表的最优索引并说明列顺序理由。
+2. 建索引 `(user_id, created_at)` 后，分别 EXPLAIN 覆盖查询（只取索引内列）与非覆盖查询，对比 Extra 列的 Using index。
+3. 写出三条会让索引失效的 SQL 并各给出修正版本。
+</Callout>

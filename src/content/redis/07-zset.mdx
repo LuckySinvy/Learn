@@ -1,0 +1,207 @@
+---
+title: ZSet：排行榜背后的跳表
+order: 7
+description: ZADD/ZRANGE/ZRANK/ZINCRBY、skiplist + hashtable 双结构、排行榜与延时队列
+---
+
+# ZSet：排行榜背后的跳表
+
+ZSet（Sorted Set）给每个成员绑定一个 double 类型的 **score**，集合始终按 score 排序。它同时具备三种能力：按分数排序、按排名取段、按成员查分——这让它成为排行榜、延时队列、滑动窗口限流的首选结构。
+
+## 1. 数据模型
+
+```text
+key: rank:game
+score      member
+------     --------
+ 98.0  <-> "ada"       按 score 升序排列
+ 95.5  <-> "bob"       score 相同时按 member 字典序
+ 95.5  <-> "carol"
+ 80.0  <-> "dave"
+```
+
+成员唯一（再次 ZADD 同名成员是更新分数），score 可重复。
+
+## 2. 核心命令实操
+
+### 2.1 写入与更新
+
+```bash
+127.0.0.1:6379> ZADD rank:game 80 "dave" 98 "ada" 95.5 "bob"
+(integer) 3
+127.0.0.1:6379> ZADD rank:game 99 "ada"
+(integer) 0             # 成员已存在: 更新分数，返回新增数 0
+127.0.0.1:6379> ZADD rank:game NX 50 "ada"
+(integer) 0             # NX: 只新增不更新，ada 分数保持 99
+127.0.0.1:6379> ZADD rank:game GT 97 "ada"
+(integer) 0             # GT: 新分数更大才更新; 97 < 99, 不更新
+127.0.0.1:6379> ZINCRBY rank:game 10 "dave"
+"90"                    # 原子加分，返回新分数
+127.0.0.1:6379> ZSCORE rank:game "ada"
+"99"
+127.0.0.1:6379> ZCARD rank:game
+(integer) 3
+```
+
+ZADD 的条件参数：`NX` 只增不改、`XX` 只改不增、`GT`/`LT` 只在新分数更大/更小时更新（做"历史最高分"极方便）。
+
+### 2.2 按排名取段：ZRANGE
+
+```bash
+127.0.0.1:6379> ZRANGE rank:game 0 -1 WITHSCORES
+1) "dave"
+2) "90"
+3) "bob"
+4) "95.5"
+5) "ada"
+6) "99"                 # 默认升序
+127.0.0.1:6379> ZRANGE rank:game 0 2 REV WITHSCORES
+1) "ada"
+2) "99"
+3) "bob"
+4) "95.5"
+5) "dave"
+6) "90"                 # REV 降序 = Top 3（6.2+ 语法，替代 ZREVRANGE）
+```
+
+### 2.3 按分数取段
+
+```bash
+127.0.0.1:6379> ZRANGEBYSCORE rank:game 90 96
+1) "dave"
+2) "bob"                # 闭区间 [90, 96]
+127.0.0.1:6379> ZRANGEBYSCORE rank:game (90 +inf
+1) "bob"
+2) "ada"                # 左开括号 = 排除 90; +inf/-inf 表示无穷
+127.0.0.1:6379> ZCOUNT rank:game 90 100
+(integer) 3             # 分数区间内的成员数
+```
+
+### 2.4 查排名与删除
+
+```bash
+127.0.0.1:6379> ZRANK rank:game "ada"
+(integer) 2             # 升序排名，从 0 开始
+127.0.0.1:6379> ZREVRANK rank:game "ada"
+(integer) 0             # 降序排名: ada 是第 1 名
+127.0.0.1:6379> ZREM rank:game "dave"
+(integer) 1
+127.0.0.1:6379> ZREMRANGEBYRANK rank:game 0 -101
+(integer) 0             # 只保留前 100 名（删掉降序 100 名之外的）
+127.0.0.1:6379> ZREMRANGEBYSCORE delay:queue -inf 1722310000
+(integer) 0             # 按分数区间删除（延时队列常用）
+```
+
+## 3. 底层实现：skiplist + hashtable 双结构
+
+小 ZSet 用 listpack（≤128 个成员且都 ≤64 字节）；超过阈值后用 **skiplist + hashtable 的组合**：
+
+```bash
+127.0.0.1:6379> OBJECT ENCODING rank:game
+"listpack"
+```
+
+```conf
+zset-max-listpack-entries 128
+zset-max-listpack-value 64
+```
+
+为什么要两个结构一起用？因为 ZSet 要同时满足两类查询：
+
+- `ZSCORE member` —— 按成员查分数，需要 **hashtable**：O(1)；
+- `ZRANGE`/`ZRANK` —— 按分数/排名的有序操作，需要 **skiplist**：O(log n)。
+
+两个结构共享成员与分数（通过指针），内存不双倍。
+
+### 3.1 跳表长什么样
+
+跳表是"带多层快速通道的有序链表"。每个节点随机决定层数（每升一层概率 1/4），高层是低层的"高速公路"：
+
+```text
+L3:  head ----------------------------> 50 ------------------> NULL
+L2:  head ----------> 20 ------------> 50 ------------------> NULL
+L1:  head --> 10 --> 20 -----> 35 --> 50 --> 70 ------------> NULL
+L0:  head --> 10 --> 20 --> 30 --> 35 --> 50 --> 60 --> 70 --> NULL
+
+查找 60: L3 到 50 (下一个是 NULL, 降层)
+         L2 从 50 (下一个 NULL, 降层)
+         L1 从 50 -> 70 超了, 降层
+         L0 从 50 -> 60 命中。 跳过了大部分节点。
+```
+
+平均查找/插入/删除都是 O(log n)。每层节点还记录了到下一节点的**跨度（span）**，把沿途跨度累加就得到排名——这是 ZRANK 也能 O(log n) 的原因。
+
+为什么不用红黑树？作者的理由：跳表实现简单得多；范围查询（ZRANGE）沿底层链表顺序走即可，比树的中序遍历更直接；调整概率参数即可权衡内存与速度。
+
+## 4. 典型场景
+
+### 4.1 排行榜
+
+```bash
+# 玩家得分更新（累加制）
+127.0.0.1:6379> ZINCRBY lb:weekly 150 "player:1001"
+"150"
+# 取 Top 10
+127.0.0.1:6379> ZRANGE lb:weekly 0 9 REV WITHSCORES
+1) "player:1001"
+2) "150"
+# 查自己的名次与分数（两条命令可用 pipeline 合并）
+127.0.0.1:6379> ZREVRANK lb:weekly "player:1001"
+(integer) 0
+127.0.0.1:6379> ZSCORE lb:weekly "player:1001"
+"150"
+```
+
+周榜按周分 key（`lb:2026w31`），过期自动清理。同分排名问题：score 相同按成员字典序，若业务要求"先到先得排前面"，可以把时间戳编进小数位：`score = 分数 * 10^10 + (10^10 - 时间戳)`。
+
+### 4.2 延时队列
+
+score 存"应执行的时间戳"，消费者轮询取"到期任务"：
+
+```bash
+# 生产: 30 分钟后关闭未支付订单
+127.0.0.1:6379> ZADD delay:close-order 1722312000 "order:8801"
+(integer) 1
+# 消费: 每秒取一批到期任务（当前时间之前的）
+127.0.0.1:6379> ZRANGEBYSCORE delay:close-order -inf 1722312000 LIMIT 0 10
+1) "order:8801"
+# 取到后用 ZREM 抢占（返回 1 才算抢到，防多个消费者重复处理）
+127.0.0.1:6379> ZREM delay:close-order "order:8801"
+(integer) 1
+```
+
+"ZRANGEBYSCORE 再 ZREM"两步之间存在竞态，严格场景用 Lua 脚本把"取+删"做成原子操作（第 12 章），或用 Redis 7 的 `ZMPOP`。
+
+### 4.3 滑动窗口限流
+
+member 存唯一请求 ID，score 存时间戳；统计窗口内的请求数：
+
+```bash
+# 判断 user:1 最近 60 秒是否超过 100 次请求
+127.0.0.1:6379> ZREMRANGEBYSCORE rate:u1 -inf 1722311940   # 清掉窗口外
+(integer) 3
+127.0.0.1:6379> ZCARD rate:u1
+(integer) 97            # 未超限, 放行并记录本次
+127.0.0.1:6379> ZADD rate:u1 1722312000 "req-uuid-x"
+(integer) 1
+```
+
+完整原子版本在第 20 章用 Lua 实现。
+
+<Callout type="warn" title="ZSet 的成本意识">
+ZSet 是所有结构里单元素内存开销最大的（skiplist 节点 + hashtable 项 + 分数）。百万级成员的 ZSet 内存可观且 ZRANGEBYSCORE 大范围扫描是 O(log n + m)。排行榜只保留 Top N（定期 ZREMRANGEBYRANK 裁剪），限流 key 记得设 TTL。
+</Callout>
+
+## 小结
+
+- ZSet = 排序 + 去重 + 按成员查分，三种查询一个结构全包
+- ZADD 的 GT/LT/NX/XX 参数优雅解决"历史最高分""只增不改"类需求
+- 底层 skiplist（有序、范围、排名）+ hashtable（O(1) 查分）双结构配合
+- 三大场景：排行榜（ZINCRBY + ZRANGE REV）、延时队列（score=执行时间）、滑动窗口限流
+- 下一章是三个特殊结构：Bitmap、HyperLogLog、GEO →
+
+<Callout type="exercise" title="练习">
+1. 构建一个 10 人游戏排行榜，实现：加分、取 Top 3、查询某玩家名次、只保留前 5 名。
+2. 用 ZSet 实现延时队列：加入 3 个不同到期时间的任务，模拟消费者取出"当前已到期"的任务并删除。
+3. 向 ZSet 写入 130 个成员，用 OBJECT ENCODING 验证 listpack 到 skiplist 的转换。
+</Callout>

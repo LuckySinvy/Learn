@@ -1,0 +1,171 @@
+---
+title: 常见问题与故障排查
+order: 19
+description: 消息积压、消费卡住、NotLeader、磁盘写满、Rebalance 风暴等七类故障的定位与解决
+---
+
+# 常见问题与故障排查
+
+Kafka 的故障模式高度收敛：翻来覆去就是积压、卡住、leader 异常、磁盘、Rebalance 那几类。本章按"症状 → 定位步骤 → 解决方案"的格式整理成排障手册，建议收藏备查。
+
+## 1. 消息积压（Lag 持续增长）
+
+**症状**：`kafka-consumer-groups.sh --describe` 显示 LAG 持续上涨。
+
+**定位步骤**：
+
+```bash
+# 1. 看积压分布: 全部分区都涨 or 个别分区?
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group my-group
+# 2. 看消费者是否活着: CONSUMER-ID 列是否为空
+# 3. 估算消费速率: 隔 60 秒再查一次, (LAG差 + 新增消息数)/60 = 每秒净积压
+```
+
+**分诊**：
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| 所有分区均匀积压 | 消费能力整体不足 | 优化处理逻辑（批量写库、异步化）；消费者数不足分区数则扩实例 |
+| 个别分区积压 | 热 key 倾斜 / 某消费者卡死 | 查 key 分布（第 10 章）；重启卡住实例 |
+| CONSUMER-ID 为空 | 消费者全挂 / 一直在 Rebalance | 看消费者日志，按第 5 节处理 |
+| 生产流量突增 | 上游放量 | 临时扩消费者，或评估跳过（reset to-latest，需业务确认） |
+
+**注意**：积压时间接近 `retention.ms` 时数据会被删除，积压将变成**永久丢失**，此时要优先扩容或临时调大 retention。
+
+## 2. 消费卡住（Lag 不动，消费者活着）
+
+**症状**：消费者进程在、CPU 低，LAG 卡住不降。
+
+**定位步骤**：
+
+```bash
+# 1. jstack 看消费线程在干嘛
+jstack <pid> | grep -A 30 "main\|consumer"
+# 常见: 卡在外部调用 (DB 锁、HTTP 无超时)、死锁
+# 2. 看消费者日志有没有反复 "Rebalance" / "poll timeout"
+# 3. 看是否卡在某条毒消息: 打印当前处理的 offset, 对照 CURRENT-OFFSET 是否不动
+```
+
+**典型原因与解决**：
+
+- **外部调用无超时**：卡死在 DB/HTTP 上。给所有外部调用加超时。
+- **毒消息（poison pill）**：某条消息反复处理失败/抛异常导致不提交。catch 住异常，失败消息发**死信 topic** 后继续推进（第 20 章有完整实现）。
+- **反复 Rebalance**：处理超时导致踢出重入循环，见第 5 节。
+- 应急手段：确认可跳过后，`--reset-offsets --shift-by 1 --execute` 跳过卡住的那条。
+
+## 3. NotLeaderForPartitionException / NOT_LEADER_OR_FOLLOWER
+
+**症状**：客户端报 NotLeaderForPartition 或 NOT_LEADER_OR_FOLLOWER。
+
+**本质**：客户端拿着过期元数据，把请求发给了已不是 leader 的 broker。常见于 broker 重启、leader 切换、重分配期间。
+
+**定位与处理**：
+
+```bash
+# 看该分区当前 leader 与 ISR
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic orders
+```
+
+- **偶发 + 自动恢复**：正常现象，客户端会自动刷新元数据重试，无需处理。
+- **持续报错**：说明 leader 一直在漂移或元数据无法刷新——检查是否有 broker 反复崩溃重启（看 broker 日志与监控），或客户端 bootstrap 地址指向了已下线节点。
+- describe 显示 `Leader: none` → 分区不可用，ISR 全挂：优先拉起原 ISR 成员 broker；确认可接受丢数据时，最后手段是 `kafka-leader-election.sh --election-type UNCLEAN`。
+
+## 4. UNKNOWN_TOPIC_OR_PARTITION
+
+**症状**：客户端报 UnknownTopicOrPartitionException。
+
+**排查顺序**：
+
+1. **topic 真不存在**：`kafka-topics.sh --list` 确认；`auto.create.topics.enable=false`（生产推荐）时写不存在的 topic 直接报此错——按流程建 topic。
+2. **拼写/环境错误**：连错集群是高频原因，确认 bootstrap.servers。
+3. **刚创建就访问**：元数据传播有延迟，几秒内自愈。
+4. **ACL 挡了**：开启授权后，无 Describe 权限的 topic 在部分路径下也表现为 unknown——查 ACL。
+5. topic 正在删除中又被访问，等删除完成。
+
+## 5. Rebalance 风暴
+
+**症状**：消费组日志循环出现 "(Re-)joining group"、"rebalancing"，LAG 锯齿状，吞吐归零又恢复。
+
+**定位步骤**：
+
+```bash
+# 消费者日志关键行:
+#  "consumer poll timeout has expired"  -> max.poll.interval 超时 (处理慢)
+#  "session has expired"                -> 心跳超时 (进程假死/GC/网络)
+#  "Attempt to heartbeat failed since group is rebalancing" -> 被动卷入
+# GC 日志: 有没有超过 session.timeout 的 Full GC 停顿
+```
+
+**解决矩阵**（详见第 9 章）：
+
+| 根因 | 措施 |
+|---|---|
+| 单批处理超 5 分钟 | 调小 max.poll.records / 处理提速 / 调大 max.poll.interval.ms |
+| 长 GC 停顿 | JVM 调优；session.timeout.ms 适当调大 |
+| 滚动发布引发连环 Rebalance | CooperativeStickyAssignor + group.instance.id 静态成员 |
+| 消费者频繁 OOM 重启 | 解决 OOM 本身（往往是单批拉太多大消息） |
+
+## 6. 磁盘写满
+
+**症状**：broker 日志报 "No space left on device"，进程可能直接退出，分区离线。
+
+**应急处理**（顺序执行）：
+
+```bash
+# 1. 找出占用大户
+bin/kafka-log-dirs.sh --bootstrap-server localhost:9092 --describe \
+  | python3 -m json.tool | grep -E '"topic"|"size"' | sort
+
+# 2. 对可牺牲的 topic 临时缩短保留 (立刻触发清理)
+bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --entity-type topics --entity-name huge-logs \
+  --add-config retention.ms=3600000
+
+# 3. 清理线程几分钟内会删老 segment, 观察磁盘释放
+df -h /var/kafka/data
+
+# 4. 恢复后把 retention 改回去, 并做根治: 扩容磁盘/迁移分区/审视保留策略
+```
+
+**绝对不要**手动 `rm` 数据目录里的个别 segment 文件——索引与元数据会不一致，可能导致副本永久损坏。一切删除交给 retention 机制。
+
+**预防**：磁盘 70% 告警、80% 强制处理；`log.retention.bytes` 给每分区兜底上限。
+
+## 7. "脑裂"与元数据异常
+
+**症状**：某些客户端读写正常、另一些报错；不同 broker 看到的元数据不一致；老版本 ZK 集群出现两个 controller。
+
+**背景**：KRaft 用 Raft quorum 从机制上杜绝了双 controller（少数派无法当选）。但仍可能出现**网络分区导致的少数派 broker 与集群失联**：
+
+```bash
+# 1. 确认 controller 状态: LeaderId 是否唯一且各节点一致
+bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status
+# 2. 各 broker 是否都注册在集群里
+bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 | grep "id:"
+# 3. 检查失联 broker 与 controller 节点之间 9093 端口连通性
+```
+
+**处理**：失联 broker 恢复网络后自动重新加入并追赶元数据；期间它上面的 leader 已被转移，恢复后可用 preferred 选举把负载迁回。若 controller quorum 本身失去多数派（如 3 节点挂 2），元数据操作全部冻结——必须优先恢复 controller 节点。
+
+<Callout type="tip" title="通用排障顺口溜">
+一看监控（UnderReplicated / Offline / Controller / 磁盘）、二查 describe（topic 与 consumer-group）、三翻日志（broker 的 server.log 与客户端日志）、四抓现场（jstack / GC 日志）。90% 的问题在前两步就能定位到方向。
+</Callout>
+
+<Callout type="warn" title="排障时的高危动作清单">
+以下操作在故障压力下很诱人，但都可能把事故放大：手动删数据目录文件、开启 unclean 选举、生产环境重置业务消费组 offset、一次性重启所有 broker、删除重建 topic。每一项动手前都要问：这个操作丢的是什么数据、影响哪些下游、能不能回滚。
+</Callout>
+
+## 小结
+
+- 积压先看分布（均匀=能力不足，倾斜=热 key/卡死），警惕积压超过 retention 变成丢数据
+- 卡住三板斧：jstack、毒消息检查、死信队列兜底
+- NotLeader 偶发属正常自愈，持续出现查 broker 稳定性；UNKNOWN_TOPIC 先查拼写与集群
+- Rebalance 风暴按"处理慢 / GC / 发布"三类根因治理
+- 磁盘满用 retention 应急清理，绝不手动删 segment；KRaft 下关注 quorum 多数派健康
+
+<Callout type="exercise" title="练习">
+1. 制造一次积压（停消费者灌 10 万条），练习用 consumer-groups 命令估算追平所需时间，再扩容消费者验证估算。
+2. 在消费逻辑里对特定消息抛异常且不捕获，复现"毒消息卡住"，然后实现 try-catch + 死信 topic 的修复版。
+3. 在测试集群把某 topic retention.ms 调到 60 秒，验证数据按时被清理，理解"积压超过保留期=丢数据"的时间线。
+</Callout>

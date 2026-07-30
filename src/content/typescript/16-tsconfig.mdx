@@ -1,0 +1,244 @@
+---
+title: tsconfig.json 详解
+order: 16
+description: 逐条理解 strict 家族、target/lib/module/moduleResolution、paths、incremental 与项目引用
+---
+
+# tsconfig.json 详解
+
+`tsconfig.json` 是 TypeScript 项目的「宪法」。它决定了三件事：**哪些文件参与编译**、**用多严格的规则检查**、**编译成什么样的 JS**。
+
+很多人的 tsconfig 是从模板复制来的，出问题时只能上网搜。这一章我们把最关键的选项讲清楚，让你能自己判断每一行该不该开。
+
+## 1. 骨架结构
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+`include`／`exclude`／`files` 决定文件集合。注意 `exclude` **只影响 `include` 的展开**，如果某个被排除的文件被其它文件 import 了，它照样会进入编译。
+
+## 2. strict 家族逐条拆解
+
+`"strict": true` 是一个开关组，一次性打开下面这些子选项。它们是 TypeScript 价值的核心，**新项目请全部开启**。
+
+| 选项 | 作用 | 不开的后果 |
+|---|---|---|
+| `strictNullChecks` | `null`／`undefined` 不再能赋给任意类型 | 空指针错误全部漏到运行时 |
+| `strictFunctionTypes` | 函数参数按逆变检查 | 回调签名不兼容却能通过 |
+| `strictBindCallApply` | `bind`/`call`/`apply` 参数被检查 | 参数写错不报错 |
+| `strictPropertyInitialization` | 类字段必须初始化 | 实例字段可能是 `undefined` |
+| `noImplicitAny` | 推不出类型时报错而不是当作 `any` | 类型洞悄悄扩散 |
+| `noImplicitThis` | `this` 类型不明时报错 | `this` 指向错误 |
+| `alwaysStrict` | 产物加 `"use strict"` | 沿用非严格模式语义 |
+| `useUnknownInCatchVariables` | `catch (e)` 中 `e` 是 `unknown` | 直接 `e.message` 埋雷 |
+
+<Callout type="warn" title="strictNullChecks 是不可回头的开关">
+在老项目里打开它，常常会一次性冒出上千个错误。正确的做法不是关掉它，而是先开 `strict` 只对新增目录生效（拆分 tsconfig + 项目引用），再逐步迁移。关掉 `strictNullChecks` 的 TypeScript，价值大概只剩三成。
+</Callout>
+
+### 2.1 strict 之外的推荐选项
+
+这些不在 `strict` 里，但强烈建议开：
+
+| 选项 | 作用 |
+|---|---|
+| `noUncheckedIndexedAccess` | `arr[i]` 与 `obj[key]` 的类型自动带上 `undefined` |
+| `exactOptionalPropertyTypes` | 区分「没有这个属性」和「属性值是 undefined」 |
+| `noImplicitOverride` | 覆写父类方法必须写 `override` |
+| `noFallthroughCasesInSwitch` | 禁止 case 穿透 |
+| `noPropertyAccessFromIndexSignature` | 索引签名只能用方括号访问 |
+| `verbatimModuleSyntax` | 只用于类型的导入必须写 `import type` |
+
+<Callout type="tip" title="noUncheckedIndexedAccess 值得忍受">
+它会让 `arr[0]` 变成 `T | undefined`，一开始很烦。但数组越界是 JS 里最高频的运行时错误之一，忍过两周你会离不开它。
+
+</Callout>
+
+## 3. target / lib：语法与 API 分开控制
+
+这两个选项经常被搞混：
+
+- **`target`** 决定**语法**降级到哪一版。设为 `ES2015` 时，`async/await` 会被编译成状态机；设为 `ES2022` 则原样保留。
+- **`lib`** 决定**有哪些内置 API 的类型声明**。它不影响产物，只影响类型检查。
+
+举例：`target: "ES5"` 但 `lib: ["ES2022"]`，你能写 `arr.at(-1)` 通过类型检查，但运行时如果环境不支持 `Array.prototype.at`，照样报错。TS **不提供 polyfill**，语法降级和 API 补丁是两件事。
+
+不写 `lib` 时，它会根据 `target` 取一个默认值。前端项目通常还要加 `"DOM"`：
+
+```json
+{ "target": "ES2022", "lib": ["ES2022", "DOM", "DOM.Iterable"] }
+```
+
+## 4. module / moduleResolution
+
+`module` 决定**产物用哪种模块语法**，`moduleResolution` 决定**编译器怎么找模块文件**。
+
+| 组合 | 适用场景 |
+|---|---|
+| `module: NodeNext` + `moduleResolution: NodeNext` | Node.js 项目，同时支持 CJS/ESM，按 `package.json` 判定 |
+| `module: ESNext` + `moduleResolution: Bundler` | 前端项目，交给 Vite/webpack 处理 |
+| `module: CommonJS` + `moduleResolution: Node10` | 传统 Node 项目，逐渐淘汰 |
+| `module: Preserve` | TS 5.4+，原样保留导入语法，交给下游工具 |
+
+`moduleResolution: Bundler` 是 TS 5.0 引入的，它允许省略扩展名、支持 `exports` 字段，最贴近打包器的真实行为。**如果你的代码经过打包器，就该用它**。
+
+<Callout type="warn" title="NodeNext 下的双重陷阱">
+`NodeNext` 会读 `package.json` 的 `type` 字段判定每个文件是 ESM 还是 CJS。同一个仓库里两种模块混用时，很容易出现「同名类型不兼容」「默认导入不可调用」的报错。排查思路永远是：先确认这个文件被判定成了哪种模块。
+</Callout>
+
+## 5. 输出相关
+
+| 选项 | 说明 |
+|---|---|
+| `outDir` / `rootDir` | 产物目录 / 源码根目录，决定产物的目录结构 |
+| `declaration` | 生成 `.d.ts`，写库必开 |
+| `declarationMap` | 生成 `.d.ts.map`，让「转到定义」跳到源码而非声明 |
+| `sourceMap` | 生成 source map，调试必备 |
+| `noEmit` | 只做类型检查，不产出文件 |
+| `isolatedModules` | 保证每个文件能被单独转译（Babel/esbuild/SWC 需要） |
+| `skipLibCheck` | 跳过 `.d.ts` 的类型检查，显著提速 |
+
+<Callout type="info" title="为什么几乎人人都开 skipLibCheck">
+`node_modules` 里成百上千个 `.d.ts` 互相冲突是常态，检查它们既慢又无法修复。开启后 TS 只检查你自己的代码，编译时间常能减半。代价是可能漏掉库之间的类型冲突——这个交换是划算的。
+</Callout>
+
+## 6. paths 与 baseUrl
+
+```json
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@config": ["src/config/index.ts"]
+    }
+  }
+}
+```
+
+TS 5.0 起，用 `moduleResolution: Bundler` 时 `paths` 可以不配 `baseUrl`（相对 tsconfig 所在目录解析）。再强调一次上一章的坑：**`paths` 只影响类型解析，运行时需要打包器或 Node 的 `imports` 字段配合**。
+
+## 7. 增量编译与项目引用
+
+### 7.1 incremental
+
+```json
+{ "incremental": true, "tsBuildInfoFile": ".cache/tsbuildinfo" }
+```
+
+TS 会把上次编译的依赖图写进 `.tsbuildinfo`，下次只重新检查变化的部分。大项目上二次编译能快数倍。记得把这个文件加进 `.gitignore`。
+
+### 7.2 Project References
+
+当仓库里有多个包（monorepo）或需要区分「源码 / 测试 / 脚本」时，可以拆成多个 tsconfig 并用 `references` 串起来：
+
+```json
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/shared" },
+    { "path": "./packages/server" },
+    { "path": "./packages/web" }
+  ]
+}
+```
+
+被引用的项目必须开启 `"composite": true`（它会隐含 `declaration: true` 和 `incremental: true`）。之后用 `tsc --build`（简写 `tsc -b`）构建，TS 会：
+
+- 按依赖顺序依次构建；
+- 跳过没有变化的项目；
+- 让 `packages/server` 引用 `packages/shared` 时只读它的 `.d.ts`，而不是重新检查全部源码。
+
+这是大型 TS 仓库保持编译速度的关键手段。
+
+<Callout type="warn" title="composite 要求 rootDir 明确">
+开启 `composite` 后，所有输入文件必须在 `rootDir` 之内，且 `include` 不能为空（除非显式写 `files: []` 作为纯聚合根）。这两条限制是新手配置 Project References 时最常撞的墙。
+</Callout>
+
+## 8. 用代码感受 strict 的效果
+
+下面这段代码在 `strict: true` 下是合法的。试着把某一行改成注释里描述的「非严格写法」，看看编译器如何拦截。
+
+<Playground
+  language="typescript"
+  id="ts-16-strict"
+  title="strict 各开关的实际效果"
+  code={`// strictNullChecks: 必须先处理 null 才能用
+function firstChar(s: string | null): string {
+  if (s === null) return "(空)";
+  return s.charAt(0);
+}
+console.log(firstChar("hello"), firstChar(null));
+
+// strictPropertyInitialization: 字段必须初始化或在构造函数里赋值
+class Counter {
+  private count: number = 0;
+  readonly label: string;
+  constructor(label: string) {
+    this.label = label;
+  }
+  inc(): this {
+    this.count += 1;
+    return this;
+  }
+  toString(): string {
+    return this.label + "=" + this.count;
+  }
+}
+console.log(new Counter("hits").inc().inc().toString());
+
+// noImplicitAny: 参数必须有类型（这里靠上下文推断出来了）
+const nums = [3, 1, 2];
+const sorted = nums.slice().sort((a, b) => a - b);
+console.log("sorted:", JSON.stringify(sorted));
+
+// strictFunctionTypes: 回调参数按逆变检查
+type Handler = (e: { type: string; code: number }) => void;
+const h: Handler = (e) => console.log("事件:", e.type, e.code);
+h({ type: "click", code: 1 });
+
+// useUnknownInCatchVariables: catch 到的是 unknown
+try {
+  throw new RangeError("越界了");
+} catch (e) {
+  if (e instanceof Error) console.log("捕获:", e.name, e.message);
+  else console.log("非 Error 抛出物:", String(e));
+}
+
+// strictBindCallApply: call 的参数会被检查
+function greet(this: { who: string }, punct: string): string {
+  return "hi " + this.who + punct;
+}
+console.log(greet.call({ who: "TS" }, "!"));`}
+/>
+
+<Callout type="exercise" title="练习">
+1. 在本地新建一个空项目，运行 `npx tsc --init --strict`，逐条阅读生成的注释，挑出五个你以前没注意的选项。
+2. 打开 `noUncheckedIndexedAccess`，修一遍现有代码，统计有多少处数组访问其实是不安全的。
+3. 把一个小项目拆成 `src` 与 `tests` 两个 tsconfig，用 `references` 关联，体验 `tsc -b` 的增量构建。
+</Callout>
+
+## 小结
+
+- `strict` 是一组开关的总闸，新项目必开；`strictNullChecks` 是其中价值最高的一条
+- `target` 管语法降级，`lib` 管 API 类型，TS 不提供 polyfill
+- `module` 管产物语法，`moduleResolution` 管找文件；打包项目用 `Bundler`，纯 Node 用 `NodeNext`
+- `skipLibCheck` 换编译速度，`incremental` 缓存依赖图，`composite` + `references` 支撑大仓库
+- `paths` 只解决类型解析，运行时另需配置
+- 下一章讲异步编程的类型 →

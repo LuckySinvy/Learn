@@ -1,0 +1,202 @@
+---
+title: Set：去重、标签与随机抽取
+order: 6
+description: SADD/SISMEMBER/SPOP/交并差集合运算、intset 编码、标签系统与抽奖场景
+---
+
+# Set：去重、标签与随机抽取
+
+Set 是**无序、去重**的字符串集合。它的两大杀手锏：O(1) 判断"存在不存在"，以及服务端直接完成交集、并集、差集运算——共同好友、共同关注这类需求一条命令搞定。
+
+## 1. 核心命令实操
+
+### 1.1 增删查
+
+```bash
+127.0.0.1:6379> SADD tags:article:1 "redis" "cache" "database"
+(integer) 3
+127.0.0.1:6379> SADD tags:article:1 "redis"
+(integer) 0             # 已存在，自动去重，返回实际新增数
+127.0.0.1:6379> SISMEMBER tags:article:1 "redis"
+(integer) 1
+127.0.0.1:6379> SMISMEMBER tags:article:1 "redis" "mysql"
+1) (integer) 1
+2) (integer) 0          # 6.2+ 批量判断
+127.0.0.1:6379> SCARD tags:article:1
+(integer) 3             # 集合大小
+127.0.0.1:6379> SREM tags:article:1 "database"
+(integer) 1
+127.0.0.1:6379> SMEMBERS tags:article:1
+1) "cache"
+2) "redis"
+```
+
+`SMEMBERS` 返回全部成员，大集合上等同于 KEYS 的危险性，改用 `SSCAN`：
+
+```bash
+127.0.0.1:6379> SSCAN tags:article:1 0 COUNT 100
+1) "0"
+2) 1) "cache"
+   2) "redis"
+```
+
+### 1.2 随机抽取：SPOP 与 SRANDMEMBER
+
+```bash
+127.0.0.1:6379> SADD lottery:users u1 u2 u3 u4 u5
+(integer) 5
+127.0.0.1:6379> SRANDMEMBER lottery:users 2
+1) "u3"
+2) "u1"                 # 只随机读取，不删除
+127.0.0.1:6379> SPOP lottery:users 2
+1) "u5"
+2) "u2"                 # 随机弹出并删除
+127.0.0.1:6379> SCARD lottery:users
+(integer) 3
+```
+
+两者的区别决定了抽奖用法：
+
+- **一等奖不能重复中**：用 `SPOP`，中奖者移出奖池；
+- **每轮独立、可重复参与**：用 `SRANDMEMBER`。
+
+`SRANDMEMBER` 的 count 为负数时允许返回重复成员（如 `-5` 可能返回同一人多次）。
+
+### 1.3 集合运算：交、并、差
+
+```bash
+127.0.0.1:6379> SADD follow:ada  u2 u3 u4
+(integer) 3
+127.0.0.1:6379> SADD follow:bob  u3 u4 u5
+(integer) 3
+
+127.0.0.1:6379> SINTER follow:ada follow:bob     # 交集: 共同关注
+1) "u3"
+2) "u4"
+127.0.0.1:6379> SUNION follow:ada follow:bob     # 并集
+1) "u2"
+2) "u3"
+3) "u4"
+4) "u5"
+127.0.0.1:6379> SDIFF follow:ada follow:bob      # 差集: ada 关注而 bob 没关注的
+1) "u2"
+```
+
+带 STORE 后缀的版本把结果存进新 key，便于缓存复用：
+
+```bash
+127.0.0.1:6379> SINTERSTORE common:ada:bob follow:ada follow:bob
+(integer) 2
+127.0.0.1:6379> EXPIRE common:ada:bob 300
+(integer) 1             # 交集结果缓存 5 分钟
+127.0.0.1:6379> SINTERCARD 2 follow:ada follow:bob
+(integer) 2             # 7.0+ 只要交集的数量，不要成员，更省
+```
+
+复杂度注意：SINTER 是 O(N*M)（最小集合大小 × 集合个数），SUNION/SDIFF 是 O(N)（全部元素之和）。对两个百万级集合求并集是重操作，必要时放到从库或离线做。
+
+## 2. 底层编码：intset 与 listpack 与 hashtable
+
+```bash
+127.0.0.1:6379> SADD nums 1 2 3
+(integer) 3
+127.0.0.1:6379> OBJECT ENCODING nums
+"intset"
+127.0.0.1:6379> SADD strs "a" "b"
+(integer) 2
+127.0.0.1:6379> OBJECT ENCODING strs
+"listpack"
+127.0.0.1:6379> SADD strs "this-is-a-long-member-over-sixty-four-bytes-xxxxxxxxxxxxxxxxxxxxxxx"
+(integer) 1
+127.0.0.1:6379> OBJECT ENCODING strs
+"hashtable"
+```
+
+| 编码 | 条件 | 结构 |
+|---|---|---|
+| `intset` | 全部成员是整数，且个数 ≤ 512 | 有序整数数组，二分查找 |
+| `listpack` | 成员含字符串，个数 ≤ 128 且都 ≤ 64 字节（7.2+） | 紧凑连续内存 |
+| `hashtable` | 超出上述条件 | 哈希表，value 为空 |
+
+```text
+intset（升级机制）:
+  [1, 2, 3]           全是 int16 -> 每个成员 2 字节
+  SADD nums 100000    需要 int32 -> 整个数组升级为 4 字节/成员
+  SADD nums 10^12     需要 int64 -> 再升级为 8 字节/成员
+  （只升不降）
+```
+
+相关配置：
+
+```conf
+set-max-intset-entries 512
+set-max-listpack-entries 128
+set-max-listpack-value 64
+```
+
+存纯数字 ID 的集合（用户 ID、商品 ID）时 intset 极其省内存：512 个 int32 只占约 2 KB。
+
+## 3. 典型场景
+
+### 3.1 标签系统
+
+```bash
+# 双向存储: 文章的标签 + 标签下的文章
+127.0.0.1:6379> SADD article:1:tags "redis" "cache"
+(integer) 2
+127.0.0.1:6379> SADD tag:redis:articles 1 5 9
+(integer) 3
+127.0.0.1:6379> SADD tag:cache:articles 1 7
+(integer) 2
+# 同时含 redis 和 cache 标签的文章:
+127.0.0.1:6379> SINTER tag:redis:articles tag:cache:articles
+1) "1"
+```
+
+### 3.2 抽奖去重
+
+```bash
+# 报名: SADD 天然防重复报名
+127.0.0.1:6379> SADD raffle:20260801 u1001
+(integer) 1
+127.0.0.1:6379> SADD raffle:20260801 u1001
+(integer) 0             # 重复报名无效
+# 开奖: 抽 3 个三等奖（不放回）
+127.0.0.1:6379> SPOP raffle:20260801 3
+1) "u1017"
+2) "u1001"
+3) "u1093"
+```
+
+### 3.3 点赞与已读去重
+
+```bash
+127.0.0.1:6379> SADD like:post:42 u1
+(integer) 1             # 返回 1 = 点赞成功
+127.0.0.1:6379> SADD like:post:42 u1
+(integer) 0             # 返回 0 = 已点过（可提示或执行取消逻辑）
+127.0.0.1:6379> SCARD like:post:42
+(integer) 1             # 点赞数
+```
+
+<Callout type="tip" title="用返回值代替先查后写">
+判断"是否已点赞"不需要先 SISMEMBER 再 SADD——直接 SADD，看返回值是 1 还是 0。一次网络往返，而且原子，不存在并发下的先查后写竞态。
+</Callout>
+
+<Callout type="warn" title="大集合的三个雷区">
+1）SMEMBERS 百万成员集合会阻塞并产生巨大响应，遍历用 SSCAN；2）SINTERSTORE 大集合会在主线程做大量计算；3）海量 UV 去重场景（千万级）用 Set 太耗内存——每天几千万 ID 可能吃掉数 GB，这种"只要数量不要成员"的需求应该用 HyperLogLog（第 8 章），12 KB 搞定。
+</Callout>
+
+## 小结
+
+- Set 提供 O(1) 存在性判断与自动去重，SADD 返回值可直接当"是否首次"用
+- SPOP 不放回抽取（抽奖），SRANDMEMBER 只读随机（可重复）
+- SINTER/SUNION/SDIFF 服务端集合运算，STORE 版本可缓存结果
+- 编码三态：纯整数 intset，小字符串集合 listpack，大集合 hashtable
+- 需要"带权重的有序集合"时，进入下一章 ZSet →
+
+<Callout type="exercise" title="练习">
+1. 构造两个各含 10 个成员的关注集合，分别求共同关注、全部关注、独有关注，并用 SINTERSTORE 把结果缓存 60 秒。
+2. 实现一个抽奖流程：100 人报名（防重复），先抽 1 个一等奖（不放回），再从剩余人中抽 5 个参与奖。
+3. 向一个纯数字 Set 依次加入 500 个小整数和 1 个字符串，观察 OBJECT ENCODING 的两次状态。
+</Callout>

@@ -1,0 +1,415 @@
+---
+title: 映射类型与条件类型
+order: 11
+description: 映射类型、修饰符增删与 key remapping，条件类型、infer 关键字与分发式条件类型
+---
+
+# 映射类型与条件类型
+
+上一章我们学会了从已有类型「取东西」（`keyof`、`T[K]`）。这一章学的是**改造**和**判断**：映射类型批量地把一个类型的每个属性变个样，条件类型则让类型系统具备「如果……那么……」的能力。这两者加在一起，构成了 TypeScript 的类型编程内核——标准库里所有内置工具类型都由它们写成。
+
+## 1. 映射类型
+
+### 1.1 基本语法
+
+映射类型的形状就是「一个带 `in` 的索引签名」：
+
+```ts
+type Mapped<T> = {
+  [K in keyof T]: T[K];
+};
+```
+
+读作：对 `keyof T` 里的每一个键 `K`，产生一个类型为 `T[K]` 的属性。上面这个 `Mapped<T>` 什么也没改，等于 `T` 本身。把冒号右边换掉，就能批量改造：
+
+```ts
+type Stringify<T> = {
+  [K in keyof T]: string;      // 所有属性都变成 string
+};
+
+type Nullable<T> = {
+  [K in keyof T]: T[K] | null;  // 所有属性都可以为空
+};
+```
+
+### 1.2 修饰符的增删
+
+属性前可以加 `readonly`，属性名后可以加 `?`。映射类型允许用 `+` / `-` 显式**添加或移除**这两个修饰符：
+
+| 写法 | 效果 |
+|---|---|
+| `readonly [K in keyof T]` | 全部加只读（`+readonly` 的简写） |
+| `-readonly [K in keyof T]` | 全部去掉只读 |
+| `[K in keyof T]?` | 全部变可选 |
+| `[K in keyof T]-?` | 全部变必选（同时去掉 `undefined`） |
+
+内置的 `Partial`、`Required`、`Readonly` 就是这么实现的：
+
+```ts
+type Partial<T> = { [K in keyof T]?: T[K] };
+type Required<T> = { [K in keyof T]-?: T[K] };
+type Readonly<T> = { readonly [K in keyof T]: T[K] };
+```
+
+<Callout type="info" title="映射类型也是「同态」的">
+当映射的是 `keyof T` 时，TypeScript 会保留原类型的 `readonly` 与 `?` 修饰符（除非你显式增删）。这种映射叫**同态映射**，也是它能正确处理数组和元组的原因——`Partial<string[]>` 得到的还是数组而不是普通对象。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-11-mapped"
+  title="映射类型与修饰符"
+  code={`interface User {
+  readonly id: number;
+  name: string;
+  email?: string;
+}
+
+// 手写 Partial / Required / Readonly
+type MyPartial<T> = { [K in keyof T]?: T[K] };
+type MyRequired<T> = { [K in keyof T]-?: T[K] };
+type MyMutable<T> = { -readonly [K in keyof T]: T[K] };
+
+// 全部变成可选：可以只传一部分
+function update(user: User, patch: MyPartial<User>): User {
+  return { ...user, ...patch };
+}
+
+const u: User = { id: 1, name: "Ada" };
+const u2 = update(u, { name: "Ada L." });
+console.log("更新后 name = " + u2.name + "，id = " + u2.id);
+
+// 全部变成必选：email 不再可选
+const full: MyRequired<User> = { id: 2, name: "Alan", email: "alan@x.com" };
+console.log("必选版 email = " + full.email);
+
+// 去掉 readonly：id 变得可写
+const mutable: MyMutable<User> = { id: 3, name: "Grace" };
+mutable.id = 30;
+console.log("可写版 id = " + mutable.id);
+
+// 改造值类型：把每个字段都变成「取值函数」
+type Lazy<T> = { [K in keyof T]: () => T[K] };
+
+const lazyUser: Lazy<{ name: string; score: number }> = {
+  name: () => "Grace",
+  score: () => 91,
+};
+console.log("惰性求值: " + lazyUser.name() + " " + lazyUser.score());
+
+// 值类型统一改写
+type Flags<T> = { [K in keyof T]: boolean };
+const dirty: Flags<{ name: string; email: string }> = { name: true, email: false };
+console.log("name 改过? " + dirty.name + "，email 改过? " + dirty.email);`}
+  expectedOutput={`更新后 name = Ada L.，id = 1\n必选版 email = alan@x.com\n可写版 id = 30\n惰性求值: Grace 91\nname 改过? true，email 改过? false`}
+/>
+
+## 2. key remapping：改键名
+
+TypeScript 4.1 给映射类型加了 `as` 子句，可以**重写键名**：
+
+```ts
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+```
+
+上面用到了模板字面量类型和内置的 `Capitalize`。`Getters<{ name: string }>` 会得到 `{ getName: () => string }`。
+
+### 2.1 用 never 过滤键
+
+`as` 子句求值为 `never` 时，这个键会被**丢弃**。这是「按条件筛选属性」的标准手法：
+
+```ts
+type OnlyStrings<T> = {
+  [K in keyof T as T[K] extends string ? K : never]: T[K];
+};
+```
+
+<Playground
+  language="typescript"
+  id="ts-11-remapping"
+  title="key remapping 与键过滤"
+  code={`interface Person {
+  name: string;
+  age: number;
+  email: string;
+}
+
+// 1) as 子句最简单的用法：原样保留（等价于不写 as）
+type Identity<T> = {
+  [K in keyof T as K]: T[K];
+};
+
+const p: Identity<Person> = { name: "Ada", age: 36, email: "ada@x.com" };
+console.log("as 原样映射保留全部键: " + Object.keys(p).join(","));
+
+// 2) 用 never 过滤：只保留值为 string 的属性
+type OnlyStrings<T> = {
+  [K in keyof T as T[K] extends string ? K : never]: T[K];
+};
+
+const s: OnlyStrings<Person> = { name: "Alan", email: "alan@x.com" };
+console.log("只剩字符串字段: " + Object.keys(s).join(","));
+// const bad: OnlyStrings<Person> = { name: "x", age: 1 };  // 错误：age 已被过滤掉
+
+// 3) 反向过滤：去掉某些键
+type Without<T, Drop extends keyof T> = {
+  [K in keyof T as K extends Drop ? never : K]: T[K];
+};
+
+const noEmail: Without<Person, "email"> = { name: "Grace", age: 45 };
+console.log("去掉 email 后: " + Object.keys(noEmail).join(","));
+
+function summarize(x: Without<Person, "email">): string {
+  return x.name + " / " + x.age;
+}
+console.log(summarize(noEmail));`}
+  expectedOutput={`as 原样映射保留全部键: name,age,email\n只剩字符串字段: name,email\n去掉 email 后: name,age\nGrace / 45`}
+/>
+
+### 2.2 配合模板字面量类型改名
+
+真正「改名」时要用模板字面量类型（用反引号包裹的类型），可运行示例框里没法展示反引号，所以放在这里：
+
+```ts
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+
+type PersonGetters = Getters<{ name: string; age: number }>;
+// 等价于 { getName: () => string; getAge: () => number }
+
+type EventHandlers<T> = {
+  [K in keyof T as `on${Capitalize<string & K>}Change`]?: (v: T[K]) => void;
+};
+```
+
+内置的 `Uppercase`、`Lowercase`、`Capitalize`、`Uncapitalize` 四个字符串工具类型专门为这种场景准备。
+
+## 3. 条件类型
+
+### 3.1 基本语法
+
+```ts
+type IsString<T> = T extends string ? true : false;
+
+type A = IsString<"hi">;     // true
+type B = IsString<42>;       // false
+```
+
+语法刻意做得和三元表达式一样。`T extends U` 在这里读作「T 可以赋给 U 吗」。
+
+条件类型的价值在于**让类型随输入变化**。例如根据传入的字面量决定返回类型：
+
+```ts
+type Unwrap<T> = T extends Array<infer E> ? E : T;
+```
+
+### 3.2 infer：从类型里「捕获」子类型
+
+`infer X` 只能出现在条件类型的 `extends` 右侧，作用是「在这个位置放一个占位符，匹配成功后把匹配到的类型绑定给 X」。它很像正则表达式的捕获组。
+
+```ts
+type ReturnOf<F> = F extends (...args: any[]) => infer R ? R : never;
+type ElementOf<T> = T extends Array<infer E> ? E : never;
+type Head<T> = T extends [infer H, ...unknown[]] ? H : never;
+```
+
+内置的 `ReturnType`、`Parameters`、`Awaited` 全部基于 `infer`。
+
+### 3.3 分发式条件类型
+
+第 9 章提过：当条件类型作用在**裸的类型参数**上，而实参是联合类型时，会自动分发：
+
+```ts
+type ToArray<T> = T extends unknown ? T[] : never;
+type R = ToArray<string | number>;   // string[] | number[]
+```
+
+正因为有分发，`Exclude` 才能这样简单地实现：
+
+```ts
+type Exclude<T, U> = T extends U ? never : T;
+type X = Exclude<"a" | "b" | "c", "a">;   // "b" | "c"
+```
+
+逐个成员判断，命中的变 `never`，联合里的 `never` 会被自动剔除。
+
+关掉分发的办法还是用方括号包起来：
+
+```ts
+type IsUnion<T> = [T] extends [infer _] ? false : false;   // 简化示意
+type NoDist<T> = [T] extends [string] ? true : false;
+```
+
+<Callout type="warn" title="never 在分发里的陷阱">
+`ToArray<never>` 的结果是 `never`，而不是 `never[]`。因为 `never` 是「空联合」，分发时没有任何成员可以遍历，结果自然是空。这个行为经常让人一头雾水，遇到「明明写了条件类型却得到 never」时先想想是不是它。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-11-conditional"
+  title="条件类型与分发"
+  code={`// 基本条件类型
+type IsString<T> = T extends string ? true : false;
+
+const yes: IsString<"hi"> = true;
+const no: IsString<42> = false;
+console.log("IsString 字符串 = " + yes + "，数字 = " + no);
+
+// 分发：联合会被逐个处理
+type Boxed<T> = T extends unknown ? { value: T } : never;
+type BoxedSN = Boxed<string | number>;   // { value: string } | { value: number }
+
+const b1: BoxedSN = { value: "文本" };
+const b2: BoxedSN = { value: 42 };
+console.log("分发结果可以装字符串: " + b1.value);
+console.log("也可以装数字: " + b2.value);
+// const bad: BoxedSN = { value: true };   // 错误：布尔不在联合里
+
+// 手写 Exclude / Extract
+type MyExclude<T, U> = T extends U ? never : T;
+type MyExtract<T, U> = T extends U ? T : never;
+
+type Level = "debug" | "info" | "warn" | "error";
+type Serious = MyExclude<Level, "debug" | "info">;   // "warn" | "error"
+type Quiet = MyExtract<Level, "debug" | "info">;     // "debug" | "info"
+
+const s: Serious = "error";
+const q: Quiet = "debug";
+console.log("严重级别: " + s + "，安静级别: " + q);
+
+function alarm(level: Serious): string {
+  return "触发告警: " + level;
+}
+console.log(alarm("warn"));
+// alarm("debug");   // 错误：debug 已被 Exclude 掉
+
+// 关掉分发：用方括号包住类型参数
+type NoDist<T> = [T] extends [string] ? "全是字符串" : "不全是";
+const r1: NoDist<string> = "全是字符串";
+const r2: NoDist<string | number> = "不全是";
+console.log(r1 + " / " + r2);`}
+  expectedOutput={`IsString 字符串 = true，数字 = false\n分发结果可以装字符串: 文本\n也可以装数字: 42\n严重级别: error，安静级别: debug\n触发告警: warn\n全是字符串 / 不全是`}
+/>
+
+## 4. infer 实战
+
+<Playground
+  language="typescript"
+  id="ts-11-infer"
+  title="用 infer 拆解类型"
+  code={`// 1) 取函数返回类型
+type ReturnOf<F> = F extends (...args: any[]) => infer R ? R : never;
+
+function loadUser(id: number) {
+  return { id, name: "Ada", tags: ["admin", "dev"] };
+}
+type User = ReturnOf<typeof loadUser>;
+
+const u: User = { id: 1, name: "Ada", tags: ["admin"] };
+console.log("从函数推出的类型: " + u.name + " / " + u.tags.join(","));
+
+// 2) 取参数类型元组
+type ParamsOf<F> = F extends (...args: infer P) => unknown ? P : never;
+
+function send(url: string, retries: number, silent: boolean): string {
+  return url + " 重试 " + retries + " 次" + (silent ? "（静默）" : "");
+}
+type SendArgs = ParamsOf<typeof send>;   // [string, number, boolean]
+
+const args: SendArgs = ["/api/user", 3, true];
+console.log(send(...args));
+
+// 3) 取数组元素类型
+type ElementOf<T> = T extends readonly (infer E)[] ? E : never;
+
+const colors = ["red", "green", "blue"] as const;
+type Color = ElementOf<typeof colors>;   // "red" | "green" | "blue"
+
+function paint(c: Color): string {
+  return "涂上" + c;
+}
+console.log(paint("green"));
+// paint("black");   // 错误：不在联合里
+
+// 4) 拆元组的头和尾
+type Head<T> = T extends [infer H, ...unknown[]] ? H : never;
+type Tail<T> = T extends [unknown, ...infer R] ? R : never;
+
+type Args = [string, number, boolean];
+const head: Head<Args> = "第一项是字符串";
+const tail: Tail<Args> = [7, false];
+console.log(head + "，剩下 " + tail.length + " 项: " + tail.join(","));
+
+// 5) 组合：从函数类型直接构造「带缓存的同签名函数」类型
+type Cached<F> = F extends (...args: infer P) => infer R
+  ? (...args: P) => R
+  : never;
+
+const cachedSend: Cached<typeof send> = (url, retries, silent) =>
+  send(url, retries, silent);
+console.log(cachedSend("/api/ping", 1, false));`}
+  expectedOutput={`从函数推出的类型: Ada / admin\n/api/user 重试 3 次（静默）\n涂上green\n第一项是字符串，剩下 2 项: 7,false\n/api/ping 重试 1 次`}
+/>
+
+## 5. 组合起来看内置工具类型
+
+学完这两章，标准库里的工具类型就没有秘密了：
+
+| 工具类型 | 实现 |
+|---|---|
+| `Partial<T>` | `{ [K in keyof T]?: T[K] }` |
+| `Required<T>` | `{ [K in keyof T]-?: T[K] }` |
+| `Readonly<T>` | `{ readonly [K in keyof T]: T[K] }` |
+| `Pick<T, K>` | `{ [P in K]: T[P] }` |
+| `Record<K, V>` | `{ [P in K]: V }` |
+| `Exclude<T, U>` | `T extends U ? never : T` |
+| `Extract<T, U>` | `T extends U ? T : never` |
+| `Omit<T, K>` | `Pick<T, Exclude<keyof T, K>>` |
+| `NonNullable<T>` | `T & {}` |
+| `ReturnType<F>` | `F extends (...a: any) => infer R ? R : any` |
+
+## 6. 递归与性能
+
+映射类型和条件类型都可以递归调用自身，这让它们具备了图灵完备的表达能力。最常见的例子是深度只读：
+
+```ts
+type DeepReadonly<T> = {
+  readonly [K in keyof T]: T[K] extends object ? DeepReadonly<T[K]> : T[K];
+};
+```
+
+递归很强大，但有两个现实约束：
+
+1. **递归深度上限**。TypeScript 对类型实例化深度有硬限制（约 50 层，尾递归条件类型能放宽到 1000 层）。超过就会报「类型实例化过深」。
+2. **编译时间**。复杂递归类型是大型项目里类型检查变慢的头号原因。一个写得随意的递归工具类型，可能让整个项目的检查时间从 5 秒涨到 30 秒。
+
+排查类型性能问题时，`tsc --diagnostics` 会打印实例化次数与检查耗时，`tsc --generateTrace` 能导出可视化的火焰图。发现某个工具类型的实例化次数异常高，通常就是它了。
+
+<Callout type="warn" title="递归类型要设终止条件">
+上面的 `DeepReadonly` 遇到函数、`Date`、`Map` 这类「也是 object 但不该被展开」的类型时会出问题——函数的属性会被逐个映射，结果面目全非。实用的版本需要先排除这些特殊情况，比如 `T extends Function ? T : ...`。写递归类型时，**先想清楚在哪里停下来**。
+</Callout>
+
+<Callout type="tip" title="类型编程要克制">
+映射类型和条件类型很容易上瘾——写出一个七层嵌套的「聪明」类型会很有成就感。但请记住：类型是给人看的。编译变慢、报错信息长达几十行、同事读不懂，代价往往超过收益。**能用一个简单的联合或接口解决，就别上类型体操。**
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 手写 `MyPick<T, K extends keyof T>` 和 `MyOmit<T, K extends keyof T>`，并用一个 `interface` 验证结果。
+2. 写一个 `DeepReadonly<T>`：递归地把嵌套对象的所有属性都变成只读（提示：值是对象时递归调用自身）。
+3. 写一个 `FunctionKeys<T>`：用 key remapping 加 `never` 过滤，只保留 `T` 中值为函数的键名。
+4. 验证 never 陷阱：定义 `type Wrap<T> = T extends unknown ? T[] : never`，分别传入 `never` 和 `string`，观察结果差异。
+</Callout>
+
+## 小结
+
+- 映射类型 `[K in keyof T]` 批量改造属性；`+` / `-` 增删 `readonly` 与 `?`
+- 同态映射会保留原有修饰符，也能正确处理数组与元组
+- `as` 子句可以重写键名；求值为 `never` 时该键被丢弃，这是筛选属性的标准手法
+- 条件类型 `T extends U ? X : Y` 让类型具备分支能力
+- `infer` 像正则捕获组，从匹配到的位置提取子类型
+- 裸类型参数上的条件类型会对联合**分发**，`[T] extends [U]` 可关闭；`never` 分发结果是 `never`
+- 所有内置工具类型都由这两套机制写成，但日常代码里要克制使用
+- 至此，TypeScript 的核心类型系统已经完整 →

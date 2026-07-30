@@ -1,0 +1,176 @@
+---
+title: 备份恢复与 binlog
+order: 19
+description: mysqldump 逻辑备份、物理备份、binlog 三种格式与时间点恢复 PITR
+---
+
+# 备份恢复与 binlog
+
+「删库跑路」是段子，误删数据是日常。衡量备份体系的两个硬指标：**能不能恢复**（没验证过恢复流程的备份等于没有备份）和**能恢复到哪个时间点**。本章讲逻辑备份、物理备份，以及用 binlog 实现精确到秒的时间点恢复（PITR）。
+
+## 1. 备份的两大流派
+
+| 维度 | 逻辑备份（mysqldump） | 物理备份（XtraBackup/克隆） |
+|---|---|---|
+| 产物 | SQL 文本（CREATE + INSERT） | 数据文件字节拷贝 |
+| 速度 | 慢（逐行导出/逐行重放） | 快（拷文件） |
+| 备份期间 | 不锁库（InnoDB + 单事务快照） | 不锁库 |
+| 恢复粒度 | 可单库单表，可跨版本/跨平台 | 通常整实例 |
+| 适用规模 | 几十 GB 以内 | 百 GB ~ TB 级 |
+
+## 2. mysqldump 逻辑备份
+
+### 2.1 标准备份命令
+
+```bash
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --routines --triggers --events \
+  --set-gtid-purged=OFF \
+  --databases shop \
+  -uroot -p | gzip > shop_$(date +%F).sql.gz
+```
+
+关键参数拆解：
+
+- `--single-transaction`：开一个 RR 事务，靠 **MVCC 快照**导出一致性数据，全程不锁表（只对 InnoDB 有效——又一个全用 InnoDB 的理由）；
+- `--source-data=2`（老版本叫 `--master-data=2`）：把备份时刻的 **binlog 文件名和位点**以注释形式写进备份文件，PITR 全靠它；
+- `--routines --triggers --events`：带上存储过程、触发器、事件，默认不导会丢；
+- 恒定搭配 gzip，文本压缩率很高。
+
+### 2.2 恢复
+
+```bash
+gunzip < shop_2026-07-30.sql.gz | mysql -uroot -p
+
+# 只恢复单表：从备份里抽出来（也是逻辑备份的独特优势）
+gunzip < shop_2026-07-30.sql.gz | sed -n '/CREATE TABLE `orders`/,/UNLOCK TABLES/p' > orders_only.sql
+```
+
+<Callout type="warn" title="备份必须演练恢复">
+备份文件损坏、参数漏了 routines、字符集不对、恢复时长远超预期——这些问题只有真正做恢复演练才会暴露。纪律：定期（至少每季度）把备份恢复到一台隔离环境，校验行数和关键数据。没演练过的备份只是心理安慰。
+</Callout>
+
+## 3. 物理备份概览
+
+大库用 Percona XtraBackup（开源）或 MySQL 企业版备份：拷贝数据文件的同时持续追 redo log，结束后应用日志得到一致性数据集。8.0.17+ 还内置了**克隆插件**（CLONE），常用于快速搭建从库：
+
+```sql
+INSTALL PLUGIN clone SONAME 'mysql_clone.so';
+-- 在新实例上直接从远端捐赠者克隆全量数据
+CLONE INSTANCE FROM 'clone_user'@'source_host':3306 IDENTIFIED BY 'xxx';
+```
+
+工程实践：**TB 级用物理备份做全量 + binlog 做增量**；中小库 mysqldump 足够。
+
+## 4. binlog：一切恢复与复制的基础
+
+binlog 是 **Server 层**的逻辑日志，按提交顺序记录所有数据变更（DDL + DML），与 InnoDB 的 redo log（物理、循环覆盖）定位完全不同：redo 管崩溃恢复，binlog 管**复制**和**增量恢复**。
+
+```sql
+SHOW VARIABLES LIKE 'log_bin';          -- 8.0 默认 ON
+SHOW BINARY LOGS;                        -- 列出 binlog 文件
+SHOW MASTER STATUS;                      -- 当前写到哪个文件哪个位点
+SHOW BINLOG EVENTS IN 'binlog.000003' LIMIT 10;
+```
+
+```ini
+[mysqld]
+server-id = 1
+log-bin = binlog
+binlog_format = ROW
+binlog_expire_logs_seconds = 604800   # 保留 7 天
+```
+
+### 4.1 三种格式
+
+| 格式 | 记录内容 | 优点 | 缺点 |
+|---|---|---|---|
+| STATEMENT | SQL 语句原文 | 日志小 | `NOW()`/`UUID()`/RC 级别等场景主从不一致 |
+| **ROW**（默认） | 每行变更的前后镜像 | 精确、可解析出反向 SQL | 批量更新日志量大 |
+| MIXED | 自动切换 | 折中 | 行为不易预测 |
+
+**生产一律 ROW**。ROW 格式还有个巨大红利：记录了每行的旧值，误操作后可以解析 binlog 生成**反向 SQL**（把 UPDATE 反转、DELETE 变 INSERT），业界工具如 MyFlash、binlog2sql 都基于此。配套参数 `binlog_row_image = FULL`（默认）保留完整前后镜像。
+
+### 4.2 查看 binlog 内容
+
+```bash
+# ROW 格式要加 -v 反解析成伪 SQL；--base64-output 压掉噪音
+mysqlbinlog -v --base64-output=decode-rows binlog.000003 | less
+
+# 按时间窗口过滤
+mysqlbinlog --start-datetime="2026-07-30 10:00:00" \
+            --stop-datetime="2026-07-30 11:00:00" \
+            -v binlog.000003 | less
+```
+
+## 5. PITR：时间点恢复实战
+
+场景：每天 2:00 全量备份；今天 **10:30 有人误删了 orders 表的数据**。目标：恢复到 10:29:59。
+
+```text
+时间线：
+02:00 全量备份（记录了 binlog 位点：binlog.000012, pos=157）
+      │
+      ├── 02:00 ~ 10:29:59 的正常变更   ← 用 binlog 重放补回
+      │
+10:30 误操作 DELETE                    ← 跳过它！
+      │
+10:35 发现事故，开始恢复
+```
+
+### 5.1 操作步骤
+
+```bash
+# 0. 立刻保护现场：停止应用写入（或切只读），确认 binlog 未清理
+mysql -e "SET GLOBAL super_read_only = ON;"
+
+# 1. 恢复到一台【新实例】——永远不要直接在生产实例上覆盖恢复
+gunzip < shop_2026-07-30_0200.sql.gz | mysql -h recover_host -uroot -p
+
+# 2. 从备份文件头找到起始位点
+zcat shop_2026-07-30_0200.sql.gz | head -50 | grep "CHANGE MASTER"
+# -- CHANGE MASTER TO MASTER_LOG_FILE='binlog.000012', MASTER_LOG_POS=157;
+
+# 3. 重放 02:00 之后、误操作之前的 binlog
+mysqlbinlog --start-position=157 \
+            --stop-datetime="2026-07-30 10:29:59" \
+            binlog.000012 binlog.000013 \
+  | mysql -h recover_host -uroot -p
+
+# 4. 在恢复实例上校验数据，然后把丢失数据导回生产（或整体切换）
+mysqldump -h recover_host shop orders --where="..." | mysql -h prod_host shop
+```
+
+精确定位误操作位点（比 stop-datetime 更准）：
+
+```bash
+mysqlbinlog -v --base64-output=decode-rows binlog.000013 \
+  | grep -n -A5 "DELETE FROM.*orders" | head
+# 找到该事务的 start position，用 --stop-position 精确截断
+```
+
+### 5.2 PITR 成立的三个前提
+
+1. 有**可用的全量备份**且记录了 binlog 位点；
+2. 备份时刻到事故时刻的 **binlog 完整未清理**（保留期必须长于备份周期）；
+3. 恢复流程**演练过**，RTO（恢复耗时）心里有数。
+
+<Callout type="tip" title="防误删的纵深防线">
+恢复是最后手段，前置防线更重要：业务账号不给 DROP/TRUNCATE 权限；DML 上线走审核平台（如 Archery）；`sql_safe_updates=1` 拦截无 WHERE 的 UPDATE/DELETE；重要表开启延迟从库（如延迟 30 分钟，误删后从库还有原始数据，直接抢救比重放 binlog 快得多）。
+</Callout>
+
+## 小结
+
+- 逻辑备份灵活可读（mysqldump + --single-transaction 不锁库），物理备份快、适合大库
+- binlog 是 Server 层逻辑日志：复制与增量恢复的基础；生产用 ROW 格式
+- ROW 格式记录前后镜像，误操作可生成反向 SQL 闪回
+- PITR = 全量备份 + 重放 binlog 到事故前一刻；备份文件里的位点是接力棒
+- 备份三纪律：自动化、异地存储、**定期恢复演练**
+
+<Callout type="exercise" title="练习">
+1. 对 shop 库做一次带位点的 mysqldump 备份，然后插入几行新数据、再故意 DELETE 一部分，完整走一遍 PITR 把数据恢复到 DELETE 之前，核对行数。
+2. 用 `mysqlbinlog -v --base64-output=decode-rows` 找到你那条 DELETE 在 binlog 里的事件，写出对应的反向 INSERT。
+3. 制定一份备份策略文档：备份方式、频率、保留期、binlog 保留期、恢复演练周期，并说明 RPO/RTO 目标。
+</Callout>

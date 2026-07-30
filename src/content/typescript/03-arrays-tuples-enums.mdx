@@ -1,0 +1,308 @@
+---
+title: 数组、元组与枚举
+order: 3
+description: 数组与只读数组的两种写法、元组的可选元素与具名元素、数字枚举与字符串枚举的取舍
+---
+
+# 数组、元组与枚举
+
+上一章的原始类型只能描述单个值。这一章介绍三种「把多个值组织起来」的类型：**数组**（同类型、长度不定）、**元组**（异类型、长度固定）、**枚举**（一组具名常量）。
+
+## 1. 数组
+
+### 1.1 两种等价写法
+
+```ts
+const a: number[] = [1, 2, 3];
+const b: Array<number> = [1, 2, 3];    // 泛型写法，完全等价
+```
+
+社区惯例是简单类型用 `number[]`，复杂类型用泛型写法以免括号打架：
+
+```ts
+const c: (string | number)[] = [1, "two"];   // 必须加括号
+const d: Array<string | number> = [1, "two"]; // 更清晰
+```
+
+<Callout type="warn" title="别漏了括号">
+`string | number[]` 的意思是「字符串，或者数字数组」，和 `(string | number)[]`「元素可以是字符串或数字的数组」完全不同。写联合元素类型时务必加括号。
+</Callout>
+
+### 1.2 数组元素访问不做越界检查
+
+这是 TypeScript 一个著名的「不安全但实用」的默认行为：
+
+```ts
+const arr = [1, 2, 3];
+const x = arr[99];      // TS 认为 x 是 number，实际运行时是 undefined
+```
+
+如果希望编译器把索引访问的结果标为 `number | undefined`，可以开启 `noUncheckedIndexedAccess`。它更安全，但会逼你在每次索引后做判空，权衡后再决定是否开启。
+
+### 1.3 只读数组
+
+`readonly number[]`（等价于 `ReadonlyArray<number>`）会去掉所有会改变自身的方法：
+
+```ts
+const nums: readonly number[] = [1, 2, 3];
+// nums.push(4);      // 错误：只读数组上不存在 push
+const bigger = [...nums, 4];   // 正确：创建新数组
+```
+
+只读数组的实用价值在于**函数签名**：把参数声明为 `readonly T[]`，等于向调用方承诺「我不会修改你的数组」，同时编译器会替你兑现这个承诺。
+
+<Playground
+  language="typescript"
+  id="ts-03-arrays"
+  title="数组与只读数组"
+  code={`const scores: number[] = [88, 92, 79];
+const tags: Array<string> = ["ts", "js"];
+const mixed: (string | number)[] = [1, "two", 3];
+
+scores.push(100);
+console.log("scores = " + scores.join(", "));
+console.log("tags = " + tags.join("/"));
+console.log("mixed 长度 = " + mixed.length);
+
+// 只读数组：函数承诺不修改入参
+function sum(values: readonly number[]): number {
+  // values.push(0);  // 编译错误：只读
+  return values.reduce((acc, v) => acc + v, 0);
+}
+console.log("总分 = " + sum(scores));
+
+const frozen: readonly string[] = ["a", "b"];
+const extended = [...frozen, "c"];   // 用展开创建新数组
+console.log("extended = " + extended.join(""));
+
+// 常用高阶方法的类型都会正确推断
+const doubled = scores.map((s) => s * 2);
+const passed = scores.filter((s) => s >= 90);
+console.log("doubled = " + doubled.join(","));
+console.log("passed = " + passed.join(","));`}
+  expectedOutput={`scores = 88, 92, 79, 100\ntags = ts/js\nmixed 长度 = 3\n总分 = 359\nextended = abc\ndoubled = 176,184,158,200\npassed = 92,100`}
+/>
+
+## 2. 元组
+
+元组是**长度固定、每个位置类型可以不同**的数组。JavaScript 运行时没有元组，它就是普通数组，元组只是 TS 层面的额外约束。
+
+### 2.1 基本用法
+
+```ts
+let pair: [string, number] = ["age", 30];
+pair[0].toUpperCase();   // TS 知道第 0 位是 string
+// pair = ["age"];        // 错误：长度不匹配
+```
+
+最常见的场景是函数需要返回多个值（React 的 `useState` 就返回一个元组），或者 `Object.entries` 的键值对。
+
+### 2.2 具名元组元素
+
+给元素起名字，纯粹为了可读性和编辑器提示，不影响运行时：
+
+```ts
+type Range = [start: number, end: number];
+type HttpResult = [status: number, body: string];
+```
+
+### 2.3 可选元素与剩余元素
+
+```ts
+type Point = [x: number, y: number, z?: number];       // z 可选
+type Command = [name: string, ...args: string[]];      // 后面可以跟任意多个
+```
+
+可选元素只能出现在必选元素之后；剩余元素只能有一个，且通常放在最后。
+
+<Playground
+  language="typescript"
+  id="ts-03-tuples"
+  title="元组"
+  code={`type Point = [x: number, y: number, z?: number];
+type Command = [name: string, ...args: string[]];
+
+const p2: Point = [3, 4];
+const p3: Point = [3, 4, 5];
+
+function norm(p: Point): number {
+  const z = p[2] ?? 0;
+  return Math.sqrt(p[0] * p[0] + p[1] * p[1] + z * z);
+}
+console.log("2D 长度 = " + norm(p2));
+console.log("3D 长度 = " + norm(p3).toFixed(4));
+
+const cmd: Command = ["git", "commit", "-m", "init"];
+const [bin, ...rest] = cmd;             // 解构，rest 推断为 string[]
+console.log("命令 = " + bin + "，参数 " + rest.length + " 个");
+
+// 元组常用于「返回多个值」
+function divide(a: number, b: number): [quotient: number, remainder: number] {
+  return [Math.floor(a / b), a % b];
+}
+const [q, r] = divide(17, 5);
+console.log("17 / 5 = " + q + " 余 " + r);
+
+// as const 会把数组字面量推断成只读元组
+const rgb = [255, 128, 0] as const;
+console.log("rgb 第一位 = " + rgb[0] + "，长度固定为 " + rgb.length);`}
+  expectedOutput={`2D 长度 = 5\n3D 长度 = 7.0711\n命令 = git，参数 3 个\n17 / 5 = 3 余 2\nrgb 第一位 = 255，长度固定为 3`}
+/>
+
+<Callout type="warn" title="元组的越界保护并不完整">
+元组能挡住 `pair[5]` 这种常量越界，但 `pair.push("x")` 却是允许的——因为元组底层就是数组，`push` 依然存在。想要真正锁死，请用 `readonly [string, number]` 或 `as const`。
+</Callout>
+
+## 3. 枚举
+
+枚举是 TypeScript 少数几个**会生成运行时代码**的语法之一。它把一组相关常量收进一个命名空间里。
+
+### 3.1 数字枚举
+
+```ts
+enum Direction {
+  Up,      // 0
+  Down,    // 1
+  Left,    // 2
+  Right,   // 3
+}
+```
+
+不指定值时从 0 开始自增，也可以手动指定起点或每一项的值。数字枚举会生成**反向映射**：既能 `Direction.Up` 拿到 0，也能 `Direction[0]` 拿回 `"Up"`。
+
+### 3.2 字符串枚举
+
+```ts
+enum Status {
+  Pending = "PENDING",
+  Success = "SUCCESS",
+  Failed = "FAILED",
+}
+```
+
+字符串枚举必须每一项都显式赋值，没有反向映射，但**调试时可读性强得多**——日志里看到 `"PENDING"` 远比看到 `0` 有用。
+
+| 对比项 | 数字枚举 | 字符串枚举 |
+|---|---|---|
+| 需要显式赋值 | 否 | 是 |
+| 反向映射 | 有 | 无 |
+| 序列化后可读 | 差 | 好 |
+| 允许把任意数字赋进去 | 历史上曾允许 | 否 |
+
+<Playground
+  language="typescript"
+  id="ts-03-enums"
+  title="数字枚举与字符串枚举"
+  code={`enum Direction {
+  Up,
+  Down,
+  Left,
+  Right,
+}
+
+enum Status {
+  Pending = "PENDING",
+  Success = "SUCCESS",
+  Failed = "FAILED",
+}
+
+console.log("Direction.Left = " + Direction.Left);
+console.log("反向映射 Direction[2] = " + Direction[2]);
+console.log("Status.Success = " + Status.Success);
+
+function move(d: Direction): string {
+  switch (d) {
+    case Direction.Up:
+      return "向上";
+    case Direction.Down:
+      return "向下";
+    case Direction.Left:
+      return "向左";
+    case Direction.Right:
+      return "向右";
+  }
+}
+console.log(move(Direction.Up) + " / " + move(Direction.Right));
+
+function label(s: Status): string {
+  if (s === Status.Pending) return "处理中";
+  if (s === Status.Success) return "已完成";
+  return "失败";
+}
+console.log(label(Status.Pending) + "，" + label(Status.Failed));
+
+// 枚举也是一个真实存在的对象，可以遍历字符串枚举的键
+const allStatus = Object.values(Status);
+console.log("共有 " + allStatus.length + " 种状态: " + allStatus.join(","));`}
+  expectedOutput={`Direction.Left = 2\n反向映射 Direction[2] = Left\nStatus.Success = SUCCESS\n向上 / 向右\n处理中，失败\n共有 3 种状态: PENDING,SUCCESS,FAILED`}
+/>
+
+### 3.3 const enum
+
+在 `enum` 前加 `const`，编译时会把所有引用**内联**成字面量，不生成任何运行时对象：
+
+```ts
+const enum Level {
+  Low = 1,
+  High = 2,
+}
+const l = Level.High;   // 编译产物直接是 const l = 2
+```
+
+代价是失去了运行时对象（不能遍历、不能反向映射），而且在只做「类型擦除」而不做完整编译的工具链（esbuild、swc、Node 的类型擦除模式）中，`const enum` 往往不被支持或行为不一致。
+
+### 3.4 枚举的替代方案
+
+现代 TypeScript 项目里，很多团队干脆不用 `enum`，改用**字面量联合 + as const 对象**：
+
+```ts
+const Status = {
+  Pending: "PENDING",
+  Success: "SUCCESS",
+} as const;
+
+type Status = (typeof Status)[keyof typeof Status];  // "PENDING" | "SUCCESS"
+```
+
+它是纯 JavaScript，没有额外语法，能被任何工具正确处理，而且字面量联合在类型收窄上更灵活。第 10 章会详细讲这个写法里的 `keyof` 与 `typeof`。
+
+<Callout type="tip" title="选型建议">
+新代码优先用字面量联合类型；确实需要「一个既是类型又是运行时对象」的东西时，用**字符串枚举**；尽量避免数字枚举和 `const enum`。
+</Callout>
+
+## 4. 三者如何取舍
+
+这三种结构经常有重叠的适用场景，用一张表理清：
+
+| 需求 | 该用什么 | 理由 |
+|---|---|---|
+| 一组同类型、数量不定的数据 | 数组 | 最自然，方法最丰富 |
+| 固定数量、位置有含义的数据 | 元组 | 长度与逐位类型都受检查 |
+| 位置有含义但字段较多 | 对象 | 超过三项时元组的可读性急剧下降 |
+| 一组互斥的具名常量 | 字面量联合 | 零运行时开销，收窄能力最好 |
+| 常量既要当类型又要当运行时值 | 字符串枚举 | 唯一能同时提供两者的内置语法 |
+
+<Callout type="warn" title="元组超过三项就该换成对象">
+`[string, number, boolean, string]` 这样的元组，调用方要靠数位置来理解含义，极易出错。具名元组元素能缓解一部分，但仍然不如对象字面量清晰。经验法则：**两三项用元组，再多就用对象**。
+
+同理，函数返回多个值时，如果调用方大概率只关心其中一两个，用对象比元组好——对象解构可以按需取、可以改名、顺序无关。
+</Callout>
+
+### 4.1 从 JSON 数据出发选择结构
+
+实践中很多结构选择其实由数据源决定。后端返回的数组就是数组；一个 `[经度, 纬度]` 的坐标对天然是元组；而一组状态码则适合建成字面量联合。**先看数据长什么样，再选类型**，比先设计类型再套数据更靠谱。
+
+<Callout type="exercise" title="练习">
+1. 定义 `type Rgb = [r: number, g: number, b: number]`，写一个 `toHex(c: Rgb): string` 把它转成六位十六进制字符串（提示：`n.toString(16).padStart(2, "0")`）。
+2. 用字符串枚举定义一周七天，写一个函数判断是否是周末；然后把它改写成 `as const` 对象加字面量联合的形式，对比两种写法的差异。
+</Callout>
+
+## 小结
+
+- 数组两种写法等价；联合元素类型记得加括号
+- 索引访问默认不检查越界，需要更安全就开 `noUncheckedIndexedAccess`
+- `readonly T[]` 在函数签名里表达「我不改你的数组」
+- 元组长度固定、类型逐位指定，支持具名元素、可选元素与剩余元素
+- `as const` 把字面量推成只读元组，是锁死结构的常用手段
+- 枚举会生成运行时代码；优先字符串枚举，或干脆用字面量联合替代
+- 下一章讲对象类型、interface 与 type →

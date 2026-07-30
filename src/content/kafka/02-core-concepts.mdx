@@ -1,0 +1,175 @@
+---
+title: 核心概念与整体架构
+order: 2
+description: Broker、Topic、Partition、Offset、副本、生产者消费者与 Controller 的关系
+---
+
+# 核心概念与整体架构
+
+Kafka 的术语不多，但它们之间的关系经常被搞混：Topic 和 Partition 是什么关系？Consumer Group 里的消费者怎么分工？Controller 又是干嘛的？本章把这些概念一次性理清，后面所有章节都建立在这张"地图"上。
+
+## 1. 整体架构图
+
+```text
+                        Kafka 集群 (KRaft 模式)
+  +--------------------------------------------------------------+
+  |  Controller Quorum (Raft): 管理元数据、选举分区 leader           |
+  +--------------------------------------------------------------+
+  |  Broker 1          |  Broker 2          |  Broker 3          |
+  |  orders-p0 (L)     |  orders-p0 (F)     |  orders-p0 (F)     |
+  |  orders-p1 (F)     |  orders-p1 (L)     |  orders-p1 (F)     |
+  |  orders-p2 (F)     |  orders-p2 (F)     |  orders-p2 (L)     |
+  +--------------------------------------------------------------+
+         ^                                        |
+         | 写入 (只写 leader)                       | 拉取 (默认读 leader)
+  +------+-------+                        +-------v--------------+
+  |   Producer   |                        | Consumer Group "inv" |
+  +--------------+                        |  C1 <- p0            |
+                                          |  C2 <- p1, p2        |
+                                          +----------------------+
+  L = Leader 副本    F = Follower 副本
+```
+
+## 2. 服务端概念
+
+### 2.1 Broker
+
+一个 Broker 就是一个 Kafka 服务进程（通常一台机器一个）。集群由多个 Broker 组成，每个有唯一的 `node.id`。Broker 负责接收生产者写入、服务消费者读取、存储日志数据。
+
+### 2.2 Topic 与 Partition
+
+- **Topic** 是逻辑上的消息分类，比如 `orders`、`payments`。生产者往 topic 写，消费者从 topic 读。
+- **Partition** 是 topic 的物理分片。一个 topic 拆成 N 个分区，分散到不同 Broker 上，从而突破单机的存储与吞吐上限。
+
+关键性质：
+
+- 分区内消息**严格有序**，分区之间**没有顺序保证**。
+- 分区是并行的最小单位：一个分区同一时刻只能被消费组内的一个消费者消费。
+- 分区数只能增加、不能减少。
+
+### 2.3 Offset
+
+分区内每条消息有一个单调递增的编号，叫 **offset**（从 0 开始）。它是消息在分区内的唯一坐标：
+
+```text
+partition-0:  offset:  0     1     2     3     4     5
+              消息:   [m0]  [m1]  [m2]  [m3]  [m4]  [m5]
+                                         ^
+                            消费者记录 "我读到了 3, 下次从 4 开始"
+```
+
+消费进度就是"每个分区消费到的 offset"，由消费者提交、Kafka 保存（细节见第 8 章）。
+
+### 2.4 Replica（副本）与 Leader
+
+每个分区可以有多个副本（`replication.factor`，生产通常为 3），分布在不同 Broker 上：
+
+- **Leader 副本**：处理该分区所有读写请求。
+- **Follower 副本**：从 leader 拉取数据保持同步，不对外服务；leader 挂掉时顶上。
+- **ISR**（In-Sync Replicas）：与 leader 保持同步的副本集合，是可靠性保证的核心（第 11 章详解）。
+
+### 2.5 Controller
+
+KRaft 模式下，若干节点组成 **Controller Quorum**（通常 3 或 5 个），基于 Raft 协议选出一个 active controller，负责：
+
+- 管理集群元数据（topic、分区、副本分布）
+- Broker 上下线感知
+- 分区 leader 选举
+
+小集群里节点可以同时担任 broker 和 controller（`process.roles=broker,controller`），生产大集群建议分开部署。
+
+## 3. 客户端概念
+
+### 3.1 Producer
+
+生产者把消息写入指定 topic。它决定消息去哪个分区（有 key 则按 key 哈希，无 key 走粘性分区），并通过 `acks` 参数控制可靠性等级。写入**只发给 leader 副本**。
+
+### 3.2 Consumer 与 Consumer Group
+
+消费者用 `group.id` 标识自己属于哪个**消费组**。核心规则只有一条：
+
+> 一个分区，在同一个消费组内，同一时刻只分配给一个消费者。
+
+由此推导出所有行为：
+
+```text
+Topic: orders, 4 个分区 (p0-p3)
+
+组 "inventory" 有 2 个消费者:      组 "audit" 有 4 个消费者:
+  C1 <- p0, p1                      A1<-p0  A2<-p1  A3<-p2  A4<-p3
+  C2 <- p2, p3                      (每人一个分区, 并行度拉满)
+
+组 "report" 有 6 个消费者:
+  R1<-p0 R2<-p1 R3<-p2 R4<-p3
+  R5, R6 空闲!  (消费者数 > 分区数, 多出来的闲置)
+```
+
+- **组内**是**分摊**（队列语义）：一条消息只被组内一个消费者处理。
+- **组间**是**广播**（发布订阅语义）：每个组都能读到全量消息。
+- 消费者数量超过分区数时，多出的消费者空转——所以分区数决定了消费并行度上限。
+
+组内成员变化（扩容、宕机）会触发**Rebalance**——重新分配分区（第 9 章详解）。
+
+## 4. 概念速查表
+
+| 概念 | 一句话 | 类比 |
+|---|---|---|
+| Broker | 一个 Kafka 服务进程 | 数据库实例 |
+| Topic | 消息的逻辑分类 | 表 |
+| Partition | topic 的物理分片，有序日志 | 分表 |
+| Offset | 消息在分区内的序号 | 自增主键 |
+| Replica | 分区的冗余拷贝 | 主从副本 |
+| Leader/Follower | 读写副本 / 同步副本 | 主库/从库 |
+| Producer | 写入方 | INSERT 客户端 |
+| Consumer Group | 一组分摊消费的消费者 | 一组 worker |
+| Controller | 元数据与选举管理者 | 集群大脑 |
+
+<Callout type="tip" title="记住三个数量关系">
+1. 分区数 ≥ 组内消费者数，否则有消费者闲置；
+2. 副本数 ≤ Broker 数，同一分区的副本必须在不同 Broker 上；
+3. 一个消费者可以消费多个分区，一个分区在组内只属于一个消费者。
+</Callout>
+
+## 5. 用 CLI 验证这些概念
+
+装好 Kafka 后（第 3 章），可以立刻验证：
+
+```bash
+# 创建 3 分区、2 副本的 topic
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic orders --partitions 3 --replication-factor 2
+
+# 查看分区与副本分布: Leader/Replicas/Isr 一目了然
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic orders
+```
+
+输出类似：
+
+```text
+Topic: orders  PartitionCount: 3  ReplicationFactor: 2
+  Partition: 0  Leader: 1  Replicas: 1,2  Isr: 1,2
+  Partition: 1  Leader: 2  Replicas: 2,3  Isr: 2,3
+  Partition: 2  Leader: 3  Replicas: 3,1  Isr: 3,1
+```
+
+每一行都是本章概念的具象化：分区 0 的 leader 在 Broker 1，副本在 Broker 1 和 2，两个副本都在 ISR 里。
+
+<Callout type="warn" title="最常见的概念误解">
+1. "Kafka 保证消息有序" —— 错。只保证**分区内**有序，topic 级别无序。要全局有序只能用单分区（牺牲并行度）。
+2. "加消费者就能加快消费" —— 只在消费者数少于分区数时成立。8 个分区加到第 9 个消费者就是白加。
+3. "消息消费完就没了" —— Kafka 按时间/大小保留策略删数据，与是否被消费无关。消费慢于删除速度时会**丢数据**。
+</Callout>
+
+## 小结
+
+- Broker 组成集群，Controller（KRaft/Raft）管理元数据与选举
+- Topic 是逻辑分类，Partition 是物理分片与并行单位，Offset 是分区内坐标
+- 副本提供容错：leader 读写、follower 同步、ISR 是可靠性核心
+- 消费组：组内分摊、组间广播，分区数决定消费并行度上限
+- 下一章动手搭建 KRaft 集群 →
+
+<Callout type="exercise" title="练习">
+1. 一个 topic 有 6 个分区，消费组 A 有 4 个消费者，画出一种可能的分区分配结果。
+2. 如果要求"同一用户的事件必须按序处理"，应该把什么作为消息的 key？为什么这能保证顺序？
+3. 3 个 Broker 的集群里，能创建 replication-factor=4 的 topic 吗？动手试一下会得到什么报错。
+</Callout>

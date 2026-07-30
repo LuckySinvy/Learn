@@ -31,6 +31,13 @@ echo "--- fast-forward pull ---"
 git fetch origin main
 git merge --ff-only origin/main
 
+echo "--- ensure TypeScript playground image ---"
+if ! docker image inspect learn-ts:1 >/dev/null 2>&1; then
+  docker build -t learn-ts:1 docker/ts-runner
+else
+  echo "learn-ts:1 already present"
+fi
+
 echo "--- npm install ---"
 npm install --no-audit --no-fund
 

@@ -1,0 +1,493 @@
+---
+title: 备份恢复与安全
+order: 18
+description: mongodump、快照、oplog 时间点恢复、认证机制、RBAC、字段级加密与网络加固
+---
+
+# 备份恢复与安全
+
+这一章的内容平时用不上，用上的那天决定公司是否还存在。前半讲怎么把数据找回来，后半讲怎么不让别人拿走。
+
+## 1. 备份策略总览
+
+| 方式 | 粒度 | 速度 | 对线上影响 | 适用规模 |
+|---|---|---|---|---|
+| `mongodump` | 库/集合/查询 | 慢 | 中（占 IO 和内存） | 100GB 以内 |
+| 文件系统快照 | 整个实例 | 快 | 小 | 任意 |
+| 复制集延迟节点 | 整个实例 | 实时 | 无 | 任意（防误删） |
+| Ops Manager / Atlas 备份 | 整个集群 | 快 | 小 | 企业级 |
+
+一个成熟的备份方案通常是**组合**：延迟节点防误操作 + 每日快照防灾难 + oplog 归档做时间点恢复。
+
+<Callout type="warn" title="没验证过的备份等于没有备份">
+备份脚本跑了两年从没报错，恢复的时候才发现文件是空的、或者缺了某个库、或者版本不兼容——这种事情非常常见。**每季度必须做一次完整的恢复演练**，把备份还原到一台干净的机器上，验证数据完整性和应用能否正常连接。
+</Callout>
+
+## 2. mongodump 与 mongorestore
+
+### 2.1 基本用法
+
+```bash
+# 全库备份
+mongodump --uri="mongodb://user:pass@localhost:27017/?authSource=admin" \
+  --out=/backup/$(date +%F)
+
+# 单个库
+mongodump --uri="..." --db=community --out=/backup/community
+
+# 单个集合，且只备份部分数据
+mongodump --uri="..." --db=community --collection=posts \
+  --query='{"createdAt":{"$gte":{"$date":"2024-06-01T00:00:00Z"}}}' \
+  --out=/backup/posts-june
+
+# 压缩成单个归档文件
+mongodump --uri="..." --archive=/backup/full-$(date +%F).gz --gzip
+```
+
+输出结构：
+
+```text
+/backup/2024-06-04/
+  community/
+    posts.bson             # 数据
+    posts.metadata.json    # 索引定义、集合选项
+    users.bson
+    users.metadata.json
+```
+
+### 2.2 恢复
+
+```bash
+# 从目录恢复
+mongorestore --uri="..." /backup/2024-06-04
+
+# 从归档恢复
+mongorestore --uri="..." --archive=/backup/full-2024-06-04.gz --gzip
+
+# 恢复到不同的库名（常用于验证）
+mongorestore --uri="..." --nsFrom="community.*" --nsTo="community_restore.*" \
+  /backup/2024-06-04
+
+# 只恢复一个集合，且先清空目标
+mongorestore --uri="..." --db=community --collection=posts \
+  --drop /backup/2024-06-04/community/posts.bson
+```
+
+### 2.3 一致性问题
+
+<Callout type="warn" title="mongodump 默认不是一致性快照">
+`mongodump` 是逐集合读取的。备份 `users` 时是 10:00 的状态，备份完 `posts` 时可能已经 10:20 了——如果这期间有跨集合的写入，恢复出来的数据可能不一致（比如帖子引用了一个不存在的用户）。解决办法是加 `--oplog` 参数，见下面的命令。
+</Callout>
+
+```bash
+mongodump --uri="..." --oplog --archive=/backup/consistent.gz --gzip
+mongorestore --uri="..." --oplogReplay --archive=/backup/consistent.gz --gzip
+```
+
+`--oplog` 会在备份期间同时记录 oplog，恢复时重放，把所有集合对齐到备份**结束**那一刻的一致状态。注意它只对复制集有效，且不支持分片集群（分片集群的一致备份需要先停均衡器）。
+
+### 2.4 性能影响
+
+```text
+mongodump 对线上的影响：
+  - 读取全部数据 → 把冷数据加载进 WiredTiger cache → 挤掉热数据
+  - 磁盘 IO 被占满 → 正常查询变慢
+  - 大集合备份耗时长 → oplog 窗口压力
+
+  缓解措施：
+  1. 在一个 hidden secondary 上执行，不影响线上流量
+  2. 用 --numParallelCollections=1 降低并发
+  3. 备份完成后观察缓存命中率恢复情况
+```
+
+## 3. 文件系统快照
+
+对于 TB 级数据，`mongodump` 的耗时不可接受，快照是唯一现实的选择。
+
+### 3.1 前提条件
+
+- 数据目录和 journal **必须在同一个卷**上（否则快照不是原子的）
+- 或者使用 `fsyncLock` 暂停写入
+
+### 3.2 操作流程
+
+```js
+// 1. 锁定写入并刷盘（在要做快照的 secondary 上执行）
+db.fsyncLock()
+```
+
+```json
+{ "info": "now locked against writes, use db.fsyncUnlock() to unlock", "ok": 1 }
+```
+
+```bash
+# 2. 创建快照（LVM / 云盘快照 / ZFS）
+lvcreate --size 100G --snapshot --name mongo-snap-$(date +%F) /dev/vg0/mongodb
+```
+
+```js
+// 3. 立刻解锁
+db.fsyncUnlock()
+```
+
+<Callout type="warn" title="fsyncLock 期间节点完全不可写">
+在 primary 上执行 `fsyncLock` 会让整个集群不可写。**永远在 hidden secondary 上做**。而且要有超时保护——如果快照命令卡住而没有执行 `fsyncUnlock`，那个节点会一直被锁着，复制延迟持续增长直到超出 oplog 窗口需要重新 initial sync。
+</Callout>
+
+### 3.3 云盘快照
+
+阿里云 ESSD、AWS EBS 等都支持在线快照，且数据目录和 journal 在同一块盘时快照是崩溃一致的（crash-consistent），MongoDB 启动时会自动用 journal 恢复。这种情况下**不需要** `fsyncLock`。
+
+## 4. 时间点恢复（PITR）
+
+「昨天下午 3 点有人误删了一批数据，我要恢复到 2 点 59 分」——这需要「全量备份 + oplog 增量」。
+
+### 4.1 原理
+
+```text
+  周日 02:00  全量快照 ──────────────────────────────▶
+                       │
+                       │  持续归档 oplog
+                       ▼
+  周一 15:00  误操作发生
+  周一 15:30  发现问题
+
+  恢复流程：
+  1. 从周日 02:00 的快照恢复到一台新机器
+  2. 重放 oplog，从周日 02:00 一直放到周一 14:59
+  3. 校验数据，切流量
+```
+
+### 4.2 归档 oplog
+
+```bash
+# 定期把 oplog 增量导出（比如每小时一次）
+mongodump --uri="mongodb://user:pass@secondary:27017/local?authSource=admin" \
+  --collection=oplog.rs \
+  --query='{"ts":{"$gt":{"$timestamp":{"t":1717470000,"i":1}}}}' \
+  --out=/backup/oplog/$(date +%F-%H)
+```
+
+### 4.3 重放到指定时间点
+
+```bash
+# 先恢复全量
+mongorestore --uri="mongodb://localhost:27018" /backup/full-2024-06-02
+
+# 再重放 oplog，limit 到误操作发生前一秒
+mongorestore --uri="mongodb://localhost:27018" \
+  --oplogReplay \
+  --oplogFile=/backup/oplog/2024-06-03-15/local/oplog.rs.bson \
+  --oplogLimit=1717484340:1
+```
+
+`oplogLimit` 的格式是 `秒:序号`，重放会在这个时间点**之前**停止。
+
+<Callout type="tip" title="找到误操作发生的精确时间">
+恢复前先在 oplog 里定位问题操作：查 `local.oplog.rs` 中 `op` 为 `d`（删除）或者 `ns` 匹配目标集合的记录，找到第一条误操作的 `ts`，用它减 1 作为 `oplogLimit`。
+</Callout>
+
+```js
+db.getSiblingDB("local").oplog.rs.find({
+  ns: "community.posts",
+  op: "d",
+  wall: { $gte: ISODate("2024-06-03T14:00:00Z") }
+}).sort({ ts: 1 }).limit(1)
+```
+
+## 5. 认证机制
+
+### 5.1 开启认证
+
+默认配置下 MongoDB **没有认证**，任何能连上端口的人都是超级管理员。这是历史上无数数据泄露事件的根源。
+
+```yaml
+# mongod.conf
+security:
+  authorization: enabled
+  keyFile: /etc/mongo/keyfile      # 复制集成员间的内部认证
+```
+
+第一步创建管理员（在开启认证之前，或者利用 localhost exception）：
+
+```js
+use admin
+db.createUser({
+  user: "admin",
+  pwd: passwordPrompt(),          // 交互式输入，不留在 shell 历史里
+  roles: [ { role: "root", db: "admin" } ]
+})
+```
+
+然后创建业务账号：
+
+```js
+use admin
+db.createUser({
+  user: "community_app",
+  pwd: passwordPrompt(),
+  roles: [ { role: "readWrite", db: "community" } ]
+})
+```
+
+### 5.2 认证机制对比
+
+| 机制 | 说明 | 适用 |
+|---|---|---|
+| SCRAM-SHA-256 | 默认，用户名密码，加盐挑战响应 | 绝大多数场景 |
+| SCRAM-SHA-1 | 旧版兼容 | 逐步淘汰 |
+| x.509 证书 | 客户端证书认证 | 高安全要求、成员间认证 |
+| LDAP / Kerberos | 对接企业目录 | 企业版功能 |
+
+x.509 的配置：
+
+```yaml
+net:
+  tls:
+    mode: requireTLS
+    certificateKeyFile: /etc/mongo/server.pem
+    CAFile: /etc/mongo/ca.pem
+security:
+  clusterAuthMode: x509
+```
+
+```js
+use $external
+db.createUser({
+  user: "CN=app.example.com,OU=svc,O=Acme,C=CN",
+  roles: [ { role: "readWrite", db: "community" } ]
+})
+```
+
+<Callout type="warn" title="keyFile 是复制集成员间认证的最低要求">
+开启 `authorization` 后，复制集成员之间也需要互相认证，否则无法同步。最简单的方式是共享一个 keyFile（一个 6 到 1024 字符的 base64 字符串，权限必须是 600）。生产环境更推荐用 x.509 成员认证，keyFile 一旦泄露等于整个集群沦陷。
+</Callout>
+
+## 6. RBAC 角色与权限
+
+### 6.1 内置角色
+
+| 角色 | 权限 |
+|---|---|
+| `read` | 读指定库 |
+| `readWrite` | 读写指定库 |
+| `dbAdmin` | 索引管理、统计、校验（不含用户管理） |
+| `userAdmin` | 管理该库的用户和角色 |
+| `dbOwner` | 上面三个的合集 |
+| `clusterMonitor` | 只读监控信息 |
+| `clusterManager` | 集群管理操作 |
+| `backup` / `restore` | 备份/恢复专用 |
+| `readAnyDatabase` | 读所有库 |
+| `root` | 全部权限 |
+
+### 6.2 最小权限原则
+
+不同用途用不同账号，权限刚好够用：
+
+```js
+use admin
+
+// 应用账号：只能读写业务库
+db.createUser({ user: "app", pwd: passwordPrompt(),
+  roles: [ { role: "readWrite", db: "community" } ] })
+
+// 只读报表账号
+db.createUser({ user: "report", pwd: passwordPrompt(),
+  roles: [ { role: "read", db: "community" } ] })
+
+// 备份账号
+db.createUser({ user: "backup", pwd: passwordPrompt(),
+  roles: [ { role: "backup", db: "admin" } ] })
+
+// 监控账号
+db.createUser({ user: "monitor", pwd: passwordPrompt(),
+  roles: [ { role: "clusterMonitor", db: "admin" } ] })
+```
+
+### 6.3 自定义角色
+
+内置角色不够精细时，自己定义：
+
+```js
+use community
+
+// 只允许读 posts 和 comments，不能碰 users
+db.createRole({
+  role: "contentReader",
+  privileges: [
+    { resource: { db: "community", collection: "posts" },    actions: ["find"] },
+    { resource: { db: "community", collection: "comments" }, actions: ["find"] }
+  ],
+  roles: []
+})
+
+db.createUser({ user: "analytics", pwd: passwordPrompt(),
+  roles: [ { role: "contentReader", db: "community" } ] })
+```
+
+常用 action：`find`、`insert`、`update`、`remove`、`createIndex`、`dropCollection`、`listCollections`、`changeStream`。
+
+<Callout type="warn" title="应用账号不该有 dropDatabase 权限">
+`readWrite` 角色实际上包含了 `dropCollection` 和 `dropDatabase`。一个被注入攻击的应用可以直接删库。**高安全场景应该用自定义角色**，只授予 find/insert/update/remove，把 drop 类权限剥离出去。
+</Callout>
+
+### 6.4 视图做字段级权限
+
+MongoDB 没有原生的列级权限，但可以用视图模拟：
+
+```js
+db.createView("users_public", "users", [
+  { $project: { username: 1, "profile.city": 1, "profile.avatar": 1, createdAt: 1 } }
+])
+```
+
+```js
+db.createRole({
+  role: "publicUserReader",
+  privileges: [
+    { resource: { db: "community", collection: "users_public" }, actions: ["find"] }
+  ],
+  roles: []
+})
+```
+
+持有这个角色的账号只能查到脱敏后的字段，看不到 email 和 passwordHash。
+
+## 7. 加密
+
+### 7.1 三个层次
+
+```text
+传输加密（TLS）        网络上的数据      防窃听
+存储加密（at rest）    磁盘上的数据      防物理盗取/云盘泄露
+字段级加密（CSFLE）    数据库内的数据    防 DBA 和数据库被拖库
+```
+
+### 7.2 TLS
+
+```yaml
+net:
+  tls:
+    mode: requireTLS
+    certificateKeyFile: /etc/mongo/server.pem
+    CAFile: /etc/mongo/ca.pem
+    allowConnectionsWithoutCertificates: false
+```
+
+```bash
+mongosh "mongodb://db1:27017/community?tls=true&tlsCAFile=/etc/mongo/ca.pem"
+```
+
+### 7.3 静态加密
+
+企业版内置，社区版用文件系统级加密（LUKS）或云盘加密代替：
+
+```yaml
+security:
+  enableEncryption: true
+  encryptionKeyFile: /etc/mongo/enc-key
+```
+
+### 7.4 客户端字段级加密（CSFLE）
+
+数据在**客户端**就被加密，MongoDB 服务端只看到密文。即使 DBA 或攻击者拿到全库备份，也读不出敏感字段。
+
+```js
+const schemaMap = {
+  "community.users": {
+    bsonType: "object",
+    properties: {
+      idCard: {
+        encrypt: {
+          keyId: [dataKeyId],
+          bsonType: "string",
+          algorithm: "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"   // 确定性，可等值查询
+        }
+      },
+      medicalNote: {
+        encrypt: {
+          keyId: [dataKeyId],
+          bsonType: "string",
+          algorithm: "AEAD_AES_256_CBC_HMAC_SHA_512-Random"          // 随机，不可查询
+        }
+      }
+    }
+  }
+}
+```
+
+| 算法 | 可否等值查询 | 安全性 |
+|---|---|---|
+| Deterministic | 可以 | 较低（相同明文产生相同密文，可做频率分析） |
+| Random | 不可以 | 高 |
+
+7.0 引入的 **Queryable Encryption** 更进一步，支持在加密字段上做范围查询。
+
+<Callout type="warn" title="CSFLE 的密钥管理才是难点">
+加密本身不难，难的是密钥怎么存、怎么轮换、怎么在多个服务间分发。密钥和数据存在一起等于没加密。生产环境应该接 KMS（AWS KMS、阿里云 KMS、HashiCorp Vault），并制定密钥轮换流程。
+</Callout>
+
+## 8. 网络加固清单
+
+```yaml
+net:
+  bindIp: 127.0.0.1,10.0.1.5      # 绝不要 0.0.0.0
+  port: 27017
+security:
+  authorization: enabled
+setParameter:
+  authenticationMechanisms: SCRAM-SHA-256
+```
+
+| 措施 | 说明 |
+|---|---|
+| 绑定内网 IP | `bindIp` 不要写 `0.0.0.0` |
+| 防火墙 | 只放行应用服务器的 IP |
+| 不要用默认端口 | 改成非 27017 能挡掉大部分扫描 |
+| 禁用 HTTP 接口 | 老版本的 `net.http` 必须关闭 |
+| 禁用服务端 JS | `security.javascriptEnabled: false`，除非确实要用 `$where` |
+| 审计日志 | 企业版功能，记录所有操作 |
+| 定期轮换密码 | 尤其是离职人员知道的账号 |
+
+<Callout type="warn" title="MongoDB 勒索事件的共同原因">
+2017 年以来发生过多轮大规模 MongoDB 数据被删勒索事件，受害者数以万计。原因全都是同一个：**没开认证 + 绑定 0.0.0.0 + 暴露公网**。攻击者用扫描器找到端口，直接连上删库留一封勒索信。开认证和绑内网 IP 这两件事，五分钟就能做完。
+</Callout>
+
+## 9. 注入防护
+
+MongoDB 也有注入风险，主要来自「把用户输入直接当查询对象」：
+
+```js
+// 危险：如果 req.body.username 是一个对象
+db.users.findOne({ username: req.body.username, password: hash })
+
+// 攻击者传 { "username": { "$ne": null } } → 匹配任意用户
+```
+
+防护：
+
+```js
+// 1. 强制类型检查
+if (typeof username !== "string") throw new Error("invalid")
+
+// 2. 用 schema 校验库（zod / joi）在入口处理
+// 3. 禁用 $where 和 mapReduce 里的 JS 执行
+// 4. 永远不要用字符串拼接构造查询
+```
+
+<Callout type="exercise" title="练习">
+一、给本地实例开启认证，创建 admin、app、report 三个账号，验证 report 账号无法写入；二、用 `mongodump --oplog` 备份，再 `mongorestore` 到另一个库名，对比文档数；三、模拟误删：记下当前时间，`deleteMany` 删掉一批帖子，然后用全量备份 + oplog 重放恢复到删除前一秒；四、创建一个只能读 posts 集合的自定义角色，用它登录后尝试读 users，确认被拒绝；五、创建一个脱敏视图 `users_public`，验证通过它看不到 email 字段；六、检查你手上任意一个 MongoDB 实例：`bindIp` 是什么、认证有没有开、有没有暴露在公网。
+</Callout>
+
+## 小结
+
+- 备份要组合使用：延迟节点防误删、快照防灾难、oplog 归档做时间点恢复
+- 没做过恢复演练的备份不算备份，每季度演练一次
+- `mongodump` 默认不一致，跨集合一致性需要 `--oplog`
+- `fsyncLock` 只能在 hidden secondary 上做，且必须有超时保护
+- 时间点恢复 = 全量快照 + oplog 重放到 `oplogLimit`
+- 默认无认证是最大的安全隐患，`authorization: enabled` 加 `bindIp` 内网是底线
+- 按最小权限原则拆分账号，高安全场景用自定义角色剥离 drop 权限
+- 三层加密各司其职：TLS 防窃听、静态加密防盘丢、CSFLE 防拖库
+- 用户输入必须做类型检查，防止查询对象注入
+- 下一章讲性能分析与优化 →

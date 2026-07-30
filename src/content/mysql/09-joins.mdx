@@ -1,0 +1,181 @@
+---
+title: 多表连接 JOIN
+order: 9
+description: INNER/LEFT/RIGHT/CROSS JOIN、自连接、驱动表选择与 NLJ/BNL/Hash Join 算法
+---
+
+# 多表连接 JOIN
+
+关系型数据库的精髓就在「关系」——数据拆在多张表里，用 JOIN 按需拼回来。本章从四种 JOIN 的语义讲到底层的连接算法，让你既能写对，也能明白为什么有的 JOIN 快有的慢。
+
+## 1. JOIN 的语义模型
+
+理解 JOIN 的正确心智模型：**逐行匹配**。以 `A JOIN B ON 条件` 为例，拿 A 的每一行去 B 里找满足 ON 条件的行，找到就拼成一行输出。
+
+```text
+orders (A)                  users (B)
+┌────┬─────────┐            ┌────┬──────────┐
+│ id │ user_id │            │ id │ username │
+├────┼─────────┤   ON       ├────┼──────────┤
+│ 1  │   1     │──匹配──▶   │ 1  │ alice    │
+│ 2  │   2     │──匹配──▶   │ 2  │ bob      │
+│ 3  │   1     │──匹配──▶   │ 1  │ alice    │
+│ 4  │   99    │──✗ 无匹配  │ 3  │ carol    │
+└────┴─────────┘            └────┴──────────┘
+INNER JOIN：丢弃 order 4        LEFT JOIN：保留 order 4，用户列补 NULL
+```
+
+## 2. 四种 JOIN
+
+### 2.1 INNER JOIN：只保留两边都匹配的行
+
+```sql
+SELECT o.order_no, o.total_amount, u.username
+FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+WHERE o.status = 1;
+```
+
+`INNER` 可省略，`JOIN` 默认就是内连接。
+
+### 2.2 LEFT JOIN：左表全保留，右表没匹配补 NULL
+
+```sql
+-- 所有用户及其订单数（包括从没下过单的用户）
+SELECT u.id, u.username, COUNT(o.id) AS order_count
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id
+GROUP BY u.id, u.username;
+```
+
+注意 `COUNT(o.id)` 而不是 `COUNT(*)`：没订单的用户，o.id 是 NULL，COUNT(o.id) 正确计为 0；COUNT(*) 会把那行 NULL 也数成 1。
+
+LEFT JOIN 的经典用法——**找「没有」的行**（反连接）：
+
+```sql
+-- 从没下过单的用户
+SELECT u.*
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id
+WHERE o.id IS NULL;
+```
+
+### 2.3 RIGHT JOIN
+
+右表全保留，实践中几乎总能改写成 LEFT JOIN（交换表顺序），团队里统一用 LEFT JOIN 可读性更好。
+
+### 2.4 CROSS JOIN：笛卡尔积
+
+无条件两两组合，A 有 m 行、B 有 n 行则输出 m×n 行。偶尔用于生成组合（如「日期 × 门店」补全报表空洞），日常出现多半是**忘写 ON 条件的事故**。
+
+<Callout type="warn" title="ON 与 WHERE 在 LEFT JOIN 里完全不同">
+INNER JOIN 里条件放 ON 或 WHERE 结果一样；LEFT JOIN 里不一样：ON 里的右表条件只影响「怎么匹配」（不匹配的左表行照样保留、右表列补 NULL），而 WHERE 里的右表条件在拼接后过滤（会把补了 NULL 的行删掉，LEFT JOIN 悄悄退化成 INNER JOIN）。例：想看「所有用户及其已支付订单」，`o.status = 1` 必须放 ON；放 WHERE 就只剩有已支付订单的用户了。
+</Callout>
+
+## 3. 自连接与多表 JOIN
+
+自连接：同一张表用两个别名，当两张表用。分类的父子关系是典型场景：
+
+```sql
+SELECT c.name AS child, p.name AS parent
+FROM categories c
+LEFT JOIN categories p ON c.parent_id = p.id;
+```
+
+```text
++-----------+-----------+
+| child     | parent    |
++-----------+-----------+
+| 电子产品   | NULL      |
+| 手机      | 电子产品   |
+| 笔记本     | 电子产品   |
+| 图书      | NULL      |
+| 技术书     | 图书      |
++-----------+-----------+
+```
+
+多表 JOIN 串起完整业务链路：
+
+```sql
+-- 订单明细报表：谁、买了什么、什么分类、花了多少
+SELECT o.order_no, u.username, p.name AS product,
+       c.name AS category, oi.quantity, oi.price
+FROM orders o
+JOIN users u        ON u.id = o.user_id
+JOIN order_items oi ON oi.order_id = o.id
+JOIN products p     ON p.id = oi.product_id
+JOIN categories c   ON c.id = p.category_id
+WHERE o.status IN (1, 2, 3);
+```
+
+## 4. 驱动表与 JOIN 顺序
+
+JOIN 执行时有**驱动表**（外层，逐行取出）和**被驱动表**（内层，按连接条件查找）。你写的表顺序只是「建议」，优化器会自己决定谁做驱动表（LEFT JOIN 的左表除外，语义上必须保留）。
+
+核心原则：**小表（过滤后行数少的表）做驱动表，被驱动表的连接列必须有索引**。
+
+- 驱动表决定外层循环次数：结果集越小，循环越少；
+- 被驱动表每次都要按连接条件查找：有索引是一次 B+ 树查找，没索引是一次全表扫描。
+
+## 5. JOIN 算法
+
+### 5.1 Nested-Loop Join（NLJ，嵌套循环）
+
+被驱动表连接列**有索引**时的算法：
+
+```text
+for row in 驱动表(过滤后):            -- 外层：扫驱动表
+    用 row 的连接值走被驱动表的索引     -- 内层：一次索引查找
+    匹配则输出拼接行
+```
+
+成本约等于「驱动表行数 × 一次索引查找」，这是理想状态。
+
+### 5.2 Block Nested-Loop（BNL）与 Hash Join
+
+被驱动表连接列**没有索引**时，8.0.18 之前用 BNL：把驱动表分块读进 join buffer，被驱动表全表扫描逐块比对——被驱动表要被扫很多遍，极慢。
+
+**8.0.18 起默认用 Hash Join** 取代 BNL：
+
+```text
+1. 构建：把驱动表（小表）按连接列建哈希表（放进 join buffer）
+2. 探测：全表扫描被驱动表，每行按连接列查哈希表，O(1) 匹配
+```
+
+Hash Join 只需两边各扫一遍，比 BNL 好得多，尤其适合两张大表无索引等值连接、以及分析型查询。EXPLAIN FORMAT=TREE 里能看到 `hash join` 字样。
+
+| 算法 | 触发条件 | 成本特征 |
+|---|---|---|
+| NLJ（索引） | 被驱动表连接列有索引 | 驱动表行数 × 索引查找，OLTP 最优 |
+| Hash Join | 等值连接、无可用索引（8.0.18+） | 两表各扫一遍 + 哈希表内存 |
+| BNL | 老版本无索引兜底 | 被驱动表反复全扫，应避免 |
+
+<Callout type="tip" title="JOIN 慢的排查顺序">
+1. 被驱动表连接列有没有索引？（EXPLAIN 看内层表 type 是否为 ref/eq_ref）
+2. 两边连接列类型和字符集是否一致？不一致会隐式转换导致索引失效（如 utf8mb4 表 JOIN utf8 表的字符串列）。
+3. 驱动表是不是选大了？可用 STRAIGHT_JOIN 强制顺序做实验，但生产慎用。
+</Callout>
+
+## 6. USING 与 NATURAL JOIN
+
+```sql
+-- 两表连接列同名时可用 USING 简写
+SELECT o.order_no, u.username
+FROM orders o JOIN users u USING (id);  -- 仅当列名都叫 id 才对，此例其实不适用
+```
+
+`NATURAL JOIN` 自动按所有同名列连接——列名巧合就出错，**不要在生产使用**。显式 ON 永远是最安全的。
+
+## 小结
+
+- JOIN 心智模型：逐行匹配拼接；INNER 只留匹配、LEFT 保左表补 NULL
+- LEFT JOIN 中右表的过滤条件放 ON 还是 WHERE，语义完全不同
+- LEFT JOIN + `IS NULL` 是「找没有」的标准姿势
+- 小表驱动大表，被驱动表连接列必须有索引（NLJ）
+- 8.0.18+ 无索引等值连接走 Hash Join，比老的 BNL 快得多
+
+<Callout type="exercise" title="练习">
+1. 查询每个分类（含无商品的分类）的商品数量，注意 COUNT 的写法。
+2. 找出「有待支付订单」的用户及其待支付金额合计；再改成「所有用户 + 待支付金额（无则 0）」，体会条件放 ON 与 WHERE 的差别。
+3. 用 EXPLAIN 观察 orders JOIN users 的执行计划，确认谁是驱动表、被驱动表用了什么索引；把 users 表的主键换成普通列模拟无索引 JOIN，看是否出现 hash join。
+</Callout>

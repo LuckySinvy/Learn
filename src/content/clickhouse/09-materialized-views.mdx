@@ -1,0 +1,488 @@
+---
+title: 物化视图
+order: 9
+description: 插入触发机制、TO 表写法、常见预聚合模式与物化视图的陷阱
+---
+
+# 物化视图
+
+上一章留了个问题：预聚合表谁来维护？答案是物化视图（Materialized View，简称 MV）。
+
+但 ClickHouse 的物化视图和你在 MySQL/Oracle 里理解的**完全不是一回事**。搞不清这一点是新手 90% 的 bug 来源。
+
+## 1. ClickHouse 的物化视图是插入触发器
+
+先建立正确的心智模型：
+
+```text
+你以为的物化视图（Oracle/PG）        实际的 ClickHouse 物化视图
+                                      
+「这个查询的结果被缓存了，              「每当源表插入一批数据，
+ 源表变了就自动刷新」                    就对这批数据跑一次 SQL，
+                                       结果追加到目标表」
+= 结果缓存 + 定期刷新                  = INSERT 触发器
+```
+
+准确定义：**物化视图是绑定在源表上的 AFTER INSERT 触发器**。
+
+```text
+INSERT INTO events VALUES (...批数据...)
+         │
+         ├──▶ 写入 events 表本身
+         │
+         └──▶ 触发 MV：对这批数据执行 MV 定义的 SELECT
+                     │
+                     └──▶ 结果 INSERT 到目标表 events_agg
+```
+
+三个直接推论，全部很重要：
+
+1. **只对新插入的数据生效**。建 MV 之前的历史数据不会被处理。
+2. **MV 的 SELECT 只能看到当前这一批数据**，看不到源表的其他行。
+3. **源表的 UPDATE/DELETE/TTL 删除不会触发 MV**。
+
+<Callout type="warn" title="推论 2 是最大的坑">
+```sql
+-- 错误示例：想在 MV 里做累计
+CREATE MATERIALIZED VIEW mv TO target AS
+SELECT country, count() AS total FROM events GROUP BY country;
+```
+
+你以为 `total` 是 `events` 表里该国家的总数。实际上它只是**这一批 INSERT 里**该国家的行数。
+
+如果每批插 1 万行，MV 就会往目标表写很多行局部计数。这些局部计数只有在目标表是 SummingMergeTree/AggregatingMergeTree 时才会被 merge 累加成正确的总数——**目标表引擎的选择是 MV 正确性的一部分**。
+</Callout>
+
+## 2. 两种写法
+
+### 2.1 TO 表写法（强烈推荐）
+
+先手动建好目标表，MV 只负责搬运：
+
+```sql
+-- 第一步：显式建目标表
+CREATE TABLE demo.events_agg
+(
+    day        Date,
+    country    LowCardinality(String),
+    event_type LowCardinality(String),
+    pv         SimpleAggregateFunction(sum, UInt64),
+    total_ms   SimpleAggregateFunction(sum, UInt64),
+    uv         AggregateFunction(uniq, UInt64)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, country, event_type);
+
+-- 第二步：建 MV，用 TO 指向目标表
+CREATE MATERIALIZED VIEW demo.events_agg_mv TO demo.events_agg AS
+SELECT
+    toDate(event_time)  AS day,
+    country,
+    event_type,
+    count()             AS pv,
+    sum(duration_ms)    AS total_ms,
+    uniqState(user_id)  AS uv
+FROM demo.events
+GROUP BY day, country, event_type;
+```
+
+优势：
+
+- 目标表结构完全可控，可以单独 `ALTER`、加 TTL、改 SETTINGS
+- 可以先建表灌历史数据，再建 MV 接管增量
+- 可以**删除 MV 而保留数据**（`DROP VIEW events_agg_mv` 不影响 `events_agg`）
+- 多个 MV 可以写同一张目标表
+
+### 2.2 隐式表写法（不推荐）
+
+```sql
+CREATE MATERIALIZED VIEW demo.events_agg_mv2
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, country, event_type)
+POPULATE                                    -- 建 MV 时回填历史
+AS SELECT
+    toDate(event_time) AS day, country, event_type,
+    count() AS pv, uniqState(user_id) AS uv
+FROM demo.events
+GROUP BY day, country, event_type;
+```
+
+ClickHouse 会自动创建一张名为 `.inner.events_agg_mv2` 的隐藏表。
+
+问题：
+
+- 表名带点，操作麻烦
+- `DROP VIEW` 会连数据一起删
+- 改结构极其困难
+
+<Callout type="warn" title="POPULATE 会丢数据">
+`POPULATE` 在创建 MV 时把历史数据跑一遍。但**在 POPULATE 执行期间新写入源表的数据不会被 MV 捕获**，会永久丢失。
+
+正确的回填流程：
+
+```sql
+-- 1. 先建 MV（不带 POPULATE），从此刻起增量被捕获
+CREATE MATERIALIZED VIEW events_agg_mv TO events_agg AS SELECT ...;
+
+-- 2. 再手动回填 MV 创建之前的历史数据
+INSERT INTO events_agg
+SELECT toDate(event_time), country, event_type, count(), sum(duration_ms), uniqState(user_id)
+FROM events
+WHERE event_time < '2024-07-30 12:00:00'    -- MV 创建时刻
+GROUP BY 1, 2, 3;
+```
+
+顺序不能反。先建 MV 再回填，最坏是有一小段重复（对 Aggregating 表来说是数据翻倍，需要小心边界）；反过来则是永久丢数据。
+</Callout>
+
+## 3. 验证 MV 工作
+
+```sql
+-- 插入新数据
+INSERT INTO demo.events
+SELECT
+    toDateTime('2024-07-01') + number % 86400,
+    1 + rand(1) % 50000,
+    ['view','click','purchase','signup'][1 + rand(2) % 4],
+    concat('/p/', toString(rand(3) % 500)),
+    ['CN','US','JP','DE','IN'][1 + rand(4) % 5],
+    ['ios','android','web'][1 + rand(5) % 3],
+    50 + rand(6) % 5000
+FROM numbers(500000);
+
+-- 目标表立刻有数据（同步写入，不是异步）
+SELECT day, country, sum(pv) AS pv, uniqMerge(uv) AS uv
+FROM demo.events_agg
+WHERE day = '2024-07-01'
+GROUP BY day, country ORDER BY pv DESC;
+```
+
+```text
+┌────────day─┬─country─┬─────pv─┬───uv─┐
+│ 2024-07-01 │ JP      │ 100412 │ 39812 │
+│ 2024-07-01 │ CN      │ 100208 │ 39755 │
+│ 2024-07-01 │ US      │  99931 │ 39701 │
+│ 2024-07-01 │ DE      │  99788 │ 39684 │
+│ 2024-07-01 │ IN      │  99661 │ 39672 │
+└────────────┴─────────┴────────┴───────┘
+```
+
+<Callout type="info" title="MV 写入是同步的，且在同一个事务里">
+MV 的执行发生在 INSERT 语句返回**之前**。如果 MV 的 SELECT 报错（比如类型不匹配、除零），**整个 INSERT 都会失败**，源表也写不进去。
+
+想让 MV 失败不影响源表写入，设置：
+
+```sql
+SET materialized_views_ignore_errors = 1;
+```
+
+但这会静默丢数据，生产上要配监控。
+</Callout>
+
+## 4. 常见 MV 模式
+
+### 4.1 模式一：多维度预聚合
+
+同一张源表可以挂多个 MV，各自聚合不同维度：
+
+```sql
+-- MV 1：按天 × 国家
+CREATE MATERIALIZED VIEW mv_daily_country TO agg_daily_country AS
+SELECT toDate(event_time) AS day, country,
+       count() AS pv, uniqState(user_id) AS uv
+FROM events GROUP BY day, country;
+
+-- MV 2：按小时 × 页面（更细粒度，用于排障）
+CREATE MATERIALIZED VIEW mv_hourly_page TO agg_hourly_page AS
+SELECT toStartOfHour(event_time) AS hour, page,
+       count() AS pv, avgState(duration_ms) AS avg_ms
+FROM events GROUP BY hour, page;
+
+-- MV 3：按天 × 设备 × 事件类型
+CREATE MATERIALIZED VIEW mv_daily_device TO agg_daily_device AS
+SELECT toDate(event_time) AS day, device, event_type,
+       count() AS pv
+FROM events GROUP BY day, device, event_type;
+```
+
+一次 INSERT 会依次触发全部 3 个 MV。写入放大 3 倍，但每个查询都变得极快。
+
+### 4.2 模式二：ETL 清洗与打宽
+
+MV 不一定要聚合，也可以做转换：
+
+```sql
+CREATE TABLE events_clean
+(
+    event_time DateTime,
+    user_id    UInt64,
+    event_type LowCardinality(String),
+    page_path  String,
+    page_id    UInt32,
+    country    LowCardinality(String),
+    is_mobile  UInt8,
+    duration_s Float32
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+
+CREATE MATERIALIZED VIEW mv_clean TO events_clean AS
+SELECT
+    event_time,
+    user_id,
+    event_type,
+    path(page)                                  AS page_path,
+    toUInt32OrZero(extract(page, '/p/(\d+)'))   AS page_id,
+    upper(country)                              AS country,
+    device IN ('ios', 'android')                AS is_mobile,
+    duration_ms / 1000.0                        AS duration_s
+FROM events
+WHERE duration_ms < 600000;                     -- 过滤异常值
+```
+
+### 4.3 模式三：Null 引擎 + MV 扇出
+
+有时你根本不想存明细，只要聚合结果。用 `Null` 引擎做入口：
+
+```sql
+-- 入口表：写进来的数据立刻丢弃，但会触发 MV
+CREATE TABLE events_ingest
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = Null;
+
+-- 挂两个 MV，一个存明细（带过滤），一个存聚合
+CREATE MATERIALIZED VIEW mv_keep_important TO events AS
+SELECT * FROM events_ingest WHERE event_type IN ('purchase', 'signup');
+
+CREATE MATERIALIZED VIEW mv_agg_all TO events_agg AS
+SELECT toDate(event_time) AS day, country, event_type,
+       count() AS pv, sum(duration_ms) AS total_ms, uniqState(user_id) AS uv
+FROM events_ingest GROUP BY day, country, event_type;
+```
+
+```text
+              ┌──▶ mv_keep_important ──▶ events（只存重要事件明细）
+INSERT ──▶ Null 表
+              └──▶ mv_agg_all ─────────▶ events_agg（全量聚合）
+
+原始明细不落盘，节省 90% 存储
+```
+
+这是超大流量场景的标配架构。
+
+### 4.4 模式四：级联 MV（多级聚合）
+
+```sql
+-- 第一级：明细 → 小时
+CREATE MATERIALIZED VIEW mv_hourly TO agg_hourly AS
+SELECT toStartOfHour(event_time) AS hour, country,
+       count() AS pv, uniqState(user_id) AS uv
+FROM events GROUP BY hour, country;
+
+-- 第二级：小时 → 天（挂在 agg_hourly 上）
+CREATE MATERIALIZED VIEW mv_daily TO agg_daily AS
+SELECT toDate(hour) AS day, country,
+       sum(pv) AS pv, uniqMergeState(uv) AS uv
+FROM agg_hourly GROUP BY day, country;
+```
+
+注意第二级用了 `uniqMergeState`：先 Merge 合并小时状态，再 State 输出天级状态。
+
+<Callout type="warn" title="级联 MV 的风险">
+1. **链路变长，故障排查困难**。任何一环报错，最上游的 INSERT 都会失败。
+2. **不要形成环**。`A → B → A` 会导致无限递归，ClickHouse 会检测并报错，但复杂拓扑下可能漏检。
+3. **写入放大叠乘**。三级级联意味着一次 INSERT 触发三次计算。
+
+一般建议**不超过两级**，且用 `system.query_log` 监控每级的耗时。
+</Callout>
+
+## 5. 物化视图的核心陷阱清单
+
+### 5.1 不处理源表的删除和更新
+
+```sql
+ALTER TABLE events DELETE WHERE user_id = 12345;
+```
+
+源表的行没了，但 `events_agg` 里对应的计数**不会减少**。TTL 删除数据同理。
+
+如果需要严格一致，只能定期重建聚合表：
+
+```sql
+-- 定期重算某个分区
+CREATE TABLE events_agg_tmp AS events_agg;
+INSERT INTO events_agg_tmp SELECT ... FROM events WHERE toYYYYMM(event_time) = 202406 GROUP BY ...;
+ALTER TABLE events_agg REPLACE PARTITION '202406' FROM events_agg_tmp;
+DROP TABLE events_agg_tmp;
+```
+
+### 5.2 修改 MV 定义需要重建
+
+```sql
+-- 不能 ALTER MV 的 SELECT，只能删了重建
+DROP VIEW demo.events_agg_mv;
+CREATE MATERIALIZED VIEW demo.events_agg_mv TO demo.events_agg AS SELECT ...;
+```
+
+`DROP VIEW` 和 `CREATE` 之间的数据会丢。生产上的安全做法是**先建新 MV 写新表，验证无误后切换查询，再删旧 MV**。
+
+24.x 提供了原子替换：
+
+```sql
+CREATE OR REPLACE VIEW ...;    -- 普通视图可以
+-- 物化视图用 ALTER TABLE ... MODIFY QUERY（有限支持，仅 TO 表写法）
+ALTER TABLE demo.events_agg_mv MODIFY QUERY
+SELECT toDate(event_time) AS day, country, event_type,
+       count() AS pv, sum(duration_ms) AS total_ms, uniqState(user_id) AS uv
+FROM demo.events GROUP BY day, country, event_type;
+```
+
+### 5.3 列名必须对齐
+
+MV 的 SELECT 输出列**按名称**匹配目标表的列（不是按位置，从 22.x 起）。名字对不上就会用默认值填充，静默产生错误数据。
+
+```sql
+-- 目标表列名是 pv，MV 里写了 cnt → pv 全是 0
+SELECT count() AS cnt FROM events GROUP BY ...   -- 错
+SELECT count() AS pv  FROM events GROUP BY ...   -- 对
+```
+
+写完 MV 后**一定要插一批测试数据验证目标表的每一列都有合理的值**。
+
+### 5.4 JOIN 在 MV 里的陷阱
+
+```sql
+CREATE MATERIALIZED VIEW mv_with_join TO target AS
+SELECT e.user_id, e.country, u.vip_level
+FROM events AS e
+LEFT JOIN users AS u ON e.user_id = u.user_id;
+```
+
+只有**左表**（`events`）的 INSERT 会触发 MV。`users` 表更新时 MV 不会重跑。而且每批 INSERT 都要执行一次 JOIN，性能可能很差。
+
+**推荐用字典（第 15 章）代替 JOIN**：
+
+```sql
+CREATE MATERIALIZED VIEW mv_with_dict TO target AS
+SELECT
+    user_id,
+    country,
+    dictGetUInt8('users_dict', 'vip_level', user_id) AS vip_level
+FROM events;
+```
+
+字典常驻内存，查表是哈希查找，比 JOIN 快几个数量级。
+
+### 5.5 MV 里不要用 SELECT *
+
+源表加列时，`SELECT *` 的输出列数变了，MV 会突然报错导致整个 INSERT 失败。**永远显式列出列名**。
+
+## 6. 监控与排查
+
+```sql
+-- 查看所有 MV
+SELECT database, name, engine, as_select
+FROM system.tables
+WHERE engine = 'MaterializedView' AND database = 'demo'
+FORMAT Vertical;
+
+-- MV 依赖关系
+SELECT database, table, dependencies_database, dependencies_table
+FROM system.tables
+WHERE database = 'demo' AND notEmpty(dependencies_table);
+
+-- MV 执行耗时与错误（关键排查手段）
+SELECT
+    view_name,
+    status,
+    event_time,
+    view_duration_ms,
+    read_rows,
+    written_rows,
+    exception
+FROM system.query_views_log
+WHERE event_date = today()
+ORDER BY event_time DESC
+LIMIT 20;
+```
+
+```text
+┌─view_name───────────────┬─status────────┬──────────event_time─┬─view_duration_ms─┬─read_rows─┬─written_rows─┬─exception─┐
+│ demo.events_agg_mv      │ QueryFinish   │ 2024-07-30 12:01:03 │               42 │    500000 │           25 │           │
+│ demo.mv_hourly_page     │ QueryFinish   │ 2024-07-30 12:01:03 │              118 │    500000 │          500 │           │
+└─────────────────────────┴───────────────┴─────────────────────┴──────────────────┴───────────┴──────────────┴───────────┘
+```
+
+`view_duration_ms` 是排查「INSERT 变慢」的关键——通常是某个 MV 太重。
+
+<Callout type="tip" title="query_views_log 默认可能没开">
+如果查不到数据，在 `config.d/` 里启用：
+
+```xml
+<clickhouse>
+    <query_views_log>
+        <database>system</database>
+        <table>query_views_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </query_views_log>
+</clickhouse>
+```
+</Callout>
+
+## 7. 普通视图 vs 物化视图
+
+| | 普通 VIEW | MATERIALIZED VIEW |
+|---|---|---|
+| 存储 | 不存数据，只存 SQL | 有实际目标表存数据 |
+| 查询时 | 展开成子查询实时算 | 直接读目标表 |
+| 触发时机 | 查询时 | 源表 INSERT 时 |
+| 历史数据 | 天然包含 | 需手动回填 |
+| 适合 | 简化复杂 SQL、封装去重逻辑 | 预聚合、ETL、扇出 |
+
+```sql
+-- 普通视图：只是 SQL 的别名，没有存储成本
+CREATE VIEW orders_latest AS
+SELECT order_id, argMax(status, updated_at) AS status
+FROM orders GROUP BY order_id;
+```
+
+还有个中间形态 `LIVE VIEW` 和 24.x 的 `REFRESHABLE MATERIALIZED VIEW`（定时全量刷新，语义最接近 Oracle 的物化视图）：
+
+```sql
+CREATE MATERIALIZED VIEW mv_refresh
+REFRESH EVERY 1 HOUR
+ENGINE = MergeTree ORDER BY day
+AS SELECT toDate(event_time) AS day, count() AS pv FROM events GROUP BY day;
+```
+
+它每小时全量重算一次，能正确反映删除和更新，代价是不实时且每次全表扫。适合小规模、要求强一致的报表。
+
+<Callout type="exercise" title="练习">
+1. 用 TO 表写法给 `events` 建一个按天聚合的 MV（含 pv、uv、avg 时长），插入新数据验证目标表自动更新。
+2. 故意在 MV 里把某列写成错的别名（比如目标表叫 `pv`、MV 里写 `AS cnt`），插入数据后观察目标表该列的值——体会「静默出错」有多危险。
+3. 建一张 `Null` 引擎的入口表，挂两个 MV（一个存明细一个存聚合），验证入口表 `SELECT count()` 永远是 0 但两个目标表都有数据。
+4. 建 MV 后，对源表执行 `ALTER TABLE events DELETE WHERE country = 'IN'`，然后对比明细表和聚合表的 IN 国家数据——验证 MV 不感知删除。
+5. 查询 `system.query_views_log`，找出你的 MV 里 `view_duration_ms` 最大的那个。
+</Callout>
+
+## 小结
+
+- ClickHouse 的物化视图是 INSERT 触发器，不是结果缓存
+- MV 的 SELECT 只能看到当前这一批插入的数据，累加靠目标表引擎（Summing/Aggregating）完成
+- 优先用 `TO 表` 写法，目标表可控、MV 可独立删除
+- 不要用 `POPULATE`，改为「先建 MV 捕获增量，再手动回填历史」
+- 常用模式：多维预聚合、ETL 清洗、Null 表扇出、级联多级聚合
+- 核心陷阱：不感知删除更新、改定义要重建、列名必须对齐、别用 `SELECT *`、JOIN 换成字典
+- MV 执行失败会导致源表 INSERT 一起失败，用 `system.query_views_log` 监控
+- 下一章讲数据导入导出，把数据搬进来才有得聚合 →

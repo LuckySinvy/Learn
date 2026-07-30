@@ -1,0 +1,200 @@
+---
+title: 事务与 Lua 脚本
+order: 12
+description: MULTI/EXEC/WATCH 乐观锁、Redis 事务为什么不是 ACID、EVAL/EVALSHA 与 Redis 7 Function
+---
+
+# 事务与 Lua 脚本
+
+"先查库存再扣减"这类多步操作，在并发下必然出现竞态。Redis 给出两种原子化手段：**事务**（MULTI/EXEC）保证命令打包串行执行，**Lua 脚本**更进一步——把"读取、判断、写入"整段逻辑放到服务端原子执行。实践中 Lua 几乎总是更好的答案，但你需要先理解事务的语义与局限。
+
+## 1. 事务：MULTI / EXEC
+
+```bash
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> SET order:1 "created"
+QUEUED
+127.0.0.1:6379(TX)> INCR order:count
+QUEUED
+127.0.0.1:6379(TX)> EXEC
+1) OK
+2) (integer) 1
+```
+
+MULTI 之后的命令**不立即执行**，而是进入队列；EXEC 时整个队列一次性、无间隔地串行执行——期间不会插入其他客户端的命令。`DISCARD` 放弃队列。
+
+### 1.1 两种错误，两种结局
+
+**入队时错误**（语法错误、不存在的命令）：整个事务被拒绝执行。
+
+```bash
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> SETT k v
+(error) ERR unknown command 'SETT'
+127.0.0.1:6379(TX)> EXEC
+(error) EXECABORT Transaction discarded because of previous errors.
+```
+
+**执行时错误**（类型不匹配等）：出错的命令失败，**其余命令照常执行，不回滚**。
+
+```bash
+127.0.0.1:6379> SET str "hello"
+OK
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> LPUSH str "x"       # 对 string 用 list 命令
+QUEUED
+127.0.0.1:6379(TX)> SET after "done"
+QUEUED
+127.0.0.1:6379(TX)> EXEC
+1) (error) WRONGTYPE Operation against a key holding the wrong kind of value
+2) OK                   # 第二条成功了! 没有回滚
+```
+
+### 1.2 为什么 Redis 事务不是 ACID
+
+| 特性 | Redis 事务的情况 |
+|---|---|
+| 原子性 A | **不完整**：执行期错误不回滚，部分成功部分失败 |
+| 一致性 C | 依赖使用者：没有约束检查与回滚兜底 |
+| 隔离性 I | **满足**：单线程串行，天然可串行化 |
+| 持久性 D | 取决于持久化配置：everysec 下仍可能丢 |
+
+官方的理由：回滚只能挽救"程序写错了类型"这类编程错误，对正确的程序没有价值，而支持回滚会显著增加复杂度、拖慢速度。**Redis 事务的本质是"打包 + 串行"，不是数据库事务**。
+
+### 1.3 WATCH：乐观锁
+
+事务里的命令在 EXEC 前不执行，所以**不能根据事务中间的读取结果做判断**。想实现"检查再更新"（check-and-set），用 WATCH：
+
+```bash
+127.0.0.1:6379> WATCH stock:sku:2001
+OK
+127.0.0.1:6379> GET stock:sku:2001
+"5"                     # 客户端判断: 库存 5 > 0, 可以扣
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> DECR stock:sku:2001
+QUEUED
+127.0.0.1:6379(TX)> EXEC
+1) (integer) 4          # 成功: WATCH 到 EXEC 之间没人改过 stock
+
+# 如果期间另一个客户端改了 stock:sku:2001:
+127.0.0.1:6379(TX)> EXEC
+(nil)                   # 事务被放弃, 需要重试整个流程
+```
+
+WATCH 的语义：被监视的 key 在 EXEC 之前被**任何客户端**修改，EXEC 返回 nil、事务不执行。这是乐观锁——不阻止别人写，只在提交时发现冲突就放弃重试。高并发下冲突率高时会大量重试，此时 Lua 是更好的选择。
+
+## 2. Lua 脚本：服务端原子逻辑
+
+`EVAL` 把一段 Lua 交给 Redis 执行，**整个脚本是一个原子单元**——执行期间不会有任何其他命令插入。读取、判断、分支、写入全在服务端一气呵成，没有竞态，也省了多次网络往返。
+
+### 2.1 基本用法
+
+```bash
+127.0.0.1:6379> EVAL "return 1 + 1" 0
+(integer) 2
+# KEYS 数组传 key, ARGV 数组传参数; numkeys 声明 key 个数
+127.0.0.1:6379> EVAL "return redis.call('SET', KEYS[1], ARGV[1])" 1 greeting "hello"
+OK
+127.0.0.1:6379> EVAL "return redis.call('GET', KEYS[1])" 1 greeting
+"hello"
+```
+
+为什么 key 必须走 KEYS 而不是拼进脚本？Cluster 需要根据 KEYS 判断脚本该路由到哪个节点；混在 ARGV 里会导致路由错误。
+
+### 2.2 实战：原子扣库存
+
+```lua
+-- deduct.lua: 库存足够则扣减, 返回剩余; 不足返回 -1
+local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+local need  = tonumber(ARGV[1])
+if stock >= need then
+  return redis.call('DECRBY', KEYS[1], need)
+else
+  return -1
+end
+```
+
+```bash
+$ redis-cli SET stock:sku:2001 5
+OK
+$ redis-cli EVAL "$(cat deduct.lua)" 1 stock:sku:2001 2
+(integer) 3
+$ redis-cli EVAL "$(cat deduct.lua)" 1 stock:sku:2001 9
+(integer) -1            # 库存不足, 拒绝, 且绝不会超卖
+```
+
+对比 WATCH 方案：无冲突重试、一次网络往返、逻辑集中在一处。这就是"检查再更新"类需求的标准解法。
+
+### 2.3 EVALSHA：不用每次传脚本
+
+脚本体每次随请求传输很浪费。先 `SCRIPT LOAD` 得到 SHA1，之后用 `EVALSHA` 引用：
+
+```bash
+127.0.0.1:6379> SCRIPT LOAD "return redis.call('GET', KEYS[1])"
+"a5260dd66ce02462c5b5e49a19df58c1f438d81a"
+127.0.0.1:6379> EVALSHA a5260dd66ce02462c5b5e49a19df58c1f438d81a 1 greeting
+"hello"
+127.0.0.1:6379> SCRIPT EXISTS a5260dd66ce02462c5b5e49a19df58c1f438d81a
+1) (integer) 1
+```
+
+客户端库通常自动处理"EVALSHA 报 NOSCRIPT 就回退 EVAL"。注意脚本缓存**重启即失效，且不主从复制**——这是 Function 要解决的问题之一。
+
+### 2.4 Lua 的规矩
+
+- 脚本执行期间**独占主线程**：超过 `busy-reply-threshold`（默认 5 秒）后其他请求收到 BUSY 错误，且只能 `SCRIPT KILL`（未执行过写命令时）或 `SHUTDOWN NOSAVE`。**脚本必须短小**，别在里面循环百万次；
+- 不要用 Lua 的 `math.random`（每个副本执行结果会不同破坏复制），用 `redis.call('TIME')` 或把随机值从客户端以 ARGV 传入；
+- `redis.call` 出错直接抛给客户端；`redis.pcall` 返回错误表，可在脚本内处理。
+
+## 3. Redis 7 Function：脚本的工程化
+
+EVAL 的痛点：脚本以 SHA 标识不可读、不持久化、无法组织成库。Redis 7 的 Function 把脚本当作**服务端持久化的命名函数**：
+
+```lua
+#!lua name=mylib
+-- 注册一个函数: 带库存检查的扣减
+local function deduct(keys, args)
+  local stock = tonumber(redis.call('GET', keys[1]) or '0')
+  local need  = tonumber(args[1])
+  if stock >= need then
+    return redis.call('DECRBY', keys[1], need)
+  end
+  return -1
+end
+redis.register_function('deduct_stock', deduct)
+```
+
+```bash
+$ redis-cli -x FUNCTION LOAD < mylib.lua
+"mylib"
+127.0.0.1:6379> FCALL deduct_stock 1 stock:sku:2001 1
+(integer) 2
+127.0.0.1:6379> FUNCTION LIST
+1) 1) "library_name"
+   2) "mylib"
+   ...
+```
+
+Function 随 RDB/AOF 持久化、随主从复制传播、有名字可管理——新项目的服务端逻辑建议直接用 Function。
+
+<Callout type="warn" title="事务 + Lua 的常见误区">
+1）以为 EXEC 失败会回滚——不会，执行期错误只影响那一条命令；2）在 pipeline 里混用 WATCH——WATCH 与连接绑定，连接池下必须确保 WATCH/MULTI/EXEC 在同一连接；3）Lua 里写死 key 名而不走 KEYS——单机能跑，上 Cluster 就路由错乱；4）用大循环脚本"批量删 key"——阻塞主线程，应该分批多次调用。
+</Callout>
+
+## 小结
+
+- MULTI/EXEC 是"打包串行"：隔离性满足，但执行期错误不回滚，不是 ACID 事务
+- WATCH 提供乐观锁式 check-and-set，高冲突场景重试成本高
+- Lua 脚本是原子化复杂逻辑的首选：一次往返、无竞态；但必须短小、key 走 KEYS
+- EVALSHA 省带宽但缓存易失；Redis 7 Function 提供持久化、可命名的服务端函数
+- 下一章：发布订阅 →
+
+<Callout type="exercise" title="练习">
+1. 复现两种事务错误：入队错误导致 EXECABORT，执行错误导致部分成功，体会"不回滚"。
+2. 开两个终端演练 WATCH：终端 A 监视并准备扣减，终端 B 在 A 执行 EXEC 前修改该 key，观察 A 的 EXEC 返回 nil。
+3. 写一个 Lua 脚本实现"限购"：某用户对某商品的购买计数不超过 2，超过返回 0，否则计数加 1 并返回新值（提示：key 形如 buy:uid:sku，记得设 TTL）。
+</Callout>

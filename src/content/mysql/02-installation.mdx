@@ -1,0 +1,227 @@
+---
+title: 安装与连接
+order: 2
+description: Docker 与包管理器安装 MySQL 8.0、mysql 客户端常用命令、字符集与时区配置
+---
+
+# 安装与连接
+
+工欲善其事，必先利其器。本章把 MySQL 8.0 跑起来，配好字符集和时区——这两项配置如果一开始不弄对，后面踩的坑（乱码、时间差 8 小时）会让你痛苦很久。
+
+## 1. 用 Docker 安装（推荐）
+
+学习和开发环境首选 Docker，干净、可随时销毁重建：
+
+```bash
+docker run -d \
+  --name mysql8 \
+  -p 3306:3306 \
+  -e MYSQL_ROOT_PASSWORD=root123 \
+  -e TZ=Asia/Shanghai \
+  -v mysql8-data:/var/lib/mysql \
+  mysql:8.0 \
+  --character-set-server=utf8mb4 \
+  --collation-server=utf8mb4_0900_ai_ci
+```
+
+参数说明：
+
+- `-p 3306:3306`：把容器的 3306 端口映射到宿主机
+- `-v mysql8-data:/var/lib/mysql`：数据放进命名卷，容器删了数据还在
+- 镜像名后面的两个 `--character-set-server` 参数会直接传给 mysqld，等价于写进配置文件
+
+验证：
+
+```bash
+docker exec -it mysql8 mysql -uroot -proot123 -e "SELECT VERSION();"
+```
+
+```text
++-----------+
+| VERSION() |
++-----------+
+| 8.0.42    |
++-----------+
+```
+
+## 2. 包管理器安装
+
+### 2.1 Ubuntu / Debian
+
+```bash
+sudo apt update
+sudo apt install -y mysql-server
+sudo systemctl enable --now mysql
+
+# 安全初始化：设 root 密码、删匿名用户、禁远程 root
+sudo mysql_secure_installation
+```
+
+### 2.2 macOS（Homebrew）
+
+```bash
+brew install mysql
+brew services start mysql
+mysql_secure_installation
+```
+
+### 2.3 CentOS / Rocky Linux
+
+```bash
+sudo dnf install -y mysql-server
+sudo systemctl enable --now mysqld
+```
+
+<Callout type="tip" title="8.0 的默认认证插件">
+MySQL 8.0 默认认证插件是 `caching_sha2_password`，比老的 `mysql_native_password` 更安全。个别老客户端/老驱动连不上时，报错通常是 `Authentication plugin 'caching_sha2_password' cannot be loaded`——正确做法是升级驱动，而不是把插件退回旧版。
+</Callout>
+
+## 3. mysql 客户端与常用命令
+
+### 3.1 连接
+
+```bash
+# 本机连接
+mysql -uroot -p
+
+# 远程连接：指定主机与端口
+mysql -h 192.168.1.100 -P 3306 -uroot -p
+
+# 连接时直接选库、执行一条语句
+mysql -uroot -p shop -e "SELECT COUNT(*) FROM users;"
+```
+
+### 3.2 客户端内的高频命令
+
+```sql
+SHOW DATABASES;              -- 列出所有库
+USE shop;                    -- 切换库
+SHOW TABLES;                 -- 列出当前库的表
+DESC users;                  -- 查看表结构（DESCRIBE 缩写）
+SHOW CREATE TABLE users\G    -- 查看完整建表语句
+SHOW PROCESSLIST;            -- 查看当前所有连接与正在执行的语句
+SELECT USER(), DATABASE();   -- 我是谁、我在哪个库
+STATUS;                      -- 连接信息汇总（字符集、版本、运行时长）
+```
+
+`\G` 是 mysql 客户端的技巧：把结果**竖排显示**，看宽表结构时比横排表格清晰得多。
+
+### 3.3 创建业务账号
+
+生产环境绝不能让应用直接用 root：
+
+```sql
+-- 创建只能从内网网段连接的应用账号
+CREATE USER 'app'@'10.0.%' IDENTIFIED BY 'S3cure#Pass';
+
+-- 授予对 shop 库的增删改查权限（不给 DDL 权限）
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'app'@'10.0.%';
+
+FLUSH PRIVILEGES;
+
+-- 查看某账号权限
+SHOW GRANTS FOR 'app'@'10.0.%';
+```
+
+## 4. 字符集：一定要 utf8mb4
+
+MySQL 里的 `utf8` 是个历史遗留的**残缺实现**，每字符最多 3 字节，存不了 emoji 和部分生僻汉字，插入时报 `Incorrect string value`。真正的 UTF-8 是 `utf8mb4`（最多 4 字节）。
+
+检查当前配置：
+
+```sql
+SHOW VARIABLES LIKE 'character_set%';
+```
+
+```text
++--------------------------+---------+
+| Variable_name            | Value   |
++--------------------------+---------+
+| character_set_client     | utf8mb4 |
+| character_set_connection | utf8mb4 |
+| character_set_database   | utf8mb4 |
+| character_set_results    | utf8mb4 |
+| character_set_server     | utf8mb4 |
++--------------------------+---------+
+```
+
+8.0 默认已是 utf8mb4，默认排序规则是 `utf8mb4_0900_ai_ci`（`ai` = accent insensitive 不区分音调，`ci` = case insensitive 不区分大小写）。如果需要区分大小写的比较，用 `utf8mb4_0900_as_cs` 或 `utf8mb4_bin`。
+
+写进配置文件（`/etc/mysql/mysql.conf.d/mysqld.cnf` 或 `/etc/my.cnf`）：
+
+```ini
+[mysqld]
+character-set-server = utf8mb4
+collation-server     = utf8mb4_0900_ai_ci
+
+[client]
+default-character-set = utf8mb4
+```
+
+<Callout type="warn" title="乱码几乎都是链路上字符集不一致">
+数据从「应用 → 连接 → 服务器 → 表 → 列」每一环都有字符集。任何一环是 latin1 或 utf8（mb3）都可能乱码。排查口诀：先 `SHOW VARIABLES LIKE 'character_set%'` 看连接层，再 `SHOW CREATE TABLE` 看表和列。JDBC 连接串记得带 `characterEncoding=utf8mb4` 语义的参数。
+</Callout>
+
+## 5. 时区配置
+
+MySQL 默认时区是 `SYSTEM`（跟随操作系统），Docker 容器默认是 UTC——于是经典的「数据库时间比北京时间慢 8 小时」就出现了。
+
+```sql
+-- 查看时区
+SELECT @@global.time_zone, @@session.time_zone, NOW();
+```
+
+```text
++--------------------+---------------------+---------------------+
+| @@global.time_zone | @@session.time_zone | NOW()               |
++--------------------+---------------------+---------------------+
+| SYSTEM             | SYSTEM              | 2026-07-30 15:04:05 |
++--------------------+---------------------+---------------------+
+```
+
+设置为东八区：
+
+```ini
+[mysqld]
+default-time-zone = '+08:00'
+```
+
+或运行时修改（重启失效）：
+
+```sql
+SET GLOBAL time_zone = '+08:00';
+SET time_zone = '+08:00';
+```
+
+时区影响的是 `TIMESTAMP` 类型（存储时转 UTC、读取时转回会话时区）和 `NOW()` 这类函数；`DATETIME` 存的是字面值、不受时区影响。第 3 章会详细对比这两个类型。
+
+<Callout type="info" title="应用与数据库时区要对齐">
+JDBC 连接串里的 `serverTimezone=Asia/Shanghai`、应用服务器系统时区、MySQL 时区三者不一致时，同一条数据在不同入口看到的时间会不同。上线前统一检查一遍。
+</Callout>
+
+## 6. 创建课程用的数据库
+
+为后续章节先把库建好：
+
+```sql
+CREATE DATABASE shop
+  DEFAULT CHARACTER SET utf8mb4
+  DEFAULT COLLATE utf8mb4_0900_ai_ci;
+
+USE shop;
+SELECT DATABASE();   -- 确认已切到 shop
+```
+
+## 小结
+
+- 学习/开发用 Docker 装 MySQL 8.0，一条命令带上 utf8mb4 与时区参数
+- 生产创建专用业务账号，按最小权限授权，不用 root
+- 字符集一律 utf8mb4，`utf8` 是残缺实现
+- 时区显式设为 `+08:00`，别依赖 SYSTEM，尤其是容器环境
+- `\G`、`SHOW CREATE TABLE`、`SHOW PROCESSLIST` 是日常排查三板斧
+
+<Callout type="exercise" title="练习">
+1. 用 Docker 启动一个 MySQL 8.0 实例，字符集 utf8mb4、时区东八区。
+2. 创建 `shop` 库和一个只对 `shop` 库有 CRUD 权限的账号 `app`，用它登录并确认 `SHOW DATABASES` 只能看到 `shop` 和 information_schema。
+3. 执行 `SELECT NOW();` 验证时间是否为北京时间；故意把会话时区改成 `+00:00` 再看 NOW() 的变化。
+</Callout>

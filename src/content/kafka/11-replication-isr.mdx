@@ -1,0 +1,168 @@
+---
+title: 副本机制与 ISR
+order: 11
+description: Leader/Follower 同步、ISR 收缩扩张、HW 与 LEO、Leader Epoch 与数据一致性
+---
+
+# 副本机制与 ISR
+
+副本机制是 Kafka 可靠性的地基。acks=all 为什么可靠？min.insync.replicas 为什么必须配？leader 切换会不会丢数据？这些问题的答案都藏在 ISR、HW/LEO、Leader Epoch 这三组概念里。这是全课程最"原理"的一章，值得慢慢读。
+
+## 1. Leader / Follower 分工
+
+每个分区的副本分为一个 leader 和若干 follower：
+
+```text
+        Producer 写           Consumer 读
+             \                 /
+              v               v
+        +------------------+
+        |  Leader (broker1)|   处理全部读写
+        +------------------+
+          ^              ^
+          | Fetch        | Fetch (follower 主动拉, 类似消费者)
+  +---------------+  +---------------+
+  |Follower(brk2) |  |Follower(brk3) |   只同步, 不服务客户端
+  +---------------+  +---------------+
+```
+
+- follower 通过 **Fetch 请求主动拉取** leader 的数据（不是 leader 推送）。
+- follower 不服务读写（2.4+ 支持就近读 follower 的特例，主要用于跨机房省流量）。
+- 副本分布由 controller 决定，同一分区的副本必须在不同 broker。
+
+## 2. ISR：同步副本集合
+
+**ISR（In-Sync Replicas）** = leader + "跟得上"的 follower。判定标准只有一个时间维度：
+
+```properties
+replica.lag.time.max.ms=30000
+# follower 超过 30 秒没有追上 leader 的最新位置 -> 踢出 ISR (收缩)
+# 被踢的 follower 追上后 -> 重新加入 (扩张)
+```
+
+被踢出的副本进入 **OSR**（Out-of-Sync Replicas）。ISR 的意义：
+
+- **acks=all 只等 ISR 中的副本确认**，不等 OSR——慢副本不拖累写入。
+- `min.insync.replicas=2` 要求 ISR 大小至少为 2，否则拒绝 acks=all 的写入。
+- leader 挂掉时，**默认只从 ISR 中选新 leader**——保证新 leader 拥有全部已确认数据。
+
+```text
+正常:      ISR = [1(L), 2, 3]        acks=all 等 3 个副本
+broker3 卡了 30 秒:
+  收缩:    ISR = [1(L), 2]           acks=all 只等 2 个, 写入不受阻
+broker2 也挂了:
+  收缩:    ISR = [1(L)]              min.insync.replicas=2 -> 拒绝写入!
+                                     (宁可不可写, 也不冒丢数据风险)
+```
+
+## 3. HW 与 LEO：两个水位
+
+| 概念 | 全称 | 含义 |
+|---|---|---|
+| LEO | Log End Offset | 每个副本日志末端的下一个写入位置 |
+| HW | High Watermark | ISR 中**所有副本都已复制到**的位置 = min(ISR 各副本 LEO) |
+
+```text
+          offset:  0   1   2   3   4   5
+Leader  日志:     [a] [b] [c] [d] [e]        LEO=5
+Follower2 日志:   [a] [b] [c] [d]            LEO=4
+Follower3 日志:   [a] [b] [c]                LEO=3
+
+HW = min(5,4,3) = 3
+消费者只能读到 offset 0..2 (HW 之前的消息)
+offset 3,4 已在 leader 上, 但 "未提交", 不可见
+```
+
+两条铁律：
+
+1. **消费者只能读到 HW 之前的消息**。避免读到"可能在 leader 切换后消失"的数据。
+2. **acks=all 的成功响应发生在消息进入所有 ISR 副本之后**，即该消息一定低于新的 HW。
+
+这就是"acks=all 已确认的消息，换 leader 也不丢"的数学保证：新 leader 来自 ISR，而 ISR 成员必然拥有 HW 之前的全部消息。
+
+## 4. Leader Epoch：修复截断错误
+
+老版本 Kafka 用 HW 做副本恢复时的日志截断依据，有一个著名缺陷：follower 的 HW 更新总是滞后 leader 一轮 Fetch，故障时机不巧会**把已提交的消息截断掉**，甚至造成副本间数据分歧。
+
+**Leader Epoch** 机制（0.11+）解决了这个问题。每次 leader 变更，epoch 加一，并记录"该 epoch 从哪个 offset 开始"：
+
+```text
+epoch 文件:  (epoch=0, startOffset=0)
+             (epoch=1, startOffset=120)   <- 第一次切主发生在 offset 120
+             (epoch=2, startOffset=345)
+
+follower 重启恢复流程 (新):
+  1. 向 leader 发 OffsetsForLeaderEpoch(自己最后的 epoch)
+  2. leader 返回该 epoch 的合法结束位置
+  3. follower 只截断超出该位置的部分  -- 精确, 不再依赖滞后的 HW
+```
+
+效果：即使连续故障切换，副本间也能收敛到一致的日志，不误删已提交数据。这是面试高频题"HW 会导致什么问题、怎么解决"的标准答案。
+
+## 5. unclean.leader.election：可用性与一致性的抉择
+
+如果 ISR 全空（所有同步副本都挂了），只剩 OSR 里落后的副本，怎么办？
+
+```properties
+unclean.leader.election.enable=false   # 默认
+```
+
+| 取值 | 行为 | 后果 |
+|---|---|---|
+| false（默认） | 等 ISR 副本活过来 | 分区不可用一段时间，但**不丢已确认数据** |
+| true | 让落后的 OSR 副本当 leader | 立刻恢复可用，但落后部分的**已确认消息永久丢失** |
+
+金融、订单类系统坚决保持 false；纯日志、可容忍丢失的场景可以权衡开 true。
+
+## 6. 配置与排查
+
+黄金组合回顾（与第 6 章呼应）：
+
+```properties
+# topic 级
+replication.factor=3
+min.insync.replicas=2
+# producer 级
+acks=all
+enable.idempotence=true
+```
+
+这个组合的容错边界：**挂任意 1 台 broker，不丢数据、不停服务**；挂 2 台时拒绝写入（保数据不保可用）。
+
+排查命令：
+
+```bash
+# 查看 ISR 状态
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic orders
+# Isr 列少于 Replicas 列 => 有副本掉队
+
+# 全集群找 under-replicated 分区 (ISR < 副本数)
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --describe --under-replicated-partitions
+
+# 找不满足 min.insync.replicas 的分区
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --describe --under-min-isr-partitions
+```
+
+<Callout type="warn" title="UnderReplicatedPartitions 是最重要的告警指标">
+JMX 指标 kafka.server ReplicaManager UnderReplicatedPartitions 长期大于 0，说明有 follower 持续追不上——可能是磁盘 IO 瓶颈、网络带宽不足或某 broker 过载。它是集群健康的第一哨兵，必须配告警。偶发的短暂非零（重启、流量尖峰）可以接受，持续非零必须处理。
+</Callout>
+
+<Callout type="info" title="为什么 Kafka 不用多数派写入">
+不同于 Raft 的 quorum 写（3 副本必须写成功 2 个），Kafka 用 ISR 模型：写入等待 ISR 全体确认，而 ISR 大小动态收缩。这让 Kafka 在同样容错能力下只需更少副本（Raft 容忍 1 台故障要 3 副本且每次等 2 个确认；Kafka 3 副本 + min.isr=2 正常时等 3 个、降级时等 2 个）。代价是依赖 controller 维护 ISR 的正确性——这正是元数据用 Raft（KRaft）而数据面用 ISR 的原因：各取所长。
+</Callout>
+
+## 小结
+
+- follower 主动 Fetch 拉取同步；ISR = 跟得上的副本集合，按 replica.lag.time.max.ms 判定
+- HW = ISR 最小 LEO，消费者只能读 HW 之前；acks=all 确认过的消息必在所有 ISR 副本上
+- Leader Epoch 取代 HW 作为截断依据，解决切主丢数据与副本分歧
+- unclean 选举默认关闭：宁可短暂不可用，不丢已确认数据
+- 黄金组合容错边界：3 副本 + min.isr=2 + acks=all，挂 1 台无感，挂 2 台停写保数据
+
+<Callout type="exercise" title="练习">
+1. 三节点集群上建 3 副本 topic，kill 一个 follower 所在 broker，观察 describe 中 ISR 收缩；重启后观察扩张回来的过程与耗时。
+2. 设 min.insync.replicas=2 后 kill 两个 broker，验证 acks=all 写入被拒绝而 acks=1 仍能写入——并解释为什么后者危险。
+3. 画图推演：3 副本、HW=10、leader LEO=12 时 leader 宕机，新 leader 上任后 offset 10、11 的消息会怎样？Producer 端什么配置能保证它们不"静默丢失"？
+</Callout>

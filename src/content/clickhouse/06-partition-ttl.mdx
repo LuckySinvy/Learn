@@ -1,0 +1,458 @@
+---
+title: 分区与 TTL
+order: 6
+description: PARTITION BY 选择、分区裁剪、分区级操作，以及行级列级 TTL 与冷热分层
+---
+
+# 分区与 TTL
+
+排序键是 part **内部**的组织方式，分区是 part **之间**的切分方式。它们解决不同的问题：分区让你能**整块删除数据**和**跳过整个目录**，这是稀疏索引做不到的。
+
+## 1. 分区是什么
+
+`PARTITION BY` 表达式的每个不同取值对应一个物理目录组。同一分区的 part 才会互相合并。
+
+```sql
+CREATE TABLE events
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+```
+
+插入横跨三个月的数据后：
+
+```sql
+SELECT partition, count() AS parts, sum(rows) AS rows,
+       formatReadableSize(sum(bytes_on_disk)) AS size
+FROM system.parts
+WHERE table = 'events' AND active
+GROUP BY partition ORDER BY partition;
+```
+
+```text
+┌─partition─┬─parts─┬────rows─┬─size──────┐
+│ 202404    │     3 │ 8241033 │ 52.1 MiB  │
+│ 202405    │     2 │ 8519204 │ 53.8 MiB  │
+│ 202406    │     4 │ 8239763 │ 52.0 MiB  │
+└───────────┴───────┴─────────┴───────────┘
+```
+
+磁盘上：
+
+```text
+/var/lib/clickhouse/data/demo/events/
+├── 202404_1_9_2/
+├── 202404_10_14_1/
+├── 202404_15_15_0/
+├── 202405_16_22_2/
+├── 202405_23_25_1/
+├── 202406_26_33_2/
+└── ...
+```
+
+## 2. 分区裁剪
+
+```sql
+SELECT count() FROM events WHERE event_time >= '2024-06-01';
+```
+
+ClickHouse 在读任何数据前，先看每个 part 的 `minmax_event_time.idx`，直接排除 202404 和 202405 两个分区的所有 part。
+
+```text
+查询执行的三层过滤
+
+第 1 层：分区裁剪（最粗，最快）
+  202404 ✗  整个目录跳过，一个字节都不读
+  202405 ✗
+  202406 ✓
+
+第 2 层：稀疏索引（中等粒度）
+  202406 分区内 122 个 granule → 只需读 31 个
+
+第 3 层：跳数索引 + WHERE 逐行过滤（最细）
+  31 个 granule × 8192 行 → 最终命中 12043 行
+```
+
+用 EXPLAIN 验证：
+
+```sql
+EXPLAIN indexes = 1
+SELECT count() FROM events WHERE event_time >= '2024-06-01';
+```
+
+```text
+      ReadFromMergeTree (demo.events)
+      Indexes:
+        MinMax
+          Keys: event_time
+          Condition: (event_time in [1717171200, +Inf))
+          Parts: 4/9              ← 9 个 part 只读 4 个
+          Granules: 1006/3020
+        Partition
+          Keys: toYYYYMM(event_time)
+          Condition: true
+          Parts: 4/4
+          Granules: 1006/1006
+```
+
+<Callout type="tip" title="分区裁剪需要 WHERE 条件能推导出分区键">
+`WHERE event_time >= '2024-06-01'` 能裁剪，因为 ClickHouse 能从 `event_time` 推出 `toYYYYMM(event_time) >= 202406`。
+
+但 `WHERE toString(event_time) LIKE '2024-06%'` **不能**裁剪——函数包裹后无法推导。写 WHERE 条件时永远让分区列裸露在比较符左边。
+</Callout>
+
+## 3. 怎么选分区键
+
+这是最容易出事的地方。核心矛盾是：**分区太粗则裁剪无效，分区太细则 part 爆炸**。
+
+| 数据量 | 推荐分区 | 说明 |
+|---|---|---|
+| 每天 10 万行以下 | 不分区，或按年 | 数据太少，分区反而增加开销 |
+| 每天 100 万~1 亿行 | `toYYYYMM(t)` 按月 | 最常见的选择 |
+| 每天 10 亿行以上 | `toYYYYMMDD(t)` 按天 | 单分区不超过几百 GB |
+| 需要按天删除 | `toYYYYMMDD(t)` | DROP PARTITION 是唯一的秒级删除手段 |
+
+<Callout type="warn" title="绝对不要用高基数列做分区键">
+最经典的事故：
+
+```sql
+PARTITION BY user_id                    -- 千万个分区，直接把系统跑死
+PARTITION BY toStartOfHour(event_time)  -- 一年 8760 个分区，通常太细
+PARTITION BY (country, toYYYYMMDD(t))   -- 200 国 × 365 天 = 7 万分区
+```
+
+后果：
+
+1. 每个分区至少一个目录、多个文件，几万分区就是几百万文件，inode 和文件句柄双双耗尽
+2. 每次 INSERT 如果数据横跨 N 个分区，就会同时生成 N 个 part
+3. `system.parts` 本身查询变慢，服务启动时要加载全部 part 元数据，启动要几十分钟
+4. 后台合并线程被大量小 part 淹没
+
+**经验红线：单表分区数控制在 1000 以内，最好几百。** ClickHouse 有个软限制 `max_partitions_per_insert_block = 100`，一次 INSERT 跨超过 100 个分区会报错，就是在保护你。
+</Callout>
+
+### 3.1 分区不是索引的替代品
+
+新手常见误区：既然按 `country` 过滤最多，那就 `PARTITION BY country`。
+
+错。分区键的目的是**数据生命周期管理**（按时间批量删除/归档），过滤应该交给排序键。`country` 该放 ORDER BY 第一列，而不是分区键。
+
+正确的组合：
+
+```sql
+PARTITION BY toYYYYMM(event_time)              -- 生命周期：按月归档删除
+ORDER BY (country, event_type, event_time)     -- 过滤：按业务维度
+```
+
+## 4. 分区级操作
+
+分区最实用的价值是这些**元数据级别的秒级操作**。
+
+### 4.1 DROP PARTITION：秒删
+
+```sql
+-- 删掉 2024 年 4 月的全部数据，无论有多少亿行，都是秒级
+ALTER TABLE events DROP PARTITION '202404';
+```
+
+对比 `DELETE FROM events WHERE event_time < '2024-05-01'`——后者是 mutation，要重写所有相关 part，10 亿行可能跑几小时。**DROP PARTITION 只是删目录**。
+
+```sql
+-- 查看有哪些分区可删
+SELECT DISTINCT partition FROM system.parts
+WHERE table = 'events' AND active ORDER BY partition;
+```
+
+### 4.2 DETACH / ATTACH：下线与恢复
+
+```sql
+-- 下线：把 part 目录移到 detached/ 子目录，数据还在但查询不到
+ALTER TABLE events DETACH PARTITION '202404';
+
+-- 后悔了，重新挂回来
+ALTER TABLE events ATTACH PARTITION '202404';
+```
+
+`DETACH` 是安全的"软删除"。运维实践中，删数据前先 DETACH 观察一天，确认没人抱怨再去 `detached/` 目录物理删除。
+
+```bash
+ls /var/lib/clickhouse/data/demo/events/detached/
+# 202404_1_9_2/  202404_10_14_1/  ...
+rm -rf /var/lib/clickhouse/data/demo/events/detached/202404_*
+```
+
+### 4.3 FREEZE：秒级快照备份
+
+```sql
+ALTER TABLE events FREEZE PARTITION '202406';
+```
+
+它在 `/var/lib/clickhouse/shadow/N/` 下创建**硬链接**指向当前 part 文件。因为是硬链接：
+
+- 瞬间完成，不占额外磁盘
+- 后续 merge 产生新文件、删除旧文件时，硬链接仍指向旧数据，快照不变
+- 之后可以从容地把 shadow 目录 rsync 到备份存储
+
+```bash
+# 备份流程
+clickhouse-client -q "ALTER TABLE demo.events FREEZE PARTITION '202406'"
+rsync -a /var/lib/clickhouse/shadow/1/ backup-server:/backups/events-202406/
+rm -rf /var/lib/clickhouse/shadow/1
+```
+
+恢复时把文件拷回表的 `detached/` 目录再 ATTACH。
+
+### 4.4 分区间搬运
+
+```sql
+-- 把某个分区移到另一张结构相同的表（元数据操作，秒级）
+ALTER TABLE events MOVE PARTITION '202404' TO TABLE events_archive;
+
+-- 从另一张表复制一个分区过来
+ALTER TABLE events_new REPLACE PARTITION '202406' FROM events;
+```
+
+`REPLACE PARTITION` 是**原子替换**，是数据修正的标准手段：把修正后的数据写进临时表，然后一次性替换掉线上分区，读者感知不到中间状态。
+
+```sql
+-- 典型的分区级数据修正流程
+CREATE TABLE events_fix AS events;
+INSERT INTO events_fix SELECT ... FROM source WHERE ...;   -- 重算 202406
+ALTER TABLE events REPLACE PARTITION '202406' FROM events_fix;
+DROP TABLE events_fix;
+```
+
+<Callout type="info" title="分区 ID 的写法">
+分区 ID 是 `PARTITION BY` 表达式的值转成的字符串：
+
+| PARTITION BY | 分区 ID 写法 |
+|---|---|
+| `toYYYYMM(t)` | `'202406'` |
+| `toYYYYMMDD(t)` | `'20240615'` |
+| `toDate(t)` | `'2024-06-15'` |
+| 无分区键 | `'all'` |
+| 元组 `(country, toYYYYMM(t))` | `('CN', 202406)` 或用 `partition_id` |
+
+不确定时查 `system.parts` 的 `partition` 和 `partition_id` 两列。也可以用 `ALTER TABLE ... DROP PARTITION ID '...'` 直接用内部 ID。
+</Callout>
+
+## 5. TTL：自动过期
+
+TTL 让 ClickHouse 在后台 merge 时自动删除或转移过期数据，不需要你写定时任务。
+
+### 5.1 表级 TTL：删除整行
+
+```sql
+-- 建表时声明
+CREATE TABLE events (...)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time)
+TTL event_time + INTERVAL 6 MONTH;
+
+-- 或者事后修改
+ALTER TABLE events MODIFY TTL event_time + INTERVAL 6 MONTH;
+```
+
+超过 6 个月的行会在 merge 时被丢弃。
+
+### 5.2 列级 TTL：只清某几列
+
+有些列体积大但时效性短，比如原始 URL、请求体。可以只让它们过期，保留其他列：
+
+```sql
+CREATE TABLE events
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String TTL event_time + INTERVAL 30 DAY,     -- 30 天后清空为默认值
+    raw_payload String TTL event_time + INTERVAL 7 DAY,      -- 7 天后清空
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+```
+
+过期后该列变成类型默认值（String 变空串，数值变 0），行本身还在。
+
+### 5.3 TTL 到冷存储
+
+生产上最有价值的用法：热数据放 SSD，冷数据自动挪到 HDD 或对象存储。
+
+先配置存储策略：
+
+```xml
+<!-- /etc/clickhouse-server/config.d/storage.xml -->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <fast_ssd>
+                <path>/mnt/ssd/clickhouse/</path>
+            </fast_ssd>
+            <slow_hdd>
+                <path>/mnt/hdd/clickhouse/</path>
+            </slow_hdd>
+            <s3_cold>
+                <type>s3</type>
+                <endpoint>https://s3.amazonaws.com/mybucket/ch/</endpoint>
+                <access_key_id>KEY</access_key_id>
+                <secret_access_key>SECRET</secret_access_key>
+            </s3_cold>
+        </disks>
+        <policies>
+            <hot_warm_cold>
+                <volumes>
+                    <hot>
+                        <disk>fast_ssd</disk>
+                    </hot>
+                    <warm>
+                        <disk>slow_hdd</disk>
+                    </warm>
+                    <cold>
+                        <disk>s3_cold</disk>
+                    </cold>
+                </volumes>
+            </hot_warm_cold>
+        </policies>
+    </storage_configuration>
+</clickhouse>
+```
+
+然后在表上组合多条 TTL 规则：
+
+```sql
+CREATE TABLE events (...)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time)
+TTL event_time + INTERVAL 7 DAY   TO VOLUME 'warm',
+    event_time + INTERVAL 90 DAY  TO VOLUME 'cold',
+    event_time + INTERVAL 2 YEAR  DELETE
+SETTINGS storage_policy = 'hot_warm_cold';
+```
+
+```text
+数据生命周期
+
+  写入        7 天后         90 天后          2 年后
+    │            │              │               │
+    ▼            ▼              ▼               ▼
+┌────────┐  ┌────────┐   ┌───────────┐    ┌────────┐
+│ SSD    │─▶│ HDD    │──▶│ S3 对象存储│───▶│ 删除   │
+│ 查询快 │  │ 查询中 │   │ 查询慢但便宜│    │        │
+└────────┘  └────────┘   └───────────┘    └────────┘
+```
+
+查看数据当前在哪个盘：
+
+```sql
+SELECT partition, disk_name, sum(rows),
+       formatReadableSize(sum(bytes_on_disk)) AS size
+FROM system.parts WHERE table = 'events' AND active
+GROUP BY partition, disk_name ORDER BY partition;
+```
+
+### 5.4 TTL 聚合：过期后降采样
+
+高级用法。老数据不删，但压缩成聚合结果：
+
+```sql
+CREATE TABLE events_rollup
+(
+    event_time  DateTime,
+    country     LowCardinality(String),
+    event_type  LowCardinality(String),
+    cnt         UInt64,
+    total_ms    UInt64
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time)
+TTL event_time + INTERVAL 90 DAY
+    GROUP BY country, event_type
+    SET cnt = sum(cnt), total_ms = sum(total_ms), event_time = min(event_time);
+```
+
+90 天后，明细行按 `country, event_type` 聚合成一行。注意 `GROUP BY` 的列必须是 ORDER BY 的前缀。
+
+<Callout type="warn" title="TTL 的三个坑">
+1. **TTL 不是实时的**。它只在后台 merge 时执行。如果某个 part 长期没被选中合并，过期数据会一直留着。用 `ALTER TABLE events MATERIALIZE TTL` 强制立刻执行一遍。
+
+2. **TTL DELETE 比 DROP PARTITION 贵得多**。TTL 删除需要重写整个 part（把未过期的行拷到新 part）。如果你的过期粒度正好等于分区粒度，用定时 `DROP PARTITION` 效率高几个数量级。
+
+3. **修改 TTL 不会立刻影响已有数据**。`ALTER TABLE ... MODIFY TTL` 只改元数据，老 part 要等下次 merge 或手动 `MATERIALIZE TTL` 才会应用新规则。
+</Callout>
+
+监控 TTL 相关的后台任务：
+
+```sql
+SELECT database, table, elapsed, progress, result_part_name
+FROM system.merges WHERE is_mutation = 0;
+
+SELECT * FROM system.mutations WHERE is_done = 0;
+```
+
+## 6. 一个完整的实践方案
+
+给 `events` 表设计完整的生命周期策略：
+
+```sql
+CREATE TABLE demo.events
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)                 -- 按月分区，12 个月 = 12 个分区
+ORDER BY (country, event_type, event_time)
+TTL event_time + INTERVAL 7 DAY TO VOLUME 'warm'  -- 热数据 7 天在 SSD
+SETTINGS storage_policy = 'hot_warm_cold',
+         index_granularity = 8192;
+```
+
+删除策略不用 TTL DELETE，改用定时脚本：
+
+```bash
+#!/bin/bash
+# 每月 1 号执行，删除 13 个月前的分区
+OLD=$(date -d '13 months ago' +%Y%m)
+clickhouse-client -q "ALTER TABLE demo.events DROP PARTITION '${OLD}'"
+```
+
+这样删除是秒级的，而不是重写几十 GB。
+
+<Callout type="exercise" title="练习">
+1. 给 `events` 表加上 `PARTITION BY toYYYYMM(event_time)`，插入横跨 3 个月的数据，用 `system.parts` 确认分区数量。
+2. 执行 `EXPLAIN indexes = 1 SELECT count() FROM events WHERE event_time >= '2024-06-01'`，记下 `Parts: x/y`，验证分区裁剪生效。
+3. 对同一个分区依次执行 `DETACH PARTITION`（查询验证数据消失）→ `ATTACH PARTITION`（数据回来）→ `FREEZE PARTITION`（去 shadow 目录看硬链接）→ `DROP PARTITION`，测量各自耗时。
+4. 建一张带 `TTL event_time + INTERVAL 1 MINUTE` 的小表，插入数据后等两分钟，观察数据是否消失。如果没消失，执行 `ALTER TABLE ... MATERIALIZE TTL` 再看。思考为什么需要手动触发。
+</Callout>
+
+## 小结
+
+- 分区是 part 之间的切分，排序键是 part 内部的排序，二者解决不同问题
+- 分区裁剪是查询的第一层过滤，比稀疏索引更粗更快，能整目录跳过
+- 分区键的目的是生命周期管理，不是加速过滤——过滤交给排序键
+- 分区数控制在 1000 以内，绝不用高基数列分区
+- `DROP PARTITION` 秒级删除，`DETACH` 软删除，`FREEZE` 硬链接快照，`REPLACE PARTITION` 原子替换
+- TTL 支持行级删除、列级清空、按卷迁移、聚合降采样
+- TTL 只在 merge 时执行，不是实时；能用 `DROP PARTITION` 就别用 TTL DELETE
+- 下一章讲 ReplacingMergeTree，解决 ClickHouse 里最棘手的问题：更新和删除 →

@@ -1,0 +1,159 @@
+---
+title: 执行计划 EXPLAIN
+order: 14
+description: EXPLAIN 各列含义、type 等级、Extra 关键字、EXPLAIN ANALYZE 与优化器提示
+---
+
+# 执行计划 EXPLAIN
+
+前两章你已经知道索引怎么工作、该怎么建，但「SQL 到底有没有走索引、走得好不好」不能靠猜——EXPLAIN 就是优化器交出的答卷。看懂它，慢 SQL 优化就从玄学变成工程。
+
+## 1. 基本用法
+
+```sql
+EXPLAIN SELECT o.order_no, u.username
+FROM orders o
+JOIN users u ON u.id = o.user_id
+WHERE o.user_id = 1;
+```
+
+```text
++----+-------------+-------+-------+------------------+------------------+---------+-------+------+-------+
+| id | select_type | table | type  | possible_keys    | key              | key_len | ref   | rows | Extra |
++----+-------------+-------+-------+------------------+------------------+---------+-------+------+-------+
+|  1 | SIMPLE      | u     | const | PRIMARY          | PRIMARY          | 8       | const |    1 | NULL  |
+|  1 | SIMPLE      | o     | ref   | idx_user_created | idx_user_created | 8       | const |    2 | NULL  |
++----+-------------+-------+-------+------------------+------------------+---------+-------+------+-------+
+```
+
+每行代表访问一张表（或物化结果），从上往下就是访问顺序（id 相同时）。
+
+## 2. 核心列逐个讲
+
+| 列 | 含义 |
+|---|---|
+| id | 子查询/UNION 的层级编号，越大越先执行；相同则自上而下 |
+| select_type | SIMPLE / PRIMARY / SUBQUERY / DERIVED（派生表）/ UNION 等 |
+| table | 访问的表（或 derived2 这类物化表） |
+| **type** | **访问类型，最重要的一列**，见下节 |
+| possible_keys | 候选索引 |
+| **key** | **实际选用的索引**，NULL 即没走索引 |
+| key_len | 用到的索引字节数——判断联合索引用了几列的关键 |
+| ref | 与索引比较的对象（常量 const、另一表的列） |
+| **rows** | **预估**扫描行数（基于统计信息，不是精确值） |
+| filtered | 经过 WHERE 后剩余行数百分比估算 |
+| **Extra** | 附加信息，藏着最多的优化线索 |
+
+**key_len 的用法**：索引 `(user_id BIGINT, created_at DATETIME)` 全用上是 8 + 5 = 13；如果 key_len 只有 8，说明只用到了 user_id——最左前缀断了或范围截断了。这是判断「联合索引到底吃了几列」的硬指标。
+
+## 3. type：访问类型等级表
+
+从好到差：
+
+| type | 含义 | 例子 |
+|---|---|---|
+| system/const | 主键或唯一索引的常量查询，最多一行 | `WHERE id = 1` |
+| eq_ref | JOIN 时被驱动表按主键/唯一索引匹配，每行最多配一行 | `JOIN u ON u.id = o.user_id` |
+| ref | 普通（非唯一）索引等值查询 | `WHERE user_id = 1` |
+| range | 索引范围扫描 | `WHERE id > 100`、IN、BETWEEN |
+| index | 扫整棵索引树（常配合覆盖索引） | 无条件但只取索引列 |
+| **ALL** | **全表扫描** | 没索引可用 |
+
+经验线：**核心业务查询至少要到 range，最好 ref 以上**。看到 ALL 先检查是不是缺索引或索引失效；但小表 ALL 无所谓，别教条。
+
+## 4. Extra 关键字解读
+
+| Extra | 含义 | 态度 |
+|---|---|---|
+| Using index | 覆盖索引，无回表 | 很好 |
+| Using index condition | 索引下推 ICP 生效 | 好 |
+| Using where | Server 层过滤（引擎返回后再筛） | 中性，结合 rows 看 |
+| Using filesort | 需要额外排序（内存或磁盘） | 大结果集时要优化 |
+| Using temporary | 用了临时表（GROUP BY/DISTINCT 常见） | 大数据量时要优化 |
+| Using join buffer (hash join) | 被驱动表无索引，走 Hash Join | 检查连接列索引 |
+
+`Using filesort` + `Using temporary` 同时出现的 GROUP BY/ORDER BY 大查询，通常就是慢查询榜单的常客——解法多半是让联合索引同时满足过滤和排序（第 13 章）。
+
+## 5. EXPLAIN ANALYZE（8.0.18+）：看真实执行
+
+EXPLAIN 是**估算**，EXPLAIN ANALYZE **真的执行一遍**并报告实际耗时与行数：
+
+```sql
+EXPLAIN ANALYZE
+SELECT user_id, COUNT(*) FROM orders
+WHERE created_at >= '2026-07-01'
+GROUP BY user_id;
+```
+
+```text
+-> Table scan on <temporary>  (actual time=0.61..0.62 rows=3 loops=1)
+    -> Aggregate using temporary table  (actual time=0.60..0.60 rows=3 loops=1)
+        -> Filter: (orders.created_at >= TIMESTAMP'2026-07-01 00:00:00')
+            (cost=0.65 rows=1.33) (actual time=0.05..0.07 rows=4 loops=1)
+            -> Table scan on orders  (cost=0.65 rows=4) (actual time=0.04..0.05 rows=4 loops=1)
+```
+
+读法：树形结构自内向外执行；每个节点对比 `(cost=估算 rows=估算)` 与 `(actual time=首行..全部 rows=实际 loops=次数)`。**估算 rows 与实际 rows 差几个数量级**，就是统计信息过期或优化器误判的信号：
+
+```sql
+ANALYZE TABLE orders;   -- 重新收集统计信息，常能纠正误判
+```
+
+注意：EXPLAIN ANALYZE 会真实执行语句（8.0 只支持 SELECT），对大查询慎用于生产高峰。
+
+## 6. 优化器提示（Hints）
+
+统计信息修正后优化器仍然选错时，可以下「指令」：
+
+```sql
+-- 强制/禁止使用某索引
+SELECT * FROM orders FORCE INDEX (idx_user_created) WHERE user_id = 1;
+SELECT * FROM orders IGNORE INDEX (idx_user_created) WHERE user_id = 1;
+
+-- 8.0 风格的注释 Hint（推荐，粒度更细）
+SELECT /*+ INDEX(o idx_user_created) */ * FROM orders o WHERE o.user_id = 1;
+SELECT /*+ NO_INDEX(o idx_user_created) */ * FROM orders o WHERE o.user_id = 1;
+
+-- JOIN 顺序提示
+SELECT /*+ JOIN_ORDER(o, u) */ * FROM orders o JOIN users u ON u.id = o.user_id;
+
+-- 单条语句的资源护栏：最多执行 3000 毫秒
+SELECT /*+ MAX_EXECUTION_TIME(3000) */ * FROM orders;
+```
+
+<Callout type="warn" title="Hint 是最后手段，不是常规武器">
+硬编码的 FORCE INDEX 会随数据分布变化而过时——今天的最优索引可能是明年的性能炸弹，而且表删了该索引 SQL 直接报错。优先顺序永远是：改写 SQL → 调整索引 → ANALYZE TABLE → 最后才是 Hint，并留注释说明原因。
+</Callout>
+
+## 7. 实战分析套路
+
+拿到一条慢 SQL 的固定流程：
+
+```text
+1. EXPLAIN 看全貌
+   ├─ type 是 ALL？ → 缺索引 or 索引失效（函数/隐式转换/最左前缀）
+   ├─ key 用的索引对吗？key_len 吃满了吗？
+   ├─ rows 估算量级合理吗？
+   └─ Extra 有 filesort / temporary？
+2. EXPLAIN ANALYZE 对照实际行数与耗时，定位最耗时的节点
+3. 措施：建/改联合索引（等值+范围+排序一体设计）、改写 SQL、ANALYZE TABLE
+4. 再次 EXPLAIN 验证，对比前后 rows 与耗时
+```
+
+<Callout type="tip" title="EXPLAIN FORMAT=TREE 和 FORMAT=JSON">
+`EXPLAIN FORMAT=TREE` 输出与 ANALYZE 相同的树形结构（不执行），比表格更容易看清 JOIN 顺序和 Hash Join；`FORMAT=JSON` 则包含成本数字 cost_info，适合深挖优化器为什么这么选。
+</Callout>
+
+## 小结
+
+- EXPLAIN 五个关键读数：type（访问等级）、key（真用的索引）、key_len（联合索引吃了几列）、rows（估算量）、Extra（filesort/temporary/覆盖索引）
+- type 至少 range，核心查询争取 ref/eq_ref；ALL + 大 rows = 优先处理对象
+- EXPLAIN ANALYZE 给真实耗时，估算与实际差距大就 ANALYZE TABLE
+- Hint 能救急，但优先改 SQL 和索引
+- 优化闭环：EXPLAIN → 改 → 再 EXPLAIN 对比
+
+<Callout type="exercise" title="练习">
+1. 对 `SELECT * FROM orders WHERE DATE(created_at) = '2026-07-01'` 执行 EXPLAIN，确认 type=ALL；改写成范围条件后再看，记录 type 与 rows 的变化。
+2. 构造一条 ORDER BY 引发 Using filesort 的查询，通过加联合索引让 filesort 消失。
+3. 用 EXPLAIN FORMAT=TREE 观察一条三表 JOIN 的执行顺序，指出驱动表，并用 JOIN_ORDER Hint 改变顺序对比 rows 估算。
+</Callout>

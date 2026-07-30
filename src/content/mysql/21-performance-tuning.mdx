@@ -1,0 +1,197 @@
+---
+title: 性能优化
+order: 21
+description: 慢查询日志、常见慢 SQL 模式与改写、连接池、buffer pool 等关键参数、分库分表思路
+---
+
+# 性能优化
+
+性能优化不是玄学调参，而是一条清晰的漏斗：**先找到慢的（慢查询日志）→ 再改快它（SQL 与索引）→ 然后管好资源（连接池与参数）→ 实在扛不住再动架构（分库分表）**。顺序千万别反——90% 的数据库性能问题靠前两步就能解决。
+
+## 1. 慢查询日志：找到病人
+
+```ini
+[mysqld]
+slow_query_log = ON
+slow_query_log_file = /var/log/mysql/slow.log
+long_query_time = 1              # 超过 1 秒记录（可低至 0.1）
+log_queries_not_using_indexes = ON   # 未走索引的也记（配合限流参数用）
+```
+
+运行时开启：
+
+```sql
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;
+```
+
+分析工具首选 `pt-query-digest`（mysqldumpslow 太粗糙）：
+
+```bash
+pt-query-digest /var/log/mysql/slow.log > report.txt
+# 报告按「总耗时」排序聚合同类 SQL——优先修「执行频繁 × 单次不算最慢」的大头，
+# 而不是只盯单次最慢的那条
+```
+
+没有慢日志权限时（云数据库常见），用 performance_schema：
+
+```sql
+SELECT DIGEST_TEXT, COUNT_STAR, 
+       ROUND(SUM_TIMER_WAIT/1e12, 2) AS total_sec,
+       ROUND(AVG_TIMER_WAIT/1e9, 2)  AS avg_ms,
+       SUM_ROWS_EXAMINED
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY SUM_TIMER_WAIT DESC LIMIT 10;
+```
+
+## 2. 常见慢 SQL 模式与改写
+
+前面章节的知识在这里汇总成「体检清单」：
+
+| 模式 | 症状 | 改法 | 出处 |
+|---|---|---|---|
+| 函数包列 | `DATE(created_at) = ?` 全表扫 | 改左闭右开范围 | 第 13 章 |
+| 隐式转换 | 字符串列不加引号 | 条件值加引号、JOIN 列类型对齐 | 第 6 章 |
+| 深分页 | `LIMIT 20 OFFSET 1000000` | 延迟关联 / 游标分页 | 第 7 章 |
+| SELECT * | 回表多、覆盖索引失效 | 只取需要的列 | 第 13 章 |
+| 前导通配 | `LIKE '%kw%'` | 前缀匹配 / 全文索引 / ES | 第 6 章 |
+| OR 两侧缺索引 | 整条全表扫 | 拆 UNION ALL | 第 13 章 |
+| 大事务批量写 | 锁等待、主从延迟 | 分批 + LIMIT | 第 5 章 |
+| filesort + temporary | GROUP BY/ORDER BY 大结果集 | 联合索引覆盖过滤+排序 | 第 14 章 |
+| JOIN 无索引 | hash join 扫大表 | 被驱动表连接列建索引 | 第 9 章 |
+
+两个再补充的高频改写：
+
+```sql
+-- COUNT 优化：不要 SELECT COUNT(*) 全表数（InnoDB 必须真数）
+-- 需要精确值且高频 → 计数表/Redis 维护；允许近似 → 用统计信息
+SELECT TABLE_ROWS FROM information_schema.tables
+WHERE table_schema='shop' AND table_name='orders';   -- 近似值，够画仪表盘
+
+-- 只判断存在性时，LIMIT 1 短路
+SELECT 1 FROM orders WHERE user_id = 1 LIMIT 1;      -- 好于 COUNT(*) > 0
+```
+
+## 3. 连接池：应用与数据库之间的闸门
+
+每个 MySQL 连接约消耗几 MB 内存 + 一个线程，TCP + 认证握手成本高。应用必须用连接池（HikariCP、Druid、database/sql 内置池），并且**算好总账**：
+
+```text
+所有应用实例的 maxPoolSize 之和  <  MySQL 的 max_connections × 0.8
+例：20 个 Pod × 每个池 20 连接 = 400，则 max_connections 至少 500
+```
+
+连接池参数经验值：
+
+- `maximumPoolSize`：不是越大越好！数据库同时真正干活的连接数上限约为 CPU 核数的 2–4 倍，池子给到几十就够，几百只会加剧上下文切换和锁竞争；
+- `maxLifetime` 要**小于** MySQL 的 `wait_timeout`（默认 8 小时），否则池里躺着已被服务端断开的死连接，业务偶发「Communications link failure」。
+
+```sql
+SHOW VARIABLES LIKE 'max_connections';
+SHOW STATUS LIKE 'Threads_connected';   -- 当前连接数
+SHOW STATUS LIKE 'Max_used_connections';
+```
+
+## 4. 关键服务器参数
+
+调参只需盯住少数大头（以专用数据库服务器为例）：
+
+### 4.1 Buffer Pool：最重要的一个
+
+```ini
+[mysqld]
+innodb_buffer_pool_size = 12G          # 物理内存的 50%~70%
+innodb_buffer_pool_instances = 8       # 大池分片降低并发争用
+```
+
+衡量效果看命中率与磁盘读：
+
+```sql
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- Innodb_buffer_pool_read_requests：逻辑读（内存）
+-- Innodb_buffer_pool_reads：真去磁盘读的次数，占比应低于 1%
+```
+
+### 4.2 redo log 容量
+
+```ini
+innodb_redo_log_capacity = 4G     # 8.0.30+；写入密集适当加大
+```
+
+redo 太小 → 频繁触发脏页强制刷盘 → 写入周期性卡顿。观察 `SHOW ENGINE INNODB STATUS` 里 checkpoint 落后程度判断。
+
+### 4.3 刷盘与安全性
+
+```ini
+innodb_flush_log_at_trx_commit = 1   # 生产标配（第 15 章）
+sync_binlog = 1                      # 每次提交刷 binlog，主从一致的保障
+```
+
+「双 1」是金融级安全配置；性能极限压榨且可容忍丢 1 秒的场景才考虑放松。
+
+### 4.4 其他值得看一眼的
+
+```ini
+max_connections = 1000
+tmp_table_size = 64M                 # 内存临时表上限，超了落盘
+max_heap_table_size = 64M            # 与上者取小生效
+table_open_cache = 4000
+```
+
+<Callout type="warn" title="不要迷信调参">
+参数默认值在 8.0 已相当合理。除 buffer pool、redo 容量、连接数、双 1 之外，其余参数没有量化证据（监控图、压测对比）就不要乱动——网上抄来的「优化配置」在你的负载下可能适得其反。永远：一次只改一个参数，观察，再决定。
+</Callout>
+
+## 5. 架构级手段：读写分离与分库分表
+
+单实例优化到头（SQL 无可改、参数已合理、硬件已顶配）才走到这一步。
+
+### 5.1 先问三个问题
+
+1. 瓶颈是读还是写？**读瓶颈 → 加从库/加缓存**，还轮不到分库分表；
+2. 是容量问题（单表几亿行、磁盘吃紧）还是吞吐问题（写 QPS 顶到头）？
+3. 能不能先归档？把 2 年前的订单挪到历史库，主表瘦身 80% 是常态。
+
+### 5.2 分区表：库内的第一步
+
+```sql
+-- 按月 RANGE 分区：查询带时间条件可裁剪分区，删旧数据秒级 DROP PARTITION
+CREATE TABLE orders_log (
+  id BIGINT UNSIGNED NOT NULL,
+  created_at DATETIME NOT NULL,
+  data JSON,
+  PRIMARY KEY (id, created_at)
+)
+PARTITION BY RANGE COLUMNS (created_at) (
+  PARTITION p202606 VALUES LESS THAN ('2026-07-01'),
+  PARTITION p202607 VALUES LESS THAN ('2026-08-01'),
+  PARTITION pmax    VALUES LESS THAN (MAXVALUE)
+);
+```
+
+分区适合时间序数据的滚动清理；它不解决写吞吐（还在一个实例上）。
+
+### 5.3 分库分表要点速览
+
+- **垂直拆**：按业务域把表拆到不同库（订单库/用户库/商品库），微服务标配，优先做；
+- **水平拆**：单表按分片键拆到 N 个库表。分片键选择是灵魂——订单表用 user_id 分片则「查用户的订单」单库命中，但「按商家查订单」要广播，通常再做一份按商家分片的**异构索引表**（binlog 同步）；
+- 拆完失去的东西要有替代：跨片 JOIN（改应用层聚合/宽表）、跨片事务（改最终一致/消息）、全局唯一 ID（雪花算法/号段）；
+- 中间件：ShardingSphere（Java 生态）、Vitess；或直接上分布式数据库（TiDB/OceanBase）免拆。
+
+<Callout type="tip" title="优化的优先级金字塔">
+SQL 与索引（收益最大、成本最低）→ 缓存与归档 → 读写分离 → 参数与硬件 → 分库分表（收益大但复杂度爆炸）。跳级操作（表才 500 万行就嚷嚷分库分表）是最常见的过度设计。
+</Callout>
+
+## 小结
+
+- 优化闭环：慢日志 + pt-query-digest 找大头 → EXPLAIN 改写 → 验证
+- 慢 SQL 九大模式对照清单逐条排查，绝大多数慢是 SQL/索引问题
+- 连接池总数要和 max_connections 对齐，maxLifetime 小于 wait_timeout
+- 参数抓大头：buffer pool（内存 50–70%）、redo 容量、双 1、连接数
+- 架构手段有顺序：归档 → 缓存/读写分离 → 分区 → 分库分表
+
+<Callout type="exercise" title="练习">
+1. 打开慢查询日志（long_query_time=0.1），跑几条本课程里的「反面教材」SQL，用 pt-query-digest 或 performance_schema 找出 Top 3 并逐条优化。
+2. 查询你实例的 buffer pool 命中率，并解释 read_requests 与 reads 两个指标的关系。
+3. 假设 orders 表 5 年后达到 20 亿行：写出你的演进路线（归档策略、分片键选择、需要的异构索引表），并说明每一步解决什么瓶颈。
+</Callout>

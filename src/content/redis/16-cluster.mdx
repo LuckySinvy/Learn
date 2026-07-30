@@ -1,0 +1,189 @@
+---
+title: Cluster：16384 槽的数据分片
+order: 16
+description: 哈希槽分片、MOVED/ASK 重定向、hash tag、跨槽命令限制、在线扩缩容
+---
+
+# Cluster：16384 槽的数据分片
+
+哨兵架构里所有数据仍在一台主库上——内存超过单机、写 QPS 超过单主时就到头了。Redis Cluster 把数据**分片**到多个主库：每个主库负责一部分数据，各配从库做故障转移，容量与写吞吐都能水平扩展。
+
+## 1. 哈希槽：数据怎么分
+
+Cluster 把整个键空间划分为 **16384 个槽（slot）**，每个 key 通过 CRC16 映射到一个槽，每个主节点负责一段槽区间：
+
+```text
+slot = CRC16(key) mod 16384
+
++-----------------+  +-----------------+  +------------------+
+| 节点 A           |  | 节点 B          |  | 节点 C            |
+| slots 0~5460    |  | slots 5461~10922|  | slots 10923~16383|
+|   + 从节点 A1    |  |   + 从节点 B1    |  |   + 从节点 C1     |
++-----------------+  +-----------------+  +------------------+
+
+key "user:1001" -> CRC16 -> slot 8123 -> 节点 B
+```
+
+为什么引入"槽"这个中间层，而不是直接 `hash(key) mod 节点数`？因为**节点数会变**。直接取模时加一台机器，几乎所有 key 的归属都变了，等于全量迁移。有了槽，扩容只需要把**一部分槽**（连同槽里的 key）搬到新节点，其余数据纹丝不动。
+
+为什么是 16384 而不是 65536？节点间心跳包里要携带自己负责的槽位图，16384 bit = 2 KB，65536 bit = 8 KB——心跳是高频消息，作者选择了够用且更省带宽的值（官方建议集群不超过 1000 节点，16384 个槽足够分）。
+
+## 2. 搭建与基本操作
+
+```conf
+# 每个节点的 redis.conf
+port 7001
+cluster-enabled yes
+cluster-config-file nodes-7001.conf     # 节点自动维护, 别手改
+cluster-node-timeout 15000
+appendonly yes
+```
+
+```bash
+# 6 个节点组成 3 主 3 从
+$ redis-cli --cluster create \
+  10.0.0.1:7001 10.0.0.2:7002 10.0.0.3:7003 \
+  10.0.0.1:7004 10.0.0.2:7005 10.0.0.3:7006 \
+  --cluster-replicas 1
+>>> Performing hash slots allocation on 6 nodes...
+[OK] All 16384 slots covered.
+
+# 连接时务必带 -c (cluster 模式, 自动跟随重定向)
+$ redis-cli -c -p 7001
+127.0.0.1:7001> CLUSTER INFO
+cluster_state:ok
+cluster_slots_assigned:16384
+cluster_known_nodes:6
+cluster_size:3
+127.0.0.1:7001> CLUSTER NODES
+07c3... 10.0.0.2:7002@17002 master - 0 1722310000 2 connected 5461-10922
+...
+```
+
+## 3. MOVED 与 ASK 重定向
+
+Cluster 的客户端路由是"去中心化"的：任何节点都能告诉你 key 在哪。
+
+### 3.1 MOVED：槽不归我管
+
+```bash
+# 不带 -c 连接节点 A, 访问属于节点 B 的 key:
+127.0.0.1:7001> GET user:1001
+(error) MOVED 8123 10.0.0.2:7002
+# 带 -c 时客户端自动跳转:
+127.0.0.1:7001> GET user:1001
+-> Redirected to slot [8123] located at 10.0.0.2:7002
+"Ada"
+```
+
+MOVED 表示"槽 8123 **永久**归 7002 管"。智能客户端（Jedis/Lettuce/redis-py-cluster）收到后会更新本地的"槽到节点"映射表，后续同槽请求直达正确节点，不再多跳。
+
+### 3.2 ASK：槽正在搬家
+
+槽迁移进行到一半时，槽里的 key 一部分在源节点、一部分已到目标节点：
+
+```text
+slot 8123 迁移中: 源节点 B (MIGRATING) -> 目标节点 D (IMPORTING)
+
+客户端 GET k1 -> 节点 B:
+  ├─ k1 还在 B  -> 正常返回
+  └─ k1 已搬走  -> (error) ASK 8123 10.0.0.4:7007
+       客户端 -> 节点 D: 先发 ASKING, 再 GET k1
+
+ASK  = 临时重定向, 只对本次请求有效, 不更新槽映射
+MOVED = 永久重定向, 更新槽映射
+```
+
+迁移完成后源节点开始对该槽返回 MOVED，客户端更新映射，世界恢复平静。
+
+## 4. hash tag 与跨槽限制
+
+### 4.1 多 key 命令的限制
+
+MSET、SINTERSTORE、事务、Lua 脚本里的多个 key，**必须落在同一个槽**，否则报错：
+
+```bash
+127.0.0.1:7001> MSET user:1 a user:2 b
+(error) CROSSSLOT Keys in request don't hash to the same slot
+```
+
+### 4.2 hash tag：把相关 key 钉进同一个槽
+
+key 中出现花括号时，**只有花括号内的部分**参与 CRC16 计算。把用户相关的 key 都写成 `user:{1001}:xxx` 的形式：
+
+```bash
+127.0.0.1:7001> MSET {user:1001}:name Ada {user:1001}:age 30
+OK                      # 两个 key 的 hash tag 都是 user:1001, 同槽, 成功
+127.0.0.1:7001> EVAL "return redis.call('GET', KEYS[1])" 1 {user:1001}:name
+"Ada"                   # 同理, Lua 多 key 也能用
+```
+
+代价是数据倾斜风险：所有 `{hot}` 前缀的 key 都挤在一个槽、一个节点。hash tag 只用于**确实需要原子多 key 操作**的一小撮 key，别全库滥用。
+
+其他限制：Cluster 只支持 0 号库（SELECT 无效）；Pub/Sub 建议用分片版 SSUBSCRIBE（第 13 章）；KEYS/SCAN 只扫当前节点，全集群遍历要逐节点执行。
+
+## 5. 故障转移
+
+Cluster 内置了类似哨兵的机制，不需要单独部署哨兵：
+
+```text
+1. 节点间通过 gossip 协议交换状态 (PING/PONG 心跳)
+2. 主节点 B 失联超过 cluster-node-timeout -> 标记 PFAIL (疑似下线)
+3. 多数主节点都认为 B PFAIL -> 升级为 FAIL (确定下线), 广播
+4. B 的从节点发起选举, 由其余主节点投票 (每纪元一票, 多数当选)
+5. 当选从节点执行切换: 接管 B 的槽, 广播自己成为新主
+```
+
+注意：**多数主节点存活**是集群运作的前提。3 主集群同时挂 2 个主（且从库也没顶上）时，整个集群拒绝服务（`cluster_state:fail`）。默认 `cluster-require-full-coverage yes` 时，任何槽无人负责都会让全集群停止服务，可按业务改为 no（缺槽部分报错，其余照常）。
+
+## 6. 扩容与缩容
+
+### 6.1 扩容：加节点 + 迁槽
+
+```bash
+# 1. 新主节点加入集群
+$ redis-cli --cluster add-node 10.0.0.4:7007 10.0.0.1:7001
+# 2. 从现有节点匀一些槽过去（交互式选择迁多少、从谁迁）
+$ redis-cli --cluster reshard 10.0.0.1:7001
+How many slots do you want to move? 4096
+What is the receiving node ID? <7007 的 node id>
+Source node: all
+# 3. 给新主配从库
+$ redis-cli --cluster add-node 10.0.0.4:7008 10.0.0.1:7001 \
+  --cluster-slave --cluster-master-id <7007 的 node id>
+```
+
+槽迁移是**在线**的：逐个 key 用 MIGRATE 命令原子搬运，期间靠 ASK 重定向保证读写正确。大 key 会让单次 MIGRATE 阻塞两边节点——又一个要治理大 key 的理由。
+
+### 6.2 缩容：先清空槽再摘节点
+
+```bash
+# 1. 把待下线节点的槽全部 reshard 给其他节点
+$ redis-cli --cluster reshard 10.0.0.1:7001   # source 填待下线节点
+# 2. 摘除节点
+$ redis-cli --cluster del-node 10.0.0.1:7001 <待下线 node id>
+```
+
+```bash
+# 迁移后检查均衡度
+$ redis-cli --cluster check 10.0.0.1:7001
+$ redis-cli --cluster rebalance 10.0.0.1:7001    # 自动均衡槽分布
+```
+
+<Callout type="warn" title="Cluster 不是银弹">
+上 Cluster 前想清楚：1）多 key 原子操作要 hash tag 迁就；2）Lua/事务受同槽限制，很多单机玩法失效；3）客户端、监控、运维复杂度全面上升；4）它仍是异步复制，故障转移仍可能丢尾部写入。**数据量与吞吐没到单机瓶颈时，主从 + 哨兵是更省心的选择。**
+</Callout>
+
+## 小结
+
+- 16384 个槽是 key 与节点之间的间接层，扩缩容只搬槽不重分布全量数据
+- MOVED 永久重定向（更新路由表），ASK 临时重定向（迁移中）
+- 多 key 命令须同槽，hash tag `{...}` 定向控制槽位，慎防倾斜
+- 故障转移内置：gossip 探测 + 多数主投票 + 从库接管槽
+- 下一章回到应用层：分布式锁 →
+
+<Callout type="exercise" title="练习">
+1. 本机用 6 个端口搭一个 3 主 3 从集群，分别用带 -c 和不带 -c 的 redis-cli 访问同一个 key，观察 MOVED 行为差异。
+2. 用 CLUSTER KEYSLOT 验证：`user:1001` 与 `{user:1001}:name` 的槽是否相同？`{user:1001}:cart` 呢？
+3. 演练扩容：加入第 4 个主节点并 reshard 4096 个槽过去，迁移期间持续读写，验证业务无感。
+</Callout>

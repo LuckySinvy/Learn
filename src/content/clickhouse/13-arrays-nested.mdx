@@ -1,0 +1,541 @@
+---
+title: 数组与嵌套结构
+order: 13
+description: Array 函数、ARRAY JOIN、Nested、Map、Tuple、JSON 与高阶函数
+---
+
+# 数组与嵌套结构
+
+MySQL 里想存一个「标签列表」，你要么建关联表，要么塞进逗号分隔的字符串。ClickHouse 有原生数组类型，而且配套了一整套函数——这是它做半结构化分析的核心能力。
+
+## 1. Array 基础
+
+```sql
+SELECT
+    [1, 2, 3]                     AS a,
+    length(a)                     AS len,
+    a[1]                          AS first,       -- 下标从 1 开始！
+    a[-1]                         AS last,        -- 负下标从末尾数
+    arrayConcat(a, [4, 5])        AS concat,
+    arraySlice(a, 2, 2)           AS slice,       -- [2,3]
+    has(a, 2)                     AS contains,    -- 1
+    indexOf(a, 3)                 AS idx,         -- 3
+    arrayReverse(a)               AS rev,
+    arraySort([3, 1, 2])          AS sorted,
+    arrayReverseSort([3, 1, 2])   AS desc_sorted,
+    arrayDistinct([1, 1, 2, 2])   AS distinct_,
+    arrayFlatten([[1,2],[3]])     AS flat,
+    arrayEnumerate([10, 20, 30])  AS positions;   -- [1,2,3]
+```
+
+```text
+┌─a───────┬─len─┬─first─┬─last─┬─concat────┬─slice─┬─contains─┬─idx─┐
+│ [1,2,3] │   3 │     1 │    3 │ [1,2,3,4,5]│ [2,3] │        1 │   3 │
+└─────────┴─────┴───────┴──────┴───────────┴───────┴──────────┴─────┘
+```
+
+<Callout type="warn" title="数组下标从 1 开始">
+和大多数编程语言不同，ClickHouse 数组下标从 1 开始（跟 SQL、Lua、R 一致）。`a[0]` 返回该类型的默认值而不是报错，很容易埋雷。
+</Callout>
+
+集合运算：
+
+```sql
+SELECT
+    arrayIntersect([1,2,3], [2,3,4])      AS inter,     -- [2,3]
+    arrayDifference([1, 3, 7])            AS diff,      -- [0,2,4] 相邻差值
+    arrayCumSum([1, 2, 3])                AS cumsum,    -- [1,3,6]
+    arrayCompact([1,1,2,2,1])             AS compact,   -- [1,2,1] 去掉连续重复
+    arrayZip([1,2], ['a','b'])            AS zipped,    -- [(1,'a'),(2,'b')]
+    arrayJoin([1,2,3])                    AS unnested;  -- 展开成 3 行，见下节
+```
+
+聚合数组：
+
+```sql
+SELECT
+    arraySum([1,2,3])       AS s,     -- 6
+    arrayAvg([1,2,3])       AS a,     -- 2
+    arrayMax([1,2,3])       AS mx,
+    arrayMin([1,2,3])       AS mn,
+    arrayProduct([2,3,4])   AS p;     -- 24
+```
+
+## 2. 高阶函数：arrayMap / arrayFilter
+
+这是 ClickHouse 数组能力的精华。用 lambda 表达式操作数组：
+
+```sql
+SELECT
+    arrayMap(x -> x * 2, [1, 2, 3])                     AS doubled,      -- [2,4,6]
+    arrayFilter(x -> x > 1, [1, 2, 3])                  AS filtered,     -- [2,3]
+    arrayCount(x -> x > 1, [1, 2, 3])                   AS cnt,          -- 2
+    arrayExists(x -> x > 2, [1, 2, 3])                  AS any_gt2,      -- 1
+    arrayAll(x -> x > 0, [1, 2, 3])                     AS all_pos,      -- 1
+    arraySum(x -> x * x, [1, 2, 3])                     AS sum_squares,  -- 14
+    arraySort(x -> -x, [1, 3, 2])                       AS sort_desc,    -- [3,2,1]
+    arrayFirst(x -> x > 1, [1, 2, 3])                   AS first_gt1,    -- 2
+    arrayFirstIndex(x -> x > 1, [1, 2, 3])              AS first_idx;    -- 2
+```
+
+多数组并行操作（lambda 接多个参数）：
+
+```sql
+SELECT
+    arrayMap((x, y) -> x + y, [1, 2, 3], [10, 20, 30])  AS summed,   -- [11,22,33]
+    arrayFilter((x, y) -> y > 15, [1,2,3], [10,20,30])  AS filtered; -- [2,3]
+```
+
+第二个例子很有用：**用一个数组的条件过滤另一个数组**。
+
+`arrayReduce` 让你对数组应用任意聚合函数：
+
+```sql
+SELECT
+    arrayReduce('max', [1, 5, 3])                     AS mx,      -- 5
+    arrayReduce('uniq', ['a','b','a'])                AS u,       -- 2
+    arrayReduce('quantile(0.9)', [1,2,3,4,5,6,7,8,9,10]) AS p90;  -- 9.1
+```
+
+## 3. ARRAY JOIN：数组展开成行
+
+这是数组最重要的用法。把一行的数组"炸开"成多行，等价于 SQL 标准的 `UNNEST` 或 Spark 的 `explode`。
+
+```sql
+SELECT
+    user_id,
+    tag
+FROM (
+    SELECT 1001 AS user_id, ['vip', 'active', 'mobile'] AS tags
+    UNION ALL
+    SELECT 1002 AS user_id, ['new'] AS tags
+)
+ARRAY JOIN tags AS tag;
+```
+
+```text
+┌─user_id─┬─tag────┐
+│    1001 │ vip    │
+│    1001 │ active │
+│    1001 │ mobile │
+│    1002 │ new    │
+└─────────┴────────┘
+```
+
+### 3.1 LEFT ARRAY JOIN
+
+空数组的行默认会被丢弃，用 `LEFT ARRAY JOIN` 保留：
+
+```sql
+SELECT user_id, tag
+FROM (
+    SELECT 1001 AS user_id, ['vip'] AS tags
+    UNION ALL
+    SELECT 1002 AS user_id, [] AS tags
+)
+LEFT ARRAY JOIN tags AS tag;
+```
+
+```text
+┌─user_id─┬─tag─┐
+│    1001 │ vip │
+│    1002 │     │   ← 保留了，tag 为空串
+└─────────┴─────┘
+```
+
+### 3.2 多数组同时展开
+
+```sql
+-- 两个等长数组按位置对齐展开
+SELECT user_id, tag, score
+FROM (
+    SELECT 1001 AS user_id, ['a','b','c'] AS tags, [10, 20, 30] AS scores
+)
+ARRAY JOIN tags AS tag, scores AS score;
+```
+
+```text
+┌─user_id─┬─tag─┬─score─┐
+│    1001 │ a   │    10 │
+│    1001 │ b   │    20 │
+│    1001 │ c   │    30 │
+└─────────┴─────┴───────┘
+```
+
+注意：写成 `ARRAY JOIN tags, scores`（逗号分隔）是**按位置对齐**；如果要笛卡尔积，需要写两个 `ARRAY JOIN` 子句。
+
+### 3.3 实战：会话路径分析
+
+```sql
+-- 把每个用户的访问序列折叠成数组，再展开成相邻页面对
+WITH user_paths AS (
+    SELECT
+        user_id,
+        groupArray(page) AS pages
+    FROM (SELECT user_id, page, event_time FROM events ORDER BY user_id, event_time)
+    GROUP BY user_id
+)
+SELECT
+    from_page,
+    to_page,
+    count() AS transitions
+FROM user_paths
+ARRAY JOIN
+    arraySlice(pages, 1, length(pages) - 1) AS from_page,
+    arraySlice(pages, 2)                    AS to_page
+GROUP BY from_page, to_page
+ORDER BY transitions DESC
+LIMIT 5;
+```
+
+```text
+┌─from_page─┬─to_page───┬─transitions─┐
+│ /p/183    │ /checkout │        1204 │
+│ /p/427    │ /p/183    │        1188 │
+│ /        │ /p/183    │        1155 │
+│ /p/91     │ /checkout │        1142 │
+│ /p/183    │ /         │        1098 │
+└───────────┴───────────┴─────────────┘
+```
+
+`arraySlice(pages, 1, n-1)` 和 `arraySlice(pages, 2)` 错位一格，展开后就是相邻页面对。**这是做用户路径分析的标准套路**。
+
+## 4. Nested：结构化的数组组
+
+`Nested` 是一组等长数组的语法糖，适合存「一对多」的嵌套数据：
+
+```sql
+CREATE TABLE events_nested
+(
+    event_time DateTime,
+    user_id    UInt64,
+    page       String,
+    products Nested
+    (
+        id       UInt32,
+        name     String,
+        price    Decimal(10, 2),
+        quantity UInt8
+    )
+)
+ENGINE = MergeTree
+ORDER BY (user_id, event_time);
+
+INSERT INTO events_nested VALUES
+(
+    '2024-06-15 10:00:00', 1001, '/checkout',
+    [101, 205, 388],                       -- products.id
+    ['键盘', '鼠标', '显示器'],              -- products.name
+    [299.00, 89.00, 1299.00],              -- products.price
+    [1, 2, 1]                              -- products.quantity
+);
+```
+
+物理上 `products.id`、`products.name` 等就是四个独立的数组列。查询时：
+
+```sql
+-- 直接查是数组
+SELECT user_id, products.id, products.name FROM events_nested;
+```
+
+```text
+┌─user_id─┬─products.id───┬─products.name──────────────────┐
+│    1001 │ [101,205,388] │ ['键盘','鼠标','显示器']         │
+└─────────┴───────────────┴────────────────────────────────┘
+```
+
+```sql
+-- ARRAY JOIN 整个 Nested，所有子列同时展开
+SELECT
+    user_id,
+    products.id       AS pid,
+    products.name     AS pname,
+    products.price    AS price,
+    products.quantity AS qty,
+    products.price * products.quantity AS subtotal
+FROM events_nested
+ARRAY JOIN products;
+```
+
+```text
+┌─user_id─┬─pid─┬─pname────┬───price─┬─qty─┬─subtotal─┐
+│    1001 │ 101 │ 键盘     │  299.00 │   1 │   299.00 │
+│    1001 │ 205 │ 鼠标     │   89.00 │   2 │   178.00 │
+│    1001 │ 388 │ 显示器   │ 1299.00 │   1 │  1299.00 │
+└─────────┴─────┴──────────┴─────────┴─────┴──────────┘
+```
+
+不展开也能算：
+
+```sql
+SELECT
+    user_id,
+    arraySum(arrayMap((p, q) -> p * q, products.price, products.quantity)) AS order_total,
+    length(products.id) AS item_count
+FROM events_nested;
+```
+
+```text
+┌─user_id─┬─order_total─┬─item_count─┐
+│    1001 │     1776.00 │          3 │
+└─────────┴─────────────┴────────────┘
+```
+
+<Callout type="warn" title="Nested 的子数组必须等长">
+插入时四个数组长度不一致会报错。ClickHouse 不会帮你补齐。
+
+另外 `Nested` 只支持一层，不能嵌套 Nested。多层结构用 `Array(Tuple(...))` 或 JSON。
+</Callout>
+
+## 5. Map 类型
+
+存动态的键值对，比如埋点的自定义属性：
+
+```sql
+CREATE TABLE events_map
+(
+    event_time DateTime,
+    user_id    UInt64,
+    event_type LowCardinality(String),
+    props      Map(String, String)
+)
+ENGINE = MergeTree
+ORDER BY (user_id, event_time);
+
+INSERT INTO events_map VALUES
+    ('2024-06-15 10:00:00', 1001, 'purchase',
+     {'order_id': '9527', 'coupon': 'SUMMER20', 'channel': 'wechat'}),
+    ('2024-06-15 10:05:00', 1002, 'view',
+     {'ref': 'google', 'ab_test': 'B'});
+```
+
+```sql
+SELECT
+    user_id,
+    props['coupon']              AS coupon,       -- 不存在返回默认值（空串）
+    mapContains(props, 'coupon') AS has_coupon,
+    mapKeys(props)               AS keys,
+    mapValues(props)             AS vals,
+    length(props)                AS prop_count
+FROM events_map;
+```
+
+```text
+┌─user_id─┬─coupon───┬─has_coupon─┬─keys──────────────────────────────┬─prop_count─┐
+│    1001 │ SUMMER20 │          1 │ ['channel','coupon','order_id']   │          3 │
+│    1002 │          │          0 │ ['ab_test','ref']                 │          2 │
+└─────────┴──────────┴────────────┴───────────────────────────────────┴────────────┘
+```
+
+Map 也能展开：
+
+```sql
+SELECT user_id, k, v
+FROM events_map
+ARRAY JOIN mapKeys(props) AS k, mapValues(props) AS v;
+```
+
+<Callout type="tip" title="Map 的性能陷阱">
+`props['coupon']` 需要**读取整个 Map 列**（所有 key 和 value），再在内存里查找。如果 Map 有 50 个 key 而你只用 1 个，就浪费了 98% 的 I/O。
+
+高频访问的属性应该**提升为独立列**：
+
+```sql
+ALTER TABLE events_map ADD COLUMN coupon String
+    MATERIALIZED props['coupon'];
+```
+
+`MATERIALIZED` 列在写入时计算并单独存储，查询它时不需要读 Map。这是 Map 类型的标准优化手段。
+</Callout>
+
+## 6. Tuple
+
+匿名的定长结构，常用于函数返回多值：
+
+```sql
+SELECT
+    (1, 'a', now())                    AS t,
+    t.1                                AS first,      -- 1
+    t.2                                AS second,     -- 'a'
+    tupleElement(t, 3)                 AS third,
+    untuple(t)                         AS unpacked;   -- 展开成多列
+```
+
+配合 `argMax` 一次取多列（第 12 章讲过）：
+
+```sql
+SELECT
+    user_id,
+    argMax((page, country, duration_ms), event_time) AS last,
+    last.1 AS last_page,
+    last.2 AS last_country
+FROM events
+GROUP BY user_id LIMIT 3;
+```
+
+Tuple 还能做多列比较：
+
+```sql
+SELECT count() FROM events WHERE (country, event_type) IN (('CN','purchase'), ('US','signup'));
+```
+
+## 7. JSON 处理
+
+ClickHouse 24.x 有多种处理 JSON 的方式。
+
+### 7.1 存为 String + JSON 函数（最通用）
+
+```sql
+CREATE TABLE events_json
+(
+    event_time DateTime,
+    user_id    UInt64,
+    payload    String          -- 原始 JSON 字符串
+)
+ENGINE = MergeTree ORDER BY (user_id, event_time);
+
+INSERT INTO events_json VALUES
+    ('2024-06-15 10:00:00', 1001,
+     '{"order":{"id":9527,"amount":299.5},"tags":["vip","new"],"active":true}');
+```
+
+```sql
+SELECT
+    JSONExtractString(payload, 'order', 'id')       AS order_id_str,
+    JSONExtractUInt(payload, 'order', 'id')         AS order_id,
+    JSONExtractFloat(payload, 'order', 'amount')    AS amount,
+    JSONExtractBool(payload, 'active')              AS active,
+    JSONExtractArrayRaw(payload, 'tags')            AS tags_raw,
+    JSONExtract(payload, 'tags', 'Array(String)')   AS tags,
+    JSONHas(payload, 'order', 'amount')             AS has_amount,
+    JSONLength(payload, 'tags')                     AS tag_count,
+    JSONType(payload, 'order')                      AS order_type
+FROM events_json;
+```
+
+```text
+┌─order_id_str─┬─order_id─┬─amount─┬─active─┬─tags─────────────┬─has_amount─┬─tag_count─┬─order_type─┐
+│ 9527         │     9527 │  299.5 │      1 │ ['vip','new']    │          1 │         2 │ Object     │
+└──────────────┴──────────┴────────┴────────┴──────────────────┴────────────┴───────────┴────────────┘
+```
+
+还有更快的简化版（牺牲严谨性换速度）：
+
+```sql
+SELECT
+    simpleJSONExtractString(payload, 'name')  AS name,
+    simpleJSONExtractUInt(payload, 'id')      AS id
+FROM events_json;
+```
+
+`simpleJSON*` 不做完整解析，只做字符串扫描，对扁平 JSON 快 3~5 倍，但不支持嵌套路径。
+
+### 7.2 用 MATERIALIZED 列提取热字段
+
+和 Map 一样，高频字段应该提升：
+
+```sql
+ALTER TABLE events_json
+    ADD COLUMN order_id UInt64  MATERIALIZED JSONExtractUInt(payload, 'order', 'id'),
+    ADD COLUMN amount   Float64 MATERIALIZED JSONExtractFloat(payload, 'order', 'amount');
+
+-- 新写入的行会自动计算，历史数据需要 MATERIALIZE
+ALTER TABLE events_json MATERIALIZE COLUMN order_id;
+ALTER TABLE events_json MATERIALIZE COLUMN amount;
+```
+
+之后 `WHERE order_id = 9527` 就是普通列查询，还能建索引。
+
+### 7.3 直接用 JSONEachRow 导入并自动展开
+
+```sql
+-- 让 ClickHouse 自动把 JSON 字段映射到表的列
+CREATE TABLE events_typed
+(
+    event_time DateTime,
+    user_id    UInt64,
+    order_id   UInt64,
+    amount     Float64,
+    tags       Array(String)
+) ENGINE = MergeTree ORDER BY (user_id, event_time);
+
+SET input_format_import_nested_json = 1;
+SET input_format_skip_unknown_fields = 1;
+-- 然后 INSERT ... FORMAT JSONEachRow
+```
+
+<Callout type="warn" title="不要把 JSON 当万能药">
+把所有字段塞进一个 JSON String 列，等于放弃了列存的全部优势：
+
+- 查一个字段要读整个 JSON（可能几 KB）
+- 无法用类型专用压缩（LowCardinality、Delta）
+- 无法建索引和跳数索引
+- 每次查询都要解析 JSON，CPU 开销大
+
+**正确做法是「schema-on-write」**：把已知的、高频的字段建成正式列，只把真正动态、低频的部分留在 JSON 里。这比「什么都塞 JSON」的性能好一个数量级。
+</Callout>
+
+## 8. 综合实战：用户行为序列分析
+
+```sql
+-- 每个用户 6 月的完整行为序列与关键指标
+SELECT
+    user_id,
+    length(seq)                                              AS event_count,
+    seq                                                      AS event_sequence,
+    arrayCount(x -> x = 'purchase', seq)                     AS purchases,
+    arrayExists(x -> x = 'signup', seq)                      AS did_signup,
+    arrayFirstIndex(x -> x = 'purchase', seq)                AS first_purchase_step,
+    arrayStringConcat(arrayDistinct(seq), ' > ')             AS uniq_path,
+    arraySum(durations)                                      AS total_ms,
+    arrayMax(durations)                                      AS max_ms,
+    -- 相邻事件的时间间隔
+    arrayDifference(times)                                   AS gaps
+FROM (
+    SELECT
+        user_id,
+        groupArray(event_type)               AS seq,
+        groupArray(duration_ms)              AS durations,
+        groupArray(toUnixTimestamp(event_time)) AS times
+    FROM (
+        SELECT user_id, event_type, duration_ms, event_time
+        FROM events
+        WHERE event_time >= '2024-06-01' AND event_time < '2024-06-02'
+        ORDER BY user_id, event_time
+    )
+    GROUP BY user_id
+)
+WHERE event_count >= 3
+ORDER BY purchases DESC, event_count DESC
+LIMIT 3;
+```
+
+```text
+┌─user_id─┬─event_count─┬─event_sequence──────────────────────────┬─purchases─┬─did_signup─┬─first_purchase_step─┬─uniq_path──────────────────────┬─total_ms─┬─max_ms─┐
+│   18234 │           6 │ ['view','click','purchase','view',...]  │         3 │          0 │                   3 │ view > click > purchase        │    15238 │   4912 │
+│    9077 │           5 │ ['view','view','click','purchase',...]  │         2 │          1 │                   4 │ view > click > purchase > signup│   12044 │   4788 │
+└─────────┴─────────────┴─────────────────────────────────────────┴───────────┴────────────┴─────────────────────┴────────────────────────────────┴──────────┴────────┘
+```
+
+一条 SQL 完成了「按用户聚合行为序列 + 序列内分析」，在 MySQL 里这需要应用层代码。
+
+<Callout type="exercise" title="练习">
+1. 用 `groupArray` 把每个用户的页面访问序列折叠成数组，再用 `ARRAY JOIN` + `arraySlice` 错位技巧统计最常见的页面跳转对（Top 10）。
+2. 建一张带 `Nested` 的订单商品表，插入 3 笔订单（每笔 2~4 个商品），用 `ARRAY JOIN` 展开后统计每个商品的总销量，再用 `arraySum(arrayMap(...))` 不展开直接算每笔订单总额，验证两种方式结果一致。
+3. 建一张带 `Map(String, String)` 的表存埋点自定义属性，用 `MATERIALIZED` 列把其中一个高频 key 提升为独立列，对比两种查询方式的 Elapsed 和 `Processed bytes`。
+4. 用 `arrayFilter` + `arrayMap` 组合，从用户行为序列里筛出所有 `duration_ms > 3000` 的事件类型。
+5. 存一段嵌套 JSON，分别用 `JSONExtract*` 和 `MATERIALIZED` 列两种方式查询同一个字段，对比性能。
+</Callout>
+
+## 小结
+
+- 数组下标从 1 开始，负下标从末尾数
+- 高阶函数 `arrayMap` / `arrayFilter` / `arrayCount` / `arraySum` 用 lambda 操作数组，支持多数组并行
+- `ARRAY JOIN` 把数组炸开成行，`LEFT ARRAY JOIN` 保留空数组的行
+- 双 `arraySlice` 错位展开是路径分析的标准套路
+- `Nested` 是一组等长数组的语法糖，`ARRAY JOIN nested_name` 同时展开所有子列
+- `Map` 灵活但查一个 key 要读整列，高频 key 用 `MATERIALIZED` 列提升
+- `Tuple` 用于函数返回多值和多列比较
+- JSON 优先「schema-on-write」：已知字段建成正式列，只把动态部分留在 JSON
+- `simpleJSON*` 比 `JSONExtract*` 快但只支持扁平结构
+- 下一章讲窗口函数、漏斗与留存 →

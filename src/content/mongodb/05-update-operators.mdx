@@ -1,0 +1,414 @@
+---
+title: 更新操作符
+order: 5
+description: 字段更新、数组更新、定位符与 arrayFilters、upsert 与 findAndModify
+---
+
+# 更新操作符
+
+MongoDB 的更新不是「读出来改完写回去」，而是把「怎么改」描述成一份指令发给服务端，由服务端原地执行。这带来两个好处：单文档内的多个修改是**原子**的，而且不需要传输整个文档。这一章把指令集学全。
+
+## 1. 更新命令的通用形态
+
+```js
+db.collection.updateOne(filter, update, options)
+db.collection.updateMany(filter, update, options)
+db.collection.replaceOne(filter, replacement, options)
+db.collection.findOneAndUpdate(filter, update, options)
+db.collection.bulkWrite([...])
+```
+
+`update` 参数必须由更新操作符构成。常用 options：
+
+| 选项 | 含义 |
+|---|---|
+| `upsert` | 没匹配到就插入一条新文档 |
+| `arrayFilters` | 配合 `$[标识符]` 精确定位数组元素 |
+| `returnDocument` | 仅 findAndModify 系列，取 `"before"` 或 `"after"` |
+| `collation` | 排序规则，影响字符串比较 |
+| `hint` | 强制使用某个索引 |
+
+## 2. 字段更新操作符
+
+### 2.1 $set 与 $unset
+
+```js
+db.users.updateOne(
+  { username: "alice" },
+  {
+    $set: {
+      "profile.city": "Hangzhou",
+      "profile.company": "Acme",     // 不存在的字段会被创建
+      updatedAt: new Date()
+    },
+    $unset: { tempToken: "" }        // 值随便写，只看键名
+  }
+)
+```
+
+```json
+{ "acknowledged": true, "matchedCount": 1, "modifiedCount": 1, "upsertedId": null }
+```
+
+`$set` 用点号路径可以精确修改内嵌文档的某一个字段，不会覆盖兄弟字段——这一点极其重要：
+
+```js
+// 只改 city，bio 保留
+db.users.updateOne({ username: "alice" }, { $set: { "profile.city": "Hangzhou" } })
+
+// 危险！整个 profile 被替换，bio 丢失
+db.users.updateOne({ username: "alice" }, { $set: { profile: { city: "Hangzhou" } } })
+```
+
+<Callout type="warn" title="改内嵌文档一定要用点号路径">
+把整个内嵌对象赋值是「静默丢字段」的头号来源。写代码时如果对象来自前端 JSON，务必逐字段展开成点号路径，或者用 `$set` 配合显式白名单。
+</Callout>
+
+### 2.2 数值操作符
+
+```js
+db.posts.updateOne({ _id: 1 }, { $inc: { "stats.views": 1 } })      // 加 1
+db.posts.updateOne({ _id: 1 }, { $inc: { "stats.likes": -1 } })     // 减 1
+db.products.updateOne({ sku: "A1" }, { $mul: { price: 1.1 } })      // 涨价 10%
+db.sensors.updateOne({ _id: 1 }, { $min: { lowest: 3.2 } })         // 仅当新值更小才写
+db.sensors.updateOne({ _id: 1 }, { $max: { highest: 9.8 } })        // 仅当新值更大才写
+```
+
+`$inc` 是原子的，这意味着一万个并发请求给同一篇帖子的浏览数加一，最终结果一定是准确的一万——不需要事务，不需要乐观锁。这是 MongoDB 最实用的特性之一。
+
+`$min` / `$max` 常用于维护「历史最低价」「峰值 QPS」这类字段，省掉一次读取判断。
+
+### 2.3 $rename 与 $currentDate
+
+```js
+// 字段改名，常用于 schema 演进
+db.users.updateMany({}, { $rename: { "profile.bio": "profile.description" } })
+
+// 写入当前时间，服务端时钟，避免客户端时钟不准
+db.users.updateOne({ _id: 1 }, { $currentDate: { lastLogin: true } })
+db.users.updateOne({ _id: 1 }, { $currentDate: { lastSeen: { $type: "timestamp" } } })
+```
+
+### 2.4 $setOnInsert
+
+只在 upsert 真的插入新文档时生效，更新已有文档时被忽略：
+
+```js
+db.counters.updateOne(
+  { name: "post_view", date: "2024-06-01" },
+  {
+    $inc: { count: 1 },
+    $setOnInsert: { createdAt: new Date(), version: 1 }
+  },
+  { upsert: true }
+)
+```
+
+第一次执行会创建文档并带上 `createdAt`；后续执行只累加 `count`，`createdAt` 保持首次的值。这是实现「创建时间不被覆盖」的标准写法。
+
+## 3. 数组更新操作符
+
+数组是文档模型的核心，MongoDB 为它准备了一整套原地修改指令。先建一份数据：
+
+```js
+db.posts.insertOne({
+  _id: 100,
+  title: "MongoDB 数组更新",
+  tags: ["mongodb"],
+  comments: [
+    { cid: 1, author: "alice", body: "好文", likes: 3, status: "visible" },
+    { cid: 2, author: "bob",   body: "一般", likes: 0, status: "visible" },
+    { cid: 3, author: "carol", body: "广告", likes: 0, status: "visible" }
+  ]
+})
+```
+
+### 3.1 $push 与它的修饰符
+
+```js
+// 追加一个元素
+db.posts.updateOne({ _id: 100 }, { $push: { tags: "tutorial" } })
+
+// 追加多个（注意必须配 $each，否则会把数组整个作为一个元素塞进去）
+db.posts.updateOne({ _id: 100 }, { $push: { tags: { $each: ["index", "perf"] } } })
+```
+
+`$push` 支持四个修饰符，组合起来能实现「维护一个有序的 Top N 列表」：
+
+```js
+// 维护最近 10 条评论，按点赞数倒序，只保留前 10
+db.posts.updateOne(
+  { _id: 100 },
+  {
+    $push: {
+      comments: {
+        $each: [ { cid: 4, author: "dave", body: "赞", likes: 0 } ],
+        $sort: { likes: -1 },
+        $slice: 10
+      }
+    }
+  }
+)
+
+// 插到数组头部
+db.posts.updateOne(
+  { _id: 100 },
+  { $push: { recent: { $each: ["x"], $position: 0, $slice: 20 } } }
+)
+```
+
+| 修饰符 | 作用 |
+|---|---|
+| `$each` | 一次追加多个元素 |
+| `$slice` | 追加后截断数组；正数保留前 N，负数保留后 N |
+| `$sort` | 追加后排序 |
+| `$position` | 指定插入位置，0 表示头部 |
+
+<Callout type="tip" title="$each + $slice 是「最近 N 条」的标准实现">
+做「最近浏览记录」「最新 20 条动态」这类需求，不需要另开集合再分页查询，一条 `$push` 就能维护一个定长有序数组。第 12 章的子集模式（subset pattern）正是基于此。
+</Callout>
+
+### 3.2 $addToSet：去重追加
+
+```js
+db.posts.updateOne({ _id: 100 }, { $addToSet: { tags: "mongodb" } })
+```
+
+```json
+{ "acknowledged": true, "matchedCount": 1, "modifiedCount": 0 }
+```
+
+`modifiedCount: 0` 说明元素已存在，没有重复添加。用 `$addToSet` 维护标签、权限、点赞用户列表，可以省掉应用层的去重逻辑。
+
+多个元素同样要配 `$each`：
+
+```js
+db.posts.updateOne({ _id: 100 }, { $addToSet: { tags: { $each: ["a", "b"] } } })
+```
+
+<Callout type="warn" title="$addToSet 对内嵌文档的比较是「整体深度相等」">
+如果数组元素是文档，`$addToSet` 会比较整个子文档的所有字段**且字段顺序也要一致**。想按业务主键去重（比如按 `cid`），`$addToSet` 帮不了你，需要先用 filter 排除已存在的情况，或者改用带条件的 upsert。
+</Callout>
+
+### 3.3 $pull / $pullAll / $pop
+
+```js
+// 按条件删除元素
+db.posts.updateOne({ _id: 100 }, { $pull: { tags: "perf" } })
+db.posts.updateOne({ _id: 100 }, { $pull: { comments: { author: "carol" } } })
+db.posts.updateOne({ _id: 100 }, { $pull: { comments: { likes: { $lt: 1 } } } })
+
+// 删除指定的多个值
+db.posts.updateOne({ _id: 100 }, { $pullAll: { tags: ["a", "b"] } })
+
+// 弹出头尾
+db.posts.updateOne({ _id: 100 }, { $pop: { tags: 1 } })    //  1 = 删最后一个
+db.posts.updateOne({ _id: 100 }, { $pop: { tags: -1 } })   // -1 = 删第一个
+```
+
+`$pull` 的条件语法就是查询语法，所以可以任意复杂。这比「读出数组、在应用里过滤、整体写回」安全得多——后者在并发下会丢失其他人的写入。
+
+### 3.4 定位符：修改数组中的某个元素
+
+这是数组更新最难的部分，一共有三种定位符。
+
+**第一种：`$` 位置定位符**，匹配 filter 中第一个命中的元素：
+
+```js
+db.posts.updateOne(
+  { _id: 100, "comments.cid": 2 },
+  { $set: { "comments.$.body": "已修改", "comments.$.status": "edited" } }
+)
+```
+
+`$` 代表「filter 里匹配到的那个下标」。注意它**只改第一个匹配**，而且 filter 里必须包含对该数组的条件，否则报错。
+
+**第二种：`$[]` 全元素定位符**，改数组里的所有元素：
+
+```js
+// 所有评论点赞数清零
+db.posts.updateOne({ _id: 100 }, { $set: { "comments.$[].likes": 0 } })
+```
+
+**第三种：`$[标识符]` 配合 arrayFilters**，按条件精确定位多个元素（3.6+，最强大）：
+
+```js
+// 把所有 likes 为 0 的评论标记为 cold
+db.posts.updateOne(
+  { _id: 100 },
+  { $set: { "comments.$[elem].status": "cold" } },
+  { arrayFilters: [ { "elem.likes": { $lte: 0 } } ] }
+)
+```
+
+```json
+{ "acknowledged": true, "matchedCount": 1, "modifiedCount": 1 }
+```
+
+三者对比：
+
+| 写法 | 影响范围 | 条件来源 | 版本 |
+|---|---|---|---|
+| `$` | 第一个匹配元素 | 查询 filter | 全版本 |
+| `$[]` | 所有元素 | 无条件 | 3.6+ |
+| `$[elem]` | 所有满足 arrayFilters 的元素 | arrayFilters | 3.6+ |
+
+多层嵌套数组也支持：
+
+```js
+// posts 里每条 comment 下面还有 replies
+db.posts.updateOne(
+  { _id: 100 },
+  { $set: { "comments.$[c].replies.$[r].hidden": true } },
+  { arrayFilters: [ { "c.cid": 2 }, { "r.spam": true } ] }
+)
+```
+
+<Callout type="warn" title="$ 定位符只改第一个，这几乎总是 bug 来源">
+如果有三条评论都是 bob 写的，`{ "comments.author": "bob" }` 配 `$` 只会改第一条。需要全部修改时必须用 arrayFilters。写更新语句前先问自己：「可能匹配到几个元素？」
+</Callout>
+
+## 4. upsert 的完整语义
+
+```js
+db.users.updateOne(
+  { username: "frank", "profile.city": "Chengdu" },
+  { $set: { email: "frank@example.com" }, $setOnInsert: { createdAt: new Date() } },
+  { upsert: true }
+)
+```
+
+如果没匹配到，插入的新文档由三部分合成：
+
+```text
+  filter 里的等值条件         { username: "frank", profile: { city: "Chengdu" } }
+        +
+  $set 的内容                { email: "frank@example.com" }
+        +
+  $setOnInsert 的内容        { createdAt: <当前时间> }
+        =
+  最终插入的文档
+```
+
+注意 filter 里的**非等值条件不会**进入新文档。如果 filter 是 `{ age: { $gt: 18 } }`，新文档里不会有 age 字段。
+
+<Callout type="warn" title="并发 upsert 需要唯一索引兜底">
+两个请求同时 upsert 同一个 key，可能都判断为「不存在」，从而插入两条。MongoDB 的解决方案是：给 filter 涉及的字段建**唯一索引**，这样其中一个会因为 E11000 失败，驱动开启 `retryWrites` 后会自动重试成更新。没有唯一索引的 upsert 在高并发下一定会产生重复数据。
+</Callout>
+
+## 5. findAndModify 系列
+
+```js
+db.tasks.findOneAndUpdate(
+  { status: "pending" },
+  { $set: { status: "processing", worker: "w-01", startedAt: new Date() } },
+  { sort: { priority: -1, createdAt: 1 }, returnDocument: "after" }
+)
+```
+
+```json
+{
+  "_id": ObjectId("665f1a2b3c4d5e6f70819230"),
+  "status": "processing",
+  "worker": "w-01",
+  "priority": 5,
+  "startedAt": ISODate("2024-06-04T10:00:00Z")
+}
+```
+
+这一条命令完成了「找到优先级最高的待处理任务、原子地标记为处理中、并返回它」。多个 worker 并发执行也不会取到同一个任务——这就是用 MongoDB 实现简易任务队列的核心。
+
+同系列还有：
+
+```js
+db.tasks.findOneAndReplace(filter, replacement, options)
+db.tasks.findOneAndDelete(filter, options)
+```
+
+<Callout type="tip" title="returnDocument 默认是 before">
+新手常见困惑是「我明明 inc 了，返回值却没变」。因为默认返回的是**更新前**的文档。想拿新值必须显式写 `returnDocument: "after"`。
+</Callout>
+
+## 6. 聚合管道形式的更新（4.2+）
+
+当更新逻辑需要引用文档自身的字段时，普通操作符不够用，可以把 update 参数写成一个管道数组：
+
+```js
+db.posts.updateMany(
+  {},
+  [
+    { $set: { score: { $add: [ { $multiply: ["$stats.likes", 3] }, "$stats.views" ] } } },
+    { $set: { level: { $cond: [ { $gte: ["$score", 1000] }, "hot", "normal" ] } } }
+  ]
+)
+```
+
+这在数据迁移、字段派生时非常高效——不需要把数据读到应用层再写回。
+
+```js
+// 把字符串类型的 views 批量转成整数
+db.posts.updateMany(
+  { views: { $type: "string" } },
+  [ { $set: { views: { $toInt: "$views" } } } ]
+)
+```
+
+<Callout type="warn" title="管道更新的性能代价">
+管道更新对每个文档都要跑一遍表达式求值，比 `$set` 慢得多。批量迁移大集合时记得分批执行（配合 `_id` 范围），并观察复制延迟，否则可能把 secondary 拖垮。
+</Callout>
+
+## 7. bulkWrite：混合批量操作
+
+```js
+db.users.bulkWrite([
+  { insertOne: { document: { username: "grace", age: 30 } } },
+  { updateOne: { filter: { username: "alice" }, update: { $inc: { "stats.posts": 1 } } } },
+  { updateMany: { filter: { age: { $lt: 18 } }, update: { $set: { minor: true } } } },
+  { deleteOne: { filter: { username: "typo" } } },
+  { replaceOne: { filter: { username: "bob" }, replacement: { username: "bob", age: 35 } } }
+], { ordered: false })
+```
+
+```json
+{
+  "acknowledged": true,
+  "insertedCount": 1,
+  "matchedCount": 3,
+  "modifiedCount": 3,
+  "deletedCount": 1,
+  "upsertedCount": 0
+}
+```
+
+`bulkWrite` 把多个操作打包成一次网络往返，是批处理场景的性能关键。同样支持 `ordered: false` 来并行执行。
+
+## 8. 操作符速查表
+
+| 操作符 | 类别 | 一句话说明 |
+|---|---|---|
+| `$set` / `$unset` | 字段 | 设置 / 删除字段 |
+| `$inc` / `$mul` | 数值 | 原子加减 / 乘 |
+| `$min` / `$max` | 数值 | 更小 / 更大时才写 |
+| `$rename` | 字段 | 改字段名 |
+| `$currentDate` | 字段 | 写服务端当前时间 |
+| `$setOnInsert` | upsert | 仅插入时生效 |
+| `$push` | 数组 | 追加元素 |
+| `$addToSet` | 数组 | 去重追加 |
+| `$pull` / `$pullAll` | 数组 | 按条件 / 按值删除 |
+| `$pop` | 数组 | 删首 / 删尾 |
+| `$` / `$[]` / `$[elem]` | 数组 | 定位要修改的元素 |
+
+<Callout type="exercise" title="练习">
+用本章的 `_id: 100` 文档完成：一、给帖子追加三个标签，并保证不重复；二、把评论按点赞数倒序排列并只保留前 2 条；三、用 arrayFilters 把所有 `likes` 小于 1 且作者不是 alice 的评论 `status` 改成 hidden，然后解释为什么这里不能用 `$` 定位符；四、写一个 upsert，实现「每天每篇帖子的 PV 计数」，要求 `createdAt` 只在首次写入；五、用管道形式的更新，给每篇帖子加一个 `tagCount` 字段等于 tags 数组的长度。
+</Callout>
+
+## 小结
+
+- 更新是「发送指令」而非「读改写」，单文档内的多个修改天然原子
+- 改内嵌文档必须用点号路径，整体赋值会静默丢失兄弟字段
+- `$inc` 的原子性让高并发计数器无需加锁
+- `$push` 配 `$each` / `$sort` / `$slice` 可维护定长有序数组
+- 数组元素定位有三种：`$` 只改第一个、`$[]` 改全部、`$[elem]` 配 arrayFilters 按条件改
+- upsert 必须配唯一索引，否则并发下会产生重复文档
+- `findOneAndUpdate` 提供「原子取任务」语义，`bulkWrite` 减少网络往返
+- 下一章讲投影、排序与分页，把读取侧补完 →

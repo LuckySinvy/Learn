@@ -1,0 +1,203 @@
+---
+title: DML：增删改数据
+order: 5
+description: INSERT 批量与冲突处理、UPDATE、DELETE、TRUNCATE、REPLACE 的用法与陷阱
+---
+
+# DML：增删改数据
+
+DML（Data Manipulation Language）是每天写得最多的 SQL。但「会写」和「写对」之间隔着不少坑：批量插入怎么最快？唯一键冲突怎么优雅处理？大表 DELETE 为什么会拖垮主从？本章逐一解决，并顺手把示例库的数据灌进去。
+
+## 1. INSERT
+
+### 1.1 基础与批量插入
+
+```sql
+-- 单行（推荐显式列名，表结构变化时不会错位）
+INSERT INTO users (username, email, phone) VALUES ('alice', 'alice@ex.com', '13800000001');
+
+-- 批量：一条语句多组 VALUES，比循环单条快一个数量级以上
+INSERT INTO users (username, email, phone) VALUES
+  ('bob',   'bob@ex.com',   '13800000002'),
+  ('carol', 'carol@ex.com', '13800000003'),
+  ('dave',  'dave@ex.com',  '13800000004'),
+  ('erin',  'erin@ex.com',  '13800000005');
+```
+
+批量快的原因：只需一次网络往返、一次 SQL 解析、一次事务提交（一次 redo/binlog 刷盘）。程序里攒 500–1000 行一批是常见实践；单条 SQL 别超过 `max_allowed_packet`（默认 64MB）。
+
+### 1.2 INSERT ... SELECT：从查询结果插入
+
+```sql
+-- 把在售商品复制一份到归档表
+INSERT INTO products_archive (id, name, price)
+SELECT id, name, price FROM products WHERE status = 2;
+```
+
+### 1.3 灌入示例数据
+
+```sql
+INSERT INTO categories (id, name, parent_id) VALUES
+  (1, '电子产品', 0), (2, '手机', 1), (3, '笔记本', 1),
+  (4, '图书', 0), (5, '技术书', 4);
+
+INSERT INTO products (category_id, name, price, stock) VALUES
+  (2, 'iPhone 15 Pro', 7999.00, 100),
+  (2, 'Xiaomi 14',     3999.00, 200),
+  (3, 'MacBook Air M3', 8999.00, 50),
+  (3, 'ThinkPad X1',    9999.00, 30),
+  (5, '高性能MySQL',      128.00, 500),
+  (5, 'SQL必知必会',       49.00, 800);
+
+INSERT INTO orders (order_no, user_id, status, total_amount) VALUES
+  ('SO20260701001', 1, 3, 8127.00),
+  ('SO20260702002', 2, 1, 3999.00),
+  ('SO20260703003', 1, 0,  177.00),
+  ('SO20260704004', 3, 4, 8999.00);
+
+INSERT INTO order_items (order_id, product_id, quantity, price) VALUES
+  (1, 1, 1, 7999.00), (1, 5, 1, 128.00),
+  (2, 2, 1, 3999.00),
+  (3, 5, 1, 128.00), (3, 6, 1, 49.00),
+  (4, 3, 1, 8999.00);
+```
+
+## 2. 唯一键冲突的三种处理方式
+
+假设 email 上有唯一索引，重复插入 `alice@ex.com` 时：
+
+### 2.1 INSERT IGNORE：冲突就跳过
+
+```sql
+INSERT IGNORE INTO users (username, email) VALUES ('alice2', 'alice@ex.com');
+-- Query OK, 0 rows affected, 1 warning
+```
+
+冲突行被静默丢弃，只给 warning。**危险点**：IGNORE 还会把其他错误（数据超长、类型不合法）也降级为 warning，可能掩盖真正的 bug，慎用。
+
+### 2.2 ON DUPLICATE KEY UPDATE：冲突就更新（Upsert）
+
+```sql
+INSERT INTO users (username, email, phone)
+VALUES ('alice', 'alice@ex.com', '13900000000')
+ON DUPLICATE KEY UPDATE phone = VALUES(phone);
+```
+
+不冲突则插入；冲突则执行 UPDATE 部分。8.0.20 起推荐用别名替代 `VALUES()` 函数：
+
+```sql
+INSERT INTO users (username, email, phone)
+VALUES ('alice', 'alice@ex.com', '13900000000') AS new
+ON DUPLICATE KEY UPDATE phone = new.phone;
+```
+
+这是最常用的 Upsert 姿势。注意：affected rows 为 1 表示插入、2 表示更新、0 表示更新了但值没变。
+
+### 2.3 REPLACE INTO：冲突就先删再插
+
+```sql
+REPLACE INTO users (username, email) VALUES ('alice_new', 'alice@ex.com');
+```
+
+REPLACE 的语义是 **DELETE + INSERT**，问题很多：
+
+- 旧行被删除，未在语句中指定的列会丢失原值、退回默认值；
+- 自增 ID 会变，其他表引用旧 ID 就成了脏数据；
+- 触发 DELETE 和 INSERT 两组触发器。
+
+<Callout type="warn" title="优先 ON DUPLICATE KEY UPDATE 而不是 REPLACE">
+REPLACE 的删除重建语义会丢列值、变主键 ID，主从复制下还可能引起自增值不一致。除非确实要「整行替换」，否则一律用 ON DUPLICATE KEY UPDATE。
+</Callout>
+
+## 3. UPDATE
+
+```sql
+-- 标准写法：WHERE 精确圈定范围
+UPDATE products SET price = 7499.00, stock = stock - 1
+WHERE id = 1;
+
+-- 基于当前值计算（库存扣减的原子写法）
+UPDATE products SET stock = stock - 1
+WHERE id = 1 AND stock >= 1;
+```
+
+第二条是防超卖的经典写法：`stock >= 1` 放进 WHERE，让「检查 + 扣减」在一条语句里原子完成，靠 affected rows 判断是否扣成功——比「先 SELECT 再 UPDATE」在并发下可靠得多。
+
+多表联合更新：
+
+```sql
+-- 把已取消订单相关的商品库存加回去
+UPDATE products p
+JOIN order_items oi ON oi.product_id = p.id
+JOIN orders o       ON o.id = oi.order_id
+SET p.stock = p.stock + oi.quantity
+WHERE o.status = 4;
+```
+
+<Callout type="warn" title="没有 WHERE 的 UPDATE/DELETE 是全表操作">
+手滑漏写 WHERE，一条 UPDATE 能把全表数据改坏。两道保险：客户端启动加 `--safe-updates`（或 `SET sql_safe_updates = 1`），禁止不带索引条件的 UPDATE/DELETE；写 SQL 习惯上先写 WHERE 再回头补 SET。
+</Callout>
+
+## 4. DELETE 与大表删除
+
+```sql
+DELETE FROM orders WHERE status = 4 AND created_at < '2025-01-01';
+```
+
+DELETE 是 DML：走事务、可回滚、逐行删并记 undo/binlog。要删几千万行时一次性 DELETE 会产生巨大事务：undo 膨胀、长时间锁行、主从延迟飙升。正确姿势是**分批删**：
+
+```bash
+# 伪代码：循环小批量删除，直到影响行数为 0
+while true; do
+  mysql shop -e "DELETE FROM logs WHERE created_at < '2025-01-01' LIMIT 5000;"
+  # affected rows 为 0 则退出；每轮之间 sleep 几百毫秒给主从同步喘息
+done
+```
+
+如果是「清空整表」，用 TRUNCATE 更好。
+
+## 5. DELETE vs TRUNCATE vs DROP
+
+| 操作 | 类别 | 速度 | 可回滚 | 自增值 | 表结构 |
+|---|---|---|---|---|---|
+| DELETE FROM t | DML | 慢（逐行） | 可以 | 保留 | 保留 |
+| TRUNCATE TABLE t | DDL | 极快（删文件重建） | 不可 | 重置为 1 | 保留 |
+| DROP TABLE t | DDL | 快 | 不可 | — | 删除 |
+
+```sql
+TRUNCATE TABLE order_items;   -- 秒清亿级表，但请三思
+```
+
+<Callout type="info" title="DELETE 后表文件不会变小">
+InnoDB 删除只是把行标记为可复用，表空间文件（.ibd）不会收缩。要真正回收磁盘，执行 `OPTIMIZE TABLE t;`（本质是重建表，8.0 下等价于 `ALTER TABLE t ENGINE=InnoDB;`），注意它是重操作，大表要挑低峰期。
+</Callout>
+
+## 6. 写操作与事务的关系预告
+
+默认 `autocommit = 1`，每条 DML 自动提交。多条写操作要「同生共死」（下单 = 插订单 + 插明细 + 扣库存）时必须显式事务：
+
+```sql
+BEGIN;
+INSERT INTO orders (order_no, user_id, status, total_amount)
+  VALUES ('SO20260730005', 2, 0, 128.00);
+INSERT INTO order_items (order_id, product_id, quantity, price)
+  VALUES (LAST_INSERT_ID(), 5, 1, 128.00);
+UPDATE products SET stock = stock - 1 WHERE id = 5 AND stock >= 1;
+COMMIT;
+```
+
+`LAST_INSERT_ID()` 返回当前会话最近一次自增插入的 ID，会话隔离、并发安全。事务的完整机制在第 15 章。
+
+## 小结
+
+- 批量 INSERT 用多组 VALUES；程序侧 500–1000 行一批
+- Upsert 用 `ON DUPLICATE KEY UPDATE`；REPLACE 有删除重建副作用，慎用；IGNORE 会吞错误
+- 库存扣减把条件写进 WHERE，原子防超卖
+- 大批量 DELETE 必须分批 + LIMIT；清空整表用 TRUNCATE
+- UPDATE/DELETE 先想 WHERE，开启 sql_safe_updates 保命
+
+<Callout type="exercise" title="练习">
+1. 把本章示例数据完整灌入 shop 库，并用批量 INSERT 再造 3 个用户、2 笔订单（含明细）。
+2. 用 ON DUPLICATE KEY UPDATE 实现：按 email upsert 用户手机号，分别观察插入和更新时的 affected rows。
+3. 写一条原子扣库存 SQL，把某商品库存扣到 0 之后再执行一次，验证 affected rows 为 0 而不是出现负库存。
+</Callout>

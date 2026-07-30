@@ -1,0 +1,227 @@
+---
+title: ClickHouse 概览
+order: 1
+description: 认识 OLAP 与列式存储，理解 ClickHouse 为什么比 MySQL 快上百倍
+---
+
+# ClickHouse 概览
+
+你大概率写过这样的 SQL：一张两亿行的埋点表，统计上个月每天的 PV。在 MySQL 上跑，等了 5 分钟没出结果，最后被 DBA 打断。同样的查询在 ClickHouse 上通常是 0.3 秒。
+
+这一章解释这个差距从哪来，以及什么时候**不该**用 ClickHouse。
+
+## 1. OLTP 与 OLAP 是两类完全不同的负载
+
+MySQL、PostgreSQL 属于 OLTP（联机事务处理），ClickHouse 属于 OLAP（联机分析处理）。它们优化的目标从第一天起就不同。
+
+| 维度 | OLTP（MySQL） | OLAP（ClickHouse） |
+|---|---|---|
+| 典型查询 | `WHERE id = 123` 取一行 | 扫 10 亿行做聚合 |
+| 读取列数 | 整行全部列 | 通常 2~5 列 |
+| 写入模式 | 单行频繁 INSERT/UPDATE | 批量追加，几乎不改 |
+| 事务 | 完整 ACID | 弱（单表插入原子性） |
+| 并发量 | 数千 QPS | 几十~几百 QPS |
+| 存储组织 | 行存 | 列存 |
+| 索引 | B+Tree 精确定位 | 稀疏索引跳过数据块 |
+
+一句话记忆：**OLTP 关心"找到某一行"，OLAP 关心"扫过很多行后算出一个数"**。
+
+### 1.1 我们贯穿全课程的数据集
+
+后面所有章节都围绕两张表展开，现在先建立印象：
+
+- `events`：网站埋点事件表。字段 `event_time`、`user_id`、`event_type`、`page`、`country`、`device`、`duration_ms`。
+- `orders`：订单表。字段 `order_id`、`user_id`、`order_time`、`amount`、`status`、`country`。
+
+它们是最典型的 OLAP 场景：只追加、量大、查询总是"按时间范围 + 若干维度做聚合"。
+
+## 2. 列式存储为什么快
+
+假设 `events` 有 10 亿行、20 个列。现在要算：
+
+```sql
+SELECT count() FROM events WHERE country = 'CN';
+```
+
+### 2.1 行存 vs 列存的物理布局
+
+行存把一行的所有列连续放在磁盘上：
+
+```text
+行存（MySQL InnoDB 页内布局）
+┌──────────────────────────────────────────────┐
+│ 行1: ts | uid | type | page | country | ...  │
+│ 行2: ts | uid | type | page | country | ...  │
+│ 行3: ts | uid | type | page | country | ...  │
+└──────────────────────────────────────────────┘
+    ↑ 只想读 country，却被迫把整行都读进内存
+```
+
+列存把同一列的所有值连续放在一起：
+
+```text
+列存（ClickHouse，每列一个文件）
+event_time.bin : [t1][t2][t3][t4] ... 
+user_id.bin    : [u1][u2][u3][u4] ...
+country.bin    : [CN][CN][US][CN] ...   ← 只读这一个文件
+device.bin     : [ios][web][web] ...
+```
+
+只读 `country.bin`，I/O 量从「20 列 × 10 亿」降到「1 列 × 10 亿」，直接省 95%。这是第一个数量级。
+
+### 2.2 压缩率：同类数据挨在一起
+
+列存的第二个红利是压缩。同一列的数据类型相同、取值分布集中，压缩率极高：
+
+| 列 | 特征 | 典型压缩比 |
+|---|---|---|
+| `event_time` | 单调递增的时间戳 | 20:1（Delta + LZ4） |
+| `country` | 只有 200 种取值 | 100:1（LowCardinality） |
+| `device` | 只有 5 种取值 | 200:1 |
+| `duration_ms` | 随机整数 | 3:1 |
+
+行存做不到这一点：一行里 int、字符串、时间戳混在一起，通用压缩算法找不到规律。
+
+压缩比高 = 磁盘读的字节更少 = 更快。这是第二个数量级。
+
+### 2.3 向量化执行
+
+传统数据库按行处理：取一行 → 判断条件 → 累加计数 → 取下一行。每行都要走一遍函数调用和虚函数分发。
+
+ClickHouse 按**块**处理，默认一次 65536 行：
+
+```text
+火山模型（逐行）            向量化（逐块）
+for row in rows:           for block in blocks:   # 每块 65536 行
+    if filter(row):            mask = simd_eq(block.country, 'CN')
+        cnt += 1               cnt += simd_popcount(mask)
+
+每行 1 次函数调用            每 65536 行 1 次函数调用
+无法用 SIMD                  一条 AVX2 指令处理 8 个 int32
+```
+
+CPU 的 SIMD 指令一次能比较 8 个甚至 16 个整数，加上更好的 cache 局部性和分支预测，这里再拿 5~10 倍。
+
+### 2.4 稀疏索引跳过数据块
+
+MySQL 的 B+Tree 是**稠密索引**：每一行都有索引项，能精确定位单行，但索引本身很大。
+
+ClickHouse 是**稀疏索引**：默认每 8192 行才记一个标记（mark），索引小到能常驻内存。
+
+```text
+主键 (event_time) 的稀疏索引
+mark 0 → 行 0      : 2024-01-01 00:00:00
+mark 1 → 行 8192   : 2024-01-01 00:14:30
+mark 2 → 行 16384  : 2024-01-01 00:29:11
+mark 3 → 行 24576  : 2024-01-01 00:43:55
+...
+
+查询 WHERE event_time >= '2024-01-01 00:29:00'
+→ 二分找到 mark 2，直接从第 16384 行开始读，前面全部跳过
+```
+
+代价是无法精确定位某一行（必须读整个 8192 行的 granule），收益是索引极小、扫描极快。这正好匹配 OLAP「反正要扫一大片」的特点。
+
+<Callout type="info" title="四个加速来源叠乘">
+少读列（20×）× 高压缩（5×）× 向量化（8×）× 索引跳过（视查询而定），最终就是「MySQL 5 分钟 vs ClickHouse 0.3 秒」。它们是相乘关系，不是相加。
+</Callout>
+
+## 3. 一个直观对比
+
+同样一张 10 亿行的 `events` 表：
+
+```sql
+-- 查询 A：按国家统计上月 PV
+SELECT country, count() AS pv
+FROM events
+WHERE event_time >= '2024-06-01' AND event_time < '2024-07-01'
+GROUP BY country
+ORDER BY pv DESC
+LIMIT 10;
+```
+
+| 引擎 | 耗时 | 说明 |
+|---|---|---|
+| MySQL 8 | 约 340 秒 | 全表扫描或大范围索引扫描，回表严重 |
+| ClickHouse 24.x | 约 0.4 秒 | 分区裁剪 + 只读 2 列 + 向量化 |
+
+但换一个查询：
+
+```sql
+-- 查询 B：取单个用户的最近一条事件
+SELECT * FROM events WHERE user_id = 10086 ORDER BY event_time DESC LIMIT 1;
+```
+
+| 引擎 | 耗时 | 说明 |
+|---|---|---|
+| MySQL（user_id 上有索引） | 约 1 毫秒 | B+Tree 精确定位 |
+| ClickHouse（主键是 event_time） | 约 3 秒 | 没有合适稀疏索引，近似全表扫 |
+
+**这就是 OLAP 的代价**：它在"点查"上远不如 MySQL。
+
+## 4. 什么时候不该用 ClickHouse
+
+<Callout type="warn" title="这些场景请继续用 MySQL">
+1. **高频单行更新/删除**。ClickHouse 的 `ALTER TABLE ... UPDATE` 是异步 mutation，会重写整个 data part，代价极高，绝不能当 OLTP 的 UPDATE 用。
+2. **需要跨表事务**。ClickHouse 没有多表事务，也没有回滚。
+3. **需要外键、唯一约束**。都不支持，主键不保证唯一。
+4. **高并发点查**（每秒上千次 `WHERE id = ?`）。每个查询都会调动多核并行，几百 QPS 就能把机器打满。
+5. **数据量很小**（几百万行以内）。MySQL 加个索引就够了，引入 ClickHouse 只是徒增运维成本。
+</Callout>
+
+典型的正确架构是**两者共存**：MySQL 存业务主数据负责事务，通过 CDC 或 Kafka 把数据同步到 ClickHouse 负责分析。
+
+## 5. 与其他分析系统的对比
+
+| 系统 | 定位 | 相比 ClickHouse |
+|---|---|---|
+| **MySQL** | OLTP | 事务强、点查快；聚合分析慢几百倍 |
+| **Elasticsearch** | 搜索引擎 | 全文检索和明细过滤强；大规模聚合内存占用高、成本更贵 |
+| **Druid** | 实时 OLAP | 实时摄入和高并发查询好；SQL 支持弱，运维组件多（历史节点/协调节点/Broker） |
+| **Doris / StarRocks** | MPP 分析库 | JOIN 能力和易用性更好、自带集群管理；单机极限吞吐通常不如 ClickHouse |
+| **Hive / Spark** | 离线批处理 | 适合 T+1 超大规模 ETL；交互式查询延迟在分钟级 |
+
+ClickHouse 的甜点区是：**单表或宽表的、高吞吐的、亚秒级交互式聚合查询**。它的短板一直是复杂多表 JOIN 和实时更新。
+
+## 6. 一分钟上手感受
+
+如果你手边有 Docker，可以立刻试一下（下一章讲完整安装）：
+
+```bash
+docker run -d --name ch -p 8123:8123 -p 9000:9000 clickhouse/clickhouse-server:24.8
+docker exec -it ch clickhouse-client
+```
+
+跑一个官方内置的 10 亿行级别随机数生成基准：
+
+```sql
+SELECT count() FROM numbers(1000000000) WHERE number % 7 = 0;
+```
+
+```text
+┌───count()─┐
+│ 142857143 │
+└───────────┘
+1 row in set. Elapsed: 0.412 sec. Processed 1.00 billion rows, 8.00 GB (2.43 billion rows/s., 19.42 GB/s.)
+```
+
+注意最后一行的 `2.43 billion rows/s.`——这就是向量化执行的直观体现。ClickHouse 每条查询结束都会打印这个统计，它是你后面做性能调优最重要的反馈信号。
+
+<Callout type="tip" title="养成看 Elapsed 行的习惯">
+`Processed X rows` 告诉你实际扫了多少数据。如果你加了 `WHERE event_time >= ...` 但扫描行数没下降，说明分区裁剪或索引没生效——这是 90% 慢查询的根因。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 用上面的 Docker 命令启动一个 ClickHouse，进入 `clickhouse-client`。
+2. 执行 `SELECT count() FROM numbers(100000000) WHERE number % 3 = 0;`，记下 Elapsed 和吞吐量。
+3. 思考并写下：你当前工作中的哪张 MySQL 表最适合迁移到 ClickHouse？它满足「只追加、量大、按时间聚合」这三个条件吗？
+</Callout>
+
+## 小结
+
+- OLTP 找一行，OLAP 扫一片，二者的存储与索引设计从根上不同
+- 列存的四个加速来源：只读用到的列、超高压缩率、向量化执行、稀疏索引跳块，它们相乘产生百倍差距
+- 稀疏索引以「无法精确定位单行」换取「索引极小」，因此 ClickHouse 点查慢
+- 不适用场景：高频更新、跨表事务、外键约束、高并发点查、小数据量
+- 正确姿势是 MySQL + ClickHouse 共存，前者管事务，后者管分析
+- 下一章动手安装并熟悉客户端 →

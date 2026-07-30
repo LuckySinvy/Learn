@@ -1,0 +1,404 @@
+---
+title: 复制集
+order: 16
+description: 成员角色、oplog 同步机制、选举流程、读偏好、故障转移与回滚
+---
+
+# 复制集
+
+单台数据库一定会挂——磁盘会坏、机房会断电、内核会 panic。复制集（replica set）是 MongoDB 的高可用方案：一份数据在多个节点上保存，主节点故障时自动选出新主。这一章讲清楚它是怎么工作的，以及哪些配置会让它工作不好。
+
+## 1. 架构与成员角色
+
+### 1.1 三节点标准架构
+
+```text
+                   客户端（driver）
+                          │
+             ┌────────────┼────────────┐
+             │            │            │
+             ▼            ▼            ▼
+       ┌──────────┐ ┌──────────┐ ┌──────────┐
+       │ Primary  │ │Secondary │ │Secondary │
+       │  可读写   │ │  只读     │ │  只读     │
+       └────┬─────┘ └────▲─────┘ └────▲─────┘
+            │            │            │
+            │  oplog 拉取 │            │
+            └────────────┴────────────┘
+
+       心跳：每 2 秒互相 ping
+       选举超时：10 秒收不到 primary 心跳就发起选举
+```
+
+### 1.2 成员角色
+
+| 角色 | 存数据 | 可投票 | 可被选为 primary | 用途 |
+|---|---|---|---|---|
+| Primary | 是 | 是 | 当前就是 | 唯一接受写入的节点 |
+| Secondary | 是 | 是 | 是 | 冗余 + 分担读 |
+| Arbiter | **否** | 是 | 否 | 只投票，凑奇数 |
+| Hidden | 是 | 是 | 否（priority 0） | 备份、离线分析 |
+| Delayed | 是 | 是 | 否 | 延迟副本，防误删 |
+
+```js
+rs.conf()
+```
+
+```json
+{
+  "_id": "rs0",
+  "members": [
+    { "_id": 0, "host": "db1:27017", "priority": 2, "votes": 1 },
+    { "_id": 1, "host": "db2:27017", "priority": 1, "votes": 1 },
+    { "_id": 2, "host": "db3:27017", "priority": 0, "votes": 1,
+      "hidden": true, "slaveDelay": 3600 }
+  ],
+  "settings": { "electionTimeoutMillis": 10000, "heartbeatIntervalMillis": 2000 }
+}
+```
+
+上面第三个成员是一个**延迟一小时的隐藏节点**：它不接受客户端读取、不会被选为主，数据永远落后一小时。作用是防止误操作——有人 `deleteMany({})` 清空了集合，你有一小时的时间从它这里恢复。
+
+<Callout type="warn" title="不要在生产用 Arbiter">
+Arbiter 不存数据，只投票。它看起来能省一台机器的存储成本，但代价很大：三节点里有一个是 Arbiter，实际只有 2 个数据副本；此时挂掉一个数据节点，就只剩 1 个副本，`w: "majority"` 的写入会因为凑不齐多数确认而阻塞。**宁可用一个低配的数据节点，也不要用 Arbiter**。
+</Callout>
+
+### 1.3 为什么要奇数个投票成员
+
+选举需要「多数派」（majority），即超过半数的投票成员同意。
+
+| 投票成员数 | 多数派 | 能容忍故障 | 评价 |
+|---|---|---|---|
+| 2 | 2 | 0 | 挂一个就无法选举，比单机还差 |
+| 3 | 2 | 1 | 标准配置 |
+| 4 | 3 | 1 | 比 3 节点多花一台，容错能力一样 |
+| 5 | 3 | 2 | 跨机房或高要求场景 |
+| 7 | 4 | 3 | 上限（最多 7 个投票成员） |
+
+偶数个节点不会提升容错，只会增加成本和选举耗时。所以永远配奇数。
+
+## 2. oplog 与数据同步
+
+### 2.1 oplog 的作用
+
+primary 上每一个写操作都会在 `local.oplog.rs` 里记一条。secondary 持续拉取并重放这些操作。
+
+```js
+db.getSiblingDB("local").oplog.rs.find().sort({ $natural: -1 }).limit(2)
+```
+
+```json
+[
+  { "op": "u", "ns": "community.posts", "o2": { "_id": 500 },
+    "o": { "$v": 2, "diff": { "u": { "status": "published" } } },
+    "ts": Timestamp({ t: 1717495852, i: 1 }), "t": NumberLong(3),
+    "wall": ISODate("2024-06-04T09:30:52.001Z") },
+  { "op": "i", "ns": "community.posts",
+    "o": { "_id": 500, "title": "新帖子", "authorId": "alice" },
+    "ts": Timestamp({ t: 1717495851, i: 1 }), "t": NumberLong(3) }
+]
+```
+
+`op` 的取值：`i` 插入、`u` 更新、`d` 删除、`c` 命令（如建索引）、`n` 空操作（心跳用）。
+
+### 2.2 oplog 是幂等的
+
+这是复制正确性的基石。原始操作会被改写成「无论重放几次结果都一样」的形式：
+
+| 原始操作 | oplog 里的形式 |
+|---|---|
+| `$inc: { views: 1 }` | `$set: { views: 1201 }` |
+| `$push: { tags: "x" }` | 指定下标的 `$set` |
+| `insertOne` 带自动 `_id` | 带上确定的 `_id` |
+| `$currentDate` | 具体的时间戳值 |
+
+这也解释了两个现象：
+
+- `updateMany` 改 10 万条文档 → 产生 10 万条 oplog（每条记录各自的最终值）
+- 大数组的小改动可能产生很大的 oplog 条目
+
+### 2.3 同步流程
+
+```text
+Primary                          Secondary
+   │                                │
+   │  1. 写入本地存储引擎             │
+   │  2. 追加 oplog 条目             │
+   │                                │
+   │◄──── 3. tailable cursor 拉取 ───┤
+   │      （长轮询，有新数据立即推）    │
+   │                                │
+   │      4. 批量应用（多线程）        ├─▶ 写入本地存储
+   │                                │
+   │◄──── 5. 上报已应用位置 ──────────┤
+   │      （用于计算 majority 提交点） │
+```
+
+secondary 应用 oplog 是**多线程**的：按 `_id` 哈希分到不同 writer 线程，保证同一文档的操作有序，不同文档并行。
+
+### 2.4 initial sync
+
+新节点加入时需要全量同步：
+
+```text
+1. 从某个源节点克隆所有数据库（除 local）
+2. 同时记录克隆期间产生的新 oplog
+3. 克隆完成后重放这些 oplog
+4. 建索引
+5. 追上进度，转为 SECONDARY 状态
+```
+
+<Callout type="warn" title="initial sync 期间源节点压力很大">
+克隆 TB 级数据会持续数小时，期间源节点的磁盘 IO 和网络带宽被大量占用。给一个繁忙的复制集加节点，务必：一、选一个低负载的 secondary 做源（用 `initialSyncSourceReadPreference`）；二、在业务低峰期做；三、考虑用文件系统快照代替 initial sync（第 18 章）。
+</Callout>
+
+### 2.5 复制延迟
+
+```js
+rs.printSecondaryReplicationInfo()
+```
+
+```text
+source: db2:27017
+  syncedTo: Tue Jun 04 2024 09:30:52 GMT+0800
+  0 secs (0 hrs) behind the primary
+
+source: db3:27017
+  syncedTo: Tue Jun 04 2024 09:25:12 GMT+0800
+  340 secs (0.09 hrs) behind the primary
+```
+
+延迟的常见原因：
+
+| 原因 | 排查 |
+|---|---|
+| secondary 硬件更差 | 对比磁盘 IOPS 和 CPU |
+| 大批量写入 | 检查是否有 `updateMany` 全表更新 |
+| secondary 在跑大查询 | `db.currentOp()` 看长时间运行的操作 |
+| 网络带宽不足 | 跨机房部署时常见 |
+| 索引构建 | secondary 在建索引会阻塞 oplog 应用 |
+
+## 3. 选举
+
+### 3.1 触发条件
+
+- secondary 连续 `electionTimeoutMillis`（默认 10 秒）收不到 primary 心跳
+- 主动执行 `rs.stepDown()`
+- 配置变更（`rs.reconfig()`）
+
+### 3.2 选举流程
+
+```text
+T+0s     primary 崩溃
+T+0~10s  secondary 心跳超时累积
+T+10s    某个 secondary 发起选举，term 加 1
+         ├─ 检查自己的 oplog 是否足够新（不能落后于其他候选者）
+         ├─ 向所有投票成员发送投票请求
+         └─ 收到多数派同意 → 成为 primary
+T+12s    新 primary 就绪，开始接受写入
+
+  典型不可写窗口：10 到 12 秒
+```
+
+### 3.3 影响选举结果的配置
+
+```js
+cfg = rs.conf()
+cfg.members[0].priority = 2        // 优先级高的更容易当选，0 表示永不当选
+cfg.settings.electionTimeoutMillis = 5000    // 缩短检测时间
+rs.reconfig(cfg)
+```
+
+| 参数 | 作用 | 调整建议 |
+|---|---|---|
+| `priority` | 0 到 1000，越高越优先；0 表示永不当选 | 让主机房的节点优先级更高 |
+| `votes` | 0 或 1 | 超过 7 个成员时，多余的设为 0 |
+| `electionTimeoutMillis` | 检测超时 | 网络稳定可降到 5000，不稳定不要降 |
+
+<Callout type="warn" title="不要盲目调小 electionTimeoutMillis">
+调小能缩短故障切换时间，但会让网络抖动更容易触发不必要的选举。每次选举都有 10 秒左右的不可写窗口，频繁的「假故障切换」比慢一点的真故障切换危害更大。默认的 10 秒是经过大量生产验证的值。
+</Callout>
+
+### 3.4 客户端的自动感知
+
+驱动会维护整个复制集的拓扑视图，通过定期 `hello` 命令探测。primary 切换后：
+
+```text
+1. 驱动发现 primary 不可用（写操作报 NotWritablePrimary）
+2. 触发 server selection，重新探测拓扑
+3. 找到新 primary
+4. 如果开启了 retryWrites，自动重试一次失败的写操作
+```
+
+```js
+// 驱动配置建议
+"mongodb://db1,db2,db3/community?replicaSet=rs0&retryWrites=true&retryReads=true&serverSelectionTimeoutMS=5000"
+```
+
+`retryWrites` 让大部分故障切换对应用透明：一次写失败会自动重试到新 primary。它依赖单文档写入的幂等性（每次写带一个 transaction number，服务端能识别重复）。
+
+## 4. 读偏好 readPreference
+
+默认所有读写都走 primary。可以把读分流到 secondary：
+
+| 模式 | 行为 | 适用 |
+|---|---|---|
+| `primary`（默认） | 只读 primary | 需要强一致 |
+| `primaryPreferred` | 优先 primary，不可用时读 secondary | 容忍降级期间的陈旧读 |
+| `secondary` | 只读 secondary | 分析查询、报表 |
+| `secondaryPreferred` | 优先 secondary | 读多写少且容忍延迟 |
+| `nearest` | 网络延迟最低的节点 | 多地部署，就近读 |
+
+```js
+// 连接串级别
+"mongodb://.../community?readPreference=secondaryPreferred&maxStalenessSeconds=90"
+
+// 单次查询级别
+db.posts.find().readPref("secondary")
+
+// 用 tag 定向到特定节点
+db.posts.find().readPref("secondary", [ { dc: "hangzhou" } ])
+```
+
+### 4.1 maxStalenessSeconds
+
+限制「最多容忍多陈旧的数据」，驱动会跳过落后超过这个值的 secondary：
+
+```js
+"...?readPreference=secondary&maxStalenessSeconds=120"
+```
+
+最小值是 90 秒（低于这个值无意义，因为心跳周期本身就有延迟）。
+
+### 4.2 读从库的三个陷阱
+
+<Callout type="warn" title="读从库不会自动提升整体吞吐">
+很多人以为「把读分到 3 个 secondary，读吞吐就变 3 倍」。实际上：一、每个 secondary 都要应用**全部**写入，写压力和 primary 一样，写多的系统里 secondary 本就很忙；二、读到的数据可能陈旧几秒；三、「读己之写」会被打破，用户发帖后刷新看不到自己的帖子。**分片才是提升整体吞吐的方案，读从库只是缓解读压力**。
+</Callout>
+
+需要读从库又要保证读己之写时，用因果一致性会话（第 14 章）：
+
+```js
+const session = client.startSession({ causalConsistency: true })
+await coll.insertOne(doc, { session })
+await coll.find({}, { session, readPreference: "secondaryPreferred" })   // 保证能看到
+```
+
+## 5. 故障转移与回滚
+
+### 5.1 什么是回滚
+
+primary 上已经写入但**还没同步到多数节点**的数据，在它降级后会被丢弃：
+
+```text
+T1  Primary A 写入 X、Y、Z，其中 X 已同步到 B，Y、Z 还没
+T2  A 网络分区
+T3  B 和 C 选举，B 成为新 primary（B 有 X，没有 Y、Z）
+T4  客户端在 B 上继续写入新数据
+T5  A 网络恢复，作为 secondary 加入
+T6  A 发现自己有 B 没有的 Y、Z → 回滚
+
+     Y、Z 被写入 rollback 目录的 BSON 文件，从数据库中移除
+```
+
+回滚文件位置：
+
+```bash
+ls /data/db/rollback/community.posts/
+```
+
+```text
+removed.2024-06-04T09-35-12.0.bson
+```
+
+### 5.2 怎么避免回滚
+
+用 `w: "majority"`。写入只有在多数节点确认后才返回成功，这样「返回成功的写入」永远不会被回滚。
+
+```js
+db.posts.insertOne(doc, { writeConcern: { w: "majority" } })
+```
+
+从 5.0 起 `w: "majority"` 是默认值，但很多应用的连接串里显式写了 `w: 1`，等于关掉了这个保护。
+
+<Callout type="warn" title="w:1 + retryWrites 可能造成数据不一致">
+用 `w: 1` 写入返回成功，然后 primary 崩溃、数据被回滚——应用以为写成功了，数据却不存在。加上 `retryWrites` 也救不了，因为驱动收到的是「成功」而不是错误。**任何有业务意义的写入都应该用 `w: "majority"`**，只有日志、埋点这类可丢数据才用 `w: 1`。
+</Callout>
+
+### 5.3 演练故障转移
+
+```js
+// 主动降级当前 primary，观察选举
+rs.stepDown(60)          // 60 秒内不参与选举
+
+// 查看状态
+rs.status().members.map(m => ({ name: m.name, state: m.stateStr, health: m.health }))
+```
+
+```json
+[
+  { "name": "db1:27017", "state": "SECONDARY", "health": 1 },
+  { "name": "db2:27017", "state": "PRIMARY",   "health": 1 },
+  { "name": "db3:27017", "state": "SECONDARY", "health": 1 }
+]
+```
+
+<Callout type="tip" title="定期演练故障转移">
+「我们有复制集所以高可用」这句话在没演练过之前只是假设。每季度做一次 `rs.stepDown()`，观察：应用是否有报错、错误持续多久、有没有写入丢失、监控告警是否正常触发。发现问题的成本，在演练时远低于在真故障时。
+</Callout>
+
+## 6. 部署拓扑建议
+
+### 6.1 同城三机房（推荐）
+
+```text
+  机房 A          机房 B          机房 C
+  Primary        Secondary       Secondary
+  priority 2     priority 1      priority 1
+
+  任一机房故障 → 剩余两个仍构成多数派 → 自动切换
+  跨机房延迟 1 到 3 ms，majority 写入代价可接受
+```
+
+### 6.2 两机房（不推荐但常见）
+
+```text
+  机房 A (2 节点)          机房 B (1 节点)
+  Primary + Secondary      Secondary
+
+  机房 B 挂 → A 仍有 2/3，正常  ✔
+  机房 A 挂 → B 只有 1/3，无法选举，整体不可写  ✘
+```
+
+两机房无法做到「任一机房故障都能自动恢复」。要么接受这个限制（人工介入 reconfig），要么在第三个地点放一个成员。
+
+### 6.3 跨地域
+
+```text
+  上海（主）      杭州           深圳
+  Primary        Secondary      Secondary
+  priority 2     priority 1     priority 0.5
+
+  跨地域延迟 20 到 40 ms
+  → w:"majority" 的写延迟至少 40 ms
+  → 需要评估业务能否接受
+```
+
+跨地域部署时，`w: "majority"` 的延迟由「第二快的节点」决定。把两个节点放在同城，第三个放异地，能让 majority 在同城内完成。
+
+<Callout type="exercise" title="练习">
+一、用 Docker Compose 搭一个真正的三节点复制集，用 `rs.status()` 确认三个成员的角色；二、执行 `rs.stepDown()` 触发选举，用脚本持续写入并记录不可写窗口有多长；三、把一个成员的 `priority` 设为 0，再次触发选举，验证它不会当选；四、用 `rs.printSecondaryReplicationInfo()` 观察复制延迟，然后执行一次影响 10 万文档的 `updateMany`，再看延迟变化；五、故意用 `w: 1` 写入后立刻 kill 掉 primary，检查 rollback 目录里有没有文件；六、配置一个延迟 5 分钟的隐藏节点，删除一个集合后从它恢复数据。
+</Callout>
+
+## 小结
+
+- 复制集通过多副本 + 自动选举实现高可用，投票成员必须是奇数
+- 不要用 Arbiter，它减少了真实副本数却不减少故障风险
+- oplog 被改写成幂等形式，这是复制正确性的基石
+- secondary 多线程应用 oplog，按 `_id` 哈希保证同文档有序
+- 选举的典型不可写窗口是 10 到 12 秒，不要盲目调小 `electionTimeoutMillis`
+- `retryWrites` 让大部分故障切换对应用透明
+- 读从库不提升整体吞吐，且会打破读己之写，需要因果一致性会话补救
+- `w: "majority"` 是避免回滚的唯一方法，有业务意义的写入必须用它
+- 三机房部署才能做到任一机房故障自动恢复
+- 下一章讲分片，解决单机容量和写入吞吐的上限 →

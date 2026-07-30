@@ -136,4 +136,18 @@ export const LANG_CONFIG: Record<ExecutableLanguage, Omit<DockerRunConfig, 'cmd'
     cpus: 1.0,
     filename: 'main.rs',
   },
+  typescript: {
+    // 自建镜像（docker/ts-runner/Dockerfile）：node:22-alpine + typescript + @types/node，
+    // 预置 /opt/tsenv（package.json 里 "type": "module"，故支持顶层 await）。
+    image: 'learn-ts:1',
+    // 先用 tsc 做严格类型检查（输出重定向到 stderr，保持 stdout 干净），通过后再执行。
+    cmd:
+      'cp /code/main.ts /opt/tsenv/main.ts && cd /opt/tsenv && ' +
+      './node_modules/.bin/tsc --strict --target ES2022 --module NodeNext --moduleResolution NodeNext --lib ES2022 --types node --skipLibCheck --noEmit main.ts 1>&2 && ' +
+      'node --disable-warning=ExperimentalWarning --experimental-transform-types main.ts',
+    timeoutMs: 20000,
+    memoryMb: 512,
+    cpus: 1.0,
+    filename: 'main.ts',
+  },
 };

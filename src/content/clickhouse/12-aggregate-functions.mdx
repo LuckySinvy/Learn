@@ -1,0 +1,520 @@
+---
+title: 聚合函数与组合子
+order: 12
+description: uniq 家族的精度取舍、quantile 家族、argMin/argMax、topK 与组合子体系
+---
+
+# 聚合函数与组合子
+
+ClickHouse 有 200 多个聚合函数，但真正决定你查询性能的是几个关键选择：UV 用哪个 uniq、分位数用哪个 quantile。选错了可能慢 10 倍或者内存爆掉。
+
+组合子（combinator）则是 ClickHouse 独有的设计，能把任意聚合函数变形，威力极大。
+
+## 1. 基础聚合函数
+
+```sql
+SELECT
+    count()                     AS total,          -- 行数（不读任何列，极快）
+    count(page)                 AS non_null_page,  -- 非 NULL 行数
+    count(DISTINCT user_id)     AS exact_uv,       -- 精确去重（= uniqExact）
+    sum(duration_ms)            AS total_ms,
+    avg(duration_ms)            AS avg_ms,
+    min(event_time)             AS first_time,
+    max(event_time)             AS last_time,
+    any(page)                   AS any_page,       -- 任意一行的值（最快）
+    anyLast(page)               AS last_page,
+    stddevPop(duration_ms)      AS std,
+    varPop(duration_ms)         AS variance,
+    median(duration_ms)         AS med
+FROM events;
+```
+
+<Callout type="tip" title="count() 不读列，count(col) 要读列">
+`SELECT count() FROM events` 直接读 part 里的 `count.txt`，不碰任何数据文件，1000 亿行也是毫秒级。
+
+`SELECT count(page) FROM events` 要读 `page.bin` 判断 NULL，慢得多。**统计行数永远写 `count()`**。
+</Callout>
+
+## 2. uniq 家族：UV 计算的核心取舍
+
+这是最需要仔细选择的一组函数。
+
+| 函数 | 算法 | 精度 | 内存 | 速度 |
+|---|---|---|---|---|
+| `uniqExact` | 完整哈希表 | **100% 精确** | 高（与基数成正比） | 慢 |
+| `uniq` | 自适应（小基数精确，大基数 HLL 变体） | 误差约 0.5%~2% | 低（固定上限） | **快** |
+| `uniqCombined` | HLL + 稀疏表混合 | 误差约 0.8% | 更低 | 快 |
+| `uniqCombined64` | 同上，支持 64 位哈希 | 同上 | 同上 | 快 |
+| `uniqHLL12` | 纯 HyperLogLog | 误差约 1.6% | **最低（固定 2.5 KB）** | **最快** |
+| `uniqTheta` | Theta Sketch | 约 3% | 低 | 支持集合运算 |
+
+实测对比（1 亿行、真实 UV = 5,000,000）：
+
+```sql
+SELECT
+    uniqExact(user_id)     AS exact,
+    uniq(user_id)          AS u,
+    uniqCombined(user_id)  AS combined,
+    uniqHLL12(user_id)     AS hll
+FROM events;
+```
+
+```text
+┌───exact─┬───────u─┬─combined─┬─────hll─┐
+│ 5000000 │ 4986213 │  5011408 │ 4923771 │
+└─────────┴─────────┴──────────┴─────────┘
+误差：      0%       0.28%      0.23%     1.52%
+
+内存：    3.2 GB    40 MB      12 MB     2.5 KB
+耗时：    18.4 s    2.1 s      1.8 s     1.4 s
+```
+
+### 2.1 怎么选
+
+```text
+需要精确 UV（财务、结算）？
+  │
+  ├─ 是 ──▶ uniqExact，但要评估内存：基数 × 8 字节 × 并发
+  │         基数超过 1 亿时考虑分批 + bitmap
+  │
+  └─ 否 ──▶ 基数量级？
+             ├─ 小于 10 万  ──▶ uniq（此时它内部就是精确的）
+             ├─ 10 万~1 亿  ──▶ uniqCombined（精度和内存最平衡）
+             └─ 超过 1 亿    ──▶ uniqHLL12（内存恒定）
+```
+
+**日常报表一律用 `uniqCombined`**。它是精度、内存、速度的最佳平衡点。
+
+<Callout type="warn" title="uniqExact 是内存炸弹">
+`uniqExact` 需要把所有不同值存在哈希表里。如果 `GROUP BY country` 而每个国家有 1000 万 UV，200 个国家就是 20 亿个 UInt64 = 16 GB，直接 OOM：
+
+```text
+Code: 241. DB::Exception: Memory limit (for query) exceeded:
+would use 10.05 GiB (attempt to allocate chunk of 4.00 GiB more)
+```
+
+`count(DISTINCT x)` 默认就等价于 `uniqExact`，同样危险。可以改默认行为：
+
+```sql
+SET count_distinct_implementation = 'uniqCombined';
+```
+</Callout>
+
+### 2.2 精确去重的替代方案：bitmap
+
+如果 ID 是连续整数（比如自增 user_id），用 bitmap 可以做到**精确且省内存**：
+
+```sql
+SELECT
+    country,
+    bitmapCardinality(groupBitmapState(toUInt32(user_id))) AS exact_uv
+FROM events
+GROUP BY country;
+
+-- 或直接用 groupBitmap
+SELECT country, groupBitmap(toUInt32(user_id)) AS exact_uv
+FROM events GROUP BY country;
+```
+
+RoaringBitmap 对稠密整数集合的压缩率极高。5000 万连续 ID 的 bitmap 只要几 MB，且完全精确。
+
+而且 bitmap 支持集合运算，这是做留存分析的基础：
+
+```sql
+-- 6 月 1 日和 6 月 2 日都活跃的用户数（次日留存）
+WITH
+    (SELECT groupBitmapState(toUInt32(user_id)) FROM events WHERE toDate(event_time) = '2024-06-01') AS d1,
+    (SELECT groupBitmapState(toUInt32(user_id)) FROM events WHERE toDate(event_time) = '2024-06-02') AS d2
+SELECT
+    bitmapCardinality(d1)                    AS day1_uv,
+    bitmapCardinality(d2)                    AS day2_uv,
+    bitmapAndCardinality(d1, d2)             AS retained,
+    round(bitmapAndCardinality(d1, d2) / bitmapCardinality(d1) * 100, 2) AS retention_pct;
+```
+
+```text
+┌─day1_uv─┬─day2_uv─┬─retained─┬─retention_pct─┐
+│   22104 │   22019 │    12833 │         58.06 │
+└─────────┴─────────┴──────────┴───────────────┘
+```
+
+## 3. quantile 家族
+
+同样是精度与性能的权衡。
+
+| 函数 | 算法 | 精度 | 内存 |
+|---|---|---|---|
+| `quantileExact` | 全量排序 | 精确 | 高（存所有值） |
+| `quantile` | 蓄水池采样 | 近似，结果不确定 | 中 |
+| `quantileTDigest` | T-Digest | 近似，尾部精度高 | **低** |
+| `quantileTiming` | 专为毫秒级延迟优化的定长桶 | 近似 | **极低** |
+| `quantileBFloat16` | bfloat16 直方图 | 近似 | 极低 |
+
+```sql
+SELECT
+    quantileExact(0.95)(duration_ms)      AS p95_exact,
+    quantile(0.95)(duration_ms)           AS p95,
+    quantileTDigest(0.95)(duration_ms)    AS p95_tdigest,
+    quantileTiming(0.95)(duration_ms)     AS p95_timing
+FROM events;
+```
+
+```text
+┌─p95_exact─┬─p95─┬─p95_tdigest─┬─p95_timing─┐
+│      4788 │4791 │        4789 │       4790 │
+└───────────┴─────┴─────────────┴────────────┘
+```
+
+一次算多个分位数（只扫一遍数据）：
+
+```sql
+SELECT
+    country,
+    quantilesTDigest(0.5, 0.9, 0.95, 0.99)(duration_ms) AS quantiles
+FROM events
+GROUP BY country;
+```
+
+```text
+┌─country─┬─quantiles────────────────────┐
+│ CN      │ [2549,4551,4790,4998]        │
+│ US      │ [2551,4548,4789,4997]        │
+└─────────┴──────────────────────────────┘
+```
+
+<Callout type="tip" title="监控延迟指标用 quantileTiming">
+`quantileTiming` 专门为「毫秒级响应时间」设计：它假设值分布在 0~30000 毫秒，用固定桶统计。
+
+- 小于 1024 毫秒时精确到 1 毫秒
+- 大于 1024 毫秒时误差 1%
+- 内存恒定，不随数据量增长
+
+APM 类监控场景用它就对了。如果值可能是负数或超过 30 秒，改用 `quantileTDigest`。
+</Callout>
+
+<Callout type="warn" title="quantile 的结果不可复现">
+`quantile`（不带后缀）用的是蓄水池采样，**同一份数据多次查询可能返回不同结果**。做对比分析时会让人怀疑人生。
+
+需要结果稳定就用 `quantileTDigest` 或 `quantileExact`。
+</Callout>
+
+## 4. argMin / argMax
+
+返回「另一列取最值时」本列的值。这是 ClickHouse 最实用的函数之一：
+
+```sql
+-- 每个用户的首次访问页面和最后访问页面
+SELECT
+    user_id,
+    argMin(page, event_time)    AS first_page,
+    argMax(page, event_time)    AS last_page,
+    min(event_time)             AS first_time,
+    max(event_time)             AS last_time,
+    count()                     AS pv
+FROM events
+GROUP BY user_id
+ORDER BY pv DESC
+LIMIT 5;
+```
+
+```text
+┌─user_id─┬─first_page─┬─last_page─┬──────────first_time─┬───────────last_time─┬─pv─┐
+│   31082 │ /p/12      │ /p/487    │ 2024-06-01 02:14:03 │ 2024-06-30 18:22:41 │ 42 │
+│    9174 │ /p/301     │ /p/98     │ 2024-06-01 00:33:12 │ 2024-06-30 21:07:55 │ 41 │
+│   22091 │ /p/155     │ /p/220    │ 2024-06-01 04:51:38 │ 2024-06-30 19:44:02 │ 40 │
+└─────────┴────────────┴───────────┴─────────────────────┴─────────────────────┴────┘
+```
+
+用元组一次取多列：
+
+```sql
+SELECT
+    user_id,
+    argMax((page, country, device, duration_ms), event_time) AS last_event
+FROM events
+GROUP BY user_id
+LIMIT 3;
+```
+
+```text
+┌─user_id─┬─last_event──────────────────────┐
+│    1001 │ ('/p/487','CN','web',3218)      │
+│    1002 │ ('/p/98','US','ios',1044)       │
+└─────────┴─────────────────────────────────┘
+```
+
+第 7 章讲的 ReplacingMergeTree 去重就是靠它。
+
+## 5. topK 与 topKWeighted
+
+近似求 Top N 高频值，比 `GROUP BY + ORDER BY + LIMIT` 快得多：
+
+```sql
+-- 访问量最高的 5 个页面（近似）
+SELECT topK(5)(page) AS top_pages FROM events;
+```
+
+```text
+┌─top_pages────────────────────────────────────┐
+│ ['/p/183','/p/427','/p/91','/p/338','/p/12'] │
+└──────────────────────────────────────────────┘
+```
+
+```sql
+-- 按权重求 Top（比如按停留时长而非次数）
+SELECT topKWeighted(5)(page, duration_ms) AS top_by_duration FROM events;
+
+-- 分组求 Top
+SELECT country, topK(3)(page) AS top3 FROM events GROUP BY country;
+```
+
+`topK` 用的是 Space-Saving 算法，内存固定，但**只保证高频项大致正确，不保证顺序和计数精确**。做数据探查很好用，做精确报表还是要老老实实 GROUP BY。
+
+## 6. 组合子（Combinator）
+
+组合子是加在聚合函数名后面的后缀，改变函数的行为。**这是 ClickHouse 最优雅的设计之一**。
+
+### 6.1 -If：条件聚合
+
+```sql
+SELECT
+    country,
+    count()                                        AS total_pv,
+    countIf(event_type = 'purchase')               AS purchases,
+    countIf(device = 'ios')                        AS ios_pv,
+    sumIf(duration_ms, event_type = 'view')        AS view_total_ms,
+    avgIf(duration_ms, duration_ms < 10000)        AS avg_ms_filtered,
+    uniqIf(user_id, event_type = 'purchase')       AS buyers,
+    round(countIf(event_type='purchase') / uniqIf(user_id, event_type='purchase'), 2) AS orders_per_buyer
+FROM events
+GROUP BY country
+ORDER BY total_pv DESC;
+```
+
+```text
+┌─country─┬─total_pv─┬─purchases─┬─ios_pv─┬─view_total_ms─┬─avg_ms_filtered─┬─buyers─┬─orders_per_buyer─┐
+│ JP      │   200412 │     50213 │  66804 │   126482013   │          2524.3 │  22104 │             2.27 │
+│ CN      │   200208 │     50041 │  66702 │   126318844   │          2521.8 │  22019 │             2.27 │
+└─────────┴──────────┴───────────┴────────┴───────────────┴─────────────────┴────────┴──────────────────┘
+```
+
+**`-If` 是 ClickHouse 最常用的组合子**。在 MySQL 里你要写 `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`，这里一个 `countIf` 搞定，而且**只扫一遍数据就能算出所有条件分支**。
+
+### 6.2 -Array：对数组元素聚合
+
+```sql
+SELECT
+    sumArray([[1,2],[3,4],[5]])        AS s,     -- 15
+    uniqArray([['a','b'],['b','c']])   AS u;     -- 3
+```
+
+配合数组列使用（第 13 章详讲）。
+
+### 6.3 -State / -Merge：聚合状态
+
+第 8 章讲过，这里回顾：
+
+```sql
+-- 生成状态
+SELECT country, uniqState(user_id) AS s FROM events GROUP BY country;
+
+-- 合并状态出结果
+SELECT uniqMerge(s) FROM (SELECT country, uniqState(user_id) AS s FROM events GROUP BY country);
+
+-- MergeState：合并后仍是状态（多级聚合用）
+SELECT uniqMergeState(s) FROM (...);
+```
+
+### 6.4 -OrNull / -OrDefault：空组处理
+
+```sql
+-- 没有匹配行时，普通聚合返回 0，-OrNull 返回 NULL
+SELECT
+    sum(duration_ms)          AS a,   -- 0
+    sumOrNull(duration_ms)    AS b,   -- NULL
+    avg(duration_ms)          AS c,   -- nan
+    avgOrNull(duration_ms)    AS d    -- NULL
+FROM events WHERE country = 'XX';     -- 不存在的国家
+```
+
+```text
+┌─a─┬────b─┬───c─┬────d─┐
+│ 0 │ ᴺᵁᴸᴸ │ nan │ ᴺᵁᴸᴸ │
+└───┴──────┴─────┴──────┘
+```
+
+区分「和为 0」和「没有数据」时用 `-OrNull`。
+
+### 6.5 -Resample：按区间分组聚合
+
+```sql
+-- 按小时分桶统计，一次返回数组
+SELECT
+    country,
+    countResample(0, 24, 1)(user_id, toHour(event_time)) AS hourly_pv
+FROM events
+GROUP BY country
+LIMIT 2;
+```
+
+```text
+┌─country─┬─hourly_pv─────────────────────────────────────────┐
+│ CN      │ [8342,8301,8388,8355,8371,...,8329]  (24 个元素)  │
+└─────────┴───────────────────────────────────────────────────┘
+```
+
+### 6.6 -Distinct：先去重再聚合
+
+```sql
+SELECT
+    sumDistinct(duration_ms)  AS s,     -- 对不同的 duration 值求和
+    countDistinct(page)       AS c
+FROM events;
+```
+
+### 6.7 组合子可以叠加
+
+这是最强大的地方——组合子能级联：
+
+```sql
+SELECT
+    -- 只对 purchase 事件求 UV 的状态
+    uniqIfState(user_id, event_type = 'purchase')     AS s1,
+    -- 数组元素中满足条件的求和
+    sumArrayIf([1,2,3], 1)                            AS s2,
+    -- 条件计数的 OrNull 版本
+    countIfOrNull(event_type = 'nonexistent')         AS s3
+FROM events;
+```
+
+`uniqIfState` = uniq + If + State，读作「对满足条件的行计算 uniq 的中间状态」。这在物化视图里极其有用：
+
+```sql
+CREATE MATERIALIZED VIEW mv_funnel TO agg_funnel AS
+SELECT
+    toDate(event_time)                                AS day,
+    country,
+    uniqIfState(user_id, event_type = 'view')         AS viewers,
+    uniqIfState(user_id, event_type = 'click')        AS clickers,
+    uniqIfState(user_id, event_type = 'purchase')     AS buyers
+FROM events
+GROUP BY day, country;
+```
+
+查询时：
+
+```sql
+SELECT
+    day,
+    uniqMerge(viewers)  AS viewers,
+    uniqMerge(clickers) AS clickers,
+    uniqMerge(buyers)   AS buyers,
+    round(uniqMerge(clickers) / uniqMerge(viewers) * 100, 2) AS click_rate,
+    round(uniqMerge(buyers) / uniqMerge(clickers) * 100, 2)  AS buy_rate
+FROM agg_funnel
+GROUP BY day ORDER BY day LIMIT 5;
+```
+
+```text
+┌────────day─┬─viewers─┬─clickers─┬─buyers─┬─click_rate─┬─buy_rate─┐
+│ 2024-06-01 │   11021 │    10988 │  10954 │      99.70 │    99.69 │
+│ 2024-06-02 │   10987 │    10951 │  10920 │      99.67 │    99.72 │
+└────────────┴─────────┴──────────┴────────┴────────────┴──────────┘
+```
+
+<Callout type="info" title="组合子的组合顺序有规则">
+后缀的顺序大致是：`If` → `Array` → `Distinct` → `Merge/State` → `OrNull/OrDefault`。
+
+写错顺序会报「Unknown aggregate function」。不确定时可以查：
+
+```sql
+SELECT name FROM system.functions WHERE is_aggregate AND name LIKE 'uniq%';
+```
+</Callout>
+
+## 7. 其他实用聚合函数
+
+```sql
+SELECT
+    -- 把分组内的值收集成数组
+    groupArray(page)                        AS pages,
+    groupArray(3)(page)                     AS first3_pages,     -- 最多 3 个
+    groupUniqArray(country)                 AS uniq_countries,
+    -- 排序后收集
+    groupArraySorted(5)(duration_ms)        AS top5_durations,
+    -- 直方图
+    histogram(5)(duration_ms)               AS hist,
+    -- 序列匹配
+    sequenceCount('(?1).*(?2)')(event_time, event_type='view', event_type='purchase') AS seq
+FROM events
+WHERE user_id = 1001;
+```
+
+`groupArray` 是把明细行折叠成数组的关键，常用于「一个用户的行为序列」：
+
+```sql
+SELECT
+    user_id,
+    groupArray(event_type)  AS event_seq,
+    groupArray(page)        AS page_seq
+FROM (SELECT * FROM events WHERE user_id IN (1001, 1002) ORDER BY event_time)
+GROUP BY user_id;
+```
+
+```text
+┌─user_id─┬─event_seq──────────────────────────┬─page_seq───────────────────────┐
+│    1001 │ ['view','click','purchase','view'] │ ['/p/1','/p/1','/checkout','/'] │
+│    1002 │ ['view','view','click']            │ ['/p/8','/p/9','/p/9']          │
+└─────────┴────────────────────────────────────┴─────────────────────────────────┘
+```
+
+<Callout type="warn" title="groupArray 没有内存上限">
+如果某个分组有 1000 万行，`groupArray` 会构造一个 1000 万元素的数组，直接 OOM。**永远加行数限制**：`groupArray(1000)(x)`。
+</Callout>
+
+## 8. 内存与性能
+
+聚合的内存主要花在哈希表上。`GROUP BY` 的基数越大越危险：
+
+```sql
+-- 危险：user_id 有 5000 万个不同值
+SELECT user_id, count() FROM events GROUP BY user_id;
+```
+
+应对手段：
+
+```sql
+-- 1. 允许溢写磁盘
+SET max_bytes_before_external_group_by = 4000000000;   -- 超过 4 GB 就写磁盘
+SET max_memory_usage = 10000000000;
+
+-- 2. 两级聚合（大基数时自动启用，也可强制）
+SET group_by_two_level_threshold = 100000;
+
+-- 3. 限制结果集
+SELECT user_id, count() AS c FROM events GROUP BY user_id ORDER BY c DESC LIMIT 100;
+```
+
+<Callout type="tip" title="max_bytes_before_external_group_by 设为 max_memory_usage 的一半">
+官方推荐这个比例。因为聚合完成后还要做合并和排序，需要留出空间。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 对 `events` 表分别用 `uniqExact`、`uniq`、`uniqCombined`、`uniqHLL12` 计算 UV，记录四者的结果差异和 Elapsed，算出各自误差率。
+2. 用 `groupBitmap` 计算精确 UV，对比 `uniqExact` 的内存占用（用 `system.query_log` 的 `memory_usage` 字段）。
+3. 用 `countIf` 一次性算出每个国家的 view / click / purchase 三个数量，对比写三条独立 SQL 的总耗时。
+4. 用 `argMax(page, event_time)` 找出每个用户的最后访问页面，再用 `topK(10)` 找出最常见的「最后访问页面」——这是分析流失点的常用方法。
+5. 用 `uniqIfState` 建一个漏斗物化视图，然后用 `uniqMerge` 查出各步骤转化率。
+</Callout>
+
+## 小结
+
+- `count()` 不读列，`count(col)` 要读列，统计行数永远用前者
+- UV 计算：日常报表用 `uniqCombined`，超大基数用 `uniqHLL12`，需要精确且 ID 连续时用 `groupBitmap`
+- `uniqExact` 和 `count(DISTINCT)` 是内存炸弹，大基数分组时会 OOM
+- 分位数：延迟监控用 `quantileTiming`，通用场景用 `quantileTDigest`，`quantile` 结果不可复现
+- `argMin` / `argMax` 取「另一列最值时本列的值」，是去重、找首末事件的核心工具
+- 组合子体系：`-If` 条件聚合最常用，`-State`/`-Merge` 支撑预聚合，`-OrNull` 区分空组，可以级联叠加
+- `groupArray` 折叠明细成数组，必须加行数上限防 OOM
+- 大基数 GROUP BY 要配置 `max_bytes_before_external_group_by` 允许溢写磁盘
+- 下一章讲数组与嵌套结构，把上面的 groupArray 用起来 →

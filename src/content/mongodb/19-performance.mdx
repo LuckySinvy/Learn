@@ -1,0 +1,570 @@
+---
+title: 性能分析与优化
+order: 19
+description: explain 三种模式、慢查询 profiler、currentOp、连接池、工作集与常见改写
+---
+
+# 性能分析与优化
+
+「数据库慢」是一个太笼统的判断。这一章讲怎么把它拆成可测量的问题：是哪条查询慢、为什么慢、慢在哪个阶段、怎么改。工具链只有几个，但用熟了能解决 90% 的性能问题。
+
+## 1. explain：读懂执行计划
+
+### 1.1 三种详细程度
+
+```js
+db.posts.find({ authorId: "alice" }).explain("queryPlanner")      // 默认，只看计划
+db.posts.find({ authorId: "alice" }).explain("executionStats")    // 真的执行，给统计
+db.posts.find({ authorId: "alice" }).explain("allPlansExecution") // 所有候选计划的统计
+```
+
+| 模式 | 是否真的执行查询 | 输出 | 用途 |
+|---|---|---|---|
+| `queryPlanner` | 否 | 选中的计划和被拒绝的计划 | 快速看走没走索引 |
+| `executionStats` | 是 | 加上扫描数、耗时、返回数 | **日常最常用** |
+| `allPlansExecution` | 是 | 加上每个候选计划的表现 | 排查「为什么选了这个索引」 |
+
+### 1.2 关键指标
+
+```js
+db.posts.find({ status: "published", "stats.views": { $gt: 1000 } })
+  .sort({ createdAt: -1 })
+  .limit(20)
+  .explain("executionStats")
+```
+
+```json
+{
+  "queryPlanner": {
+    "winningPlan": {
+      "stage": "LIMIT",
+      "limitAmount": 20,
+      "inputStage": {
+        "stage": "FETCH",
+        "filter": { "stats.views": { "$gt": 1000 } },
+        "inputStage": {
+          "stage": "IXSCAN",
+          "indexName": "status_1_createdAt_-1",
+          "direction": "forward",
+          "indexBounds": {
+            "status": [ "[\"published\", \"published\"]" ],
+            "createdAt": [ "[MaxKey, MinKey]" ]
+          }
+        }
+      }
+    },
+    "rejectedPlans": [ ]
+  },
+  "executionStats": {
+    "executionSuccess": true,
+    "nReturned": 20,
+    "executionTimeMillis": 8,
+    "totalKeysExamined": 640,
+    "totalDocsExamined": 640
+  }
+}
+```
+
+三个数字决定一切：
+
+| 指标 | 含义 | 健康标准 |
+|---|---|---|
+| `nReturned` | 最终返回文档数 | — |
+| `totalKeysExamined` | 扫描的索引条目数 | 接近 `nReturned` |
+| `totalDocsExamined` | 读取的文档数 | 接近 `nReturned`，覆盖查询时为 0 |
+
+**理想比例是 1:1:1**。上面的例子是 20:640:640，说明索引把范围缩小到 640 条，但其中 620 条被 `stats.views` 过滤掉了——这就是优化空间。
+
+### 1.3 常见 stage 含义
+
+| stage | 含义 | 好坏 |
+|---|---|---|
+| `COLLSCAN` | 全集合扫描 | 大集合上是灾难 |
+| `IXSCAN` | 索引扫描 | 好 |
+| `FETCH` | 根据索引回表读文档 | 正常，但能避免更好 |
+| `PROJECTION_COVERED` | 覆盖查询，未回表 | 最好 |
+| `SORT` | 内存排序 | 需要优化 |
+| `SORT_KEY_GENERATOR` | 为排序生成键 | 伴随 SORT 出现 |
+| `LIMIT` / `SKIP` | 截断 | 正常 |
+| `AND_SORTED` / `OR` | 索引交集/并集 | 通常说明索引设计不佳 |
+| `SHARD_MERGE` | 分片广播后合并 | 分片下要尽量避免 |
+| `SUBPLAN` | `$or` 各分支独立规划 | 检查每个分支有没有索引 |
+
+### 1.4 一个真实的优化过程
+
+**问题**：帖子列表接口 P99 达到 800ms。
+
+```js
+db.posts.find({ status: "published", tags: "mongodb" })
+  .sort({ "stats.likes": -1 })
+  .limit(20)
+  .explain("executionStats")
+```
+
+```json
+{
+  "executionStats": {
+    "nReturned": 20,
+    "executionTimeMillis": 812,
+    "totalKeysExamined": 0,
+    "totalDocsExamined": 1204882,
+    "executionStages": {
+      "stage": "SORT",
+      "memUsage": 31459840,
+      "inputStage": { "stage": "COLLSCAN" }
+    }
+  }
+}
+```
+
+诊断：`totalKeysExamined: 0` 说明完全没走索引，`COLLSCAN` 扫了 120 万文档，还做了 30MB 的内存排序。
+
+**第一次尝试**：加索引。
+
+```js
+db.posts.createIndex({ status: 1, tags: 1, "stats.likes": -1 })
+```
+
+```json
+{
+  "executionStats": {
+    "nReturned": 20,
+    "executionTimeMillis": 6,
+    "totalKeysExamined": 20,
+    "totalDocsExamined": 20,
+    "executionStages": {
+      "stage": "LIMIT",
+      "inputStage": { "stage": "FETCH", "inputStage": { "stage": "IXSCAN" } }
+    }
+  }
+}
+```
+
+812ms → 6ms。SORT 阶段消失，扫描比 20:20:20。
+
+**第二次优化**：如果列表页只需要标题、作者、点赞数，做成覆盖查询。
+
+```js
+db.posts.createIndex({ status: 1, tags: 1, "stats.likes": -1, title: 1, "author.username": 1 })
+
+db.posts.find(
+  { status: "published", tags: "mongodb" },
+  { title: 1, "author.username": 1, "stats.likes": 1, _id: 0 }
+).sort({ "stats.likes": -1 }).limit(20)
+```
+
+```json
+{
+  "executionStats": {
+    "nReturned": 20,
+    "executionTimeMillis": 1,
+    "totalKeysExamined": 20,
+    "totalDocsExamined": 0,
+    "executionStages": { "stage": "PROJECTION_COVERED" }
+  }
+}
+```
+
+6ms → 1ms，`totalDocsExamined` 归零。
+
+<Callout type="tip" title="explain 聚合与更新">
+不只 `find` 能 explain。聚合用 `db.coll.explain("executionStats").aggregate([...])`，更新和删除用 `db.coll.explain().update(...)`。更新语句的执行计划同样重要——一个走 COLLSCAN 的 `updateMany` 能把库拖垮。
+</Callout>
+
+## 2. 慢查询 Profiler
+
+explain 用于「已知某条查询慢」，profiler 用于「不知道哪条慢」。
+
+### 2.1 开启
+
+```js
+// level: 0 关闭, 1 只记慢查询, 2 记全部（仅用于调试，开销大）
+db.setProfilingLevel(1, { slowms: 100, sampleRate: 1.0 })
+db.getProfilingStatus()
+```
+
+```json
+{ "was": 1, "slowms": 100, "sampleRate": 1, "ok": 1 }
+```
+
+profiler 数据写在 `system.profile` 这个定长集合里（默认 1MB，建议调大）：
+
+```js
+db.setProfilingLevel(0)
+db.system.profile.drop()
+db.createCollection("system.profile", { capped: true, size: 100 * 1024 * 1024 })
+db.setProfilingLevel(1, { slowms: 100 })
+```
+
+### 2.2 分析慢查询
+
+```js
+// 最慢的 5 条
+db.system.profile.find({ ns: "community.posts" })
+  .sort({ millis: -1 }).limit(5)
+  .projection({ op: 1, millis: 1, command: 1, planSummary: 1, docsExamined: 1, nreturned: 1 })
+```
+
+```json
+[
+  {
+    "op": "query",
+    "millis": 3421,
+    "planSummary": "COLLSCAN",
+    "docsExamined": 1204882,
+    "nreturned": 12,
+    "command": { "find": "posts", "filter": { "slug": "why-mongodb" } }
+  }
+]
+```
+
+按查询形状聚合，找出「总耗时」最高的模式（比 单条最慢 更有价值）：
+
+```js
+db.system.profile.aggregate([
+  { $match: { millis: { $gte: 100 } } },
+  { $group: {
+      _id: { ns: "$ns", plan: "$planSummary" },
+      count: { $sum: 1 },
+      totalMs: { $sum: "$millis" },
+      avgMs: { $avg: "$millis" },
+      maxMs: { $max: "$millis" }
+  } },
+  { $sort: { totalMs: -1 } },
+  { $limit: 10 }
+])
+```
+
+```json
+[
+  { "_id": { "ns": "community.posts", "plan": "COLLSCAN" },
+    "count": 4210, "totalMs": 1852300, "avgMs": 439.9, "maxMs": 3421 },
+  { "_id": { "ns": "community.comments", "plan": "IXSCAN { postId: 1 }" },
+    "count": 88120, "totalMs": 924100, "avgMs": 10.5, "maxMs": 210 }
+]
+```
+
+第二行很有意思：平均只有 10.5ms，但因为调用了 8.8 万次，总耗时接近第一名。**优化高频的中速查询，收益常常大于优化低频的慢查询**。
+
+<Callout type="warn" title="profiler 有性能开销">
+`level: 2`（记录全部）在高 QPS 下会显著拖慢数据库。生产环境用 `level: 1` 配合合理的 `slowms`，需要采样时用 `sampleRate: 0.1` 只记 10%。排查完记得关掉或调回默认。
+</Callout>
+
+### 2.3 mongod 日志
+
+慢查询也会写进 mongod 日志（默认阈值 100ms），格式是结构化 JSON：
+
+```text
+{"t":{"$date":"2024-06-04T09:31:23.451+08:00"},"s":"I","c":"COMMAND",
+ "msg":"Slow query","attr":{"type":"command","ns":"community.posts",
+ "command":{"find":"posts","filter":{"slug":"why-mongodb"}},
+ "planSummary":"COLLSCAN","keysExamined":0,"docsExamined":1204882,
+ "nreturned":1,"durationMillis":3421}}
+```
+
+用日志采集系统（ELK、Loki）收上去做聚合分析，比 `system.profile` 更适合长期趋势观察。
+
+## 3. currentOp 与 killOp
+
+排查「现在为什么卡住了」。
+
+```js
+// 所有运行超过 3 秒的操作
+db.currentOp({
+  active: true,
+  secs_running: { $gte: 3 },
+  ns: /^community\./
+})
+```
+
+```json
+{
+  "inprog": [
+    {
+      "opid": 84213,
+      "active": true,
+      "secs_running": 128,
+      "op": "command",
+      "ns": "community.posts",
+      "command": { "aggregate": "posts", "pipeline": [ { "$group": { "_id": "$authorId" } } ] },
+      "planSummary": "COLLSCAN",
+      "numYields": 84021,
+      "waitingForLock": false,
+      "lockStats": { }
+    }
+  ]
+}
+```
+
+```js
+// 杀掉它
+db.killOp(84213)
+```
+
+关键字段：
+
+| 字段 | 含义 |
+|---|---|
+| `secs_running` | 已运行秒数 |
+| `numYields` | 让出锁的次数，很高说明在读大量数据 |
+| `waitingForLock` | 是否在等锁 |
+| `planSummary` | 执行计划摘要 |
+| `msg` / `progress` | 长任务（索引构建）的进度 |
+
+<Callout type="warn" title="killOp 不是万能的">
+`killOp` 只在操作到达「可中断点」时生效。正在执行 `$group` 的聚合通常能很快被杀掉，但正在写入的操作、正在建索引的操作可能要等一段时间，甚至无法中断。而且杀掉写操作不会回滚已经写入的部分（除非在事务里）。
+</Callout>
+
+## 4. 工作集与内存
+
+### 4.1 什么是工作集
+
+工作集（working set）= 经常被访问的数据 + 相关索引。它应该完全装进 WiredTiger cache，否则每次查询都要读磁盘。
+
+```text
+  理想状态：
+  ┌────────────────────────────┐
+  │   WiredTiger Cache (32GB)  │
+  │  ┌──────────────────────┐  │
+  │  │  热数据 (18GB)        │  │  ← 命中率 99%+
+  │  │  索引  (10GB)         │  │
+  │  └──────────────────────┘  │
+  └────────────────────────────┘
+       磁盘：冷数据 500GB
+
+  糟糕状态：
+  ┌────────────────────────────┐
+  │   WiredTiger Cache (8GB)   │  ← 装不下
+  └────────────────────────────┘
+       每次查询都要读磁盘，延迟从 0.1ms 变成 5ms
+```
+
+### 4.2 关键指标
+
+```js
+db.serverStatus().wiredTiger.cache
+```
+
+```json
+{
+  "maximum bytes configured": 34359738368,
+  "bytes currently in the cache": 33982221312,
+  "pages read into cache": 8421093,
+  "pages written from cache": 1204882,
+  "tracked dirty bytes in the cache": 421093888,
+  "eviction server evicting pages": 84210
+}
+```
+
+| 指标 | 健康信号 |
+|---|---|
+| `bytes currently in the cache` / `maximum` | 长期接近 100% 说明内存吃紧 |
+| `pages read into cache` 增长率 | 持续增长说明命中率低 |
+| `tracked dirty bytes` | 超过 cache 的 20% 会触发激进淘汰 |
+
+```js
+// 索引总大小 vs 内存
+db.posts.stats().indexSizes
+db.stats().indexSize
+```
+
+<Callout type="tip" title="索引必须能装进内存">
+数据装不下内存还能接受（冷数据读磁盘），但**索引装不下内存是致命的**：每次索引查找都可能触发多次随机磁盘 IO。一个经验规则是：所有活跃索引的总大小应该小于 WiredTiger cache 的 50%。如果超了，要么加内存，要么删索引，要么用部分索引缩小体积。
+</Callout>
+
+## 5. 连接池
+
+### 5.1 配置
+
+```js
+"mongodb://.../community?maxPoolSize=50&minPoolSize=5&maxIdleTimeMS=60000&waitQueueTimeoutMS=5000"
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `maxPoolSize` | 100 | 单个客户端到单个节点的最大连接数 |
+| `minPoolSize` | 0 | 保持的最小空闲连接 |
+| `maxIdleTimeMS` | 无限 | 空闲连接的存活时间 |
+| `waitQueueTimeoutMS` | 无限 | 池满时等待连接的超时 |
+
+### 5.2 怎么算合理值
+
+```text
+总连接数 = 应用实例数 × maxPoolSize × 副本节点数
+
+  20 个 Pod × maxPoolSize 100 × 3 个节点 = 6000 个连接
+
+  mongod 每个连接约占 1MB 栈空间 → 6GB 内存被连接吃掉
+  而且 MongoDB 默认最大连接数是 65536，但实际上超过几千就会出问题
+```
+
+合理的 `maxPoolSize` 应该接近「应用的实际并发查询数」，而不是越大越好：
+
+```text
+maxPoolSize ≈ 单实例并发请求数 × 每请求的平均数据库查询数
+
+  例：单 Pod 峰值 200 QPS，平均响应 50ms，每请求 2 次查询
+     并发查询数 ≈ 200 × 0.05 × 2 = 20
+     maxPoolSize 设 30 到 50 足够
+```
+
+<Callout type="warn" title="连接池设太大反而更慢">
+连接数超过数据库能有效并发处理的量时，请求会在服务端排队，每个请求的延迟都变长，而不是吞吐变高。这是典型的「排队论」现象。看到 `db.serverStatus().connections.current` 很高但 CPU 不满，就要考虑调小连接池。
+</Callout>
+
+```js
+db.serverStatus().connections
+```
+
+```json
+{ "current": 842, "available": 51386, "totalCreated": 120483, "active": 27 }
+```
+
+`current` 很高但 `active` 很低，说明大量连接是闲置的，池设大了。
+
+## 6. 常见慢查询模式与改写
+
+### 6.1 正则中间匹配
+
+```js
+// 慢：无法用索引
+db.posts.find({ title: /mongodb/i })
+
+// 改写方案一：前缀匹配（能用索引）
+db.posts.find({ title: /^MongoDB/ })
+
+// 改写方案二：冗余一个小写字段 + 文本索引
+db.posts.createIndex({ titleLower: 1 })
+db.posts.find({ titleLower: { $regex: "^mongodb" } })
+
+// 改写方案三：上 Atlas Search / ES
+```
+
+### 6.2 $ne 与 $nin
+
+```js
+// 慢：需要扫描索引中除了排除值之外的所有条目
+db.posts.find({ status: { $ne: "deleted" } })
+
+// 改写：正向枚举
+db.posts.find({ status: { $in: ["draft", "published"] } })
+```
+
+### 6.3 大 skip 深分页
+
+```js
+// 慢
+db.posts.find().sort({ _id: -1 }).skip(200000).limit(20)
+
+// 改写：游标分页（第 6 章）
+db.posts.find({ _id: { $lt: lastId } }).sort({ _id: -1 }).limit(20)
+```
+
+### 6.4 无索引排序
+
+```js
+// 慢：内存排序，可能撞 32MB 上限
+db.posts.find({ status: "published" }).sort({ "stats.likes": -1 })
+
+// 改写：建符合 ESR 的索引
+db.posts.createIndex({ status: 1, "stats.likes": -1 })
+```
+
+### 6.5 $lookup 放大
+
+```js
+// 慢：对 10 万条帖子每条都关联一次
+db.posts.aggregate([
+  { $lookup: { from: "users", localField: "authorId", foreignField: "_id", as: "author" } },
+  { $match: { status: "published" } },
+  { $limit: 20 }
+])
+
+// 改写一：先 match 和 limit，再 lookup
+db.posts.aggregate([
+  { $match: { status: "published" } },
+  { $sort: { createdAt: -1 } },
+  { $limit: 20 },
+  { $lookup: { from: "users", localField: "authorId", foreignField: "_id", as: "author" } }
+])
+
+// 改写二（更好）：用扩展引用模式冗余作者名，彻底去掉 lookup
+```
+
+### 6.6 数组元素过多
+
+```js
+// 慢：文档 5MB，每次读取都要传输整个数组
+{ _id: 11, title: "...", comments: [ /* 20000 条 */ ] }
+
+// 改写：子集模式 + 独立 comments 集合（第 12 章）
+```
+
+### 6.7 大量小查询（N+1）
+
+```js
+// 慢：循环里 N 次查询
+for (const post of posts) {
+  post.author = db.users.findOne({ _id: post.authorId })
+}
+
+// 改写：批量查询后在内存里 join
+const ids = [...new Set(posts.map(p => p.authorId))]
+const users = db.users.find({ _id: { $in: ids } }).toArray()
+const map = new Map(users.map(u => [u._id.toString(), u]))
+posts.forEach(p => { p.author = map.get(p.authorId.toString()) })
+```
+
+一次 `$in` 查询代替 N 次 `findOne`，网络往返从 N 次降到 1 次。
+
+## 7. 性能排查流程
+
+```text
+  用户反馈慢 / 监控告警
+          │
+          ▼
+  1. 是全局慢还是某个接口慢？
+     └─ 看 CPU / 内存 / 磁盘 IO / 连接数
+          │
+          ▼
+  2. 全局慢 → 检查：
+     ├─ WiredTiger cache 命中率（工作集是否超内存）
+     ├─ 复制延迟（secondary 是否拖累）
+     ├─ 是否有大批量写入 / 索引构建在跑
+     └─ 连接数是否异常
+          │
+          ▼
+  3. 局部慢 → 用 profiler 定位具体查询
+     └─ 按 totalMs 排序，找出总耗时最高的查询形状
+          │
+          ▼
+  4. 对该查询 explain("executionStats")
+     ├─ 有 COLLSCAN？    → 建索引
+     ├─ 有 SORT？        → 调整索引顺序（ESR）
+     ├─ docsExamined 远大于 nReturned？ → 调整索引或改查询
+     └─ 已经很优？       → 考虑改建模 / 加缓存 / 分片
+          │
+          ▼
+  5. 改完后再 explain 验证，并观察线上指标
+```
+
+<Callout type="warn" title="不要凭感觉优化">
+「我觉得这里加个索引会快」是最常见的时间浪费。每一次优化都应该有：一、优化前的量化指标；二、明确的假设；三、优化后的对比数据。加了索引却没有变快的情况非常常见（因为优化器没选它、或者瓶颈根本不在这里）。
+</Callout>
+
+<Callout type="exercise" title="练习">
+一、造 100 万条帖子数据，对一个没有索引的字段做查询，记录 `explain` 的三个关键指标；二、加上索引后重测，计算改善倍数；三、进一步做成覆盖查询，验证 `totalDocsExamined` 归零；四、开启 profiler（slowms 设 50），跑一批混合查询，用聚合找出总耗时最高的三个查询形状；五、在一个窗口跑一个耗时很长的聚合，在另一个窗口用 `currentOp` 找到它并 `killOp`；六、用 `db.serverStatus().connections` 观察连接数，然后把 `maxPoolSize` 从 100 调到 20，看应用延迟有没有变化；七、找出本章 6.1 到 6.7 中三种模式在你自己项目里的实例，并改写它们。
+</Callout>
+
+## 小结
+
+- `explain("executionStats")` 是最常用的模式，看 `nReturned`、`totalKeysExamined`、`totalDocsExamined` 三个数字，理想比例 1:1:1
+- 看到 `COLLSCAN` 就建索引，看到 `SORT` 就按 ESR 调整索引顺序
+- profiler 用于「不知道哪条慢」，按查询形状聚合总耗时比看单条最慢更有价值
+- 高频的中速查询往往比低频的慢查询更值得优化
+- `currentOp` 找当前卡住的操作，`killOp` 终止它（但不保证立即生效）
+- 索引必须装进内存，总大小控制在 WiredTiger cache 的 50% 以内
+- 连接池不是越大越好，超过数据库并发处理能力反而增加排队延迟
+- 七种常见慢查询模式：中间正则、`$ne`、深分页、无索引排序、`$lookup` 放大、超大数组、N+1
+- 每次优化都要有前后对比数据，不要凭感觉
+- 下一章用一个完整项目把全部内容串起来 →

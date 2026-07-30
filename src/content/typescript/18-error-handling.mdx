@@ -1,0 +1,336 @@
+---
+title: 错误处理
+order: 18
+description: Error 子类化、unknown 类型的 catch、Result 模式、类型安全的错误联合与不变量断言
+---
+
+# 错误处理
+
+TypeScript 在错误处理上有一个绕不开的现实：**`throw` 可以抛出任何值，而且函数签名里无法声明它会抛什么**。Java 有 `throws`，Rust 有 `Result`，TS 两样都没有。
+
+```ts
+function risky(): number {
+  throw "字符串也能抛";     // 签名仍然是 () => number
+}
+```
+
+这意味着：类型系统默认帮不了你。要想让错误处理也变得类型安全，得靠**主动建模**。本章给出三条互补的路线：规范化异常、把错误编码进返回值、以及用断言表达不变量。
+
+## 1. `catch` 里的值是 `unknown`
+
+开启 `strict`（准确说是 `useUnknownInCatchVariables`）之后，`catch (e)` 中 `e` 的类型是 `unknown`，必须先收窄才能用：
+
+```ts
+try {
+  doSomething();
+} catch (e) {
+  // e.message         // 报错：unknown 上没有 message
+  if (e instanceof Error) console.error(e.message);
+  else console.error(String(e));
+}
+```
+
+这个改动经常被抱怨「太啰嗦」，但它反映的是真实情况：第三方库抛字符串、抛对象、抛 `undefined` 的都有。实践中最好写一个统一的**规范化函数**，把任何抛出物变成 `Error`：
+
+```ts
+function toError(e: unknown): Error {
+  if (e instanceof Error) return e;
+  if (typeof e === "string") return new Error(e);
+  return new Error("非 Error 抛出物: " + JSON.stringify(e));
+}
+```
+
+<Callout type="warn" title="别用 catch (e: any)">
+`catch (e: any)` 能让编译通过，但它把整条错误处理链变成了无类型区。TS 只允许 `catch` 参数标注为 `any` 或 `unknown` 两种，选 `unknown` 并配一个 `toError`，成本很低收益很大。
+</Callout>
+
+## 2. 自定义 Error 子类
+
+内置的 `Error` 只有 `name`／`message`／`stack`／`cause`。要携带业务信息（HTTP 状态码、字段名、重试标记），就需要子类化。
+
+三个要点：
+
+1. 构造函数里必须 `super(message)`；
+2. 手动设置 `this.name`，否则 `err.name` 一直是 `"Error"`；
+3. `target` 低于 ES2015 时，`extends Error` 会丢失原型链，需要 `Object.setPrototypeOf(this, new.target.prototype)`。现代项目 `target: ES2022` 无此问题。
+
+`cause` 是 ES2022 新增的标准字段，用来串联错误链，比自己发明 `originalError` 字段更好：
+
+```ts
+throw new Error("加载配置失败", { cause: ioError });
+```
+
+<Playground
+  language="typescript"
+  id="ts-18-custom-error"
+  title="Error 子类化与错误链"
+  code={`class AppError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+
+  constructor(message: string, code: string, options?: { retryable?: boolean; cause?: unknown }) {
+    super(message, { cause: options?.cause });
+    this.name = "AppError";
+    this.code = code;
+    this.retryable = options?.retryable ?? false;
+  }
+}
+
+class NotFoundError extends AppError {
+  readonly resource: string;
+  constructor(resource: string, id: string) {
+    super(resource + " " + id + " 不存在", "NOT_FOUND");
+    this.name = "NotFoundError";
+    this.resource = resource;
+  }
+}
+
+class TimeoutError extends AppError {
+  constructor(ms: number, cause?: unknown) {
+    super("操作超时 " + ms + "ms", "TIMEOUT", { retryable: true, cause });
+    this.name = "TimeoutError";
+  }
+}
+
+function toError(e: unknown): Error {
+  if (e instanceof Error) return e;
+  if (typeof e === "string") return new Error(e);
+  return new Error("非 Error 抛出物: " + JSON.stringify(e));
+}
+
+function handle(e: unknown): void {
+  const err = toError(e);
+  if (err instanceof NotFoundError) {
+    console.log("[404]", err.resource, "|", err.message);
+  } else if (err instanceof AppError) {
+    console.log("[" + err.code + "]", err.message, "可重试:", err.retryable);
+    if (err.cause instanceof Error) console.log("  根因:", err.cause.message);
+  } else {
+    console.log("[未知]", err.name, err.message);
+  }
+}
+
+handle(new NotFoundError("user", "u-42"));
+handle(new TimeoutError(3000, new Error("socket hang up")));
+handle("裸字符串");
+handle({ weird: true });
+
+// instanceof 链是完整的
+const t = new TimeoutError(100);
+console.log("是 AppError 吗:", t instanceof AppError, "| 是 Error 吗:", t instanceof Error);
+console.log("name:", t.name, "| code:", t.code);`}
+/>
+
+<Callout type="info" title="错误分类比错误信息更重要">
+日志里的 message 是给人看的，`code` 是给程序看的。用稳定的 `code` 字符串（如 `"NOT_FOUND"`、`"RATE_LIMITED"`）做分支判断，message 可以随时改写、翻译、加上下文，而不会破坏调用方逻辑。
+</Callout>
+
+## 3. 类型安全的错误联合
+
+比子类化更「TS 味」的做法：把错误建模成**可辨识联合**，用 `switch` 做穷尽性处理。这样新增一种错误时，编译器会指出所有需要补分支的地方。
+
+```ts
+type AppFailure =
+  | { kind: "not_found"; id: string }
+  | { kind: "validation"; field: string; message: string }
+  | { kind: "network"; status: number };
+```
+
+它的优势是**错误集合是封闭的、可枚举的**；劣势是没有 stack trace，且不能直接 `throw` 后被通用中间件识别。两种方式常常混用：内层用联合，边界处包装成 Error 抛出。
+
+## 4. Result 模式：把错误放进返回值
+
+既然 `throw` 无法出现在类型签名里，那就干脆不抛——把「成功或失败」编码成返回值。这就是 Rust 的 `Result`、Haskell 的 `Either` 在 TS 里的翻版：
+
+```ts
+type Ok<T> = { ok: true; value: T };
+type Err<E> = { ok: false; error: E };
+type Result<T, E> = Ok<T> | Err<E>;
+```
+
+调用方**必须**先检查 `ok` 字段才能拿到 `value`，编译器强制你面对失败分支。
+
+| 方案 | 优点 | 缺点 |
+|---|---|---|
+| `throw` + 子类 | 符合 JS 习惯、有 stack、能跨层冒泡 | 签名不体现、容易漏 catch |
+| 错误联合 | 可穷尽、易测试 | 需要手动传递 |
+| `Result` | 类型强制处理、无隐藏控制流 | 调用链啰嗦、与生态不兼容 |
+
+实践建议：**领域核心逻辑用 `Result`，进程边界（HTTP handler、CLI 入口）用 `throw` + 统一 catch**。
+
+<Playground
+  language="typescript"
+  id="ts-18-result"
+  title="Result 模式与穷尽处理"
+  code={`type Ok<T> = { readonly ok: true; readonly value: T };
+type Err<E> = { readonly ok: false; readonly error: E };
+type Result<T, E> = Ok<T> | Err<E>;
+
+function ok<T>(value: T): Ok<T> {
+  return { ok: true, value };
+}
+function err<E>(error: E): Err<E> {
+  return { ok: false, error };
+}
+
+type ParseFailure =
+  | { kind: "empty" }
+  | { kind: "not_a_number"; raw: string }
+  | { kind: "out_of_range"; value: number; max: number };
+
+function parseAge(raw: string): Result<number, ParseFailure> {
+  if (raw.trim() === "") return err<ParseFailure>({ kind: "empty" });
+  const n = Number(raw);
+  if (Number.isNaN(n)) return err<ParseFailure>({ kind: "not_a_number", raw });
+  if (n > 150) return err<ParseFailure>({ kind: "out_of_range", value: n, max: 150 });
+  return ok(n);
+}
+
+function assertNever(x: never): never {
+  throw new Error("未处理的错误分支: " + JSON.stringify(x));
+}
+
+function describe(f: ParseFailure): string {
+  switch (f.kind) {
+    case "empty":
+      return "输入为空";
+    case "not_a_number":
+      return "不是数字: " + f.raw;
+    case "out_of_range":
+      return f.value + " 超过上限 " + f.max;
+    default:
+      return assertNever(f);
+  }
+}
+
+for (const raw of ["30", "", "abc", "999"]) {
+  const r = parseAge(raw);
+  if (r.ok) console.log("输入", JSON.stringify(raw), "-> 年龄", r.value);
+  else console.log("输入", JSON.stringify(raw), "-> 失败:", describe(r.error));
+}
+
+// 组合子：map 与 andThen，让 Result 可以链式串联
+function map<T, U, E>(r: Result<T, E>, fn: (v: T) => U): Result<U, E> {
+  return r.ok ? ok(fn(r.value)) : r;
+}
+function andThen<T, U, E>(r: Result<T, E>, fn: (v: T) => Result<U, E>): Result<U, E> {
+  return r.ok ? fn(r.value) : r;
+}
+
+const pipeline = andThen(map(parseAge("42"), (n) => n * 2), (n) =>
+  n < 100 ? ok("合法: " + n) : err({ kind: "out_of_range", value: n, max: 100 } as ParseFailure),
+);
+console.log("链式结果:", pipeline.ok ? pipeline.value : describe(pipeline.error));`}
+/>
+
+<Callout type="tip" title="把 throw 包装成 Result">
+在边界处写一个 `tryCatch` 辅助函数：`function attempt<T>(fn: () => T): Result<T, Error>`，内部 `try { return ok(fn()) } catch (e) { return err(toError(e)) }`。这样第三方库的异常能一次性接入你的 Result 体系。
+</Callout>
+
+## 5. 断言与不变量
+
+第 14 章讲过断言函数。在错误处理语境下，它们用来表达**「这里如果不成立，程序就该崩」**的假设：
+
+- **可恢复错误**：用户输入非法、网络超时——用 `Result` 或受检异常处理。
+- **不变量违背**：数组本该非空却为空、状态机进入了不可能的状态——用 `invariant` 直接崩溃。
+
+区分这两类非常重要。把「程序 bug」伪装成「可恢复错误」去 catch，只会让问题在更远的地方以更诡异的形式爆发。
+
+<Playground
+  language="typescript"
+  id="ts-18-invariant"
+  title="不变量与错误规范化"
+  code={`class InvariantError extends Error {
+  constructor(message: string) {
+    super("不变量被破坏: " + message);
+    this.name = "InvariantError";
+  }
+}
+
+function invariant(cond: unknown, msg: string): asserts cond {
+  if (!cond) throw new InvariantError(msg);
+}
+
+function toError(e: unknown): Error {
+  if (e instanceof Error) return e;
+  if (typeof e === "string") return new Error(e);
+  return new Error("非 Error 抛出物: " + JSON.stringify(e));
+}
+
+type Ok<T> = { ok: true; value: T };
+type Err = { ok: false; error: Error };
+type Attempt<T> = Ok<T> | Err;
+
+function attempt<T>(fn: () => T): Attempt<T> {
+  try {
+    return { ok: true, value: fn() };
+  } catch (e) {
+    return { ok: false, error: toError(e) };
+  }
+}
+
+type State = "idle" | "running" | "done";
+
+class Machine {
+  private state: State = "idle";
+  start(): void {
+    invariant(this.state === "idle", "只能从 idle 启动，当前是 " + this.state);
+    this.state = "running";
+  }
+  finish(): void {
+    invariant(this.state === "running", "只能从 running 完成，当前是 " + this.state);
+    this.state = "done";
+  }
+  get current(): State {
+    return this.state;
+  }
+}
+
+const m = new Machine();
+m.start();
+console.log("状态:", m.current);
+
+const bad = attempt(() => {
+  m.start();
+  return "不会到这里";
+});
+console.log("attempt 捕获:", bad.ok ? bad.value : bad.error.message);
+
+m.finish();
+console.log("状态:", m.current);
+
+const good = attempt(() => JSON.parse('{"a":1}') as { a: number });
+console.log("解析成功:", good.ok ? good.value.a : good.error.message);
+
+const worse = attempt(() => JSON.parse("not json") as unknown);
+console.log("解析失败:", worse.ok ? "?" : worse.error.name);`}
+/>
+
+<Callout type="warn" title="不要吞掉错误">
+`catch (e) {}` 是代码库里最危险的五个字符。即使确实要忽略，也应该写明理由并至少打一条 debug 日志。真正需要「尽力而为」的场景（如清理临时文件），把忽略逻辑封装成一个命名清晰的函数，比裸的空 catch 好得多。
+</Callout>
+
+## 6. 检查清单
+
+1. `catch` 参数一律 `unknown`，配一个 `toError` 规范化。
+2. 业务错误子类化，带稳定的 `code`；用 `cause` 串错误链。
+3. 可枚举的失败用可辨识联合 + `assertNever` 保证穷尽。
+4. 核心逻辑考虑 `Result`，边界处统一转成异常或 HTTP 响应。
+5. 程序 bug 用 `invariant` 直接崩溃，不要伪装成可恢复错误。
+6. 永远不要空 catch。
+
+<Callout type="exercise" title="练习">
+1. 给 `AppError` 加一个 `toJSON()` 方法，输出 `name`、`code`、`message` 与递归展开的 `cause`，用于结构化日志。
+2. 实现异步版 `attemptAsync<T>(fn: () => Promise<T>): Promise<Result<T, Error>>`，并用它改写一段 `try/catch` 代码。
+3. 给 `Result` 补上 `unwrapOr(r, fallback)` 与 `mapErr(r, fn)` 两个组合子，并思考什么时候不该用 `unwrap`。
+</Callout>
+
+## 小结
+
+- TS 无法在签名中表达「会抛什么」，错误安全必须靠主动建模
+- `catch` 参数是 `unknown`，统一用 `toError` 规范化
+- 自定义 Error 记得设 `this.name`，用 ES2022 的 `cause` 串错误链
+- 可辨识联合 + `assertNever` 让错误集合可穷尽
+- `Result` 把失败编码进返回值，适合领域核心；边界处再转回异常
+- 区分「可恢复错误」与「不变量违背」，后者应该直接崩溃
+- 下一章讲 TypeScript 5 的标准装饰器 →

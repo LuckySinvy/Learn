@@ -1,0 +1,397 @@
+---
+title: 表引擎与 MergeTree
+order: 4
+description: 引擎家族地图、MergeTree 建表语法、data part 物理结构与后台 merge 过程
+---
+
+# 表引擎与 MergeTree
+
+MySQL 也有引擎的概念（InnoDB / MyISAM），但你几乎从不选择——永远是 InnoDB。ClickHouse 不一样：**选错引擎，表就废了**。这一章讲清楚引擎家族，并深入 MergeTree 的物理结构。
+
+## 1. 引擎家族地图
+
+```text
+ClickHouse 表引擎
+│
+├── MergeTree 家族  ← 99% 的生产表用这个
+│   ├── MergeTree                     基础款，只追加
+│   ├── ReplacingMergeTree            按主键去重（模拟 UPDATE）
+│   ├── CollapsingMergeTree           用 sign 折叠（模拟 DELETE）
+│   ├── VersionedCollapsingMergeTree  带版本的折叠
+│   ├── SummingMergeTree              自动 SUM 预聚合
+│   ├── AggregatingMergeTree          任意聚合函数预聚合
+│   └── Replicated* （每种都有副本版）  ReplicatedMergeTree 等
+│
+├── 日志家族（小数据、无索引、无并发）
+│   ├── TinyLog / Log / StripeLog
+│
+├── 集成引擎（把外部系统映射成表）
+│   ├── Kafka / MySQL / PostgreSQL / S3 / HDFS / MongoDB
+│
+└── 特殊引擎
+    ├── Memory      纯内存，重启即失，适合临时表
+    ├── Distributed 分布式表的路由层，不存数据
+    ├── Dictionary  把字典暴露成表
+    ├── Merge       跨多表联合读（只读视图）
+    ├── Null        写入即丢弃，配合物化视图很有用
+    └── View / MaterializedView
+```
+
+选型决策非常简单：
+
+| 需求 | 引擎 |
+|---|---|
+| 常规明细表（埋点、日志、订单） | `MergeTree` |
+| 需要按业务主键"更新"最新状态 | `ReplacingMergeTree` |
+| 需要预聚合的指标表 | `SummingMergeTree` / `AggregatingMergeTree` |
+| 生产多副本高可用 | 对应的 `Replicated*` 版本 |
+| 临时中间结果 | `Memory` |
+| 只做物化视图的触发源 | `Null` |
+
+<Callout type="warn" title="不要用 Log 家族存业务数据">
+`Log`、`TinyLog` 没有索引、没有并发控制、不支持分区，写入时会锁整表。它们只适合几万行的配置表或做单元测试。生产上见到 `ENGINE = Log` 基本就是历史遗留问题。
+</Callout>
+
+## 2. MergeTree 建表语法
+
+完整语法：
+
+```sql
+CREATE TABLE demo.events
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)              -- 分区键：按月
+ORDER BY (country, event_type, event_time)     -- 排序键（同时是默认主键）
+PRIMARY KEY (country, event_type)              -- 可选，必须是 ORDER BY 的前缀
+SAMPLE BY intHash64(user_id)                   -- 可选，用于 SAMPLE 子句
+TTL event_time + INTERVAL 12 MONTH             -- 可选，自动过期
+SETTINGS index_granularity = 8192;             -- 稀疏索引粒度
+```
+
+逐项解释：
+
+| 子句 | 必需 | 作用 |
+|---|---|---|
+| `ORDER BY` | **是** | 决定数据在磁盘上的物理排列顺序，是性能的第一决定因素 |
+| `PARTITION BY` | 否 | 数据的物理切分单位，影响裁剪与批量删除 |
+| `PRIMARY KEY` | 否 | 稀疏索引使用的列，默认等于 ORDER BY |
+| `SAMPLE BY` | 否 | 支持 `SAMPLE 0.1` 抽样查询 |
+| `TTL` | 否 | 自动删除或转移过期数据 |
+| `SETTINGS` | 否 | 引擎级参数 |
+
+`ORDER BY ()`（空元组）也是合法的，表示不排序——只在做纯追加日志缓冲时用。
+
+<Callout type="info" title="ORDER BY 不是 MySQL 的主键">
+MySQL 的 PRIMARY KEY 保证唯一性。ClickHouse 的 ORDER BY / PRIMARY KEY **完全不保证唯一**，同一个键可以有任意多行。它的唯一作用是决定物理顺序和稀疏索引。第 5 章会展开。
+</Callout>
+
+## 3. Data Part：数据在磁盘上的样子
+
+每次 `INSERT` 会生成一个独立的**目录**，叫做 data part。
+
+```sql
+INSERT INTO events VALUES ('2024-06-01 10:00:00', 1, 'view', '/a', 'CN', 'web', 100);
+INSERT INTO events VALUES ('2024-06-01 10:00:01', 2, 'click', '/b', 'US', 'ios', 200);
+```
+
+看看磁盘：
+
+```bash
+ls /var/lib/clickhouse/data/demo/events/
+```
+
+```text
+202406_1_1_0/          ← 第一次 INSERT 产生的 part
+202406_2_2_0/          ← 第二次 INSERT 产生的 part
+detached/
+format_version.txt
+```
+
+part 目录名的结构是 `分区ID_最小块号_最大块号_合并层级`：
+
+```text
+202406_1_5_2
+   │    │ │ │
+   │    │ │ └── level: 已经被合并过 2 次
+   │    │ └──── max_block_number: 5
+   │    └────── min_block_number: 1
+   └─────────── partition_id: 2024 年 6 月
+```
+
+`202406_1_5_2` 表示：这个 part 是由块号 1 到 5 的原始数据合并而来的，属于 2024-06 分区。
+
+### 3.1 part 目录内部
+
+```bash
+ls /var/lib/clickhouse/data/demo/events/202406_1_1_0/
+```
+
+```text
+checksums.txt              各文件校验和
+columns.txt                列定义
+count.txt                  行数（COUNT 优化直接读它）
+primary.cidx               主键稀疏索引（常驻内存）
+partition.dat              分区键值
+minmax_event_time.idx      分区键的 min/max，用于分区裁剪
+
+event_time.bin             ← 列数据（压缩后）
+event_time.cmrk2           ← 列的 mark 文件（granule 偏移量）
+user_id.bin
+user_id.cmrk2
+country.bin
+country.cmrk2
+country.dict.bin           ← LowCardinality 的字典
+...
+```
+
+关键点：**每一列是独立的 `.bin` 文件**，这就是列存的物理体现。查询只读需要的列文件。
+
+`.cmrk2` 是 mark 文件，记录每个 granule（默认 8192 行）在 `.bin` 里的压缩块偏移和块内偏移：
+
+```text
+primary.cidx                 country.cmrk2               country.bin
+（每 8192 行一个索引项）      （每 granule 一个偏移对）
+┌───────────────────┐        ┌──────────────────┐        ┌──────────────┐
+│ mark0: (CN,view)  │───────▶│ (0, 0)           │───────▶│ 压缩块 #0    │
+│ mark1: (CN,view)  │───────▶│ (0, 8192)        │───────▶│ （含多个     │
+│ mark2: (CN,click) │───────▶│ (65536, 0)       │───────▶│  granule）   │
+│ mark3: (US,view)  │───────▶│ (65536, 8192)    │        │ 压缩块 #1    │
+└───────────────────┘        └──────────────────┘        └──────────────┘
+```
+
+查询时：主键索引二分定位到 mark N → 通过 mark 文件找到 `.bin` 里的字节偏移 → 只解压那一小段。
+
+### 3.2 用 system.parts 观察
+
+```sql
+SELECT
+    name,
+    partition,
+    active,
+    rows,
+    formatReadableSize(bytes_on_disk) AS size,
+    level,
+    modification_time
+FROM system.parts
+WHERE database = 'demo' AND table = 'events'
+ORDER BY modification_time;
+```
+
+```text
+┌─name─────────┬─partition─┬─active─┬───rows─┬─size──────┬─level─┬───modification_time─┐
+│ 202406_1_1_0 │ 202406    │      0 │ 300000 │ 4.21 MiB  │     0 │ 2024-07-30 10:00:01 │
+│ 202406_2_2_0 │ 202406    │      0 │ 300000 │ 4.19 MiB  │     0 │ 2024-07-30 10:00:05 │
+│ 202406_3_3_0 │ 202406    │      0 │ 400000 │ 5.58 MiB  │     0 │ 2024-07-30 10:00:09 │
+│ 202406_1_3_1 │ 202406    │      1 │1000000 │ 11.4 MiB  │     1 │ 2024-07-30 10:00:14 │
+└──────────────┴───────────┴────────┴────────┴───────────┴───────┴─────────────────────┘
+```
+
+注意 `active` 列：前三个 part 已经被合并成 `202406_1_3_1`，标记为 inactive，稍后由后台线程物理删除。合并后总大小从 13.98 MiB 降到 11.4 MiB——**合并本身会提升压缩率**。
+
+<Callout type="tip" title="查询 system.parts 记得加 active = 1">
+不加会把已合并待删除的 part 也统计进去，导致行数和体积翻倍。这是新手统计表大小时最常见的错误。
+</Callout>
+
+## 4. 后台 Merge 过程
+
+MergeTree 名字里的 "Merge" 指的就是这个过程。它是理解 ClickHouse 一切行为的钥匙。
+
+### 4.1 为什么必须 merge
+
+每次 INSERT 生成一个 part。如果不合并：
+
+- 一天 10 万次小批量插入 = 10 万个目录 = 几百万个文件
+- 每次查询要打开所有 part，读所有 part 的索引
+- 文件句柄耗尽，查询退化成随机 I/O
+
+所以后台线程持续把小 part 合并成大 part。
+
+### 4.2 合并的执行过程
+
+```text
+时刻 T0：三次 INSERT
+  part A (1000 行, 按 ORDER BY 有序)
+  part B (2000 行, 按 ORDER BY 有序)
+  part C (1500 行, 按 ORDER BY 有序)
+
+时刻 T1：后台线程挑中 A/B/C，做归并排序（k 路 merge）
+  ┌─ A: (CN,click,t1) (CN,view,t3) (US,view,t9)
+  ├─ B: (CN,click,t2) (JP,view,t5)
+  └─ C: (CN,view,t4)  (US,click,t7)
+           ↓ 归并（因为每个 part 内部已有序，只需线性扫描）
+  part D: (CN,click,t1) (CN,click,t2) (CN,view,t3) (CN,view,t4)
+          (JP,view,t5)  (US,click,t7) (US,view,t9)
+
+时刻 T2：D 标记为 active，A/B/C 标记为 inactive
+时刻 T3（默认 8 分钟后）：物理删除 A/B/C 的目录
+```
+
+关键性质：
+
+1. **归并是流式的**，内存占用与 part 大小无关，只与列数有关
+2. **合并触发的时机不确定**，由后台线程池按策略挑选，你无法预测何时发生
+3. **合并会重新压缩**，大 part 压缩率更高
+4. **不同分区的 part 永远不会合并到一起**
+
+### 4.3 合并策略
+
+ClickHouse 用的是分层策略（类似 LSM Tree 的 tiered compaction）：优先合并大小相近的 part，避免反复重写大 part。
+
+```sql
+-- 查看正在进行的合并
+SELECT
+    table,
+    elapsed,
+    progress,
+    num_parts,
+    formatReadableSize(total_size_bytes_compressed) AS total,
+    formatReadableSize(memory_usage)                AS mem
+FROM system.merges;
+```
+
+```text
+┌─table──┬──elapsed─┬─progress─┬─num_parts─┬─total─────┬─mem──────┐
+│ events │ 2.341    │     0.68 │         5 │ 1.24 GiB  │ 84.2 MiB │
+└────────┴──────────┴──────────┴───────────┴───────────┴──────────┘
+```
+
+### 4.4 手动触发合并：OPTIMIZE
+
+```sql
+-- 尝试合并（可能什么都不做）
+OPTIMIZE TABLE events;
+
+-- 强制把整个分区合并成一个 part
+OPTIMIZE TABLE events PARTITION '202406' FINAL;
+
+-- 等待合并完成再返回
+OPTIMIZE TABLE events FINAL SETTINGS optimize_throw_if_noop = 1;
+```
+
+<Callout type="warn" title="OPTIMIZE FINAL 是重操作，不要写进定时任务">
+`OPTIMIZE ... FINAL` 会把分区内所有 part 重写成一个，对于 100 GB 的分区意味着读 100 GB 写 100 GB。它会：
+
+- 长时间占用磁盘 I/O 和 CPU，影响线上查询
+- 产生一个超大 part，后续任何小合并都要重写它
+- 在有副本的集群上，每个副本都要各自执行
+
+正确做法是**信任后台自动合并**。只在这些场景手动执行：数据导入完成后一次性整理、需要立刻让 ReplacingMergeTree 去重生效的测试环境。
+</Callout>
+
+## 5. 写入的黄金法则
+
+理解了 merge，就能理解 ClickHouse 最重要的写入约束。
+
+```sql
+-- 灾难写法：每行一个 INSERT
+INSERT INTO events VALUES (...);   -- 生成 part 1
+INSERT INTO events VALUES (...);   -- 生成 part 2
+INSERT INTO events VALUES (...);   -- 生成 part 3
+```
+
+写 10 万行 = 10 万个 part，后台合并线程根本追不上，很快会看到：
+
+```text
+Code: 252. DB::Exception: Too many parts (3000).
+Merges are processing significantly slower than inserts.
+```
+
+正确做法：**批量写入，每批 1 万到 100 万行，每秒不超过 1~2 次 INSERT**。
+
+```sql
+-- 好：一次插入大批量
+INSERT INTO events VALUES
+    ('2024-06-01 10:00:00', 1, 'view', '/a', 'CN', 'web', 100),
+    ('2024-06-01 10:00:01', 2, 'click', '/b', 'US', 'ios', 200),
+    ... （几万行）;
+```
+
+如果应用端无法攒批，用**异步插入**让服务端帮你攒：
+
+```sql
+INSERT INTO events SETTINGS
+    async_insert = 1,
+    wait_for_async_insert = 1,      -- 等落盘再返回，更安全
+    async_insert_max_data_size = 10000000,
+    async_insert_busy_timeout_ms = 1000
+VALUES (...);
+```
+
+服务端会把多个小 INSERT 在内存缓冲区攒到 10 MB 或 1 秒，再合并成一个 part 写盘。
+
+<Callout type="info" title="INSERT 的原子性">
+单条 INSERT 语句写入单个分区时是原子的：要么整个 part 可见，要么完全不可见，不会出现"看到一半"。但跨分区的 INSERT 会生成多个 part，整体不保证原子。
+
+另外，同一批数据重复 INSERT 时，ReplicatedMergeTree 会通过数据块哈希做去重（`insert_deduplicate = 1`），这在 Kafka 消费重试场景很关键。
+</Callout>
+
+## 6. 完整示例：观察 merge 全过程
+
+```sql
+-- 1. 建一张干净的表
+CREATE TABLE merge_demo
+(
+    id UInt64,
+    v  String
+)
+ENGINE = MergeTree
+ORDER BY id;
+
+-- 2. 分 5 批插入
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(0, 200000);
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(200000, 200000);
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(400000, 200000);
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(600000, 200000);
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(800000, 200000);
+
+-- 3. 立刻查看 part（可能已经开始合并了，动作要快）
+SELECT name, rows, level, active FROM system.parts
+WHERE table = 'merge_demo' ORDER BY name;
+```
+
+```text
+┌─name───────┬───rows─┬─level─┬─active─┐
+│ all_1_1_0  │ 200000 │     0 │      1 │
+│ all_2_2_0  │ 200000 │     0 │      1 │
+│ all_3_3_0  │ 200000 │     0 │      1 │
+│ all_4_4_0  │ 200000 │     0 │      1 │
+│ all_5_5_0  │ 200000 │     0 │      1 │
+└────────────┴────────┴───────┴────────┘
+```
+
+`all` 是没有 PARTITION BY 时的默认分区名。等几秒再查：
+
+```text
+┌─name───────┬────rows─┬─level─┬─active─┐
+│ all_1_5_1  │ 1000000 │     1 │      1 │
+│ all_1_1_0  │  200000 │     0 │      0 │
+│ ... （inactive 的旧 part）              │
+└────────────┴─────────┴───────┴────────┘
+```
+
+五个 part 合并成了一个 level=1 的 part。
+
+<Callout type="exercise" title="练习">
+1. 用上面的脚本重现 merge 过程，用 `watch -n1` 或反复执行 `system.parts` 查询，观察 part 数量从 5 变成 1。
+2. 对比合并前后的总磁盘占用（`sum(bytes_on_disk) WHERE active`），计算压缩率提升了多少。
+3. 写一个循环脚本，每次只插入 1 行、连续插入 500 次，观察 part 数量增长和后台合并的追赶过程。再改用 `async_insert = 1` 重跑，对比最终 part 数量。
+4. 用 `SHOW CREATE TABLE events` 看看 ClickHouse 补全了哪些你没写的默认 SETTINGS。
+</Callout>
+
+## 小结
+
+- MergeTree 家族覆盖 99% 的生产需求，Log 家族只适合玩具场景
+- 每次 INSERT 生成一个 data part 目录，目录名编码了分区、块号范围和合并层级
+- part 内每列一个 `.bin` 文件加一个 mark 文件，这是列存的物理实现
+- 后台线程持续做归并排序把小 part 合并成大 part，这是 ClickHouse 一切"延迟生效"行为的根源
+- `OPTIMIZE FINAL` 是重操作，除非有明确理由否则交给后台自动合并
+- 写入必须批量：每批上万行、每秒 1~2 次，攒不了批就开 `async_insert`
+- 下一章讲主键与稀疏索引，把「为什么这样排序」讲透 →

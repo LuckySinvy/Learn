@@ -1,0 +1,298 @@
+---
+title: 测试与类型测试
+order: 21
+description: node:test 内置测试运行器、断言库、类型层面的测试与 CI 中的 tsc --noEmit
+---
+
+# 测试与类型测试
+
+TypeScript 项目的质量保障有**两层**：
+
+1. **运行时测试**：代码的行为对不对——这和其它语言没有区别。
+2. **类型测试**：你写的类型（尤其是泛型工具类型和库的公开 API）推导得对不对。
+
+第二层是 TS 特有的。一个 `ReturnType` 用错了不会让测试失败，但会让所有下游用户拿到 `any`。本章两层都讲，并给出 CI 里应该怎么串起来。
+
+## 1. `node:test`：不用装依赖的测试运行器
+
+Node.js 18 起内置了测试运行器，20 起稳定。它的好处是**零依赖**——不需要 Jest、Vitest 及其一整套配置。
+
+```ts
+import { test, describe, before, after, mock } from "node:test";
+import { strict as assert } from "node:assert";
+
+describe("加法", () => {
+  before(() => console.log("准备"));
+  after(() => console.log("清理"));
+
+  test("正数相加", () => {
+    assert.equal(1 + 2, 3);
+  });
+
+  test("处理浮点误差", () => {
+    assert.ok(Math.abs(0.1 + 0.2 - 0.3) < Number.EPSILON);
+  });
+
+  test("异步", async () => {
+    const v = await Promise.resolve(7);
+    assert.equal(v, 7);
+  });
+});
+```
+
+运行方式：
+
+```bash
+# Node 22.6+ 可以直接跑 .ts 文件
+node --experimental-transform-types --test "src/**/*.test.ts"
+
+# 或者先编译再跑
+tsc && node --test dist/
+```
+
+<Callout type="info" title="node:test 的取舍">
+优点：零依赖、启动快、和 Node 版本同步演进。
+缺点：快照测试、并行 worker、覆盖率报告等能力不如 Vitest 完善，社区插件生态几乎没有。中小型库和 Node 服务用它很合适；大型前端项目仍推荐 Vitest。
+</Callout>
+
+### 1.1 常用断言
+
+`node:assert` 的 `strict` 模式默认用深度严格比较（相当于 `===` 加递归）：
+
+| 断言 | 用途 |
+|---|---|
+| `assert.equal(a, b)` | 严格相等（strict 模式下等价于 `strictEqual`） |
+| `assert.deepEqual(a, b)` | 深度严格相等，比较对象结构 |
+| `assert.ok(v)` | 断言真值 |
+| `assert.throws(fn, /正则/)` | 断言同步抛错 |
+| `assert.rejects(promise)` | 断言 Promise 被拒绝 |
+| `assert.match(str, /正则/)` | 字符串匹配 |
+
+<Callout type="warn" title="一定要用 strict 导入">
+`import assert from "node:assert"` 拿到的是**宽松模式**，`assert.equal(1, "1")` 会通过！务必写 `import { strict as assert } from "node:assert"`，这是 Node 官方的推荐用法。
+</Callout>
+
+## 2. 一个可运行的迷你测试框架
+
+理解测试框架最好的方式是自己写一个。下面这三十行代码包含了所有测试运行器的核心：注册、执行、捕获断言错误、汇总报告。
+
+<Playground
+  language="typescript"
+  id="ts-21-mini-runner"
+  title="手写测试运行器"
+  code={`import { strict as assert } from "node:assert";
+
+type TestCase = { name: string; fn: () => void | Promise<void> };
+
+const suite: TestCase[] = [];
+
+function it(name: string, fn: () => void | Promise<void>): void {
+  suite.push({ name, fn });
+}
+
+async function run(): Promise<void> {
+  let pass = 0;
+  let fail = 0;
+  for (const t of suite) {
+    try {
+      await t.fn();
+      pass += 1;
+      console.log("  ok   " + t.name);
+    } catch (e) {
+      fail += 1;
+      const msg = e instanceof Error ? e.message : String(e);
+      console.log("  FAIL " + t.name);
+      console.log("       " + msg);
+    }
+  }
+  console.log("结果: 通过 " + pass + " 条，失败 " + fail + " 条");
+}
+
+// ---- 被测代码 ----
+function slugify(input: string): string {
+  return input.trim().toLowerCase().split(" ").filter(Boolean).join("-");
+}
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  if (size <= 0) throw new RangeError("size 必须为正数");
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
+}
+
+// ---- 测试用例 ----
+it("slugify 基本用法", () => {
+  assert.equal(slugify("Hello TypeScript World"), "hello-typescript-world");
+});
+
+it("slugify 去掉多余空格", () => {
+  assert.equal(slugify("  a   b  "), "a-b");
+});
+
+it("chunk 正常切分", () => {
+  assert.deepEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
+});
+
+it("chunk 非法 size 抛错", () => {
+  assert.throws(() => chunk([1], 0), RangeError);
+});
+
+it("故意失败的用例", () => {
+  assert.equal(slugify("A B"), "a_b");
+});
+
+it("异步用例", async () => {
+  const v = await Promise.resolve(21);
+  assert.equal(v * 2, 42);
+});
+
+void run();`}
+/>
+
+<Callout type="tip" title="被测函数要「纯」">
+上面的 `slugify` 和 `chunk` 都是纯函数：同样的输入永远得到同样的输出，没有副作用。把业务逻辑的核心提炼成纯函数，测试成本会断崖式下降。需要 IO 的部分尽量薄，用依赖注入把它们挡在外面。
+</Callout>
+
+## 3. 类型层面的测试
+
+运行时测试管不到类型。要验证「`DeepPartial<T>` 推导出来的确实是我想要的东西」，需要**类型测试**。
+
+### 3.1 `Equal` 与 `Expect`
+
+社区标准做法是这一对工具类型：
+
+```ts
+type Equal<X, Y> =
+  (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
+
+type Expect<T extends true> = T;
+```
+
+`Equal` 的实现很反直觉：它利用了「两个泛型函数签名相同才互相赋值」这个编译器内部规则，从而实现**严格相等**（能区分 `any` 与 `unknown`，能区分 `{ a: 1 }` 与 `{ a: 1 } & {}`），比简单的双向 `extends` 精确得多。
+
+`Expect<T extends true>` 则是一个约束：如果 `T` 不是 `true`，这行代码就编译不过。**类型测试的「失败」表现为编译错误**，这也是它必须配合 `tsc --noEmit` 在 CI 里跑的原因。
+
+### 3.2 `@ts-expect-error`
+
+另一半的类型测试是「验证错误代码确实报错」。`@ts-expect-error` 注释要求下一行**必须**有类型错误，否则它自己会报错：
+
+```ts
+// @ts-expect-error 参数类型不匹配
+add("1", 2);
+```
+
+它比 `@ts-ignore` 好得多：`@ts-ignore` 会永久沉默，即使将来错误消失了也不会提醒你删掉。
+
+<Playground
+  language="typescript"
+  id="ts-21-type-tests"
+  title="类型测试"
+  code={`// 严格相等判定
+type Equal<X, Y> =
+  (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
+
+type Expect<T extends true> = T;
+type ExpectFalse<T extends false> = T;
+
+// ---- 被测的类型工具 ----
+type DeepPartial<T> = T extends object ? { [K in keyof T]?: DeepPartial<T[K]> } : T;
+type Head<T extends readonly unknown[]> = T extends readonly [infer H, ...unknown[]] ? H : never;
+
+// ---- 类型断言集合 ----
+type Cases = [
+  Expect<Equal<Head<[1, 2, 3]>, 1>>,
+  Expect<Equal<Head<[]>, never>>,
+  Expect<Equal<DeepPartial<{ a: number; b: string }>, { a?: number; b?: string }>>,
+  Expect<Equal<Awaited<Promise<Promise<string>>>, string>>,
+  Expect<Equal<Capitalize<"ab">, "Ab">>,
+  ExpectFalse<Equal<string, "a">>,
+  // Equal 能区分 any 与 unknown，简单的 extends 做不到
+  ExpectFalse<Equal<unknown, string>>,
+];
+
+// 只要上面任何一行不成立，这里就编译不过
+const cases: Cases = [true, true, true, true, true, false, false];
+console.log("类型测试全部通过，共 " + cases.length + " 条");
+
+// ---- 运行时侧：验证「该报错的确实报错」----
+function add(a: number, b: number): number {
+  return a + b;
+}
+
+// @ts-expect-error 字符串不能作为 number 参数
+const wrong = add("1", 2);
+console.log("虽然类型错误被断言，运行时仍会执行:", wrong);
+console.log("正确调用:", add(1, 2));
+
+// 检验函数签名的推导
+function identity<T>(v: T): T {
+  return v;
+}
+type IdReturn = ReturnType<typeof identity<string>>;
+const idCheck: Expect<Equal<IdReturn, string>> = true;
+console.log("identity 返回类型断言:", idCheck);`}
+/>
+
+<Callout type="warn" title="Equal 不是万能的">
+`Equal` 依赖编译器的内部实现细节，在某些边界情况（条件类型延迟求值、交叉类型顺序）下会给出反直觉的结果。遇到「明明一样却判 false」时，先用 `Expect<Extends<A, B>>` 这类宽松版本定位问题，别把时间耗在和 `Equal` 较劲上。
+</Callout>
+
+### 3.3 tsd 与 expect-type
+
+如果你在写一个库，可以用现成的工具：
+
+- **`tsd`**：为库的 `.d.ts` 写测试，语法是 `expectType<string>(fn())`、`expectError(fn(1))`。它有自己的 CLI，能独立于项目 tsconfig 运行。
+- **`expect-type`**：纯类型实现，链式 API 如 `expectTypeOf(fn()).toEqualTypeOf<string>()`，可以直接写在普通测试文件里，和 Vitest 集成良好。
+
+两者本质上都是上面 `Equal`／`Expect` 的封装，选顺手的即可。
+
+## 4. 测试与类型在 CI 中的位置
+
+一条合理的 CI 流水线：
+
+```yaml
+- run: npm ci
+- run: npx tsc --noEmit          # 类型检查（含类型测试）
+- run: npx eslint .              # 代码规范
+- run: node --test --experimental-transform-types "src/**/*.test.ts"
+- run: npm run build
+```
+
+几个要点：
+
+1. **`tsc --noEmit` 必须单独跑一步**。用 Vite/esbuild/SWC 构建时，它们只做转译**不做类型检查**，构建成功不代表类型正确。
+2. **类型检查放在最前面**。它最快，且能拦住大部分低级错误。
+3. **不要用 `--transpileOnly` 跳过检查**。开发时为了速度可以，CI 里必须完整检查。
+4. **锁定 TypeScript 版本**。TS 是 minor 版本也可能引入新错误的工具，`package.json` 里别写 `^5.x`，写精确版本或用 lockfile 保证一致。
+
+<Callout type="warn" title="构建通过 ≠ 类型正确">
+这是新手最常踩的坑：`vite build` 或 `next build`（未开启类型检查时）都可能在有类型错误的情况下成功。真正的守门员永远是 `tsc --noEmit`。
+</Callout>
+
+## 5. 测试策略建议
+
+| 层次 | 测什么 | 工具 |
+|---|---|---|
+| 类型测试 | 泛型工具、库公开 API 的推导 | `Expect`/`Equal`、tsd |
+| 单元测试 | 纯函数、领域逻辑 | node:test / Vitest |
+| 集成测试 | 模块协作、数据库读写 | node:test + 真实依赖 |
+| 端到端 | 用户路径 | Playwright |
+
+比例上，**纯函数单元测试应该占大头**。如果你发现单元测试里 mock 的代码比真实代码还多，说明被测模块的依赖太重，该重构了。
+
+<Callout type="exercise" title="练习">
+1. 给第 12 章手写的 `MyOmit` 写五条类型测试，包括「排除不存在的键」这种边界情况。
+2. 给本章的 `chunk` 函数补充测试：空数组、size 大于数组长度、size 为小数。想一想小数时应该抛错还是向下取整，并把决定写成测试。
+3. 在自己的项目里加一步 `tsc --noEmit`，看看能不能通过。如果不能，说明构建工具一直在替你隐藏类型错误。
+</Callout>
+
+## 小结
+
+- `node:test` + `node:assert` 提供零依赖的测试能力，导入 assert 时**必须**用 `strict`
+- 测试框架的核心只有「注册、执行、捕获、汇总」四步，业务逻辑写成纯函数最好测
+- 类型测试用 `Equal` + `Expect` 组合，失败表现为编译错误
+- `@ts-expect-error` 验证「该报错的确实报错」，优于 `@ts-ignore`
+- CI 必须单独跑 `tsc --noEmit`，构建成功不代表类型正确
+- 下一章做项目实战：类型安全的 CLI 内核与事件总线 →

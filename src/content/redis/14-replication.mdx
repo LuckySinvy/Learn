@@ -1,0 +1,196 @@
+---
+title: 主从复制：读写分离与数据冗余
+order: 14
+description: 全量同步与部分重同步、repl_backlog 环形缓冲、replica-read-only、复制延迟与一致性
+---
+
+# 主从复制：读写分离与数据冗余
+
+单实例有两个致命问题：挂了服务就停（可用性），盘坏了数据就没（冗余）。主从复制是解决这两个问题的第一步：**主库写，从库实时同步并提供读能力**。它也是后面哨兵和 Cluster 的地基——两者的故障转移本质都是"把某个从库提升为主库"。
+
+## 1. 搭建主从
+
+从库只需一条配置或命令：
+
+```bash
+# 方式一: 配置文件
+# replica.conf
+replicaof 192.168.1.10 6379
+masterauth Your_Strong_Pass123     # 主库有密码时需要
+
+# 方式二: 运行时命令（重启失效）
+127.0.0.1:6380> REPLICAOF 192.168.1.10 6379
+OK
+# 取消复制, 恢复为独立主库:
+127.0.0.1:6380> REPLICAOF NO ONE
+OK
+```
+
+验证：
+
+```bash
+# 主库视角
+127.0.0.1:6379> INFO replication
+role:master
+connected_slaves:1
+slave0:ip=192.168.1.11,port=6380,state=online,offset=4213,lag=0
+master_repl_offset:4213
+
+# 从库视角
+127.0.0.1:6380> INFO replication
+role:slave
+master_host:192.168.1.10
+master_link_status:up
+slave_read_only:1
+slave_repl_offset:4213      # 与主库 offset 一致 = 无延迟
+```
+
+## 2. 同步机制：全量与部分重同步
+
+### 2.1 首次连接：全量同步
+
+```text
+从库                                主库
+ |--- PSYNC ? -1 ------------------->|   (第一次, 不知道任何上下文)
+ |<-- +FULLRESYNC replid offset -----|   (主库: 做全量吧)
+ |                                   |-- BGSAVE 生成 RDB
+ |<-- RDB 文件 ----------------------|   (期间新写命令暂存 replication buffer)
+ |-- 清空自身, 加载 RDB               |
+ |<-- 缓冲的增量命令 -----------------|
+ |<== 此后持续接收写命令流 ===========|   (命令传播阶段)
+```
+
+全量同步很昂贵：主库 fork + 生成 RDB + 网络传输，从库清空 + 加载。10 GB 的实例做一次全量同步，网络和磁盘都要抖一阵。
+
+### 2.2 断线重连：部分重同步与 repl_backlog
+
+从库断线几秒重连，重新全量太浪费。主库维护一个**环形缓冲区** `repl_backlog`（默认 1 MB），记录最近的写命令流：
+
+```text
+repl_backlog（环形, 固定大小, 新数据覆盖最老数据）:
+
+        写入位置(master_repl_offset)
+              |
+   +----------v-----------+
+   |  ...旧命令 | 新命令... |
+   +----------------------+
+        ^
+   从库断线时的 offset
+
+重连: PSYNC replid offset
+  ├─ offset 还在 backlog 范围内 -> +CONTINUE, 只补发缺的命令 (部分重同步)
+  └─ offset 已被覆盖 / replid 不匹配 -> +FULLRESYNC, 重来全量
+```
+
+关键配置：
+
+```conf
+repl-backlog-size 64mb        # 默认 1mb 太小! 按"断线时长 × 写入速率"估算
+repl-backlog-ttl 3600         # 无从库连接后 backlog 保留时间
+```
+
+写入 1 MB/s 的主库，默认 backlog 只够 1 秒的断线容忍——网络闪断 5 秒就得全量重来。**调大 backlog 是主从架构第一个该动的参数**。
+
+replid 是主库的"血统标识"：从库晋升为新主库后会换 replid，但保留旧 replid（replid2），让其他从库在故障转移后仍可能走部分重同步。
+
+### 2.3 无盘复制
+
+主库磁盘慢时，可以不落盘直接把 RDB 写进 socket：
+
+```conf
+repl-diskless-sync yes           # 7.x 默认开启
+repl-diskless-sync-delay 5       # 等 5 秒攒多个从库一起同步
+```
+
+## 3. 从库只读与读写分离
+
+```conf
+replica-read-only yes    # 默认: 从库拒绝写命令
+```
+
+```bash
+127.0.0.1:6380> SET k v
+(error) READONLY You can't write against a read only replica.
+```
+
+**不要**把从库改成可写：写入的数据不会同步回主库，且下次全量同步会被清掉，纯粹制造数据不一致。读写分离的正确姿势是应用层（或客户端库/代理）把读请求路由到从库：
+
+```text
+            写                      读
+  应用 ------------> 主库   应用 ---------> 从库1
+                      |            \------> 从库2
+                      +--复制流--> 从库1, 从库2
+```
+
+## 4. 复制延迟与一致性
+
+Redis 复制是**异步**的：主库执行完写命令立即返回客户端，然后才把命令传播给从库。这意味着：
+
+### 4.1 读到旧数据
+
+```text
+t0: 客户端 SET x 2 -> 主库返回 OK（此时从库还是 x=1）
+t1: 客户端从从库 GET x -> 得到 1   <- 写后读不一致
+t2: 复制流到达, 从库 x=2
+```
+
+正常情况下延迟是毫秒级，但这些场景会放大：从库执行慢查询阻塞了复制流应用、主库写入洪峰、网络拥塞、从库正在加载全量 RDB。监控指标：
+
+```bash
+127.0.0.1:6379> INFO replication
+master_repl_offset:100230
+slave0:...,offset=100180,lag=0     # 主从 offset 差 = 积压字节数
+```
+
+应对策略按业务分级：
+
+- 能容忍（商品详情、文章内容）：直接读从库；
+- 写后立即读自己的数据（发帖后跳详情页）：**读主库**，或会话粘滞（该用户短时间内读主库）；
+- 完全不能容忍：这个数据别用读写分离。
+
+### 4.2 主库可以要求"最少从库在线"
+
+```conf
+min-replicas-to-write 1       # 至少 1 个从库
+min-replicas-max-lag 10       # 且延迟不超过 10 秒, 否则主库拒绝写入
+```
+
+这不是强一致（复制仍是异步的），只是降低"主库裸奔写入然后宕机全丢"的风险窗口。
+
+<Callout type="warn" title="主从切换丢数据是设计内行为">
+异步复制决定了：主库宕机瞬间，尚未传播到从库的写入**必然丢失**（哪怕配了 AOF always——那只保住主库本机的盘）。哨兵/Cluster 的故障转移同样如此。Redis 的定位是 AP 系统，需要"不丢一条"的场景请把 Redis 当缓存、把真相放数据库，或用 WAIT 命令确认复制（性能代价大且仍非绝对）。
+</Callout>
+
+<Callout type="info" title="复制风暴">
+一主多从（如 1 主 8 从）同时断线重连（比如主库机房网络闪断恢复），8 个从库同时请求全量同步，主库要 fork 并传 8 份 RDB，可能直接被打死。缓解：树状复制拓扑（从库再挂从库，从库也能当同步源）、调大 backlog 让重连走部分重同步、repl-diskless-sync-delay 合并同步请求。
+</Callout>
+
+## 5. 常用运维检查
+
+```bash
+# 从库落后多少
+127.0.0.1:6380> INFO replication
+master_link_status:up            # down 说明复制断了
+slave_repl_offset:100180
+
+# 主库上看所有从库状态与延迟
+127.0.0.1:6379> INFO replication
+
+# 复制相关事件都会写日志:
+# "Full resync requested by replica"    <- 全量, 该警惕频率
+# "Partial resynchronization accepted"  <- 部分, 健康
+```
+
+## 小结
+
+- REPLICAOF 一条命令建立复制：首次全量（RDB），断线重连尽量部分重同步（repl_backlog）
+- repl-backlog-size 默认 1 MB 远远不够，按写入速率 × 容忍断线时长调大
+- 从库保持只读；读写分离在应用层路由，注意写后读一致性问题
+- 复制是异步的：主从切换必然可能丢尾部写入，架构设计要接受这个前提
+- 主库挂了谁来切？下一章哨兵 →
+
+<Callout type="exercise" title="练习">
+1. 用 Docker 起两个 Redis 组成主从，在主库写入后立刻在从库读取，再尝试写从库观察 READONLY 错误。
+2. 从库 shutdown 30 秒后重启，观察主库日志是 Full resync 还是 Partial resynchronization；把 repl-backlog-size 调小到 16kb 并灌大量写入重试，对比结果。
+3. 估算你的业务：主库写入峰值 5 MB/s，希望容忍 2 分钟断线不触发全量同步，repl-backlog-size 应设多大？
+</Callout>

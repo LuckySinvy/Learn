@@ -1,0 +1,207 @@
+---
+title: 视图与窗口函数
+order: 11
+description: CREATE VIEW 与可更新视图、ROW_NUMBER/RANK/LAG/LEAD、分组内 TOP N 的标准解法
+---
+
+# 视图与窗口函数
+
+本章两个主题：视图——把复杂查询封装成「虚拟表」；窗口函数——8.0 最值得学的特性，一举解决排名、分组 TOP N、环比这些用普通 SQL 写起来非常拧巴的问题。
+
+## 1. 视图（VIEW）
+
+### 1.1 创建与使用
+
+视图是**存起来的 SELECT 语句**，用起来像表，但本身不存数据：
+
+```sql
+CREATE VIEW v_order_detail AS
+SELECT o.id AS order_id, o.order_no, o.status, o.created_at,
+       u.username, p.name AS product_name, c.name AS category_name,
+       oi.quantity, oi.price, oi.quantity * oi.price AS item_amount
+FROM orders o
+JOIN users u        ON u.id = o.user_id
+JOIN order_items oi ON oi.order_id = o.id
+JOIN products p     ON p.id = oi.product_id
+JOIN categories c   ON c.id = p.category_id;
+
+-- 之后五表 JOIN 一行搞定
+SELECT * FROM v_order_detail WHERE username = 'alice';
+```
+
+视图的价值：
+
+- **封装复杂性**：报表、BI 工具直接查视图，不用人人都会写五表 JOIN；
+- **权限隔离**：只授予视图的 SELECT 权限，隐藏敏感列（如手机号）；
+- **稳定接口**：底层表重构时改视图定义，调用方无感。
+
+管理命令：
+
+```sql
+SHOW CREATE VIEW v_order_detail\G
+ALTER VIEW v_order_detail AS SELECT ...;   -- 修改定义
+DROP VIEW v_order_detail;
+```
+
+### 1.2 可更新视图与性能真相
+
+满足条件的视图可以直接 UPDATE/INSERT（单表、无聚合/DISTINCT/GROUP BY/UNION 等），修改会落到基表。带 `WITH CHECK OPTION` 可阻止把行改出视图可见范围：
+
+```sql
+CREATE VIEW v_active_users AS
+SELECT id, username, email FROM users WHERE status = 1
+WITH CHECK OPTION;
+
+UPDATE v_active_users SET username = 'alice2' WHERE id = 1;  -- OK，落到 users
+UPDATE v_active_users SET status = 2 WHERE id = 1;           -- 报错：status 不在视图列里
+```
+
+<Callout type="warn" title="视图不是性能优化手段">
+MySQL 视图默认用 MERGE 算法把视图定义合并进外层查询——查视图和直接写完整 SQL 性能一样，**不会更快**。含 GROUP BY 等无法合并的视图会走 TEMPTABLE 算法（先物化成临时表），外层条件无法下推到临时表内，反而可能**更慢**。视图是为可维护性服务的，别指望它提速；MySQL 也没有 PostgreSQL 那种物化视图。
+</Callout>
+
+## 2. 窗口函数：改变游戏规则
+
+### 2.1 与 GROUP BY 的本质区别
+
+- GROUP BY：多行**坍缩**成一行，明细丢失；
+- 窗口函数：**每行保留**，只是在行旁边「开个窗」看到同组其他行算出的值。
+
+```sql
+SELECT order_no, user_id, total_amount,
+       SUM(total_amount) OVER (PARTITION BY user_id) AS user_total,
+       total_amount / SUM(total_amount) OVER (PARTITION BY user_id) AS pct
+FROM orders;
+```
+
+```text
++---------------+---------+--------------+------------+--------+
+| order_no      | user_id | total_amount | user_total | pct    |
++---------------+---------+--------------+------------+--------+
+| SO20260701001 |       1 |      8127.00 |    8304.00 | 0.9787 |
+| SO20260703003 |       1 |       177.00 |    8304.00 | 0.0213 |
+| SO20260702002 |       2 |      3999.00 |    3999.00 | 1.0000 |
+| SO20260704004 |       3 |      8999.00 |    8999.00 | 1.0000 |
++---------------+---------+--------------+------------+--------+
+```
+
+每行都在，旁边多了「本用户总额」和「本单占比」——GROUP BY 做不到这种「明细 + 汇总同框」。
+
+语法骨架：
+
+```text
+函数() OVER (
+  PARTITION BY 分组列     -- 窗口按什么分区（可省略 = 全表一个窗口）
+  ORDER BY 排序列          -- 窗口内按什么排序（排名/偏移函数必需）
+  [ROWS BETWEEN ...]      -- 窗口帧（滑动范围，做移动平均时用）
+)
+```
+
+### 2.2 排名三兄弟：ROW_NUMBER / RANK / DENSE_RANK
+
+区别在**并列名次怎么处理**：
+
+```sql
+SELECT name, price,
+       ROW_NUMBER() OVER (ORDER BY price DESC) AS row_num,
+       RANK()       OVER (ORDER BY price DESC) AS rnk,
+       DENSE_RANK() OVER (ORDER BY price DESC) AS dense_rnk
+FROM products;
+```
+
+```text
++---------------+---------+---------+-----+-----------+
+| name          | price   | row_num | rnk | dense_rnk |
++---------------+---------+---------+-----+-----------+
+| ThinkPad X1   | 9999.00 |       1 |   1 |         1 |
+| MacBook Air M3| 8999.00 |       2 |   2 |         2 |
+| iPhone 15 Pro | 7999.00 |       3 |   3 |         3 |
+| Xiaomi 14     | 3999.00 |       4 |   4 |         4 |
+| 高性能MySQL    |  128.00 |       5 |   5 |         5 |
+| SQL必知必会    |   49.00 |       6 |   6 |         6 |
++---------------+---------+---------+-----+-----------+
+```
+
+- ROW_NUMBER：严格递增 1,2,3，并列也硬排先后；
+- RANK：并列同名次，之后**跳号**（1,1,3）；
+- DENSE_RANK：并列同名次，**不跳号**（1,1,2）。
+
+### 2.3 分组内 TOP N：最高频的面试题与实战题
+
+「每个分类价格最高的 2 个商品」——GROUP BY 无解，窗口函数标准解法：
+
+```sql
+WITH ranked AS (
+  SELECT p.*, 
+         ROW_NUMBER() OVER (PARTITION BY category_id ORDER BY price DESC) AS rn
+  FROM products p
+)
+SELECT category_id, name, price
+FROM ranked
+WHERE rn <= 2;
+```
+
+同样的模板还能解决：每个用户最新一笔订单、每台设备最后一次上报、每篇文章最热的 3 条评论……记住这个 `PARTITION BY ... ORDER BY ... WHERE rn <= N` 模式，一招吃遍天。
+
+注意：窗口函数不能直接写在 WHERE 里（逻辑执行顺序上 WHERE 先于窗口计算），必须像上面那样套一层 CTE 或派生表。
+
+### 2.4 LAG / LEAD：跨行取值
+
+LAG 取当前行**前面**第 n 行的值，LEAD 取后面的，做环比/间隔分析必备：
+
+```sql
+-- 每日 GMV 与环比增幅
+WITH daily AS (
+  SELECT DATE(created_at) AS d, SUM(total_amount) AS gmv
+  FROM orders GROUP BY DATE(created_at)
+)
+SELECT d, gmv,
+       LAG(gmv)  OVER (ORDER BY d)              AS prev_gmv,
+       gmv - LAG(gmv) OVER (ORDER BY d)          AS diff,
+       LAG(gmv, 7) OVER (ORDER BY d)             AS same_day_last_week
+FROM daily;
+```
+
+再比如「用户相邻两单的间隔天数」：
+
+```sql
+SELECT user_id, created_at,
+       DATEDIFF(created_at,
+                LAG(created_at) OVER (PARTITION BY user_id ORDER BY created_at)
+       ) AS days_since_last_order
+FROM orders;
+```
+
+### 2.5 聚合窗口与移动平均
+
+聚合函数 + ORDER BY 默认是「从分区开头累计到当前行」：
+
+```sql
+-- 累计 GMV 与 7 日移动平均
+WITH daily AS (
+  SELECT DATE(created_at) AS d, SUM(total_amount) AS gmv
+  FROM orders GROUP BY DATE(created_at)
+)
+SELECT d, gmv,
+       SUM(gmv) OVER (ORDER BY d) AS running_total,
+       AVG(gmv) OVER (ORDER BY d ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS ma7
+FROM daily;
+```
+
+`ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` 定义了 7 行的滑动窗口帧。
+
+还有 `NTILE(n)`（把分区均分成 n 桶，做用户分层）和 `FIRST_VALUE` / `LAST_VALUE`（取窗口首尾值），语法同理。
+
+## 小结
+
+- 视图封装复杂查询、隔离权限，但不是性能工具（MERGE 不加速、TEMPTABLE 可能更慢）
+- 窗口函数在保留明细的同时计算组内聚合/排名/偏移
+- 排名三兄弟：ROW_NUMBER 硬排、RANK 跳号、DENSE_RANK 不跳号
+- 分组 TOP N 模板：CTE + `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` + `WHERE rn <= N`
+- LAG/LEAD 做环比与间隔，ROWS BETWEEN 做移动平均
+
+<Callout type="exercise" title="练习">
+1. 创建视图 v_user_stats（用户名、订单数、消费总额），并给一个只读账号授予该视图的 SELECT 权限。
+2. 查询每个用户金额最大的那一笔订单（完整行），用窗口函数实现；再思考不用窗口函数怎么写，对比可读性。
+3. 计算每日订单量的 3 日移动平均和累计值。
+</Callout>

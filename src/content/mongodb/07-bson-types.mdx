@@ -1,0 +1,340 @@
+---
+title: 数据类型与 BSON
+order: 7
+description: BSON 规范、ObjectId、Date、Decimal128、整数类型、16MB 限制与应对
+---
+
+# 数据类型与 BSON
+
+MongoDB 存的不是 JSON，是 BSON。这个区别不是学术细节——它决定了你能存什么类型、比较时按什么规则、以及为什么单个文档不能超过 16MB。写过一段时间 MongoDB 的人，踩过的坑有相当一部分源自对 BSON 类型的误解。
+
+## 1. 为什么是 BSON 而不是 JSON
+
+JSON 有三个致命缺点，让它不适合做存储格式：
+
+1. **类型太少**：只有 string、number、boolean、null、array、object。没有日期、没有二进制、没有整数与浮点的区分。
+2. **解析慢**：要顺序扫描字符串找分隔符，无法跳过不需要的字段。
+3. **体积大**：数字、布尔都要转成文本。
+
+BSON（Binary JSON）针对这三点做了改造：
+
+```text
+JSON:  {"a": 1, "b": "hi"}
+       ↓ 27 字节文本，必须逐字符解析
+
+BSON:  \x1b\x00\x00\x00           总长度 27
+       \x10 a\x00 \x01\x00\x00\x00    类型=int32, 名="a", 值=1
+       \x02 b\x00 \x03\x00\x00\x00 hi\x00  类型=string, 名="b", 长度=3, 值="hi"
+       \x00                        结束符
+       ↓ 每个元素都带长度前缀，可以直接跳过
+```
+
+**长度前缀**是关键设计：想读第 10 个字段，不用解析前 9 个，按长度跳过即可。这也是投影和索引能高效工作的基础。
+
+<Callout type="info" title="mongosh 里显示的是 Extended JSON">
+你在 shell 里看到的 `ObjectId("...")`、`ISODate("...")` 并不是 BSON 本身，而是 **Extended JSON** 表示法——一种用 JSON 语法保留 BSON 类型信息的编码。`mongoexport` 的输出、驱动的调试日志用的都是它。
+</Callout>
+
+## 2. 核心类型一览
+
+| BSON 类型 | 编号 | mongosh 构造 | 说明 |
+|---|---|---|---|
+| Double | 1 | `3.14` | 64 位浮点，JS 默认数字类型 |
+| String | 2 | `"hi"` | UTF-8 |
+| Object | 3 | 内嵌文档 | 嵌套深度上限 100 |
+| Array | 4 | `[1, 2]` | 本质是键为 "0","1" 的文档 |
+| BinData | 5 | `BinData(0, "...")` | 二进制，含 UUID 子类型 |
+| ObjectId | 7 | `ObjectId()` | 12 字节，见第 3 章 |
+| Boolean | 8 | `true` | |
+| Date | 9 | `new Date()` | 64 位毫秒时间戳 |
+| Null | 10 | `null` | |
+| Regex | 11 | `/^a/i` | |
+| Int32 | 16 | `NumberInt(42)` | 32 位整数 |
+| Timestamp | 17 | `Timestamp()` | **内部用**，非业务时间 |
+| Int64 | 18 | `NumberLong("...")` | 64 位整数 |
+| Decimal128 | 19 | `NumberDecimal("1.1")` | 128 位十进制，精确 |
+| MinKey/MaxKey | -1/127 | `MinKey` | 比较时永远最小/最大 |
+
+## 3. 数字类型：最容易出事的地方
+
+### 3.1 三种数字的取舍
+
+mongosh 是 JavaScript 环境，字面量数字**一律是 Double**：
+
+```js
+db.t.insertOne({ a: 42, b: 42.5, c: 9007199254740993 })
+db.t.findOne()
+```
+
+```json
+{
+  "_id": ObjectId("..."),
+  "a": 42,
+  "b": 42.5,
+  "c": 9007199254740992
+}
+```
+
+注意 `c`：输入的是 `...993`，存进去变成了 `...992`。因为 Double 只有 53 位尾数，超过 2 的 53 次方就无法精确表示整数。雪花 ID、订单号这类大整数如果用字面量写入，会**静默丢精度**。
+
+正确写法：
+
+```js
+db.t.insertOne({ c: NumberLong("9007199254740993") })
+db.t.findOne({}, { c: 1 })
+```
+
+```json
+{ "c": Long("9007199254740993") }
+```
+
+### 3.2 金额必须用 Decimal128
+
+```js
+db.t.insertOne({ price: 0.1, qty: 3 })
+db.t.aggregate([ { $project: { total: { $multiply: ["$price", "$qty"] } } } ])
+```
+
+```json
+[ { "total": 0.30000000000000004 } ]
+```
+
+这就是经典的二进制浮点误差。金额、税率、汇率一律用 Decimal128：
+
+```js
+db.t.insertOne({ price: NumberDecimal("0.1"), qty: NumberDecimal("3") })
+db.t.aggregate([ { $project: { total: { $multiply: ["$price", "$qty"] } } } ])
+```
+
+```json
+[ { "total": NumberDecimal("0.3") } ]
+```
+
+| 类型 | 精度 | 性能 | 适用 |
+|---|---|---|---|
+| Double | 15-17 位有效数字，二进制 | 最快 | 度量值、评分、坐标 |
+| Int32 | 精确，范围约 ±21 亿 | 快 | 计数、状态码 |
+| Int64 | 精确，范围约 ±9.2e18 | 快 | 雪花 ID、大计数 |
+| Decimal128 | 34 位有效数字，十进制 | 慢约 3 倍 | **金额、财务** |
+
+<Callout type="warn" title="类型不同会影响索引和相等判断">
+`42`（Double）和 `NumberInt(42)`（Int32）在 MongoDB 里**能相互匹配**（数值比较跨类型），但它们在排序、`$type` 过滤、以及某些驱动的反序列化中表现不同。更麻烦的是 `NumberDecimal("42")` 和 `42` 也能匹配，但 `NumberDecimal("42.0")` 与 `NumberDecimal("42")` 虽然相等，序列化出来的字符串却不同。同一个字段务必在整个集合里保持类型一致，用 `$jsonSchema`（第 13 章）强制。
+</Callout>
+
+### 3.3 排查混合类型
+
+```js
+// 统计某字段的类型分布
+db.posts.aggregate([
+  { $group: { _id: { $type: "$views" }, count: { $sum: 1 } } }
+])
+```
+
+```json
+[
+  { "_id": "int", "count": 9832 },
+  { "_id": "double", "count": 145 },
+  { "_id": "string", "count": 23 }
+]
+```
+
+接手陌生集合时，对每个关键字段跑一遍这个聚合，能提前发现一大堆隐患。
+
+## 4. 日期与时间
+
+### 4.1 Date
+
+```js
+db.events.insertOne({
+  name: "launch",
+  at: new Date(),                            // 当前时间
+  at2: new Date("2024-06-01T10:00:00Z"),     // ISO 字符串
+  at3: ISODate("2024-06-01T10:00:00+08:00")  // 带时区，会转成 UTC 存储
+})
+```
+
+```json
+{
+  "at":  ISODate("2024-06-04T09:31:23.451Z"),
+  "at2": ISODate("2024-06-01T10:00:00.000Z"),
+  "at3": ISODate("2024-06-01T02:00:00.000Z")
+}
+```
+
+关键点：**BSON Date 内部永远是 UTC 毫秒时间戳，不存时区信息**。`+08:00` 在写入时就被换算掉了。如果业务需要知道「用户当时所在时区」，必须单独存一个字段。
+
+```js
+db.events.insertOne({
+  at: ISODate("2024-06-01T02:00:00Z"),
+  tz: "Asia/Shanghai"          // 时区单独存
+})
+```
+
+聚合里可以按时区做日期分组（5.0+）：
+
+```js
+db.events.aggregate([
+  { $group: {
+      _id: { $dateToString: { date: "$at", format: "%Y-%m-%d", timezone: "Asia/Shanghai" } },
+      count: { $sum: 1 }
+  } }
+])
+```
+
+### 4.2 Timestamp 不是给你用的
+
+BSON 有一个叫 Timestamp 的类型，但它是 MongoDB **内部**用于 oplog 排序的，语义是「秒 + 同秒内的递增序号」。业务时间**永远用 Date**，不要用 Timestamp。
+
+<Callout type="warn" title="日期存成字符串是最常见的建模错误">
+`createdAt: "2024-06-01"` 看起来能用，但它无法做范围比较（跨月时 `"2024-09-30" > "2024-10-01"` 字符串比较是成立的吗？取决于格式）、无法用 `$dateToString` 处理、也无法建 TTL 索引。日期一律存 Date 类型，展示层再格式化。
+</Callout>
+
+## 5. ObjectId 与 UUID
+
+第 3 章讲过 ObjectId 的结构。这里补充另一个选项：UUID。
+
+```js
+db.t.insertOne({ _id: UUID(), name: "x" })
+db.t.findOne()
+```
+
+```json
+{ "_id": UUID("3b241101-e2bb-4255-8caf-4136c566a962"), "name": "x" }
+```
+
+| 维度 | ObjectId | UUID v4 |
+|---|---|---|
+| 长度 | 12 字节 | 16 字节 |
+| 是否有序 | 秒级递增 | 完全随机 |
+| 能否推出时间 | 能 | 不能 |
+| 索引写入局部性 | 好（顺序追加） | 差（随机分布） |
+| 跨系统通用性 | MongoDB 专有 | 标准 |
+| 分片写热点 | 范围分片会有 | 天然分散 |
+
+选择建议：**默认用 ObjectId**；只在需要与外部系统共享标识、或者要用范围分片键且必须避免热点时才用 UUID。
+
+## 6. 数组与内嵌文档
+
+### 6.1 数组的本质
+
+BSON 里数组其实就是键为 "0"、"1"、"2" 的文档。这解释了几件事：
+
+- 为什么可以用 `"tags.0"` 访问下标
+- 为什么数组元素的存储有额外开销（每个元素都带一个键名）
+- 为什么超长数组（比如 10 万个元素）性能很差
+
+### 6.2 嵌套深度限制
+
+BSON 文档最多嵌套 **100 层**。实践中超过 4 到 5 层就应该反思建模，因为深层嵌套的更新语句会长得难以维护。
+
+### 6.3 字段名的限制
+
+- 不能包含 `\u0000`
+- 顶层字段名不能是空字符串
+- 从 5.0 起字段名可以以美元符号开头、可以含点号，但**强烈不建议**——查询语法会产生歧义
+
+```js
+// 能存，但查询时非常痛苦
+db.t.insertOne({ "a.b": 1 })
+db.t.find({ "a.b": 1 })      // 这会被理解成「a 内嵌文档的 b 字段」，查不到
+```
+
+<Callout type="warn" title="不要用动态值做字段名">
+把用户 ID 当键存成 `{ "u_123": 5, "u_456": 3 }` 是一种常见的错误建模。后果是：无法对它建索引（键名无穷多）、无法用查询语法过滤、schema 分析工具全部失效。正确做法是转成数组，形如包含 userId 和 score 两个字段的对象的数组，然后对 `userId` 建多键索引。
+</Callout>
+
+## 7. 16MB 文档大小限制
+
+### 7.1 为什么有这个限制
+
+这是一条硬性设计约束，理由有三：
+
+1. **保护内存**：一次查询可能返回上千个文档，如果每个都能是 1GB，服务端和客户端都会 OOM
+2. **保护网络**：BSON 文档是原子传输单元，不能分片传
+3. **暗示建模问题**：需要 16MB 的文档，几乎肯定是把「无界增长的集合」内嵌进了文档
+
+### 7.2 什么时候会撞上
+
+最典型的场景是**无界数组**：
+
+```text
+帖子文档
+  ├── title
+  ├── body
+  └── comments: [ ... ]     ← 一篇爆款文章 5 万条评论
+                              每条 300 字节 → 15MB → 逼近上限
+```
+
+更糟的是，即使没到 16MB，一个 10MB 的文档每次更新都要重写整个文档（MongoDB 的原地更新在文档增长超出预留空间时会移动文档），性能会断崖下跌。
+
+### 7.3 三种应对方案
+
+**方案一：引用 + 独立集合（最常用）**
+
+```js
+// posts 只存计数与热评
+{ _id: 100, title: "...", stats: { comments: 50000 },
+  hotComments: [ /* 最多 3 条 */ ] }
+
+// comments 独立集合
+{ _id: ObjectId(), postId: 100, author: "alice", body: "...", createdAt: ISODate() }
+```
+
+**方案二：桶模式（bucket pattern）**
+
+把大量小记录按时间或数量分桶，每个桶是一个文档：
+
+```js
+{
+  postId: 100,
+  bucket: 0,                  // 第 0 桶
+  count: 100,                 // 本桶已有 100 条
+  comments: [ /* 100 条 */ ]
+}
+```
+
+写入时 upsert 到「未满的那个桶」，读取时按桶顺序取。这在时序数据、IoT 场景里非常常用，第 12 章会展开。
+
+**方案三：GridFS（存大文件）**
+
+文件超过 16MB 就用 GridFS，它把文件切成 255KB 的 chunk 存在两个集合里：
+
+```bash
+mongofiles --db=community put ./video.mp4
+```
+
+```js
+db.fs.files.find()      // 文件元数据
+db.fs.chunks.find()     // 文件分块
+```
+
+<Callout type="tip" title="GridFS 通常不是最佳选择">
+如果你的场景是存图片、视频，对象存储（S3、COS、OSS）在成本、CDN 加速、带宽上都远优于 GridFS。GridFS 适合的是「必须和数据库保持事务一致、且不方便引入外部存储」的场景，比如内网系统的附件。
+</Callout>
+
+## 8. 类型比较顺序
+
+当同一个字段存了不同类型，排序时 MongoDB 用一个固定的类型优先级：
+
+```text
+MinKey  <  Null  <  数字(Int/Long/Double/Decimal)  <  String
+        <  Object  <  Array  <  BinData  <  ObjectId
+        <  Boolean  <  Date  <  Timestamp  <  Regex  <  MaxKey
+```
+
+这个顺序很少直接用到，但能解释一些诡异现象，比如「为什么 `sort` 之后所有缺失字段的文档排在了最前面」——因为缺失被当作 Null，而 Null 的优先级仅高于 MinKey。
+
+<Callout type="exercise" title="练习">
+一、插入一个 `NumberLong("9007199254740993")` 和一个字面量 `9007199254740993`，用 `$type` 和精确查询验证后者已经丢精度；二、用 Double 存 `0.1` 和 `0.2`，用聚合把它们相加，观察结果；再换成 Decimal128 重做一遍；三、写一个聚合，统计 `posts` 集合中 `createdAt` 字段的类型分布，找出被存成字符串的脏数据；四、设计一个「桶模式」的评论存储方案：每桶 200 条，写出插入时的 upsert 语句（提示：用 `$inc` 维护 count，用 filter 限制 `count` 小于 200）。
+</Callout>
+
+## 小结
+
+- BSON 是带长度前缀的二进制格式，支持类型丰富且能跳字段解析
+- mongosh 里的数字字面量都是 Double，大整数会静默丢精度，必须用 `NumberLong`
+- 金额一律 Decimal128，Double 的二进制误差在财务场景不可接受
+- Date 内部是 UTC 毫秒时间戳，不含时区；Timestamp 是内部类型，不要用于业务
+- ObjectId 有序、局部性好；UUID 通用、分布均匀，按需选择
+- 不要用动态值做字段名，改用数组加索引
+- 16MB 是硬限制，无界数组必须拆分：引用、桶模式或 GridFS
+- 下一章开始讲索引，性能优化的主战场 →

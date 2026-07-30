@@ -1,0 +1,369 @@
+---
+title: 主键、排序键与稀疏索引
+order: 5
+description: 理解 ORDER BY 与 PRIMARY KEY 的关系、index_granularity、索引如何跳过数据块
+---
+
+# 主键、排序键与稀疏索引
+
+如果只能记住 ClickHouse 的一件事，就是这一章。**排序键设计决定了你的表能不能用**——设计对了查询 50 毫秒，设计错了同样的查询 30 秒，而且事后很难改。
+
+## 1. ORDER BY 和 PRIMARY KEY 到底是什么关系
+
+先纠正一个 MySQL 带来的误解：
+
+| | MySQL PRIMARY KEY | ClickHouse ORDER BY / PRIMARY KEY |
+|---|---|---|
+| 唯一性 | **强制唯一** | 完全不保证，重复随便插 |
+| NULL | 不允许 | 不允许（Nullable 列不能进） |
+| 作用 | 唯一标识 + 聚簇索引 | 决定物理排序 + 构建稀疏索引 |
+| 能否改 | 可以（重建表） | 只能加列到末尾，不能改顺序 |
+
+在 ClickHouse 里：
+
+- `ORDER BY` 决定**数据在 part 内的物理排列顺序**
+- `PRIMARY KEY` 决定**稀疏索引记录哪些列**，必须是 ORDER BY 的**前缀**
+- 不写 `PRIMARY KEY` 时，它默认等于 `ORDER BY`
+
+```sql
+ENGINE = MergeTree
+ORDER BY (country, event_type, event_time)
+-- 等价于额外写了 PRIMARY KEY (country, event_type, event_time)
+```
+
+### 1.1 什么时候要单独指定 PRIMARY KEY
+
+当排序键很长、但你只需要前几列做索引时。索引项越少，`primary.cidx` 越小，越能常驻内存：
+
+```sql
+ENGINE = MergeTree
+ORDER BY (country, event_type, event_time, user_id)   -- 物理排序用 4 列
+PRIMARY KEY (country, event_type)                      -- 索引只记 2 列
+```
+
+排序仍然是 4 列（保证了 merge 时的去重/折叠语义和数据局部性），但索引文件小了一半。适合 ReplacingMergeTree 这类需要用完整业务键排序、但查询只用前缀过滤的场景。
+
+<Callout type="info" title="PRIMARY KEY 必须是 ORDER BY 的前缀">
+`ORDER BY (a, b, c)` 时，`PRIMARY KEY (a)` 和 `PRIMARY KEY (a, b)` 合法，`PRIMARY KEY (b)` 或 `PRIMARY KEY (a, c)` 会直接报错。原因很直观：索引记录的是每个 granule 的第一行的键值，只有前缀才能保持单调有序。
+</Callout>
+
+## 2. 稀疏索引的工作原理
+
+假设 `events` 表按 `ORDER BY (country, event_type, event_time)` 排序，`index_granularity = 8192`（默认）。
+
+### 2.1 索引长什么样
+
+数据物理有序后，每 8192 行取第一行的主键值，构成 `primary.cidx`：
+
+```text
+part 内的数据（已按 country, event_type, event_time 排序）
+行号      country  event_type  event_time
+0         CN       click       2024-06-01 00:00:03   ← mark 0
+...
+8191      CN       click       2024-06-11 08:12:44
+8192      CN       click       2024-06-11 08:13:01   ← mark 1
+...
+16383     CN       purchase    2024-06-02 14:00:00
+16384     CN       purchase    2024-06-02 14:00:07   ← mark 2
+...
+24575     CN       view        2024-06-09 22:31:00
+24576     CN       view        2024-06-09 22:31:05   ← mark 3
+...
+32768     JP       click       2024-06-01 00:01:12   ← mark 4
+...
+40960     US       view        2024-06-01 03:44:20   ← mark 5
+
+primary.cidx（只存这 6 行，极小）
+┌──────┬─────────┬────────────┬─────────────────────┐
+│ mark │ country │ event_type │ event_time          │
+├──────┼─────────┼────────────┼─────────────────────┤
+│  0   │ CN      │ click      │ 2024-06-01 00:00:03 │
+│  1   │ CN      │ click      │ 2024-06-11 08:13:01 │
+│  2   │ CN      │ purchase   │ 2024-06-02 14:00:07 │
+│  3   │ CN      │ view       │ 2024-06-09 22:31:05 │
+│  4   │ JP      │ click      │ 2024-06-01 00:01:12 │
+│  5   │ US      │ view       │ 2024-06-01 03:44:20 │
+└──────┴─────────┴────────────┴─────────────────────┘
+```
+
+10 亿行的表，索引只有 12 万个条目，几 MB，全部常驻内存。
+
+### 2.2 查询如何跳过数据
+
+```sql
+SELECT count() FROM events WHERE country = 'JP';
+```
+
+ClickHouse 在索引上二分查找：
+
+```text
+mark 0: CN ... ─┐
+mark 1: CN ...  ├─ country < 'JP'，跳过
+mark 2: CN ...  │
+mark 3: CN ... ─┘
+mark 4: JP ... ←── 命中！读 granule 4（8192 行）
+mark 5: US ... ←── country > 'JP'，但 mark 4 到 mark 5 之间可能还有 JP 数据
+                    所以 granule 4 必须读，granule 5 也要读（边界）
+
+结果：只读 2 个 granule = 16384 行，跳过了其余所有数据
+```
+
+再看第二个例子：
+
+```sql
+SELECT count() FROM events WHERE country = 'CN' AND event_type = 'purchase';
+```
+
+索引前两列都能用上，直接定位到 mark 2，只读 granule 2 和 3（边界）。
+
+### 2.3 前缀失效的情况
+
+```sql
+-- 只给了第二列，第一列没条件
+SELECT count() FROM events WHERE event_type = 'purchase';
+```
+
+```text
+mark 0: CN click     ← purchase 可能在这个 granule 后半段？不可能，click < purchase
+mark 1: CN click     ← granule 1 的范围是 [CN,click, CN,purchase)，可能含 purchase！读
+mark 2: CN purchase  ← 读
+mark 3: CN view      ← granule 3 范围 [CN,view, JP,click)，不含 purchase，跳
+mark 4: JP click     ← granule 4 范围 [JP,click, US,view)，可能含 JP,purchase！读
+mark 5: US view      ← 读（末尾 granule 范围未知）
+```
+
+虽然还能跳掉一些，但效果差很多。**排序键就像 MySQL 的联合索引，遵循最左前缀原则**——但比 MySQL 更宽松一点，因为即使前缀不完整，只要能确定某个 granule 的键值区间不包含目标值，仍然能跳过。
+
+<Callout type="tip" title="用 EXPLAIN 看跳过了多少">
+```sql
+EXPLAIN indexes = 1
+SELECT count() FROM events WHERE country = 'CN' AND event_type = 'purchase';
+```
+
+```text
+Expression ((Projection + Before ORDER BY))
+  Aggregating
+    Expression (Before GROUP BY)
+      ReadFromMergeTree (demo.events)
+      Indexes:
+        PrimaryKey
+          Keys:
+            country
+            event_type
+          Condition: and((country in ['CN','CN']), (event_type in ['purchase','purchase']))
+          Parts: 1/4
+          Granules: 31/122
+```
+
+`Granules: 31/122` 表示 122 个 granule 里只需读 31 个。这个比值就是索引效率。
+</Callout>
+
+## 3. index_granularity 的取舍
+
+默认 8192 行一个 granule。这个值控制索引的精细程度。
+
+| granularity | 索引大小 | 单次最小读取量 | 适合 |
+|---|---|---|---|
+| 1024 | 8 倍大 | 1024 行 | 高选择性查询、需要点查 |
+| 8192（默认） | 基准 | 8192 行 | 绝大多数场景 |
+| 65536 | 1/8 | 65536 行 | 超宽表、全表扫为主 |
+
+```sql
+CREATE TABLE events_fine (...)
+ENGINE = MergeTree
+ORDER BY (user_id, event_time)
+SETTINGS index_granularity = 1024;
+```
+
+### 3.1 自适应粒度
+
+ClickHouse 从 19.x 起默认开启**自适应 granularity**：当一行特别宽（比如含大 String）时，会在行数不到 8192 就切分 granule，保证每个 granule 的压缩前大小不超过 `index_granularity_bytes`（默认 10 MB）。
+
+```sql
+SELECT name, value FROM system.merge_tree_settings
+WHERE name IN ('index_granularity', 'index_granularity_bytes');
+```
+
+```text
+┌─name────────────────────┬─value────┐
+│ index_granularity       │ 8192     │
+│ index_granularity_bytes │ 10485760 │
+└─────────────────────────┴──────────┘
+```
+
+<Callout type="warn" title="不要盲目调小 granularity">
+把 granularity 从 8192 调到 256，索引会变成 32 倍大。10 亿行的表索引从 3 MB 涨到 96 MB，还是能接受；但如果表有 100 个分区、每个分区多个 part，索引总量可能占满内存。而且 mark 文件也会同比膨胀，增加 I/O。
+
+只在明确知道「查询选择性极高、每次只命中几十行」时才调小。
+</Callout>
+
+## 4. 排序键设计原则
+
+这是本章的核心。四条经验法则：
+
+### 4.1 原则一：最常用的过滤列放最前
+
+如果 90% 的查询都带 `WHERE country = ?`，`country` 就该是第一列。
+
+```sql
+-- 业务：运营看板，永远按国家 + 事件类型筛选，再按时间聚合
+ORDER BY (country, event_type, event_time)   -- 好
+ORDER BY (event_time, country, event_type)   -- 差
+```
+
+### 4.2 原则二：低基数列放前面
+
+这一条和直觉相反，但对压缩率至关重要。
+
+```text
+ORDER BY (country, user_id)          ORDER BY (user_id, country)
+country: CN CN CN CN CN US US ...    country: CN US JP CN US ...
+         ↑ 完美的游程，压缩 100:1              ↑ 随机，压缩 3:1
+
+user_id: 5 88 102 340 ...            user_id: 1 1 2 2 3 3 ...
+         ↑ 组内随机                            ↑ 有序，Delta 编码效果好
+```
+
+低基数列在前，它自己压缩到极致，后面的列在每个分组内仍能保持局部有序。反过来则两边都不讨好。
+
+同时，低基数列在前也意味着**每个不同值占据连续的大块**，稀疏索引跳过效率高。
+
+### 4.3 原则三：时间列通常放最后
+
+```sql
+ORDER BY (country, event_type, event_time)
+```
+
+时间几乎总是范围查询（`BETWEEN`、`>=`），放在末尾时，前面的等值条件已经把范围缩到很小，时间再做二分即可。放在最前面则会让所有其他维度的过滤都失效。
+
+例外：如果查询**只按时间过滤、不带其他维度**，那时间就该在前，或者干脆靠 `PARTITION BY toYYYYMM(event_time)` 做裁剪。
+
+### 4.4 原则四：不要放太多列
+
+排序键每多一列，merge 时的比较成本、索引大小都增加。**通常 3~5 列足够**。第 4 列以后对跳过效率的贡献往往微乎其微。
+
+### 4.5 一个完整的推导
+
+假设 `events` 表的实际查询模式统计如下：
+
+| 查询模式 | 占比 |
+|---|---|
+| `WHERE country=? AND event_time BETWEEN ?` | 60% |
+| `WHERE country=? AND event_type=? AND event_time BETWEEN ?` | 25% |
+| `WHERE event_time BETWEEN ?` 全局聚合 | 10% |
+| `WHERE user_id = ?` 单用户明细 | 5% |
+
+推导：
+
+1. `country` 出现在 85% 的查询里，且基数只有 200 → 第一列
+2. `event_type` 出现在 25%，基数 4 → 第二列
+3. `event_time` 所有查询都有，且是范围 → 第三列
+4. `user_id` 只占 5%，基数千万 → **不放进排序键**，用跳数索引或单独建投影解决
+
+```sql
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time)
+```
+
+那 5% 的 user_id 查询怎么办？第 16 章的 bloom_filter 跳数索引或 Projection 是标准答案。
+
+<Callout type="warn" title="排序键改不了">
+`ALTER TABLE ... MODIFY ORDER BY` 只能在**末尾追加**列，不能改变已有列的顺序，也不能删列。想改顺序只能：
+
+```sql
+CREATE TABLE events_new (...) ENGINE = MergeTree ORDER BY (新的顺序);
+INSERT INTO events_new SELECT * FROM events;
+RENAME TABLE events TO events_old, events_new TO events;
+DROP TABLE events_old;
+```
+
+10 亿行的表这个过程要跑几十分钟。所以**建表前一定要把查询模式想清楚**。
+</Callout>
+
+## 5. 实测对比
+
+建两张表，唯一区别是排序键：
+
+```sql
+CREATE TABLE ev_good (
+    event_time DateTime, user_id UInt64,
+    event_type LowCardinality(String), page String,
+    country LowCardinality(String), device LowCardinality(String),
+    duration_ms UInt32
+) ENGINE = MergeTree ORDER BY (country, event_type, event_time);
+
+CREATE TABLE ev_bad (
+    event_time DateTime, user_id UInt64,
+    event_type LowCardinality(String), page String,
+    country LowCardinality(String), device LowCardinality(String),
+    duration_ms UInt32
+) ENGINE = MergeTree ORDER BY (user_id, event_time);
+
+-- 灌入相同的 2000 万行
+INSERT INTO ev_good SELECT
+    toDateTime('2024-06-01') + number % 2592000,
+    1 + rand(1) % 5000000,
+    ['view','click','purchase','signup'][1 + rand(2) % 4],
+    concat('/p/', toString(rand(3) % 500)),
+    ['CN','US','JP','DE','IN'][1 + rand(4) % 5],
+    ['ios','android','web'][1 + rand(5) % 3],
+    50 + rand(6) % 5000
+FROM numbers(20000000);
+
+INSERT INTO ev_bad SELECT * FROM ev_good;
+```
+
+查询对比：
+
+```sql
+SELECT count() FROM ev_good WHERE country = 'JP' AND event_type = 'purchase';
+SELECT count() FROM ev_bad  WHERE country = 'JP' AND event_type = 'purchase';
+```
+
+| 表 | 扫描行数 | 耗时 | 磁盘占用 |
+|---|---|---|---|
+| `ev_good` | 1,081,344 | 0.021 s | 128 MiB |
+| `ev_bad` | 20,000,000 | 0.186 s | 214 MiB |
+
+`ev_good` 只扫了 5% 的行，磁盘还小 40%（因为低基数列有序后压缩率更高）。**同一份数据，仅仅换了排序键**。
+
+## 6. 主键索引的内存占用
+
+```sql
+SELECT
+    table,
+    formatReadableSize(sum(primary_key_bytes_in_memory)) AS pk_mem,
+    formatReadableSize(sum(bytes_on_disk))               AS disk,
+    sum(rows)                                            AS rows
+FROM system.parts
+WHERE database = 'demo' AND active
+GROUP BY table;
+```
+
+```text
+┌─table───┬─pk_mem────┬─disk──────┬─────rows─┐
+│ ev_good │ 96.42 KiB │ 128 MiB   │ 20000000 │
+│ ev_bad  │ 214.8 KiB │ 214 MiB   │ 20000000 │
+└─────────┴───────────┴───────────┴──────────┘
+```
+
+2000 万行的索引不到 100 KB。这就是稀疏索引的威力——**MySQL 同样数据量的 B+Tree 索引通常有几百 MB**。
+
+<Callout type="exercise" title="练习">
+1. 复现上面的 `ev_good` / `ev_bad` 对比实验，用 `EXPLAIN indexes = 1` 分别查看两张表的 `Granules: x/y`。
+2. 再建一张 `ev_time_first`，排序键为 `(event_time, country, event_type)`，插入同样数据。测试三种查询：仅按时间范围、仅按国家、国家加时间。记录三张表在三种查询下的扫描行数，做成 3×3 表格。
+3. 建一张 `index_granularity = 1024` 的表，对比它的 `primary_key_bytes_in_memory` 和默认表相差几倍，并测试一个高选择性查询是否真的更快。
+4. 思考题：你的业务表如果要重新设计排序键，前三列应该是什么？写下你的推导依据（查询占比 + 基数）。
+</Callout>
+
+## 小结
+
+- ClickHouse 的主键不唯一，唯一作用是决定物理排序和构建稀疏索引
+- `PRIMARY KEY` 必须是 `ORDER BY` 的前缀，单独指定可以缩小索引体积
+- 稀疏索引每 8192 行记一条，10 亿行的索引只有几 MB，常驻内存
+- 查询通过二分索引定位 granule，跳过不可能命中的数据块，`EXPLAIN indexes = 1` 能看到跳过比例
+- 排序键设计四原则：常用过滤列在前、低基数在前、时间在后、总数控制在 3~5 列
+- 低基数列在前不只利于跳过，还能显著提升压缩率
+- 排序键建表后基本改不了，设计前必须先统计真实查询模式
+- 下一章讲分区与 TTL，它是比索引更粗粒度但更暴力的过滤手段 →

@@ -1,8 +1,24 @@
-export type Language = 'python' | 'go' | 'java' | 'grafana' | 'rag' | 'langchain' | 'dify' | 'k8s' | 'rust';
+export type Language =
+  | 'python'
+  | 'go'
+  | 'java'
+  | 'rust'
+  | 'typescript'
+  | 'grafana'
+  | 'rag'
+  | 'langchain'
+  | 'dify'
+  | 'k8s'
+  | 'mysql'
+  | 'redis'
+  | 'mongodb'
+  | 'clickhouse'
+  | 'kafka';
 
-// 可在 Docker 沙箱中执行的“编程语言”。Grafana 等以配置（YAML/JSON/PromQL 等）
-// 为主，不在沙箱中执行；Rust 用 rustc 单文件编译后运行（仅标准库可用）。
-export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust';
+// 可在 Docker 沙箱中执行的“编程语言”。Grafana、数据库与消息队列等以配置/命令
+// （YAML/SQL/CLI）为主，不在沙箱中执行；Rust 用 rustc 单文件编译后运行；
+// TypeScript 先 tsc --strict 类型检查再用 node --experimental-transform-types 运行。
+export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust' | 'typescript';
 
 export type ExecuteRequest = {
   language: Language;
@@ -45,4 +61,10 @@ export const LANG_META: Record<Language, { label: string; color: string; emoji: 
   dify: { label: 'Dify', color: 'bg-pink-500/10 text-pink-600 dark:text-pink-300', emoji: '🧩' },
   k8s: { label: 'Kubernetes', color: 'bg-sky-500/10 text-sky-600 dark:text-sky-300', emoji: '☸️' },
   rust: { label: 'Rust', color: 'bg-red-500/10 text-red-600 dark:text-red-300', emoji: '🦀' },
+  typescript: { label: 'TypeScript', color: 'bg-blue-600/10 text-blue-700 dark:text-blue-300', emoji: '📘' },
+  mysql: { label: 'MySQL', color: 'bg-teal-500/10 text-teal-600 dark:text-teal-300', emoji: '🐬' },
+  redis: { label: 'Redis', color: 'bg-rose-500/10 text-rose-600 dark:text-rose-300', emoji: '⚡' },
+  mongodb: { label: 'MongoDB', color: 'bg-green-500/10 text-green-600 dark:text-green-300', emoji: '🍃' },
+  clickhouse: { label: 'ClickHouse', color: 'bg-amber-500/10 text-amber-600 dark:text-amber-300', emoji: '🧮' },
+  kafka: { label: 'Kafka', color: 'bg-slate-500/10 text-slate-600 dark:text-slate-300', emoji: '🌊' },
 };

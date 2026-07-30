@@ -1,0 +1,362 @@
+---
+title: 库、集合与文档 CRUD
+order: 3
+description: insert / find / update / delete 四类基本操作，以及 _id 与 ObjectId 的原理
+---
+
+# 库、集合与文档 CRUD
+
+这一章是 MongoDB 的「SELECT / INSERT / UPDATE / DELETE」。表面上很简单，但有三个地方和 SQL 差别巨大，值得慢慢读：写操作的返回值含义、更新时的「替换 vs 修改」陷阱、以及 `_id` 到底是什么。
+
+## 1. 库与集合的生命周期
+
+### 1.1 惰性创建
+
+```js
+use community          // 只是切换上下文
+db.posts.insertOne({ title: "hello" })   // 这一刻，库和集合才真正被创建
+```
+
+和 MySQL 必须先 `CREATE DATABASE` / `CREATE TABLE` 不同，MongoDB 不需要预先声明。这带来一个副作用：**集合名写错不会报错，只会悄悄多出一个新集合**。
+
+```js
+db.userss.insertOne({ username: "typo" })   // 成功了，但数据进了错的集合
+show collections
+```
+
+```text
+posts
+users
+userss
+```
+
+### 1.2 显式创建集合
+
+有些场景需要显式创建，因为要传参数：
+
+```js
+// 定长集合（capped）：写满后覆盖最老的文档，常用于日志
+db.createCollection("logs", { capped: true, size: 1048576, max: 1000 })
+
+// 时间序列集合（5.0+），存监控指标非常省空间
+db.createCollection("metrics", {
+  timeseries: { timeField: "ts", metaField: "sensorId", granularity: "seconds" }
+})
+```
+
+删除操作：
+
+```js
+db.userss.drop()        // 删集合，返回 true
+db.dropDatabase()       // 删当前整个库
+```
+
+<Callout type="warn" title="drop 没有二次确认">
+`db.collection.drop()` 立即生效、无事务保护、无回收站。生产环境里最好先 `db.collection.renameCollection("xxx_deleted_20240601")` 放几天再删。
+</Callout>
+
+## 2. 插入（Create）
+
+### 2.1 insertOne
+
+```js
+db.users.insertOne({
+  username: "dave",
+  email: "dave@example.com",
+  age: 41,
+  profile: { city: "Shenzhen", bio: "DBA" },
+  tags: ["mysql", "mongodb"],
+  stats: { posts: 0, followers: 0 },
+  createdAt: new Date()
+})
+```
+
+```json
+{
+  "acknowledged": true,
+  "insertedId": ObjectId("665f1a2b3c4d5e6f70819204")
+}
+```
+
+`acknowledged: true` 表示服务端确认了这次写入（受写关注 `w` 影响，详见第 14 章）。
+
+### 2.2 insertMany 与有序性
+
+```js
+db.posts.insertMany([
+  { _id: 1, title: "MongoDB 入门", authorId: "alice", views: 120 },
+  { _id: 2, title: "索引原理",     authorId: "bob",   views: 340 },
+  { _id: 1, title: "重复 id",      authorId: "carol", views: 0   },
+  { _id: 3, title: "聚合管道",     authorId: "alice", views: 88  }
+])
+```
+
+第三条 `_id` 重复，会报错：
+
+```text
+MongoBulkWriteError: E11000 duplicate key error collection: community.posts index: _id_ dup key: { _id: 1 }
+Result: nInserted: 2
+```
+
+注意 **`nInserted: 2`**——前两条已经写进去了，第四条没有执行。这是因为 `insertMany` 默认是**有序**的（`ordered: true`），遇错即停。
+
+如果希望「跳过错的、继续插剩下的」：
+
+```js
+db.posts.insertMany([...], { ordered: false })
+```
+
+无序模式下 MongoDB 会尝试全部插入，最后一并报告哪些失败了，而且可以并行执行，吞吐更高。
+
+<Callout type="tip" title="批量导入用 ordered false">
+从外部导数据时，几乎总是应该用 `ordered: false`：一条脏数据不会阻断整批，而且性能更好。只有当文档之间存在顺序依赖时才需要有序。
+</Callout>
+
+## 3. 查询（Read）
+
+### 3.1 find 与 findOne
+
+```js
+db.users.find()                              // 全部（默认返回前 20 条，输入 it 翻页）
+db.users.find({ age: 28 })                   // 等值
+db.users.findOne({ username: "alice" })      // 返回单个文档而非游标
+db.users.find({ "profile.city": "Beijing" }) // 点号访问内嵌字段
+db.users.find({ tags: "mongodb" })           // 数组字段：匹配「包含该元素」
+```
+
+对照 SQL：
+
+| SQL | MongoDB |
+|---|---|
+| `SELECT * FROM users` | `db.users.find()` |
+| `SELECT * FROM users WHERE age = 28` | `db.users.find({ age: 28 })` |
+| `SELECT username, age FROM users` | `db.users.find({}, { username: 1, age: 1, _id: 0 })` |
+| `SELECT COUNT(*) FROM users` | `db.users.countDocuments()` |
+| `SELECT DISTINCT city FROM users` | `db.users.distinct("profile.city")` |
+
+### 3.2 find 返回的是游标
+
+这是和 SQL 客户端最大的心智差异：`find()` **不会**立刻把所有数据拉到本地，它返回一个游标（cursor），按批（默认首批 101 个文档）懒加载。
+
+```js
+const cur = db.posts.find({ views: { $gt: 100 } })
+cur.hasNext()      // true
+cur.next()         // 取一个文档
+cur.toArray()      // 取剩下的全部，变成数组（大集合慎用！）
+cur.forEach(doc => print(doc.title))
+```
+
+```js
+// 游标链式方法
+db.posts.find().sort({ views: -1 }).skip(10).limit(5)
+```
+
+<Callout type="warn" title="toArray 会把整个结果集拉进内存">
+在一个千万级集合上执行 `db.posts.find().toArray()`，mongosh 进程会直接 OOM。养成习惯：探索性查询一律加 `.limit(10)`，遍历大集合用 `forEach` 或驱动的流式接口。
+</Callout>
+
+### 3.3 计数的三种方式
+
+```js
+db.users.countDocuments()                        // 精确，会真的扫描/走索引
+db.users.countDocuments({ age: { $gte: 30 } })   // 带条件的精确计数
+db.users.estimatedDocumentCount()                // 读元数据，O(1)，但不接受条件且分片下可能不准
+```
+
+<Callout type="info" title="count 已废弃">
+老教程里的 `db.collection.count()` 在新版本中已被废弃，因为它在分片集群、孤儿文档场景下会给出错误结果。请统一用 `countDocuments()` 与 `estimatedDocumentCount()`。
+</Callout>
+
+## 4. 更新（Update）
+
+### 4.1 updateOne 与更新操作符
+
+```js
+db.users.updateOne(
+  { username: "alice" },                     // filter：改谁
+  { $set: { "profile.city": "Hangzhou" },    // update：怎么改
+    $inc: { "stats.posts": 1 } }
+)
+```
+
+```json
+{
+  "acknowledged": true,
+  "matchedCount": 1,
+  "modifiedCount": 1,
+  "upsertedId": null
+}
+```
+
+`matchedCount` 是匹配到几条，`modifiedCount` 是**实际发生变化**几条。如果把 city 改成和原来一样的值，matched 是 1 但 modified 是 0——排查「更新没生效」时这两个数字要分开看。
+
+### 4.2 最危险的坑：忘记 $set
+
+```js
+// 错误！这会把整个文档替换成只有一个 city 字段的文档
+db.users.replaceOne({ username: "alice" }, { "profile.city": "Hangzhou" })
+```
+
+`updateOne` 在 5.0 之后如果第二个参数不含任何更新操作符会直接报错保护你：
+
+```text
+MongoInvalidArgumentError: Update document requires atomic operators
+```
+
+但 `replaceOne` 就是真的替换。曾经有大量数据事故来源于此：以为在改一个字段，实际上把文档其余部分全删了。
+
+<Callout type="warn" title="区分 update 和 replace">
+`updateOne` 传的第二个参数必须是「操作符文档」，形如带 `$set` 的对象；`replaceOne` 传的是「完整新文档」。看到没有美元符号开头的更新参数，就要警觉。
+</Callout>
+
+### 4.3 updateMany 与 upsert
+
+```js
+// 批量：把所有北京用户打上标签
+db.users.updateMany(
+  { "profile.city": "Beijing" },
+  { $addToSet: { tags: "beijing" } }
+)
+```
+
+```json
+{ "acknowledged": true, "matchedCount": 2, "modifiedCount": 2, "upsertedId": null }
+```
+
+```js
+// upsert：存在就更新，不存在就插入
+db.stats.updateOne(
+  { date: "2024-06-01" },
+  { $inc: { pv: 1 } },
+  { upsert: true }
+)
+```
+
+首次执行返回：
+
+```json
+{
+  "acknowledged": true,
+  "matchedCount": 0,
+  "modifiedCount": 0,
+  "upsertedId": ObjectId("665f1a2b3c4d5e6f70819210")
+}
+```
+
+新文档会同时包含 filter 里的等值条件字段（`date`）和更新的结果（`pv: 1`）。这个特性让 upsert 成为做计数器、幂等写入的利器。
+
+### 4.4 findOneAndUpdate
+
+需要拿到被修改的文档时用它，它是原子的：
+
+```js
+db.posts.findOneAndUpdate(
+  { _id: 1 },
+  { $inc: { views: 1 } },
+  { returnDocument: "after" }     // "before"（默认）返回旧文档
+)
+```
+
+```json
+{ "_id": 1, "title": "MongoDB 入门", "authorId": "alice", "views": 121 }
+```
+
+这相当于 SQL 里 `UPDATE ... RETURNING`，在实现「原子获取并占用一个任务」这类队列语义时非常有用。
+
+## 5. 删除（Delete）
+
+```js
+db.posts.deleteOne({ _id: 3 })
+db.posts.deleteMany({ views: { $lt: 10 } })
+db.posts.deleteMany({})            // 清空集合（但保留索引定义）
+```
+
+```json
+{ "acknowledged": true, "deletedCount": 1 }
+```
+
+| 目的 | 命令 | 索引是否保留 | 速度 |
+|---|---|---|---|
+| 删部分文档 | `deleteMany(filter)` | 是 | 逐条，慢 |
+| 清空集合 | `deleteMany({})` | 是 | 逐条，很慢 |
+| 清空并重建 | `drop()` | 否 | 瞬间 |
+
+<Callout type="tip" title="清空大集合用 drop 而不是 deleteMany">
+`deleteMany` 要逐条写 oplog，删 1000 万条可能耗时几十分钟并把复制延迟拉爆。如果确实要清空，`drop()` 后重建索引通常快几个数量级。
+</Callout>
+
+## 6. _id 与 ObjectId
+
+### 6.1 _id 的三条规则
+
+1. 每个文档**必须**有 `_id`，不写则由驱动自动生成
+2. `_id` 在集合内唯一，且自动带有一个名为 `_id_` 的唯一索引
+3. `_id` **不可修改**，想改只能删了重插
+
+`_id` 可以是任何 BSON 类型：数字、字符串、甚至内嵌文档。用业务主键当 `_id` 是完全合法的做法：
+
+```js
+db.follows.insertOne({
+  _id: { follower: "alice", followee: "bob" },   // 复合主键，天然防重复关注
+  createdAt: new Date()
+})
+```
+
+### 6.2 ObjectId 的 12 字节结构
+
+默认生成的 ObjectId 是 12 字节，十六进制打印成 24 个字符：
+
+```text
+  665f1a2b      3c4d5e6f70      819204
+ ┌────────┐   ┌──────────┐   ┌────────┐
+ │ 4 字节  │   │  5 字节   │   │ 3 字节  │
+ │ 时间戳  │   │ 随机值    │   │ 自增计数│
+ │ (秒)   │   │ (进程唯一)│   │        │
+ └────────┘   └──────────┘   └────────┘
+```
+
+因此可以从 ObjectId 反推创建时间，也可以按 `_id` 排序近似按时间排序：
+
+```js
+const id = ObjectId("665f1a2b3c4d5e6f70819204")
+id.getTimestamp()
+```
+
+```text
+ISODate("2024-06-04T09:31:23.000Z")
+```
+
+```js
+// 查 2024-06-01 之后创建的文档，不需要额外的 createdAt 索引
+db.posts.find({ _id: { $gt: ObjectId.createFromTime(new Date("2024-06-01") / 1000) } })
+```
+
+### 6.3 对比 MySQL 自增主键
+
+| 维度 | MySQL AUTO_INCREMENT | MongoDB ObjectId |
+|---|---|---|
+| 生成方 | 数据库服务端 | **客户端驱动** |
+| 是否需要往返 | 需要（插入后才知道 id） | 不需要，插入前就有 id |
+| 分布式唯一 | 需要额外机制 | 天然唯一 |
+| 有序性 | 严格递增 | 秒级近似递增 |
+| 长度 | 8 字节 | 12 字节 |
+
+客户端生成是一个很实用的性质：你可以先创建 ObjectId、构造好一整棵对象树的引用关系，最后一次性批量写入。
+
+<Callout type="warn" title="ObjectId 递增导致的写热点">
+因为高位是时间戳，连续插入的 ObjectId 都落在 B 树最右侧，索引写入集中在同一批页上。单机没问题，但在分片集群里用 `_id` 做**范围分片键**会造成所有写入打到同一个分片。第 17 章会讲怎么用哈希分片键解决。
+</Callout>
+
+<Callout type="exercise" title="练习">
+在 `community` 库上完成：一、用 `insertMany` 一次插入 5 篇帖子，故意让其中两篇 `_id` 重复，分别用有序和无序模式执行，对比 `nInserted`；二、用 `findOneAndUpdate` 实现「阅读数加一并返回新值」；三、用 `updateOne` 配合 `upsert` 实现按日期累计 PV 的计数器，连续执行三次，观察 `upsertedId` 从有值变成 null；四、取任意一个 ObjectId，用 `getTimestamp()` 打印它的创建时间。
+</Callout>
+
+## 小结
+
+- 库和集合惰性创建，集合名拼错不会报错，注意核对
+- `insertMany` 默认有序、遇错即停，批量导入应显式设为无序
+- `find()` 返回游标而非结果集，大集合上禁用 `toArray()`
+- `updateOne` 要求带更新操作符，`replaceOne` 会整体替换，务必分清
+- upsert 是实现幂等写入与计数器的标准手法
+- `_id` 必存在、唯一、不可改；ObjectId 由客户端生成，前 4 字节是时间戳
+- 下一章展开查询操作符，把 `find` 的过滤能力用满 →

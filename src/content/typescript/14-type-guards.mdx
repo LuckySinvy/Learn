@@ -1,0 +1,290 @@
+---
+title: 类型守卫与类型收窄
+order: 14
+description: 用类型谓词、断言函数、as const 与穷尽性检查，让运行时判断与编译期类型保持一致
+---
+
+# 类型守卫与类型收窄
+
+TypeScript 的类型只存在于编译期，运行时全部被抹掉。可现实中我们拿到的数据往往是「不确定的」：JSON 解析结果、第三方回调参数、`catch` 到的异常。这时就需要**在运行时做检查，并让编译器知道检查通过之后类型变窄了**。
+
+这个「让编译器跟着运行时判断走」的机制，叫**类型收窄（narrowing）**；帮助它收窄的代码，叫**类型守卫（type guard）**。
+
+## 1. 编译器自带的收窄
+
+很多常见写法，TS 无需任何额外声明就能理解。
+
+### 1.1 typeof 守卫
+
+```ts
+function len(x: string | number[]): number {
+  if (typeof x === "string") return x.length;   // 这里 x 是 string
+  return x.length;                               // 这里 x 是 number[]
+}
+```
+
+### 1.2 instanceof 守卫
+
+```ts
+function fmt(d: Date | string): string {
+  return d instanceof Date ? d.toISOString() : d;
+}
+```
+
+### 1.3 in 操作符守卫
+
+```ts
+type Cat = { meow(): void };
+type Dog = { bark(): void };
+
+function speak(a: Cat | Dog): void {
+  if ("meow" in a) a.meow();
+  else a.bark();
+}
+```
+
+### 1.4 真值与判等收窄
+
+`if (x)`、`x !== null`、`x === "a"` 都会参与收窄。特别地，对**可辨识联合**用 `switch` 判断标签字段，是最常用的收窄方式。
+
+<Callout type="warn" title="真值收窄的经典陷阱">
+`if (x)` 对 `string | undefined` 会同时排除掉空字符串 `""`，对 `number | undefined` 会同时排除掉 `0`。想只排除 `undefined`，请写 `if (x !== undefined)`。这个坑在处理配置项和表单默认值时非常高频。
+</Callout>
+
+## 2. 类型谓词：自定义守卫
+
+内置守卫覆盖不了所有场景，比如「判断这个 `unknown` 是不是我想要的对象结构」。这时可以写一个返回 `boolean` 的函数，并把返回类型标注为 `参数名 is 类型`：
+
+```ts
+function isString(v: unknown): v is string {
+  return typeof v === "string";
+}
+```
+
+`v is string` 就是**类型谓词（type predicate）**。它告诉编译器：这个函数返回 `true` 时，实参就可以被当作 `string`。
+
+<Playground
+  language="typescript"
+  id="ts-14-predicate"
+  title="类型谓词"
+  code={`type User = { kind: "user"; name: string; age: number };
+
+function isUser(v: unknown): v is User {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as Record<string, unknown>;
+  return o.kind === "user" && typeof o.name === "string" && typeof o.age === "number";
+}
+
+const raw: unknown = JSON.parse('{"kind":"user","name":"Ada","age":36}');
+
+if (isUser(raw)) {
+  // 这里 raw 被收窄成 User，可以放心访问属性
+  console.log("合法用户:", raw.name, raw.age);
+} else {
+  console.log("数据非法");
+}
+
+const bad: unknown = JSON.parse('{"kind":"user","name":"Bob"}');
+console.log("bad 是 User 吗:", isUser(bad));
+
+// 谓词函数配合数组过滤，能把 (T | null)[] 变成 T[]
+function isNotNull<T>(v: T | null | undefined): v is T {
+  return v !== null && v !== undefined;
+}
+const mixed: (string | null)[] = ["a", null, "b", null];
+const clean: string[] = mixed.filter(isNotNull);
+console.log("过滤后:", JSON.stringify(clean), "长度", clean.length);`}
+/>
+
+<Callout type="warn" title="类型谓词是「无条件信任」">
+编译器不会验证谓词函数的实现是否真的检查了这些字段。如果你写 `function isUser(v: unknown): v is User { return true; }`，编译能过，运行时会炸。类型谓词的正确性由你负责，所以谓词函数应该短小、直白、有测试。
+</Callout>
+
+## 3. 断言函数：`asserts x is T`
+
+有时我们不想用 `if` 分支，而希望「不满足就直接抛错」。这就是**断言函数**：
+
+```ts
+function assertIsString(v: unknown): asserts v is string {
+  if (typeof v !== "string") throw new TypeError("expected string");
+}
+```
+
+调用之后，**从调用点往下**变量就被收窄了：
+
+```ts
+function shout(v: unknown): string {
+  assertIsString(v);
+  return v.toUpperCase();   // 这里 v 已经是 string
+}
+```
+
+还有一种不带 `is` 的形式 `asserts v`，表示「断言 v 为真值」，常用于实现 `invariant`。
+
+<Playground
+  language="typescript"
+  id="ts-14-assert"
+  title="断言函数与不变量"
+  code={`function assertIsNumber(v: unknown): asserts v is number {
+  if (typeof v !== "number" || Number.isNaN(v)) {
+    throw new TypeError("期望 number，实际是 " + typeof v);
+  }
+}
+
+function invariant(cond: unknown, msg: string): asserts cond {
+  if (!cond) throw new Error("不变量被破坏: " + msg);
+}
+
+function double(v: unknown): number {
+  assertIsNumber(v);
+  return v * 2;    // v 已收窄为 number
+}
+
+console.log("double(21) =", double(21));
+
+try {
+  double("21");
+} catch (e) {
+  console.log("捕获:", (e as Error).message);
+}
+
+function head<T>(arr: T[]): T {
+  invariant(arr.length > 0, "数组不能为空");
+  const first = arr[0];
+  invariant(first !== undefined, "首元素存在");
+  return first;
+}
+console.log("head:", head([10, 20, 30]));
+
+try {
+  head<number>([]);
+} catch (e) {
+  console.log("捕获:", (e as Error).message);
+}`}
+/>
+
+<Callout type="warn" title="断言函数必须显式标注">
+断言函数只能被赋给**有显式类型注解**的标识符。写成 `const assertIsString = (v: unknown): asserts v is string => {...}` 会报错「断言的调用目标必须具有显式类型注释」。老老实实用 `function` 声明最省事。
+</Callout>
+
+## 4. 类型断言与 `as const`
+
+### 4.1 `as` 断言
+
+`as T` 是「我比编译器更清楚」的声明，它**不做任何运行时检查**，只是让类型检查闭嘴。TS 只允许在两个类型「有重叠」时断言，否则要走 `as unknown as T` 双重断言。
+
+原则：`as` 的使用应该被限制在**类型系统边界**——解析外部数据的那一层、和无类型库交互的那一层。业务代码里出现 `as`，往往说明类型建模有问题。
+
+### 4.2 `as const`
+
+`as const` 完全不同，它是**常量断言**，作用是让字面量保持最窄的类型，并递归加上 `readonly`：
+
+```ts
+const a = "up";                      // 类型 string
+const b = "up" as const;             // 类型 "up"
+
+const arr1 = [1, 2, 3];              // number[]
+const arr2 = [1, 2, 3] as const;     // readonly [1, 2, 3]
+
+const cfg = { mode: "dark" } as const;  // { readonly mode: "dark" }
+```
+
+它在定义「枚举替代品」和「配置常量」时特别有用，因为可以用 `typeof` 反推出联合类型。
+
+## 5. `unknown` 与 `never` 的正确用法
+
+| 类型 | 含义 | 什么时候用 |
+|---|---|---|
+| `any` | 关闭类型检查 | 尽量不用 |
+| `unknown` | 未知，用之前必须先收窄 | 所有外部输入的入口 |
+| `never` | 不可能存在的值 | 穷尽性检查、永不返回的函数 |
+
+`unknown` 是 `any` 的安全替代品：任何值都能赋给 `unknown`，但 `unknown` 不能直接使用，必须先经过守卫。把 `JSON.parse`、`catch` 参数、消息队列 payload 统统当作 `unknown`，是写健壮 TS 代码的第一原则。
+
+`never` 是空类型，没有任何值属于它。它最重要的用途是**穷尽性检查**：当一个联合的所有分支都被处理完，剩下的类型就是 `never`；如果以后有人往联合里加了新成员，`never` 处就会立刻报错。
+
+<Playground
+  language="typescript"
+  id="ts-14-exhaustive"
+  title="as const 与穷尽性检查"
+  code={`const MODES = ["idle", "running", "done"] as const;
+type Mode = typeof MODES[number];   // "idle" | "running" | "done"
+
+type Shape =
+  | { kind: "circle"; r: number }
+  | { kind: "rect"; w: number; h: number }
+  | { kind: "square"; side: number };
+
+function assertNever(x: never): never {
+  throw new Error("未处理的分支: " + JSON.stringify(x));
+}
+
+function area(s: Shape): number {
+  switch (s.kind) {
+    case "circle":
+      return Math.PI * s.r * s.r;
+    case "rect":
+      return s.w * s.h;
+    case "square":
+      return s.side * s.side;
+    default:
+      // 三个分支都处理了，这里 s 的类型是 never
+      return assertNever(s);
+  }
+}
+
+const shapes: Shape[] = [
+  { kind: "circle", r: 1 },
+  { kind: "rect", w: 2, h: 3 },
+  { kind: "square", side: 4 },
+];
+for (const s of shapes) {
+  console.log(s.kind, "面积 =", area(s).toFixed(2));
+}
+
+console.log("所有模式:", MODES.join(", "));
+const m: Mode = "running";
+console.log("当前模式:", m);
+
+// 运行时也做一次穷尽保护：伪造一个非法值
+const fake = { kind: "triangle", base: 1 } as unknown as Shape;
+try {
+  area(fake);
+} catch (e) {
+  console.log("捕获:", (e as Error).message);
+}`}
+/>
+
+<Callout type="tip" title="assertNever 是重构的安全网">
+把 `assertNever` 放进每个 `switch` 的 `default`，以后任何人往联合类型里加成员，编译器都会精确地指出所有需要补充分支的位置。这是 TS 相比动态语言最实在的收益之一。
+</Callout>
+
+## 6. 收窄失效的常见原因
+
+1. **回调里的收窄会失效**。收窄结果在闭包中可能被认为已过期，尤其是 `let` 变量。用 `const` 保存收窄后的值最稳妥。
+2. **可选属性访问链**。`obj.a.b` 收窄了 `obj.a`，但如果中途调用了函数，编译器会保守地重置收窄。
+3. **索引访问不收窄**。`arr[i]` 每次访问对编译器来说都是新表达式，先存进 `const` 再判断。
+
+```ts
+const list: (string | null)[] = ["x", null];
+// 不推荐：编译器不保证 list[0] 两次访问一致
+// if (list[0] !== null) console.log(list[0].length);
+
+const first = list[0];
+if (first !== null && first !== undefined) console.log(first.length);
+```
+
+<Callout type="exercise" title="练习">
+1. 写一个 `isRecord(v: unknown): v is Record<string, unknown>` 守卫，并用它安全地读取 `JSON.parse` 的结果。
+2. 给一个 `type Result = { ok: true; value: number } | { ok: false; error: string }` 写处理函数，用 `assertNever` 保证穷尽。
+3. 把 `MODES` 换成一个对象常量 `as const`，用 `typeof OBJ[keyof typeof OBJ]` 推出值的联合类型，体会它和数组写法的区别。
+</Callout>
+
+## 小结
+
+- `typeof`/`instanceof`/`in`/判等 是编译器自带的收窄手段
+- 类型谓词 `v is T` 自定义守卫；断言函数 `asserts v is T` 不满足就抛错
+- 谓词与断言的**正确性由开发者保证**，编译器不会验证实现
+- `as` 只关闭检查、不做运行时转换；`as const` 是保留字面量的常量断言
+- 外部输入一律用 `unknown` 接住；用 `never` + `assertNever` 做穷尽性检查
+- 下一章讲模块系统与声明文件 →

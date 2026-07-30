@@ -1,0 +1,385 @@
+---
+title: 对象类型与接口
+order: 4
+description: 对象类型的声明、interface 与 type 的取舍、可选属性、readonly、索引签名、接口继承与声明合并
+---
+
+# 对象类型与接口
+
+JavaScript 里几乎一切都是对象，因此**描述对象的形状**是 TypeScript 最核心的工作。这一章讲清楚三种描述方式（内联、`interface`、`type`）、四种修饰手段（可选、只读、索引签名、继承），以及它们各自的适用场景。
+
+## 1. 三种写法
+
+### 1.1 内联对象类型
+
+直接把形状写在注解位置，适合一次性使用：
+
+```ts
+function print(user: { id: number; name: string }): void {
+  console.log(user.id + " " + user.name);
+}
+```
+
+属性之间用分号或逗号分隔都行，换行时可以省略分隔符。社区惯例是用分号。
+
+### 1.2 interface
+
+```ts
+interface User {
+  id: number;
+  name: string;
+}
+```
+
+### 1.3 type 别名
+
+```ts
+type User = {
+  id: number;
+  name: string;
+};
+```
+
+注意 `type` 后面有等号，末尾建议加分号；`interface` 后面直接跟花括号，不要加等号。
+
+## 2. interface 与 type 怎么选
+
+两者在描述对象形状时**几乎完全等价**，区别集中在能力范围和扩展方式上：
+
+| 能力 | `interface` | `type` |
+|---|---|---|
+| 描述对象形状 | 支持 | 支持 |
+| 描述联合类型 | 不支持 | 支持 |
+| 描述元组、原始类型别名 | 不支持 | 支持 |
+| 扩展 | `extends` | 交叉类型 `&` |
+| 同名声明合并 | **会自动合并** | 报错「重复标识符」 |
+| 映射类型、条件类型 | 不支持 | 支持 |
+| 报错信息 | 通常保留接口名，更易读 | 复杂类型会被展开，较冗长 |
+
+<Callout type="tip" title="实用选型规则">
+描述**对象或类的公共契约**时用 `interface`；需要联合、元组、映射、条件类型等类型运算时用 `type`。团队内保持一致比选哪个更重要。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-04-shapes"
+  title="三种对象类型写法"
+  code={`interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+type Point = {
+  x: number;
+  y: number;
+};
+
+function greet(u: User): string {
+  return "Hi, " + u.name + " (" + u.email + ")";
+}
+
+// 内联写法，适合一次性使用
+function distance(a: Point, b: { x: number; y: number }): number {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+const ada: User = { id: 1, name: "Ada", email: "ada@example.com" };
+console.log(greet(ada));
+console.log("距离 = " + distance({ x: 0, y: 0 }, { x: 3, y: 4 }));
+
+// 结构相同即兼容，不需要显式声明关系
+const somePoint = { x: 6, y: 8, label: "P" };
+console.log("到原点 = " + distance({ x: 0, y: 0 }, somePoint));`}
+  expectedOutput={`Hi, Ada (ada@example.com)\n距离 = 5\n到原点 = 10`}
+/>
+
+## 3. 可选属性
+
+属性名后加 `?` 表示可以不提供：
+
+```ts
+interface Config {
+  host: string;
+  port?: number;        // 类型实际是 number | undefined
+}
+```
+
+在 strict 模式下，读取可选属性得到的类型包含 `undefined`，必须处理后才能使用：
+
+```ts
+function url(c: Config): string {
+  const port = c.port ?? 80;      // 空值合并，只在 null/undefined 时取默认
+  return c.host + ":" + port;
+}
+```
+
+<Callout type="warn" title="?? 与 || 的区别">
+`||` 在左值为**任意假值**（`0`、`""`、`false`、`NaN`）时取右边，`??` 只在 `null` / `undefined` 时取右边。给 `port: 0` 或 `count: 0` 设默认值时用 `||` 会踩坑，默认优先用 `??`。
+</Callout>
+
+`?` 和 `| undefined` 也不完全一样：
+
+| 写法 | 可以省略这个键吗 | 可以显式传 undefined 吗 |
+|---|---|---|
+| `port?: number` | 可以 | 可以 |
+| `port: number \| undefined` | 不可以，必须写出来 | 可以 |
+
+后者用于「这个字段必须出现，但值可以是空」的场景，能防止漏写字段。
+
+## 4. readonly 属性
+
+`readonly` 阻止**重新赋值**该属性：
+
+```ts
+interface Account {
+  readonly id: string;
+  balance: number;
+}
+
+const acc: Account = { id: "A-1", balance: 100 };
+acc.balance = 200;    // 可以
+// acc.id = "A-2";    // 错误：无法分配到 id，因为它是只读属性
+```
+
+<Callout type="warn" title="readonly 是浅层的，且只在编译期">
+`readonly` 只保护这一层属性，嵌套对象内部依然可改。而且它完全是编译期概念，编译后消失，运行时没有任何保护——需要真正冻结请用 `Object.freeze`（也只冻结一层）。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-04-optional-readonly"
+  title="可选属性与 readonly"
+  code={`interface ServerConfig {
+  readonly id: string;
+  host: string;
+  port?: number;
+  tls?: boolean;
+}
+
+function toUrl(c: ServerConfig): string {
+  const scheme = c.tls === true ? "https" : "http";
+  const port = c.port ?? (c.tls === true ? 443 : 80);
+  return scheme + "://" + c.host + ":" + port;
+}
+
+const dev: ServerConfig = { id: "dev", host: "localhost", port: 3000 };
+const prod: ServerConfig = { id: "prod", host: "example.com", tls: true };
+
+console.log(toUrl(dev));
+console.log(toUrl(prod));
+
+dev.host = "127.0.0.1";     // 普通属性可改
+// dev.id = "x";            // 编译错误：id 是 readonly
+console.log(toUrl(dev));
+
+// ?? 与 || 的区别：配置项显式写了 0
+const configured: number | undefined = 0;
+console.log("用 ?? 得到 " + (configured ?? 8080));
+console.log("用 || 得到 " + (configured || 8080));`}
+  expectedOutput={`http://localhost:3000\nhttps://example.com:443\nhttp://127.0.0.1:3000\n用 ?? 得到 0\n用 || 得到 8080`}
+/>
+
+## 5. 索引签名
+
+当键名不固定（例如一个字典）时，用索引签名描述：
+
+```ts
+interface StringMap {
+  [key: string]: string;
+}
+
+const headers: StringMap = {};
+headers["Content-Type"] = "application/json";
+```
+
+索引签名的键类型只能是 `string`、`number`、`symbol` 或模板字面量类型。
+
+### 5.1 索引签名与具名属性共存
+
+同时存在时，**具名属性的类型必须能赋给索引签名的类型**：
+
+```ts
+interface Mixed {
+  [key: string]: string | number;
+  name: string;      // string 是 string | number 的子类型，OK
+  age: number;       // OK
+  // ok: boolean;    // 错误：boolean 不能赋给 string | number
+}
+```
+
+### 5.2 更推荐用 Record
+
+内置工具类型 `Record` 通常更简洁，而且能限定键的集合：
+
+```ts
+type Headers = Record<string, string>;
+type Scores = Record<"math" | "english", number>;   // 两个键都必须有
+```
+
+<Callout type="warn" title="索引签名会让读取变得不安全">
+`headers["nope"]` 在类型上是 `string`，运行时却是 `undefined`。这和数组越界是同一个问题，同样由 `noUncheckedIndexedAccess` 解决。处理外部数据时要格外小心。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-04-index-signature"
+  title="索引签名与 Record"
+  code={`interface CountMap {
+  [word: string]: number;
+}
+
+function countWords(text: string): CountMap {
+  const result: CountMap = {};
+  for (const word of text.split(" ")) {
+    const key = word.toLowerCase();
+    result[key] = (result[key] || 0) + 1;
+  }
+  return result;
+}
+
+const counts = countWords("the cat and the hat and the bat");
+console.log("the 出现 " + counts["the"] + " 次");
+console.log("and 出现 " + counts["and"] + " 次");
+console.log("不同单词 " + Object.keys(counts).length + " 个");
+
+// Record 限定键集合，漏写一个键就报错
+type Subject = "math" | "english";
+const scores: Record<Subject, number> = { math: 92, english: 85 };
+let total = 0;
+for (const key of Object.keys(scores) as Subject[]) {
+  total += scores[key];
+}
+console.log("平均分 = " + total / 2);`}
+  expectedOutput={`the 出现 3 次\nand 出现 2 次\n不同单词 5 个\n平均分 = 88.5`}
+/>
+
+## 6. 接口继承与声明合并
+
+### 6.1 extends
+
+```ts
+interface Animal {
+  name: string;
+}
+
+interface Dog extends Animal {
+  breed: string;
+}
+```
+
+一个接口可以同时继承多个接口：`interface A extends B, C {}`。用 `type` 表达同样的意思要靠交叉类型：
+
+```ts
+type Dog = Animal & { breed: string };
+```
+
+两者的差别在于**冲突处理**：`interface` 继承时如果属性类型不兼容会**立即报错**，而交叉类型会默默把冲突属性算成 `never`，问题被推迟到使用处才暴露。
+
+### 6.2 声明合并
+
+同名 `interface` 会自动合并成一个，这是 `interface` 独有的能力：
+
+```ts
+interface Window { title: string }
+interface Window { version: number }
+// 等价于 interface Window { title: string; version: number }
+```
+
+这在给第三方库或全局对象「打补丁」时非常有用（比如给 Express 的 `Request` 加一个 `user` 字段）。反过来说，在自己的业务代码里它也可能让人困惑——你以为接口定义在一处，实际被别的文件悄悄扩展了。
+
+<Playground
+  language="typescript"
+  id="ts-04-extends"
+  title="接口继承与声明合并"
+  code={`interface Animal {
+  name: string;
+  age: number;
+}
+
+interface Pet extends Animal {
+  owner: string;
+}
+
+// 同名接口自动合并
+interface Pet {
+  vaccinated: boolean;
+}
+
+function intro(p: Pet): string {
+  return p.name + "（" + p.age + " 岁），主人 " + p.owner +
+    "，" + (p.vaccinated ? "已接种" : "未接种");
+}
+
+const dog: Pet = { name: "旺财", age: 3, owner: "小明", vaccinated: true };
+console.log(intro(dog));
+
+// 多重继承
+interface Timestamped {
+  createdAt: string;
+}
+interface Record2 extends Animal, Timestamped {}
+
+const r: Record2 = { name: "小黑", age: 1, createdAt: "2024-01-01" };
+console.log(r.name + " 建档于 " + r.createdAt);
+
+// 用交叉类型表达同样的组合
+type Combined = Animal & Timestamped & { tag: string };
+const c: Combined = { name: "花花", age: 2, createdAt: "2024-05-01", tag: "cat" };
+console.log(c.tag + ": " + c.name);`}
+  expectedOutput={`旺财（3 岁），主人 小明，已接种\n小黑 建档于 2024-01-01\ncat: 花花`}
+/>
+
+## 7. 对象字面量的额外属性检查
+
+上一章提过这个细节，这里说清楚规则：**直接把对象字面量赋给一个有具体类型的位置时**，多余属性会报错；先赋给变量再传就不会。
+
+```ts
+interface Opts { debug?: boolean }
+
+// declare function run(o: Opts): void;
+// run({ debug: true, verbose: true });   // 错误：verbose 不存在于 Opts
+const o = { debug: true, verbose: true };
+// run(o);                                 // 通过：走结构化兼容规则
+```
+
+这个「不一致」是有意为之：字面量是**刚刚写出来的**，多余属性极可能是拼写错误（比如把 `debug` 写成 `debgu`），值得报错；而已有变量则可能来自别处、天然带更多字段，按结构化规则放行更实用。
+
+## 8. object、Object 与空对象类型
+
+这三个长得像的东西含义差别很大，是 TypeScript 里的经典混淆点：
+
+| 写法 | 含义 | 能接受什么 |
+|---|---|---|
+| `object` | 任意**非原始值** | 对象、数组、函数；不接受 number、string 等 |
+| `Object` | 全局 Object 接口 | 几乎所有值（原始值会被自动装箱） |
+| 空对象类型 | 「除 null 和 undefined 外的任何值」 | 数字、字符串也能通过 |
+
+最反直觉的是第三个：用一对空花括号写出来的类型**不表示「空对象」**，而表示「非空值」。所以下面的代码是合法的：
+
+```ts
+type Anything = {};
+const a: Anything = 42;        // 合法！
+const b: Anything = "hello";   // 合法！
+// const c: Anything = null;   // 不合法
+```
+
+想表达「一个不含任何已知属性的对象」，用 `Record<string, never>`；想表达「任意对象」，用 `object`；想表达「非空值」才用空花括号（内置的 `NonNullable` 就是这么实现的）。日常代码里，`Object` 基本没有使用场景。
+
+<Callout type="exercise" title="练习">
+1. 定义 `interface Book`，包含 `readonly isbn: string`、`title: string`、`author: string`、可选的 `pages?: number`；写一个 `summary(b: Book): string`，页数缺失时显示「页数未知」。
+2. 定义 `type Inventory = Record<string, number>` 表示库存，写一个 `restock(inv: Inventory, item: string, n: number): Inventory` 返回**新对象**（用展开运算符），不修改原对象。
+3. 试着用 `interface` 继承一个属性类型冲突的接口，再用交叉类型做同样的事，对比两者报错的时机与信息。
+</Callout>
+
+## 小结
+
+- 对象形状可以内联写、用 `interface`、或用 `type`；描述契约优先 `interface`，需要类型运算用 `type`
+- `?` 让属性可选，读取时类型带 `undefined`；默认值优先用 `??` 而不是 `||`
+- `readonly` 是浅层的编译期约束，运行时不生效
+- 索引签名描述动态键，`Record` 通常更简洁；索引读取默认不带 `undefined`，注意风险
+- `interface` 支持 `extends` 与同名声明合并；交叉类型 `&` 在冲突时更隐蔽
+- 对象字面量有额外属性检查，专门用来抓拼写错误
+- 下一章讲联合类型与类型收窄 →

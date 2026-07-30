@@ -6,7 +6,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const MAX_CODE_LEN = 50_000;
-const VALID_LANGS: Language[] = ['python', 'go', 'java', 'rust'];
+const VALID_LANGS: Language[] = ['python', 'go', 'java', 'rust', 'typescript'];
 
 // 简单限流：进程并发上限 5
 let inFlight = 0;
@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
 
   if (!body || typeof body.code !== 'string' || !VALID_LANGS.includes(body.language)) {
     return NextResponse.json(
-      { status: 'internal_error', stdout: '', stderr: '', exitCode: null, durationMs: 0, timedOut: false, message: 'language 必须是 python/go/java 且 code 必填' } satisfies ExecuteResponse,
+      { status: 'internal_error', stdout: '', stderr: '', exitCode: null, durationMs: 0, timedOut: false, message: 'language 必须是 python/go/java/rust/typescript 且 code 必填' } satisfies ExecuteResponse,
       { status: 400 },
     );
   }
@@ -71,6 +71,9 @@ export async function POST(req: NextRequest) {
         status = 'compile_error';
       } else if (body.language === 'rust' && /error(\[\d+]|[:,])/.test(result.stderr)) {
         // rustc 编译错误形如 `error[E0382]: ...` 或 `error: ...`
+        status = 'compile_error';
+      } else if (body.language === 'typescript' && /error TS\d+/.test(result.stderr)) {
+        // tsc 类型检查错误形如 `main.ts(1,7): error TS2322: ...`
         status = 'compile_error';
       } else {
         status = 'runtime_error';

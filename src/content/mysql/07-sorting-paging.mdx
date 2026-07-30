@@ -1,0 +1,176 @@
+---
+title: 排序、分页与去重
+order: 7
+description: ORDER BY、LIMIT/OFFSET、深分页问题与游标分页、DISTINCT 去重
+---
+
+# 排序、分页与去重
+
+「按时间倒序、每页 20 条」大概是后端最常写的查询。但当产品经理问「为什么第 5000 页打开要 8 秒」时，你就需要理解 LIMIT OFFSET 背后发生了什么。本章讲排序与分页的正确姿势，包括面试高频的深分页优化。
+
+## 1. ORDER BY
+
+```sql
+-- 单列排序：ASC 升序（默认）、DESC 降序
+SELECT id, name, price FROM products ORDER BY price DESC;
+
+-- 多列排序：先按第一列，相同时再按第二列
+SELECT * FROM orders ORDER BY status ASC, created_at DESC;
+
+-- 按表达式、别名排序
+SELECT name, price * stock AS inventory_value
+FROM products
+ORDER BY inventory_value DESC;
+```
+
+要点：
+
+- 多列排序时每列可以独立指定方向；
+- **不写 ORDER BY 时结果顺序没有任何保证**。InnoDB 常「看起来」按主键返回，但那只是执行计划的副产品，加个索引、改个条件顺序就变。需要顺序就显式 ORDER BY；
+- NULL 在升序时排最前、降序时排最后。想自定义：`ORDER BY col IS NULL, col`（先把非 NULL 的排前面）。
+
+### 1.1 排序的成本：filesort
+
+排序有两种实现：
+
+1. **利用索引有序性**：数据在 B+ 树里本来就按索引列有序，顺着读出来即免排序。EXPLAIN 的 Extra 列干净无 filesort。
+2. **filesort**：把结果集读进 sort buffer 内存排序，放不下就落磁盘临时文件归并。EXPLAIN 显示 `Using filesort`。
+
+```sql
+-- orders 有 idx_user_created (user_id, created_at)
+-- 这条查询可以利用索引直接有序输出，无 filesort：
+SELECT * FROM orders WHERE user_id = 1 ORDER BY created_at DESC;
+```
+
+filesort 不一定慢（小结果集内存排序很快），但大结果集排序是慢查询的主力来源之一。第 13、14 章会讲如何设计索引消除排序。
+
+## 2. LIMIT 分页
+
+```sql
+-- 取前 10 条
+SELECT id, name, price FROM products ORDER BY id LIMIT 10;
+
+-- 跳过 20 条取 10 条（第 3 页，每页 10 条）
+SELECT id, name, price FROM products ORDER BY id LIMIT 10 OFFSET 20;
+-- 等价旧写法：LIMIT 20, 10（先 offset 后 count，容易记反，建议用 OFFSET 语法）
+```
+
+<Callout type="warn" title="LIMIT 没有 ORDER BY 等于随机取样">
+`LIMIT 10` 不配 ORDER BY，返回哪 10 条完全由执行计划决定，两次执行可能不同。分页查询必须有确定性的 ORDER BY，且排序列组合要能唯一确定顺序（通常补上主键：`ORDER BY created_at DESC, id DESC`），否则排序值相同的行在翻页时可能重复或丢失。
+</Callout>
+
+## 3. 深分页问题
+
+```sql
+SELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 1000000;
+```
+
+这条语句的真实执行过程：**扫描并丢弃前 100 万行，再返回 20 行**。OFFSET 不是「跳到第 100 万行」，而是「读出来然后扔掉」。页码越深越慢，线性恶化。
+
+### 3.1 优化一：延迟关联（子查询先定位主键）
+
+```sql
+SELECT o.*
+FROM orders o
+JOIN (
+  SELECT id FROM orders ORDER BY id LIMIT 20 OFFSET 1000000
+) t ON o.id = t.id;
+```
+
+原理：子查询只在主键索引（或覆盖索引）上翻页，扫描的每行只有一个 id，不用回表取整行；定位到 20 个 id 后再回主表取完整数据。扫描量没变但**每行的成本大幅下降**，通常能快几倍到几十倍。
+
+### 3.2 优化二：游标分页（keyset pagination，推荐）
+
+不用页码，改用「上一页最后一条的排序值」作为游标：
+
+```sql
+-- 第一页
+SELECT id, order_no, created_at FROM orders
+ORDER BY id DESC LIMIT 20;
+
+-- 下一页：把上一页最后一条的 id 带回来
+SELECT id, order_no, created_at FROM orders
+WHERE id < 1000000        -- 上一页最后一条的 id
+ORDER BY id DESC LIMIT 20;
+```
+
+WHERE 条件直接在索引上定位起点，**无论翻到多深，成本都恒定**。这就是信息流「下拉加载更多」的标准实现。代价是不能随机跳页——所以产品上「无限滚动」和「游标分页」是天生一对。
+
+排序键不唯一时用复合游标：
+
+```sql
+-- 按 created_at 倒序，游标为 (last_created_at, last_id)
+SELECT * FROM orders
+WHERE created_at < '2026-07-01 12:00:00'
+   OR (created_at = '2026-07-01 12:00:00' AND id < 987)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+### 3.3 三种方案对比
+
+| 方案 | 深页性能 | 支持跳页 | 实现复杂度 |
+|---|---|---|---|
+| LIMIT OFFSET | 差（线性恶化） | 支持 | 最简单 |
+| 延迟关联 | 中（仍扫索引） | 支持 | 简单 |
+| 游标分页 | 优（恒定） | 不支持 | 中等 |
+
+## 4. DISTINCT 去重
+
+```sql
+-- 有多少个不同的下单用户
+SELECT DISTINCT user_id FROM orders;
+
+-- 多列 DISTINCT：按「列组合」去重，不是只对第一列
+SELECT DISTINCT user_id, status FROM orders;
+
+-- 统计去重数量
+SELECT COUNT(DISTINCT user_id) AS buyer_count FROM orders;
+```
+
+```text
++-------------+
+| buyer_count |
++-------------+
+|           3 |
++-------------+
+```
+
+注意：
+
+- `DISTINCT` 作用于**整个选择列表**，`SELECT DISTINCT a, b` 是对 (a,b) 组合去重。想「每个 a 取一行」是分组问题，用 GROUP BY（第 8 章）或窗口函数（第 11 章）；
+- DISTINCT 的实现和 GROUP BY 类似（去重需要排序或哈希），大数据量同样耗资源，能用索引就让它走索引；
+- `DISTINCT` 与 `ORDER BY` 同用时，排序列必须出现在选择列表里，否则 8.0 会报错。
+
+<Callout type="tip" title="需要去重时先想想为什么有重复">
+JOIN 后出现大量重复行，很多时候是关联条件不完整导致的「行数放大」，此时 DISTINCT 是掩盖问题而不是解决问题。先检查 JOIN 逻辑，再考虑去重。
+</Callout>
+
+## 5. 组合示例：订单列表页
+
+一个真实的订单列表接口 SQL 长这样：
+
+```sql
+SELECT id, order_no, status, total_amount, created_at
+FROM orders
+WHERE user_id = 1
+  AND status IN (1, 2, 3)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+配合索引 `idx_user_created (user_id, created_at)`：WHERE 用 user_id 定位、created_at 天然有序免 filesort。这种「条件列 + 排序列」的联合索引设计是第 13 章的核心内容。
+
+## 小结
+
+- 需要顺序就必须写 ORDER BY，分页排序键要能唯一确定顺序（补主键）
+- LIMIT OFFSET 深分页会扫描并丢弃前面所有行，页越深越慢
+- 优化深分页：延迟关联减小回表成本；游标分页成本恒定但不能跳页
+- DISTINCT 对列组合去重；大量重复先怀疑 JOIN 写错
+- 利用索引有序性可以消除 filesort，是排序优化的根本手段
+
+<Callout type="exercise" title="练习">
+1. 写出订单表「第 2 页、每页 2 条、按创建时间倒序」的三种实现：LIMIT OFFSET、延迟关联、游标分页。
+2. 造一张 100 万行的测试表（可用存储过程或 INSERT ... SELECT 自我复制），分别测试 OFFSET 0 与 OFFSET 900000 的耗时差异，再用游标分页对比。
+3. 用 `COUNT(DISTINCT user_id)` 统计 7 月份下过单的用户数。
+</Callout>

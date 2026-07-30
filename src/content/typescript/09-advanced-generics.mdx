@@ -1,0 +1,311 @@
+---
+title: 泛型进阶
+order: 9
+description: extends 约束、默认类型参数、多类型参数的关联、泛型在联合上的分发，以及常见泛型工具函数的写法
+---
+
+# 泛型进阶
+
+上一章的泛型参数是完全自由的——`T` 可以是任何类型。这带来了一个问题：函数体内部什么都不能对 `T` 做，因为编译器不知道它有什么能力。这一章讲怎么给类型参数**加约束**、**给默认值**、**建立多个参数之间的关联**，以及泛型遇到联合类型时的分发行为。
+
+## 1. extends 约束
+
+### 1.1 问题：裸类型参数太自由
+
+```ts
+function longest<T>(a: T, b: T): T {
+  // return a.length > b.length ? a : b;   // 错误：T 上不存在 length
+  return a;
+}
+```
+
+编译器是对的：如果有人传两个数字进来，`length` 就不存在。解决办法是**约束** `T` 必须具备某种结构：
+
+```ts
+function longest<T extends { length: number }>(a: T, b: T): T {
+  return a.length > b.length ? a : b;
+}
+
+longest("hello", "hi");        // 字符串有 length
+longest([1, 2], [1, 2, 3]);    // 数组有 length
+// longest(10, 20);            // 错误：number 没有 length
+```
+
+`T extends X` 读作「T 必须可以赋给 X」。约束之后，函数体内就能安全使用 X 上的成员，同时**返回值仍然保留了调用方传入的精确类型**——这正是泛型比 `(a: { length: number })` 强的地方。
+
+### 1.2 常见约束写法
+
+| 约束 | 含义 |
+|---|---|
+| `T extends string` | 必须是字符串或其字面量子类型 |
+| `T extends object` | 必须是对象（排除原始类型） |
+| `T extends unknown[]` | 必须是数组 |
+| `T extends (...args: any[]) => unknown` | 必须是函数 |
+| `K extends keyof T` | K 必须是 T 的某个键名 |
+
+最后一条是全场最实用的，它把两个类型参数**绑定**在一起。
+
+<Callout type="warn" title="约束会「收窄」传入值吗">
+不会。`T extends { length: number }` 只是准入门槛，函数体内 `T` 依然是「某个具有 length 的未知类型」，你不能凭空创造一个 `T` 的值（`return { length: 0 }` 会报错，因为调用方可能要的是 `string`）。约束限制的是「能传什么进来」，不是「T 是什么」。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-09-constraints"
+  title="extends 约束"
+  code={`// 约束为「有 length 的东西」
+function longest<T extends { length: number }>(a: T, b: T): T {
+  return a.length >= b.length ? a : b;
+}
+
+const s = longest("hello", "hi");        // 返回类型仍是 string
+const arr = longest([1, 2], [1, 2, 3]);  // 返回类型仍是 number[]
+console.log("更长的字符串大写 = " + s.toUpperCase());
+console.log("更长的数组求和 = " + arr.reduce((x, y) => x + y, 0));
+
+// K extends keyof T：把两个类型参数绑定起来
+interface User {
+  id: number;
+  name: string;
+  active: boolean;
+}
+
+function getProp<T, K extends keyof T>(obj: T, key: K): T[K] {
+  return obj[key];
+}
+
+const user: User = { id: 7, name: "Grace", active: true };
+const uid = getProp(user, "id");        // 推断为 number
+const uname = getProp(user, "name");    // 推断为 string
+console.log("id + 1 = " + (uid + 1));
+console.log("名字长度 = " + uname.length);
+// getProp(user, "email");   // 错误：email 不是 User 的键
+
+// 约束为函数
+function twice<T extends (n: number) => number>(fn: T, x: number): number {
+  return fn(fn(x));
+}
+console.log("翻倍两次 = " + twice((n) => n * 2, 3));`}
+  expectedOutput={`更长的字符串大写 = HELLO\n更长的数组求和 = 6\nid + 1 = 8\n名字长度 = 5\n翻倍两次 = 12`}
+/>
+
+## 2. 默认类型参数
+
+和函数参数的默认值一样，类型参数也能有默认值，写在约束之后：
+
+```ts
+interface ApiResponse<TData = unknown, TError = Error> {
+  ok: boolean;
+  data?: TData;
+  error?: TError;
+}
+
+type Simple = ApiResponse;              // TData = unknown, TError = Error
+type UserResp = ApiResponse<User>;      // 只覆盖第一个
+```
+
+默认类型参数让泛型 API「简单场景简单用，复杂场景可定制」。规则和函数默认值一致：**有默认值的参数必须排在没有默认值的后面**。
+
+## 3. 多类型参数的关联
+
+泛型真正的威力在于**表达多个位置之间的关系**。看一个改造对象某个字段的函数：
+
+```ts
+function withProp<T, K extends string, V>(
+  obj: T,
+  key: K,
+  value: V,
+): T & Record<K, V> {
+  return { ...obj, [key]: value } as T & Record<K, V>;
+}
+```
+
+返回类型精确地表达了「原对象 + 新增的这个键」。这类签名在写工具库时非常常见。
+
+<Playground
+  language="typescript"
+  id="ts-09-defaults"
+  title="默认类型参数与多参数关联"
+  code={`interface ApiResponse<TData = unknown, TError = string> {
+  ok: boolean;
+  data?: TData;
+  error?: TError;
+}
+
+function ok<T>(data: T): ApiResponse<T> {
+  return { ok: true, data };
+}
+function fail<T>(message: string): ApiResponse<T> {
+  return { ok: false, error: message };
+}
+
+const r1 = ok({ id: 1, name: "Ada" });
+const r2 = fail<number>("网络超时");
+
+console.log("r1.ok = " + r1.ok + ", 名字 = " + (r1.data !== undefined ? r1.data.name : "无"));
+console.log("r2.ok = " + r2.ok + ", 错误 = " + String(r2.error));
+
+// 用默认参数时可以完全不写尖括号
+const raw: ApiResponse = { ok: true, data: "任意内容" };
+console.log("raw.data 的类型是 unknown，需要收窄: " + (typeof raw.data === "string" ? raw.data : "非字符串"));
+
+// 多类型参数关联：合并两个对象，返回类型是二者的交叉
+function merge<A extends object, B extends object>(a: A, b: B): A & B {
+  return { ...a, ...b };
+}
+
+const merged = merge({ id: 1, name: "Ada" }, { active: true, score: 95 });
+console.log("合并后: id=" + merged.id + " name=" + merged.name +
+  " active=" + merged.active + " score=" + merged.score);
+
+// 键值都被类型参数捕获
+function entriesOf<T extends object>(obj: T): [string, unknown][] {
+  return Object.entries(obj);
+}
+for (const [k, v] of entriesOf({ a: 1, b: "two" })) {
+  console.log(k + " -> " + String(v));
+}`}
+  expectedOutput={`r1.ok = true, 名字 = Ada\nr2.ok = false, 错误 = 网络超时\nraw.data 的类型是 unknown，需要收窄: 任意内容\n合并后: id=1 name=Ada active=true score=95\na -> 1\nb -> two`}
+/>
+
+## 4. 泛型与联合：分发行为
+
+当一个类型参数被用在条件类型里，而实参是联合类型时，TypeScript 会**把联合拆开、逐个处理、再合并回去**，这叫分发（distribution）。完整的条件类型在第 11 章讲，这里先建立直觉：
+
+```ts
+type ToArray<T> = T extends unknown ? T[] : never;
+
+type A = ToArray<string>;            // string[]
+type B = ToArray<string | number>;   // string[] | number[]  ← 分发了
+```
+
+注意 `B` 不是 `(string | number)[]`。理解这一点，能解释很多「泛型工具类型结果和预期不一样」的困惑。
+
+想**关掉**分发，把类型参数用方括号包起来：
+
+```ts
+type ToArrayNoDist<T> = [T] extends [unknown] ? T[] : never;
+type C = ToArrayNoDist<string | number>;   // (string | number)[]
+```
+
+<Callout type="info" title="为什么默认要分发">
+因为绝大多数工具类型都希望「对联合的每个成员分别处理」。比如 `Exclude<"a" | "b" | "c", "a">` 要得到 `"b" | "c"`，就必须逐个成员判断。分发是默认行为，不分发才需要特殊写法。
+</Callout>
+
+## 5. 常见泛型工具函数
+
+下面这些函数在几乎每个项目里都会重新写一遍，是练习泛型的最佳素材。
+
+<Playground
+  language="typescript"
+  id="ts-09-utils"
+  title="手写常见泛型工具函数"
+  code={`// 1) pick：从对象中挑出若干键
+function pick<T extends object, K extends keyof T>(obj: T, keys: K[]): Pick<T, K> {
+  const out = {} as Pick<T, K>;
+  for (const k of keys) out[k] = obj[k];
+  return out;
+}
+
+// 2) groupBy：按键函数分组
+function groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]> {
+  const map = new Map<string, T[]>();
+  for (const item of items) {
+    const k = key(item);
+    const bucket = map.get(k);
+    if (bucket === undefined) map.set(k, [item]);
+    else bucket.push(item);
+  }
+  return map;
+}
+
+// 3) zip：把两个数组配对
+function zip<A, B>(as: A[], bs: B[]): [A, B][] {
+  const n = Math.min(as.length, bs.length);
+  const out: [A, B][] = [];
+  for (let i = 0; i < n; i++) out.push([as[i] as A, bs[i] as B]);
+  return out;
+}
+
+// 4) sortBy：按可比较的字段排序，返回新数组
+function sortBy<T>(items: T[], by: (item: T) => number): T[] {
+  return [...items].sort((x, y) => by(x) - by(y));
+}
+
+interface Student {
+  id: number;
+  name: string;
+  grade: string;
+  score: number;
+}
+
+const students: Student[] = [
+  { id: 1, name: "Ada", grade: "A", score: 95 },
+  { id: 2, name: "Alan", grade: "B", score: 82 },
+  { id: 3, name: "Grace", grade: "A", score: 91 },
+];
+
+const brief = pick(students[0] as Student, ["name", "score"]);
+console.log("pick: " + brief.name + " " + brief.score);
+
+const byGrade = groupBy(students, (s) => s.grade);
+for (const [g, list] of byGrade) {
+  console.log("等级 " + g + " 有 " + list.length + " 人");
+}
+
+const pairs = zip(["a", "b", "c"], [1, 2]);
+console.log("zip 结果长度 = " + pairs.length + "，第一对 = " + pairs[0]?.[0] + pairs[0]?.[1]);
+
+const sorted = sortBy(students, (s) => s.score);
+console.log("按分数升序: " + sorted.map((s) => s.name).join(" < "));`}
+  expectedOutput={`pick: Ada 95\n等级 A 有 2 人\n等级 B 有 1 人\nzip 结果长度 = 2，第一对 = a1\n按分数升序: Alan < Grace < Ada`}
+/>
+
+<Callout type="warn" title="不要滥用 as">
+上面 `pick` 里的 `{} as Pick<T, K>` 是一处必要的妥协：空对象在填充完成前确实不满足目标类型，编译器无法跟踪这个过程。这类断言应当**局部、可审阅**，并且函数对外的签名必须是准确的。如果一个函数需要三四处 `as` 才能通过检查，通常说明类型设计出了问题。
+</Callout>
+
+## 6. 泛型设计的几条经验
+
+1. **先写调用方，再写签名**。想清楚希望调用处推断出什么类型，再倒推签名。
+2. **约束要恰到好处**。约束太松，函数体没法用；约束太紧，调用方传不进来。
+3. **类型参数至少出现两次**。只出现一次的类型参数应该换成 `unknown`。
+4. **别怕显式指定**。推断失败时让调用方写 `fn<Foo>(...)` 完全合理，比设计一个扭曲的签名好。
+
+### 6.1 推断失败的三种常见原因
+
+遇到「推断结果不是我想要的」，八成是下面之一：
+
+| 现象 | 原因 | 对策 |
+|---|---|---|
+| 推断成 `never` | 没有任何实参能提供信息（如传空数组） | 显式指定类型参数 |
+| 推断成宽类型（`string` 而非字面量） | 类型参数没有约束，走了默认的拓宽规则 | 加 `T extends string` 约束，或调用处加 `as const` |
+| 推断成联合而非精确分支 | 多个参数位置提供了冲突的候选类型 | 调整参数顺序，或把其中一个位置改成非推断位置 |
+
+第二条特别常见。对比一下：
+
+```ts
+function pickA<T>(v: T): T { return v; }
+function pickB<T extends string>(v: T): T { return v; }
+
+const a = pickA("hello");    // string
+const b = pickB("hello");    // "hello"  ← 约束让它保留了字面量
+```
+
+加上 `extends string` 之后，编译器知道你关心的是字符串的**具体值**，于是不再拓宽。这个技巧在设计接受字面量键名的 API 时非常有用。
+
+<Callout type="exercise" title="练习">
+1. 写一个 `omit<T extends object, K extends keyof T>(obj: T, keys: K[]): Omit<T, K>`，与本章的 `pick` 互补。
+2. 写一个带默认类型参数的 `interface Paged<TItem, TCursor = string>`，包含 `items: TItem[]`、`nextCursor?: TCursor`，并写一个构造它的泛型函数。
+3. 验证分发行为：定义 `type Boxed<T> = T extends unknown ? { value: T } : never`，分别传入 `string` 和 `string | number`，把结果赋给具体变量看编译器是否接受。
+</Callout>
+
+## 小结
+
+- `T extends X` 给类型参数设准入门槛，同时保留调用方的精确类型
+- `K extends keyof T` 是把多个类型参数绑定起来的核心手法
+- 默认类型参数让泛型 API 兼顾易用与可定制，有默认值的必须排在后面
+- 泛型遇到联合会**分发**，用 `[T] extends [X]` 可以关掉
+- 手写 `pick` / `groupBy` / `zip` / `sortBy` 是练习泛型的最佳方式
+- 类型参数只出现一次说明不需要泛型；约束要松紧适度
+- 下一章讲 keyof、typeof、索引访问与 satisfies →

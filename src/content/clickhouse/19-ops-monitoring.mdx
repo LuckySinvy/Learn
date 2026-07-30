@@ -1,0 +1,215 @@
+---
+title: 运维与监控
+order: 19
+description: system 库常用表、内存与并发限制、mutation 代价、备份恢复与故障排查方法论
+---
+
+# 运维与监控
+
+会写查询只是第一步，让 ClickHouse 在生产里稳定跑、出问题能定位，才是真本事。这一章盘清 `system` 库里最有用的几张表、内存与并发的关键设置、mutation 的代价，以及备份恢复和排查方法论。
+
+## 1. system 库：你的运维仪表盘
+
+ClickHouse 把所有运行状态都暴露成 `system` 库的表。新人最常问"怎么看现在在跑什么、谁慢了"，答案都在这里。
+
+```sql
+-- 当前正在执行的查询（最常用！排查"谁在拖慢集群"）
+SELECT query_id, user, elapsed, read_rows, memory_usage, query
+FROM system.processes
+ORDER BY elapsed DESC
+LIMIT 10;
+
+-- 杀掉某个跑飞的查询
+KILL QUERY WHERE query_id = 'xxx';
+```
+
+| 表名 | 看什么 |
+|---|---|
+| `system.processes` | 当前正在跑的查询、耗时、内存、读行数 |
+| `system.query_log` | 历史查询记录（执行时间、读/写行数、异常） |
+| `system.query_thread_log` | 每个线程的执行细节 |
+| `system.merges` | 正在进行的 merge（磁盘/CPU 消耗） |
+| `system.mutations` | 正在进行的 mutation（ALTER UPDATE/DELETE） |
+| `system.replicas` | 各副本复制队列、延迟 |
+| `system.parts` | 每个 data part 的行数、字节、层级 |
+| `system.settings` | 所有可配置参数及当前默认值 |
+| `system.metrics` / `system.events` | 进程级计数器（实时指标，给监控采集） |
+| `system.asynchronous_metric_log` | 异步指标历史（CPU/内存/网络） |
+
+<Callout type="info" title="query_log 默认只在出错或慢查询时记">
+`system.query_log` 受 `log_queries` 和 `log_queries_min_type` 控制，默认记录 `QUERY_FINISH`/`EXCEPTION` 等。想全量审计需要调设置。排查问题时它比 `processes` 更可靠，因为进程表只显示"正在跑"的。
+</Callout>
+
+## 2. 内存限制：最容易踩的墙
+
+ClickHouse 是内存贪婪的引擎：GROUP BY、JOIN、排序、去重都会吃内存。关键设置：
+
+```sql
+-- 单查询内存上限（默认 0 = 用 max_server_memory_usage 的份额）
+SET max_memory_usage = 10000000000;          -- 10 GB
+
+-- 超过后是否落盘做"外部聚合/排序"（强烈建议开）
+SET max_bytes_before_external_group_by = 8000000000;   -- 8 GB 后 Group By 落盘
+SET max_bytes_before_external_sort = 8000000000;       -- 8 GB 后排序落盘
+
+-- 整个服务端的内存上限（防止 OOM 把机器拖死）
+-- 写在 users.xml 的 profiles 里，例如 max_server_memory_usage = 32 GB
+```
+
+```text
+GROUP BY 吃内存增长曲线：
+  数据量小 → 全在内存，最快
+  超过 max_bytes_before_external_group_by → 部分中间状态写磁盘（变慢但能跑）
+  超过 max_memory_usage → 查询报错 "Memory limit exceeded"
+  超过 max_server_memory_usage → 服务端自我保护，杀掉最耗内存的查询
+```
+
+<Callout type="warn" title="一定要设 external_group_by，否则大查询直接失败">
+没有 `max_bytes_before_external_group_by` 时，超内存的 GROUP BY 会直接抛 `Memory limit exceeded` 报错。设了之后它会像"外部归并排序"一样把中间状态溢出到磁盘，虽然慢但能跑完。经验值：设为 `max_memory_usage` 的 0.5~0.8 倍。
+</Callout>
+
+## 3. 并发与队列
+
+```sql
+-- 单节点同时执行的查询上限（默认 100）
+SET max_concurrent_queries = 100;
+
+-- 限制单用户并发，防止某个报表把集群打满
+-- 在 users.xml 的 quotas 里配置
+```
+
+突发大量查询时，超出的会排队还是报错？由 `max_concurrent_queries` 和资源调度决定。生产环境建议给不同业务配不同 `settings_profile` 和 `quotas`，把"即席 exploratory 查询"和"核心报表"隔离开。
+
+## 4. mutation 的代价：ALTER UPDATE/DELETE 不是免费的
+
+回忆第 4、7 章：ClickHouse 的 UPDATE/DELETE 走 **mutation**，是**重写整个涉及 part** 的异步操作，不是行级原地修改（和 MySQL 天差地别）。
+
+```sql
+-- 这两条都会触发 mutation：重写包含匹配行的所有 part
+ALTER TABLE events DELETE WHERE event_time < '2020-01-01';
+ALTER TABLE events UPDATE duration_ms = duration_ms * 2 WHERE country = 'CN';
+```
+
+代价：
+
+```text
+影响行数    实际重写量        耗时        对线上影响
+  100 行    整个 part（可能 800 万行）   分钟级    重写期间该 part 不可读（短暂），merge 争抢 IO
+```
+
+```sql
+-- 监控 mutation 进度，避免堆积
+SELECT
+    database, table, mutation_id,
+    command, create_time, parts_to_do, is_done
+FROM system.mutations
+WHERE NOT is_done
+ORDER BY create_time;
+```
+
+<Callout type="warn" title="频繁小批量 UPDATE/DELETE 是性能灾难">
+每条 mutation 至少重写一个 part。如果在循环里逐条 `DELETE WHERE id = ?`，会触发海量 mutation、磁盘 IO 爆满、合并雪崩。正确姿势：用 7 章的 `ReplacingMergeTree`/`CollapsingMergeTree` 做"逻辑更新"，把删除/修改转换成"插入一条抵消记录"。
+</Callout>
+
+## 5. 备份与恢复
+
+ClickHouse 没有 MySQL 那种 `mysqldump` 全量热备那么简单，但有几种成熟方案。
+
+### 5.1 分区级 FREEZE（轻量、推荐日常）
+
+`ALTER TABLE ... FREEZE` 利用硬链接（hardlink）把 part 快照到 `shadow/` 目录，**几乎不占额外空间、不阻塞读写**：
+
+```sql
+-- 冻结整张表（生成硬链接快照到 shadow/）
+ALTER TABLE events FREEZE;
+
+-- 只冻结某分区（更省）
+ALTER TABLE events FREEZE PARTITION '202401';
+```
+
+恢复时把 `shadow/<时间戳>/.../parts/...` 下的目录复制到表数据目录，再 `ATTACH PARTITION`（见 6 章）。因为硬链接，快照瞬间完成、空间几乎为零，是日常备份首选。
+
+### 5.2 用 clickhouse-backup 工具
+
+开源的 `clickhouse-backup`（Altinity 出品）能做全量/增量备份，支持本地、S3、远程：
+
+```bash
+# 全量备份到本地
+clickhouse-backup create full_backup_20240101
+
+# 恢复到指定表
+clickhouse-backup restore full_backup_20240101 --table=default.events
+```
+
+<Callout type="tip" title="备份前先停写入还是不停？">
+`FREEZE` 是物理硬链接快照，与线上写入互不阻塞，可以随时做。逻辑备份（导出 SQL/数据）期间建议暂停该表的写入（或接受备份点的一致性边界），否则可能漏掉备份开始后写入的数据。
+</Callout>
+
+## 6. 故障排查方法论
+
+遇到"慢/报错"别慌，按这张清单逐层下钻：
+
+```text
+查询慢
+  ├─ 看 system.processes：是不是有别的查询在抢资源？
+  ├─ 看 EXPLAIN indexes=1（16 章）：扫描了多少 granule？能否靠主键/跳数索引减少？
+  ├─ 看 system.query_log.read_rows / memory_usage：是读太多行还是内存爆？
+  ├─ 看 ProfileEvents：是否大量 DiskRead/CompressedRead 偏慢（IO 瓶颈）？
+  └─ 看 system.merges：是不是 merge 太猛把 IO 占满了？
+
+写入失败
+  ├─ "Too many parts" → 写入太碎，加大批次 / 开 async_insert（10 章）
+  ├─ "Memory limit exceeded" → 单批太大，拆小 / 调大限制
+  └─ 副本写入卡住 → 查 system.replicas 的 queue_size 是否堆积，Keeper 是否存活
+
+副本不一致
+  ├─ system.replicas.absolute_delay 是否持续增长
+  ├─ Keeper 连接是否断开
+  └─ 必要时 SYSTEM RESTORE REPLICA（18 章）
+```
+
+```sql
+-- 一键看"最慢的 10 个历史查询"
+SELECT
+    query,
+    query_duration_ms,
+    read_rows,
+    memory_usage,
+    normalized_query_hash
+FROM system.query_log
+WHERE type = 'QueryFinish'
+ORDER BY query_duration_ms DESC
+LIMIT 10;
+```
+
+<Callout type="tip" title="normalized_query_hash 帮你找「同一类慢查询」">
+`system.query_log` 里的 `normalized_query_hash` 会把"参数不同但结构相同的查询"归为同一个 hash。按它 `GROUP BY` 聚合，能发现"某类查询整体慢"而不是被单条偶发查询干扰，便于定位热点模板。
+</Callout>
+
+## 7. 监控接入
+
+把 `system.metrics`、`system.events`、`system.asynchronous_metric_log` 暴露给 Prometheus，配合 Grafana 看板（官方有 `clickhouse-exporter`）。最核心盯四个指标：
+
+- **Query 数量与耗时**（QPS、p99 延迟）
+- **MemoryUsage / 峰值内存**
+- **Merge / Mutation 队列长度**（堆积 = 写入或删除压力大）
+- **Replica 延迟**（absolute_delay）
+
+<Callout type="warn" title="不要只盯 CPU">
+ClickHouse 瓶颈常在磁盘 IO 和内存，而非 CPU。看到 CPU 闲但查询慢，多半是 merge 抢 IO 或查询在等磁盘。结合 `system.asynchronous_metric_log` 的磁盘读字节、IO 等待一起看。
+</Callout>
+
+## 8. 小结
+
+- `system` 库是运维仪表盘：`processes` 看实时、`query_log` 看历史、`merges`/`mutations`/`replicas` 看后台任务。
+- 内存三件套：`max_memory_usage`、`max_bytes_before_external_group_by`、`max_server_memory_usage`，务必设好防止 OOM。
+- mutation 是"重写整个 part"的昂贵操作，频繁小删除请用 Replacing/Collapsing 引擎替代。
+- 备份优先用 `FREEZE`（硬链接快照，秒级、零额外空间），或 `clickhouse-backup` 做异地备份。
+- 排查遵循"资源争抢 → 索引利用 → IO/内存 → 后台任务"逐层下钻；监控盯 QPS、内存、merge/mutation 队列、副本延迟。
+
+<Callout type="exercise" title="动手练习">
+1. 在当前实例插入 1000 万行 `events`，然后故意跑一个 `GROUP BY country, event_type, page, device` 的大聚合，期间用另一个会话查 `system.processes` 观察 `memory_usage` 与 `read_rows` 增长。
+2. 把 `max_bytes_before_external_group_by` 设得很小（如 1MB）再跑同一查询，对比 `system.query_log` 里该查询的 `query_duration_ms` 与外部聚合是否触发（看 ProfileEvents 的 `ExternalAggregationWritePart`）。
+3. 对一张表执行 `ALTER TABLE ... FREEZE PARTITION '202401'`，到数据目录的 `shadow/` 下找到硬链接快照，确认其大小远小于原表。
+4. 触发一次 `ALTER TABLE ... DELETE WHERE ...`，用 `system.mutations` 跟踪其从 `is_done=0` 到完成的过程，并记录 `parts_to_do` 变化。
+</Callout>

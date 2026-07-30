@@ -1,0 +1,487 @@
+---
+title: Schema 校验
+order: 13
+description: jsonSchema 语法、validationLevel 与 validationAction、约束设计与 schema 演进
+---
+
+# Schema 校验
+
+「MongoDB 是 schema-less 的」这句话害了很多项目。灵活性在开发初期是优势，在系统运行三年、经手五个开发者之后就变成了负债：同一个字段有三种类型、有的文档缺关键字段、状态值拼写不一致。这一章讲怎么在保留灵活性的同时，把关键约束交回给数据库。
+
+## 1. 为什么需要校验
+
+### 1.1 一个真实的退化过程
+
+```text
+第 1 个月：createdAt 都是 Date
+第 3 个月：新同事写了个脚本，插入了 createdAt: "2024-03-15"（字符串）
+第 6 个月：另一个服务写入 createdAt: 1718000000（Unix 秒）
+第 9 个月：TTL 索引失效（非 Date 类型被忽略），过期数据永不删除
+第 12 个月：按时间排序的接口返回错误顺序，排查两天
+```
+
+这类问题的共同点是：**写入时没人拦，读出来才发现**。而读的时候往往已经过了很久，脏数据已经积累了几百万条。
+
+### 1.2 应用层校验为什么不够
+
+Mongoose、Pydantic 这类 ODM 提供了应用层 schema，但它们保护不了：
+
+- 直接用 mongosh 执行的运维脚本
+- 数据迁移工具、ETL 任务
+- 另一个用不同语言写的服务
+- 老版本的应用实例（灰度发布期间）
+
+**数据库层的约束是唯一对所有写入路径都生效的约束**。
+
+<Callout type="tip" title="应用层和数据库层的校验各司其职">
+应用层校验负责给用户友好的错误提示（「邮箱格式不正确」），数据库层校验负责兜底防止脏数据落盘。两者不冲突，都要有。数据库层的约束应该只覆盖**核心不变量**，不要把所有业务规则都塞进去。
+</Callout>
+
+## 2. $jsonSchema 基础
+
+### 2.1 创建带校验的集合
+
+```js
+db.createCollection("users", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      title: "用户文档校验",
+      required: ["username", "email", "createdAt"],
+      properties: {
+        username: {
+          bsonType: "string",
+          minLength: 3,
+          maxLength: 32,
+          pattern: "^[a-zA-Z0-9_]+$",
+          description: "用户名，3 到 32 位字母数字下划线"
+        },
+        email: {
+          bsonType: "string",
+          pattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+        },
+        age: {
+          bsonType: "int",
+          minimum: 0,
+          maximum: 150
+        },
+        createdAt: { bsonType: "date" }
+      }
+    }
+  },
+  validationLevel: "strict",
+  validationAction: "error"
+})
+```
+
+试着插入非法数据：
+
+```js
+db.users.insertOne({ username: "ab", email: "bad", createdAt: new Date() })
+```
+
+```json
+{
+  "ok": 0,
+  "code": 121,
+  "codeName": "DocumentValidationFailure",
+  "errInfo": {
+    "failingDocumentId": ObjectId("665f..."),
+    "details": {
+      "operatorName": "$jsonSchema",
+      "schemaRulesNotSatisfied": [
+        {
+          "operatorName": "properties",
+          "propertiesNotSatisfied": [
+            {
+              "propertyName": "username",
+              "description": "用户名，3 到 32 位字母数字下划线",
+              "details": [ { "operatorName": "minLength", "specifiedAs": { "minLength": 3 },
+                             "reason": "specified string length was not satisfied",
+                             "consideredValue": "ab" } ]
+            },
+            {
+              "propertyName": "email",
+              "details": [ { "operatorName": "pattern", "reason": "regular expression did not match",
+                             "consideredValue": "bad" } ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+5.0 之后的错误信息非常详细，能精确定位到是哪个字段的哪条规则不满足。
+
+### 2.2 给已有集合加校验
+
+```js
+db.runCommand({
+  collMod: "posts",
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["title", "authorId", "status", "createdAt"],
+      properties: {
+        title: { bsonType: "string", minLength: 1, maxLength: 200 },
+        status: { enum: ["draft", "published", "deleted"] },
+        createdAt: { bsonType: "date" }
+      }
+    }
+  },
+  validationLevel: "moderate",
+  validationAction: "warn"
+})
+```
+
+查看当前校验规则：
+
+```js
+db.getCollectionInfos({ name: "posts" })[0].options.validator
+```
+
+移除校验：
+
+```js
+db.runCommand({ collMod: "posts", validator: {} })
+```
+
+## 3. 关键字大全
+
+### 3.1 类型与通用约束
+
+| 关键字 | 适用 | 说明 |
+|---|---|---|
+| `bsonType` | 全部 | BSON 类型，可以是数组表示多选 |
+| `enum` | 全部 | 枚举取值 |
+| `description` | 全部 | 说明文字，会出现在错误信息里 |
+
+```js
+{ bsonType: ["int", "long"] }                 // 允许两种整数类型
+{ enum: ["draft", "published", "deleted"] }
+{ bsonType: ["string", "null"] }              // 允许为 null
+```
+
+<Callout type="warn" title="bsonType 和 type 不一样">
+`type` 是标准 JSON Schema 的关键字，只认识 JSON 的六种类型，`type: "number"` 会同时接受 int、long、double、decimal。`bsonType` 是 MongoDB 扩展，能精确区分 BSON 类型。**校验 MongoDB 数据一律用 `bsonType`**。
+</Callout>
+
+### 3.2 字符串
+
+```js
+{
+  bsonType: "string",
+  minLength: 1,
+  maxLength: 200,
+  pattern: "^[a-z0-9-]+$"        // 注意是字符串形式的正则，不是 /.../ 字面量
+}
+```
+
+### 3.3 数字
+
+```js
+{
+  bsonType: "int",
+  minimum: 0,
+  maximum: 150,
+  exclusiveMinimum: true,        // 配合 minimum，表示严格大于
+  multipleOf: 5
+}
+```
+
+### 3.4 数组
+
+```js
+{
+  bsonType: "array",
+  minItems: 1,
+  maxItems: 10,
+  uniqueItems: true,
+  items: {                        // 每个元素的 schema
+    bsonType: "string",
+    maxLength: 30
+  }
+}
+```
+
+数组元素是文档时，嵌套一层 object schema：
+
+```js
+{
+  bsonType: "array",
+  maxItems: 3,
+  items: {
+    bsonType: "object",
+    required: ["author", "body"],
+    properties: {
+      author: { bsonType: "string" },
+      body: { bsonType: "string", maxLength: 500 },
+      likes: { bsonType: "int", minimum: 0 }
+    }
+  }
+}
+```
+
+### 3.5 内嵌文档
+
+```js
+{
+  bsonType: "object",
+  required: ["city"],
+  properties: {
+    city: { bsonType: "string" },
+    bio: { bsonType: "string", maxLength: 500 }
+  },
+  additionalProperties: false      // 禁止出现未声明的字段
+}
+```
+
+<Callout type="warn" title="additionalProperties false 会阻碍 schema 演进">
+设成 `false` 意味着任何新字段都会被拒绝。这在早期能防止拼写错误，但当你需要灰度上线一个新字段时，必须先改 schema 再发版，顺序搞反就是线上事故。建议顶层保持 `true`（默认），只在稳定的内嵌结构上用 `false`。
+</Callout>
+
+### 3.6 组合关键字
+
+```js
+{
+  oneOf: [                         // 必须且只能满足其中一个
+    { properties: { type: { enum: ["like"] }, postId: { bsonType: "objectId" } },
+      required: ["postId"] },
+    { properties: { type: { enum: ["follow"] }, byUserId: { bsonType: "objectId" } },
+      required: ["byUserId"] }
+  ]
+}
+```
+
+还有 `anyOf`（满足任一）、`allOf`（全部满足）、`not`（不满足）。用它们可以表达「多态文档的条件必填」这类复杂规则。
+
+## 4. validationLevel 与 validationAction
+
+这两个选项决定「校验什么」和「不通过怎么办」，是给已有集合加校验时的关键。
+
+### 4.1 validationLevel
+
+| 值 | 插入新文档 | 更新已合规文档 | 更新已有的**不合规**文档 |
+|---|---|---|---|
+| `strict`（默认） | 校验 | 校验 | 校验（会失败） |
+| `moderate` | 校验 | 校验 | **不校验**（允许通过） |
+| `off` | 不校验 | 不校验 | 不校验 |
+
+`moderate` 的意义在于：老数据里有 10 万条不合规文档，你不想因为加了校验就让这些文档完全无法更新（比如软删除都做不了）。
+
+### 4.2 validationAction
+
+| 值 | 行为 |
+|---|---|
+| `error`（默认） | 拒绝写入，返回 121 错误 |
+| `warn` | 允许写入，但在 mongod 日志里记一条警告 |
+
+### 4.3 安全的上线流程
+
+给一个已有 1 亿文档的集合加校验，不能一步到位。正确的四步：
+
+```text
+第 1 步：warn + moderate
+  ├─ 加上 schema，validationAction: "warn"
+  └─ 观察日志一周，统计有多少不合规写入
+
+第 2 步：修 bug
+  ├─ 从日志里找出哪些代码路径在写脏数据
+  └─ 修复应用代码
+
+第 3 步：清洗存量数据
+  ├─ 用聚合找出不合规文档
+  └─ 分批修复
+
+第 4 步：error + strict
+  └─ 收紧到强制模式
+```
+
+第 3 步的关键工具是用 schema 本身反查不合规文档：
+
+```js
+// 找出所有不满足当前 schema 的文档
+const schema = db.getCollectionInfos({ name: "posts" })[0].options.validator
+
+db.posts.find({ $nor: [schema] }).limit(10)
+db.posts.countDocuments({ $nor: [schema] })
+```
+
+```json
+[
+  { "_id": ObjectId("..."), "title": "", "status": "PUBLISHED", "createdAt": "2024-03-15" }
+]
+```
+
+```js
+// 批量修复：状态值大小写不一致
+db.posts.updateMany(
+  { status: "PUBLISHED" },
+  { $set: { status: "published" } }
+)
+
+// 批量修复：createdAt 是字符串
+db.posts.updateMany(
+  { createdAt: { $type: "string" } },
+  [ { $set: { createdAt: { $toDate: "$createdAt" } } } ]
+)
+```
+
+<Callout type="tip" title="dryRun：先统计再修复">
+清洗数据之前，永远先跑一遍 `countDocuments` 看看影响面。如果不合规文档有 500 万条，`updateMany` 一次跑完会产生巨量 oplog 拖垮复制。要按 `_id` 范围分批，每批 1 万条，中间 sleep 一下观察复制延迟。
+</Callout>
+
+## 5. 用查询语法做校验
+
+除了 `$jsonSchema`，validator 也接受普通查询表达式，适合表达 schema 说不清的规则：
+
+```js
+db.runCommand({
+  collMod: "posts",
+  validator: {
+    $and: [
+      { $jsonSchema: { /* 结构校验 */ } },
+      { $expr: { $lte: ["$stats.likes", "$stats.views"] } },        // 点赞不能超过浏览
+      { $or: [
+          { status: { $ne: "published" } },
+          { publishedAt: { $exists: true } }                        // 已发布必须有发布时间
+      ] }
+    ]
+  }
+})
+```
+
+`$expr` 让「字段之间的关系约束」成为可能，这是 `$jsonSchema` 做不到的。
+
+## 6. Schema 演进策略
+
+### 6.1 版本字段模式
+
+给每个文档打上 schema 版本号：
+
+```js
+{
+  _id: ObjectId("...201"),
+  schemaVersion: 2,
+  title: "...",
+  author: { _id: ..., username: "alice" }     // v2：从 authorId 改成内嵌对象
+}
+```
+
+应用层按版本分支处理：
+
+```js
+function normalize(post) {
+  if (post.schemaVersion === undefined || post.schemaVersion < 2) {
+    // v1 只有 authorId，需要额外查一次
+    return migrateV1ToV2(post)
+  }
+  return post
+}
+```
+
+好处是**不需要停机做全量迁移**：新写入用 v2，老文档读到时惰性升级，后台脚本慢慢刷。等 v1 文档数量归零，再删掉兼容代码。
+
+### 6.2 三种迁移方式对比
+
+| 方式 | 做法 | 优点 | 缺点 |
+|---|---|---|---|
+| 大爆炸迁移 | 停机跑脚本全量转换 | 干净，代码无分支 | 需要停机窗口 |
+| 惰性迁移 | 读到老文档时转换并回写 | 无停机 | 冷数据永不迁移，兼容代码长期存在 |
+| 后台批量 | 应用兼容双版本，后台分批刷 | 无停机、有终点 | 需要一段时间双版本兼容 |
+
+生产环境推荐**惰性 + 后台批量**组合：应用同时兼容，后台脚本按 `_id` 分批推进，通过 `countDocuments({ schemaVersion: { $lt: 2 } })` 观察进度。
+
+### 6.3 加字段与删字段
+
+```js
+// 加字段：给老文档补默认值，分批执行
+db.posts.updateMany(
+  { schemaVersion: { $lt: 2 }, _id: { $lt: batchMaxId } },
+  { $set: { level: "normal", schemaVersion: 2 } }
+)
+
+// 删字段：先在应用里停止读写，观察一段时间，再真正删除
+db.posts.updateMany({}, { $unset: { deprecatedField: "" } })
+```
+
+<Callout type="warn" title="删字段前一定要先停止读">
+「代码里已经不用了」和「没有任何代码在读」是两回事。可能还有报表脚本、老版本客户端、数据同步任务在依赖它。安全流程是：先在监控里确认该字段的读取量归零，等待至少一个发布周期，再执行 `$unset`。
+</Callout>
+
+## 7. 内容社区的完整校验规则
+
+```js
+db.runCommand({
+  collMod: "posts",
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["slug", "title", "author", "status", "createdAt"],
+      properties: {
+        schemaVersion: { bsonType: "int", minimum: 1 },
+        slug: { bsonType: "string", pattern: "^[a-z0-9-]{1,100}$" },
+        title: { bsonType: "string", minLength: 1, maxLength: 200 },
+        body: { bsonType: "string", maxLength: 100000 },
+        author: {
+          bsonType: "object",
+          required: ["_id", "username"],
+          properties: {
+            _id: { bsonType: "objectId" },
+            username: { bsonType: "string" },
+            avatar: { bsonType: ["string", "null"] }
+          }
+        },
+        tags: {
+          bsonType: "array",
+          maxItems: 10,
+          uniqueItems: true,
+          items: { bsonType: "string", pattern: "^[a-z0-9-]{1,30}$" }
+        },
+        status: { enum: ["draft", "published", "deleted"] },
+        stats: {
+          bsonType: "object",
+          properties: {
+            views:    { bsonType: ["int", "long"], minimum: 0 },
+            likes:    { bsonType: ["int", "long"], minimum: 0 },
+            comments: { bsonType: ["int", "long"], minimum: 0 }
+          }
+        },
+        createdAt: { bsonType: "date" },
+        publishedAt: { bsonType: ["date", "null"] }
+      }
+    }
+  },
+  validationLevel: "moderate",
+  validationAction: "error"
+})
+```
+
+设计取舍说明：
+
+| 决策 | 理由 |
+|---|---|
+| `body` 不设 required | 草稿可以没有正文 |
+| `stats` 各字段允许 int 和 long | 浏览数可能超过 21 亿 |
+| `tags` 限制 10 个且唯一 | 防止数组无限增长 |
+| `avatar` 允许 null | 用户可以没有头像 |
+| 顶层不设 `additionalProperties: false` | 留出加新字段的空间 |
+| 用 `moderate` 而不是 `strict` | 允许修改存量脏数据 |
+
+<Callout type="exercise" title="练习">
+一、给 `users` 集合写一份完整的 `$jsonSchema`，要求用户名唯一格式、邮箱格式、年龄范围、`profile.city` 必填；二、故意插入三条各违反不同规则的文档，把错误信息里的 `schemaRulesNotSatisfied` 读懂；三、用 `$nor` 加 schema 反查出集合里所有不合规的存量文档并统计数量；四、写一个 `$expr` 校验规则，要求「已发布的帖子必须有 publishedAt 且不能早于 createdAt」；五、设计一个 schema 从 v1 到 v2 的演进方案（v1 用 `authorId`，v2 用内嵌 `author` 对象），写出惰性迁移和后台批量脚本；六、解释为什么顶层不建议设 `additionalProperties: false`。
+</Callout>
+
+## 小结
+
+- schema-less 是开发期的优势、运维期的负债，关键约束应该交给数据库
+- 数据库层校验是唯一对所有写入路径都生效的防线，应用层校验负责友好提示
+- 用 `bsonType` 而不是 `type`，前者能精确区分 BSON 类型
+- `validationLevel` 控制校验范围，`moderate` 允许修改存量脏数据
+- `validationAction` 控制处理方式，上线新校验先用 `warn` 观察
+- 加校验的安全流程：warn 观察 → 修 bug → 清洗存量 → 收紧到 error
+- 用 `$nor` 配合 schema 能反查出所有不合规文档
+- schema 演进用版本字段 + 惰性迁移 + 后台批量，避免停机
+- 下一章讲事务，处理跨文档的一致性问题 →

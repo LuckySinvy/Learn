@@ -2,14 +2,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import type { Chapter, Language } from './types';
+import { LANG_META } from './types';
 
 const CONTENT_ROOT = path.join(process.cwd(), 'src', 'content');
+
+export const ALL_LANGUAGES = Object.keys(LANG_META) as Language[];
 
 const TITLES: Record<string, string> = {};
 
 function loadTitlesOnce() {
   if (Object.keys(TITLES).length) return;
-  for (const lang of ['python', 'go', 'java', 'grafana', 'rag', 'langchain', 'dify', 'k8s', 'rust'] as const) {
+  for (const lang of ALL_LANGUAGES) {
     const dir = path.join(CONTENT_ROOT, lang);
     if (!fs.existsSync(dir)) continue;
     for (const file of fs.readdirSync(dir)) {
@@ -49,7 +52,7 @@ export function getChapter(lang: Language, slug: string): Chapter | null {
 }
 
 export function getAllChaptersFlat(): { lang: Language; chapter: Chapter }[] {
-  return (['python', 'go', 'java', 'grafana', 'rag', 'langchain', 'dify', 'k8s', 'rust'] as Language[]).flatMap((lang) =>
+  return ALL_LANGUAGES.flatMap((lang) =>
     getChapters(lang).map((chapter) => ({ lang, chapter })),
   );
 }

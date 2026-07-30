@@ -1,0 +1,213 @@
+---
+title: DDL：建表与改表
+order: 4
+description: CREATE TABLE 全解、主键/外键/唯一/CHECK 约束、ALTER TABLE 与在线 DDL
+---
+
+# DDL：建表与改表
+
+DDL（Data Definition Language）定义数据的「形状」。一张设计良好的表能让后续所有查询事半功倍；而在一张亿级大表上执行 ALTER，如果不懂在线 DDL 的机制，可能直接锁表引发生产事故。本章把建表和改表一次讲透，并正式建立课程的电商示例库。
+
+## 1. CREATE TABLE 全解
+
+先看一张标准的生产级建表语句，逐块拆解：
+
+```sql
+CREATE TABLE orders (
+  id           BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT COMMENT '订单ID',
+  order_no     VARCHAR(32)      NOT NULL COMMENT '业务订单号',
+  user_id      BIGINT UNSIGNED  NOT NULL COMMENT '下单用户',
+  status       TINYINT          NOT NULL DEFAULT 0 COMMENT '0待支付 1已支付 2已发货 3完成 4取消',
+  total_amount DECIMAL(12,2)    NOT NULL DEFAULT 0.00 COMMENT '订单总额',
+  created_at   DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at   DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_order_no (order_no),
+  KEY idx_user_created (user_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='订单表';
+```
+
+要点：
+
+- **每列 NOT NULL + DEFAULT + COMMENT**，注释就是活文档；
+- **主键用无业务含义的自增 ID**，业务编号（order_no）另建唯一索引——业务规则会变，主键不能变；
+- 索引命名约定：唯一索引 `uk_`、普通索引 `idx_` 前缀，见名知义；
+- 表选项里显式写 ENGINE 和 CHARSET，不依赖服务器默认值。
+
+## 2. 约束
+
+### 2.1 主键（PRIMARY KEY）
+
+每张 InnoDB 表**必须有主键**。没有显式主键时，InnoDB 会优先用第一个非空唯一索引，都没有则生成隐藏的 6 字节 row_id——隐藏主键无法用于查询，还是全局分配的，高并发下有争用。
+
+为什么推荐**自增**主键？InnoDB 按主键顺序物理存储数据（第 12 章聚簇索引细讲），自增 ID 保证新行总是追加到最后一页，顺序写入；而 UUID 这类随机主键会导致页分裂、写放大、缓存命中率下降。
+
+### 2.2 唯一约束（UNIQUE）
+
+```sql
+ALTER TABLE users ADD UNIQUE KEY uk_email (email);
+```
+
+唯一约束是**数据正确性的最后防线**。「先 SELECT 检查再 INSERT」在并发下必然出现重复数据（两个请求同时检查通过），唯一索引才能在数据库层面兜底。
+
+### 2.3 外键（FOREIGN KEY）
+
+```sql
+CREATE TABLE order_items (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_id   BIGINT UNSIGNED NOT NULL,
+  product_id BIGINT UNSIGNED NOT NULL,
+  quantity   INT UNSIGNED    NOT NULL DEFAULT 1,
+  price      DECIMAL(10,2)   NOT NULL COMMENT '下单时单价快照',
+  PRIMARY KEY (id),
+  KEY idx_order (order_id),
+  KEY idx_product (product_id),
+  CONSTRAINT fk_item_order FOREIGN KEY (order_id)
+    REFERENCES orders (id) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+外键保证引用完整性，但**互联网大厂普遍禁用外键**：每次写入都要检查父表加锁，影响性能与分库分表；约束改由应用层保证。学习阶段建议用外键理解关系，生产上遵循团队规范。
+
+### 2.4 CHECK 约束（8.0.16+ 真正生效）
+
+```sql
+ALTER TABLE products
+  ADD CONSTRAINT chk_price CHECK (price >= 0),
+  ADD CONSTRAINT chk_stock CHECK (stock >= 0);
+```
+
+5.7 会解析 CHECK 但**默默忽略**，8.0.16 起才真正执行。违反时报错 `Check constraint 'chk_price' is violated`。
+
+## 3. 电商示例库完整 DDL
+
+后续所有章节都基于这五张表，请完整执行一遍：
+
+```sql
+USE shop;
+
+CREATE TABLE users (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  username   VARCHAR(50)     NOT NULL,
+  email      VARCHAR(100)    NOT NULL,
+  phone      VARCHAR(20)     NOT NULL DEFAULT '',
+  status     TINYINT         NOT NULL DEFAULT 1 COMMENT '1正常 2冻结',
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_email (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户';
+
+CREATE TABLE categories (
+  id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name      VARCHAR(50)     NOT NULL,
+  parent_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0为顶级',
+  PRIMARY KEY (id),
+  KEY idx_parent (parent_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品分类';
+
+CREATE TABLE products (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  category_id BIGINT UNSIGNED NOT NULL,
+  name        VARCHAR(100)    NOT NULL,
+  price       DECIMAL(10,2)   NOT NULL,
+  stock       INT UNSIGNED    NOT NULL DEFAULT 0,
+  status      TINYINT         NOT NULL DEFAULT 1 COMMENT '1在售 2下架',
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_category (category_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品';
+
+CREATE TABLE orders (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_no     VARCHAR(32)     NOT NULL,
+  user_id      BIGINT UNSIGNED NOT NULL,
+  status       TINYINT         NOT NULL DEFAULT 0 COMMENT '0待支付 1已支付 2已发货 3完成 4取消',
+  total_amount DECIMAL(12,2)   NOT NULL DEFAULT 0.00,
+  created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_order_no (order_no),
+  KEY idx_user_created (user_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单';
+
+CREATE TABLE order_items (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_id   BIGINT UNSIGNED NOT NULL,
+  product_id BIGINT UNSIGNED NOT NULL,
+  quantity   INT UNSIGNED    NOT NULL DEFAULT 1,
+  price      DECIMAL(10,2)   NOT NULL COMMENT '下单时单价快照',
+  PRIMARY KEY (id),
+  KEY idx_order (order_id),
+  KEY idx_product (product_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单明细';
+```
+
+注意 `order_items.price` 存的是**下单时的价格快照**——商品价格会变，历史订单金额不能跟着变，这是电商建模的经典细节。
+
+## 4. ALTER TABLE 与在线 DDL
+
+### 4.1 常用改表操作
+
+```sql
+ALTER TABLE users ADD COLUMN nickname VARCHAR(50) NOT NULL DEFAULT '' AFTER username;
+ALTER TABLE users MODIFY COLUMN phone VARCHAR(30) NOT NULL DEFAULT '';
+ALTER TABLE users RENAME COLUMN nickname TO nick;   -- 8.0 语法
+ALTER TABLE users DROP COLUMN nick;
+ALTER TABLE users ADD INDEX idx_status (status);
+ALTER TABLE users DROP INDEX idx_status;
+RENAME TABLE users TO members;                       -- 改表名（原子）
+```
+
+### 4.2 在线 DDL：ALGORITHM 与 LOCK
+
+大表 ALTER 的核心问题：**改表期间业务还能不能读写？** InnoDB 在线 DDL 提供三种算法：
+
+| 算法 | 机制 | 速度 | 期间 DML |
+|---|---|---|---|
+| INSTANT | 只改元数据（8.0：加列到末尾、改默认值等） | 秒级 | 完全不影响 |
+| INPLACE | 引擎内部改，不拷贝整表（多数加索引） | 中 | 允许 |
+| COPY | 建临时表全量拷贝再替换 | 慢 | 阻塞写 |
+
+显式声明期望的算法，MySQL 不支持时会直接报错而不是默默降级：
+
+```sql
+-- 加列：期望 INSTANT
+ALTER TABLE orders ADD COLUMN remark VARCHAR(200) NOT NULL DEFAULT '',
+  ALGORITHM = INSTANT;
+
+-- 加索引：期望 INPLACE 且不锁 DML
+ALTER TABLE orders ADD INDEX idx_status (status),
+  ALGORITHM = INPLACE, LOCK = NONE;
+```
+
+<Callout type="warn" title="在线 DDL 也可能瞬间锁表">
+即使是 INPLACE，DDL 开始和结束时都要短暂获取 MDL（元数据锁）。如果此刻有个长事务/慢查询占着表的 MDL 读锁，DDL 就会等待，而排在 DDL 后面的所有查询（哪怕是 SELECT）都会被堵死——现象是全表请求突然挂起。大表 DDL 前先 `SHOW PROCESSLIST` 确认没有长事务，并设置 `SET lock_wait_timeout = 5;` 让 DDL 等不到锁时尽快失败。超大表建议用 gh-ost / pt-online-schema-change。
+</Callout>
+
+### 4.3 8.0 的原子 DDL
+
+8.0 把 DDL 变成原子操作：`DROP TABLE t1, t2` 要么都删要么都不删，崩溃后不会留下「表建了一半」的中间状态。5.7 没有这个保证。
+
+## 5. DROP / TRUNCATE 的危险性
+
+```sql
+DROP TABLE order_items;      -- 删表：结构+数据全没，不可回滚
+TRUNCATE TABLE order_items;  -- 清空：保留结构，重置自增，不可回滚
+```
+
+两者都是 DDL，**不走事务、不能 ROLLBACK**，binlog 里也只记语句本身，误操作只能靠备份恢复（第 19 章）。生产执行前务必确认库名、表名，最好先 `SELECT COUNT(*)` 看一眼。
+
+## 小结
+
+- 建表模板：自增 BIGINT 主键 + NOT NULL/DEFAULT/COMMENT + 显式 ENGINE/CHARSET
+- 唯一索引是并发下防重复的唯一可靠手段；外键学习可用、生产看规范
+- CHECK 约束 8.0.16 起才真正生效
+- 在线 DDL 记住三算法（INSTANT/INPLACE/COPY），显式写 ALGORITHM 防止降级
+- 小心 MDL 锁：DDL 前检查长事务；DROP/TRUNCATE 不可回滚
+
+<Callout type="exercise" title="练习">
+1. 完整执行本章的五表 DDL，用 `SHOW CREATE TABLE orders\G` 检查结果。
+2. 给 products 表用 INSTANT 算法加一列 `sales_count INT UNSIGNED NOT NULL DEFAULT 0`，观察执行耗时。
+3. 开两个会话：会话 A 执行 `BEGIN; SELECT * FROM orders;` 不提交，会话 B 对 orders 执行 ALTER 加列，观察 B 被阻塞；再开会话 C 查询 orders，体会 MDL 连锁阻塞，最后在 A 里 COMMIT 解锁。
+</Callout>

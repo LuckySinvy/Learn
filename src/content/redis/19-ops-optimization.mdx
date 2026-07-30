@@ -1,0 +1,201 @@
+---
+title: 运维与性能优化
+order: 19
+description: INFO/SLOWLOG/LATENCY 排障、大 key 与热 key 定位治理、pipeline 批量、连接池与监控指标
+---
+
+# 运维与性能优化
+
+"Redis 变慢了"是后端最常见的告警之一。本章给你一套排查工具箱（INFO、SLOWLOG、LATENCY、MEMORY）、两类顽疾的治理方案（大 key、热 key），以及吞吐优化的核心手段（pipeline、连接池）。
+
+## 1. 体检工具箱
+
+### 1.1 INFO：全局状态
+
+```bash
+127.0.0.1:6379> INFO server
+redis_version:7.2.4
+uptime_in_days:42
+
+127.0.0.1:6379> INFO memory
+used_memory_human:3.21G
+used_memory_rss_human:3.80G
+mem_fragmentation_ratio:1.18     # RSS/used, >1.5 碎片严重, <1 在用 swap(危险)
+maxmemory_human:6.00G
+
+127.0.0.1:6379> INFO stats
+instantaneous_ops_per_sec:24310  # 当前 QPS
+keyspace_hits:9928103
+keyspace_misses:203110           # 命中率 = hits/(hits+misses) ≈ 98%
+evicted_keys:0                   # 被淘汰的 key, 增长=内存不够
+rejected_connections:0           # 被拒连接, 增长=maxclients 不够
+
+127.0.0.1:6379> INFO clients
+connected_clients:210
+blocked_clients:2                # BLPOP 等阻塞中的
+```
+
+四个必须配告警的指标：**内存使用率**（used_memory/maxmemory 超 80%）、**命中率**（低于 90% 要查）、**evicted_keys 增速**、**mem_fragmentation_ratio**。
+
+### 1.2 SLOWLOG：慢命令抓现行
+
+```conf
+slowlog-log-slower-than 10000    # 超过 10ms(微秒单位) 记录
+slowlog-max-len 128
+```
+
+```bash
+127.0.0.1:6379> SLOWLOG GET 3
+1) 1) (integer) 14              # 日志 ID
+   2) (integer) 1722310000      # 时间戳
+   3) (integer) 152000          # 耗时 152ms!
+   4) 1) "HGETALL"
+      2) "big:hash"             # 元凶: 大 hash 的全量读取
+   5) "10.0.0.21:53311"
+   6) ""
+127.0.0.1:6379> SLOWLOG RESET
+OK
+```
+
+慢日志只统计**命令执行时间**，不含网络与排队。榜上常客：KEYS、HGETALL/SMEMBERS 大集合、大范围 ZRANGE、DEL 大 key、复杂 Lua。
+
+### 1.3 LATENCY 与延迟基线
+
+```bash
+# 服务端事件级延迟追踪 (需 latency-monitor-threshold 100)
+127.0.0.1:6379> LATENCY LATEST
+1) 1) "fork"                    # 事件类型
+   2) (integer) 1722310000
+   3) (integer) 210             # 最近一次 210ms
+   4) (integer) 460             # 历史峰值
+
+# 客户端侧测量网络+处理总延迟
+$ redis-cli --latency -h 10.0.0.5
+min: 0, max: 3, avg: 0.12 (1032 samples)
+```
+
+延迟毛刺的常见来源：fork（RDB/AOF 重写，看 latest_fork_usec）、集中过期、大 key 操作、AOF fsync 卡顿（aof_delayed_fsync）、swap（fragmentation ratio 小于 1）、透明大页（THP，建议关闭）。
+
+### 1.4 MEMORY USAGE：单 key 体积
+
+```bash
+127.0.0.1:6379> MEMORY USAGE big:hash
+(integer) 10485762              # 10MB, 大 key 实锤
+127.0.0.1:6379> MEMORY DOCTOR
+"Sam, I detected a few issues in this Redis instance memory implants..."
+```
+
+## 2. 大 key：定位与治理
+
+判定经验值：String 超 10 KB；集合类元素超 5000 或总体积超 1 MB。危害：操作阻塞主线程、网络放大、Cluster 数据倾斜、迁移/删除卡顿。
+
+### 2.1 定位
+
+```bash
+# 方式一: 内置扫描 (对每种类型给出最大 key, 基于 SCAN 不阻塞)
+$ redis-cli --bigkeys -i 0.1
+[00.00%] Biggest hash   found so far '"big:hash"' with 120000 fields
+...
+Biggest   hash found '"big:hash"' has 120000 fields
+
+# 方式二: 更精细的体积扫描
+$ redis-cli --memkeys
+
+# 方式三: 离线分析 RDB 文件 (rdb-tools / redis-rdb-cli), 不影响线上
+$ rdb -c memory dump.rdb --bytes 1048576 -f big_keys.csv
+```
+
+### 2.2 治理
+
+- **拆分**：`big:hash` 按 field 哈希拆成 `big:hash:0` 到 `big:hash:15`，读写前先对 field 取模定位分片；
+- **压缩**：大 JSON 先 gzip/snappy 再存（CPU 换网络与内存）；
+- **改结构**：全量成员不需要时，用 HyperLogLog/Bitmap 替代巨型 Set；
+- **删除**：一律 `UNLINK`，或 SCAN 配合 HSCAN/SSCAN 分批删。
+
+## 3. 热 key：定位与治理
+
+单个 key 的 QPS 极高（如爆款商品缓存），把它所在的分片/实例 CPU 打满——Cluster 也救不了，因为一个 key 只能在一个节点上。
+
+```bash
+# 定位: LFU 模式下找访问频率最高的 key
+$ redis-cli --hotkeys        # 要求 maxmemory-policy 为 *-lfu
+# 或: 短暂开启 MONITOR 采样统计 (有性能损耗, 只能秒级采样)
+$ redis-cli monitor | head -100000 | awk '{print $4}' | sort | uniq -c | sort -rn | head
+```
+
+治理：
+
+- **本地缓存**：应用进程内缓存热 key（Caffeine，几百毫秒 TTL），流量根本不出应用；
+- **副本分摊**：把 `hot:sku:1` 复制成 `hot:sku:1:copy0` 到 `:copyN` 散到多个节点，读时随机挑一个；
+- **读写分离**：读请求打到多个从库分摊。
+
+## 4. Pipeline：一次往返干 N 件事
+
+每条命令一次网络往返（RTT）。RTT 1ms 时，串行执行 1 万条命令光网络就要 10 秒。Pipeline 把一批命令打包发出、一次收回：
+
+```bash
+# redis-cli 演示: 100 条 SET 一次发送
+$ printf 'SET k%d v%d\r\n' $(seq 1 100 | sed 'p') | redis-cli --pipe
+All data transferred. Waiting for the last reply...
+Last reply received from server.
+errors: 0, replies: 100
+```
+
+```python
+# redis-py
+pipe = redis.pipeline(transaction=False)   # 纯 pipeline, 不包 MULTI
+for i in range(10000):
+    pipe.set(f"k{i}", i)
+pipe.execute()          # 1 次往返(按缓冲分批), 而不是 10000 次
+```
+
+效果量级：跨机房 RTT 1ms 下，1 万条命令从约 10 秒缩到约 100 毫秒。注意：
+
+- pipeline 不是原子的（要原子用 Lua 或 MULTI）；
+- 单批别太大（几百到 1000 条一批），过大批次会撑爆客户端/服务端缓冲并拖长单次阻塞；
+- 与之相关的原生批量命令（MGET/MSET/HMGET）优先级更高——能用一条命令就别用 pipeline 拼。
+
+## 5. 连接池：别让建连吃掉性能
+
+每次操作新建 TCP 连接（三次握手 + AUTH + SELECT）开销远大于命令本身，且高并发下端口耗尽。连接池参数要点（以 Java Lettuce/Jedis、Python redis-py 通用概念）：
+
+| 参数 | 建议 | 说明 |
+|---|---|---|
+| max_connections / maxTotal | 按"峰值并发 × 单请求 Redis 次数"估算, 常见 50~200 | 太小排队, 太大压垮服务端 |
+| 最小空闲 minIdle | 预热保持一定空闲连接 | 避免突发流量时集中建连 |
+| 获取超时 | 100~500ms 并配降级 | 池耗尽时快速失败优于无限等 |
+| 空闲检测 testWhileIdle | 开启 | 剔除被服务端/防火墙断掉的死连接 |
+| timeout（命令超时） | 200ms~1s | 必设! 否则一个网络故障挂住全部线程 |
+
+服务端对应项：`maxclients 10000`（默认）、`timeout 0`（服务端不主动断空闲连接，交给客户端管理）。
+
+## 6. 监控指标清单
+
+| 类别 | 指标 | 告警参考 |
+|---|---|---|
+| 性能 | instantaneous_ops_per_sec, 命中率, p99 延迟 | 命中率低于 90% |
+| 内存 | used_memory/maxmemory, evicted_keys, fragmentation | 使用率超 80%; ratio 超 1.5 或低于 1 |
+| 持久化 | rdb_last_bgsave_status, aof_last_write_status, latest_fork_usec | 任一 status 不为 ok |
+| 复制 | master_link_status, 主从 offset 差 | link down; 积压持续增长 |
+| 连接 | connected_clients, rejected_connections | rejected 增长 |
+| 慢查询 | SLOWLOG 数量增速 | 每分钟新增超阈值 |
+
+主流方案：Prometheus 的 redis_exporter + Grafana 大盘 + 上表告警规则。
+
+<Callout type="warn" title="生产配置红线复述">
+KEYS/FLUSHALL 重命名禁用；SCAN 系列替代全量遍历命令；删大 key 用 UNLINK；maxmemory 必设且策略非默认 noeviction（缓存场景）；关闭 THP；vm.overcommit_memory=1；客户端命令超时必设。每一条背后都是一类真实事故。
+</Callout>
+
+## 小结
+
+- 排障四板斧：INFO 看全局、SLOWLOG 抓慢命令、LATENCY 定位毛刺来源、MEMORY USAGE 查单 key
+- 大 key 靠拆分/压缩/换结构/UNLINK；热 key 靠本地缓存/副本分摊
+- pipeline 消灭网络往返（非原子）；原生批量命令优先
+- 连接池 + 命令超时是客户端侧的生命线
+- 最后一章：把学到的一切组装成秒杀系统 →
+
+<Callout type="exercise" title="练习">
+1. 把 slowlog-log-slower-than 临时调到 1000（1ms），执行一次对 10 万成员集合的 SMEMBERS，用 SLOWLOG GET 抓到它。
+2. 写脚本对比：循环 1 万次 SET 与 pipeline 批量 1 万次 SET 的总耗时（本机与远程 Redis 各测一次，体会 RTT 的影响）。
+3. 用 redis-cli --bigkeys 扫描你的测试实例，找出最大的 key 并给出治理方案。
+</Callout>

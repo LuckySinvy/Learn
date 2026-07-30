@@ -1,0 +1,338 @@
+---
+title: 泛型基础
+order: 8
+description: 泛型函数、泛型接口、泛型类与类型参数推断，理解「类型的参数」这一抽象
+---
+
+# 泛型基础
+
+到目前为止，我们写的类型都是**固定**的：`number[]`、`(a: string) => boolean`。但很多逻辑其实和具体类型无关——「取数组第一个元素」对数字数组和字符串数组是同一套代码。泛型（generics）就是让类型也能像值一样**被参数化**。
+
+## 1. 为什么需要泛型
+
+先看没有泛型时的三种糟糕做法。写一个「返回数组第一项」的函数：
+
+```ts
+// 做法一：只支持一种类型，其他类型要复制粘贴
+function firstNumber(arr: number[]): number | undefined {
+  return arr[0];
+}
+
+// 做法二：用 any，类型信息全丢了
+function firstAny(arr: any[]): any {
+  return arr[0];
+}
+const s = firstAny(["a"]);   // s 是 any，之后再没有任何提示
+
+// 做法三：用 unknown，安全但调用方每次都要收窄
+function firstUnknown(arr: unknown[]): unknown {
+  return arr[0];
+}
+```
+
+泛型给出第四种做法：**把元素类型留成一个空位，调用时再填上**。
+
+```ts
+function first<T>(arr: T[]): T | undefined {
+  return arr[0];
+}
+
+const a = first([1, 2, 3]);        // a 是 number | undefined
+const b = first(["x", "y"]);       // b 是 string | undefined
+```
+
+<Callout type="info" title="把泛型参数读作「函数的参数」">
+`function first(arr)` 里 `arr` 是值的参数，调用时传值；`function first<T>(...)` 里 `T` 是类型的参数，调用时传类型（通常由编译器自动推断）。理解这个类比，泛型就不神秘了。
+</Callout>
+
+## 2. 泛型函数
+
+### 2.1 基本语法
+
+类型参数写在函数名之后的尖括号里，可以有多个：
+
+```ts
+function pair<A, B>(a: A, b: B): [A, B] {
+  return [a, b];
+}
+
+const p = pair("age", 30);    // [string, number]
+```
+
+### 2.2 类型参数推断
+
+绝大多数情况下**不需要手动写类型参数**，编译器会根据实参倒推：
+
+```ts
+first([1, 2, 3]);        // T 推断为 number
+first<string>(["x"]);    // 也可以显式指定
+```
+
+什么时候需要显式指定？当推断不出来（没有参数可供推断）或推断结果不是你想要的时候：
+
+```ts
+const empty = first([]);              // T 推断为 never
+const empty2 = first<string>([]);     // 显式指定为 string
+```
+
+### 2.3 命名约定
+
+单个类型参数惯用 `T`（Type），多个时常见 `T` `U` `V`，或者更有语义的 `TKey` `TValue` `TItem`。名字长一点通常更好读，尤其是类型参数较多时。
+
+<Playground
+  language="typescript"
+  id="ts-08-generic-fn"
+  title="泛型函数与类型推断"
+  code={`function first<T>(arr: T[]): T | undefined {
+  return arr[0];
+}
+
+function pair<A, B>(a: A, b: B): [A, B] {
+  return [a, b];
+}
+
+function swap<A, B>(t: [A, B]): [B, A] {
+  return [t[1], t[0]];
+}
+
+// 类型参数由实参推断出来
+const n = first([10, 20, 30]);
+const s = first(["x", "y"]);
+console.log("首个数字 = " + String(n));
+console.log("首个字符串大写 = " + (s !== undefined ? s.toUpperCase() : "空"));
+
+const p = pair("age", 30);        // [string, number]
+console.log("pair = " + p[0] + ":" + p[1]);
+
+const q = swap(p);                // [number, string]
+console.log("swap 后第一项加一 = " + (q[0] + 1));
+
+// 显式指定类型参数
+const emptyList = first<string>([]);
+console.log("空数组的首项 = " + String(emptyList));
+
+// 泛型让「工具函数」真正可复用
+function unique<T>(arr: T[]): T[] {
+  const out: T[] = [];
+  for (const item of arr) {
+    if (!out.includes(item)) out.push(item);
+  }
+  return out;
+}
+console.log("去重数字 = " + unique([1, 2, 2, 3, 1]).join(","));
+console.log("去重字符 = " + unique(["a", "b", "a"]).join(","));`}
+  expectedOutput={`首个数字 = 10\n首个字符串大写 = X\npair = age:30\nswap 后第一项加一 = 31\n空数组的首项 = undefined\n去重数字 = 1,2,3\n去重字符 = a,b`}
+/>
+
+## 3. 泛型接口与泛型类型别名
+
+类型参数同样可以加在 `interface` 和 `type` 上：
+
+```ts
+interface Box<T> {
+  value: T;
+  map<U>(fn: (v: T) => U): Box<U>;
+}
+
+type Pair<A, B> = { first: A; second: B };
+type Nullable<T> = T | null;
+```
+
+`Nullable` 这种「一行别名」看起来简单，威力却不小——它让你能给类型运算起名字，从而复用。
+
+<Callout type="tip" title="泛型接口 vs 泛型函数">
+`interface Fn<T> { (x: T): T }` 和 `interface Fn { <T>(x: T): T }` 不一样。前者在**使用接口时**确定 T（`Fn<string>`），后者在**调用函数时**才确定 T。需要「同一个函数对不同类型都能用」时，把类型参数放在调用签名上。
+</Callout>
+
+## 4. 泛型类
+
+类也可以带类型参数，最典型的就是各种容器：
+
+```ts
+class Stack<T> {
+  #items: T[] = [];
+  push(item: T): void { this.#items.push(item); }
+  pop(): T | undefined { return this.#items.pop(); }
+  get size(): number { return this.#items.length; }
+}
+
+const s = new Stack<string>();
+```
+
+注意：**静态成员不能使用类的类型参数**，因为静态成员属于类本身，而类型参数是每次实例化时才确定的。
+
+<Playground
+  language="typescript"
+  id="ts-08-generic-class"
+  title="泛型接口与泛型类"
+  code={`interface Box<T> {
+  value: T;
+}
+
+function unbox<T>(b: Box<T>): T {
+  return b.value;
+}
+
+const numBox: Box<number> = { value: 42 };
+const strBox: Box<string> = { value: "hello" };
+console.log("unbox 数字 = " + unbox(numBox));
+console.log("unbox 字符串 = " + unbox(strBox));
+
+// 泛型类：一个类型安全的栈
+class Stack<T> {
+  #items: T[] = [];
+
+  push(item: T): void {
+    this.#items.push(item);
+  }
+  pop(): T | undefined {
+    return this.#items.pop();
+  }
+  peek(): T | undefined {
+    return this.#items[this.#items.length - 1];
+  }
+  get size(): number {
+    return this.#items.length;
+  }
+}
+
+const stack = new Stack<string>();
+stack.push("a");
+stack.push("b");
+stack.push("c");
+console.log("栈顶 = " + String(stack.peek()) + "，大小 = " + stack.size);
+console.log("弹出 = " + String(stack.pop()));
+console.log("弹出后大小 = " + stack.size);
+// stack.push(1);   // 编译错误：只接受 string
+
+// 泛型类型别名：给类型运算起名字
+type Nullable<T> = T | null;
+type Pair<A, B> = { first: A; second: B };
+
+const maybeName: Nullable<string> = null;
+const kv: Pair<string, number> = { first: "score", second: 95 };
+console.log("maybeName = " + String(maybeName));
+console.log(kv.first + " = " + kv.second);`}
+  expectedOutput={`unbox 数字 = 42\nunbox 字符串 = hello\n栈顶 = c，大小 = 3\n弹出 = c\n弹出后大小 = 2\nmaybeName = null\nscore = 95`}
+/>
+
+## 5. 泛型在真实代码里长什么样
+
+你其实早就在用泛型了。JavaScript 标准库的类型定义里到处都是：
+
+| 你写的代码 | 背后的泛型签名（简化） |
+|---|---|
+| `[1, 2].map(n => n * 2)` | `map<U>(fn: (v: T) => U): U[]` |
+| `new Map()` | `class Map<K, V>` |
+| `Promise.resolve(1)` | `Promise<T>` |
+| `arr.filter(...)` | `filter(fn: (v: T) => boolean): T[]` |
+
+理解了泛型，读这些声明文件就不再费劲了。以 `map` 为例，标准库里的真实声明是：
+
+```ts
+interface Array<T> {
+  map<U>(
+    callbackfn: (value: T, index: number, array: T[]) => U,
+    thisArg?: any,
+  ): U[];
+}
+```
+
+拆开来读：`T` 是数组元素类型，在 `interface Array<T>` 上确定；`U` 是回调返回值的类型，在**每次调用 map 时**确定。所以 `["a"].map(s => s.length)` 里 `T` 是 `string`、`U` 被推断为 `number`，最终返回 `number[]`。类型参数放在接口上还是方法上，决定的正是这个「什么时候确定」的问题。
+
+养成一个习惯：遇到不理解的类型提示，直接在编辑器里跳进声明文件看一眼签名。它们全是普通的 TypeScript 代码，没有魔法。
+
+<Playground
+  language="typescript"
+  id="ts-08-inference"
+  title="推断链：泛型如何在管道里传递类型"
+  code={`interface User {
+  id: number;
+  name: string;
+  score: number;
+}
+
+const users: User[] = [
+  { id: 1, name: "Ada", score: 95 },
+  { id: 2, name: "Alan", score: 88 },
+  { id: 3, name: "Grace", score: 91 },
+];
+
+// map 的类型参数 U 由回调返回值推断
+const names = users.map((u) => u.name);            // string[]
+const scores = users.map((u) => u.score);          // number[]
+console.log("姓名: " + names.join(", "));
+console.log("最高分: " + Math.max(...scores));
+
+// 自己写一个泛型工具：按某个键分组计数
+function countBy<T>(items: T[], key: (item: T) => string): Map<string, number> {
+  const result = new Map<string, number>();
+  for (const item of items) {
+    const k = key(item);
+    result.set(k, (result.get(k) || 0) + 1);
+  }
+  return result;
+}
+
+const grouped = countBy(users, (u) => (u.score >= 90 ? "优秀" : "良好"));
+for (const [k, v] of grouped) {
+  console.log(k + ": " + v + " 人");
+}
+
+// Map 的两个类型参数
+const cache = new Map<number, User>();
+for (const u of users) cache.set(u.id, u);
+const found = cache.get(2);
+console.log("id=2 的用户是 " + (found !== undefined ? found.name : "不存在"));`}
+  expectedOutput={`姓名: Ada, Alan, Grace\n最高分: 95\n优秀: 2 人\n良好: 1 人\nid=2 的用户是 Alan`}
+/>
+
+<Callout type="warn" title="不要为了泛型而泛型">
+如果一个类型参数**只在一处出现**，它多半不该是泛型。比如 `function log<T>(x: T): void` 完全等价于 `function log(x: unknown): void`，加了 `T` 只是徒增阅读成本。泛型的价值在于**建立多个位置之间的类型关联**（参数与返回值、两个参数之间）。
+</Callout>
+
+## 6. 泛型不是什么
+
+初学者常把泛型和另外几个概念搞混，这里逐一澄清。
+
+### 6.1 泛型不是运行时的东西
+
+第 1 章说过类型会被完全擦除，泛型也不例外。编译后 `Stack<string>` 和 `Stack<number>` 是**同一个类**，运行时没有任何办法知道 `T` 到底是什么：
+
+```ts
+function create<T>(): T {
+  // return new T();     // 错误：T 只是类型，运行时不存在
+  // if (typeof T === "string") {}   // 错误：同上
+  throw new Error("做不到");
+}
+```
+
+需要在运行时「按类型行事」时，必须把信息用**值**传进来，比如传一个构造函数、传一个字符串 tag、或者传一个校验函数。这和 Java 的泛型擦除是同一类限制，但比 C# 的具体化泛型弱。
+
+### 6.2 泛型不是重载
+
+重载是「几组固定签名」，泛型是「一组可变签名」。当不同调用之间只有类型不同、逻辑完全一致时用泛型；当**逻辑本身就不同**时才用重载。
+
+### 6.3 泛型不会让代码变慢
+
+类型参数不产生任何运行时开销——编译后它就消失了。唯一的成本是**编译时间**：过度复杂的泛型会显著拖慢类型检查，这在大型项目里是真实存在的问题。
+
+<Callout type="info" title="泛型与结构化类型的配合">
+TypeScript 的泛型建立在结构化类型之上，所以 `Box<string>` 和 `{ value: string }` 是兼容的——不像 Java 那样有「不同实例化的泛型类互不相干」的名义规则。这让泛型代码更容易和普通对象字面量互相配合。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 写一个 `zip` 函数：接收两个数组，返回配对元组数组，签名为 `zip<A, B>(a: A[], b: B[]): [A, B][]`，长度取较短的那个。
+2. 实现泛型类 `Queue<T>`，包含 `enqueue`、`dequeue`、`isEmpty`，内部数组用 `#` 私有字段保护。
+3. 写一个 `groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]>`，返回分组后的元素数组，并用一组对象验证。
+</Callout>
+
+## 小结
+
+- 泛型是「类型的参数」：把具体类型留空，调用时再确定
+- 相比 `any`（丢类型）和 `unknown`（每次都要收窄），泛型保留了完整的类型关联
+- 类型参数通常由实参**自动推断**，推断不出或不满意时才显式指定
+- `interface` / `type` / `class` 都可以带类型参数；静态成员不能用类的类型参数
+- 类型参数放在接口上还是调用签名上，决定了 T 在何时被确定
+- 类型参数只出现一次时，往往说明不需要泛型
+- 下一章讲泛型约束、默认类型参数与分发行为 →

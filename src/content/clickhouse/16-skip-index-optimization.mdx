@@ -1,0 +1,578 @@
+---
+title: 跳数索引与查询优化
+order: 16
+description: minmax/set/bloom_filter 索引、Projection 投影、EXPLAIN 与 query_log 分析
+---
+
+# 跳数索引与查询优化
+
+主键索引只对排序键前缀有效。但业务上总有「按非排序键列过滤」的需求——`WHERE user_id = 10086`、`WHERE page LIKE '%checkout%'`。
+
+这一章讲两个补救手段（跳数索引、投影）和一套系统的调优方法论。
+
+## 1. 跳数索引是什么
+
+跳数索引（Data Skipping Index）不是 MySQL 那种「定位到行」的索引，而是**记录每 N 个 granule 的统计信息，用来判断能不能整块跳过**。
+
+```text
+主键索引（稀疏索引）              跳数索引
+每 8192 行记一个键值             每 GRANULARITY × 8192 行记一份统计
+用于二分定位起始位置              用于判断「这块里可能有目标值吗」
+
+granule:  [0-8191] [8192-16383] [16384-24575] [24576-32767]
+                                                              
+minmax 索引 (GRANULARITY 4)：
+  记录 [0-32767] 这 4 个 granule 里 user_id 的 min=1, max=48213
+
+查询 WHERE user_id = 99999
+  → 99999 > max(48213)，整块 4 个 granule 全部跳过
+```
+
+关键理解：**跳数索引只能"排除"，不能"定位"**。它回答的是「这块数据里肯定没有目标值吗」，答案是"肯定没有"时跳过，"可能有"时就得读。
+
+## 2. 四种跳数索引
+
+### 2.1 minmax
+
+记录每个索引块内该表达式的最小值和最大值。
+
+```sql
+ALTER TABLE events
+    ADD INDEX idx_duration duration_ms TYPE minmax GRANULARITY 4;
+
+ALTER TABLE events MATERIALIZE INDEX idx_duration;   -- 对历史数据生效
+```
+
+适用条件：**列的值与主键排序有相关性**。
+
+```text
+好的场景：event_id 随时间递增，主键是 event_time
+  block 0: event_id ∈ [1, 8192]
+  block 1: event_id ∈ [8193, 16384]     ← 区间不重叠，跳过效果极好
+  查 event_id = 20000 → 只读 block 2
+
+坏的场景：user_id 完全随机
+  block 0: user_id ∈ [1, 49998]
+  block 1: user_id ∈ [3, 49999]         ← 区间几乎完全重叠
+  查 user_id = 10086 → 每块都"可能有"，一块都跳不掉
+```
+
+<Callout type="tip" title="minmax 是最便宜的索引">
+它只存两个值，几乎不占空间，构建也快。**只要列和主键有相关性，就无脑加上**。
+
+典型场景：自增 ID、创建时间之外的另一个时间列（`update_time`）、单调递增的序列号。
+</Callout>
+
+### 2.2 set
+
+记录每个索引块内该表达式的**不同取值集合**（最多 N 个）。
+
+```sql
+ALTER TABLE events
+    ADD INDEX idx_page_set page TYPE set(1000) GRANULARITY 4;
+```
+
+`set(1000)` 表示每个块最多记 1000 个不同值；超过就放弃（该块永远不跳过）。
+
+适用条件：**块内基数低**。比如 `page` 全表有 50 万种，但按主键排序后每个块内只有几百种，`set` 就很有效。
+
+```sql
+-- 检查块内基数
+SELECT
+    intDiv(rowNumberInAllBlocks(), 32768) AS block,
+    uniqExact(page)                       AS distinct_in_block
+FROM events
+GROUP BY block
+LIMIT 5;
+```
+
+### 2.3 bloom_filter
+
+布隆过滤器，用位图判断「值可能存在 / 一定不存在」。
+
+```sql
+ALTER TABLE events
+    ADD INDEX idx_user_bf user_id TYPE bloom_filter(0.01) GRANULARITY 4;
+```
+
+参数 `0.01` 是**假阳性率**（1%）。越小索引越大：
+
+| 假阳性率 | 每个值占用 | 说明 |
+|---|---|---|
+| 0.1 | 约 4.8 bit | 索引小，10% 的块白读 |
+| 0.01（推荐） | 约 9.6 bit | 平衡点 |
+| 0.001 | 约 14.4 bit | 索引大，精度高 |
+
+适用条件：**高基数列的等值查询**。这是解决「按 user_id 点查」的标准方案。
+
+```sql
+-- 加索引前
+SELECT count() FROM events WHERE user_id = 10086;
+-- Elapsed: 0.184 sec. Processed 20.00 million rows
+
+-- 加索引后
+ALTER TABLE events ADD INDEX idx_user_bf user_id TYPE bloom_filter(0.01) GRANULARITY 4;
+ALTER TABLE events MATERIALIZE INDEX idx_user_bf;
+
+SELECT count() FROM events WHERE user_id = 10086;
+-- Elapsed: 0.012 sec. Processed 425.98 thousand rows
+```
+
+**扫描行数从 2000 万降到 42 万，快 15 倍**。
+
+### 2.4 tokenbf_v1 与 ngrambf_v1：文本搜索
+
+```sql
+-- tokenbf：按非字母数字字符切词，适合 URL、日志
+ALTER TABLE events
+    ADD INDEX idx_page_token page TYPE tokenbf_v1(8192, 3, 0) GRANULARITY 4;
+
+-- ngrambf：按 N-gram 切分，适合中文、子串匹配
+ALTER TABLE events
+    ADD INDEX idx_page_ngram page TYPE ngrambf_v1(4, 8192, 3, 0) GRANULARITY 4;
+```
+
+参数含义：
+
+| 参数 | tokenbf_v1 | ngrambf_v1 |
+|---|---|---|
+| 第 1 个 | 布隆过滤器大小（字节） | n-gram 长度（如 4） |
+| 第 2 个 | 哈希函数个数 | 布隆过滤器大小 |
+| 第 3 个 | 随机种子 | 哈希函数个数 |
+| 第 4 个 | — | 随机种子 |
+
+生效的查询：
+
+```sql
+-- tokenbf 支持
+WHERE hasToken(page, 'checkout')
+WHERE page LIKE '%checkout%'
+WHERE page = '/checkout'
+WHERE multiSearchAny(page, ['checkout', 'cart'])
+
+-- ngrambf 额外支持任意子串
+WHERE page LIKE '%eckou%'      -- tokenbf 无效，ngrambf 有效
+```
+
+<Callout type="warn" title="tokenbf 只能匹配完整 token">
+`tokenbf_v1` 把 `/p/checkout/step2` 切成 `['p', 'checkout', 'step2']`。
+
+- `LIKE '%checkout%'` → 有效（checkout 是完整 token）
+- `LIKE '%check%'` → **无效**（check 不是完整 token，索引会被跳过，退化成全扫）
+
+中文没有空格分隔，`tokenbf` 完全无效，必须用 `ngrambf_v1(2 或 3, ...)`。
+</Callout>
+
+## 3. GRANULARITY 参数
+
+跳数索引的 `GRANULARITY N` 表示**每 N 个主键 granule 记一份统计**。
+
+```text
+GRANULARITY 1：每 8192 行一份统计
+  索引最精细，但索引本身大，且构建/加载慢
+
+GRANULARITY 4（推荐）：每 32768 行一份
+  平衡点
+
+GRANULARITY 16：每 131072 行一份
+  索引小，但跳过粒度粗
+```
+
+选择原则：
+
+- 数据分布**集中**（同一个值扎堆）→ 用大 GRANULARITY
+- 数据分布**分散**（值随机散布）→ 用小 GRANULARITY，但如果太分散，索引根本没用
+
+## 4. 验证索引是否生效
+
+```sql
+EXPLAIN indexes = 1
+SELECT count() FROM events WHERE user_id = 10086;
+```
+
+```text
+Expression ((Projection + Before ORDER BY))
+  Aggregating
+    Expression (Before GROUP BY)
+      ReadFromMergeTree (demo.events)
+      Indexes:
+        MinMax
+          Condition: true
+          Parts: 4/4
+          Granules: 2442/2442
+        Partition
+          Condition: true
+          Parts: 4/4
+          Granules: 2442/2442
+        PrimaryKey
+          Condition: true
+          Parts: 4/4
+          Granules: 2442/2442
+        Skip
+          Name: idx_user_bf
+          Description: bloom_filter GRANULARITY 4
+          Parts: 3/4                    ← 排除了 1 个 part
+          Granules: 52/2442             ← 2442 个 granule 只读 52 个
+```
+
+`Granules: 52/2442` 就是索引效率。如果加了索引但这个比值没变，说明索引没生效。
+
+<Callout type="warn" title="索引不生效的常见原因">
+1. **忘了 MATERIALIZE**。`ADD INDEX` 只对新写入的数据生效，历史数据要 `ALTER TABLE ... MATERIALIZE INDEX idx_name`。
+
+2. **WHERE 条件包了函数**。`WHERE toString(user_id) = '10086'` 无法用索引，必须让列裸露。
+
+3. **索引类型和查询不匹配**。`bloom_filter` 只支持等值和 `IN`，不支持范围查询（`>`、`BETWEEN`）；范围查询要用 `minmax`。
+
+4. **数据分布不适合**。随机分布的列用 `minmax` 完全无效。
+
+5. **被设置禁用了**。检查 `SELECT ... SETTINGS use_skip_indexes = 1`（默认开）。
+</Callout>
+
+查看已有索引及大小：
+
+```sql
+SELECT
+    table, name, type_full, granularity,
+    formatReadableSize(data_compressed_bytes) AS size
+FROM system.data_skipping_indices
+WHERE database = 'demo';
+```
+
+```text
+┌─table──┬─name──────────┬─type_full──────────────┬─granularity─┬─size──────┐
+│ events │ idx_user_bf   │ bloom_filter(0.01)     │           4 │ 1.24 MiB  │
+│ events │ idx_duration  │ minmax                 │           4 │ 12.4 KiB  │
+│ events │ idx_page_token│ tokenbf_v1(8192, 3, 0) │           4 │ 4.82 MiB  │
+└────────┴───────────────┴────────────────────────┴─────────────┴───────────┘
+```
+
+## 5. Projection：另一套排序的物化副本
+
+跳数索引只能"跳过"，投影则是**存一份按不同键排序的完整数据**。
+
+### 5.1 排序投影
+
+```sql
+ALTER TABLE events ADD PROJECTION proj_by_user
+(
+    SELECT *
+    ORDER BY (user_id, event_time)
+);
+
+ALTER TABLE events MATERIALIZE PROJECTION proj_by_user;
+```
+
+现在表里有两份数据：
+
+```text
+events/202406_1_9_2/
+├── event_time.bin           ← 主数据，按 (country, event_type, event_time) 排序
+├── user_id.bin
+├── ...
+└── proj_by_user.proj/       ← 投影，按 (user_id, event_time) 排序
+    ├── event_time.bin
+    ├── user_id.bin
+    ├── primary.cidx
+    └── ...
+```
+
+查询时 ClickHouse **自动选择**更合适的那份：
+
+```sql
+SELECT * FROM events WHERE user_id = 10086 ORDER BY event_time;
+```
+
+```sql
+EXPLAIN indexes = 1 SELECT count() FROM events WHERE user_id = 10086;
+```
+
+```text
+      ReadFromMergeTree (demo.events)
+      Projections:
+        Name: proj_by_user
+        Description: Projection has been analyzed and is used
+        Condition: true
+        Search Algorithm: projection
+        Parts: 4
+        Granules: 8               ← 从投影读，只需 8 个 granule
+```
+
+### 5.2 聚合投影
+
+投影也可以是聚合结果，效果类似物化视图但**由引擎自动维护和选择**：
+
+```sql
+ALTER TABLE events ADD PROJECTION proj_daily_agg
+(
+    SELECT
+        toDate(event_time) AS day,
+        country,
+        count(),
+        sum(duration_ms),
+        uniqState(user_id)
+    GROUP BY day, country
+);
+
+ALTER TABLE events MATERIALIZE PROJECTION proj_daily_agg;
+```
+
+之后这个查询会自动走投影：
+
+```sql
+SELECT toDate(event_time) AS day, country, count()
+FROM events GROUP BY day, country;
+-- 自动从 proj_daily_agg 读，不扫明细
+```
+
+### 5.3 Projection vs 物化视图
+
+| | Projection | 物化视图 |
+|---|---|---|
+| 查询是否需要改 | **不需要**，引擎自动选 | 需要显式查目标表 |
+| 数据一致性 | **强一致**（同一个 part 内） | 最终一致 |
+| 支持删除/更新 | **是**（随 part 一起） | 否 |
+| 跨表 | 否 | 是 |
+| 存储位置 | part 内的子目录 | 独立表 |
+| 灵活性 | 低（只能基于本表） | 高 |
+
+<Callout type="tip" title="Projection 的最大优势是透明">
+业务方的 SQL 一行不用改，加个投影就变快了。而物化视图需要业务改成查汇总表。
+
+对于「已经上线、不想改代码」的场景，Projection 是首选。
+</Callout>
+
+<Callout type="warn" title="Projection 的代价">
+1. **存储翻倍**。排序投影是完整数据的副本。
+2. **写入变慢**。每次 INSERT 和 merge 都要额外维护投影。
+3. **不能用 lightweight delete**。带投影的表某些操作受限。
+4. **不是所有查询都能命中**。投影的匹配规则比较严格，`EXPLAIN` 里没看到 `Projections` 就是没命中。
+
+一张表建议不超过 2~3 个投影。
+</Callout>
+
+## 6. EXPLAIN 全家桶
+
+```sql
+-- 1. 查询计划（默认）
+EXPLAIN SELECT country, count() FROM events GROUP BY country;
+
+-- 2. 索引分析（最常用）
+EXPLAIN indexes = 1 SELECT count() FROM events WHERE country = 'CN';
+
+-- 3. 执行管道
+EXPLAIN PIPELINE SELECT country, count() FROM events GROUP BY country;
+
+-- 4. 语法树
+EXPLAIN AST SELECT 1;
+
+-- 5. 优化后的语法树
+EXPLAIN SYNTAX SELECT * FROM events WHERE 1 = 1 AND country = 'CN';
+
+-- 6. 估算读取量
+EXPLAIN ESTIMATE SELECT count() FROM events WHERE country = 'CN';
+```
+
+```text
+-- EXPLAIN ESTIMATE 输出
+┌─database─┬─table──┬─parts─┬────rows─┬─marks─┐
+│ demo     │ events │     4 │ 4098048 │   501 │
+└──────────┴────────┴───────┴─────────┴───────┘
+```
+
+`EXPLAIN ESTIMATE` 在不执行查询的情况下估算要读多少行，做优化时很方便。
+
+```sql
+-- PIPELINE 能看到并行度
+EXPLAIN PIPELINE SELECT country, count() FROM events GROUP BY country;
+```
+
+```text
+(Expression)
+ExpressionTransform × 8              ← 8 个并行线程
+  (Aggregating)
+  Resize 8 → 8
+    AggregatingTransform × 8
+      StrictResize 8 → 8
+        (Expression)
+        ExpressionTransform × 8
+          (ReadFromMergeTree)
+          MergeTreeThread × 8 0 → 1
+```
+
+## 7. query_log：性能分析的主战场
+
+每条查询的执行细节都记录在 `system.query_log`。
+
+```sql
+-- 最近的慢查询 Top 10
+SELECT
+    event_time,
+    query_duration_ms,
+    formatReadableQuantity(read_rows)            AS rows,
+    formatReadableSize(read_bytes)               AS bytes,
+    formatReadableSize(memory_usage)             AS mem,
+    result_rows,
+    substring(query, 1, 100)                     AS q
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND event_date = today()
+  AND query_kind = 'Select'
+ORDER BY query_duration_ms DESC
+LIMIT 10;
+```
+
+```text
+┌──────────event_time─┬─query_duration_ms─┬─rows──────────┬─bytes─────┬─mem───────┬─result_rows─┬─q──────────────────────────────┐
+│ 2024-07-30 12:04:12 │              4218 │ 20.00 million │ 1.24 GiB  │ 820 MiB   │           5 │ SELECT country, uniqExact(us...│
+│ 2024-07-30 12:03:41 │              1842 │ 20.00 million │ 480 MiB   │ 240 MiB   │        1000 │ SELECT page, count() FROM ev...│
+└─────────────────────┴───────────────────┴───────────────┴───────────┴───────────┴─────────────┴────────────────────────────────┘
+```
+
+### 7.1 按查询模式聚合
+
+```sql
+-- 找出最消耗资源的查询模式（normalized_query_hash 会把参数不同的同类查询归并）
+SELECT
+    normalized_query_hash,
+    count()                                          AS runs,
+    round(avg(query_duration_ms), 1)                 AS avg_ms,
+    max(query_duration_ms)                           AS max_ms,
+    formatReadableQuantity(sum(read_rows))           AS total_rows,
+    formatReadableSize(max(memory_usage))            AS peak_mem,
+    any(substring(query, 1, 80))                     AS sample
+FROM system.query_log
+WHERE type = 'QueryFinish' AND event_date >= today() - 7 AND query_kind = 'Select'
+GROUP BY normalized_query_hash
+ORDER BY sum(query_duration_ms) DESC
+LIMIT 10;
+```
+
+按「总耗时」而不是「单次耗时」排序——一个跑 1 万次的 100 毫秒查询，比一个跑 1 次的 10 秒查询更值得优化。
+
+### 7.2 ProfileEvents：深入细节
+
+```sql
+SELECT
+    query_duration_ms,
+    ProfileEvents['SelectedParts']              AS parts,
+    ProfileEvents['SelectedMarks']              AS marks,
+    ProfileEvents['SelectedRanges']             AS ranges,
+    ProfileEvents['OSReadBytes']                AS disk_read,
+    ProfileEvents['OSCPUVirtualTimeMicroseconds'] / 1000 AS cpu_ms,
+    ProfileEvents['NetworkSendBytes']           AS net_send
+FROM system.query_log
+WHERE query_id = '你的-query-id' AND type = 'QueryFinish';
+```
+
+`SelectedMarks` 是最关键的指标——它就是实际读取的 granule 数。
+
+### 7.3 失败查询排查
+
+```sql
+SELECT
+    event_time, query_duration_ms,
+    exception_code, exception,
+    substring(query, 1, 200) AS q
+FROM system.query_log
+WHERE type = 'ExceptionWhileProcessing' AND event_date = today()
+ORDER BY event_time DESC
+LIMIT 5;
+```
+
+## 8. 优化 Checklist
+
+拿到一个慢查询，按这个顺序排查：
+
+```text
+第 1 步：看扫描量
+  SELECT ... 的输出末尾 "Processed X rows"
+  或 EXPLAIN ESTIMATE
+  ├─ 扫描量 ≈ 全表 ──▶ 索引没生效，往下走
+  └─ 扫描量已经很小 ──▶ 问题在计算/内存，跳到第 5 步
+
+第 2 步：分区裁剪
+  EXPLAIN indexes = 1 看 MinMax / Partition 的 Parts: x/y
+  ├─ 没裁剪 ──▶ WHERE 里的时间列被函数包了？加时间范围条件？
+  └─ 已裁剪 ──▶ 继续
+
+第 3 步：主键索引
+  看 PrimaryKey 的 Granules: x/y
+  ├─ 比值接近 1 ──▶ 排序键不匹配查询模式
+  │                  → 考虑加 Projection 或重建表
+  └─ 比值很小 ──▶ 继续
+
+第 4 步：跳数索引
+  按非排序键列过滤？
+  ├─ 等值 + 高基数 ──▶ bloom_filter
+  ├─ 范围 + 与主键相关 ──▶ minmax
+  ├─ 块内低基数 ──▶ set(N)
+  └─ 文本包含 ──▶ tokenbf_v1 / ngrambf_v1
+
+第 5 步：计算优化
+  ├─ uniqExact → uniqCombined
+  ├─ count(DISTINCT) → uniq
+  ├─ JOIN → 字典 / IN
+  ├─ 窗口函数 → 先聚合再开窗
+  ├─ SELECT * → 只选需要的列
+  └─ 正则 → startsWith / position
+
+第 6 步：并发与资源
+  ├─ max_threads 是否够
+  ├─ 内存是否触及 max_memory_usage
+  └─ 是否被其他查询挤占（system.processes）
+```
+
+### 8.1 常见优化对照表
+
+| 反模式 | 改法 | 收益 |
+|---|---|---|
+| `SELECT *` | 只列需要的列 | 与列数成正比 |
+| `WHERE toDate(t) = '2024-06-15'` | `WHERE t >= '2024-06-15' AND t < '2024-06-16'` | 恢复分区裁剪 |
+| `WHERE toString(id) = '123'` | `WHERE id = 123` | 恢复索引 |
+| `count(DISTINCT x)` | `uniqCombined(x)` | 10 倍以上 |
+| `JOIN 维表` | `dictGet` | 5~10 倍 |
+| `ORDER BY x LIMIT 10` 无索引 | 加 `optimize_read_in_order` 或调整排序键 | 视情况 |
+| 大表直接开窗 | 先 GROUP BY 再开窗 | 数量级 |
+| `LIKE '%xxx%'` | `hasToken` + tokenbf 索引 | 10 倍以上 |
+| `IN (超大列表)` | 用临时表 + JOIN 或 `IN (SELECT)` | 避免 SQL 解析爆炸 |
+
+### 8.2 实时监控当前查询
+
+```sql
+-- 正在跑的查询
+SELECT
+    query_id,
+    elapsed,
+    round(read_rows / elapsed) AS rows_per_sec,
+    formatReadableSize(memory_usage) AS mem,
+    user,
+    substring(query, 1, 80) AS q
+FROM system.processes
+ORDER BY elapsed DESC;
+
+-- 杀掉失控的查询
+KILL QUERY WHERE query_id = 'xxx-xxx-xxx';
+KILL QUERY WHERE elapsed > 300 AND user = 'analyst';
+```
+
+<Callout type="exercise" title="练习">
+1. 对 `events` 表执行 `SELECT count() FROM events WHERE user_id = 10086`，记录 Processed rows。然后加 `bloom_filter(0.01)` 索引并 MATERIALIZE，再次执行，对比扫描量和耗时。
+2. 用 `EXPLAIN indexes = 1` 观察加索引前后 `Skip` 部分的 `Granules: x/y` 变化。
+3. 给 `page` 列加 `tokenbf_v1` 索引，测试 `WHERE hasToken(page, 'checkout')` 和 `WHERE page LIKE '%eckou%'` 两种查询，验证后者索引失效。
+4. 建一个 `ORDER BY (user_id, event_time)` 的排序投影，用 `EXPLAIN indexes = 1` 确认查询自动走了投影。对比表的磁盘占用变化。
+5. 从 `system.query_log` 按 `normalized_query_hash` 聚合，找出你环境里总耗时最高的三个查询模式，逐个套用第 8 节的 checklist 优化。
+</Callout>
+
+## 小结
+
+- 跳数索引只能"排除"整块数据，不能定位单行，效果完全取决于数据分布
+- `minmax` 最便宜，适合与主键相关的列；`set(N)` 适合块内低基数；`bloom_filter` 解决高基数等值查询；`tokenbf_v1`/`ngrambf_v1` 做文本包含
+- `tokenbf` 只匹配完整 token，中文和子串必须用 `ngrambf`
+- 加索引后必须 `MATERIALIZE INDEX` 才对历史数据生效
+- Projection 存一份不同排序的副本，引擎自动选择，业务 SQL 不用改，代价是存储翻倍
+- `EXPLAIN indexes = 1` 看 `Granules: x/y` 是判断索引效率的黄金指标
+- `EXPLAIN ESTIMATE` 不执行就能估算读取量
+- `system.query_log` 按 `normalized_query_hash` 聚合，按总耗时而非单次耗时排序找优化目标
+- 优化按顺序排查：扫描量 → 分区裁剪 → 主键索引 → 跳数索引 → 计算 → 资源
+- 下一章进入分布式，讲分片与副本 →

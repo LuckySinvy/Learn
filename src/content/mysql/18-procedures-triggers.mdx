@@ -1,0 +1,209 @@
+---
+title: 存储过程、触发器与事件
+order: 18
+description: 存储过程/函数/触发器/事件调度器的语法、适用场景，以及生产上为什么要慎用
+---
+
+# 存储过程、触发器与事件
+
+MySQL 允许把逻辑放进数据库：存储过程封装多条 SQL、触发器在增删改时自动执行、事件调度器定时跑任务。这些能力**要会**（造测试数据、接手遗留系统都用得上），但也要清楚**为什么现代互联网架构普遍把它们请出生产环境**。本章两件事都讲。
+
+## 1. 存储过程（PROCEDURE）
+
+### 1.1 基本语法
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE get_user_orders(IN p_user_id BIGINT, OUT p_total DECIMAL(12,2))
+BEGIN
+  SELECT order_no, status, total_amount, created_at
+  FROM orders
+  WHERE user_id = p_user_id
+  ORDER BY created_at DESC;
+
+  SELECT IFNULL(SUM(total_amount), 0) INTO p_total
+  FROM orders
+  WHERE user_id = p_user_id AND status IN (1,2,3);
+END //
+
+DELIMITER ;
+
+-- 调用
+CALL get_user_orders(1, @total);
+SELECT @total;
+```
+
+要点：
+
+- `DELIMITER //` 临时改结束符——过程体里有分号，得让客户端别在第一个分号处就把语句切断；
+- 参数三种方向：`IN`（入参）、`OUT`（出参）、`INOUT`；
+- `SELECT ... INTO 变量` 给变量赋值；`@total` 是会话级用户变量。
+
+### 1.2 流程控制与批量造数
+
+存储过程最实用的场景：**造测试数据**（第 7 章练习深分页就需要百万行）：
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE gen_test_orders(IN p_count INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  DECLARE v_user BIGINT;
+
+  WHILE i < p_count DO
+    SET v_user = FLOOR(1 + RAND() * 3);
+    INSERT INTO orders (order_no, user_id, status, total_amount, created_at)
+    VALUES (CONCAT('T', LPAD(i, 10, '0')),
+            v_user,
+            FLOOR(RAND() * 5),
+            ROUND(RAND() * 10000, 2),
+            NOW() - INTERVAL FLOOR(RAND() * 365) DAY);
+    SET i = i + 1;
+    IF i % 1000 = 0 THEN
+      COMMIT;               -- 分批提交，避免超大事务
+    END IF;
+  END WHILE;
+END //
+
+DELIMITER ;
+
+SET autocommit = 0;
+CALL gen_test_orders(100000);
+COMMIT;
+SET autocommit = 1;
+```
+
+其他流程控制：`IF/ELSEIF/ELSE`、`CASE`、`REPEAT ... UNTIL`、`LOOP + LEAVE`，以及游标（CURSOR）逐行处理结果集——语法都不难，需要时查手册即可。
+
+管理命令：
+
+```sql
+SHOW PROCEDURE STATUS WHERE db = 'shop';
+SHOW CREATE PROCEDURE get_user_orders\G
+DROP PROCEDURE IF EXISTS get_user_orders;
+```
+
+## 2. 自定义函数（FUNCTION）
+
+函数必须返回单值，能嵌进 SQL 表达式里用：
+
+```sql
+DELIMITER //
+
+CREATE FUNCTION order_status_text(p_status TINYINT)
+RETURNS VARCHAR(10)
+DETERMINISTIC
+BEGIN
+  RETURN CASE p_status
+    WHEN 0 THEN '待支付' WHEN 1 THEN '已支付' WHEN 2 THEN '已发货'
+    WHEN 3 THEN '已完成' ELSE '已取消' END;
+END //
+
+DELIMITER ;
+
+SELECT order_no, order_status_text(status) AS st FROM orders;
+```
+
+与过程的区别：函数有 RETURNS、在表达式中调用、限制更多（不能返回结果集、默认要求声明 DETERMINISTIC 等特性，开了 binlog 时未声明会报 1418 错误）。
+
+**注意**：SQL 里对每一行都调用一次函数，无法利用索引，大表上性能差。展示映射这种事放应用层做更好。
+
+## 3. 触发器（TRIGGER）
+
+在表的 INSERT/UPDATE/DELETE 前后自动执行，`NEW` / `OLD` 引用新旧行：
+
+```sql
+-- 审计：记录 products 价格变动
+CREATE TABLE product_price_log (
+  id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  product_id BIGINT UNSIGNED NOT NULL,
+  old_price  DECIMAL(10,2)   NOT NULL,
+  new_price  DECIMAL(10,2)   NOT NULL,
+  changed_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+DELIMITER //
+
+CREATE TRIGGER trg_product_price_audit
+AFTER UPDATE ON products
+FOR EACH ROW
+BEGIN
+  IF OLD.price <> NEW.price THEN
+    INSERT INTO product_price_log (product_id, old_price, new_price)
+    VALUES (OLD.id, OLD.price, NEW.price);
+  END IF;
+END //
+
+DELIMITER ;
+
+UPDATE products SET price = 7599.00 WHERE id = 1;
+SELECT * FROM product_price_log;
+```
+
+时机与事件组合：BEFORE/AFTER × INSERT/UPDATE/DELETE，每张表每种组合各最多一个（8.0 允许同组合多个，按顺序执行）。BEFORE 触发器还能改 `NEW.列` 的值（如自动填充、标准化数据）。
+
+## 4. 事件调度器（EVENT）
+
+数据库内置的定时任务：
+
+```sql
+-- 确认调度器开启
+SHOW VARIABLES LIKE 'event_scheduler';
+SET GLOBAL event_scheduler = ON;
+
+-- 每天凌晨 3 点清理 90 天前的价格日志
+CREATE EVENT ev_purge_price_log
+ON SCHEDULE EVERY 1 DAY STARTS '2026-08-01 03:00:00'
+DO
+  DELETE FROM product_price_log
+  WHERE changed_at < NOW() - INTERVAL 90 DAY
+  LIMIT 10000;
+
+SHOW EVENTS FROM shop;
+```
+
+## 5. 为什么生产上要慎用
+
+这些特性在传统企业软件（Oracle 时代）里是主力，但互联网架构下普遍被限制使用，原因是系统性的：
+
+### 5.1 共性问题
+
+1. **不可观测**：逻辑藏在数据库里，应用日志、链路追踪、APM 全部失明。触发器尤甚——一条 UPDATE 悄悄引发连锁写入，排查者一脸茫然；
+2. **难以版本管理与发布**：代码有 Git、CR、灰度、回滚，存储过程往往是 DBA 手工执行的脚本，变更不可追溯；
+3. **难调试难测试**：没有断点、没有单测框架、报错信息贫瘠；
+4. **占用数据库 CPU**：数据库是最难水平扩展的组件，应用服务器可以加机器，把计算塞进数据库等于把负载压到最脆弱的一环；
+5. **分库分表不兼容**：数据拆到多个实例后，跨库的过程/触发器逻辑直接失效；
+6. **主从与迁移隐患**：基于语句的复制下触发器行为可能不一致；换数据库（如迁 PG/TiDB）时这些方言代码全要重写。
+
+### 5.2 各自的合理保留区
+
+| 特性 | 可以用的场景 |
+|---|---|
+| 存储过程 | 造测试数据、一次性数据修复/迁移脚本、DBA 运维工具 |
+| 函数 | 极简单且确定性的转换（且团队认可） |
+| 触发器 | 遗留系统兼容、简单审计留痕（新系统建议用 binlog 订阅代替，如 Canal/Debezium） |
+| 事件 | 无外部调度设施的小项目定时清理（有 K8s CronJob/XXL-Job 就用它们） |
+
+<Callout type="warn" title="触发器是隐形炸弹">
+接手老系统时务必先执行 `SELECT trigger_name, event_object_table, action_timing, event_manipulation FROM information_schema.triggers WHERE trigger_schema = 'shop';` 摸清所有触发器，否则「我只改了一行，为什么另一张表变了」会让你怀疑人生。批量导数据前尤其要检查——触发器会被逐行触发，性能雪崩。
+</Callout>
+
+<Callout type="info" title="业务逻辑的归属原则">
+一句话准则：**数据的完整性约束（唯一、非空、外键）交给数据库，业务流程逻辑留在应用代码**。前者是数据的固有属性，后者需要可观测、可测试、可发布的工程设施。
+</Callout>
+
+## 小结
+
+- 存储过程封装多条 SQL，DELIMITER + IN/OUT 参数 + 流程控制；造数据神器
+- 函数返回单值可嵌入表达式，但逐行调用性能差
+- 触发器 BEFORE/AFTER × 增删改自动执行，NEW/OLD 引用行；审计可用但要克制
+- 事件调度器是库内 cron，有外部调度就别用
+- 生产慎用的根因：不可观测、难发布、占数据库 CPU、不兼容分库分表
+
+<Callout type="exercise" title="练习">
+1. 写一个存储过程给 orders 造 10 万行测试数据（分批提交），完成后用它验证第 7 章的深分页优化效果。
+2. 给 users 表建一个 BEFORE INSERT 触发器：email 统一转小写存储；插入大写邮箱验证效果。
+3. 列出你当前库中所有触发器和事件，然后全部 DROP 掉，体会「摸清遗留逻辑」的排查过程。
+</Callout>

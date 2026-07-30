@@ -1,0 +1,152 @@
+---
+title: 事务与 ACID
+order: 15
+description: BEGIN/COMMIT/ROLLBACK、savepoint、redo log 与 undo log、两阶段提交
+---
+
+# 事务与 ACID
+
+转账扣了款却没入账、下单扣了库存却没生成订单——没有事务，这些「半截子操作」会摧毁数据的正确性。本章从事务的使用讲到 InnoDB 靠 redo log / undo log 实现 ACID 的底层机制，最后讲清面试必问的「两阶段提交」。
+
+## 1. ACID：事务的四个承诺
+
+| 特性 | 含义 | 由谁实现 |
+|---|---|---|
+| 原子性 Atomicity | 全做或全不做 | undo log（回滚日志） |
+| 一致性 Consistency | 从一个合法状态到另一个合法状态 | 其余三者 + 应用约束共同保证 |
+| 隔离性 Isolation | 并发事务互不干扰 | 锁 + MVCC（第 16、17 章） |
+| 持久性 Durability | 提交了就不会丢 | redo log（重做日志） |
+
+一致性是**目的**，原子性、隔离性、持久性是**手段**——这个关系理清了，ACID 就不再是背诵条目。
+
+## 2. 事务的基本使用
+
+```sql
+-- 显式事务：下单三件套
+BEGIN;   -- 或 START TRANSACTION
+
+INSERT INTO orders (order_no, user_id, status, total_amount)
+VALUES ('SO20260730006', 1, 0, 3999.00);
+
+INSERT INTO order_items (order_id, product_id, quantity, price)
+VALUES (LAST_INSERT_ID(), 2, 1, 3999.00);
+
+UPDATE products SET stock = stock - 1 WHERE id = 2 AND stock >= 1;
+-- 检查 affected rows：为 0 说明库存不足，应 ROLLBACK
+
+COMMIT;     -- 全部生效
+-- ROLLBACK; -- 或全部撤销
+```
+
+### 2.1 autocommit
+
+默认 `autocommit = 1`：每条 DML 单独成一个事务并立即提交。`BEGIN` 会临时接管直到 COMMIT/ROLLBACK。
+
+```sql
+SHOW VARIABLES LIKE 'autocommit';
+SET autocommit = 0;   -- 慎用：之后每条语句都在未提交事务里
+```
+
+<Callout type="warn" title="长事务是万恶之源">
+把 autocommit 关掉又忘了提交、或者事务里夹了 RPC 调用/人工等待，就会产生长事务。危害：undo log 无法清理（MVCC 要保留老版本）导致存储膨胀、行锁一直握着引发大面积锁等待、还会阻塞 DDL（MDL 锁）。排查：`SELECT * FROM information_schema.innodb_trx WHERE TIME_TO_SEC(TIMEDIFF(NOW(), trx_started)) > 60;` 生产建议监控并告警超过 N 秒的事务。
+</Callout>
+
+### 2.2 SAVEPOINT：部分回滚
+
+```sql
+BEGIN;
+INSERT INTO orders (order_no, user_id) VALUES ('SO7', 1);
+SAVEPOINT sp1;
+INSERT INTO orders (order_no, user_id) VALUES ('SO8', 2);
+ROLLBACK TO sp1;   -- 只撤销 SO8，SO7 还在事务里
+COMMIT;            -- 最终只有 SO7 生效
+```
+
+适合「批量处理中单条失败跳过」的场景，但逻辑复杂时更推荐拆小事务。
+
+### 2.3 隐式提交
+
+DDL（CREATE/ALTER/DROP）、`LOCK TABLES` 等语句会**隐式提交当前事务**——事务里混 DDL，前面的 DML 就被悄悄提交了，无法再回滚。事务里只放 DML。
+
+## 3. undo log：原子性与回滚
+
+执行 DML 时，InnoDB 先把「反向操作」记进 undo log：
+
+- INSERT 一行 → undo 记「删掉这行」
+- DELETE 一行 → undo 记「把这行加回来」
+- UPDATE 一行 → undo 记「改回旧值」
+
+ROLLBACK 就是**倒序重放 undo log**。上一章行格式里的 `roll_pointer` 隐藏列，指向的正是该行的 undo 记录——同一行的历史版本通过 roll_pointer 串成**版本链**，这条链同时也是 MVCC 读旧版本的依据（第 17 章）。这就是为什么长事务会让 undo 膨胀：只要还有老事务可能读旧版本，undo 就不能删。
+
+## 4. redo log：持久性与崩溃恢复
+
+### 4.1 为什么需要 redo log
+
+修改数据时，InnoDB 改的是 **Buffer Pool 里的内存页**（脏页），不会立刻写磁盘——随机写 16KB 页太慢。但 COMMIT 承诺了持久性，机器一断电内存就没了，怎么办？
+
+答案是 **WAL（Write-Ahead Logging）**：提交前，先把「对哪个页做了什么修改」这条物理日志**顺序追加**写入 redo log 并刷盘。顺序写比随机写快一个数量级，于是既快又不丢：
+
+```text
+UPDATE 提交流程：
+1. 改 Buffer Pool 中的页（内存，产生脏页）
+2. 写 redo log buffer → COMMIT 时 fsync 刷盘   ← 顺序写，快
+3. 脏页由后台线程在之后「慢慢」刷回磁盘         ← 随机写，异步
+
+崩溃恢复：重启后重放 redo log，把没来得及落盘的修改补回来
+```
+
+### 4.2 刷盘策略
+
+`innodb_flush_log_at_trx_commit` 控制 redo 刷盘时机：
+
+| 值 | 行为 | 安全性 |
+|---|---|---|
+| 1（默认） | 每次提交 fsync | 崩溃不丢已提交事务，**生产标配** |
+| 2 | 提交写 OS 缓存，每秒 fsync | MySQL 崩溃不丢，主机断电丢约 1 秒 |
+| 0 | 每秒才写 + fsync | 最快，可丢约 1 秒，仅适合可重灌的数据 |
+
+redo log 是固定大小的循环文件（8.0.30+ 由 `innodb_redo_log_capacity` 控制），写满会强制刷脏页、造成写入卡顿——写入密集的库要给足容量（第 21 章）。
+
+## 5. 两阶段提交：redo log 与 binlog 的一致性
+
+Server 层还有一份 **binlog**（归档日志，主从复制和备份恢复用，第 19 章）。一次提交要写两份日志，如果在两次写入之间崩溃，就可能出现「redo 有、binlog 无」或反之——主库恢复的数据和从库复制的数据就不一致了。
+
+InnoDB 用**两阶段提交（2PC）**解决：
+
+```text
+       ┌─────────────────────────────────────────┐
+       │ 1. redo log 写入，标记为 prepare 状态      │
+       │ 2. 写 binlog 并刷盘                       │
+       │ 3. redo log 标记为 commit 状态            │
+       └─────────────────────────────────────────┘
+
+崩溃恢复时的裁决规则：
+- redo 是 commit 状态            → 事务有效，重放
+- redo 是 prepare，binlog 完整   → 提交（binlog 可能已传给从库）
+- redo 是 prepare，binlog 不完整 → 回滚
+```
+
+裁决标准统一以 **binlog 是否完整**为准，保证了「主库自身恢复」与「从库复制到的内容」永远一致。面试问「为什么要两阶段提交」，答案就是这句：**让 redo log 和 binlog 这两份独立的日志，在任何崩溃点上都能达成一致**。
+
+## 6. 事务使用的工程守则
+
+1. **事务要小而快**：只包住必须原子的 DML，RPC、发消息、文件 IO 都放到事务外；
+2. **先想清楚失败路径**：哪些错误要 ROLLBACK、应用层怎么感知（如扣库存 affected rows = 0）；
+3. **不要在事务里等待用户输入**（Web 应用一般不会，但脚本和运维操作常犯）；
+4. 写操作顺序在多个事务间保持一致，能显著减少死锁（第 16 章）；
+5. 框架的声明式事务（如 Spring `@Transactional`）失效场景很多（自调用、异常被吞），关键路径要验证事务真的生效——一个简单办法是在事务中查 `SELECT trx_id FROM information_schema.innodb_trx`。
+
+## 小结
+
+- ACID：一致性是目标；原子性靠 undo、持久性靠 redo、隔离性靠锁 + MVCC
+- undo log 记反向操作，串成版本链，同时服务回滚与 MVCC
+- redo log 是 WAL：顺序写日志先行，脏页异步落盘，崩溃后重放
+- `innodb_flush_log_at_trx_commit = 1` 是生产安全底线
+- 两阶段提交让 redo 与 binlog 在任意崩溃点保持一致
+- 长事务危害巨大：undo 膨胀、锁等待、堵 DDL，必须监控
+
+<Callout type="exercise" title="练习">
+1. 开两个会话演练：会话 A BEGIN 后 UPDATE 一行不提交，会话 B 查询该行（看到旧值）并尝试 UPDATE 同一行（被阻塞），A COMMIT 后观察 B 的变化。
+2. 用 SAVEPOINT 写一个事务：插入 3 笔订单，回滚掉第 2 笔，验证最终只有 1、3 生效。
+3. 口述：`innodb_flush_log_at_trx_commit` 三个取值分别在「MySQL 进程崩溃」和「主机断电」两种故障下各丢多少数据？
+</Callout>

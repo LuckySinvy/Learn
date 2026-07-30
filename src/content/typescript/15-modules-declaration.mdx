@@ -1,0 +1,292 @@
+---
+title: 模块系统与声明文件
+order: 15
+description: ESM 与 CommonJS 互操作、import type、路径别名、.d.ts 声明文件与 @types 生态
+---
+
+# 模块系统与声明文件
+
+到目前为止我们写的都是「单个文件里的类型」。真实项目由几百个文件组成，还要引用大量第三方库。这一章解决两个问题：
+
+1. **模块怎么组织**：TypeScript 如何理解 `import`／`export`，ESM 和 CommonJS 混用时会发生什么。
+2. **类型从哪来**：当一个库本身是 JS 写的，TypeScript 怎么知道它的类型。
+
+这是 TS 项目里最容易「报错看不懂」的一块，值得花时间搞清楚。
+
+## 1. 一个文件什么时候算「模块」
+
+规则很朴素：**文件里只要有顶层的 `import` 或 `export`，它就是一个模块**；否则它是**全局脚本**，里面声明的变量和类型会污染全局作用域。
+
+```ts
+// a.ts —— 没有 import/export，这是全局脚本
+const shared = 1;   // 会和其它脚本文件冲突
+
+// b.ts —— 有 export，这是模块
+export const value = 1;
+```
+
+如果一个文件只想声明类型、不想导出任何值，但又不希望污染全局，标准做法是加一行空导出：
+
+```ts
+export {};
+```
+
+<Callout type="info" title="全局脚本不是没用">
+`.d.ts` 里的全局脚本恰恰很有用——`declare global` 之外，直接在全局脚本 `.d.ts` 里写 `declare const __VERSION__: string`，就能给构建时注入的全局变量补上类型。
+</Callout>
+
+## 2. ESM 与 CommonJS
+
+### 2.1 两套模块系统的区别
+
+| | CommonJS | ESM |
+|---|---|---|
+| 导出 | `module.exports = ...` | `export` |
+| 导入 | `require("x")` | `import ... from "x"` |
+| 解析时机 | 运行时、同步 | 编译期静态分析 |
+| 循环依赖 | 拿到半成品对象 | 有 TDZ 保护 |
+| 顶层 await | 不支持 | 支持 |
+| Node 识别方式 | 默认，或 `.cjs` | `package.json` 里 `"type": "module"`，或 `.mjs` |
+
+### 2.2 `esModuleInterop` 到底做了什么
+
+CommonJS 模块导出的是「一个对象」，而 ESM 的 `import x from "y"` 期待的是「一个 default 导出」。二者对不上，于是有了 `esModuleInterop`。
+
+开启后（`module` 设为 `node16`/`nodenext` 时默认就是开的），TS 会：
+
+- 允许 `import express from "express"` 这种默认导入 CJS 模块；
+- 在生成的代码里插入 `__importDefault` 辅助函数做包装；
+- 同时开启 `allowSyntheticDefaultImports`，让类型检查也接受这种写法。
+
+```ts
+// 关闭 esModuleInterop 时只能这么写
+import * as express from "express";
+
+// 开启后可以写成更自然的
+import express from "express";
+```
+
+<Callout type="warn" title="import * as 不可调用">
+在正确的 ESM 语义下，命名空间对象 `import * as x` **不是函数**，即使底层 CJS 导出的是个函数也不能 `x()`。这是 `module: nodenext` 下最常见的报错来源。解决办法是改成默认导入，而不是加 `as any`。
+</Callout>
+
+### 2.3 NodeNext 下的扩展名规则
+
+当 `module` 设为 `nodenext` 且项目是 ESM 时，相对导入**必须带扩展名**，而且要写 **`.js`** 而不是 `.ts`：
+
+```ts
+import { helper } from "./utils.js";   // 对应源文件 utils.ts
+```
+
+初见很反直觉，但这是对的：TS 只做类型擦除，不改写路径，所以你写的路径必须是**编译产物**的路径。
+
+## 3. `import type` 与 `export type`
+
+类型在编译后会被完全擦除。如果一个 import 只用于类型，却写成了普通 import，可能导致：
+
+- 打包体积变大（引入了运行时不需要的模块）；
+- 循环依赖变成真实的运行时循环；
+- 副作用模块被意外执行。
+
+所以 TS 提供了显式的类型导入：
+
+```ts
+import type { User } from "./models.js";        // 整句都是类型，编译后消失
+import { type User, createUser } from "./models.js";  // 内联形式，混合导入
+
+export type { User };
+```
+
+配合 `verbatimModuleSyntax: true`，编译器会强制要求：**任何只用于类型的导入必须带 `type` 关键字**，否则报错。新项目建议直接打开。
+
+<Callout type="tip" title="内联 type 还是整句 type">
+只导入类型时用 `import type { ... }`；同时需要值和类型时用内联 `{ type A, b }`。两者语义一致，选一种风格在团队里统一即可。
+</Callout>
+
+## 4. 路径别名 paths
+
+深层相对路径 `../../../shared/utils.js` 既难读又难重构。`tsconfig.json` 的 `paths` 可以定义别名：
+
+```json
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@shared/*": ["packages/shared/src/*"]
+    }
+  }
+}
+```
+
+<Callout type="warn" title="paths 只影响类型检查">
+`paths` 是**告诉 TS 去哪里找类型**，它**不会**改写产物里的 import 路径。运行时能不能解析 `@/foo`，取决于你的打包器（Vite/webpack/Next.js 各有对应配置）或 Node 的 `imports` 字段。只配 tsconfig 会得到「类型检查通过但运行时找不到模块」。
+</Callout>
+
+## 5. 声明文件 `.d.ts`
+
+`.d.ts` 是**只有类型、没有实现**的文件。它的作用是给 JS 代码（或非 TS 资源）补上类型信息。
+
+### 5.1 基本语法
+
+`.d.ts` 里所有声明都用 `declare`，且不能有函数体：
+
+```ts
+// legacy-math.d.ts
+declare function add(a: number, b: number): number;
+declare const VERSION: string;
+
+declare namespace Legacy {
+  interface Options { precision: number }
+  function round(n: number, o?: Options): number;
+}
+
+export { add, VERSION, Legacy };
+```
+
+### 5.2 `declare module`：给无类型的包补类型
+
+某个包没有类型，安装后 TS 报「找不到模块的声明文件」。你可以在项目里建一个 `types/shims.d.ts`：
+
+```ts
+declare module "untyped-lib" {
+  export interface Config { retries: number }
+  export function connect(url: string, cfg?: Config): Promise<void>;
+  const _default: { version: string };
+  export default _default;
+}
+```
+
+同样的语法还能给非代码资源补类型，这在前端项目里极其常见：
+
+```ts
+declare module "*.svg" {
+  const content: string;
+  export default content;
+}
+
+declare module "*.css";
+```
+
+### 5.3 模块增强（Module Augmentation）
+
+想给一个**已有类型**的库加字段（比如给 Express 的 `Request` 加 `user`），用**同名 `declare module` 块 + 接口合并**：
+
+```ts
+import "express";
+
+declare module "express-serve-static-core" {
+  interface Request {
+    user?: { id: string; role: string };
+  }
+}
+```
+
+关键点：这个文件必须是**模块**（有顶层 import/export），否则 `declare module "x"` 会被当成「声明一个新模块」而不是「增强已有模块」。
+
+### 5.4 `declare global`：扩展全局
+
+```ts
+export {};
+
+declare global {
+  interface Window {
+    __APP_STATE__: Record<string, unknown>;
+  }
+  var __DEV__: boolean;
+}
+```
+
+注意 `declare global` 只能出现在模块里，所以前面那行 `export {}` 不能省。
+
+## 6. 三斜线指令
+
+在 ESM 普及之前，TS 用**三斜线指令**表达文件间依赖。今天它主要剩下两个用途：
+
+```ts
+/// <reference types="node" />
+/// <reference lib="dom" />
+```
+
+- `reference types` 显式引入某个 `@types` 包（在 `.d.ts` 里声明依赖时常用）；
+- `reference lib` 引入某个内置库（如 `dom`、`es2022`）。
+
+`/// <reference path="..." />` 已基本被模块导入取代，新代码不要再用。
+
+<Callout type="info" title="typeRoots 与 types">
+默认情况下，`node_modules/@types` 下的所有包都会被自动加载为全局类型。项目大了以后这会拖慢编译并引入意外的全局声明。可以用 `"types": ["node", "vitest"]` 精确控制，只加载列出的那几个。
+</Callout>
+
+## 7. `@types` 生态
+
+社区的 DefinitelyTyped 仓库为几千个 JS 库提供了类型包，命名规则是 `@types/包名`（带 scope 的包 `@scope/name` 对应 `@types/scope__name`）。
+
+引入类型的三种情况：
+
+| 情况 | 做法 |
+|---|---|
+| 库自带类型（`package.json` 有 `types` 字段） | 直接用，无需额外安装 |
+| 库没自带，社区有 | `npm i -D @types/xxx` |
+| 都没有 | 自己写 `declare module` 补丁 |
+
+<Callout type="warn" title="@types 版本要对齐主版本">
+`@types/xxx` 的版本号只跟随库的**主版本**。库升到 5.x 而 `@types` 还停在 4.x，会出现「类型说没有这个方法，运行时明明有」的诡异情况。升级依赖时记得一起升类型包。
+</Callout>
+
+## 8. 一个可运行的例子：namespace
+
+`namespace` 是 ESM 之前 TS 自带的模块化方案。今天在**应用代码里已不推荐**（应该用 ESM 模块），但在 `.d.ts` 里描述遗留的全局库时仍然常见，值得认识它的形态。
+
+<Playground
+  language="typescript"
+  id="ts-15-namespace"
+  title="namespace 的形态"
+  code={`namespace Geometry {
+  export const PI = 3.14159;
+
+  export function circleArea(r: number): number {
+    return PI * r * r;
+  }
+
+  export namespace Units {
+    export const area = "cm^2";
+    export const length = "cm";
+  }
+
+  // 没有 export 的成员是命名空间私有的
+  function secret(): string {
+    return "internal";
+  }
+  export function reveal(): string {
+    return secret();
+  }
+}
+
+console.log("PI =", Geometry.PI);
+console.log("面积 =", Geometry.circleArea(2).toFixed(3), Geometry.Units.area);
+console.log("私有成员通过导出函数访问:", Geometry.reveal());
+
+// 命名空间可以「声明合并」：同名块会被合并到一起
+namespace Geometry {
+  export function rectArea(w: number, h: number): number {
+    return w * h;
+  }
+}
+console.log("矩形面积 =", Geometry.rectArea(3, 4));
+console.log("合并后仍能访问 PI:", Geometry.PI);`}
+/>
+
+<Callout type="exercise" title="练习">
+1. 在项目里建一个 `types/shims.d.ts`，给一个虚构的包 `tiny-cache` 补上 `get`／`set` 两个函数的类型声明，并在业务文件里 import 它验证补全生效。
+2. 打开 `verbatimModuleSyntax`，把项目里所有只用于类型的 import 改成 `import type`，观察产物体积和编译错误的变化。
+3. 用 `declare global` 给全局加一个 `__BUILD_TIME__: string`，并解释为什么必须先写 `export {}`。
+</Callout>
+
+## 小结
+
+- 有顶层 `import`/`export` 才算模块，否则是会污染全局的脚本；`export {}` 可强制成模块
+- ESM 与 CJS 的差异靠 `esModuleInterop` 弥合；`nodenext` 下相对导入要带 `.js` 扩展名
+- `import type`／`export type` 保证类型导入被完全擦除，配合 `verbatimModuleSyntax` 强制执行
+- `paths` 只解决类型解析，运行时解析需要打包器或 Node 配合
+- `.d.ts` 用 `declare` 描述类型；`declare module` 补包类型或增强已有包；`declare global` 扩展全局
+- 下一章逐条拆解 tsconfig.json →

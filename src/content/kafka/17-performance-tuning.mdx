@@ -1,0 +1,157 @@
+---
+title: 性能调优
+order: 17
+description: 吞吐与延迟的取舍、三端参数矩阵、压缩选择、OS 配置与 perf-test 压测
+---
+
+# 性能调优
+
+Kafka 调优的第一原则：**先定目标，再动参数**。追求吞吐和追求低延迟的配置方向经常相反；不做压测的调优全是玄学。本章给出 Producer/Consumer/Broker 三端的参数矩阵、OS 层配置，以及用官方压测工具建立基线的方法。
+
+## 1. 吞吐 vs 延迟：核心取舍
+
+Kafka 性能的本质杠杆是**批量**：批次越大，单位消息的网络/磁盘开销越低（吞吐高），但消息等待攒批的时间越长（延迟高）。
+
+```text
+              吞吐优先                          延迟优先
+Producer   linger.ms=50~100                 linger.ms=0
+           batch.size=64KB~256KB            batch.size 默认
+           compression=zstd/lz4             compression=none 或 lz4
+           acks=1 (可容忍丢) / all          acks 按可靠性定, 不为延迟牺牲
+Consumer   fetch.min.bytes=64KB             fetch.min.bytes=1
+           fetch.max.wait.ms=500            fetch.max.wait.ms=100
+Broker     多分区并行                        分区别过多 (元数据/攒批碎片)
+```
+
+大多数业务系统的正确姿势是"**吞吐优先 + 可接受的延迟上限**"：几十毫秒的发送延迟换 5-10 倍吞吐，几乎总是划算的。
+
+## 2. Producer 端参数矩阵
+
+| 参数 | 默认 | 吞吐调优建议 | 说明 |
+|---|---|---|---|
+| batch.size | 16KB | 64KB~128KB | 单分区批次上限 |
+| linger.ms | 0 | 20~100 | 攒批等待时间 |
+| compression.type | none | lz4 或 zstd | 批次级压缩 |
+| buffer.memory | 32MB | 64~128MB | 分区多/流量大时调大 |
+| acks | all(3.x) | 按可靠性需求 | all 比 1 慢但差距在攒批面前不大 |
+| max.in.flight | 5 | 保持 5（幂等下安全） | 更大提升有限 |
+
+压缩算法实测特征（相对值）：
+
+| 算法 | 压缩比 | 压缩 CPU | 适用 |
+|---|---|---|---|
+| lz4 | ~2-3x | 很低 | CPU 紧张、通用默认 |
+| zstd | ~3-4x | 低中 | 带宽/磁盘紧张，3.x 首选 |
+| snappy | ~2x | 低 | 历史选择，可被 lz4 替代 |
+| gzip | ~3-4x | 高 | 不推荐 |
+
+文本类消息（JSON 日志）压缩收益巨大；已压缩内容（图片、加密数据）别再压。
+
+## 3. Consumer 端参数矩阵
+
+| 参数 | 默认 | 建议 | 说明 |
+|---|---|---|---|
+| fetch.min.bytes | 1 | 吞吐场景 65536 | broker 攒够才返回，减少空轮询 |
+| fetch.max.wait.ms | 500 | 与上者配合 | 攒不够最多等这么久 |
+| max.poll.records | 500 | 按单条处理耗时倒推 | 见第 7 章超时公式 |
+| fetch.max.bytes | 50MB | 一般不动 | 单次 fetch 总上限 |
+| max.partition.fetch.bytes | 1MB | 大消息场景调大 | 单分区单次上限 |
+
+消费端的瓶颈九成在**业务处理**而非拉取。先 profile 处理逻辑（写库改批量、外部调用改异步/缓存），再谈拉取参数。
+
+## 4. Broker 端要点
+
+```properties
+# 线程: 默认值适合中小规模, 高负载按 CPU 核数调
+num.network.threads=8          # 网络收发 (默认 3)
+num.io.threads=16              # 磁盘读写 (默认 8, 建议 >= 磁盘数)
+num.replica.fetchers=4         # 副本同步拉取线程 (默认 1, 副本追不上时首先调它)
+
+# 日志
+log.segment.bytes=1073741824   # 1GB, 一般不动
+# 不要设置 log.flush.interval.* 强制刷盘! 靠副本保可靠, 靠 OS 刷盘
+```
+
+分区数与性能的关系（呼应第 10 章）：分区多 → 并行度高，但过多（单 broker 数千以上）会导致：更多文件句柄与内存映射、controller 元数据膨胀、故障恢复变慢、攒批变碎。**够用 + 余量**即可。
+
+## 5. OS 与硬件配置
+
+```bash
+# 文件句柄
+ulimit -n 100000
+
+# 内核参数 (/etc/sysctl.conf)
+vm.swappiness=1                    # 几乎禁用 swap
+vm.dirty_background_ratio=5        # 后台异步刷脏页阈值
+vm.dirty_ratio=60                  # 给突发写留足缓冲
+net.core.wmem_max=16777216         # socket 缓冲
+net.core.rmem_max=16777216
+```
+
+硬件优先级（预算有限时从上往下投）：
+
+1. **磁盘**：SSD/NVMe，或多块独立 HDD（log.dirs 多目录分摊 IO）；数据盘独立，别与系统盘/ZK 混用
+2. **内存**：JVM 堆 6-8GB 就够，**其余全部留给 PageCache**（64GB 机器留 50GB+ 缓存是正常形态）
+3. **网络**：万兆起步，注意副本同步流量 = 写入流量 ×(副本数-1)
+4. CPU：通常不是瓶颈，开压缩/SSL 时例外
+
+文件系统 XFS，挂载加 `noatime`。
+
+## 6. 压测：先建立基线
+
+用官方工具在**你自己的环境**里测出基线，一切调优以此对照。
+
+```bash
+# 生产压测: 100 万条 1KB 消息, 不限速, acks=all + lz4
+bin/kafka-producer-perf-test.sh \
+  --topic perf-test --num-records 1000000 --record-size 1024 \
+  --throughput -1 \
+  --producer-props bootstrap.servers=localhost:9092 \
+    acks=all linger.ms=20 batch.size=65536 compression.type=lz4
+# 关键输出: records/sec, MB/sec, 平均/最大延迟, p50/p95/p99/p999
+```
+
+```bash
+# 消费压测
+bin/kafka-consumer-perf-test.sh \
+  --bootstrap-server localhost:9092 \
+  --topic perf-test --messages 1000000 --group perf-group
+# 关键输出: MB.sec, nMsg.sec
+
+# 端到端延迟测试
+bin/kafka-e2e-latency.sh localhost:9092 perf-test 10000 all 1024
+```
+
+科学压测方法：
+
+```text
+1. 固定一组基线参数, 跑 3 次取中位数
+2. 每次只改一个变量 (如 linger.ms: 0 -> 20 -> 50 -> 100)
+3. 记录 吞吐 + p99 延迟 双指标, 画曲线找拐点
+4. 用生产真实的消息大小与 key 分布, 别用全随机数据 (压缩比失真)
+```
+
+<Callout type="warn" title="调优常见误区">
+1. **抄网上"最优配置"**：别人的瓶颈在磁盘，你的在消费端写库，同一份参数毫无意义。先压测定位瓶颈。
+2. **给 Kafka JVM 分超大堆**：堆 31GB 以上指针压缩失效，且挤占 PageCache。6-8GB + G1GC 是甜点位。
+3. **开强制 fsync 求安心**：log.flush.interval.messages=1 会把吞吐打到骨折，Kafka 的可靠性模型靠副本不靠单机刷盘。
+4. **消息体塞大对象**：单条几 MB 的消息会拖垮攒批与内存，正确做法是大文件放对象存储、Kafka 传引用。
+</Callout>
+
+<Callout type="tip" title="一个立竿见影的检查">
+很多"Kafka 慢"的案例里，Producer 用默认 linger.ms=0 逐条发送。只加两行配置（linger.ms=20、compression.type=lz4），吞吐提升 3-10 倍是家常便饭。调优先摘这个最低的果子。
+</Callout>
+
+## 小结
+
+- 批量是核心杠杆：吞吐优先调大 linger/batch/fetch.min.bytes，延迟优先反之
+- 压缩选 lz4（CPU 优先）或 zstd（带宽优先）；文本收益大，已压缩数据别再压
+- Broker 端：io/network/replica.fetcher 线程按负载调；不要强制 fsync
+- 内存留给 PageCache、堆 6-8GB；磁盘独立、XFS + noatime；swappiness=1
+- 用 producer/consumer-perf-test 建基线，单变量对照，看吞吐与 p99 双指标
+
+<Callout type="exercise" title="练习">
+1. 用 producer-perf-test 分别测 linger.ms=0/20/100 三组（其他参数固定），记录吞吐与 p99 延迟，画出取舍曲线。
+2. 同一批数据分别用 none/lz4/zstd 压测，对比吞吐、延迟与 broker 端磁盘占用（kafka-log-dirs 查看）。
+3. 把 record-size 从 100B 改到 10KB 再到 100KB，观察吞吐（MB/s 与 records/s）的变化规律并解释原因。
+</Callout>

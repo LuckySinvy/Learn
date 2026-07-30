@@ -1,0 +1,540 @@
+---
+title: 数据建模
+order: 12
+description: 内嵌与引用的决策、一对多与多对多、扩展引用、子集、桶、预聚合等设计模式
+---
+
+# 数据建模
+
+这是整门课最重要的一章。MongoDB 的性能问题、扩展性问题、甚至一致性问题，八成能追溯到建模。关系型建模有范式理论指导，文档建模没有——它由**查询模式**驱动。
+
+## 1. 建模思维的转变
+
+### 1.1 关系模型 vs 文档模型
+
+| 维度 | 关系模型 | 文档模型 |
+|---|---|---|
+| 设计起点 | 数据的内在结构（实体、关系） | 应用的**访问模式** |
+| 优化目标 | 消除冗余（范式化） | 减少查询次数 |
+| 数据放在哪 | 拆散到多张表 | 尽量放一起 |
+| 关联成本 | JOIN，优化器成熟 | `$lookup`，嵌套循环 |
+| 一致性 | 靠外键和事务 | 靠单文档原子性或应用逻辑 |
+| schema 变更 | `ALTER TABLE`，可能锁表 | 写入时直接带新字段 |
+
+关系建模问「这些数据是什么关系」，文档建模问「**我的应用会怎么读写这些数据**」。同一份业务数据，读多写少和写多读少可能得到完全不同的文档结构。
+
+### 1.2 三个核心问题
+
+设计任何一个集合之前，先回答：
+
+1. **一起读吗？** 如果查 A 时几乎总要 B，倾向内嵌
+2. **一起写吗？** 如果改 A 时常常要同步改 B，内嵌能拿到原子性
+3. **会无限增长吗？** 会的话不能内嵌（16MB 限制）
+
+## 2. 内嵌 vs 引用的决策树
+
+```text
+                  A 和 B 有关系
+                        │
+          ┌─────────────┴─────────────┐
+          │                           │
+   B 会无限增长？                  B 不会无限增长
+   （评论、日志、订单）            （地址、配置、标签）
+          │                           │
+          ▼                           ▼
+       必须引用                查 A 时通常要 B？
+   （或用桶/子集模式）                │
+                          ┌──────────┴──────────┐
+                          否                     是
+                          │                      │
+                          ▼                      ▼
+                       引用              B 被多处共享且常改？
+                                        （用户名、店铺名）
+                                                 │
+                                    ┌────────────┴────────────┐
+                                    是                        否
+                                    │                         │
+                                    ▼                         ▼
+                          引用 + 扩展引用模式               内嵌
+                       （冗余少量高频字段）
+```
+
+### 2.1 内嵌的收益与代价
+
+```js
+// 内嵌：一次查询拿到全部
+{
+  _id: ObjectId("...101"),
+  username: "alice",
+  profile: { city: "Beijing", bio: "后端工程师", avatar: "https://..." },
+  settings: { theme: "dark", lang: "zh-CN", notifications: { email: true, push: false } },
+  addresses: [
+    { label: "家", province: "北京", detail: "...", isDefault: true },
+    { label: "公司", province: "北京", detail: "...", isDefault: false }
+  ]
+}
+```
+
+| 收益 | 代价 |
+|---|---|
+| 一次查询，零关联 | 文档变大，读取时全量加载 |
+| 单文档更新天然原子 | 无法单独查询内嵌项（除非用聚合） |
+| 数据局部性好，磁盘 IO 少 | 重复数据更新要扫全表 |
+| 无需维护外键一致性 | 有 16MB 上限 |
+
+### 2.2 引用的收益与代价
+
+```js
+// posts 只存作者 id
+{ _id: 11, title: "...", authorId: ObjectId("...101") }
+
+// users 独立维护
+{ _id: ObjectId("...101"), username: "alice", ... }
+```
+
+| 收益 | 代价 |
+|---|---|
+| 无数据冗余，改一处即可 | 每次展示都要 `$lookup` 或二次查询 |
+| 集合各自可无限增长 | 跨文档更新需要事务 |
+| 各自可独立索引与分片 | 关联性能受制于嵌套循环 |
+
+## 3. 三种基数关系的建模
+
+### 3.1 一对一：几乎总是内嵌
+
+```js
+// 用户与用户资料
+{
+  _id: ObjectId("...101"),
+  username: "alice",
+  profile: { city: "Beijing", bio: "...", website: "..." }
+}
+```
+
+例外情况：资料非常大（比如包含一篇长简历）且很少被读，此时拆开能让主文档保持轻量。
+
+### 3.2 一对少（one-to-few）：内嵌数组
+
+「少」的标准是**有明确上界且不大**，比如一个用户最多 20 个收货地址：
+
+```js
+{
+  _id: ObjectId("...101"),
+  username: "alice",
+  addresses: [
+    { _id: 1, label: "家", detail: "..." },
+    { _id: 2, label: "公司", detail: "..." }
+  ]
+}
+```
+
+### 3.3 一对多（one-to-many）：引用
+
+一篇帖子的评论没有上界，必须独立成集合：
+
+```js
+// comments
+{
+  _id: ObjectId("...301"),
+  postId: 11,
+  authorId: ObjectId("...101"),
+  body: "写得好",
+  parentId: null,
+  createdAt: ISODate("2024-06-01T10:00:00Z")
+}
+```
+
+```js
+db.comments.createIndex({ postId: 1, createdAt: -1 })
+```
+
+### 3.4 一对海量（one-to-squillions）：反向引用 + 分桶
+
+日志、指标这类每秒都在产生的数据，连「一对多」的写法都不够用，因为主文档的计数器会成为写热点。此时用桶模式（见 5.3 节）。
+
+### 3.5 多对多
+
+内容社区的「关注」是典型多对多。三种方案：
+
+**方案 A：中间集合（推荐）**
+
+```js
+// follows
+{ _id: ObjectId(), followerId: ObjectId("...101"), followeeId: ObjectId("...102"),
+  createdAt: ISODate() }
+```
+
+```js
+db.follows.createIndex({ followerId: 1, followeeId: 1 }, { unique: true })
+db.follows.createIndex({ followeeId: 1, createdAt: -1 })   // 查粉丝列表
+```
+
+**方案 B：双向内嵌数组**
+
+```js
+{ _id: ObjectId("...101"), username: "alice",
+  following: [ObjectId("...102"), ObjectId("...103")],
+  followers: [ObjectId("...104")] }
+```
+
+只在双方数量都很小且有明确上界时可用（比如「用户加入的群组」，上限 100 个）。大 V 有百万粉丝，数组必然爆掉。
+
+**方案 C：单向内嵌**
+
+如果只需要「查我关注了谁」而不需要「查谁关注了我」，只内嵌 `following` 一边。
+
+| 方案 | 适用 | 风险 |
+|---|---|---|
+| A 中间集合 | 数量无上界，双向查询 | 需要一次额外查询 |
+| B 双向数组 | 双方都有明确小上界 | 数组增长失控、一致性维护 |
+| C 单向内嵌 | 只有一个方向的查询需求 | 反向查询无法做 |
+
+<Callout type="warn" title="社交关注一律用中间集合">
+「用大 V 的粉丝数组」是新手最常见的建模事故：一个 500 万粉丝的账号，`followers` 数组会远超 16MB，而且每次涨粉都要重写整个文档。中间集合 + 索引才是正解，粉丝数用计数器字段单独维护。
+</Callout>
+
+## 4. 扩展引用模式（Extended Reference）
+
+纯引用的问题是列表页要 N 次关联。扩展引用的思路是：**在引用的同时，冗余少量高频只读字段**。
+
+```js
+// posts：冗余作者的用户名和头像
+{
+  _id: 11,
+  title: "MongoDB 入门",
+  author: {
+    _id: ObjectId("...101"),
+    username: "alice",              // 冗余
+    avatar: "https://cdn/a.jpg"     // 冗余
+  },
+  stats: { views: 1200, likes: 88, comments: 15 },
+  createdAt: ISODate("2024-06-01")
+}
+```
+
+现在渲染文章列表只需要一次查询，`$lookup` 彻底消失。
+
+### 4.1 冗余字段的选择标准
+
+| 应该冗余 | 不该冗余 |
+|---|---|
+| 显示必需（用户名、头像、店铺名） | 大字段（个人简介、商品详情） |
+| 变更频率低 | 高频变化（在线状态、余额） |
+| 变更后允许短暂不一致 | 要求强一致（价格、库存） |
+
+### 4.2 一致性怎么维护
+
+用户改了用户名怎么办？三个层次的方案：
+
+```js
+// 方案一：后台异步批量更新（最常用）
+db.posts.updateMany(
+  { "author._id": ObjectId("...101") },
+  { $set: { "author.username": "alice_new" } }
+)
+```
+
+```js
+// 方案二：用 Change Streams 监听 users 变更，自动同步（第 15 章）
+db.users.watch([ { $match: { "updateDescription.updatedFields.username": { $exists: true } } } ])
+```
+
+```js
+// 方案三：事务内同步更新（强一致，代价高，第 14 章）
+```
+
+<Callout type="tip" title="接受最终一致性">
+「文章列表里的作者名慢了 10 秒才更新」在绝大多数业务里完全可以接受。为此引入分布式事务、牺牲吞吐量和可用性，往往是过度设计。**明确哪些数据要强一致、哪些可以最终一致，是建模的核心判断**。
+</Callout>
+
+## 5. 六种经典设计模式
+
+### 5.1 子集模式（Subset）
+
+只在主文档里保留最常用的一小部分，其余放独立集合：
+
+```js
+// posts 里只放 3 条热评
+{
+  _id: 11,
+  title: "...",
+  topComments: [                     // 只有 3 条
+    { _id: ObjectId("...301"), author: "bob", body: "好文", likes: 42 },
+    { _id: ObjectId("...302"), author: "carol", body: "学到了", likes: 30 },
+    { _id: ObjectId("...303"), author: "dave", body: "赞", likes: 18 }
+  ],
+  stats: { comments: 1520 }
+}
+```
+
+写入时用 `$push` 的 `$sort` + `$slice` 自动维护：
+
+```js
+db.posts.updateOne(
+  { _id: 11 },
+  {
+    $push: {
+      topComments: {
+        $each: [ { _id: newId, author: "eve", body: "新评论", likes: 0 } ],
+        $sort: { likes: -1 },
+        $slice: 3
+      }
+    },
+    $inc: { "stats.comments": 1 }
+  }
+)
+```
+
+详情页先展示这 3 条，用户点「查看全部」时才查 `comments` 集合。90% 的请求只需要一次查询。
+
+### 5.2 计算/预聚合模式（Computed）
+
+不要在读的时候算，在写的时候算好：
+
+```js
+// 反例：每次都实时统计
+db.comments.countDocuments({ postId: 11 })     // 每次读都要扫索引
+
+// 正例：写评论时同步 $inc
+db.posts.updateOne({ _id: 11 }, { $inc: { "stats.comments": 1 } })
+```
+
+对于「日/周/月」这类固定粒度的统计，预先算好存进独立集合：
+
+```js
+// dailyStats
+{ _id: { postId: 11, day: "2024-06-04" }, views: 1200, likes: 88, comments: 15 }
+```
+
+读多写少的场景（比如 1000:1 的读写比），预聚合的收益是巨大的。
+
+### 5.3 桶模式（Bucket）
+
+把大量小记录按固定数量或时间窗口打包成一个文档：
+
+```js
+// 传统：每条读取记录一个文档，1 亿条
+{ userId: "u1", postId: 11, at: ISODate("2024-06-04T10:00:01Z") }
+
+// 桶模式：每个用户每小时一个文档
+{
+  _id: { userId: "u1", hour: "2024-06-04T10" },
+  count: 47,
+  first: ISODate("2024-06-04T10:00:01Z"),
+  last:  ISODate("2024-06-04T10:59:58Z"),
+  events: [
+    { postId: 11, at: ISODate("2024-06-04T10:00:01Z") },
+    { postId: 23, at: ISODate("2024-06-04T10:03:12Z") }
+  ]
+}
+```
+
+写入用 upsert，配合 count 上限防止桶过大：
+
+```js
+db.readEvents.updateOne(
+  { userId: "u1", hour: "2024-06-04T10", count: { $lt: 200 } },
+  {
+    $push: { events: { postId: 11, at: new Date() } },
+    $inc: { count: 1 },
+    $setOnInsert: { userId: "u1", hour: "2024-06-04T10" }
+  },
+  { upsert: true }
+)
+```
+
+收益量化：
+
+```text
+1 亿条独立文档：
+  文档开销（_id + BSON 头 + 字段名）约 80 字节 × 1 亿 = 8 GB
+  _id 索引：约 1.2 GB
+
+桶模式，每桶 200 条，50 万个桶：
+  文档开销 80 字节 × 50 万 = 40 MB
+  _id 索引：约 30 MB
+
+  存储与索引降低两个数量级
+```
+
+MongoDB 5.0+ 的**时间序列集合**本质上就是内建的桶模式，监控指标场景优先用它。
+
+### 5.4 多态模式（Polymorphic）
+
+同一集合存不同形态的文档，用一个 `type` 字段区分：
+
+```js
+// notifications 集合
+{ _id: ..., type: "like",    userId: ..., postId: 11, byUserId: ... }
+{ _id: ..., type: "comment", userId: ..., postId: 11, commentId: ..., excerpt: "..." }
+{ _id: ..., type: "follow",  userId: ..., byUserId: ... }
+{ _id: ..., type: "system",  userId: ..., title: "...", body: "..." }
+```
+
+一次查询就能拉出用户的完整通知列表，不需要 UNION 四张表。关系库里做这件事要么用宽表加一堆 NULL 列，要么用继承表。
+
+```js
+db.notifications.createIndex({ userId: 1, createdAt: -1 })
+```
+
+### 5.5 属性模式（Attribute）
+
+字段名不固定、且需要对任意字段做查询时，把「键值对」转成数组：
+
+```js
+// 反例：字段名不固定，无法建索引
+{ _id: 1, name: "手机", spec_cpu: "A17", spec_ram: "8GB", spec_screen: "6.1寸" }
+
+// 属性模式
+{
+  _id: 1, name: "手机",
+  attrs: [
+    { k: "cpu", v: "A17" },
+    { k: "ram", v: "8GB" },
+    { k: "screen", v: "6.1寸" }
+  ]
+}
+```
+
+```js
+db.products.createIndex({ "attrs.k": 1, "attrs.v": 1 })     // 一个索引搞定所有属性
+db.products.find({ attrs: { $elemMatch: { k: "ram", v: "8GB" } } })
+```
+
+### 5.6 树形模式
+
+存储层级结构（评论树、分类目录）有四种常见方案：
+
+| 方案 | 结构 | 查子树 | 查祖先 | 移动节点 |
+|---|---|---|---|---|
+| 父引用 | `parentId` | 需递归 | 需递归 | 改一个字段 |
+| 子引用 | `children: [id]` | 需递归 | 难 | 改两个文档 |
+| 祖先数组 | `ancestors: [id...]` | 一次查询 | 一次查询 | 要更新整棵子树 |
+| 物化路径 | `path: "/1/5/12/"` | 前缀正则一次查询 | 解析字符串 | 更新子树 |
+
+推荐**父引用 + 祖先数组**组合：
+
+```js
+{
+  _id: ObjectId("...304"),
+  postId: 11,
+  body: "三级回复",
+  parentId: ObjectId("...303"),
+  ancestors: [ObjectId("...301"), ObjectId("...302"), ObjectId("...303")],
+  depth: 3
+}
+```
+
+```js
+db.comments.createIndex({ ancestors: 1 })
+
+// 查某条评论的完整子树，一次搞定
+db.comments.find({ ancestors: ObjectId("...301") })
+```
+
+## 6. 反范式的取舍框架
+
+判断要不要冗余，看这四个维度：
+
+```text
+              读写比
+     读多写少 ◄──────────► 写多读少
+        冗余                不冗余
+
+              一致性要求
+     可最终一致 ◄─────────► 必须强一致
+        冗余                不冗余（或用事务）
+
+              冗余字段大小
+        小 ◄───────────────► 大
+       冗余                不冗余
+
+              更新扇出
+    影响文档少 ◄──────────► 影响文档多
+       冗余                 不冗余
+```
+
+举例：文章里冗余作者用户名——读写比 1000:1、允许延迟、字段很小、改名时扇出可控（一个人的文章数有限）。四项全过，应该冗余。
+
+反例：订单里冗余商品实时库存——写多、要求强一致、扇出巨大。四项全败，绝对不能冗余。
+
+<Callout type="warn" title="订单快照是个例外">
+「订单里冗余商品名称和成交价」看起来违反了原则，实际上它不是冗余而是**快照**：订单需要记录的是「下单那一刻的价格」，商品后来涨价不应该影响历史订单。分清「冗余副本」（需要同步）和「历史快照」（不该同步），这是两种完全不同的东西。
+</Callout>
+
+## 7. 内容社区完整建模
+
+```js
+// users
+{
+  _id: ObjectId("...101"),
+  username: "alice",                    // 唯一索引
+  email: "alice@example.com",           // 唯一索引
+  passwordHash: "...",
+  profile: { city: "Beijing", bio: "...", avatar: "..." },   // 内嵌，一对一
+  stats: { posts: 42, followers: 1280, following: 96 },      // 预聚合计数
+  createdAt: ISODate()
+}
+
+// posts
+{
+  _id: ObjectId("...201"),
+  slug: "why-mongodb",                  // 唯一索引
+  title: "为什么选择 MongoDB",
+  body: "...",
+  author: { _id: ObjectId("...101"), username: "alice", avatar: "..." },  // 扩展引用
+  tags: ["mongodb", "database"],        // 内嵌数组，多键索引
+  status: "published",
+  stats: { views: 1200, likes: 88, comments: 15 },           // 预聚合
+  topComments: [ /* 子集模式，3 条 */ ],
+  createdAt: ISODate()
+}
+
+// comments
+{
+  _id: ObjectId("...301"),
+  postId: ObjectId("...201"),           // 引用，一对多
+  author: { _id: ObjectId("...101"), username: "alice", avatar: "..." },
+  body: "...",
+  parentId: null,
+  ancestors: [],                        // 树形
+  likes: 0,
+  createdAt: ISODate()
+}
+
+// follows
+{
+  _id: ObjectId(),
+  followerId: ObjectId("...101"),
+  followeeId: ObjectId("...102"),       // 复合唯一索引
+  createdAt: ISODate()
+}
+```
+
+每个决策的理由：
+
+| 决策 | 模式 | 理由 |
+|---|---|---|
+| `profile` 内嵌 | 一对一内嵌 | 总是一起读，大小固定 |
+| `tags` 内嵌数组 | 一对少 | 上界明确（一般不超过 10 个） |
+| `author` 冗余 | 扩展引用 | 列表页高频，消灭 `$lookup` |
+| `stats` 计数器 | 预聚合 | 避免每次 count |
+| `topComments` | 子集 | 详情页首屏一次查询搞定 |
+| `comments` 独立 | 一对多引用 | 无上界 |
+| `follows` 独立 | 多对多中间集合 | 双向查询、无上界 |
+
+<Callout type="exercise" title="练习">
+一、为「电商订单」设计文档结构，明确哪些字段是快照、哪些是引用，并说明理由；二、把本章的 `follows` 方案改成「双向内嵌数组」，估算一个百万粉丝账号会遇到什么问题；三、给「用户浏览记录」设计桶模式，每桶 500 条，写出插入语句和「查某用户最近 1000 条浏览」的查询；四、用属性模式重构一个「商品规格」集合，并设计只需要一个索引就能支持任意规格查询的方案；五、用「父引用 + 祖先数组」实现评论树，写出「查某条评论的全部子孙」和「查某条评论的完整祖先链」两个查询；六、列出你当前项目里三个「冗余了但其实不该冗余」或「该冗余却没冗余」的字段。
+</Callout>
+
+## 小结
+
+- 文档建模由**查询模式**驱动，不是由数据结构驱动
+- 三个核心问题：一起读吗、一起写吗、会无限增长吗
+- 一对一和一对少内嵌，一对多引用，一对海量用桶
+- 多对多一律用中间集合，不要用双向数组
+- 扩展引用模式冗余少量高频只读字段，是消灭列表页 `$lookup` 的关键
+- 子集模式让详情页首屏一次查询搞定，预聚合把统计成本从读转移到写
+- 桶模式能把存储和索引开销降低两个数量级
+- 分清「冗余副本」和「历史快照」，前者要同步，后者不该同步
+- 下一章讲 Schema 校验，给灵活的文档模型加上必要的约束 →

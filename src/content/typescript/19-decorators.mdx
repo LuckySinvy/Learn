@@ -1,0 +1,347 @@
+---
+title: 装饰器
+order: 19
+description: TypeScript 5 标准装饰器语法、类与成员装饰器、装饰器元数据，以及与旧版 experimentalDecorators 的差异
+---
+
+# 装饰器
+
+装饰器（Decorator）是一种**声明式的元编程**语法：在类或类成员前加一个 `@名字`，就能在定义阶段对它进行包装、替换、注册或打标记。
+
+```ts
+@sealed
+class Point {
+  @log
+  distance(): number { return 0; }
+}
+```
+
+Angular、NestJS、TypeORM、MobX 的核心 API 都建立在装饰器之上。TypeScript 从 1.5 起就提供了实验性实现，而 **TC39 的标准装饰器提案在 2022 年进入 Stage 3，TypeScript 5.0 正式支持了它**。两套语法长得很像但语义完全不同，这是本章最需要讲清楚的部分。
+
+<Callout type="warn" title="本章没有可运行示例">
+标准装饰器目前还没有被 V8 实现，Node.js 无法直接运行含装饰器的代码，必须先经过 TypeScript/Babel 编译。因此本章全部使用普通代码块。你可以在本地 `tsc` 编译后运行来验证。
+</Callout>
+
+## 1. 两套装饰器的区别
+
+| | 旧版（`experimentalDecorators`） | 标准版（TS 5.0+） |
+|---|---|---|
+| 开关 | 需显式开 `experimentalDecorators` | 默认可用，**不要**开那个开关 |
+| 规范 | TC39 旧提案（Stage 2） | TC39 Stage 3，未来的 JS 语法 |
+| 方法装饰器签名 | `(target, key, descriptor)` | `(value, context)` |
+| 参数装饰器 | 支持 | **不支持** |
+| 装饰器求值顺序 | 自上而下求值 | 自上而下求值、自下而上应用 |
+| 元数据 | 靠 `reflect-metadata` | 内置 `context.metadata` |
+| 能否装饰 `accessor` 字段 | 否 | 是 |
+
+<Callout type="info" title="怎么判断项目用的是哪套">
+看 `tsconfig.json`：出现 `"experimentalDecorators": true` 就是旧版。NestJS、TypeORM、Angular 目前仍普遍依赖旧版（它们需要参数装饰器和 `emitDecoratorMetadata`）。新项目如果不依赖这些框架，直接用标准装饰器。
+</Callout>
+
+## 2. 标准装饰器的统一模型
+
+所有标准装饰器都是一个函数，签名统一为：
+
+```ts
+type Decorator = (value: unknown, context: DecoratorContext) => unknown;
+```
+
+- **第一个参数 `value`**：被装饰的东西本身（类构造器、方法函数、getter/setter 函数）。字段装饰器的 `value` 是 `undefined`。
+- **第二个参数 `context`**：描述「被装饰的是什么」的上下文对象。
+- **返回值**：返回一个新值来**替换**原来的东西；返回 `undefined` 表示不替换。
+
+`context` 的公共字段：
+
+| 字段 | 说明 |
+|---|---|
+| `kind` | `"class"` / `"method"` / `"getter"` / `"setter"` / `"field"` / `"accessor"` |
+| `name` | 成员名（`string` 或 `symbol`） |
+| `static` | 是否静态成员 |
+| `private` | 是否私有成员 |
+| `access` | 包含 `get`／`set` 的读写器，用于访问被装饰成员 |
+| `addInitializer(fn)` | 注册一个在实例（或类）初始化时执行的回调 |
+| `metadata` | 共享的元数据对象 |
+
+## 3. 方法装饰器
+
+方法装饰器最常见：接收原方法，返回一个包装后的方法。
+
+```ts
+function logged<This, Args extends unknown[], Return>(
+  target: (this: This, ...args: Args) => Return,
+  context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => Return>,
+) {
+  const name = String(context.name);
+  return function (this: This, ...args: Args): Return {
+    console.log("调用 " + name + " 参数 " + JSON.stringify(args));
+    const result = target.call(this, ...args);
+    console.log("返回 " + JSON.stringify(result));
+    return result;
+  };
+}
+
+class Calc {
+  @logged
+  add(a: number, b: number): number {
+    return a + b;
+  }
+}
+
+new Calc().add(1, 2);
+// 调用 add 参数 [1,2]
+// 返回 3
+```
+
+注意三个泛型参数 `This`／`Args`／`Return`：它们让包装函数保持与原方法完全一致的类型，这是标准装饰器相比旧版的一大进步。
+
+### 3.1 装饰器工厂
+
+需要传参时，写一个**返回装饰器的函数**：
+
+```ts
+function retry(times: number) {
+  return function <This, Args extends unknown[], Return>(
+    target: (this: This, ...args: Args) => Return,
+    context: ClassMethodDecoratorContext<This>,
+  ) {
+    return function (this: This, ...args: Args): Return {
+      let lastError: unknown;
+      for (let i = 0; i < times; i++) {
+        try {
+          return target.call(this, ...args);
+        } catch (e) {
+          lastError = e;
+        }
+      }
+      throw lastError;
+    };
+  };
+}
+
+class Api {
+  @retry(3)
+  fetchOnce(): string {
+    if (Math.random() < 0.7) throw new Error("flaky");
+    return "ok";
+  }
+}
+```
+
+`@retry(3)` 中的 `retry(3)` 在类定义时**立即求值**，得到真正的装饰器函数。
+
+## 4. 字段装饰器
+
+字段装饰器的 `value` 永远是 `undefined`。它的返回值是一个**初始化器函数**，接收字段的初始值，返回真正要写入的值：
+
+```ts
+function clamp(min: number, max: number) {
+  return function (
+    _target: undefined,
+    context: ClassFieldDecoratorContext<unknown, number>,
+  ) {
+    return function (initial: number): number {
+      const v = Math.min(max, Math.max(min, initial));
+      if (v !== initial) console.log(String(context.name) + " 被钳制到 " + v);
+      return v;
+    };
+  };
+}
+
+class Volume {
+  @clamp(0, 100)
+  level = 150;      // 实际得到 100
+}
+```
+
+<Callout type="warn" title="字段装饰器不能改成 getter">
+标准装饰器**不允许改变成员的种类**：字段还是字段，方法还是方法。旧版装饰器可以通过修改 `PropertyDescriptor` 把字段变成访问器，标准版做不到。需要拦截读写请用下面的 `accessor` 字段。
+</Callout>
+
+## 5. `accessor` 字段与自动访问器
+
+TS 5.0 引入了新关键字 `accessor`。`accessor x = 1` 会自动生成一对 getter/setter 和一个私有存储槽：
+
+```ts
+class Model {
+  accessor name = "unnamed";
+}
+// 等价于大致：
+// #name = "unnamed";
+// get name() { return this.#name }
+// set name(v) { this.#name = v }
+```
+
+配上 `accessor` 装饰器，就能干净地实现「响应式属性」：
+
+```ts
+function observed<This, Value>(
+  target: ClassAccessorDecoratorTarget<This, Value>,
+  context: ClassAccessorDecoratorContext<This, Value>,
+): ClassAccessorDecoratorResult<This, Value> {
+  const key = String(context.name);
+  return {
+    get(this: This): Value {
+      return target.get.call(this);
+    },
+    set(this: This, value: Value): void {
+      console.log(key + " 变化: " + String(target.get.call(this)) + " -> " + String(value));
+      target.set.call(this, value);
+    },
+    init(this: This, initial: Value): Value {
+      console.log(key + " 初始化为 " + String(initial));
+      return initial;
+    },
+  };
+}
+
+class Counter {
+  @observed accessor count = 0;
+}
+
+const c = new Counter();
+c.count = 1;    // count 变化: 0 -> 1
+c.count = 2;    // count 变化: 1 -> 2
+```
+
+这正是 MobX、Lit 等库在新版里采用的实现方式。
+
+## 6. 类装饰器
+
+类装饰器的 `value` 是构造器本身，返回值可以是一个**新的构造器**：
+
+```ts
+function withVersion(version: string) {
+  return function <T extends new (...args: never[]) => object>(
+    target: T,
+    context: ClassDecoratorContext<T>,
+  ) {
+    context.addInitializer(function () {
+      console.log("类 " + String(context.name) + " 已装饰");
+    });
+    return class extends target {
+      static readonly version = version;
+    };
+  };
+}
+
+@withVersion("1.2.0")
+class Service {}
+
+console.log((Service as unknown as { version: string }).version);   // "1.2.0"
+```
+
+<Callout type="warn" title="返回子类会丢类型">
+返回 `class extends target` 时，新增的静态成员（这里的 `version`）不会自动出现在 `Service` 的类型上。TypeScript 目前无法让装饰器修改被装饰者的类型签名。这是标准装饰器最大的类型学限制，通常只能靠接口声明合并或额外断言绕过。
+</Callout>
+
+## 7. `addInitializer` 与注册模式
+
+`context.addInitializer(fn)` 注册的回调，会在**实例构造时**（成员装饰器）或**类定义完成时**（静态成员与类装饰器）执行。它是实现「自动注册」类框架的关键。
+
+```ts
+const routes: { path: string; handler: string }[] = [];
+
+function route(path: string) {
+  return function (
+    _target: (...args: never[]) => unknown,
+    context: ClassMethodDecoratorContext,
+  ) {
+    context.addInitializer(function () {
+      routes.push({ path, handler: String(context.name) });
+    });
+  };
+}
+
+class Controller {
+  @route("/users")
+  listUsers(): string { return "users"; }
+
+  @route("/posts")
+  listPosts(): string { return "posts"; }
+}
+
+new Controller();
+console.log(JSON.stringify(routes));
+// [{"path":"/users","handler":"listUsers"},{"path":"/posts","handler":"listPosts"}]
+```
+
+## 8. 装饰器元数据
+
+TS 5.2 起支持 `context.metadata`：同一个类上所有装饰器共享一个元数据对象，最终挂在 `Class[Symbol.metadata]` 上。
+
+```ts
+function column(type: string) {
+  return function (_v: undefined, context: ClassFieldDecoratorContext) {
+    const meta = context.metadata as Record<string, unknown>;
+    const cols = (meta.columns as string[] | undefined) ?? [];
+    cols.push(String(context.name) + ":" + type);
+    meta.columns = cols;
+  };
+}
+
+class Row {
+  @column("int") id = 0;
+  @column("text") title = "";
+}
+
+console.log(JSON.stringify((Row as unknown as Record<symbol, unknown>)[Symbol.metadata as symbol]));
+```
+
+使用它需要 `lib` 包含 `esnext.decorators`（或自行 polyfill `Symbol.metadata`）。这套机制的目标是取代 `reflect-metadata`——ORM 和 DI 容器不必再依赖一个额外的运行时库。
+
+## 9. 求值与应用顺序
+
+```ts
+@A @B
+class C {}
+```
+
+- **求值**（执行装饰器工厂）：自上而下，先 `A` 后 `B`。
+- **应用**（调用装饰器函数）：自下而上，先 `B` 后 `A`。
+
+同一个类里，成员装饰器先于类装饰器应用；静态成员与实例成员按书写顺序处理。这个顺序在写「装饰器叠加」时必须记牢，比如 `@cache @logged method()` 的实际包装顺序是 `cache(logged(method))`。
+
+## 10. 旧版装饰器速览
+
+如果你要维护 NestJS 或 TypeORM 项目，还需要认识旧版签名：
+
+```ts
+// 旧版方法装饰器
+function oldLogged(target: object, key: string, descriptor: PropertyDescriptor) {
+  const original = descriptor.value as (...args: unknown[]) => unknown;
+  descriptor.value = function (...args: unknown[]) {
+    console.log("call " + key);
+    return original.apply(this, args);
+  };
+  return descriptor;
+}
+
+// 旧版参数装饰器（标准版不支持）
+function Inject(token: string) {
+  return function (target: object, key: string | undefined, index: number) {
+    // 通常把 token 记录到 reflect-metadata
+  };
+}
+```
+
+配合 `emitDecoratorMetadata: true`，TS 会在编译产物里注入 `design:type`、`design:paramtypes` 等元数据，这正是 NestJS 能靠类型做依赖注入的原因。**标准装饰器没有这个能力**，这也是相关框架迁移缓慢的主因。
+
+<Callout type="warn" title="两套语法不能混用">
+`experimentalDecorators` 开启时，编译器一律按旧版语义处理，标准装饰器的 `context` 参数会变成 `undefined`。一个项目只能二选一。迁移时要整体切换，不能逐文件迁移。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 写一个 `@memoize` 方法装饰器，用参数的 JSON 序列化结果做 key 缓存返回值，注意缓存要按实例隔离（提示：`context.addInitializer` 里给实例挂 Map）。
+2. 写一个 `@deprecated(msg)` 装饰器，第一次调用被装饰方法时打印一次警告，之后不再打印。
+3. 用 `context.metadata` 实现一个迷你「校验框架」：`@required`、`@maxLength(n)` 标记字段，再写一个 `validate(obj)` 函数读取元数据执行校验。
+</Callout>
+
+## 小结
+
+- TS 5.0 起支持 TC39 标准装饰器，签名统一为 `(value, context)`
+- `context` 提供 `kind`／`name`／`access`／`addInitializer`／`metadata`
+- 方法装饰器返回替换函数；字段装饰器返回初始化器；类装饰器可返回新构造器
+- 标准装饰器**不能改变成员种类、不支持参数装饰器、不能修改被装饰者的类型签名**
+- `accessor` 字段 + accessor 装饰器是实现响应式属性的正规方式
+- 旧版 `experimentalDecorators` 与标准版语义不兼容，只能整体二选一
+- 下一章讲生态中的类型实践 →

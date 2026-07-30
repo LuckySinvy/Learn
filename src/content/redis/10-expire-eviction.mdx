@@ -1,0 +1,171 @@
+---
+title: 过期删除与内存淘汰
+order: 10
+description: EXPIRE 家族、惰性删除与定期删除、maxmemory 八种淘汰策略、近似 LRU/LFU
+---
+
+# 过期删除与内存淘汰
+
+内存是 Redis 最贵的资源。有两套机制在管理它：**过期删除**处理"到点的 key"，**内存淘汰**处理"内存满了怎么办"。搞不清这两套机制的区别与配置，轻则缓存命中率莫名下降，重则写入报错、实例 OOM。
+
+## 1. 过期时间：EXPIRE 家族
+
+```bash
+127.0.0.1:6379> SET token:abc "data" EX 300     # 写入时直接带 TTL（推荐）
+OK
+127.0.0.1:6379> EXPIRE token:abc 600            # 重设为 600 秒
+(integer) 1
+127.0.0.1:6379> PEXPIRE token:abc 600000        # 毫秒版
+(integer) 1
+127.0.0.1:6379> EXPIREAT token:abc 1722400000   # 指定绝对时间戳(秒)
+(integer) 1
+127.0.0.1:6379> TTL token:abc
+(integer) 88000
+127.0.0.1:6379> PERSIST token:abc               # 移除 TTL
+(integer) 1
+127.0.0.1:6379> TTL token:abc
+(integer) -1
+```
+
+Redis 7 的 EXPIRE 支持条件参数：`NX`（没有 TTL 才设置）、`XX`（有 TTL 才设置）、`GT`/`LT`（新 TTL 更长/更短才设置）：
+
+```bash
+127.0.0.1:6379> EXPIRE token:abc 100 NX
+(integer) 1
+127.0.0.1:6379> EXPIRE token:abc 50 GT
+(integer) 0             # 50 < 100, GT 条件不满足
+```
+
+注意会**清除 TTL** 的操作：`SET` 覆盖同名 key（除非带 KEEPTTL）、`GETSET`。而 `INCR`、`HSET`、`LPUSH` 等修改值内容的命令**不影响** TTL。`RENAME` 会把 TTL 带到新名字。
+
+## 2. 过期的 key 什么时候真正被删？
+
+设置了 10 秒过期，第 10 秒 Redis 并不会精确地删掉它。实际是两种策略配合：
+
+### 2.1 惰性删除（lazy expiration）
+
+访问 key 时先检查是否过期，过期就删掉并返回 nil。零后台成本，但**永远不被访问的过期 key 会一直占内存**。
+
+### 2.2 定期删除（active expiration）
+
+后台任务默认每秒跑 10 次（`hz 10`），每次：
+
+```text
+1. 从"设置了 TTL 的 key"里随机抽 20 个
+2. 删掉其中已过期的
+3. 如果过期比例 > 25%, 回到第 1 步继续抽
+   (单次循环有时间上限, 防止阻塞主线程过久)
+```
+
+这是一个概率算法：不保证及时删除每个过期 key，但保证过期 key 的比例长期维持在较低水平。
+
+```text
+ key 过期后的三种"死法":
+ ① 被客户端访问 -> 惰性删除
+ ② 被定期任务抽中 -> 定期删除
+ ③ 一直没被碰到 -> 占着内存, 直到 ①/② 发生或被内存淘汰清走
+```
+
+<Callout type="warn" title="集中过期会造成延迟尖刺">
+大批 key 设置了相同的过期时间（比如凌晨活动结束时 100 万 key 同时到期），定期删除任务会连续多轮抽样都超过 25% 过期比例，长时间占用主线程，表现为周期性延迟尖刺。解决：**TTL 加随机抖动**，如 `EX 3600 + rand(0, 300)`。这也是缓存雪崩的预防手段之一（第 18 章）。
+</Callout>
+
+从库不主动删除过期 key，而是等主库同步 DEL 命令；读从库时会检查过期时间并返回 nil（3.2+），但 key 仍占用从库内存直到主库的 DEL 到达。
+
+## 3. maxmemory 与八种淘汰策略
+
+过期机制管不了"没设 TTL 的 key 越写越多"。当内存达到 `maxmemory` 上限，淘汰策略决定 Redis 的行为：
+
+```conf
+maxmemory 4gb
+maxmemory-policy allkeys-lru
+```
+
+| 策略 | 范围 | 规则 |
+|---|---|---|
+| `noeviction` | - | 不淘汰，写命令直接报错（默认） |
+| `allkeys-lru` | 所有 key | 淘汰最久未访问的 |
+| `allkeys-lfu` | 所有 key | 淘汰访问频率最低的 |
+| `allkeys-random` | 所有 key | 随机淘汰 |
+| `volatile-lru` | 仅带 TTL 的 key | 最久未访问 |
+| `volatile-lfu` | 仅带 TTL 的 key | 频率最低 |
+| `volatile-random` | 仅带 TTL 的 key | 随机 |
+| `volatile-ttl` | 仅带 TTL 的 key | 剩余 TTL 最短的先淘汰 |
+
+选型指南：
+
+- **纯缓存**（所有数据可从数据库重建）：`allkeys-lru`，或有明显冷热频率差异时 `allkeys-lfu`；
+- **缓存与持久数据混部**：`volatile-lru`，给缓存 key 设 TTL、持久 key 不设，淘汰只发生在缓存上（更好的做法是拆成两个实例）；
+- **不允许丢任何数据**：`noeviction` + 容量监控告警，满了报错总好过悄悄丢数据。
+
+```bash
+127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lfu
+OK
+127.0.0.1:6379> INFO stats
+# ...
+evicted_keys:12034      # 被淘汰的 key 总数, 持续增长说明内存不够
+```
+
+<Callout type="warn" title="默认 noeviction 会让写入报错">
+很多人给缓存实例忘了改策略，内存一满，所有写命令返回 `OOM command not allowed when used memory is greater than maxmemory`，业务直接故障。部署缓存实例的 checklist 里必须有：设 maxmemory + 改淘汰策略。
+</Callout>
+
+## 4. 近似 LRU 与 LFU
+
+### 4.1 为什么是"近似"LRU
+
+标准 LRU 需要维护一个全局双向链表，每次访问都要移动节点——内存和 CPU 开销都不小。Redis 的做法：
+
+- 每个 key 的对象头里记录 24 bit 的**最后访问时间戳**（lru 字段）；
+- 淘汰时**随机抽 5 个 key**（`maxmemory-samples 5`），淘汰其中最久未访问的；
+- 维护一个淘汰候选池（16 个），跨多次抽样积累"更老"的 key，逼近真实 LRU。
+
+```text
+真 LRU:  全局链表精确排序        成本高
+近似 LRU: 随机抽 5 个挑最老的     成本 O(1)
+          samples=10 时效果已非常接近真 LRU
+```
+
+### 4.2 LFU：频率比"最近"更公平
+
+LRU 有个缺陷：一个几小时才被扫一次的冷 key，恰好在淘汰前被访问了一下，就躲过了淘汰；而高频访问的热 key 只因最近 1 分钟没被访问就被淘汰。LFU（Least Frequently Used）按**访问频率**淘汰，更符合缓存直觉。
+
+Redis 的 LFU 把 24 bit 对象头拆成两半：
+
+```text
++------------------+----------+
+| 16bit 分钟级时钟  | 8bit 频率 |
++------------------+----------+
+频率计数是对数增长的: 访问时以概率 1/(counter * lfu_log_factor + 1) 才 +1
+  -> 8bit 就能表示百万级访问量
+频率会随时间衰减: 每过 lfu-decay-time 分钟 counter 减 1
+  -> 曾经的热 key 凉了以后也能被淘汰
+```
+
+```conf
+lfu-log-factor 10      # 越大, counter 增长越慢
+lfu-decay-time 1       # 每 1 分钟衰减 1 点
+```
+
+用 `OBJECT FREQ`（LFU 模式下）或 `OBJECT IDLETIME`（LRU 模式下）可以观察 key 的热度：
+
+```bash
+127.0.0.1:6379> OBJECT FREQ hot:key
+(integer) 42
+127.0.0.1:6379> OBJECT IDLETIME cold:key
+(integer) 86400         # 一天没被访问过
+```
+
+## 小结
+
+- 过期删除 = 惰性删除（访问时查）+ 定期删除（每秒 10 次随机抽样），过期不等于立即删除
+- 大批 key 集中过期会造成延迟尖刺，TTL 要加随机抖动
+- maxmemory 满了走淘汰策略：缓存场景 allkeys-lru/lfu，默认的 noeviction 会写报错
+- 近似 LRU 靠随机抽样 + 候选池；LFU 用对数计数 + 时间衰减，更适合频率差异明显的场景
+- 下一章：数据的最后防线——持久化 →
+
+<Callout type="exercise" title="练习">
+1. 给一个 key 设 5 秒 TTL，过期后立即 GET 与 TTL，解释返回值；再验证 SET 覆盖会清掉 TTL 而 INCR 不会。
+2. 在测试实例上 CONFIG SET maxmemory 10mb 且策略为 noeviction，用脚本灌数据直到写入报错，再改成 allkeys-lru 观察 evicted_keys 增长。
+3. 你的业务里哪些 key 该设 TTL、哪些不该？如果两类混在一个实例，选哪种淘汰策略？写出你的推理。
+</Callout>

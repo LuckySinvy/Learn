@@ -1,0 +1,349 @@
+---
+title: 查询操作符
+order: 4
+description: 比较、逻辑、元素、数组、正则与 $expr，把 find 的过滤能力用满
+---
+
+# 查询操作符
+
+SQL 的 WHERE 子句是一门小语言，MongoDB 的查询文档也是。区别在于 SQL 用中缀语法（`age > 18`），MongoDB 用嵌套对象（`age` 字段配一个带 `$gt` 的子文档）。这一章把常用操作符过一遍，并重点讲三个容易出错的地方：数组匹配语义、`$not` 的坑、以及什么时候必须用 `$expr`。
+
+## 1. 查询文档的基本结构
+
+一条查询文档是「字段 → 条件」的映射。条件可以是一个字面值（等值匹配），也可以是一个操作符对象：
+
+```js
+// 等值
+db.users.find({ age: 28 })
+
+// 操作符
+db.users.find({ age: { $gte: 25, $lt: 40 } })
+
+// 多个字段之间是隐式 AND
+db.users.find({ age: { $gte: 25 }, "profile.city": "Beijing" })
+```
+
+对应 SQL：
+
+```sql
+SELECT * FROM users WHERE age >= 25 AND city = 'Beijing';
+```
+
+<Callout type="info" title="所有操作符都以美元符号开头">
+`$gt`、`$in`、`$and` 这些都是保留字。这也是为什么 MongoDB 不建议字段名以美元符号开头——虽然 5.0 之后技术上允许了，但会给查询解析带来歧义。
+</Callout>
+
+## 2. 比较操作符
+
+| 操作符 | 含义 | SQL 对应 |
+|---|---|---|
+| `$eq` | 等于 | `=` |
+| `$ne` | 不等于 | `<>` |
+| `$gt` / `$gte` | 大于 / 大于等于 | `>` / `>=` |
+| `$lt` / `$lte` | 小于 / 小于等于 | `<` / `<=` |
+| `$in` | 在列表中 | `IN` |
+| `$nin` | 不在列表中 | `NOT IN` |
+
+```js
+db.posts.find({ views: { $gt: 100, $lte: 500 } })
+db.users.find({ username: { $in: ["alice", "bob", "carol"] } })
+db.users.find({ "profile.city": { $nin: ["Beijing", "Shanghai"] } })
+```
+
+### 2.1 $ne 和 $nin 的隐蔽陷阱
+
+在 MongoDB 里，「字段不存在」和「字段值为 null」在 `$ne` 面前行为不同于直觉：
+
+```js
+db.users.insertOne({ username: "eve" })          // 没有 age 字段
+db.users.find({ age: { $ne: 28 } })              // eve 会被匹配到！
+```
+
+因为「不存在」也满足「不等于 28」。如果你想要「有 age 字段且不等于 28」，要显式加条件：
+
+```js
+db.users.find({ age: { $exists: true, $ne: 28 } })
+```
+
+<Callout type="warn" title="$ne 和 $nin 无法有效利用索引">
+它们是「否定」条件，需要扫描索引中除了排除值之外的所有条目，选择性极差。查询计划里看到 `IXSCAN` 但扫描行数接近全表，多半就是它俩。能改写成正向条件（比如 `$in` 列出允许值）就一定要改写。
+</Callout>
+
+## 3. 逻辑操作符
+
+```js
+// $or：任一成立
+db.posts.find({ $or: [ { views: { $gt: 1000 } }, { tags: "featured" } ] })
+
+// $and：显式 AND，用于同一字段的多个复杂条件
+db.posts.find({ $and: [ { tags: "mongodb" }, { tags: "index" } ] })
+
+// $nor：全部不成立
+db.users.find({ $nor: [ { age: { $lt: 18 } }, { "profile.city": "Beijing" } ] })
+
+// $not：对某个字段的条件取反
+db.posts.find({ views: { $not: { $gt: 100 } } })
+```
+
+### 3.1 什么时候必须用 $and
+
+多数情况下不需要 `$and`，因为同一个查询文档的多个键天然是 AND。但当**同一个字段**需要两个同名操作符时，对象的键会冲突：
+
+```js
+// 错误：后一个 $gt 覆盖前一个，等价于只有 $gt: 200
+db.posts.find({ views: { $gt: 100 }, views: { $gt: 200 } })
+
+// 正确
+db.posts.find({ $and: [ { views: { $gt: 100 } }, { views: { $lt: 500 } } ] })
+```
+
+上面第二个例子其实也能写成一个对象里放 `$gt` 和 `$lt` 两个不同的键，但如果是两个 `$elemMatch`，就只能靠 `$and` 了。
+
+### 3.2 $or 的索引行为
+
+`$or` 的每个分支会**各自**尝试走索引，最后做去重合并。这意味着：只要有一个分支没有可用索引，整个查询就会退化成集合扫描。
+
+```text
+   $or 查询
+     ├── 分支 1: views > 1000   ── 走 views_1 索引  ✔
+     └── 分支 2: tags = featured ── 无索引 → COLLSCAN ✘
+                                    ↓
+                         整体退化为集合扫描
+```
+
+<Callout type="tip" title="给 $or 的每个分支都建索引">
+排查 `$or` 慢查询时，把每个分支单独拿出来 `explain` 一遍，找出那个没走索引的分支。这是第 19 章会反复用到的技巧。
+</Callout>
+
+## 4. 元素操作符
+
+```js
+// 字段是否存在
+db.users.find({ "profile.bio": { $exists: true } })
+db.users.find({ deletedAt: { $exists: false } })
+
+// 按 BSON 类型过滤
+db.posts.find({ views: { $type: "int" } })
+db.posts.find({ views: { $type: ["int", "long", "double"] } })
+db.posts.find({ tags: { $type: "array" } })
+```
+
+`$type` 在数据清洗时特别有用。历史遗留数据里同一个字段可能一部分是字符串一部分是数字，用它能快速定位脏数据：
+
+```js
+// 找出 views 被误存成字符串的文档
+db.posts.find({ views: { $type: "string" } }).count()
+```
+
+```text
+17
+```
+
+| 类型别名 | 数字编号 | 说明 |
+|---|---|---|
+| `double` | 1 | 双精度浮点 |
+| `string` | 2 | UTF-8 字符串 |
+| `object` | 3 | 内嵌文档 |
+| `array` | 4 | 数组 |
+| `objectId` | 7 | ObjectId |
+| `bool` | 8 | 布尔 |
+| `date` | 9 | 日期 |
+| `null` | 10 | 空值 |
+| `int` | 16 | 32 位整数 |
+| `long` | 18 | 64 位整数 |
+| `decimal` | 19 | Decimal128 |
+
+<Callout type="warn" title="null 和不存在不是一回事">
+查询 `db.users.find({ age: null })` 会同时匹配「age 字段值为 null」和「根本没有 age 字段」两种文档。要区分它们，前者用 `$type: "null"`，后者用 `$exists: false`。这是从 SQL 迁移过来最容易混淆的一点，因为 SQL 里列一定存在。
+</Callout>
+
+## 5. 数组查询（重点）
+
+数组是文档模型的灵魂，也是查询语义最反直觉的地方。先准备数据：
+
+```js
+db.posts.insertMany([
+  { _id: 11, title: "A", tags: ["mongodb", "index", "perf"],
+    scores: [ { user: "alice", v: 5 }, { user: "bob", v: 2 } ] },
+  { _id: 12, title: "B", tags: ["mongodb", "aggregation"],
+    scores: [ { user: "alice", v: 1 }, { user: "carol", v: 5 } ] },
+  { _id: 13, title: "C", tags: ["redis"],
+    scores: [ { user: "bob", v: 4 } ] }
+])
+```
+
+### 5.1 三种匹配语义
+
+```js
+// 1) 包含某个元素
+db.posts.find({ tags: "mongodb" })            // 匹配 A、B
+
+// 2) 数组完全相等（顺序也要一致）
+db.posts.find({ tags: ["mongodb", "index", "perf"] })   // 只匹配 A
+
+// 3) 包含全部指定元素（顺序无关）
+db.posts.find({ tags: { $all: ["mongodb", "perf"] } })  // 只匹配 A
+```
+
+第一种最常用：对数组字段做等值查询，语义自动变成「包含」。这个隐式转换非常方便，但也意味着你**无法**用等值语法表达「数组只有这一个元素」，那需要配合 `$size`。
+
+### 5.2 $size
+
+```js
+db.posts.find({ tags: { $size: 1 } })     // 只匹配 C
+```
+
+`$size` 只接受精确数字，不支持 `$gt` 这类比较。想查「标签超过 3 个」有两条路：
+
+```js
+// 方案一：冗余一个长度字段（推荐，可建索引）
+db.posts.find({ tagCount: { $gt: 3 } })
+
+// 方案二：用 $expr（灵活但不走索引）
+db.posts.find({ $expr: { $gt: [ { $size: "$tags" }, 3 ] } })
+```
+
+<Callout type="tip" title="数组长度是典型的冗余字段场景">
+如果业务经常按数组长度过滤或排序，就在写入时同步维护一个 `tagCount` 字段。用 `$push` 的同时 `$inc` 计数，成本极低，换来一个可索引的字段。
+</Callout>
+
+### 5.3 $elemMatch：数组内文档的多条件匹配
+
+这是最容易出错的一个。看这个查询：
+
+```js
+db.posts.find({ "scores.user": "alice", "scores.v": 5 })
+```
+
+它匹配 A 和 B。为什么 B 也匹配？因为这两个条件**分别**在数组中找元素满足即可——B 里 alice 的分是 1、carol 的分是 5，两个条件由**不同元素**满足，MongoDB 认为成立。
+
+要求「同一个元素同时满足所有条件」，必须用 `$elemMatch`：
+
+```js
+db.posts.find({ scores: { $elemMatch: { user: "alice", v: 5 } } })
+```
+
+```json
+[ { "_id": 11, "title": "A", "...": "..." } ]
+```
+
+只有 A 匹配，这才是通常想要的语义。
+
+```text
+文档 B 的 scores:
+  ┌─────────────────┐
+  │ user: alice, v:1│ ← 满足 user=alice
+  ├─────────────────┤
+  │ user: carol, v:5│ ← 满足 v=5
+  └─────────────────┘
+  点号写法：两个条件被不同元素满足 → 匹配 ✔（通常不是你想要的）
+  $elemMatch：要求单个元素同时满足   → 不匹配 ✘（正确）
+```
+
+<Callout type="warn" title="点号访问数组是最常见的逻辑 bug">
+只要数组元素是文档、且过滤条件涉及两个及以上字段，就必须用 `$elemMatch`。代码 review 时看到 `"数组名.字段A"` 和 `"数组名.字段B"` 同时出现，基本可以断定是 bug。
+</Callout>
+
+### 5.4 按下标查询
+
+```js
+db.posts.find({ "tags.0": "mongodb" })   // 第一个标签是 mongodb
+```
+
+下标从 0 开始，写在点号后面。这在「取数组首元素」的场景（比如主图、首选地址）很有用。
+
+## 6. 正则匹配
+
+```js
+db.users.find({ username: /^ali/ })                       // 字面量写法
+db.users.find({ username: { $regex: "^ali", $options: "i" } })  // 操作符写法
+db.posts.find({ title: { $regex: "mongo", $options: "i" } })    // 不区分大小写
+```
+
+| 选项 | 含义 |
+|---|---|
+| `i` | 忽略大小写 |
+| `m` | 多行模式，`^`/`$` 匹配每行 |
+| `s` | 让点号匹配换行 |
+| `x` | 忽略模式里的空白（便于写长正则） |
+
+<Callout type="warn" title="只有前缀正则能走索引">
+`/^ali/` 可以利用索引做范围扫描（等价于 `>= "ali"` 且 `< "alj"`），因为 B 树按前缀有序。但 `/ali/`（中间匹配）和任何带 `i` 选项的正则都无法利用索引，必须逐条比对。需要中间匹配的全文搜索，请用文本索引（第 8 章）或 Atlas Search。
+</Callout>
+
+## 7. $expr：在查询里做字段间比较
+
+标准查询语法只能拿「字段」和「常量」比。想比较**同一文档的两个字段**，SQL 里写 `WHERE a > b` 就行，MongoDB 需要 `$expr` 把聚合表达式引入查询：
+
+```js
+// 找出点赞数超过浏览数的异常帖子
+db.posts.find({ $expr: { $gt: ["$stats.likes", "$stats.views"] } })
+
+// 计算后再比较：转化率低于 1%
+db.posts.find({
+  $expr: {
+    $lt: [ { $divide: ["$stats.likes", "$stats.views"] }, 0.01 ]
+  }
+})
+```
+
+注意 `$expr` 内部引用字段要加美元前缀写成 `"$字段名"`，这是聚合表达式的语法（第 10 章详解）。
+
+`$expr` 也让条件逻辑成为可能：
+
+```js
+db.orders.find({
+  $expr: {
+    $cond: {
+      if: { $eq: ["$type", "vip"] },
+      then: { $gt: ["$amount", 1000] },
+      else: { $gt: ["$amount", 5000] }
+    }
+  }
+})
+```
+
+<Callout type="warn" title="$expr 的索引支持很有限">
+只有 `$eq`、`$gt`、`$gte`、`$lt`、`$lte` 直接作用在字段上时，`$expr` 才可能用索引。一旦套了 `$divide`、`$size`、`$cond` 这类计算，就是全集合扫描。高频查询不要依赖 `$expr`，把计算结果冗余成字段并建索引。
+</Callout>
+
+## 8. 综合示例
+
+在 `community` 库上，找出「北京或上海的用户，年龄 25 到 40，有 bio，且标签里同时有 mongodb 和 go」：
+
+```js
+db.users.find({
+  "profile.city": { $in: ["Beijing", "Shanghai"] },
+  age: { $gte: 25, $lte: 40 },
+  "profile.bio": { $exists: true, $ne: "" },
+  tags: { $all: ["mongodb", "go"] }
+})
+```
+
+对应的 SQL 大概是：
+
+```sql
+SELECT u.* FROM users u
+WHERE u.city IN ('Beijing','Shanghai')
+  AND u.age BETWEEN 25 AND 40
+  AND u.bio IS NOT NULL AND u.bio <> ''
+  AND EXISTS (SELECT 1 FROM user_tags t WHERE t.uid=u.id AND t.tag='mongodb')
+  AND EXISTS (SELECT 1 FROM user_tags t WHERE t.uid=u.id AND t.tag='go');
+```
+
+对比之下，数组内嵌带来的表达力优势相当明显。
+
+<Callout type="exercise" title="练习">
+用本章的 `posts` 数据完成：一、写一个查询，找出「有一条评分记录同时满足 user 是 bob 且 v 大于等于 4」的帖子，并解释为什么不能用点号写法；二、找出 tags 数组长度大于 2 的帖子，分别用 `$expr` 和冗余字段两种方案，并说明各自的代价；三、找出 `views` 字段类型不是数字的所有文档；四、写一个查询找出「标题以 Mongo 开头（不区分大小写）」的帖子，然后解释它为什么不走索引，以及如何改造使其能走索引。
+</Callout>
+
+## 小结
+
+- 查询文档是「字段 → 条件」的映射，多个字段之间隐式 AND
+- `$ne` / `$nin` 会匹配到「字段不存在」的文档，且几乎无法利用索引
+- `$or` 的每个分支都要有索引，否则整体退化成集合扫描
+- null 与「字段不存在」是两回事，用 `$type` 和 `$exists` 区分
+- 数组等值查询语义是「包含」；多条件匹配数组内文档必须用 `$elemMatch`
+- 只有前缀正则能利用索引，中间匹配请改用文本索引
+- 字段间比较用 `$expr`，但代价是通常无法走索引
+- 下一章讲更新操作符，尤其是数组的原地修改 →

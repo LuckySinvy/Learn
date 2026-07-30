@@ -1,0 +1,248 @@
+---
+title: 项目实战：秒杀、排行榜与限流
+order: 20
+description: 库存扣减 Lua 防超卖、ZSet 排行榜、滑动窗口限流，完整脚本与调用伪代码
+---
+
+# 项目实战：秒杀、排行榜与限流
+
+最后一章把前面的知识组装成三个可直接落地的模块：**秒杀库存扣减**（Lua 原子防超卖 + 防重复购买）、**销量排行榜**（ZSet）、**滑动窗口限流**（ZSet + Lua）。所有脚本都可以复制即用。
+
+## 1. 秒杀系统：防超卖的库存扣减
+
+### 1.1 需求与架构
+
+10 万人抢 100 件商品，要求：不超卖、每人限购 1 件、数据库不被打死。
+
+```text
+用户请求
+   |
+   v
+[网关限流]  <- 第 3 节的滑动窗口, 挡掉超出系统容量的流量
+   |
+   v
+[Redis 原子扣减]  <- Lua: 校验+去重+扣库存, 一次搞定 (本节核心)
+   |  成功者(最多 100 人)
+   v
+[MQ 异步下单]  <- 削峰, 数据库按自己的节奏消费
+   |
+   v
+[MySQL 创建订单]  <- 最终数据落库, 唯一约束兜底
+```
+
+Redis 在这里是"资格裁判"：10 万请求进来，99.9% 在 Redis 层就被判"没抢到"直接返回，只有 100 个胜出者进入后续流程。
+
+### 1.2 数据准备
+
+```bash
+# 活动开始前预热
+127.0.0.1:6379> SET seckill:stock:{2001} 100        # 库存
+OK
+127.0.0.1:6379> DEL seckill:users:{2001}            # 已购用户集合(清空)
+(integer) 0
+```
+
+key 用 hash tag 把同一活动的库存与用户集合钉在同一个槽，Lua 脚本才能在 Cluster 上运行（第 16 章）。
+
+### 1.3 核心 Lua 脚本
+
+```lua
+-- seckill.lua
+-- KEYS[1] = seckill:stock:{skuId}    库存
+-- KEYS[2] = seckill:users:{skuId}    已购用户 Set
+-- ARGV[1] = userId
+-- 返回: 1=抢购成功  0=库存不足  -1=重复购买
+
+-- 1. 防重复购买
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
+  return -1
+end
+
+-- 2. 校验库存
+local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+if stock <= 0 then
+  return 0
+end
+
+-- 3. 扣库存 + 记录用户 (同一脚本内, 原子)
+redis.call('DECR', KEYS[1])
+redis.call('SADD', KEYS[2], ARGV[1])
+return 1
+```
+
+整个"查重、验库存、扣减、记录"在服务端一气呵成——不存在两个请求都读到 stock=1 然后都扣成功的竞态，**物理上不可能超卖**。
+
+### 1.4 验证
+
+```bash
+$ redis-cli SCRIPT LOAD "$(cat seckill.lua)"
+"9f2b1c8e7d3a5f4b6c8d9e0f1a2b3c4d5e6f7a8b"
+
+127.0.0.1:6379> EVALSHA 9f2b...a8b 2 seckill:stock:{2001} seckill:users:{2001} u1001
+(integer) 1             # u1001 抢到了
+127.0.0.1:6379> EVALSHA 9f2b...a8b 2 seckill:stock:{2001} seckill:users:{2001} u1001
+(integer) -1            # 重复购买, 拒绝
+127.0.0.1:6379> GET seckill:stock:{2001}
+"99"
+```
+
+### 1.5 服务端调用伪代码
+
+```python
+SECKILL_SHA = redis.script_load(open('seckill.lua').read())
+
+def seckill(user_id, sku_id):
+    r = redis.evalsha(SECKILL_SHA, 2,
+                      f"seckill:stock:{{{sku_id}}}",
+                      f"seckill:users:{{{sku_id}}}",
+                      user_id)
+    if r == 1:
+        mq.send("order.create", {"user": user_id, "sku": sku_id})  # 异步落库
+        return "抢购成功, 订单处理中"
+    elif r == 0:
+        return "已售罄"
+    else:
+        return "您已参与过本次活动"
+```
+
+<Callout type="warn" title="必须处理的三个边界">
+1）**MQ 消息丢失**：Redis 扣了库存但订单消息丢了——消费侧要有对账任务（比对 seckill:users 与订单表，补单或回补库存）；2）**下单失败回补**：数据库下单失败（风控拦截等）要把库存加回去并从用户集合移除；3）**数据库最后防线**：订单表加"活动 ID + 用户 ID"唯一索引，扣减 SQL 用 `WHERE stock > 0` 条件更新——即使上游全部失效也不会超卖。
+</Callout>
+
+## 2. 销量排行榜
+
+秒杀成功后顺手更新商品销量榜与用户战绩榜（第 7 章 ZSet 的直接应用）：
+
+```bash
+# 订单落库成功后 (消费者侧执行, 保证只统计有效订单)
+127.0.0.1:6379> ZINCRBY rank:sales:20260730 1 sku:2001
+"101"
+# 实时 Top 10 商品
+127.0.0.1:6379> ZRANGE rank:sales:20260730 0 9 REV WITHSCORES
+ 1) "sku:2001"
+ 2) "101"
+ 3) "sku:2002"
+ 4) "87"
+ ...
+# 某商品排名与销量 (排名从 0 起, 展示时 +1)
+127.0.0.1:6379> ZREVRANK rank:sales:20260730 sku:2001
+(integer) 0
+127.0.0.1:6379> ZSCORE rank:sales:20260730 sku:2001
+"101"
+```
+
+工程细节：
+
+- **按天分 key** 并设 TTL（如 7 天），历史榜单归档到数据库：
+
+```bash
+127.0.0.1:6379> EXPIRE rank:sales:20260730 604800
+(integer) 1
+```
+
+- 周榜/月榜用 `ZUNIONSTORE` 聚合日榜：
+
+```bash
+127.0.0.1:6379> ZUNIONSTORE rank:sales:w31 7 rank:sales:20260727 rank:sales:20260728 rank:sales:20260729 rank:sales:20260730 rank:sales:20260731 rank:sales:20260801 rank:sales:20260802
+(integer) 342
+```
+
+- 榜单只保留 Top 1000，定期裁剪防止无限增长：
+
+```bash
+127.0.0.1:6379> ZREMRANGEBYRANK rank:sales:20260730 0 -1001
+(integer) 0
+```
+
+## 3. 滑动窗口限流
+
+固定窗口计数（每分钟一个计数器）有临界突刺问题：59 秒和 61 秒各来 100 个请求，两个窗口都不超限，但 2 秒内实际来了 200 个。滑动窗口用 ZSet 记录每个请求的时间戳，统计"任意时刻往前 N 秒"的真实请求数：
+
+```text
+ZSet: member=请求唯一ID, score=毫秒时间戳
+
+          |<------- 窗口 60s ------->|
+ ---------+--------------------------+---> 时间
+     ZREMRANGEBYSCORE           now
+     清掉窗口左边的旧记录        ZCARD 数窗口内的请求
+```
+
+### 3.1 限流 Lua 脚本
+
+```lua
+-- ratelimit.lua  滑动窗口限流
+-- KEYS[1] = rate:{uid}:api
+-- ARGV[1] = 窗口毫秒数 (60000)
+-- ARGV[2] = 阈值 (100)
+-- ARGV[3] = 当前毫秒时间戳
+-- ARGV[4] = 本次请求唯一 ID
+-- 返回: 1=放行  0=限流
+
+local window  = tonumber(ARGV[1])
+local limit   = tonumber(ARGV[2])
+local now     = tonumber(ARGV[3])
+
+-- 1. 移除窗口外的旧请求
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+
+-- 2. 统计窗口内请求数
+local count = redis.call('ZCARD', KEYS[1])
+if count >= limit then
+  return 0
+end
+
+-- 3. 记录本次请求, 并刷新 key 的 TTL 防泄漏
+redis.call('ZADD', KEYS[1], now, ARGV[4])
+redis.call('PEXPIRE', KEYS[1], window + 1000)
+return 1
+```
+
+### 3.2 验证与调用
+
+```bash
+$ redis-cli SCRIPT LOAD "$(cat ratelimit.lua)"
+"c4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
+
+# 阈值设 3, 连续调用 4 次:
+127.0.0.1:6379> EVALSHA c4e5...d2e3 1 rate:{u1001}:seckill 60000 3 1722310000001 req-a
+(integer) 1
+127.0.0.1:6379> EVALSHA c4e5...d2e3 1 rate:{u1001}:seckill 60000 3 1722310000450 req-b
+(integer) 1
+127.0.0.1:6379> EVALSHA c4e5...d2e3 1 rate:{u1001}:seckill 60000 3 1722310000900 req-c
+(integer) 1
+127.0.0.1:6379> EVALSHA c4e5...d2e3 1 rate:{u1001}:seckill 60000 3 1722310001200 req-d
+(integer) 0             # 第 4 次, 窗口内已有 3 个, 拒绝
+```
+
+```python
+def allow(user_id, api, window_ms=60000, limit=100):
+    return 1 == redis.evalsha(RATELIMIT_SHA, 1,
+                              f"rate:{{{user_id}}}:{api}",
+                              window_ms, limit,
+                              int(time.time() * 1000),
+                              uuid.uuid4().hex)
+
+def seckill_api(user_id, sku_id):
+    if not allow(user_id, "seckill", 60000, 10):
+        return "操作过于频繁, 请稍后再试"    # 429
+    return seckill(user_id, sku_id)
+```
+
+时间戳由客户端传入而非脚本内取（`redis.call('TIME')` 也可以，但传入便于测试且对复制更安全）。注意 ZSet 方案每个请求存一条记录，超高 QPS 的全局限流（几十万 QPS）会让这个 key 变热变大，那种场景改用固定窗口 INCR + 短窗口，或网关层令牌桶。
+
+<Callout type="tip" title="三个模块的共同套路">
+回看三个模块，套路是一致的：**把"读、判断、写"的竞态逻辑压缩进一个 Lua 脚本原子执行；用 hash tag 保证多 key 同槽；用 TTL 防止数据无限堆积；数据库层永远留一道最终防线。** 这四条原则可以推广到绝大多数 Redis 业务设计。
+</Callout>
+
+## 小结
+
+- 秒杀 = 限流挡量 + Lua 原子扣减（查重/验库存/扣减/记录一体）+ MQ 削峰 + 数据库唯一约束兜底
+- 排行榜 = ZINCRBY 累计 + ZRANGE REV 取榜 + 按天分 key/TTL/裁剪三件套
+- 滑动窗口限流 = ZSet 时间戳 + ZREMRANGEBYSCORE 清窗 + ZCARD 计数，Lua 保证原子
+- 至此 20 章完结：数据结构 → 机制原理 → 高可用 → 应用模式 → 实战，愿你从"用过 Redis"变成"用好 Redis"
+
+<Callout type="exercise" title="综合练习">
+1. 部署完整秒杀脚本：库存 10 件，用 shell 循环模拟 30 个不同用户各请求 2 次，验证最终库存为 0、成功用户恰好 10 人、无人成功两次。
+2. 给排行榜加一个"用户购买战绩榜"，并实现"查询我的排名及前后各 2 名"（提示：ZREVRANK 得到名次 n，再 ZRANGE REV 取 n-2 到 n+2）。
+3. 思考题：如果秒杀活动有 100 万人参与、库存 10 万件，seckill:users 这个 Set 会有多大？它是大 key 吗？给出你的优化方案（提示：分片、或改用 Bitmap/布隆过滤器做资格判断）。
+</Callout>

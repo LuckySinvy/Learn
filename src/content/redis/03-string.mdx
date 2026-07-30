@@ -1,0 +1,208 @@
+---
+title: String：最常用的类型与三种编码
+order: 3
+description: SET 全参数、原子计数、int/embstr/raw 编码与计数器、分布式 ID 场景
+---
+
+# String：最常用的类型与三种编码
+
+String 是 Redis 最基础的类型，但"基础"不等于"简单"：SET 的完整参数就是分布式锁的基石，INCR 的原子性支撑起了计数器和 ID 生成器，三种底层编码则直接影响内存占用。
+
+## 1. String 能存什么
+
+String 是**二进制安全**的字节序列，最大 512 MB。它可以存：
+
+- 文本：用户名、JSON 序列化后的对象；
+- 数字：Redis 会识别整数并用特殊编码存储，支持原子加减；
+- 二进制：图片缩略图、Protobuf 序列化数据、位图（Bitmap 本质就是 String）。
+
+## 2. 核心命令
+
+### 2.1 SET 的完整参数
+
+```bash
+SET key value [NX | XX] [EX seconds | PX ms | EXAT ts | KEEPTTL] [GET]
+```
+
+| 参数 | 含义 |
+|---|---|
+| `NX` | 只在 key **不存在**时设置（Not eXists） |
+| `XX` | 只在 key **已存在**时设置 |
+| `EX 10` | 设置的同时附带 10 秒过期 |
+| `PX 10000` | 过期时间用毫秒 |
+| `KEEPTTL` | 覆盖 value 但保留原有 TTL |
+| `GET` | 返回旧值再设置新值（替代已废弃的 GETSET） |
+
+实操：
+
+```bash
+127.0.0.1:6379> SET lock:order:1001 "uuid-abc" NX EX 10
+OK                      # 抢锁成功
+127.0.0.1:6379> SET lock:order:1001 "uuid-def" NX EX 10
+(nil)                   # key 已存在，NX 失败 —— 别人持有锁
+127.0.0.1:6379> SET counter 100
+OK
+127.0.0.1:6379> SET counter 200 GET
+"100"                   # 返回旧值，同时已写入新值
+```
+
+`SET key val NX EX 10` 一条命令同时完成"不存在才写入 + 设过期"，且是原子的——这正是分布式锁的标准写法（第 17 章展开）。
+
+<Callout type="warn" title="不要用 SETNX + EXPIRE 两条命令">
+早期写法 `SETNX lock 1` 然后 `EXPIRE lock 10` 不是原子的：如果两条命令之间进程崩溃，锁将永不过期，造成死锁。务必用 SET 的 NX EX 组合参数。
+</Callout>
+
+### 2.2 读写与批量
+
+```bash
+127.0.0.1:6379> SET user:1:name "Ada"
+OK
+127.0.0.1:6379> GET user:1:name
+"Ada"
+127.0.0.1:6379> MSET user:2:name "Bob" user:3:name "Carol"
+OK
+127.0.0.1:6379> MGET user:1:name user:2:name user:404:name
+1) "Ada"
+2) "Bob"
+3) (nil)
+127.0.0.1:6379> SETEX cache:home 60 "<html>...</html>"    # 等价 SET ... EX 60
+OK
+```
+
+`MGET`/`MSET` 一次网络往返处理多个 key，比循环单条快得多——**批量思维**是 Redis 性能优化的第一课（第 19 章还有 pipeline）。
+
+### 2.3 原子计数
+
+```bash
+127.0.0.1:6379> SET article:1:pv 0
+OK
+127.0.0.1:6379> INCR article:1:pv
+(integer) 1
+127.0.0.1:6379> INCRBY article:1:pv 10
+(integer) 11
+127.0.0.1:6379> DECR article:1:pv
+(integer) 10
+127.0.0.1:6379> INCRBYFLOAT price 0.1
+"0.1"
+127.0.0.1:6379> INCR user:1:name
+(error) ERR value is not an integer or out of range
+```
+
+因为命令单线程执行，`INCR` 天然原子：100 个并发客户端各执行一次，结果一定是精确加 100，不需要任何锁。
+
+### 2.4 子串操作
+
+```bash
+127.0.0.1:6379> SET msg "Hello World"
+OK
+127.0.0.1:6379> APPEND msg "!"
+(integer) 12            # 返回新长度
+127.0.0.1:6379> GETRANGE msg 0 4
+"Hello"
+127.0.0.1:6379> SETRANGE msg 6 "Redis"
+(integer) 12
+127.0.0.1:6379> GET msg
+"Hello Redis!"
+127.0.0.1:6379> STRLEN msg
+(integer) 12
+```
+
+## 3. 底层编码：int / embstr / raw
+
+Redis 对每个 String 值按内容自动选择三种编码之一，用 `OBJECT ENCODING` 查看：
+
+```bash
+127.0.0.1:6379> SET n 12345
+OK
+127.0.0.1:6379> OBJECT ENCODING n
+"int"
+127.0.0.1:6379> SET s1 "short string"
+OK
+127.0.0.1:6379> OBJECT ENCODING s1
+"embstr"
+127.0.0.1:6379> SET s2 "this string is definitely longer than forty-four bytes..."
+OK
+127.0.0.1:6379> OBJECT ENCODING s2
+"raw"
+```
+
+| 编码 | 触发条件 | 存储方式 |
+|---|---|---|
+| `int` | 值是 64 位整数 | 直接存在 redisObject 的指针字段里，零额外分配 |
+| `embstr` | 长度 ≤ 44 字节 | redisObject 与 sds 一次分配、内存连续，只读 |
+| `raw` | 长度 > 44 字节 | redisObject 与 sds 分开两次分配 |
+
+```text
+embstr（一次分配，缓存友好）:
++------------------+----------------+
+| redisObject 头   | sds "hello..." |
++------------------+----------------+
+
+raw（两次分配，可能不相邻）:
++------------------+        +----------------+
+| redisObject 头   | -----> | sds "loooong…" |
++------------------+        +----------------+
+```
+
+embstr 是只读的：对它执行 APPEND、SETRANGE 等修改命令后会转成 raw，且**不会转回去**。
+
+底层的字符串实现是 SDS（Simple Dynamic String），相比 C 字符串的优势：O(1) 取长度、二进制安全（不以 \0 判定结尾）、预分配空间减少扩容次数。
+
+## 4. 典型场景
+
+### 4.1 对象缓存
+
+```bash
+127.0.0.1:6379> SET cache:user:1001 '{"id":1001,"name":"Ada","vip":true}' EX 600
+OK
+127.0.0.1:6379> GET cache:user:1001
+"{\"id\":1001,\"name\":\"Ada\",\"vip\":true}"
+```
+
+整个对象序列化成 JSON 存一个 key。读写整对象方便；只改一个字段时要整体读出、修改、写回——这种场景 Hash 更合适（下一章对比）。
+
+### 4.2 计数器
+
+阅读量、点赞数直接 `INCR`。若要"每天一个计数"，把日期编进 key 并设过期：
+
+```bash
+127.0.0.1:6379> INCR pv:20260730:article:1
+(integer) 1
+127.0.0.1:6379> EXPIRE pv:20260730:article:1 172800
+(integer) 1
+```
+
+### 4.3 分布式 ID 生成器
+
+用 `INCRBY` 批量取号段，减少网络往返：
+
+```bash
+127.0.0.1:6379> INCRBY seq:order 1000
+(integer) 1000          # 本应用实例拿到 1~1000 号段，在本地内存分配
+127.0.0.1:6379> INCRBY seq:order 1000
+(integer) 2000          # 下一个实例拿到 1001~2000
+```
+
+应用在内存中消耗完号段再来取下一批。相比每次 INCR 取一个 ID，网络开销降低三个数量级；代价是实例重启会浪费未用完的号段（ID 不连续但仍单调有序）。
+
+<Callout type="tip" title="数字也是 String">
+Redis 没有独立的"数字类型"，`INCR` 操作的仍是 String，只是要求其内容能解析为 64 位整数。这也是为什么 `TYPE` 对计数器返回 string。
+</Callout>
+
+<Callout type="warn" title="大 value 警告">
+虽然 String 上限 512 MB，但超过 10 KB 的 value 就应该警惕：读写它会占用更多网络带宽和处理时间，容易造成延迟毛刺。缓存整页 HTML、大 JSON 时要评估体积，必要时压缩（gzip 后再存）或拆分。
+</Callout>
+
+## 小结
+
+- SET 的 NX/XX/EX/KEEPTTL/GET 参数组合覆盖了锁、缓存、CAS 等大量场景
+- INCR 家族提供无锁原子计数，是计数器与 ID 生成的基础
+- 三种编码：int（整数）、embstr（≤44 字节）、raw（更长或被修改过）
+- MGET/MSET 批量操作是性能优化的第一手段
+- 下一章 Hash：字段级读写的对象存储 →
+
+<Callout type="exercise" title="练习">
+1. 分别写入整数、20 字节字符串、100 字节字符串，用 OBJECT ENCODING 验证三种编码；再对 embstr 的 key 执行 APPEND，观察编码变化。
+2. 用 SET NX EX 模拟抢锁：开两个 redis-cli 窗口同时抢同一把锁，验证只有一个成功。
+3. 设计一个"每日签到计数"的 key 命名方案，要求自动过期、支持按天查询。
+</Callout>

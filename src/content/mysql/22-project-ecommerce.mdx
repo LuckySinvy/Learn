@@ -1,0 +1,242 @@
+---
+title: 项目实战：电商库全流程
+order: 22
+description: 从需求到建模、建表、造数、典型查询、EXPLAIN 分析、加索引与前后对比的完整闭环
+---
+
+# 项目实战：电商库全流程
+
+最后一章把全课程串成一次完整交付：拿到需求 → 设计模型 → 写 DDL → 灌数据 → 写业务查询 → EXPLAIN 找问题 → 设计索引 → 对比验证。请真的动手跑一遍——这一章的价值全在手上。
+
+## 1. 需求
+
+一个中等规模电商的核心交易域：
+
+1. 用户注册登录（邮箱唯一）、可被冻结；
+2. 商品有分类（两级）、价格、库存、上下架状态；
+3. 用户下单：一单多商品，记录下单时价格；订单状态流转（待支付→已支付→已发货→完成/取消）；
+4. 高频查询：我的订单列表（分页）、订单详情、商品搜索（分类+价格区间+销量排序）、运营日报（GMV/单量/取消率）、商家看「某商品最近购买记录」。
+
+预估量级：用户 500 万，商品 50 万，订单每年 3000 万，明细每年 8000 万。
+
+## 2. 建模决策记录
+
+| 决策 | 选择 | 理由（对应章节） |
+|---|---|---|
+| 主键 | BIGINT UNSIGNED 自增 | 短 + 递增防页分裂（12） |
+| 金额 | DECIMAL(12,2)/(10,2) | 浮点不能存钱（3） |
+| 时间 | DATETIME + DEFAULT CURRENT_TIMESTAMP | 防 2038（3） |
+| 明细价格 | 冗余快照 price | 历史订单金额不可变（4） |
+| 外键 | 不建物理外键，索引照建 | 高并发写 + 未来分库（4） |
+| 状态 | TINYINT + 注释 | 枚举演进灵活（3） |
+| 字符集 | utf8mb4 | 唯一正确答案（2） |
+| 订单号 | 业务生成 + 唯一索引 | 主键与业务解耦（4） |
+
+表结构沿用第 4 章的五张表（users / categories / products / orders / order_items），这里不再重复 DDL——但注意我们**故意先不建二级索引**（只保留主键和唯一约束），让问题自己暴露出来。
+
+```sql
+CREATE DATABASE IF NOT EXISTS shop2 DEFAULT CHARACTER SET utf8mb4;
+USE shop2;
+-- 从第 4 章复制五张表的 DDL，但删掉所有 KEY idx_* 行，只留 PRIMARY KEY 和 UNIQUE KEY
+```
+
+## 3. 造出有规模的数据
+
+没有数据量，一切优化都是空谈。用存储过程（第 18 章技能）造 100 万订单 + 250 万明细：
+
+```sql
+DELIMITER //
+CREATE PROCEDURE gen_data()
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  -- 用户 10 万
+  WHILE i < 100000 DO
+    INSERT INTO users (username, email, phone)
+    VALUES (CONCAT('user', i), CONCAT('u', i, '@ex.com'),
+            CONCAT('138', LPAD(i, 8, '0')));
+    SET i = i + 1;
+    IF i % 5000 = 0 THEN COMMIT; END IF;
+  END WHILE;
+
+  -- 分类与商品
+  INSERT INTO categories (name, parent_id) VALUES
+    ('数码',0),('手机',1),('电脑',1),('图书',0),('技术书',4);
+  SET i = 0;
+  WHILE i < 50000 DO
+    INSERT INTO products (category_id, name, price, stock, status)
+    VALUES (2 + FLOOR(RAND()*3), CONCAT('商品', i),
+            ROUND(10 + RAND()*9990, 2), FLOOR(RAND()*1000),
+            IF(RAND() < 0.9, 1, 2));
+    SET i = i + 1;
+    IF i % 5000 = 0 THEN COMMIT; END IF;
+  END WHILE;
+
+  -- 订单 100 万，时间散布一年
+  SET i = 0;
+  WHILE i < 1000000 DO
+    INSERT INTO orders (order_no, user_id, status, total_amount, created_at)
+    VALUES (CONCAT('SO', LPAD(i, 12, '0')),
+            1 + FLOOR(RAND()*100000),
+            FLOOR(RAND()*5),
+            ROUND(10 + RAND()*20000, 2),
+            NOW() - INTERVAL FLOOR(RAND()*365) DAY
+                  - INTERVAL FLOOR(RAND()*86400) SECOND);
+    SET i = i + 1;
+    IF i % 5000 = 0 THEN COMMIT; END IF;
+  END WHILE;
+
+  -- 明细：每单 1~5 条
+  INSERT INTO order_items (order_id, product_id, quantity, price)
+  SELECT o.id, 1 + FLOOR(RAND()*50000), 1 + FLOOR(RAND()*3),
+         ROUND(10 + RAND()*9990, 2)
+  FROM orders o
+  JOIN (SELECT 1 n UNION ALL SELECT 2 UNION ALL SELECT 3) x
+  WHERE RAND() < 0.8;
+  COMMIT;
+END //
+DELIMITER ;
+
+SET autocommit = 0;
+CALL gen_data();
+COMMIT;
+SET autocommit = 1;
+
+ANALYZE TABLE users, products, orders, order_items;
+```
+
+## 4. 典型查询：先跑、再看、后改
+
+### 4.1 查询一：我的订单列表
+
+```sql
+SELECT id, order_no, status, total_amount, created_at
+FROM orders
+WHERE user_id = 4396 AND status IN (1,2,3)
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+无索引时的 EXPLAIN：
+
+```text
+type: ALL   rows: 996482   Extra: Using where; Using filesort
+```
+
+全表扫 100 万行 + 排序，耗时数百毫秒。按第 13 章方法设计索引——等值列 user_id 在前，排序列 created_at 在后（status 是 IN 多值，放中间会截断 created_at 的有序性，放弃收编，靠 ICP 过滤）：
+
+```sql
+ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at);
+```
+
+再看：
+
+```text
+type: ref   key: idx_user_created   rows: 11   Extra: Using index condition
+```
+
+`rows` 从 99 万降到 11，filesort 消失（索引天然按 created_at 有序，倒序扫描即可），耗时进入亚毫秒级。**这就是本课程反复强调的「条件 + 排序一体设计」**。
+
+### 4.2 查询二：订单详情（三表 JOIN）
+
+```sql
+SELECT o.order_no, o.status, o.total_amount,
+       oi.quantity, oi.price, p.name
+FROM orders o
+JOIN order_items oi ON oi.order_id = o.id
+JOIN products p     ON p.id = oi.product_id
+WHERE o.order_no = 'SO000000004396';
+```
+
+问题出在 order_items：无 order_id 索引时，EXPLAIN 显示它 `type: ALL` 走 hash join，扫 250 万行明细。补上索引：
+
+```sql
+ALTER TABLE order_items ADD INDEX idx_order (order_id);
+```
+
+之后三张表全部 `const/ref/eq_ref`，总扫描行数为个位数。**JOIN 优化的第一原则：被驱动表的连接列必须有索引（第 9 章）。**
+
+### 4.3 查询三：商品搜索（分类 + 价格区间 + 排序）
+
+```sql
+SELECT id, name, price
+FROM products
+WHERE category_id = 2 AND status = 1 AND price BETWEEN 100 AND 2000
+ORDER BY price
+LIMIT 20;
+```
+
+索引设计推演（第 13 章口诀）：等值 category_id、status 在前，范围/排序列 price 在最后：
+
+```sql
+ALTER TABLE products ADD INDEX idx_cat_status_price (category_id, status, price);
+```
+
+EXPLAIN 从 `ALL + filesort` 变为 `range + 无 filesort`——price 既当范围过滤又当排序，一列两吃。
+
+### 4.4 查询四：运营日报（聚合）
+
+```sql
+SELECT DATE(created_at) AS d,
+       COUNT(*) AS orders_cnt,
+       SUM(CASE WHEN status IN (1,2,3) THEN total_amount ELSE 0 END) AS gmv,
+       AVG(status = 4) AS cancel_rate
+FROM orders
+WHERE created_at >= '2026-07-01' AND created_at < '2026-08-01'
+GROUP BY DATE(created_at)
+ORDER BY d;
+```
+
+注意两点：WHERE 用**左闭右开范围**而不是 `DATE(created_at) = ...`（函数包列索引失效）；GROUP BY 的 `DATE()` 无妨——过滤已由范围完成。为它建 `(created_at)` 索引即可 range 扫描一个月的数据。数据量再大时，日报应落**汇总表**（每天定时聚合一次），而不是每次实时算——这是「空间换时间」在架构层的应用。
+
+### 4.5 查询五：某商品最近购买记录
+
+```sql
+SELECT o.created_at, o.user_id, oi.quantity
+FROM order_items oi
+JOIN orders o ON o.id = oi.order_id
+WHERE oi.product_id = 12345
+ORDER BY o.created_at DESC
+LIMIT 10;
+```
+
+需要 `order_items(product_id)` 索引；排序列在另一张表上，无法用单个索引消除 filesort——这类查询若成为高频热点，考虑在 order_items 冗余 created_at 字段并建 `(product_id, created_at)`，用一点冗余换掉 JOIN 后排序。**冗余是手段不是罪，失控的冗余才是。**
+
+## 5. 前后对比与验收
+
+用 EXPLAIN ANALYZE 记录五条查询优化前后的真实耗时，形成报告：
+
+| 查询 | 优化前 | 优化后 | 手段 |
+|---|---|---|---|
+| 订单列表 | ALL / 99 万行 / filesort | ref / 11 行 | (user_id, created_at) |
+| 订单详情 | hash join 扫 250 万 | 全 ref/eq_ref | order_items(order_id) |
+| 商品搜索 | ALL + filesort | range 免排序 | (category_id, status, price) |
+| 运营日报 | ALL | range | (created_at) + 范围改写 |
+| 商品购买记录 | ALL | ref + filesort（10 行） | (product_id)，热点再冗余 |
+
+最后别忘了体检索引本身：
+
+```sql
+SELECT * FROM sys.schema_redundant_indexes;   -- 有没有把 (user_id) 和 (user_id, created_at) 都建了？
+SELECT * FROM sys.schema_unused_indexes;      -- 跑一段时间后回头清理
+```
+
+<Callout type="warn" title="索引不是终点">
+这套库到了亿级订单后，本章的索引也只能保住单点查询——届时按第 21 章的金字塔继续演进：归档历史订单 → 读写分离 → 日报走汇总表/数仓 → 按 user_id 水平分片。每一步都应由监控数据驱动，而不是拍脑袋。
+</Callout>
+
+## 6. 课程收官清单
+
+学完 22 章，你应该能独立完成：
+
+- 设计规范的表结构（类型、约束、字符集、主键策略）
+- 写出正确且高效的查询（JOIN/子查询/CTE/窗口函数）
+- 用 B+ 树原理推导索引设计，用 EXPLAIN 验证
+- 解释事务、锁、MVCC 的行为并排查死锁
+- 搭建主从、执行备份与 PITR 恢复
+- 按优先级金字塔开展性能优化
+
+<Callout type="exercise" title="毕业练习">
+1. 完整跑通本章流程：建库→造 100 万订单→五条查询逐一 EXPLAIN ANALYZE 记录前后耗时，产出你自己的对比表。
+2. 新需求：「用户收藏商品」功能（一个用户可收藏多个商品，需查「我的收藏列表」和「商品被收藏数」）。设计表、索引，并写出两个查询的 SQL 与 EXPLAIN 预期。
+3. 压力题：把订单列表查询的 OFFSET 推到 50 万模拟深分页，分别用延迟关联和游标分页优化，给出三种写法的 EXPLAIN ANALYZE 数据。
+</Callout>

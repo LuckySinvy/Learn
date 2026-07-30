@@ -1,0 +1,243 @@
+---
+title: TypeScript 是什么
+order: 1
+description: 从动态类型的痛点出发，理解 TypeScript 与 JavaScript 的关系、类型擦除与 tsc 编译流程，并写出第一个程序
+---
+
+# TypeScript 是什么
+
+如果你写过 Java、Go、C# 或 Rust，第一次接触 JavaScript 时大概会有点不安：变量可以随时换类型，函数少传一个参数也照跑不误，拼错的属性名要等到线上报错才被发现。**TypeScript（简称 TS）就是给 JavaScript 补上一层编译期类型系统**，让这些错误在你按下保存键的那一刻就暴露出来。
+
+## 1. 为什么需要静态类型
+
+### 1.1 动态类型的代价
+
+JavaScript 在运行前不检查任何类型。下面这段代码语法完全合法：
+
+```js
+function area(w, h) {
+  return w * h;
+}
+
+area(3);              // 结果是 NaN，没有任何报错
+area("3", "4");       // 结果是 12，字符串被隐式转成了数字
+area(3, 4, 5);        // 多余参数被静默忽略
+```
+
+三种调用全都「跑通了」，但只有最后一种接近你的本意。错误没有消失，它们只是被推迟到了运行时——通常是推迟到用户点开页面的那一刻。
+
+一个大型项目里，这类问题的成本会指数级放大：你改了一个函数的返回结构，却不知道有多少处调用依赖旧结构；你想重命名一个字段，只能靠全文搜索加祈祷。
+
+### 1.2 静态类型带来了什么
+
+给上面的函数加上类型注解后：
+
+```ts
+function area(w: number, h: number): number {
+  return w * h;
+}
+
+// area(3);            // 错误：应有 2 个参数，但获得 1 个
+// area("3", "4");     // 错误：类型 string 的参数不能赋给类型 number 的参数
+```
+
+类型系统在这里扮演了三个角色：
+
+| 角色 | 说明 |
+|---|---|
+| 校验器 | 在编译期发现参数个数、类型、拼写错误 |
+| 文档 | 函数签名本身说明了「要什么、给什么」，胜过注释 |
+| 工具基础 | 编辑器据此提供自动补全、跳转定义、安全重命名 |
+
+第三点常被低估。类型信息让编辑器真正「理解」你的代码，重构从体力活变成了机械操作。
+
+## 2. TypeScript 与 JavaScript 的关系
+
+### 2.1 TS 是 JS 的超集
+
+任何合法的 JavaScript 代码都是合法的 TypeScript 代码。把 `.js` 改名为 `.ts`，它依然能跑。TypeScript 在 JS 之上只增加了两类东西：
+
+1. **类型语法**：类型注解、interface、泛型、类型别名等。
+2. **少量运行时语法**：`enum`、`namespace`、构造器参数属性等（这几个会被编译成真实的 JS 代码）。
+
+这意味着你不需要重写项目，可以从一个文件开始逐步迁移。
+
+### 2.2 类型在编译后会被完全擦除
+
+这是理解 TypeScript 最重要的一条：**类型只存在于编译期**。编译产物里没有任何类型信息。
+
+```ts
+// 源码
+const age: number = 30;
+interface User { id: number }
+```
+
+```js
+// 编译产物
+const age = 30;
+// interface 完全消失，不产生任何 JS 代码
+```
+
+<Callout type="warn" title="类型不做运行时校验">
+TypeScript 不会在运行时检查类型。如果数据来自网络接口，而后端返回的字段和你声明的 interface 不一致，TS 不会报错，程序会照常运行到崩溃为止。跨越系统边界的数据（HTTP 响应、`JSON.parse`、用户输入）必须写运行时校验代码。
+</Callout>
+
+### 2.3 对比速查
+
+| 维度 | JavaScript | TypeScript |
+|---|---|---|
+| 类型检查时机 | 运行时（且大量隐式转换） | 编译期 |
+| 文件扩展名 | `.js` / `.mjs` | `.ts` / `.mts` |
+| 浏览器/Node 能否直接跑 | 能 | 需先编译或用支持类型擦除的运行时 |
+| 类型对运行结果的影响 | — | 无（会被擦除） |
+
+## 3. tsc 编译流程
+
+TypeScript 官方编译器叫 `tsc`。典型流程如下：
+
+```bash
+npm install -D typescript      # 安装
+npx tsc --init                 # 生成 tsconfig.json
+npx tsc                        # 编译整个项目
+npx tsc --noEmit               # 只做类型检查，不产出文件
+npx tsc --watch                # 监听改动并增量检查
+```
+
+`tsconfig.json` 里最值得先了解的几个选项：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "strict": true,
+    "noEmit": false,
+    "outDir": "dist"
+  }
+}
+```
+
+- `target`：编译产物遵循哪个 ECMAScript 版本。
+- `module`：产物用哪种模块系统（ESM 还是 CommonJS）。
+- `strict`：一键开启全部严格检查，**强烈建议新项目直接开**。
+- `outDir`：编译输出目录。
+
+<Callout type="tip" title="从第一天就开启 strict">
+`strict` 会打开 `noImplicitAny`、`strictNullChecks` 等一组开关。在老项目里补开非常痛苦，在新项目里几乎无感。本教程所有示例都在 strict 模式下编写。
+</Callout>
+
+### 3.1 「编译」其实是两件独立的事
+
+`tsc` 同时做了类型检查和语法降级，但这两件事可以拆开。现代工具链（esbuild、swc、Node 的类型擦除模式）通常只负责**去掉类型**，把类型检查交给 `tsc --noEmit` 在 CI 里跑。本教程页面上的运行按钮也是这个流程：先做一次严格类型检查，通过后再执行。
+
+## 4. 第一个程序
+
+试着点击「运行」，然后把 `userName` 的类型改成 `number` 看看会发生什么。
+
+<Playground
+  language="typescript"
+  id="ts-01-hello"
+  title="Hello, TypeScript"
+  code={`const userName: string = "Ada";
+const year: number = 1843;
+const isPioneer: boolean = true;
+
+function greet(who: string): string {
+  return "Hello, " + who + "!";
+}
+
+console.log(greet(userName));
+console.log("year = " + year + ", pioneer = " + isPioneer);`}
+  expectedOutput={`Hello, Ada!\nyear = 1843, pioneer = true`}
+/>
+
+## 5. 类型如何帮你把错误挡在前面
+
+下面这个例子里，`formatPrice` 明确声明只接受 `number`。如果你把 `console.log(formatPrice(cents))` 改成 `formatPrice("199")`，页面上的类型检查会立刻失败，代码根本不会被执行。
+
+<Playground
+  language="typescript"
+  id="ts-01-guard"
+  title="编译期拦截"
+  code={`function formatPrice(cents: number): string {
+  const yuan = cents / 100;
+  return yuan.toFixed(2) + " 元";
+}
+
+const cents = 19900;
+console.log(formatPrice(cents));
+
+// 试试把下面这行的注释去掉，看类型检查如何报错
+// console.log(formatPrice("19900"));
+
+const prices: number[] = [1250, 800, 19900];
+const total = prices.reduce((sum, p) => sum + p, 0);
+console.log("合计 " + formatPrice(total));`}
+  expectedOutput={`199.00 元\n合计 219.50 元`}
+/>
+
+## 6. 结构化类型：TS 的独特之处
+
+如果你来自 Java 或 C#，会习惯「必须显式 implements 某个接口才算实现它」。TypeScript 不是这样——它采用**结构化类型（structural typing）**，也叫鸭子类型：**只要结构对得上，就是兼容的类型**。
+
+<Playground
+  language="typescript"
+  id="ts-01-structural"
+  title="结构化类型"
+  code={`interface Point2D {
+  x: number;
+  y: number;
+}
+
+function describe(p: Point2D): string {
+  return "(" + p.x + ", " + p.y + ")";
+}
+
+// 没有写 implements Point2D，但结构匹配，照样可以传
+const origin = { x: 0, y: 0 };
+console.log(describe(origin));
+
+// 多出来的属性也没问题（只要不是字面量直接传参）
+const point3d = { x: 3, y: 4, z: 5 };
+console.log(describe(point3d));
+
+console.log("兼容性只看形状，不看名字");`}
+  expectedOutput={`(0, 0)\n(3, 4)\n兼容性只看形状，不看名字`}
+/>
+
+<Callout type="info" title="为什么是结构化类型">
+TypeScript 要给已有的海量 JavaScript 代码「事后」加类型。那些代码里的对象都是随手写的字面量，不可能回头去 implements 一个接口。只看结构，才能让类型系统贴合 JS 的真实用法。
+</Callout>
+
+<Callout type="warn" title="对象字面量的额外属性检查">
+上面 `point3d` 能传进去，是因为它先赋给了变量。如果直接写 `describe({ x: 3, y: 4, z: 5 })`，TS 会报「对象字面量只能指定已知属性」。这是一条专门针对字面量的额外检查，用于捕捉拼写错误，第 4 章会详细讲。
+</Callout>
+
+## 7. 一个重要的取舍：TypeScript 不追求「绝对正确」
+
+学术上，如果一个类型系统能保证「通过检查的程序绝不会出现类型错误」，就称它是**健全的（sound）**。TypeScript **有意**放弃了健全性。前面提到的数组越界返回 `undefined`、类型断言可以指鹿为马、`any` 能关掉一切检查，都是刻意留下的口子。
+
+为什么？因为 TypeScript 的目标不是「设计一门完美的新语言」，而是「给已经写了二十多年的 JavaScript 生态加上类型」。如果坚持完全健全，大量惯用的 JS 写法都会被拒绝，没人愿意迁移。官方设计原则里明确写着：**在正确性与生产力之间，倾向于生产力**。
+
+理解这一点很重要，它决定了你使用 TypeScript 的心态：
+
+- 类型检查通过**不等于**代码没有 bug，它只是排除了一大类低级错误。
+- 遇到「编译器管得太宽」时，通常有更好的建模方式，而不是直接加 `any`。
+- 遇到「编译器管得太松」时（如索引越界），要靠编码规范和运行时校验补上。
+
+<Callout type="tip" title="把类型检查当成第一层测试">
+类型检查是成本最低、覆盖面最广的一层验证，但它上面还需要单元测试、集成测试。二者互补：类型管「形状对不对」，测试管「逻辑对不对」。
+</Callout>
+
+<Callout type="exercise" title="练习">
+写一个函数 `bmi(weightKg: number, heightM: number): number` 计算体质指数（体重除以身高的平方），再写一个 `level(v: number): string` 根据数值返回「偏瘦」「正常」「超重」。用 `console.log` 打印几组数据的结果，并尝试给 `bmi` 传一个字符串，观察类型检查的报错信息。
+</Callout>
+
+## 小结
+
+- 静态类型把「运行时才炸」的错误提前到编译期，同时充当文档与编辑器智能提示的基础
+- TypeScript 是 JavaScript 的超集，可以渐进式迁移
+- **类型会被完全擦除**，不产生任何运行时开销，也不做运行时校验
+- `tsc` 负责类型检查与降级；现代工具常把二者拆开，类型检查交给 `tsc --noEmit`
+- TS 使用**结构化类型**：只要形状匹配就兼容，不需要显式声明实现关系
+- 下一章开始系统学习基础类型与类型注解 →

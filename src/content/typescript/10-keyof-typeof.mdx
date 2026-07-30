@@ -1,0 +1,374 @@
+---
+title: keyof、typeof 与 satisfies
+order: 10
+description: keyof 操作符、typeof 类型查询、索引访问类型、as const 断言与 satisfies 操作符
+---
+
+# keyof、typeof 与 satisfies
+
+前面几章我们都在**写**类型。从这一章开始，我们学习**由已有类型或已有值推导出新类型**——这是 TypeScript 类型系统真正强大的部分，也是「类型编程」的入口。
+
+核心思路只有一句话：**不要重复定义**。类型应该从单一数据源推导出来，这样改一处就全都对上了。
+
+## 1. keyof：取出所有键名
+
+`keyof T` 返回 `T` 所有公开键名组成的**字符串字面量联合**：
+
+```ts
+interface User {
+  id: number;
+  name: string;
+  active: boolean;
+}
+
+type UserKey = keyof User;    // "id" | "name" | "active"
+```
+
+它最常见的搭档就是第 9 章见过的约束：
+
+```ts
+function getProp<T, K extends keyof T>(obj: T, key: K): T[K] {
+  return obj[key];
+}
+```
+
+### 1.1 特殊情况
+
+| 类型 | `keyof` 结果 |
+|---|---|
+| `{ a: 1; b: 2 }` | `"a" \| "b"` |
+| `Record<string, number>` | `string \| number` |
+| `number[]` | `number \| "length" \| "push" \| ...` 等全部数组成员名 |
+| `{}` | `never` |
+
+第二行常让人意外：索引签名为 `string` 时 `keyof` 会带上 `number`，因为 JS 里 `obj[0]` 和 `obj["0"]` 是同一个键。
+
+## 2. typeof：从值取类型
+
+JavaScript 里的 `typeof` 返回字符串。TypeScript 在**类型位置**复用了这个关键字，含义完全不同：**取出一个值的类型**。
+
+```ts
+const config = {
+  host: "localhost",
+  port: 3000,
+};
+
+type Config = typeof config;    // { host: string; port: number }
+```
+
+这是「不要重复定义」的关键工具：先写值，再由值推出类型，而不是先写类型再写一份值。
+
+<Callout type="warn" title="两个 typeof 不要混淆">
+`typeof x === "string"` 里的是**值层面**的运算符，结果是字符串；`type T = typeof x` 里的是**类型层面**的查询，结果是类型。它们只是长得一样，位置决定了含义。
+</Callout>
+
+### 2.1 keyof typeof：最常用的组合
+
+```ts
+const levels = {
+  debug: 10,
+  info: 20,
+  error: 40,
+};
+
+type Level = keyof typeof levels;    // "debug" | "info" | "error"
+```
+
+先用 `typeof` 把值变成类型，再用 `keyof` 取键。这个组合是「用对象当枚举」这一模式的基石。
+
+<Playground
+  language="typescript"
+  id="ts-10-keyof-typeof"
+  title="keyof 与 typeof"
+  code={`interface User {
+  id: number;
+  name: string;
+  active: boolean;
+}
+
+// keyof 得到键名联合
+function getProp<T, K extends keyof T>(obj: T, key: K): T[K] {
+  return obj[key];
+}
+
+const user: User = { id: 7, name: "Grace", active: true };
+console.log("name = " + getProp(user, "name"));
+console.log("active = " + getProp(user, "active"));
+
+// typeof：由值推类型，避免重复定义
+const defaultConfig = {
+  host: "localhost",
+  port: 3000,
+  secure: false,
+};
+type Config = typeof defaultConfig;
+
+function makeConfig(overrides: Partial<Config>): Config {
+  return { ...defaultConfig, ...overrides };
+}
+const c = makeConfig({ port: 8080 });
+console.log("配置: " + c.host + ":" + c.port + " secure=" + c.secure);
+
+// keyof typeof：把对象的键变成字面量联合
+const levels = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+};
+type Level = keyof typeof levels;
+
+function shouldLog(current: Level, min: Level): boolean {
+  return levels[current] >= levels[min];
+}
+console.log("debug 在 info 之上? " + shouldLog("debug", "info"));
+console.log("error 在 info 之上? " + shouldLog("error", "info"));
+
+// 遍历时也能保持类型安全
+const keys = Object.keys(levels) as Level[];
+console.log("全部级别: " + keys.join(" < "));`}
+  expectedOutput={`name = Grace\nactive = true\n配置: localhost:8080 secure=false\ndebug 在 info 之上? false\nerror 在 info 之上? true\n全部级别: debug < info < warn < error`}
+/>
+
+## 3. 索引访问类型
+
+用方括号从类型里「取出」某个成员的类型，语法和访问对象属性一模一样，只是发生在类型层面：
+
+```ts
+interface User {
+  id: number;
+  profile: { email: string; age: number };
+  tags: string[];
+}
+
+type Id = User["id"];                    // number
+type Email = User["profile"]["email"];   // string，可以链式取
+type Tag = User["tags"][number];         // string，用 number 取数组元素类型
+```
+
+### 3.1 三个高频技巧
+
+1. **用联合取多个**：`User["id" | "name"]` 得到 `number | string`。
+2. **用 `keyof` 取全部值类型**：`User[keyof User]` 得到所有属性类型的联合。
+3. **用 `[number]` 拆数组**：`T[number]` 是「数组元素类型」的标准写法，对元组同样有效。
+
+<Callout type="warn" title="索引访问必须用类型，不是值">
+`User["id"]` 里的 `"id"` 是**字符串字面量类型**，不是字符串值。所以 `const k = "id"; type X = User[k]` 会报错——`k` 是值不是类型，得写 `User[typeof k]`。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-10-indexed-access"
+  title="索引访问类型"
+  code={`interface Product {
+  id: number;
+  title: string;
+  price: number;
+  tags: string[];
+  meta: { createdAt: string; author: string };
+}
+
+type Price = Product["price"];              // number
+type Tag = Product["tags"][number];         // string
+type Author = Product["meta"]["author"];    // string
+type AnyValue = Product[keyof Product];     // 所有属性类型的联合
+
+const price: Price = 199;
+const tag: Tag = "热销";
+const author: Author = "Ada";
+console.log("价格 " + price + "，标签 " + tag + "，作者 " + author);
+
+// T[number] 拆数组元素类型，这样定义函数就不用重复写元素结构
+const rows = [
+  { sku: "A-1", qty: 2 },
+  { sku: "B-2", qty: 5 },
+];
+type Row = (typeof rows)[number];
+
+function describeRow(r: Row): string {
+  return r.sku + " x " + r.qty;
+}
+console.log(rows.map(describeRow).join("; "));
+
+// 元组同样适用
+type Coord = [x: number, y: number, label: string];
+type CoordFirst = Coord[0];      // number
+type CoordAny = Coord[number];   // number | string
+
+const first: CoordFirst = 10;
+const anyItem: CoordAny = "原点";
+console.log("元组首项 " + first + "，任意项 " + anyItem);
+
+function sumValues(p: Product): string {
+  const values: AnyValue[] = [p.id, p.title, p.price];
+  return values.map((v) => String(v)).join(" | ");
+}
+console.log(sumValues({
+  id: 1,
+  title: "键盘",
+  price: 299,
+  tags: ["办公"],
+  meta: { createdAt: "2024-01-01", author: "Ada" },
+}));`}
+  expectedOutput={`价格 199，标签 热销，作者 Ada\nA-1 x 2; B-2 x 5\n元组首项 10，任意项 原点\n1 | 键盘 | 299`}
+/>
+
+## 4. as const 断言
+
+`as const` 把一个字面量表达式「冻结」成尽可能窄的类型：
+
+| 表达式 | 默认推断 | 加 `as const` 后 |
+|---|---|---|
+| `"hi"` | `string`（let） | `"hi"` |
+| `[1, 2]` | `number[]` | `readonly [1, 2]` |
+| `{ a: 1 }` | `{ a: number }` | `{ readonly a: 1 }` |
+
+它做了三件事：字面量不再拓宽、数组变只读元组、对象所有属性变 `readonly`（递归生效）。
+
+### 4.1 典型用途
+
+```ts
+const ROUTES = {
+  home: "/",
+  about: "/about",
+} as const;
+
+type Route = (typeof ROUTES)[keyof typeof ROUTES];   // "/" | "/about"
+```
+
+没有 `as const` 的话，`ROUTES.home` 的类型只是 `string`，`Route` 也会退化成 `string`，字面量的精度全部丢失。
+
+## 5. satisfies 操作符
+
+这是 TypeScript 4.9 引入的、非常实用的一个操作符。它要解决的问题是：**我想校验一个值符合某个类型，但不想让这个类型「盖住」推断出来的精确类型。**
+
+先看没有 `satisfies` 时的两难：
+
+```ts
+type Palette = Record<string, string | [number, number, number]>;
+
+// 方案 A：加类型注解 —— 校验有了，精度没了
+const a: Palette = { red: "#f00", green: [0, 255, 0] };
+// a.red 的类型是 string | [number, number, number]，不能直接 .toUpperCase()
+
+// 方案 B：不加注解 —— 精度有了，校验没了
+const b = { red: "#f00", green: [0, 255, 0] };
+// 写错成 { red: 123 } 也不会报错
+```
+
+`satisfies` 同时满足两者：
+
+```ts
+const c = { red: "#f00", green: [0, 255, 0] } satisfies Palette;
+// 既校验了结构，c.red 仍然是 string，c.green 仍然是 number[]
+```
+
+| 写法 | 校验值符合类型 | 保留精确推断 |
+|---|---|---|
+| `const x: T = ...` | 是 | 否 |
+| `const x = ...` | 否 | 是 |
+| `const x = ... satisfies T` | 是 | 是 |
+
+<Callout type="tip" title="配置对象一律用 satisfies">
+凡是「一个大对象，既要保证符合某个约定，又想在使用处享受精确的键名与值类型」的场景——路由表、主题色、命令注册表、i18n 词条——都是 `satisfies` 的主场。配合 `as const` 效果更佳。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-10-const-satisfies"
+  title="as const 与 satisfies"
+  code={`// as const：字面量不拓宽，对象递归只读
+const ROUTES = {
+  home: "/",
+  about: "/about",
+  post: "/posts/:id",
+} as const;
+
+type RouteName = keyof typeof ROUTES;            // "home" | "about" | "post"
+type RoutePath = (typeof ROUTES)[RouteName];     // "/" | "/about" | "/posts/:id"
+
+function go(name: RouteName): RoutePath {
+  return ROUTES[name];
+}
+console.log("home -> " + go("home"));
+console.log("post -> " + go("post"));
+// ROUTES.home = "/x";   // 编译错误：as const 后所有属性只读
+
+// satisfies：既校验又保留精确类型
+type Palette = Record<string, string | [number, number, number]>;
+
+const theme = {
+  primary: "#0066ff",
+  danger: "#ff0033",
+  accent: [255, 128, 0],
+} satisfies Palette;
+
+// primary 仍然是 string，可以直接调用字符串方法
+console.log("主色大写 = " + theme.primary.toUpperCase());
+// accent 仍然是元组，可以按下标取数字
+console.log("强调色 R 通道 = " + theme.accent[0]);
+
+// 对比：加了类型注解就会丢失精度
+const themeAnnotated: Palette = {
+  primary: "#0066ff",
+  accent: [255, 128, 0],
+};
+const p = themeAnnotated.primary;
+console.log("注解版需要收窄: " + (typeof p === "string" ? p : "非字符串"));
+
+// 组合拳：as const + satisfies
+const COMMANDS = {
+  build: { desc: "构建项目", alias: "b" },
+  test: { desc: "运行测试", alias: "t" },
+} as const satisfies Record<string, { desc: string; alias: string }>;
+
+type CommandName = keyof typeof COMMANDS;
+const names = Object.keys(COMMANDS) as CommandName[];
+for (const n of names) {
+  console.log(n + " (" + COMMANDS[n].alias + "): " + COMMANDS[n].desc);
+}`}
+  expectedOutput={`home -> /\npost -> /posts/:id\n主色大写 = #0066FF\n强调色 R 通道 = 255\n注解版需要收窄: #0066ff\nbuild (b): 构建项目\ntest (t): 运行测试`}
+/>
+
+<Callout type="warn" title="satisfies 不是 as">
+`as` 是类型断言：告诉编译器「相信我，它就是这个类型」，可以指鹿为马。`satisfies` 是类型校验：让编译器检查「这个值确实符合该类型」，不符合就报错，且不改变推断结果。二者方向完全相反，`satisfies` 安全得多。
+</Callout>
+
+## 6. 一个绕不开的问题：Object.keys 为什么返回 string[]
+
+你一定会遇到这个场景：明明知道对象只有三个键，`Object.keys(obj)` 返回的却是 `string[]`，于是 `obj[key]` 报错。
+
+```ts
+const levels = { debug: 10, info: 20 };
+// Object.keys(levels).forEach((k) => console.log(levels[k]));   // 错误
+```
+
+这**不是** TypeScript 偷懒，而是结构化类型的必然结果。`levels` 的类型只描述了「至少有 debug 和 info 两个键」，运行时完全可能有更多键——比如别人传了一个结构兼容但多带了字段的对象进来。如果 `Object.keys` 声明为返回 `(keyof T)[]`，就会撒谎。
+
+处理办法有三种，按推荐程度排列：
+
+| 办法 | 写法 | 说明 |
+|---|---|---|
+| 断言键类型 | `Object.keys(o) as (keyof T)[]` | 最常用，明确表示「我知道自己在做什么」 |
+| 用 `Object.entries` | `for (const [k, v] of Object.entries(o))` | 直接拿到值，绕开索引 |
+| 用 `Map` | `new Map<Level, number>()` | 数据本来就是动态集合时，别用普通对象 |
+
+<Callout type="tip" title="遇到「明明知道却报错」时先想想为什么">
+TypeScript 里大部分「看起来太严格」的地方，背后都有一条站得住脚的理由。花一分钟想清楚编译器在担心什么，往往比直接加 `as any` 收获更大——有时候你会发现它担心的事情真的会发生。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 定义一个 `const HTTP_STATUS` 对象（如 200 对应 OK、404 对应 Not Found），用 `as const` 冻结，然后推导出 `type StatusCode` 与 `type StatusText` 两个字面量联合。
+2. 写一个 `pluck<T, K extends keyof T>(items: T[], key: K): T[K][]`，从对象数组中抽出某一列，用一组数据验证返回类型是否精确。
+3. 定义一个 i18n 词条对象并用 `satisfies Record<string, string>` 校验，然后写 `t(key: keyof typeof messages): string`；试着故意把某个值写成数字，看报错是否指向具体那一行。
+</Callout>
+
+## 小结
+
+- `keyof T` 取键名联合，是泛型约束里最常用的搭档
+- 类型位置的 `typeof` 从**值**取**类型**，`keyof typeof obj` 是标准组合拳
+- 索引访问 `T[K]` 支持链式、联合下标，`T[number]` 用来取数组/元组元素类型
+- `as const` 让字面量不拓宽、数组变只读元组、对象递归只读
+- `satisfies` 同时做到「校验结构」与「保留精确推断」，是配置对象的最佳写法
+- 记住核心原则：**从值推导类型，不要写两遍**
+- 下一章讲映射类型与条件类型 →

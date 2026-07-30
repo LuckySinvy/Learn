@@ -1,0 +1,609 @@
+---
+title: JOIN 与字典
+order: 15
+description: JOIN 类型与执行方式、为什么慢、join_algorithm、IN 替代与 dictGet 高性能查表
+---
+
+# JOIN 与字典
+
+JOIN 是 ClickHouse 最弱的一环。从 MySQL 迁过来的人写的第一个复杂查询，往往就死在 JOIN 上。
+
+这一章讲清楚 JOIN 为什么慢、怎么写才不慢，以及大多数场景更好的替代方案——字典。
+
+## 1. JOIN 为什么慢
+
+### 1.1 执行模型
+
+ClickHouse 默认的 JOIN 算法是 **hash join**，且**总是把右表全部加载进内存**：
+
+```text
+SELECT * FROM events AS e JOIN users AS u ON e.user_id = u.user_id
+
+执行过程：
+1. 把 users 整张表读进内存，构建哈希表   ← 右表必须全部装进内存！
+   ┌─────────────────────────┐
+   │ hash{user_id → 整行数据} │
+   └─────────────────────────┘
+2. 流式扫描 events，每行去哈希表查找
+3. 输出匹配结果
+```
+
+关键约束：**右表必须能装进单机内存**。
+
+```text
+Code: 241. DB::Exception: Memory limit (for query) exceeded:
+would use 12.34 GiB. While executing JoiningTransform.
+```
+
+对比 MySQL：MySQL 有 nested loop join，可以用右表索引逐行查找，右表再大也不怕（只是慢）。ClickHouse 没有这种能力（因为没有稠密索引）。
+
+### 1.2 三条铁律
+
+<Callout type="warn" title="ClickHouse JOIN 三条铁律">
+1. **小表永远放右边**。ClickHouse 不会自动调整表顺序（除非开 `query_plan_optimize_join_order`，24.x 仍不成熟）。写反了就是把 10 亿行的表灌进内存。
+
+2. **先过滤再 JOIN**。ClickHouse 的谓词下推不完善，`WHERE` 条件不一定能推到 JOIN 之前。手动写成子查询更保险。
+
+3. **能不 JOIN 就不 JOIN**。宽表、字典、IN 子查询往往是更好的方案。
+</Callout>
+
+```sql
+-- 差：右表是大表
+SELECT ... FROM users AS u JOIN events AS e ON u.user_id = e.user_id;
+
+-- 好：右表是小表
+SELECT ... FROM events AS e JOIN users AS u ON e.user_id = u.user_id;
+
+-- 更好：先过滤右表
+SELECT ...
+FROM events AS e
+JOIN (SELECT user_id, vip_level FROM users WHERE vip_level > 0) AS u
+    ON e.user_id = u.user_id;
+```
+
+## 2. JOIN 类型
+
+### 2.1 标准类型
+
+```sql
+-- 准备一张用户维表
+CREATE TABLE users
+(
+    user_id    UInt64,
+    reg_time   DateTime,
+    vip_level  UInt8,
+    channel    LowCardinality(String),
+    city       LowCardinality(String)
+)
+ENGINE = MergeTree ORDER BY user_id;
+
+INSERT INTO users
+SELECT
+    number + 1,
+    toDateTime('2024-01-01') + rand(1) % 15000000,
+    rand(2) % 5,
+    ['organic','ads','referral'][1 + rand(3) % 3],
+    ['北京','上海','深圳','杭州'][1 + rand(4) % 4]
+FROM numbers(50000);
+```
+
+```sql
+-- INNER JOIN（默认）
+SELECT u.vip_level, count() AS pv
+FROM events AS e
+INNER JOIN users AS u ON e.user_id = u.user_id
+GROUP BY u.vip_level ORDER BY u.vip_level;
+
+-- LEFT JOIN：保留左表所有行，右表无匹配时填默认值
+SELECT e.user_id, u.vip_level
+FROM events AS e
+LEFT JOIN users AS u ON e.user_id = u.user_id
+LIMIT 5;
+
+-- CROSS JOIN：笛卡尔积
+SELECT * FROM small_a CROSS JOIN small_b;
+```
+
+```text
+┌─vip_level─┬─────pv─┐
+│         0 │ 200412 │
+│         1 │ 199988 │
+│         2 │ 200103 │
+│         3 │ 199772 │
+│         4 │ 199725 │
+└───────────┴────────┘
+```
+
+<Callout type="warn" title="LEFT JOIN 不匹配时填的是默认值，不是 NULL">
+```sql
+SELECT e.user_id, u.vip_level
+FROM events AS e LEFT JOIN users AS u ON e.user_id = u.user_id
+WHERE e.user_id > 100000;
+```
+
+`vip_level` 会是 `0` 而不是 `NULL`（因为它是非 Nullable 的 UInt8）。这和 MySQL 完全不同，很容易导致统计错误。
+
+想要 NULL 语义：
+
+```sql
+SET join_use_nulls = 1;
+```
+
+开启后不匹配的列变成 `Nullable` 并填 NULL。但这会让所有 JOIN 结果列变成 Nullable，有性能代价。
+</Callout>
+
+### 2.2 ClickHouse 特有的 JOIN 类型
+
+**ANY JOIN**：右表有多行匹配时只取一行（不做行数放大）：
+
+```sql
+SELECT e.user_id, u.city
+FROM events AS e
+ANY LEFT JOIN users AS u ON e.user_id = u.user_id;
+```
+
+如果右表 user_id 唯一，`ANY LEFT JOIN` 和 `LEFT JOIN` 结果一样，但 `ANY` 更快（哈希表每个 key 只存一行）。**维表关联优先用 ANY**。
+
+**SEMI / ANTI JOIN**：只判断存在性，不取右表列：
+
+```sql
+-- SEMI：左表中在右表有匹配的行（类似 IN）
+SELECT * FROM events AS e SEMI LEFT JOIN users AS u ON e.user_id = u.user_id;
+
+-- ANTI：左表中在右表没有匹配的行（类似 NOT IN）
+SELECT * FROM events AS e ANTI LEFT JOIN users AS u ON e.user_id = u.user_id;
+```
+
+**ASOF JOIN**：按时间"最近匹配"，做时序数据关联的神器：
+
+```sql
+-- 每个事件关联「事件发生时最近的一次汇率」
+CREATE TABLE rates (currency String, ts DateTime, rate Float64)
+ENGINE = MergeTree ORDER BY (currency, ts);
+
+SELECT
+    o.order_id,
+    o.order_time,
+    o.amount,
+    r.rate,
+    o.amount * r.rate AS amount_usd
+FROM orders AS o
+ASOF LEFT JOIN rates AS r
+    ON o.country = r.currency AND o.order_time >= r.ts;
+```
+
+`ASOF` 的最后一个条件必须是不等式（`>=`、`>`、`<=`、`<`），它会找**满足条件的最近一行**。在 MySQL 里实现这个需要关联子查询，性能极差。
+
+## 3. join_algorithm：选择执行算法
+
+24.x 支持多种算法，通过 `join_algorithm` 设置：
+
+| 算法 | 内存 | 适用 |
+|---|---|---|
+| `hash`（默认） | 右表全量进内存 | 右表小 |
+| `parallel_hash` | 同上但并行构建 | 右表中等，多核机器 |
+| `partial_merge` | 低（可溢写磁盘） | 右表大，内存不够 |
+| `full_sorting_merge` | 低 | 两表都大且已排序 |
+| `grace_hash` | 可控（分批） | 右表很大，内存有限 |
+| `direct` | 极低 | 右表是字典或 Join 引擎表 |
+| `auto` | 自适应 | 让 ClickHouse 自己选 |
+
+```sql
+-- 右表太大装不下内存时
+SELECT ...
+FROM events AS e JOIN big_table AS b ON e.user_id = b.user_id
+SETTINGS join_algorithm = 'grace_hash', max_bytes_in_join = 4000000000;
+
+-- 两表都大且按 join key 排序时（最省内存）
+SETTINGS join_algorithm = 'full_sorting_merge';
+
+-- 让引擎自动选
+SETTINGS join_algorithm = 'auto';
+```
+
+`grace_hash` 的原理是把两表按 join key 哈希分桶，逐桶做 hash join，内存占用降到 `1/桶数`：
+
+```text
+grace_hash 执行过程
+
+右表 ──hash 分桶──▶ bucket0, bucket1, ..., bucketN（落盘）
+左表 ──hash 分桶──▶ bucket0, bucket1, ..., bucketN（落盘）
+
+for i in 0..N:
+    加载 右表 bucket_i 到内存建哈希表
+    流式扫描 左表 bucket_i 做匹配
+    释放内存
+```
+
+<Callout type="tip" title="内存不够时的处理顺序">
+1. 先检查是不是表顺序写反了
+2. 尝试先过滤右表缩小规模
+3. 改用 `join_algorithm = 'grace_hash'` 或 `'partial_merge'`
+4. 调高 `max_bytes_in_join` 和 `max_memory_usage`
+5. 考虑改用字典或 IN 子查询
+</Callout>
+
+## 4. IN 替代 JOIN
+
+很多"JOIN"其实只是为了过滤，用 `IN` 更快：
+
+```sql
+-- 用 JOIN 过滤 VIP 用户的事件
+SELECT count()
+FROM events AS e
+INNER JOIN (SELECT user_id FROM users WHERE vip_level >= 3) AS u
+    ON e.user_id = u.user_id;
+-- Elapsed: 1.24 sec, Memory: 480 MiB
+
+-- 用 IN（更快、更省内存）
+SELECT count()
+FROM events
+WHERE user_id IN (SELECT user_id FROM users WHERE vip_level >= 3);
+-- Elapsed: 0.41 sec, Memory: 82 MiB
+```
+
+`IN` 子查询只需要在内存里存一个**去重的 key 集合**（Set），而 JOIN 要存整行。数据量差 10 倍以上。
+
+而且 `IN` 的结果可以被用于**索引过滤**：
+
+```sql
+-- 如果 user_id 在排序键里，IN 能走稀疏索引
+SELECT count() FROM events_by_user
+WHERE user_id IN (SELECT user_id FROM users WHERE vip_level >= 3);
+```
+
+<Callout type="warn" title="NOT IN 遇到 NULL 会返回空">
+和标准 SQL 一样，如果子查询结果里含 NULL，`NOT IN` 会返回空集。用 `NOT IN (SELECT x FROM t WHERE x IS NOT NULL)` 或改用 `ANTI JOIN`。
+</Callout>
+
+## 5. 字典：JOIN 的正确替代
+
+字典（Dictionary）是 ClickHouse 为「维表关联」专门设计的机制：**把维表常驻内存，用哈希查找代替 JOIN**。
+
+### 5.1 定义字典
+
+```sql
+CREATE DICTIONARY users_dict
+(
+    user_id    UInt64,
+    vip_level  UInt8      DEFAULT 0,
+    channel    String     DEFAULT 'unknown',
+    city       String     DEFAULT 'unknown',
+    reg_time   DateTime
+)
+PRIMARY KEY user_id
+SOURCE(CLICKHOUSE(
+    HOST 'localhost' PORT 9000
+    USER 'default' PASSWORD ''
+    DB 'demo' TABLE 'users'
+))
+LAYOUT(HASHED())
+LIFETIME(MIN 300 MAX 600);       -- 300~600 秒随机刷新一次
+```
+
+三个关键部分：
+
+- **SOURCE**：数据从哪来（ClickHouse 表、MySQL、PostgreSQL、HTTP、文件、MongoDB…）
+- **LAYOUT**：内存布局（决定性能和内存占用）
+- **LIFETIME**：多久刷新一次
+
+### 5.2 使用 dictGet
+
+```sql
+SELECT
+    country,
+    dictGet('users_dict', 'vip_level', user_id)  AS vip,
+    count()                                       AS pv
+FROM events
+GROUP BY country, vip
+ORDER BY country, vip;
+```
+
+```text
+┌─country─┬─vip─┬────pv─┐
+│ CN      │   0 │ 40213 │
+│ CN      │   1 │ 39988 │
+│ CN      │   2 │ 40103 │
+│ CN      │   3 │ 39772 │
+│ CN      │   4 │ 40132 │
+└─────────┴─────┴───────┘
+```
+
+一次取多个属性：
+
+```sql
+SELECT
+    user_id,
+    dictGet('users_dict', ('vip_level', 'channel', 'city'), user_id) AS attrs,
+    attrs.1 AS vip,
+    attrs.2 AS channel,
+    attrs.3 AS city
+FROM events LIMIT 3;
+```
+
+其他字典函数：
+
+```sql
+SELECT
+    dictGet('users_dict', 'city', toUInt64(1001))                AS city,
+    dictGetOrDefault('users_dict', 'city', toUInt64(999999), '未知') AS city2,
+    dictGetOrNull('users_dict', 'city', toUInt64(999999))        AS city3,
+    dictHas('users_dict', toUInt64(1001))                        AS exists_;
+```
+
+### 5.3 性能对比
+
+```sql
+-- JOIN 方式
+SELECT u.city, count() FROM events AS e
+ANY LEFT JOIN users AS u ON e.user_id = u.user_id
+GROUP BY u.city;
+-- Elapsed: 2.84 sec, Memory: 620 MiB
+
+-- 字典方式
+SELECT dictGet('users_dict', 'city', user_id) AS city, count()
+FROM events GROUP BY city;
+-- Elapsed: 0.38 sec, Memory: 45 MiB
+```
+
+**7 倍加速，内存降低 93%**。原因：
+
+1. 字典常驻内存，不需要每次查询都重建哈希表
+2. `dictGet` 是向量化的，一次处理一整块数据
+3. 不产生中间结果集
+
+### 5.4 LAYOUT 类型
+
+| LAYOUT | key 类型 | 内存 | 查找 | 适用 |
+|---|---|---|---|---|
+| `FLAT` | UInt64（连续） | key 最大值 × 行宽 | **最快**（数组下标） | ID 连续且不太大 |
+| `HASHED` | 任意单键 | 中 | 快（哈希） | 通用首选 |
+| `SPARSE_HASHED` | 任意单键 | **低**（省 2 倍） | 稍慢 | 内存紧张 |
+| `COMPLEX_KEY_HASHED` | 复合键 | 中 | 快 | 多列联合主键 |
+| `RANGE_HASHED` | 键 + 时间区间 | 中 | 快 | 有生效时间的维表 |
+| `IP_TRIE` | IP 前缀 | 中 | 快 | IP 归属地查询 |
+| `CACHE` | 任意 | **可控** | 慢（缓存未命中要回源） | 超大维表 |
+| `DIRECT` | 任意 | 无 | 慢（每次回源） | 极大维表、低频查询 |
+
+```sql
+-- FLAT：ID 从 1 开始连续，最快
+LAYOUT(FLAT(INITIAL_ARRAY_SIZE 100000 MAX_ARRAY_SIZE 5000000))
+
+-- 复合键
+CREATE DICTIONARY geo_dict
+(
+    country String,
+    city    String,
+    region  String,
+    lat     Float64,
+    lon     Float64
+)
+PRIMARY KEY country, city
+SOURCE(CLICKHOUSE(TABLE 'geo_table'))
+LAYOUT(COMPLEX_KEY_HASHED())
+LIFETIME(3600);
+
+SELECT dictGet('geo_dict', 'region', (country, city)) FROM events;
+
+-- 带时间区间：查询「某时刻的汇率」
+CREATE DICTIONARY rate_dict
+(
+    currency  String,
+    start_ts  DateTime,
+    end_ts    DateTime,
+    rate      Float64
+)
+PRIMARY KEY currency
+SOURCE(CLICKHOUSE(TABLE 'rates'))
+LAYOUT(RANGE_HASHED())
+RANGE(MIN start_ts MAX end_ts)
+LIFETIME(600);
+
+SELECT dictGet('rate_dict', 'rate', currency, order_time) FROM orders;
+
+-- IP 归属地
+CREATE DICTIONARY ip_dict
+(
+    prefix  String,
+    country String,
+    city    String
+)
+PRIMARY KEY prefix
+SOURCE(CLICKHOUSE(TABLE 'ip_ranges'))
+LAYOUT(IP_TRIE())
+LIFETIME(86400);
+
+SELECT dictGet('ip_dict', 'country', toIPv4('8.8.8.8'));
+```
+
+### 5.5 外部数据源
+
+字典可以直接从 MySQL 拉，自动定期刷新：
+
+```sql
+CREATE DICTIONARY users_from_mysql
+(
+    user_id   UInt64,
+    vip_level UInt8,
+    city      String
+)
+PRIMARY KEY user_id
+SOURCE(MYSQL(
+    HOST 'mysql-host' PORT 3306
+    USER 'ch_reader' PASSWORD 'secret'
+    DB 'shop' TABLE 'users'
+    -- 增量刷新：只拉 update_time 变化的行
+    UPDATE_FIELD 'update_time' UPDATE_LAG 60
+))
+LAYOUT(HASHED())
+LIFETIME(MIN 300 MAX 360);
+```
+
+`UPDATE_FIELD` 让字典只拉增量，避免每次全表扫 MySQL。
+
+也支持 HTTP、本地文件、Redis、MongoDB：
+
+```sql
+SOURCE(HTTP(url 'http://api.internal/dims/users.csv' format 'CSVWithNames'))
+SOURCE(FILE(path '/var/lib/clickhouse/user_files/geo.csv' format 'CSVWithNames'))
+SOURCE(REDIS(host 'redis' port 6379 storage_type 'hash_map'))
+```
+
+### 5.6 字典运维
+
+```sql
+-- 查看所有字典及内存占用
+SELECT
+    name, status, type, key,
+    element_count,
+    formatReadableSize(bytes_allocated) AS mem,
+    round(hit_rate * 100, 2)            AS hit_pct,
+    last_successful_update_time,
+    last_exception
+FROM system.dictionaries
+FORMAT Vertical;
+```
+
+```text
+Row 1:
+──────
+name:                        users_dict
+status:                      LOADED
+type:                        Hashed
+key:                         UInt64
+element_count:               50000
+mem:                         4.82 MiB
+hit_pct:                     100
+last_successful_update_time: 2024-07-30 12:05:00
+last_exception:
+```
+
+```sql
+-- 手动刷新
+SYSTEM RELOAD DICTIONARY users_dict;
+SYSTEM RELOAD DICTIONARIES;          -- 全部
+
+-- 把字典当表查（调试用）
+SELECT * FROM users_dict LIMIT 5;
+SELECT count() FROM dictionary(users_dict);
+```
+
+<Callout type="warn" title="字典的三个注意点">
+1. **内存占用是实打实的**。1000 万行 × 100 字节 = 1 GB 常驻内存，且每个副本节点都要有一份。用 `SPARSE_HASHED` 或 `CACHE` 布局可以缓解。
+
+2. **数据有延迟**。`LIFETIME(MIN 300 MAX 600)` 意味着最多 10 分钟的陈旧数据。需要实时的场景要缩短周期，但会增加源库压力。
+
+3. **`dictGet` 的 key 类型必须精确匹配**。字典的 key 是 `UInt64` 时，传 `UInt32` 会报错，要写 `dictGet('d', 'x', toUInt64(id))`。
+</Callout>
+
+## 6. 其他替代方案
+
+### 6.1 Join 引擎表
+
+把 JOIN 的右表预先构建成常驻内存的哈希表：
+
+```sql
+CREATE TABLE users_join
+(
+    user_id   UInt64,
+    vip_level UInt8,
+    city      String
+)
+ENGINE = Join(ANY, LEFT, user_id);
+
+INSERT INTO users_join SELECT user_id, vip_level, city FROM users;
+
+-- 用法一：直接 JOIN（不需要重建哈希表）
+SELECT e.user_id, u.city
+FROM events AS e ANY LEFT JOIN users_join AS u ON e.user_id = u.user_id;
+
+-- 用法二：joinGet 函数（类似 dictGet）
+SELECT user_id, joinGet('users_join', 'city', user_id) AS city
+FROM events LIMIT 3;
+```
+
+Join 引擎表和字典很像，区别是它支持任意 JOIN 类型且可以增量 INSERT，但没有自动刷新机制。
+
+### 6.2 宽表（反范式）
+
+最彻底的方案：**在写入时就把维度字段冗余进事实表**。
+
+```sql
+CREATE TABLE events_wide
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32,
+    -- 冗余的用户维度
+    user_vip    UInt8,
+    user_city   LowCardinality(String),
+    user_channel LowCardinality(String)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+
+-- 写入时用字典打宽
+CREATE MATERIALIZED VIEW mv_widen TO events_wide AS
+SELECT
+    event_time, user_id, event_type, page, country, device, duration_ms,
+    dictGet('users_dict', 'vip_level', user_id) AS user_vip,
+    dictGet('users_dict', 'city',      user_id) AS user_city,
+    dictGet('users_dict', 'channel',   user_id) AS user_channel
+FROM events;
+```
+
+代价是存储变大（LowCardinality 后其实增加很少）和维度变更不会回溯历史。但查询完全不需要 JOIN，性能最好。
+
+**ClickHouse 的最佳实践就是宽表**。这与 MySQL 的三范式思维完全相反，需要主动转变。
+
+## 7. 决策树
+
+```text
+需要关联维度数据？
+│
+├─ 维表小（小于 1000 万行）且查询频繁
+│   └──▶ 字典 + dictGet          ★ 首选
+│
+├─ 只是为了过滤，不需要维表的列
+│   └──▶ WHERE key IN (子查询)
+│
+├─ 维度在写入时就能确定
+│   └──▶ 宽表（MV 打宽）         ★ 性能最好
+│
+├─ 需要按时间"最近匹配"
+│   └──▶ ASOF JOIN
+│
+├─ 右表大到装不下内存
+│   └──▶ join_algorithm = 'grace_hash'
+│
+└─ 一次性分析、数据量不大
+    └──▶ 普通 JOIN（小表放右边）
+```
+
+<Callout type="exercise" title="练习">
+1. 建 `users` 维表（5 万行），分别用 `ANY LEFT JOIN` 和 `dictGet` 关联 `events`，对比 Elapsed 和 `system.query_log` 里的 `memory_usage`。
+2. 把 JOIN 的左右表写反（大表放右边），观察内存占用和耗时的变化，体会「小表放右边」的重要性。
+3. 用 `WHERE user_id IN (SELECT ...)` 替换一个只用于过滤的 JOIN，对比性能。
+4. 创建一个 `RANGE_HASHED` 字典存汇率的生效时间区间，用 `dictGet('rate_dict', 'rate', currency, order_time)` 给订单表换算金额。
+5. 用 `system.dictionaries` 查看字典的 `bytes_allocated` 和 `hit_rate`，思考 1000 万行的维表建成字典要多少内存。
+6. 建一个 MV 用 `dictGet` 把 `events` 打宽成 `events_wide`，对比宽表查询和 JOIN 查询的性能差异。
+</Callout>
+
+## 小结
+
+- ClickHouse 的 JOIN 默认是 hash join，**右表必须全部装进内存**
+- 三条铁律：小表放右边、先过滤再 JOIN、能不 JOIN 就不 JOIN
+- `LEFT JOIN` 不匹配时填默认值不是 NULL，需要 NULL 语义要开 `join_use_nulls`
+- `ANY JOIN` 用于维表关联（右表 key 唯一），比普通 JOIN 快
+- `ASOF JOIN` 做时间最近匹配，时序数据关联神器
+- 内存不够时改 `join_algorithm` 为 `grace_hash` 或 `partial_merge`
+- 只为过滤时用 `IN` 子查询，内存占用比 JOIN 小一个数量级
+- **字典是维表关联的正确答案**：常驻内存、向量化查找、比 JOIN 快 5~10 倍
+- LAYOUT 选择：连续 ID 用 `FLAT`，通用用 `HASHED`，内存紧张用 `SPARSE_HASHED`，超大表用 `CACHE`
+- 终极方案是宽表：写入时用字典打宽，查询完全不 JOIN
+- 下一章讲跳数索引与查询优化 →

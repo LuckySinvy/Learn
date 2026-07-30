@@ -1,0 +1,194 @@
+---
+title: List：队列、栈与时间线
+order: 5
+description: LPUSH/RPOP/LRANGE/BLPOP/LMOVE、quicklist 编码、消息队列场景与局限
+---
+
+# List：队列、栈与时间线
+
+List 是一个**双端链表**语义的有序集合：两端都能推入弹出，中间可按下标访问。它是 Redis 里最简单的消息队列载体，也是"最新 N 条"类需求（时间线、操作日志）的标准答案。
+
+## 1. 数据模型
+
+```text
+          LPUSH 从左进                RPUSH 从右进
+              |                           |
+              v                           v
+  左(头) <- [ e4 | e3 | e2 | e1 | e0 ] -> 右(尾)
+              ^                           ^
+              |                           |
+          LPOP 从左出                  RPOP 从右出
+```
+
+- `LPUSH` + `RPOP`（或反向）= 队列（FIFO）
+- `LPUSH` + `LPOP` = 栈（LIFO）
+
+## 2. 核心命令实操
+
+### 2.1 推入与弹出
+
+```bash
+127.0.0.1:6379> LPUSH tasks "job1"
+(integer) 1
+127.0.0.1:6379> LPUSH tasks "job2" "job3"
+(integer) 3             # 返回列表当前长度; 现在顺序: job3 job2 job1
+127.0.0.1:6379> RPUSH tasks "job0"
+(integer) 4             # job3 job2 job1 job0
+127.0.0.1:6379> RPOP tasks
+"job0"
+127.0.0.1:6379> LPOP tasks 2
+1) "job3"
+2) "job2"               # Redis 6.2+ 支持一次弹出多个
+127.0.0.1:6379> LLEN tasks
+(integer) 1
+```
+
+### 2.2 范围读取与裁剪
+
+```bash
+127.0.0.1:6379> RPUSH timeline p1 p2 p3 p4 p5
+(integer) 5
+127.0.0.1:6379> LRANGE timeline 0 2
+1) "p1"
+2) "p2"
+3) "p3"
+127.0.0.1:6379> LRANGE timeline -2 -1     # 负下标从尾部数
+1) "p4"
+2) "p5"
+127.0.0.1:6379> LTRIM timeline 0 2        # 只保留前 3 个，其余删除
+OK
+127.0.0.1:6379> LRANGE timeline 0 -1      # 0 到 -1 = 全部
+1) "p1"
+2) "p2"
+3) "p3"
+```
+
+`LPUSH` + `LTRIM` 组合是"定长时间线"的标准姿势：
+
+```bash
+# 用户动态流: 新动态插头部，只保留最新 100 条
+127.0.0.1:6379> LPUSH feed:u1001 "post:9527"
+(integer) 101
+127.0.0.1:6379> LTRIM feed:u1001 0 99
+OK
+```
+
+### 2.3 按下标与按值操作
+
+```bash
+127.0.0.1:6379> LINDEX timeline 0
+"p1"
+127.0.0.1:6379> LSET timeline 0 "p1-edited"
+OK
+127.0.0.1:6379> LINSERT timeline BEFORE "p2" "p1.5"
+(integer) 4
+127.0.0.1:6379> LREM timeline 1 "p1.5"    # 从头开始删 1 个值为 p1.5 的元素
+(integer) 1
+127.0.0.1:6379> LPOS timeline "p3"        # 查找元素下标 (6.0.6+)
+(integer) 2
+```
+
+注意 `LINDEX`/`LSET`/`LINSERT` 都是 O(n)，长列表上慎用。
+
+### 2.4 阻塞弹出：BLPOP / BRPOP
+
+消费者轮询空队列既浪费 CPU 又有延迟。阻塞版本让连接挂起等待，有数据立刻返回：
+
+```bash
+# 消费者窗口: 阻塞等待，最长 30 秒（0 表示无限等待）
+127.0.0.1:6379> BLPOP queue:email 30
+（挂起中...）
+
+# 另一个窗口的生产者:
+127.0.0.1:6379> RPUSH queue:email "to:ada@example.com"
+(integer) 1
+
+# 消费者立刻返回:
+1) "queue:email"        # 哪个 key 有数据（BLPOP 可同时监听多个 key）
+2) "to:ada@example.com"
+(3.62s)
+```
+
+### 2.5 LMOVE：可靠队列的雏形
+
+`RPOPLPUSH` 已废弃，Redis 6.2+ 用 `LMOVE`：原子地把元素从一个列表转移到另一个列表。
+
+```bash
+127.0.0.1:6379> RPUSH pending "task-1"
+(integer) 1
+127.0.0.1:6379> LMOVE pending processing LEFT RIGHT
+"task-1"                # 从 pending 左端取出，放入 processing 右端
+127.0.0.1:6379> LRANGE processing 0 -1
+1) "task-1"
+# 处理成功后从 processing 删除; 消费者崩溃则 task 还留在 processing 可被恢复
+127.0.0.1:6379> LREM processing 1 "task-1"
+(integer) 1
+```
+
+这个"工作队列 + 处理中队列"模式让消息在消费者崩溃时不丢失，也有阻塞版 `BLMOVE`。
+
+## 3. 底层编码：quicklist
+
+Redis 7 中 List 的编码是 listpack 或 quicklist：
+
+```bash
+127.0.0.1:6379> OBJECT ENCODING timeline
+"listpack"              # 元素少且短时
+```
+
+元素超过 128 个或单元素超 64 字节后转为 quicklist——一个**由多个 listpack 节点组成的双向链表**：
+
+```text
+quicklist:
+ head                                              tail
+  |                                                 |
+  v                                                 v
++---------+     +---------+     +---------+     +---------+
+| listpack| <-> | listpack| <-> | listpack| <-> | listpack|
+| e1..e64 |     | e65..   |     |  ...    |     | ..eN    |
++---------+     +---------+     +---------+     +---------+
+```
+
+设计动机：纯双向链表每个节点都有前后指针（16 字节开销）且内存碎片化；纯 listpack 大了以后插入删除要整体挪动。quicklist 折中：**链表串起一段段小 listpack**，两端操作 O(1)，内存又紧凑。相关配置：
+
+```conf
+list-max-listpack-size 128   # 每个 listpack 节点的元素上限
+list-compress-depth 0        # 两端各保留几个节点不压缩（中间节点可 LZF 压缩）
+```
+
+复杂度速查：LPUSH/RPUSH/LPOP/RPOP 为 O(1)；LRANGE 为 O(s+n)；LINDEX/LREM/LINSERT 为 O(n)。
+
+## 4. List 做消息队列的局限
+
+List 是入门级队列，但相比专业方案缺了不少东西：
+
+| 能力 | List | Stream（第 9 章） |
+|---|---|---|
+| 阻塞消费 | BLPOP 支持 | XREAD BLOCK 支持 |
+| 消息确认 ACK | 无（弹出即删除） | XACK 支持 |
+| 消费组（多消费者分摊） | 无，弹出即抢占 | XGROUP 支持 |
+| 重复消费/回溯 | 不可能 | 消息保留可回溯 |
+| 广播（一条消息多方消费） | 不支持 | 多个消费组各自独立消费 |
+
+<Callout type="warn" title="BLPOP 弹出即删除，崩溃就丢消息">
+消费者 BLPOP 拿到消息后、处理完成前如果崩溃，这条消息就永久丢失了。要可靠性就用 LMOVE 双队列模式，或者直接上 Stream。另外注意：BLPOP 阻塞期间连接被占用，使用连接池的客户端要为阻塞命令使用独立连接。
+</Callout>
+
+<Callout type="info" title="时间线场景的局限">
+LPUSH + LTRIM 的时间线只能"按插入顺序"排列。如果需要按分数排序（热度榜）、按时间范围查询、去重插入，应该用 ZSet。List 适合"只追加、只看最新 N 条"的简单场景。
+</Callout>
+
+## 小结
+
+- List 双端 O(1) 操作：LPUSH/RPUSH/LPOP/RPOP 组合出队列与栈
+- LPUSH + LTRIM 实现定长时间线；BLPOP 实现无轮询消费
+- LMOVE 双队列模式给消息加上"处理中"状态，防消费者崩溃丢消息
+- 编码：小列表 listpack，大列表 quicklist（listpack 节点组成的链表）
+- 需要 ACK、消费组、消息回溯时，升级到 Stream →（第 9 章）
+- 下一章 Set：无序去重集合 →
+
+<Callout type="exercise" title="练习">
+1. 用两个 redis-cli 窗口演练生产者-消费者：一边 BLPOP 阻塞等待，另一边 RPUSH，观察阻塞返回的耗时标记。
+2. 实现"最近浏览记录"：每次浏览 LPUSH 商品 ID，先 LREM 去重再插入，保留最多 10 条，写出完整命令序列。
+3. 向一个 List 连续 RPUSH 200 个元素，用 OBJECT ENCODING 观察从 listpack 到 quicklist 的编码转换。
+</Callout>

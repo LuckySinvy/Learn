@@ -1,0 +1,398 @@
+---
+title: 索引基础
+order: 8
+description: 单字段索引、唯一/稀疏/部分索引、TTL、多键、文本与地理索引
+---
+
+# 索引基础
+
+没有索引的 MongoDB 就是一个很贵的文件系统。这一章讲清楚索引是什么、有哪些种类、每种解决什么问题。下一章再讲复合索引的设计策略。
+
+## 1. 索引是什么
+
+### 1.1 没有索引会怎样
+
+```js
+db.posts.find({ authorId: "alice" }).explain("executionStats")
+```
+
+```json
+{
+  "executionStats": {
+    "nReturned": 12,
+    "totalDocsExamined": 1000000,
+    "executionTimeMillis": 842,
+    "executionStages": { "stage": "COLLSCAN" }
+  }
+}
+```
+
+`COLLSCAN` 意为集合扫描：为了找 12 条，读了 100 万条。加上索引：
+
+```js
+db.posts.createIndex({ authorId: 1 })
+db.posts.find({ authorId: "alice" }).explain("executionStats")
+```
+
+```json
+{
+  "executionStats": {
+    "nReturned": 12,
+    "totalDocsExamined": 12,
+    "totalKeysExamined": 12,
+    "executionTimeMillis": 1,
+    "executionStages": { "stage": "FETCH", "inputStage": { "stage": "IXSCAN" } }
+  }
+}
+```
+
+842 毫秒变 1 毫秒，扫描量从 100 万降到 12。
+
+### 1.2 B 树结构
+
+MongoDB 的索引是 B 树（WiredTiger 里实现为 B+ 树变体）。索引里存的是「键值 → 记录地址」的有序映射：
+
+```text
+                  ┌──────────────┐
+                  │  bob | frank │            根节点
+                  └───┬──────┬───┘
+             ┌────────┘      └────────┐
+        ┌────▼─────┐            ┌─────▼──────┐
+        │alice|bob │            │frank|grace │   中间节点
+        └──┬────┬──┘            └───┬─────┬──┘
+           ▼    ▼                   ▼     ▼
+        [记录地址]                [记录地址]        叶子
+
+  查 authorId = "frank"：根 → 右子树 → 叶子，3 次跳转
+  查 authorId >= "bob"：定位到 bob 后顺序读叶子链表
+```
+
+两个关键性质：
+
+1. **有序**，所以能做范围查询和排序
+2. **树高很低**，百万级数据通常 3 到 4 层
+
+### 1.3 索引的代价
+
+| 代价 | 说明 |
+|---|---|
+| 写放大 | 每次插入/更新/删除都要维护所有相关索引 |
+| 存储 | 索引本身占磁盘和内存，热点索引应常驻内存 |
+| 内存竞争 | 索引挤占 WiredTiger cache，可能把数据挤出去 |
+
+```text
+一次 insert 的真实成本：
+
+  写文档 ────────────────────────────▶ 1 次
+  维护 _id 索引 ─────────────────────▶ 1 次
+  维护 authorId 索引 ────────────────▶ 1 次
+  维护 tags 多键索引（5 个标签）─────▶ 5 次
+  维护 status_createdAt 复合索引 ────▶ 1 次
+                                       ────
+                                       9 次写
+
+  索引越多，写入越慢。这就是「不该建的索引不要建」的原因。
+```
+
+## 2. 创建与管理索引
+
+```js
+// 创建（1 升序，-1 降序，单字段索引方向无所谓）
+db.posts.createIndex({ authorId: 1 })
+
+// 带名字与选项
+db.posts.createIndex({ createdAt: -1 }, { name: "idx_created_desc" })
+
+// 查看所有索引
+db.posts.getIndexes()
+```
+
+```json
+[
+  { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+  { "v": 2, "key": { "authorId": 1 }, "name": "authorId_1" },
+  { "v": 2, "key": { "createdAt": -1 }, "name": "idx_created_desc" }
+]
+```
+
+```js
+// 看索引占用
+db.posts.stats().indexSizes
+
+// 删除
+db.posts.dropIndex("idx_created_desc")
+db.posts.dropIndexes()      // 除 _id_ 外全删
+
+// 后台构建（4.2+ 默认就是不阻塞读写的混合构建，无需额外参数）
+db.posts.createIndex({ tags: 1 })
+```
+
+<Callout type="warn" title="生产环境建索引要挑时间">
+4.2 之后索引构建不再长时间持有排他锁，但它仍然消耗大量 IO 和 CPU，并且在构建的最后阶段会短暂阻塞。给亿级集合建索引可能耗时数小时，务必在低峰期做，并优先在 secondary 上滚动构建（rolling index build）。
+</Callout>
+
+## 3. 唯一索引
+
+```js
+db.users.createIndex({ email: 1 }, { unique: true })
+db.users.insertOne({ username: "x", email: "alice@example.com" })
+```
+
+```text
+MongoServerError: E11000 duplicate key error collection: community.users
+index: email_1 dup key: { email: "alice@example.com" }
+```
+
+复合唯一索引约束的是**组合**唯一，不是每个字段各自唯一：
+
+```js
+// 一个用户对同一个人只能关注一次
+db.follows.createIndex({ followerId: 1, followeeId: 1 }, { unique: true })
+```
+
+### 3.1 唯一索引与缺失字段
+
+如果某些文档没有该字段，MongoDB 会把它当作 `null` 参与唯一性判断——所以**只能有一个文档缺失该字段**：
+
+```js
+db.users.createIndex({ phone: 1 }, { unique: true })
+db.users.insertOne({ username: "a" })     // 成功，phone 视为 null
+db.users.insertOne({ username: "b" })     // 失败！null 重复
+```
+
+解决方案是配合部分索引（见 5 节）。
+
+<Callout type="tip" title="唯一索引是并发正确性的最后一道防线">
+应用层的「先查是否存在，再插入」在并发下必然失效。唯一索引是数据库级别的保证，任何有唯一性语义的字段（邮箱、用户名、订单号、幂等键）都应该建唯一索引，哪怕应用层已经做了检查。
+</Callout>
+
+## 4. 稀疏索引（sparse）
+
+只为「存在该字段」的文档建索引条目：
+
+```js
+db.users.createIndex({ vipLevel: 1 }, { sparse: true })
+```
+
+好处是索引更小。但有一个重要的副作用：
+
+```js
+// 这个查询不能用稀疏索引，因为需要返回缺失字段的文档
+db.users.find({ vipLevel: { $exists: false } })
+
+// 排序也不能用，因为缺失字段的文档不在索引里，会被漏掉
+db.users.find().sort({ vipLevel: 1 })      // MongoDB 会拒绝使用该索引
+```
+
+<Callout type="warn" title="sparse 已基本被 partialFilterExpression 取代">
+稀疏索引只能表达「字段存在」这一种条件，而部分索引可以表达任意查询条件，功能是它的超集。新项目建议直接用部分索引，`sparse` 主要用于兼容老代码。
+</Callout>
+
+## 5. 部分索引（partial）
+
+只为满足指定条件的文档建索引：
+
+```js
+// 只给已发布的帖子建索引，草稿不占索引空间
+db.posts.createIndex(
+  { authorId: 1, createdAt: -1 },
+  { partialFilterExpression: { status: "published" } }
+)
+
+// 唯一索引 + 部分索引：只约束有 phone 字段的文档
+db.users.createIndex(
+  { phone: 1 },
+  { unique: true, partialFilterExpression: { phone: { $type: "string" } } }
+)
+```
+
+### 5.1 使用前提
+
+查询必须**能被证明**落在部分索引的条件范围内，否则 MongoDB 不会用它：
+
+```js
+// 用得上：查询里显式带了 status: "published"
+db.posts.find({ authorId: "alice", status: "published" }).sort({ createdAt: -1 })   // ✔
+
+// 用不上：没带 status 条件，优化器无法确定草稿是否需要返回
+db.posts.find({ authorId: "alice" }).sort({ createdAt: -1 })                        // ✘
+```
+
+`partialFilterExpression` 支持的条件有限：等值、`$gt` 系列、`$exists: true`、`$type`、以及它们的 `$and` 组合。不支持 `$or`、`$ne`、`$in`。
+
+### 5.2 典型收益
+
+```text
+posts 集合 1000 万文档，其中 published 只有 80 万：
+
+  普通索引：1000 万条索引项，约 620 MB
+  部分索引： 80 万条索引项，约  50 MB
+
+  内存占用降低 12 倍，写入时草稿的更新也不需要维护索引
+```
+
+## 6. TTL 索引：自动过期
+
+```js
+// 文档在 createdAt 之后 7 天被删除
+db.sessions.createIndex({ createdAt: 1 }, { expireAfterSeconds: 604800 })
+
+// 精确控制每条文档的过期时间：设成 0，用字段值本身作为过期时刻
+db.tokens.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+db.tokens.insertOne({ token: "abc", expiresAt: new Date(Date.now() + 3600 * 1000) })
+```
+
+后台有一个每 60 秒运行一次的线程扫描过期文档并删除。
+
+| 特性 | 说明 |
+|---|---|
+| 精度 | 分钟级，不是秒级；负载高时延迟更久 |
+| 索引字段 | 必须是 Date 或 Date 数组；其他类型直接被忽略，不报错 |
+| 数组行为 | 取数组里**最早**的日期作为判断依据 |
+| 复合索引 | 不支持，TTL 只能是单字段索引 |
+| 复制集 | 只在 primary 上删除，通过 oplog 同步到 secondary |
+
+<Callout type="warn" title="TTL 删除是逐条 delete，不是批量清理">
+删除大量过期文档时，TTL 线程会产生大量 oplog 写入，可能造成复制延迟飙升。如果每天要过期几千万条，更好的方案是**按时间分集合**（比如 `logs_20240601`），过期时直接 `drop()` 整个集合，代价接近于零。
+</Callout>
+
+## 7. 多键索引（multikey）
+
+对数组字段建索引时，MongoDB 自动为数组的**每个元素**创建一个索引项：
+
+```js
+db.posts.createIndex({ tags: 1 })
+
+// 文档：{ _id: 11, tags: ["mongodb", "index", "perf"] }
+// 产生三条索引项：
+//   "index"   → doc 11
+//   "mongodb" → doc 11
+//   "perf"    → doc 11
+```
+
+这让数组查询变得高效：
+
+```js
+db.posts.find({ tags: "mongodb" })                       // 走索引
+db.posts.find({ tags: { $all: ["mongodb", "perf"] } })   // 走索引
+```
+
+数组内嵌文档同样可以：
+
+```js
+db.posts.createIndex({ "comments.author": 1 })
+db.posts.find({ "comments.author": "alice" })
+```
+
+### 7.1 多键索引的限制
+
+**一个复合索引里最多只能有一个多键字段**：
+
+```js
+db.t.createIndex({ tags: 1, categories: 1 })      // 定义时不报错
+db.t.insertOne({ tags: ["a", "b"], categories: ["x", "y"] })
+```
+
+```text
+MongoServerError: cannot index parallel arrays [categories] [tags]
+```
+
+原因是索引项数量会变成笛卡尔积：2 × 2 = 4 条，两个各 100 元素的数组就是 1 万条索引项，一个文档就能撑爆索引。
+
+<Callout type="warn" title="多键索引会放大索引体积">
+每篇帖子平均 5 个标签，`{ tags: 1 }` 索引的条目数就是文档数的 5 倍。如果数组平均有 100 个元素，索引会比数据本身还大。数组字段建索引前，先看一眼平均长度：用聚合算 `$size` 的平均值。
+</Callout>
+
+## 8. 文本索引
+
+```js
+db.posts.createIndex({ title: "text", body: "text" }, {
+  weights: { title: 10, body: 1 },        // 标题命中权重更高
+  default_language: "none"                // 中文场景用 none，关掉英文词干还原
+})
+
+db.posts.find(
+  { $text: { $search: "mongodb 索引" } },
+  { score: { $meta: "textScore" }, title: 1 }
+).sort({ score: { $meta: "textScore" } })
+```
+
+```json
+[
+  { "_id": 12, "title": "索引原理", "score": 11.5 },
+  { "_id": 11, "title": "MongoDB 入门", "score": 8.2 }
+]
+```
+
+限制很明确：
+
+- **每个集合只能有一个文本索引**（可以覆盖多个字段）
+- 中文分词能力弱：MongoDB 自带的分词器不支持中文，实际是按空格和标点切分
+- 不支持前缀通配（搜 "mong" 找不到 "mongodb"）
+
+<Callout type="tip" title="严肃的全文搜索请用 Atlas Search 或 Elasticsearch">
+MongoDB 原生文本索引适合「英文关键词粗筛」这类轻量场景。中文搜索、拼音、同义词、高亮这些需求，用 Atlas Search（底层是 Lucene）或者外挂 ES 是更现实的选择。
+</Callout>
+
+## 9. 地理索引概览
+
+```js
+// 2dsphere：球面坐标，支持 GeoJSON
+db.shops.createIndex({ location: "2dsphere" })
+
+db.shops.insertOne({
+  name: "咖啡店",
+  location: { type: "Point", coordinates: [116.397, 39.909] }   // [经度, 纬度]
+})
+
+// 查附近 1 公里内的店，按距离排序
+db.shops.find({
+  location: {
+    $near: {
+      $geometry: { type: "Point", coordinates: [116.40, 39.91] },
+      $maxDistance: 1000
+    }
+  }
+})
+```
+
+| 操作符 | 用途 |
+|---|---|
+| `$near` / `$nearSphere` | 按距离排序取最近的 |
+| `$geoWithin` | 在某个多边形/圆内 |
+| `$geoIntersects` | 与某个几何图形相交 |
+
+<Callout type="warn" title="坐标顺序是经度在前">
+GeoJSON 规范是 `[longitude, latitude]`，和我们习惯说的「纬度、经度」相反。写反了不会报错，只会让你的北京店铺出现在南极附近。
+</Callout>
+
+## 10. 索引类型速查
+
+| 类型 | 创建语法 | 解决什么 |
+|---|---|---|
+| 单字段 | `{ field: 1 }` | 等值、范围、排序 |
+| 复合 | `{ a: 1, b: -1 }` | 多条件组合，见第 9 章 |
+| 多键 | 对数组字段建索引，自动生效 | 数组元素查询 |
+| 唯一 | `unique: true` | 唯一性约束 |
+| 部分 | `partialFilterExpression` | 只索引子集，省空间 |
+| 稀疏 | `sparse: true` | 只索引存在字段的文档（已被部分索引取代） |
+| TTL | `expireAfterSeconds` | 自动过期删除 |
+| 文本 | `{ f: "text" }` | 关键词搜索 |
+| 地理 | `{ f: "2dsphere" }` | 位置查询 |
+| 哈希 | `{ f: "hashed" }` | 分片键打散，见第 17 章 |
+| 通配符 | `{ "$**": 1 }` | 字段名不固定的场景 |
+
+<Callout type="exercise" title="练习">
+一、给 `posts.authorId` 建索引，用 `explain("executionStats")` 对比建索引前后的 `totalDocsExamined`；二、给 `users.phone` 建一个「只约束有手机号的文档」的唯一部分索引，插入两条没有 phone 的文档验证不冲突；三、给 `sessions` 建一个 TTL 索引让会话 30 分钟过期，插入一条并观察它在一小时内被删除；四、给 `posts.tags` 建多键索引，然后尝试建 `{ tags: 1, categories: 1 }` 并插入两个数组字段的文档，复现 parallel arrays 报错；五、用聚合算出 `posts.tags` 的平均长度，估算多键索引会有多少条目。
+</Callout>
+
+## 小结
+
+- 索引是 B 树，有序且树高低；代价是写放大与内存占用
+- 唯一索引是并发正确性的最后防线，缺失字段会被当作 null 参与唯一判断
+- 部分索引是稀疏索引的超集，能显著缩小索引体积，但查询必须带上过滤条件才能命中
+- TTL 索引精度是分钟级，海量过期建议改用按时间分集合再 drop
+- 多键索引为数组每个元素建条目，一个复合索引里只能有一个数组字段
+- 原生文本索引能力有限，严肃的全文搜索另找方案
+- 地理坐标顺序是经度在前
+- 下一章讲复合索引的 ESR 规则与覆盖查询，这是索引设计的核心 →

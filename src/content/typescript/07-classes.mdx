@@ -1,0 +1,401 @@
+---
+title: 类
+order: 7
+description: 类字段、构造器、访问修饰符、参数属性、getter/setter、抽象类、implements、静态成员与 #私有字段
+---
+
+# 类
+
+TypeScript 的类在 JavaScript 的 `class` 之上叠加了访问控制、抽象类、接口实现等能力。如果你来自 Java 或 C#，会觉得很多东西似曾相识；但要留意其中几个「看着像、其实不一样」的地方——尤其是 `private` 与真正的运行时私有 `#`。
+
+## 1. 字段与构造器
+
+字段必须在类体里声明（strict 模式下还要求确定被初始化）：
+
+```ts
+class Point {
+  x: number;
+  y: number;
+
+  constructor(x: number, y: number) {
+    this.x = x;
+    this.y = y;
+  }
+}
+```
+
+<Callout type="warn" title="strictPropertyInitialization">
+strict 模式要求每个字段要么有初始值、要么在构造器里被赋值，否则报错。如果确实会在别处初始化（比如依赖注入），可以用 `x!: number` 的「确定赋值断言」告诉编译器「我保证会赋值」——但这等于放弃了这一处的检查，慎用。
+</Callout>
+
+## 2. 参数属性：消除样板代码
+
+上面「声明字段 + 构造器赋值」的重复很烦。TypeScript 提供了**参数属性**：在构造器参数前加访问修饰符，就会自动声明同名字段并赋值。
+
+```ts
+class Point {
+  constructor(public x: number, public y: number) {}
+  // 等价于声明 x、y 两个 public 字段并在构造器里赋值
+}
+```
+
+这是 TS 特有语法，能大幅减少样板代码，非常常用。修饰符可以是 `public` / `private` / `protected` / `readonly` 中的任意组合。
+
+## 3. 访问修饰符
+
+| 修饰符 | 可访问范围 | 运行时是否真的隔离 |
+|---|---|---|
+| `public`（默认） | 任何地方 | — |
+| `protected` | 本类及子类内部 | 否 |
+| `private` | 仅本类内部 | 否 |
+| `#name` | 仅本类内部 | **是** |
+
+<Callout type="warn" title="private 只是编译期约定">
+TypeScript 的 `private` 编译后就是个普通属性，运行时用 `obj["secret"]` 照样能访问到。它只在类型检查阶段拦你。需要**运行时真正私有**，用下面讲的 `#` 字段。
+</Callout>
+
+<Playground
+  language="typescript"
+  id="ts-07-basics"
+  title="参数属性与访问修饰符"
+  code={`class BankAccount {
+  // 参数属性：一行搞定声明 + 赋值 + 修饰符
+  constructor(
+    public readonly owner: string,
+    private balance: number,
+  ) {}
+
+  deposit(amount: number): void {
+    if (amount <= 0) throw new Error("金额必须为正");
+    this.balance += amount;
+  }
+
+  withdraw(amount: number): boolean {
+    if (amount > this.balance) return false;
+    this.balance -= amount;
+    return true;
+  }
+
+  getBalance(): number {
+    return this.balance;
+  }
+}
+
+const acc = new BankAccount("Ada", 100);
+acc.deposit(50);
+console.log(acc.owner + " 余额 = " + acc.getBalance());
+console.log("取 200: " + acc.withdraw(200));
+console.log("取 120: " + acc.withdraw(120));
+console.log("最终余额 = " + acc.getBalance());
+// acc.balance;        // 编译错误：balance 是 private
+// acc.owner = "Bob";  // 编译错误：owner 是 readonly`}
+  expectedOutput={`Ada 余额 = 150\n取 200: false\n取 120: true\n最终余额 = 30`}
+/>
+
+## 4. getter 与 setter
+
+用 `get` / `set` 把方法伪装成属性，可以在读写时插入逻辑（校验、计算、日志）：
+
+```ts
+class Temperature {
+  private celsius = 0;
+
+  get fahrenheit(): number {
+    return this.celsius * 9 / 5 + 32;
+  }
+  set fahrenheit(value: number) {
+    this.celsius = (value - 32) * 5 / 9;
+  }
+}
+```
+
+只有 getter 没有 setter 时，该属性自动变成只读。
+
+## 5. 静态成员
+
+用 `static` 声明属于**类本身**而非实例的成员，常用于工厂方法、常量、计数器：
+
+```ts
+class User {
+  static count = 0;
+  static create(name: string): User {
+    User.count++;
+    return new User(name);
+  }
+  constructor(public name: string) {}
+}
+```
+
+<Playground
+  language="typescript"
+  id="ts-07-getter-static"
+  title="getter/setter 与静态成员"
+  code={`class Temperature {
+  private celsiusValue = 0;
+
+  get celsius(): number {
+    return this.celsiusValue;
+  }
+  set celsius(v: number) {
+    if (v < -273.15) throw new Error("低于绝对零度");
+    this.celsiusValue = v;
+  }
+  get fahrenheit(): number {
+    return this.celsiusValue * 9 / 5 + 32;
+  }
+  set fahrenheit(v: number) {
+    this.celsius = (v - 32) * 5 / 9;   // 复用 setter 的校验
+  }
+}
+
+const t = new Temperature();
+t.celsius = 25;
+console.log("25°C = " + t.fahrenheit + "°F");   // 像属性一样读写
+t.fahrenheit = 212;
+console.log("212°F = " + t.celsius + "°C");
+
+class IdGenerator {
+  static prefix = "ID";
+  private static counter = 0;
+
+  static next(): string {
+    IdGenerator.counter++;
+    return IdGenerator.prefix + "-" + IdGenerator.counter;
+  }
+}
+
+console.log(IdGenerator.next());
+console.log(IdGenerator.next());
+console.log("前缀属于类本身: " + IdGenerator.prefix);`}
+  expectedOutput={`25°C = 77°F\n212°F = 100°C\nID-1\nID-2\n前缀属于类本身: ID`}
+/>
+
+## 6. 继承与抽象类
+
+### 6.1 继承
+
+用 `extends` 继承，子类构造器里必须先调用 `super()`：
+
+```ts
+class Animal {
+  constructor(protected name: string) {}
+  speak(): string { return this.name + " 发出声音"; }
+}
+
+class Dog extends Animal {
+  speak(): string { return this.name + " 汪汪叫"; }   // 覆写
+}
+```
+
+覆写方法时建议加 `override` 关键字（配合 `noImplicitOverride`），这样如果父类方法被改名，编译器会提醒你，避免「以为在覆写、实际新增了个方法」。
+
+### 6.2 抽象类
+
+`abstract` 类不能被实例化，用来定义「模板」——一部分实现好，一部分留给子类：
+
+```ts
+abstract class Shape {
+  abstract area(): number;         // 抽象方法，子类必须实现
+  describe(): string {             // 具体方法，子类共享
+    return "面积是 " + this.area();
+  }
+}
+```
+
+<Playground
+  language="typescript"
+  id="ts-07-inheritance"
+  title="继承与抽象类"
+  code={`abstract class Shape {
+  abstract area(): number;
+  abstract name(): string;
+
+  describe(): string {
+    return this.name() + " 的面积是 " + this.area().toFixed(2);
+  }
+}
+
+class Circle extends Shape {
+  constructor(private radius: number) {
+    super();
+  }
+  override area(): number {
+    return Math.PI * this.radius * this.radius;
+  }
+  override name(): string {
+    return "圆";
+  }
+}
+
+class Rectangle extends Shape {
+  constructor(private w: number, private h: number) {
+    super();
+  }
+  override area(): number {
+    return this.w * this.h;
+  }
+  override name(): string {
+    return "矩形";
+  }
+}
+
+const shapes: Shape[] = [new Circle(2), new Rectangle(3, 4)];
+for (const s of shapes) {
+  console.log(s.describe());
+}
+
+// const s = new Shape();   // 编译错误：抽象类不能实例化
+console.log("多态：同一个 describe，行为随实际类型变化");`}
+  expectedOutput={`圆 的面积是 12.57\n矩形 的面积是 12.00\n多态：同一个 describe，行为随实际类型变化`}
+/>
+
+## 7. implements 接口
+
+`implements` 声明「这个类满足某个接口」。它是一种**契约检查**，不影响类的实现方式：
+
+```ts
+interface Comparable<T> {
+  compareTo(other: T): number;
+}
+
+class Version implements Comparable<Version> {
+  constructor(public major: number, public minor: number) {}
+  compareTo(other: Version): number {
+    return this.major - other.major || this.minor - other.minor;
+  }
+}
+```
+
+一个类可以同时 `implements` 多个接口。
+
+<Callout type="warn" title="implements 不会「带来」类型">
+`implements` 只做检查，不会替你补上属性类型。如果接口里的属性没在类里声明，类里访问它时会报错——`implements` 不是继承。另外，构造器签名不受 `implements` 约束，接口无法约束一个类怎么被 `new`。
+</Callout>
+
+## 8. `#` 私有字段：运行时真私有
+
+`#` 开头的字段是 ECMAScript 标准语法（不是 TS 特有），提供**运行时**级别的私有：外部无论用什么手段都访问不到，连 `obj["#x"]` 都不行。
+
+```ts
+class Counter {
+  #count = 0;               // 真私有
+  increment(): void { this.#count++; }
+  get value(): number { return this.#count; }
+}
+```
+
+| 对比 | TS 的 `private` | `#` 私有字段 |
+|---|---|---|
+| 来源 | TypeScript | ECMAScript 标准 |
+| 检查时机 | 编译期 | 运行时强制 |
+| 能否被 `obj["x"]` 绕过 | 能 | 不能 |
+| 子类能否访问 | 不能（但 protected 能） | 不能 |
+
+<Playground
+  language="typescript"
+  id="ts-07-private-implements"
+  title="implements 与 # 私有字段"
+  code={`interface Serializable {
+  serialize(): string;
+}
+
+class Session implements Serializable {
+  #token: string;          // 运行时真私有
+  constructor(public userId: string, token: string) {
+    this.#token = token;
+  }
+  serialize(): string {
+    // 只暴露安全信息，token 不外泄
+    return JSON.stringify({ userId: this.userId, hasToken: this.#token.length > 0 });
+  }
+  matches(token: string): boolean {
+    return this.#token === token;
+  }
+}
+
+const s = new Session("u_42", "secret-abc");
+console.log(s.serialize());
+console.log("校验 secret-abc: " + s.matches("secret-abc"));
+console.log("校验 wrong: " + s.matches("wrong"));
+
+// 外部拿不到 #token，即使用字符串索引也不行
+console.log("能看到的键: " + Object.keys(s).join(","));`}
+  expectedOutput={`{"userId":"u_42","hasToken":true}\n校验 secret-abc: true\n校验 wrong: false\n能看到的键: userId`}
+/>
+
+## 9. 类的「双重身份」
+
+这是 TypeScript 里一个容易绊倒人的细节：写下一个 `class Foo` 之后，你同时得到了**两样东西**——
+
+1. 一个**类型** `Foo`，指的是「Foo 的实例」。
+2. 一个**值** `Foo`，指的是「Foo 这个构造函数对象」。
+
+```ts
+class Point { constructor(public x: number) {} }
+
+const p: Point = new Point(1);        // 这里的 Point 是「实例类型」
+const C: typeof Point = Point;        // 这里的 Point 是「构造函数值」
+const q = new C(2);                   // 通过构造函数值创建实例
+```
+
+想在类型位置表达「类本身」，要写 `typeof Point`，或者用第 6 章讲的构造签名。工厂函数、依赖注入容器、插件注册表都会用到这个技巧。
+
+### 9.1 字段初始化顺序的坑
+
+类字段的初始化发生在 `super()` **之后**、构造器其余语句**之前**。这条规则会在继承时制造一个经典陷阱：
+
+```ts
+class Base {
+  constructor() {
+    this.setup();          // 调用了子类覆写的方法
+  }
+  setup(): void {}
+}
+
+class Child extends Base {
+  private items: string[] = [];   // 这行在 super() 返回后才执行
+  override setup(): void {
+    // this.items 此刻还是 undefined！
+  }
+}
+```
+
+`Base` 的构造器运行时，`Child` 的字段初始化器还没跑。规避办法很简单：**不要在构造器里调用可被覆写的方法**，需要初始化逻辑就提供一个显式的 `init()` 让调用方触发。
+
+### 9.2 类也可以当接口用
+
+因为类同时定义了实例类型，所以它可以直接出现在 `implements` 后面：
+
+```ts
+class Base { greet(): string { return "hi"; } }
+class Other implements Base {
+  greet(): string { return "hello"; }     // 只要结构匹配即可
+}
+```
+
+这里 `Other` 并没有继承 `Base` 的实现，只是承诺「我的形状和 Base 实例一样」。这在需要「替换实现但保持接口」时很有用。
+
+<Callout type="tip" title="组合优于继承">
+类继承在 TypeScript 里能用，但不必成为默认选择。多层继承会让类型难以追踪、测试难以隔离。多数场景下，把能力拆成几个小接口、用组合（持有对象）加委托，比深继承树更容易演进。抽象类最适合的场景是「模板方法」——流程固定、步骤可替换。
+</Callout>
+
+<Callout type="tip" title="装饰器暂不在本教程运行环境内">
+你可能听说过用 `@decorator` 给类和方法加元数据。装饰器虽已进入 ECMAScript 标准，但运行环境（V8）尚未原生实现，本教程的运行沙箱也不支持，因此不放进可运行示例。真实项目中它常用于依赖注入、ORM 实体映射等框架场景。
+</Callout>
+
+<Callout type="exercise" title="练习">
+1. 写一个抽象类 `Employee`，含参数属性 `name`、抽象方法 `monthlySalary(): number`、具体方法 `annualSalary()`；派生出 `FullTime`（月薪固定）和 `Hourly`（时薪 × 工时）两个子类。
+2. 用 `#` 私有字段实现一个 `Stack<number>`：`push`、`pop`、`peek`、只读的 `size` getter，确保外部无法直接触碰内部数组。
+3. 定义接口 `Printable { print(): string }`，让上面的类 `implements` 它，体会 `implements` 的检查作用。
+</Callout>
+
+## 小结
+
+- 字段需声明；strict 下要求确定初始化
+- **参数属性**（构造器参数前加修饰符）是消除样板代码的利器
+- `public` / `protected` / `private` 只在编译期生效，`private` 可被字符串索引绕过
+- getter/setter 让方法伪装成属性；`static` 成员属于类本身
+- 抽象类定义模板，`override` 关键字防止「假覆写」
+- `implements` 只做契约检查，不提供实现，也约束不了构造器
+- `#` 字段是标准语法，提供运行时真正的私有
+- 下一章进入泛型 →

@@ -1,0 +1,402 @@
+---
+title: 事务
+order: 14
+description: 单文档原子性、多文档事务 API、readConcern 与 writeConcern、限制与代价
+---
+
+# 事务
+
+关系型开发者迁到 MongoDB 时，最常问的一句话是「它支持事务吗」。答案是：4.0 起支持复制集内的多文档事务，4.2 起支持分片集群跨分片事务。但更重要的答案是：**在设计良好的文档模型里，你需要事务的场景比想象中少得多**。
+
+## 1. 单文档原子性
+
+### 1.1 天然的 ACID 单元
+
+MongoDB 对**单个文档**的写操作永远是原子的，不管这个文档有多复杂、修改了多少个字段：
+
+```js
+db.accounts.updateOne(
+  { _id: "acc-1" },
+  {
+    $inc: { balance: -100, version: 1 },
+    $push: { history: { type: "withdraw", amount: 100, at: new Date() } },
+    $set: { lastOpAt: new Date() }
+  }
+)
+```
+
+这一条语句里修改了 4 个字段、包括一次数组追加，它要么全部生效，要么全部不生效。不存在「余额扣了但流水没记」的中间状态，也不会被其他读操作看到半成品。
+
+### 1.2 这解释了为什么内嵌很重要
+
+回到第 12 章的建模原则——「一起写的数据放一起」。这条原则的深层理由就是：**内嵌把跨实体的一致性问题，转化成了单文档的原子性问题**。
+
+```text
+关系模型：下单要改 3 张表
+  orders          INSERT
+  order_items     INSERT × N
+  inventory       UPDATE
+  → 必须开事务
+
+文档模型：订单和明细内嵌在一个文档里
+  orders          INSERT（含 items 数组）  ← 原子
+  inventory       UPDATE                  ← 仍需事务或补偿
+  → 事务范围从 3 个对象缩到 2 个
+```
+
+<Callout type="tip" title="需要事务时，先问建模能不能改">
+每次觉得「这里需要事务」时，先花五分钟想想：能不能把这几个文档合成一个？能不能用最终一致性 + 补偿？能不能用幂等设计避免部分失败？很多时候答案是能，而且方案比事务更简单、更快。
+</Callout>
+
+## 2. 多文档事务 API
+
+### 2.1 mongosh 里的写法
+
+```js
+const session = db.getMongo().startSession()
+
+session.startTransaction({
+  readConcern: { level: "snapshot" },
+  writeConcern: { w: "majority" }
+})
+
+try {
+  const accounts = session.getDatabase("bank").accounts
+
+  accounts.updateOne({ _id: "acc-1" }, { $inc: { balance: -100 } })
+  accounts.updateOne({ _id: "acc-2" }, { $inc: { balance:  100 } })
+
+  session.commitTransaction()
+  print("committed")
+} catch (e) {
+  session.abortTransaction()
+  print("aborted: " + e.message)
+} finally {
+  session.endSession()
+}
+```
+
+<Callout type="warn" title="事务里的操作必须用 session 的集合句柄">
+`session.getDatabase("bank").accounts` 和 `db.accounts` 是两个不同的东西。用后者执行的写入**不在事务里**，会立刻生效且不会回滚。这是最隐蔽也最危险的写法错误，代码 review 时要重点检查。
+</Callout>
+
+### 2.2 Node.js 驱动的推荐写法
+
+```js
+const session = client.startSession()
+
+try {
+  await session.withTransaction(async () => {
+    const accounts = client.db("bank").collection("accounts")
+
+    await accounts.updateOne(
+      { _id: "acc-1", balance: { $gte: 100 } },
+      { $inc: { balance: -100 } },
+      { session }
+    )
+    await accounts.updateOne(
+      { _id: "acc-2" },
+      { $inc: { balance: 100 } },
+      { session }
+    )
+  }, {
+    readConcern: { level: "snapshot" },
+    writeConcern: { w: "majority" },
+    readPreference: "primary"
+  })
+} finally {
+  await session.endSession()
+}
+```
+
+`withTransaction` 比手写 try/catch 好在它**自动处理重试**：遇到 `TransientTransactionError`（比如主节点切换、写冲突）会自动重跑整个回调，最多重试到 120 秒。
+
+<Callout type="warn" title="回调必须是幂等的">
+既然 `withTransaction` 会重跑回调，回调里就不能有「不可重复执行」的副作用——不能在回调里发 HTTP 请求、发消息队列、写文件。这些操作要放在事务提交成功之后。
+</Callout>
+
+### 2.3 内容社区的事务示例
+
+发一条评论需要：插入评论文档、更新帖子的评论计数和热评列表、更新作者的通知。
+
+```js
+await session.withTransaction(async () => {
+  const db = client.db("community")
+
+  const comment = {
+    _id: new ObjectId(),
+    postId,
+    author: { _id: userId, username, avatar },
+    body,
+    likes: 0,
+    createdAt: new Date()
+  }
+
+  await db.collection("comments").insertOne(comment, { session })
+
+  await db.collection("posts").updateOne(
+    { _id: postId },
+    {
+      $inc: { "stats.comments": 1 },
+      $push: {
+        topComments: {
+          $each: [ { _id: comment._id, author: username, body, likes: 0 } ],
+          $sort: { likes: -1 },
+          $slice: 3
+        }
+      }
+    },
+    { session }
+  )
+
+  await db.collection("notifications").insertOne({
+    userId: postAuthorId,
+    type: "comment",
+    postId,
+    commentId: comment._id,
+    createdAt: new Date()
+  }, { session })
+})
+```
+
+这个例子其实值得讨论：通知的插入真的需要在事务里吗？如果通知偶尔丢一条是可以接受的，把它移出事务能显著降低事务的持有时间。**事务范围越小越好**。
+
+## 3. readConcern：读到什么
+
+`readConcern` 决定「读操作能看到哪些数据」。
+
+| 级别 | 含义 | 可能读到已回滚数据 | 性能 |
+|---|---|---|---|
+| `local`（默认） | 读节点上最新的数据 | 会 | 最快 |
+| `available` | 分片场景下最快，可能读到孤儿文档 | 会 | 最快 |
+| `majority` | 只读已被多数节点确认的数据 | 不会 | 略慢 |
+| `snapshot` | 读某个时间点的一致快照 | 不会 | 最慢 |
+| `linearizable` | 线性一致，只能用于 primary 单文档读 | 不会 | 很慢 |
+
+### 3.1 local 为什么可能读到「不存在」的数据
+
+```text
+时刻 T1：客户端写入 X 到 primary，primary 本地已应用
+时刻 T2：客户端用 readConcern local 读到 X
+时刻 T3：primary 网络分区被降级，X 还没同步到任何 secondary
+时刻 T4：新 primary 选出，X 被回滚
+
+  客户端在 T2 读到的 X，最终从未存在过
+```
+
+这在金融场景是不可接受的，所以关键读要用 `majority`。
+
+### 3.2 snapshot 与因果一致性
+
+事务默认用 `snapshot`：整个事务看到的是**开始那一刻**的数据快照，事务期间其他人的提交对它不可见。这就是可重复读（repeatable read）语义。
+
+```js
+// 会话内的因果一致性：保证「读到自己刚写的」
+const session = client.startSession({ causalConsistency: true })
+
+await coll.insertOne({ _id: 1, v: "a" }, { session })
+const doc = await coll.findOne({ _id: 1 }, { session, readPreference: "secondaryPreferred" })
+// 即使从 secondary 读，也保证能看到刚才的写入
+```
+
+因果一致性的实现原理是：会话记录了最后一次操作的 `operationTime`，后续读会等待目标节点至少同步到这个时间点。这让「写主读从」的架构在会话内保持正确。
+
+<Callout type="tip" title="读己之写是最常见的一致性需求">
+用户发完帖立刻跳转到列表页，结果看不到自己的帖子——这就是典型的「读己之写」违背。开启因果一致性会话，或者对该请求强制 `readPreference: "primary"`，都能解决。
+</Callout>
+
+## 4. writeConcern：写到哪算成功
+
+```js
+db.orders.insertOne(doc, {
+  writeConcern: { w: "majority", j: true, wtimeout: 5000 }
+})
+```
+
+| 参数 | 含义 |
+|---|---|
+| `w: 1` | primary 写入内存即返回（默认在老版本；5.0 起默认 majority） |
+| `w: "majority"` | 多数节点确认 |
+| `w: 0` | 不等确认，fire and forget |
+| `w: 2` | 指定节点数确认（这里是 2 个节点） |
+| `j: true` | 必须写入 journal（磁盘）才算成功 |
+| `wtimeout` | 等待超时毫秒数，超时报错但**写入可能已成功** |
+
+### 4.1 持久性阶梯
+
+```text
+w:0            → 发出去就返回。可能连 primary 都没写进去
+w:1            → primary 内存写入。primary 崩溃且未刷盘 → 丢
+w:1, j:true    → primary 刷盘。primary 磁盘损坏 → 丢
+w:majority     → 多数节点内存写入。几乎不会丢（除非多数节点同时崩）
+w:majority,j   → 多数节点刷盘。最强持久性
+```
+
+延迟代价（三节点复制集，同机房）：
+
+| 配置 | 典型延迟 |
+|---|---|
+| `w: 0` | 约 0.1 ms |
+| `w: 1` | 约 0.5 ms |
+| `w: 1, j: true` | 约 2 ms |
+| `w: "majority"` | 约 2 ms |
+| `w: "majority", j: true` | 约 5 ms |
+
+跨机房部署时 `majority` 的延迟会变成几十毫秒，这是选型时必须算进去的成本。
+
+<Callout type="warn" title="wtimeout 超时不代表写入失败">
+`wtimeout` 只是「等待确认」的超时。超时报错时，写入可能已经在 primary 上生效，只是还没被多数节点确认——而且它随后很可能会被确认。**收到 wtimeout 错误后直接重试，可能造成重复写入**。要么用幂等设计（upsert + 唯一键），要么先查询确认状态。
+</Callout>
+
+## 5. 事务的限制
+
+### 5.1 硬性限制
+
+| 限制 | 值 | 说明 |
+|---|---|---|
+| 默认最大运行时间 | 60 秒 | 由 `transactionLifetimeLimitSeconds` 控制 |
+| oplog 单条大小 | 16MB | 事务的全部改动打包成一条 oplog |
+| 不能创建集合 | 4.4 前 | 4.4+ 允许隐式创建 |
+| 不能建索引 | 是 | DDL 操作大多不允许 |
+| 不能操作 config/admin/local 库 | 是 | |
+| 不能用 `count` | 是 | 用 `countDocuments` 代替 |
+| 需要复制集 | 是 | standalone 不支持 |
+
+### 5.2 写冲突
+
+两个事务同时修改同一个文档时，后到的会立刻失败（不是等待）：
+
+```text
+MongoServerError: WriteConflict error: this operation conflicted with another operation.
+Please retry your operation or multi-document transaction.
+```
+
+这是**乐观并发控制**，和 MySQL 的行锁等待不同。MongoDB 不排队，直接让一方失败重试。因此：
+
+- 高冲突场景下事务的吞吐会急剧下降（大量重试）
+- 必须实现重试逻辑（`withTransaction` 已内置）
+
+### 5.3 性能代价的量化
+
+```text
+同一逻辑的三种实现（三节点复制集，单文档 1KB）：
+
+  单文档 updateOne（w:1）              →  约  8000 ops/s
+  单文档 updateOne（w:majority）       →  约  4500 ops/s
+  两文档事务（w:majority）             →  约  1200 ops/s
+  两文档事务 + 高冲突（同一热点文档）  →  约   200 ops/s
+
+  事务不是免费的，代价通常是 3 到 10 倍
+```
+
+<Callout type="warn" title="不要把事务当成 MySQL 事务用">
+在 MySQL 里给每个 Service 方法套一个 `@Transactional` 是常见做法。在 MongoDB 里这样做会让吞吐直接掉一个数量级。事务应该是**例外**而不是默认：只在跨文档强一致性确实必要时才用，而且事务体要尽可能短。
+</Callout>
+
+## 6. 事务的替代方案
+
+### 6.1 幂等 upsert
+
+```js
+// 用业务唯一键做 _id，天然幂等，重复执行无副作用
+db.payments.updateOne(
+  { _id: `pay:${orderId}` },
+  { $setOnInsert: { orderId, amount, status: "paid", createdAt: new Date() } },
+  { upsert: true }
+)
+```
+
+### 6.2 状态机 + 补偿
+
+把「一个事务」拆成「多个带状态的步骤」，用后台任务推进和补偿：
+
+```js
+// 步骤 1：创建订单，状态 pending
+db.orders.insertOne({ _id: orderId, status: "pending", items, createdAt: new Date() })
+
+// 步骤 2：扣库存，成功后推进状态
+db.inventory.updateOne({ sku, qty: { $gte: n } }, { $inc: { qty: -n } })
+db.orders.updateOne({ _id: orderId, status: "pending" }, { $set: { status: "reserved" } })
+
+// 补偿任务：扫描超过 10 分钟仍是 pending 的订单，取消并回滚库存
+db.orders.find({ status: "pending", createdAt: { $lt: tenMinutesAgo } })
+```
+
+关键在于每一步都**可重入**：条件里带上当前状态，重复执行不会重复扣减。
+
+### 6.3 用 Change Streams 做异步同步
+
+第 15 章会展开。适合「扩展引用字段同步」这类允许最终一致的场景。
+
+### 6.4 三种方案对比
+
+| 方案 | 一致性 | 吞吐 | 实现复杂度 | 适用 |
+|---|---|---|---|---|
+| 多文档事务 | 强一致 | 低 | 低 | 转账、库存扣减等强一致场景 |
+| 幂等 + 重试 | 最终一致 | 高 | 中 | 支付回调、计数器 |
+| 状态机 + 补偿 | 最终一致 | 高 | 高 | 长流程业务（下单、退款） |
+
+## 7. 一个完整的转账示例
+
+```js
+async function transfer(client, fromId, toId, amount) {
+  const session = client.startSession()
+  try {
+    let result
+    await session.withTransaction(async () => {
+      const accounts = client.db("bank").collection("accounts")
+
+      // 条件更新：余额不足时 matchedCount 为 0
+      const debit = await accounts.updateOne(
+        { _id: fromId, balance: { $gte: amount } },
+        { $inc: { balance: -amount } },
+        { session }
+      )
+      if (debit.matchedCount === 0) {
+        throw new Error("INSUFFICIENT_FUNDS")
+      }
+
+      await accounts.updateOne(
+        { _id: toId },
+        { $inc: { balance: amount } },
+        { session }
+      )
+
+      await client.db("bank").collection("transfers").insertOne({
+        from: fromId, to: toId, amount, at: new Date()
+      }, { session })
+
+      result = { ok: true }
+    }, {
+      readConcern: { level: "snapshot" },
+      writeConcern: { w: "majority", j: true },
+      readPreference: "primary"
+    })
+    return result
+  } finally {
+    await session.endSession()
+  }
+}
+```
+
+三个设计要点：
+
+1. **把余额检查写进 filter**，而不是先查后判断——避免 TOCTOU 竞态
+2. **业务错误主动 throw**，让 `withTransaction` 回滚
+3. 注意区分业务错误（不该重试）和瞬时错误（该重试）——自定义 Error 不带 `TransientTransactionError` 标签，`withTransaction` 不会重试它
+
+<Callout type="exercise" title="练习">
+一、在本地单成员复制集上跑通本章的转账示例，包括余额不足的失败路径；二、故意在事务里用 `db.accounts` 而不是 `session.getDatabase(...).accounts`，观察结果为什么没有回滚；三、开两个 mongosh 会话同时修改同一个文档，复现 WriteConflict 错误；四、用 `w: 0`、`w: 1`、`w: "majority"` 各插入 1000 条文档，对比耗时；五、把第 2.3 节的评论事务改写成「评论和帖子计数用事务，通知异步插入」的版本，说明这样改的收益；六、设计一个不用事务的「点赞」实现，要求同一用户重复点赞不会重复计数（提示：用 `$addToSet` 的返回值判断）。
+</Callout>
+
+## 小结
+
+- 单文档写入永远原子，这是「一起写的数据放一起」的深层理由
+- 事务操作必须用 session 的集合句柄，用 `db.xxx` 的写入不在事务里
+- 驱动的 `withTransaction` 内置重试，但回调必须幂等、不能有外部副作用
+- `readConcern` 决定读到什么，`majority` 避免读到会被回滚的数据
+- `writeConcern` 决定写到哪算成功，`majority` 加 `j: true` 是最强持久性
+- `wtimeout` 超时不代表写入失败，盲目重试会产生重复数据
+- 事务的吞吐代价是 3 到 10 倍，写冲突是立刻失败而非等待
+- 优先考虑幂等 upsert、状态机补偿这些替代方案，事务是例外不是默认
+- 下一章讲 Change Streams，实现异步的跨文档同步 →

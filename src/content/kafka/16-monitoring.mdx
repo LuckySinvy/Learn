@@ -1,0 +1,176 @@
+---
+title: 监控与日常运维
+order: 16
+description: 关键 JMX 指标、Lag 监控、Prometheus 采集、分区重分配与滚动重启
+---
+
+# 监控与日常运维
+
+Kafka 出事故前几乎总有前兆：ISR 抖动、Lag 爬升、请求队列变长。问题是你有没有在看。本章给出一套最小但够用的监控清单，以及扩容、重分配、滚动重启三大日常运维操作的标准流程。
+
+## 1. Broker 端关键 JMX 指标
+
+Kafka 通过 JMX 暴露指标（启动时设 `JMX_PORT=9999`）。必须盯住的核心项：
+
+| 指标（kafka.server 域） | 含义 | 告警建议 |
+|---|---|---|
+| ReplicaManager UnderReplicatedPartitions | ISR 缺员的分区数 | 持续 &gt; 0 告警（最重要） |
+| ReplicaManager UnderMinIsrPartitionCount | 低于 min.insync.replicas 的分区 | &gt; 0 立即告警（已拒写） |
+| KafkaController ActiveControllerCount | active controller 数 | 全集群求和 ≠ 1 告警 |
+| KafkaController OfflinePartitionsCount | 无 leader 的分区 | &gt; 0 立即告警（不可用） |
+| BrokerTopicMetrics BytesInPerSec / BytesOutPerSec | 进出流量 | 容量规划基线 |
+| KafkaRequestHandlerPool RequestHandlerAvgIdlePercent | 请求线程空闲率 | 低于 0.3 说明 broker 过载 |
+| Network RequestMetrics TotalTimeMs (Produce/Fetch) | 请求耗时分布 | p99 突增排查 |
+
+再加三个 OS 层指标：磁盘使用率（写满即灾难）、磁盘 IO util、网卡带宽。
+
+## 2. 消费延迟 Lag：最重要的业务指标
+
+Lag = LOG-END-OFFSET − CURRENT-OFFSET，即"还有多少条没消费"。
+
+```bash
+# 临时查看
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group inventory-service
+```
+
+持续监控方案：
+
+- **Kafka Exporter**（prometheus 生态，最常用）：读取 __consumer_offsets 与分区 LEO，暴露 `kafka_consumergroup_lag` 等指标；
+- **Burrow**（LinkedIn）：不只看绝对值，还评估 Lag 的变化趋势给出健康状态；
+- 客户端 JMX：consumer 的 records-lag-max（只有消费者活着才有值——**消费者挂了这个指标就消失**，所以服务端视角的 Exporter 不可少）。
+
+告警别只按绝对值：高吞吐 topic 积压 1 万条可能几秒就追平。更好的做法是"**Lag 持续增长 N 分钟**"或换算成时间维度（当前 Lag ÷ 消费速率）。
+
+## 3. Prometheus + Grafana 采集
+
+标准姿势：JMX Exporter 以 javaagent 方式挂到 broker，Kafka Exporter 独立部署收 Lag。
+
+```bash
+# broker 启动参数加 (jmx_prometheus_javaagent)
+export KAFKA_OPTS="-javaagent:/opt/jmx_prometheus_javaagent.jar=7071:/opt/kafka-jmx.yml"
+```
+
+```yaml
+# kafka-jmx.yml 片段: 白名单方式只采关键指标
+lowercaseOutputName: true
+rules:
+  - pattern: kafka.server<type=ReplicaManager, name=(UnderReplicatedPartitions|UnderMinIsrPartitionCount)><>Value
+    name: kafka_server_replicamanager_$1
+  - pattern: kafka.controller<type=KafkaController, name=(ActiveControllerCount|OfflinePartitionsCount)><>Value
+    name: kafka_controller_$1
+  - pattern: kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec)><>OneMinuteRate
+    name: kafka_server_brokertopicmetrics_$1
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: kafka-broker
+    static_configs: [{ targets: ["kafka1:7071", "kafka2:7071", "kafka3:7071"] }]
+  - job_name: kafka-exporter
+    static_configs: [{ targets: ["kafka-exporter:9308"] }]
+```
+
+核心告警规则示意：
+
+```yaml
+groups:
+  - name: kafka
+    rules:
+      - alert: KafkaUnderReplicated
+        expr: sum(kafka_server_replicamanager_underreplicatedpartitions) > 0
+        for: 5m
+      - alert: KafkaNoActiveController
+        expr: sum(kafka_controller_activecontrollercount) != 1
+        for: 1m
+      - alert: ConsumerLagGrowing
+        expr: sum by (consumergroup, topic)
+              (delta(kafka_consumergroup_lag[10m])) > 0
+        for: 30m
+```
+
+Grafana 直接用社区现成的 Kafka Overview / Kafka Exporter 仪表盘导入改造即可，不必从零画。
+
+## 4. 分区重分配：kafka-reassign-partitions
+
+新 broker 加入集群**不会自动分担已有分区**，必须手动重分配；下线 broker 前也要先把分区挪走。
+
+```bash
+# 1. 生成方案: 把 topics.json 里的 topic 均衡到 broker 1,2,3,4
+cat > topics.json <<'EOF'
+{"topics": [{"topic": "orders"}], "version": 1}
+EOF
+bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 \
+  --topics-to-move-json-file topics.json \
+  --broker-list "1,2,3,4" --generate
+# 输出两段 JSON: 当前分布 (留作回滚) 与建议方案 (存为 plan.json)
+
+# 2. 执行, 限速 50MB/s 防止同步流量打爆网卡与磁盘
+bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 \
+  --reassignment-json-file plan.json --throttle 52428800 --execute
+
+# 3. 验证 (完成后会自动移除限速; 没完成前反复跑)
+bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 \
+  --reassignment-json-file plan.json --verify
+```
+
+<Callout type="warn" title="重分配的两个纪律">
+1. **必须限速**：重分配本质是全量拷贝副本数据，不限速会挤占正常生产消费带宽，引发 ISR 收缩连锁反应。
+2. **必须 verify 收尾**：verify 除了确认完成，还负责移除 throttle 配置。忘了 verify，限速会永久留在集群上，后患无穷。
+</Callout>
+
+## 5. 优雅扩缩容与滚动重启
+
+### 5.1 扩容流程
+
+```text
+1. 新 broker 配好同一集群 ID 与 controller.quorum.voters, 启动入集群
+2. kafka-reassign-partitions 把部分分区迁到新节点 (限速!)
+3. verify 完成, 观察 UnderReplicatedPartitions 归零
+```
+
+### 5.2 缩容/下线流程
+
+```text
+1. 生成不含目标 broker 的重分配方案并执行
+2. 确认该 broker 上已无任何分区副本
+3. 优雅停止 (见下), 再从监控与配置中移除
+```
+
+### 5.3 滚动重启（升级、改配置）
+
+一次只动一台，顺序做：
+
+```bash
+# 每台机器重复以下步骤
+# 1. 健康前提: 无 under-replicated 分区
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --describe --under-replicated-partitions   # 应无输出
+
+# 2. 优雅停止 (发 SIGTERM, 触发 controlled shutdown: leader 主动转移)
+bin/kafka-server-stop.sh
+
+# 3. 升级/改配置后启动, 等它重新加入所有 ISR
+# 4. 确认 UnderReplicatedPartitions 归零后, 再做下一台
+```
+
+controlled shutdown（默认开启）会在停止前把该 broker 上的 leader 转移走，客户端几乎无感；`kill -9` 则让所有相关分区经历完整的故障切换。重启完成后可用 `kafka-leader-election.sh --election-type PREFERRED --all-topic-partitions` 把 leader 迁回首选副本，恢复负载均衡。
+
+<Callout type="tip" title="日常巡检清单">
+每天一眼：UnderReplicatedPartitions=0、OfflinePartitions=0、ActiveController=1、各 broker 磁盘低于 70%、核心消费组 Lag 趋势平稳。这五项正常，集群基本无恙；任何一项异常都值得立刻深挖。
+</Callout>
+
+## 小结
+
+- Broker 监控四大金刚：UnderReplicatedPartitions、UnderMinIsr、OfflinePartitions、ActiveControllerCount
+- Lag 用服务端视角（Kafka Exporter/Burrow）监控，按趋势而非绝对值告警
+- JMX Exporter + Kafka Exporter + Prometheus + Grafana 是标准监控栈
+- 重分配必限速、必 verify；新 broker 不迁分区就是空转
+- 滚动重启：确认健康 → 优雅停止（controlled shutdown）→ 等 ISR 恢复 → 下一台
+
+<Callout type="exercise" title="练习">
+1. 给本地集群挂上 JMX Exporter，用 Prometheus 抓取并在 Grafana 画出 BytesInPerSec 曲线，然后跑 perf-test 观察曲线变化。
+2. 部署 kafka-exporter，制造消费积压（停掉消费者灌数据），验证 kafka_consumergroup_lag 指标与告警规则。
+3. 在三节点集群上演练一次完整滚动重启，全程观察 UnderReplicatedPartitions 的起落，并对比 kill -9 一台 broker 时客户端报错的差异。
+</Callout>

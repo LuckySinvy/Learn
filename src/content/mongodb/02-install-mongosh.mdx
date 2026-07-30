@@ -1,0 +1,280 @@
+---
+title: 安装与 mongosh
+order: 2
+description: Docker 与包管理器安装、连接字符串 URI 详解、mongosh 用法、Compass 与 Atlas
+---
+
+# 安装与 mongosh
+
+工具链决定学习效率。这一章我们把环境搭好：一个能用事务和变更流的本地 MongoDB 7.x、一个称手的 shell、以及一个能看数据的 GUI。写完这一章你应该能连上库、创建 `community` 数据库、并把连接串的每一个参数解释清楚。
+
+## 1. 安装 MongoDB 7.x
+
+### 1.1 Docker（推荐）
+
+本地开发首选 Docker，干净、可随时重置。但要注意——上一章说过，**事务和 Change Streams 需要复制集**，所以我们直接以单成员复制集启动，而不是裸的 standalone：
+
+```bash
+docker run -d --name mongo7 \
+  -p 27017:27017 \
+  -v mongo7-data:/data/db \
+  mongo:7.0 \
+  --replSet rs0 --bind_ip_all
+```
+
+容器起来后要初始化复制集，只需一次：
+
+```bash
+docker exec -it mongo7 mongosh --eval 'rs.initiate({
+  _id: "rs0",
+  members: [{ _id: 0, host: "localhost:27017" }]
+})'
+```
+
+返回：
+
+```json
+{ "ok": 1 }
+```
+
+再次进入 shell，提示符会变成 `rs0 [direct: primary] test>`，说明复制集就绪。
+
+### 1.2 macOS（Homebrew）
+
+```bash
+brew tap mongodb/brew
+brew install mongodb-community@7.0
+brew services start mongodb-community@7.0
+```
+
+配置文件在 `/opt/homebrew/etc/mongod.conf`，数据目录默认 `/opt/homebrew/var/mongodb`。要启用复制集，在配置里加：
+
+```yaml
+replication:
+  replSetName: rs0
+```
+
+重启服务后同样执行一次 `rs.initiate()`。
+
+### 1.3 Ubuntu / Debian
+
+```bash
+curl -fsSL https://pgp.mongodb.com/server-7.0.asc | \
+  sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
+
+echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | \
+  sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+
+sudo apt update && sudo apt install -y mongodb-org
+sudo systemctl enable --now mongod
+```
+
+<Callout type="warn" title="不要用发行版仓库里的 mongodb 包">
+Ubuntu 官方源里有一个叫 `mongodb` 的老包，版本停留在 3.6，且和 MongoDB 官方的 `mongodb-org` 冲突。一定要用上面的官方源，包名是 `mongodb-org`。
+</Callout>
+
+## 2. 安装 mongosh
+
+从 6.0 起，老的 `mongo` shell 被移除，取而代之的是 **mongosh**——它基于 Node.js，支持语法高亮、自动补全、多行编辑，并且可以直接 `require` npm 模块。
+
+```bash
+# macOS
+brew install mongosh
+
+# Ubuntu（加了上面的源之后）
+sudo apt install -y mongodb-mongosh
+
+# 任意平台，若已有 Node.js
+npm install -g mongosh
+```
+
+验证：
+
+```bash
+mongosh --version
+```
+
+```text
+2.2.10
+```
+
+## 3. 连接字符串 URI 详解
+
+这是最容易含糊过去、又最容易出事的地方。完整格式：
+
+```text
+mongodb://[username:password@]host1[:port1][,host2[:port2],...][/database][?opt1=val1&opt2=val2]
+```
+
+### 3.1 逐段拆解
+
+| 部分 | 例子 | 说明 |
+|---|---|---|
+| scheme | `mongodb://` | 标准格式；`mongodb+srv://` 用 DNS 查种子列表 |
+| 认证信息 | `app:s3cret@` | 密码里的特殊字符必须做 URL 编码 |
+| 主机列表 | `h1:27017,h2:27017,h3:27017` | 复制集要写全部成员，驱动自己发现拓扑 |
+| 默认库 | `/community` | 同时也是**认证库**的默认值 |
+| 选项 | `?replicaSet=rs0` | 见下表 |
+
+### 3.2 常用选项
+
+| 选项 | 含义 | 建议值 |
+|---|---|---|
+| `replicaSet` | 复制集名，连复制集时必填 | `rs0` |
+| `authSource` | 用户所在的库 | 通常是 `admin` |
+| `readPreference` | 读偏好 | `primary`（默认）；见第 16 章 |
+| `w` | 写关注 | `majority`（生产必设） |
+| `retryWrites` | 写失败自动重试一次 | `true`（默认） |
+| `maxPoolSize` | 连接池上限 | 按并发调，默认 100 |
+| `serverSelectionTimeoutMS` | 找不到可用节点的等待时间 | 5000 比默认 30000 更快暴露问题 |
+| `directConnection` | 只连指定节点，不做拓扑发现 | 调试单个 secondary 时用 |
+
+### 3.3 三个真实例子
+
+```bash
+# 本地开发（单成员复制集）
+mongosh "mongodb://localhost:27017/community?replicaSet=rs0"
+
+# 生产复制集，带认证与写关注
+mongosh "mongodb://app:s3cr3t@db1:27017,db2:27017,db3:27017/community?replicaSet=rs0&authSource=admin&w=majority&readPreference=primaryPreferred"
+
+# Atlas 托管集群（SRV 格式，主机由 DNS 解析得到）
+mongosh "mongodb+srv://app:s3cr3t@cluster0.ab12c.mongodb.net/community?retryWrites=true&w=majority"
+```
+
+<Callout type="warn" title="密码里的 @ 和 / 会破坏 URI">
+如果密码是 `p@ss/word`，直接拼进 URI 会被解析器当成分隔符。必须做 percent-encoding：`p%40ss%2Fword`。更稳妥的做法是不把密码写进 URI，用 `mongosh --username app --password` 交互式输入，或用环境变量注入。
+</Callout>
+
+## 4. mongosh 基本用法
+
+### 4.1 导航命令
+
+```js
+show dbs                 // 列出所有数据库
+use community            // 切换（不存在也不会报错，写入时才真正创建）
+db                       // 当前数据库
+show collections         // 列出集合
+db.users.countDocuments()  // 统计文档数
+```
+
+<Callout type="info" title="use 一个不存在的库不会报错">
+MongoDB 的库和集合都是**惰性创建**的：`use community` 只是切换上下文，直到你第一次向某个集合写入文档，库和集合才真正落盘。`show dbs` 看不到空库，这是正常的，不是命令失败。
+</Callout>
+
+### 4.2 写入第一批数据
+
+我们把贯穿全课程的示例库建起来：
+
+```js
+use community
+
+db.users.insertMany([
+  { username: "alice", email: "alice@example.com", age: 28,
+    profile: { city: "Beijing", bio: "后端工程师" },
+    tags: ["mongodb", "go"], createdAt: new Date("2024-01-05") },
+  { username: "bob", email: "bob@example.com", age: 34,
+    profile: { city: "Shanghai", bio: "架构师" },
+    tags: ["kafka", "java"], createdAt: new Date("2024-02-11") },
+  { username: "carol", email: "carol@example.com", age: 23,
+    profile: { city: "Beijing", bio: "前端" },
+    tags: ["react"], createdAt: new Date("2024-03-20") }
+])
+```
+
+返回：
+
+```json
+{
+  "acknowledged": true,
+  "insertedIds": {
+    "0": ObjectId("665f1a2b3c4d5e6f70819201"),
+    "1": ObjectId("665f1a2b3c4d5e6f70819202"),
+    "2": ObjectId("665f1a2b3c4d5e6f70819203")
+  }
+}
+```
+
+查一下：
+
+```js
+db.users.find({ "profile.city": "Beijing" }, { username: 1, age: 1, _id: 0 })
+```
+
+```json
+[ { "username": "alice", "age": 28 }, { "username": "carol", "age": 23 } ]
+```
+
+### 4.3 好用的 shell 技巧
+
+```js
+// 结果太宽？转成表格
+db.users.find().limit(3).toArray()
+
+// 只看字段名，不看值
+Object.keys(db.users.findOne())
+
+// mongosh 就是 JS 运行时，可以写循环批量造数据
+for (let i = 0; i < 100; i++) {
+  db.posts.insertOne({ title: `post-${i}`, views: Math.floor(Math.random() * 1000) })
+}
+
+// 把查询结果存进变量再处理
+const beijingUsers = db.users.find({ "profile.city": "Beijing" }).toArray()
+beijingUsers.map(u => u.username)
+```
+
+```js
+// 执行外部脚本文件
+// mongosh "mongodb://localhost:27017/community" --file seed.js
+
+// 一次性执行并退出
+// mongosh --quiet --eval 'db.users.countDocuments()'
+```
+
+<Callout type="tip" title="用 .mongoshrc.js 自定义环境">
+在家目录建 `~/.mongoshrc.js`，每次启动 mongosh 会自动执行。常见用法是设置提示符显示当前库、把结果默认打印成表格、或定义几个常用的辅助函数。
+</Callout>
+
+## 5. 图形化工具与 Atlas
+
+### 5.1 MongoDB Compass
+
+官方免费 GUI，最有价值的三个功能不是「浏览数据」，而是：
+
+- **Schema 分析**：对集合采样，统计每个字段出现的比例和类型分布。接手一个陌生集合时，这比读代码快得多。
+- **Explain 可视化**：把执行计划画成树，一眼看出是不是全表扫描。第 19 章会大量用到。
+- **索引管理**：查看索引大小和使用次数，找出从来没被用过的索引。
+
+### 5.2 MongoDB Atlas
+
+官方托管云服务，有永久免费的 M0 层（512MB 存储、共享 CPU）。它的价值在于让你**在真实的三节点复制集上练习**，而不是本地单节点。第 16、17 章讲复制集与分片时，Atlas 能让你直接观察选举和 chunk 迁移。
+
+连接 Atlas 时使用 `mongodb+srv://` 前缀，它会通过 DNS 的 SRV 记录自动发现所有节点，所以 URI 里只写一个主机名。
+
+<Callout type="warn" title="Atlas 免费层的两个限制">
+M0 不支持分片、不支持自定义角色、连接数上限 500，而且**14 天无操作会被暂停**（不会删数据，但需要手动恢复）。用它学复制集没问题，学分片必须自己搭本地集群。
+</Callout>
+
+## 6. 常见连接故障排查
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `ECONNREFUSED 127.0.0.1:27017` | 服务没起或端口不对 | `docker ps` / `systemctl status mongod` |
+| `Server selection timed out` | 复制集名写错或成员不可达 | 核对 `replicaSet=` 参数 |
+| `Authentication failed` | `authSource` 不对 | 用户建在 admin 库就要写 `authSource=admin` |
+| `not primary and secondaryOk=false` | 连到了 secondary 想写 | 去掉 `directConnection`，让驱动找 primary |
+| `Transaction numbers are only allowed on a replica set` | 用了 standalone | 按 1.1 节改成单成员复制集 |
+
+<Callout type="exercise" title="练习">
+用 Docker 起一个 7.0 的单成员复制集，插入本章的 3 个用户，然后完成三件事：一、用 `db.hello()` 确认当前节点是 primary；二、写一段 mongosh 循环，往 `posts` 集合插入 50 条帖子，每条随机挑一个已有用户的 `_id` 作为 `authorId`；三、写出一条**同时带认证库、写关注 majority 和 5 秒服务选择超时**的完整连接 URI。
+</Callout>
+
+## 小结
+
+- 本地开发也要用单成员复制集启动，否则事务和变更流不可用
+- mongosh 取代了旧的 mongo shell，本质是一个连着数据库的 Node.js REPL
+- 连接 URI 的 `replicaSet`、`authSource`、`w`、`readPreference` 四个参数最常出问题，密码必须 URL 编码
+- 库和集合惰性创建，`use` 不存在的库不报错
+- Compass 的 schema 分析与 explain 可视化是排查问题的利器；Atlas 免费层适合练习复制集
+- 下一章开始正式做 CRUD →

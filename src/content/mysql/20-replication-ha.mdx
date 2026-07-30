@@ -1,0 +1,176 @@
+---
+title: 主从复制与高可用
+order: 20
+description: 复制原理、异步/半同步、GTID、主从延迟排查、读写分离与 MGR/MHA 概览
+---
+
+# 主从复制与高可用
+
+单机 MySQL 有两个天花板：挂了就全挂（可用性），读流量全压一台（扩展性）。主从复制同时解决这两个问题——它也是上一章 binlog 的最大用武之地。本章讲复制原理、GTID、延迟排查，最后概览高可用方案的演进。
+
+## 1. 复制原理：三线程模型
+
+```text
+   主库                                    从库
+┌──────────────┐                    ┌────────────────────┐
+│ 事务提交       │                    │                    │
+│   │           │                    │  IO 线程            │
+│   ▼           │   ①拉取 binlog     │   │ 把收到的日志写入  │
+│ 写 binlog ────┼───────────────────▶│   ▼                │
+│  (dump线程发送)│                    │ relay log(中继日志) │
+└──────────────┘                    │   │                │
+                                    │   ▼                │
+                                    │ SQL 线程(重放)       │
+                                    │  → 数据落库、写自己的 binlog
+                                    └────────────────────┘
+```
+
+1. 主库 **dump 线程**：把 binlog 事件推给从库；
+2. 从库 **IO 线程**：接收并写入本地 relay log；
+3. 从库 **SQL 线程**（8.0 默认多线程 applier）：重放 relay log 使数据一致。
+
+### 1.1 搭建一套主从（8.0 语法）
+
+主库：
+
+```ini
+[mysqld]
+server-id = 1
+log-bin = binlog
+binlog_format = ROW
+gtid_mode = ON
+enforce_gtid_consistency = ON
+```
+
+```sql
+CREATE USER 'repl'@'%' IDENTIFIED BY 'Repl#Pass1';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+```
+
+从库（server-id 必须不同；先用备份/克隆插件同步全量数据）：
+
+```sql
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '10.0.0.1',
+  SOURCE_USER = 'repl',
+  SOURCE_PASSWORD = 'Repl#Pass1',
+  SOURCE_AUTO_POSITION = 1;      -- GTID 模式，自动找位点
+
+START REPLICA;
+SHOW REPLICA STATUS\G
+```
+
+健康判断看三项：`Replica_IO_Running: Yes`、`Replica_SQL_Running: Yes`、`Seconds_Behind_Source: 0`。
+
+## 2. 异步、半同步与组复制
+
+| 模式 | 主库提交时机 | 主库崩溃丢数据？ | 性能 |
+|---|---|---|---|
+| 异步（默认） | 不等从库 | 可能丢（binlog 没传出去） | 最好 |
+| 半同步 | 等**至少一个**从库确认收到 | 基本不丢 | 每次提交多一次网络往返 |
+| 组复制 MGR | 多数派认证通过 | 不丢 | 取决于组内最慢的多数派 |
+
+半同步开启（主从都装插件）：
+
+```sql
+-- 主库
+INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
+SET GLOBAL rpl_semi_sync_source_enabled = ON;
+SET GLOBAL rpl_semi_sync_source_timeout = 1000;  -- 等待超时(ms)后退化为异步
+```
+
+注意半同步的语义是「从库**收到**日志」而非「从库**执行完**」，且超时会自动退化为异步——它降低丢数据概率，不是绝对保证。
+
+## 3. GTID：给每个事务发身份证
+
+传统复制用「binlog 文件名 + 位点」定位进度，主库一切换，位点全乱。GTID（全局事务标识）给每个事务一个全局唯一 ID：
+
+```text
+GTID = server_uuid:序号
+例如  3E11FA47-71CA-11E1-9E33-C80AA9429562:23
+```
+
+从库记录自己**执行过的 GTID 集合**，接上任何主库都能自动对齐：「你有的我没有的，从那开始传」。收益：
+
+- 换主（failover）不用人肉算位点，`SOURCE_AUTO_POSITION = 1` 一行搞定；
+- 天然幂等：执行过的 GTID 再收到会跳过，避免重复重放。
+
+新集群一律开 GTID，没有理由不开。
+
+## 4. 主从延迟：定位与治理
+
+延迟 = 从库落后主库的时间。读写分离架构下，延迟直接造成「下单成功却查不到订单」的业务问题。
+
+### 4.1 常见原因与对策
+
+| 原因 | 特征 | 对策 |
+|---|---|---|
+| 大事务 | 延迟突然飙升又回落 | 大 DELETE/UPDATE 分批（第 5 章） |
+| 从库单线程重放跟不上 | 延迟持续增长 | 多线程复制（8.0 默认 `replica_parallel_type=LOGICAL_CLOCK`），调大 `replica_parallel_workers` |
+| 从库机器弱/承担太多读 | 高峰期延迟 | 从库规格对齐主库；加从库分摊 |
+| 无主键表 | ROW 格式逐行全表扫 | 所有表必须有主键（8.0.30 可强制 `sql_require_primary_key`） |
+| DDL 在从库重放 | 长时间延迟 | 低峰变更、gh-ost |
+
+```sql
+-- 8.0 更精确的延迟观测（代替粗糙的 Seconds_Behind_Source）
+SELECT * FROM performance_schema.replication_applier_status_by_worker\G
+```
+
+### 4.2 业务侧兜底
+
+- **关键读走主库**：下单后立刻查订单这类「读己之写」场景，强制路由主库；
+- 会话粘性：写入后 N 秒内该用户的读都走主库；
+- 8.0 从库支持 `SELECT ... FOR UPDATE` 之外的一致性等待函数 `WAIT_FOR_EXECUTED_GTID_SET()`，中间件（如 ProxySQL）可基于 GTID 做「读自己的写」。
+
+## 5. 读写分离
+
+```text
+                 ┌──▶ 主库（写 + 关键读）
+应用 ──▶ 中间件/SDK ─┤
+                 ├──▶ 从库1（读）
+                 └──▶ 从库2（读）
+```
+
+实现层级：
+
+1. **应用层多数据源**：代码里 read/write 两个连接池，简单可控，路由逻辑侵入业务；
+2. **中间件**：ProxySQL、ShardingSphere-Proxy，对应用透明，自动读写分离 + 故障摘除；
+3. **云厂商读写分离地址**：RDS 一个地址自动分流，最省事。
+
+无论哪种，都必须回答「延迟窗口内的读怎么办」——见上一节兜底策略。
+
+## 6. 高可用方案概览
+
+复制只解决数据冗余，**主库挂了谁来切**才是高可用的核心：
+
+| 方案 | 机制 | 特点 |
+|---|---|---|
+| MHA | 监控主库，故障时自动选从库提升、补齐日志 | 经典老将，脚本化，逐渐退役 |
+| Orchestrator | 拓扑管理 + 自动 failover，Web 可视化 | GitHub 出品，配合 GTID 很流行 |
+| **MGR（组复制）** | Paxos 多数派协议，官方 InnoDB Cluster 的核心 | 单主/多主模式，自动选主，脑裂免疫（多数派） |
+| 云 RDS 高可用版 | 主备双机 + VIP 自动切换 | 掏钱免运维 |
+
+MGR 简述：3 或 5 个节点组成复制组，事务提交需**多数派认证**冲突后才落盘，主挂了组内自动选新主，配合 MySQL Router 对应用透明。它是官方给出的「复制 + 自动切换」完整答案（InnoDB Cluster = MGR + Router + Shell）。
+
+<Callout type="warn" title="从库要设为只读">
+从库务必 `SET GLOBAL super_read_only = ON;`（连 root 都拦），否则任何人往从库写一行，主从数据就分叉了，复制随时因冲突中断，修复代价极大。同理，双主互写（不做冲突域隔离）在业务上几乎总是灾难，别用。
+</Callout>
+
+<Callout type="tip" title="复制中断的排查入口">
+`SHOW REPLICA STATUS\G` 的 `Last_IO_Error` / `Last_SQL_Error` 是第一现场。常见错误：1062 主键冲突（从库被写过脏数据）、1032 找不到行（同因）。定位后要么修数据重启复制，要么用 pt-table-checksum 校验一致性后重建从库——不要盲目 skip 错误，那是把不一致藏起来。
+</Callout>
+
+## 小结
+
+- 复制链路：主库 binlog → 从库 IO 线程 → relay log → SQL 线程重放
+- 异步快但可能丢、半同步等一个从库确认、MGR 多数派最稳
+- GTID 让换主与位点管理自动化，新集群必开
+- 延迟治理：拆大事务、多线程重放、表必有主键；业务侧「读己之写」走主库
+- 高可用 = 复制 + 自动切换：Orchestrator / MGR / 云 RDS
+- 从库必须 super_read_only
+
+<Callout type="exercise" title="练习">
+1. 用两个 Docker 容器搭一套 GTID 主从，`SHOW REPLICA STATUS\G` 确认三项健康指标。
+2. 在主库执行一个 50 万行的大事务 UPDATE，观察从库 Seconds_Behind_Source 的变化过程，然后改成分批更新对比。
+3. 手动停掉主库容器，练习把从库提升为新主（`STOP REPLICA; RESET REPLICA ALL;` + 开写），并说明生产上这个过程该由什么组件自动完成。
+</Callout>

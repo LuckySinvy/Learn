@@ -1,0 +1,536 @@
+---
+title: 查询语法与常用函数
+order: 11
+description: SELECT 扩展语法、WITH 子句、SAMPLE、LIMIT BY 与字符串日期类型转换函数
+---
+
+# 查询语法与常用函数
+
+ClickHouse 的 SQL 大体兼容标准 SQL，但加了很多非常好用的扩展。这一章把日常写查询会用到的语法和函数过一遍。
+
+## 1. SELECT 的扩展语法
+
+### 1.1 列选择器：COLUMNS 与 APPLY
+
+```sql
+-- 用正则批量选列
+SELECT COLUMNS('.*_ms') FROM events LIMIT 3;
+
+-- 对选中的列批量应用函数
+SELECT COLUMNS('.*_ms') APPLY max FROM events;
+
+-- 排除某些列（宽表神器）
+SELECT * EXCEPT (page, device) FROM events LIMIT 3;
+
+-- 替换某列的表达式
+SELECT * REPLACE (duration_ms / 1000 AS duration_ms) FROM events LIMIT 3;
+```
+
+```text
+┌─max(duration_ms)─┐
+│             5049 │
+└──────────────────┘
+```
+
+`SELECT * EXCEPT (...)` 在 40 列的宽表里只想去掉两列时特别省事。
+
+### 1.2 序号引用
+
+```sql
+SELECT country, event_type, count() AS pv
+FROM events
+GROUP BY 1, 2         -- 引用第 1、2 个 SELECT 列
+ORDER BY 3 DESC       -- 按第 3 列排序
+LIMIT 5;
+```
+
+也可以直接用别名（MySQL 也支持，但 ClickHouse 支持得更彻底，WHERE 里也能用别名）：
+
+```sql
+SELECT
+    toDate(event_time) AS day,
+    duration_ms / 1000 AS dur_s
+FROM events
+WHERE day = '2024-06-15' AND dur_s > 3    -- WHERE 里直接用别名，MySQL 不行
+LIMIT 5;
+```
+
+### 1.3 WITH 子句
+
+**定义标量常量**（最常用）：
+
+```sql
+WITH
+    '2024-06-01' AS start_date,
+    '2024-07-01' AS end_date,
+    3000         AS slow_threshold
+SELECT
+    country,
+    count()                                 AS pv,
+    countIf(duration_ms > slow_threshold)   AS slow_pv
+FROM events
+WHERE event_time >= start_date AND event_time < end_date
+GROUP BY country
+ORDER BY pv DESC;
+```
+
+**定义子查询（CTE）**：
+
+```sql
+WITH heavy_users AS (
+    SELECT user_id
+    FROM events
+    GROUP BY user_id
+    HAVING count() > 100
+)
+SELECT country, count() AS pv
+FROM events
+WHERE user_id IN (SELECT user_id FROM heavy_users)
+GROUP BY country;
+```
+
+**用子查询结果做标量**：
+
+```sql
+WITH (SELECT count() FROM events) AS total
+SELECT
+    country,
+    count()                        AS pv,
+    round(count() / total * 100, 2) AS pct
+FROM events
+GROUP BY country
+ORDER BY pv DESC;
+```
+
+```text
+┌─country─┬─────pv─┬───pct─┐
+│ JP      │ 200412 │ 20.04 │
+│ CN      │ 200208 │ 20.02 │
+│ US      │ 199931 │ 19.99 │
+│ DE      │ 199788 │ 19.98 │
+│ IN      │ 199661 │ 19.97 │
+└─────────┴────────┴───────┘
+```
+
+<Callout type="tip" title="WITH 标量子查询会被计算一次并广播">
+`WITH (SELECT ...) AS x` 里的子查询只执行一次，结果作为常量参与后续计算。这比在主查询里写关联子查询高效得多。
+</Callout>
+
+### 1.4 GROUP BY 扩展
+
+```sql
+-- WITH TOTALS：额外输出一行总计
+SELECT country, count() AS pv
+FROM events
+GROUP BY country WITH TOTALS
+ORDER BY pv DESC;
+```
+
+```text
+┌─country─┬─────pv─┐
+│ JP      │ 200412 │
+│ CN      │ 200208 │
+│ US      │ 199931 │
+└─────────┴────────┘
+
+Totals:
+┌─country─┬──────pv─┐
+│         │ 1000000 │
+└─────────┴─────────┘
+```
+
+```sql
+-- WITH ROLLUP：层级小计
+SELECT country, device, count() AS pv
+FROM events
+GROUP BY country, device WITH ROLLUP
+ORDER BY country, device;
+
+-- WITH CUBE：所有维度组合
+SELECT country, device, count() AS pv
+FROM events
+GROUP BY country, device WITH CUBE;
+```
+
+`ROLLUP` 输出 `(country, device)`、`(country)`、`()` 三个层级；`CUBE` 还额外输出 `(device)`。做多维报表时能一次查询搞定。
+
+### 1.5 LIMIT BY
+
+ClickHouse 特有，**对每个分组取前 N 行**：
+
+```sql
+-- 每个国家最慢的 2 个页面
+SELECT country, page, duration_ms
+FROM events
+ORDER BY country, duration_ms DESC
+LIMIT 2 BY country;
+```
+
+```text
+┌─country─┬─page───┬─duration_ms─┐
+│ CN      │ /p/183 │        5049 │
+│ CN      │ /p/427 │        5049 │
+│ DE      │ /p/91  │        5049 │
+│ DE      │ /p/338 │        5048 │
+│ IN      │ /p/12  │        5049 │
+│ IN      │ /p/276 │        5049 │
+└─────────┴────────┴─────────────┘
+```
+
+在 MySQL 里这要写窗口函数加子查询，ClickHouse 一行搞定。
+
+还支持 offset：
+
+```sql
+-- 每个国家第 3~5 慢的页面
+SELECT country, page, duration_ms
+FROM events
+ORDER BY country, duration_ms DESC
+LIMIT 2, 3 BY country;
+```
+
+### 1.6 SAMPLE
+
+对大表做快速近似统计。前提是建表时声明了 `SAMPLE BY`：
+
+```sql
+CREATE TABLE events_sampled (...)
+ENGINE = MergeTree
+ORDER BY (country, event_type, event_time, intHash64(user_id))
+SAMPLE BY intHash64(user_id);
+```
+
+```sql
+-- 采样 10% 的数据
+SELECT country, count() * 10 AS pv_estimate
+FROM events_sampled SAMPLE 0.1
+GROUP BY country;
+
+-- 采样固定行数（约 100 万行）
+SELECT count() FROM events_sampled SAMPLE 1000000;
+
+-- 用 _sample_factor 自动缩放
+SELECT country, sum(_sample_factor) AS pv_estimate
+FROM events_sampled SAMPLE 0.1
+GROUP BY country;
+```
+
+`_sample_factor` 是虚拟列，值为 `1 / 采样率`，用它做加权比手动乘 10 更稳妥。
+
+<Callout type="warn" title="SAMPLE 的两个前提">
+1. **必须建表时声明 `SAMPLE BY`**，且它必须是 ORDER BY 的一部分。事后不能加。
+2. **SAMPLE BY 表达式必须是均匀分布的哈希**。用 `intHash64(user_id)` 而不是 `user_id` 本身——后者分布不均会导致采样偏差。
+
+另外，SAMPLE 是"确定性"的：同样的采样率每次返回同样的行。这既是优点（结果可复现）也是缺点（不能通过多次采样降低误差）。
+</Callout>
+
+## 2. 常用函数速查
+
+### 2.1 字符串函数
+
+```sql
+SELECT
+    length('hello')                       AS len,          -- 5（字节数）
+    lengthUTF8('你好')                    AS len_utf8,     -- 2（字符数）
+    upper('abc')                          AS up,
+    lower('ABC')                          AS low,
+    concat('a', '-', 'b')                 AS c,            -- 'a-b'
+    substring('abcdef', 2, 3)             AS sub,          -- 'bcd'（从 1 开始）
+    replaceAll('a-b-c', '-', '+')         AS rep,          -- 'a+b+c'
+    splitByChar('/', '/a/b/c')            AS parts,        -- ['','a','b','c']
+    trim(BOTH ' ' FROM '  x  ')           AS trimmed,      -- 'x'
+    startsWith('/product/1', '/product')  AS sw,           -- 1
+    position('hello', 'll')               AS pos;          -- 3
+```
+
+正则相关：
+
+```sql
+SELECT
+    match(page, '^/p/\\d+$')                  AS is_product,   -- 是否匹配
+    extract(page, '/p/(\\d+)')                AS page_id,      -- 提取第一个捕获组
+    extractAll('a1b22c333', '\\d+')           AS nums,         -- ['1','22','333']
+    replaceRegexpAll(page, '\\d+', 'N')       AS normalized    -- '/p/N'
+FROM events LIMIT 3;
+```
+
+```text
+┌─is_product─┬─page_id─┬─nums──────────┬─normalized─┐
+│          1 │ 183     │ ['1','22','333'] │ /p/N     │
+│          1 │ 427     │ ['1','22','333'] │ /p/N     │
+│          1 │ 91      │ ['1','22','333'] │ /p/N     │
+└────────────┴─────────┴──────────────┴────────────┘
+```
+
+<Callout type="tip" title="正则很慢，优先用普通字符串函数">
+`match`、`extract` 用的是 RE2 引擎，虽然比 PCRE 快，但仍比 `startsWith`、`position`、`splitByChar` 慢一个数量级。
+
+能用 `startsWith(page, '/p/')` 就别写 `match(page, '^/p/')`。
+</Callout>
+
+### 2.2 URL 函数
+
+分析埋点数据的利器：
+
+```sql
+WITH 'https://shop.example.com/p/183?utm_source=wechat&utm_medium=cpc#reviews' AS u
+SELECT
+    protocol(u)                        AS proto,       -- https
+    domain(u)                          AS dom,         -- shop.example.com
+    topLevelDomain(u)                  AS tld,         -- com
+    path(u)                            AS p,           -- /p/183
+    pathFull(u)                        AS pf,          -- /p/183?utm_source=...
+    queryString(u)                     AS qs,          -- utm_source=wechat&utm_medium=cpc
+    fragment(u)                        AS frag,        -- reviews
+    extractURLParameter(u, 'utm_source') AS src,       -- wechat
+    extractURLParameters(u)            AS all_params,
+    cutQueryString(u)                  AS clean;       -- 去掉 query
+```
+
+```text
+┌─proto─┬─dom─────────────────┬─tld─┬─p──────┬─src────┬─all_params──────────────────────────────┐
+│ https │ shop.example.com    │ com │ /p/183 │ wechat │ ['utm_source=wechat','utm_medium=cpc']  │
+└───────┴─────────────────────┴─────┴────────┴────────┴─────────────────────────────────────────┘
+```
+
+实战：统计各渠道来源的 PV：
+
+```sql
+SELECT
+    extractURLParameter(page, 'utm_source') AS source,
+    count() AS pv
+FROM events
+WHERE page LIKE '%utm_source%'
+GROUP BY source
+ORDER BY pv DESC;
+```
+
+### 2.3 日期时间函数
+
+```sql
+WITH toDateTime('2024-06-15 14:37:52') AS t
+SELECT
+    toDate(t)                    AS d,            -- 2024-06-15
+    toStartOfHour(t)             AS hour,         -- 2024-06-15 14:00:00
+    toStartOfDay(t)              AS day,          -- 2024-06-15 00:00:00
+    toStartOfWeek(t)             AS week,         -- 2024-06-09（周日为首）
+    toMonday(t)                  AS monday,       -- 2024-06-10
+    toStartOfMonth(t)            AS month,        -- 2024-06-01
+    toStartOfInterval(t, INTERVAL 15 MINUTE) AS q, -- 2024-06-15 14:30:00
+    toYYYYMM(t)                  AS ym,           -- 202406
+    toHour(t)                    AS h,            -- 14
+    toDayOfWeek(t)               AS dow,          -- 6（周六）
+    formatDateTime(t, '%Y/%m/%d %H:%M') AS fmt;   -- 2024/06/15 14:37
+```
+
+时间运算：
+
+```sql
+SELECT
+    now()                                       AS n,
+    now() - INTERVAL 7 DAY                      AS week_ago,
+    addMonths(toDate('2024-01-31'), 1)          AS next_month,   -- 2024-02-29
+    dateDiff('day', toDate('2024-06-01'), toDate('2024-06-15')) AS days,  -- 14
+    dateDiff('minute', toDateTime('2024-06-15 10:00:00'), now()) AS mins,
+    toRelativeWeekNum(now())                    AS week_num;
+```
+
+`toStartOfInterval` 特别有用，能做任意粒度的时间分桶：
+
+```sql
+-- 每 5 分钟的 PV 曲线
+SELECT
+    toStartOfInterval(event_time, INTERVAL 5 MINUTE) AS bucket,
+    count() AS pv
+FROM events
+WHERE event_time >= '2024-06-15' AND event_time < '2024-06-16'
+GROUP BY bucket
+ORDER BY bucket
+LIMIT 5;
+```
+
+```text
+┌──────────────bucket─┬───pv─┐
+│ 2024-06-15 00:00:00 │  116 │
+│ 2024-06-15 00:05:00 │  108 │
+│ 2024-06-15 00:10:00 │  121 │
+│ 2024-06-15 00:15:00 │  114 │
+│ 2024-06-15 00:20:00 │  109 │
+└─────────────────────┴──────┘
+```
+
+### 2.4 时间序列补零
+
+上面的查询有个问题：如果某个 5 分钟没有数据，那一行就缺失了，画图会断线。用 `WITH FILL` 补齐：
+
+```sql
+SELECT
+    toStartOfInterval(event_time, INTERVAL 1 HOUR) AS hour,
+    count() AS pv
+FROM events
+WHERE event_time >= '2024-06-15' AND event_time < '2024-06-16'
+GROUP BY hour
+ORDER BY hour
+    WITH FILL
+    FROM toDateTime('2024-06-15 00:00:00')
+    TO   toDateTime('2024-06-16 00:00:00')
+    STEP INTERVAL 1 HOUR;
+```
+
+缺失的小时会自动补一行，`pv` 为 0。这是做监控图表的必备技巧，MySQL 里要靠日历表 LEFT JOIN 才能实现。
+
+### 2.5 类型转换
+
+```sql
+SELECT
+    toUInt32('123')            AS a,     -- 123
+    toUInt32OrZero('abc')      AS b,     -- 0（失败返回 0）
+    toUInt32OrNull('abc')      AS c,     -- NULL
+    toUInt32OrDefault('abc', 99) AS d,   -- 99
+    toString(123)              AS e,     -- '123'
+    toDecimal64('12.34', 2)    AS f,
+    CAST('2024-06-15' AS Date) AS g,
+    accurateCastOrNull('300', 'UInt8') AS h;   -- NULL（因为溢出）
+```
+
+<Callout type="warn" title="toXxx 失败会抛异常中断整个查询">
+```sql
+SELECT toUInt32(page) FROM events;
+-- Code: 6. Cannot parse string '/p/183' as UInt32
+```
+
+处理脏数据时**永远用 `OrZero` / `OrNull` / `OrDefault` 变体**。一条脏数据不该让整个报表挂掉。
+</Callout>
+
+### 2.6 条件函数
+
+```sql
+SELECT
+    if(duration_ms > 3000, 'slow', 'fast')       AS speed,
+    multiIf(
+        duration_ms < 500,  'fast',
+        duration_ms < 2000, 'normal',
+        duration_ms < 5000, 'slow',
+                            'very_slow'
+    )                                             AS bucket,
+    CASE
+        WHEN country IN ('CN','JP') THEN 'APAC'
+        WHEN country = 'US'         THEN 'NA'
+        ELSE 'Other'
+    END                                           AS region,
+    count() AS cnt
+FROM events
+GROUP BY speed, bucket, region
+ORDER BY cnt DESC
+LIMIT 5;
+```
+
+`multiIf` 比嵌套的 `if` 可读性好得多，也比 `CASE WHEN` 简洁。
+
+空值处理：
+
+```sql
+SELECT
+    ifNull(x, 0)          AS a,      -- x 为 NULL 时返回 0
+    nullIf(x, 0)          AS b,      -- x = 0 时返回 NULL
+    coalesce(x, y, z, 0)  AS c,      -- 返回第一个非 NULL
+    assumeNotNull(x)      AS d;      -- 断言非 NULL（去掉 Nullable 包装）
+```
+
+### 2.7 数学与舍入
+
+```sql
+SELECT
+    round(3.14159, 2)        AS r,      -- 3.14
+    floor(3.9)               AS f,      -- 3
+    ceil(3.1)                AS c,      -- 4
+    roundToExp2(100)         AS r2,     -- 64（向下取到 2 的幂）
+    roundDown(37, [0,10,20,30,40]) AS rd,  -- 30（分桶）
+    greatest(1, 5, 3)        AS g,      -- 5
+    least(1, 5, 3)           AS l;      -- 1
+```
+
+`roundDown` 是做直方图分桶的利器：
+
+```sql
+-- 响应时间分布直方图
+SELECT
+    roundDown(duration_ms, [0, 100, 500, 1000, 2000, 5000]) AS bucket,
+    count() AS cnt,
+    bar(count(), 0, 400000, 40) AS chart
+FROM events
+GROUP BY bucket
+ORDER BY bucket;
+```
+
+```text
+┌─bucket─┬────cnt─┬─chart────────────────────────────────────┐
+│      0 │  20114 │ ██                                       │
+│    100 │  80237 │ ████████                                 │
+│    500 │ 100128 │ ██████████                               │
+│   1000 │ 199884 │ ███████████████████                      │
+│   2000 │ 599637 │ ███████████████████████████████████████  │
+└────────┴────────┴──────────────────────────────────────────┘
+```
+
+`bar()` 直接在终端画柱状图，做快速数据探查非常爽。
+
+## 3. 一个综合查询
+
+把这一章的东西串起来，分析 6 月份各国家的流量质量：
+
+```sql
+WITH
+    '2024-06-01'  AS d_from,
+    '2024-07-01'  AS d_to,
+    3000          AS slow_ms,
+    (SELECT count() FROM events WHERE event_time >= d_from AND event_time < d_to) AS total_pv
+SELECT
+    country,
+    count()                                         AS pv,
+    round(count() / total_pv * 100, 2)              AS pv_pct,
+    uniq(user_id)                                   AS uv,
+    round(avg(duration_ms), 1)                      AS avg_ms,
+    quantile(0.95)(duration_ms)                     AS p95_ms,
+    countIf(duration_ms > slow_ms)                  AS slow_cnt,
+    round(countIf(duration_ms > slow_ms) / count() * 100, 2) AS slow_pct,
+    countIf(event_type = 'purchase')                AS purchases,
+    round(countIf(event_type = 'purchase') / uniq(user_id), 3) AS orders_per_user,
+    bar(count(), 0, 250000, 30)                     AS pv_chart
+FROM events
+WHERE event_time >= d_from AND event_time < d_to
+GROUP BY country
+ORDER BY pv DESC;
+```
+
+```text
+┌─country─┬─────pv─┬─pv_pct─┬────uv─┬──avg_ms─┬─p95_ms─┬─slow_cnt─┬─slow_pct─┬─purchases─┬─orders_per_user─┬─pv_chart───────────────┐
+│ JP      │ 200412 │  20.04 │ 39812 │  2524.3 │   4788 │    80102 │    39.97 │     50213 │           1.261 │ ████████████████████████ │
+│ CN      │ 200208 │  20.02 │ 39755 │  2521.8 │   4790 │    79988 │    39.95 │     50041 │           1.259 │ ████████████████████████ │
+│ US      │ 199931 │  19.99 │ 39701 │  2525.6 │   4789 │    79912 │    39.97 │     49877 │           1.256 │ ███████████████████████  │
+│ DE      │ 199788 │  19.98 │ 39684 │  2519.4 │   4791 │    79803 │    39.94 │     49912 │           1.258 │ ███████████████████████  │
+│ IN      │ 199661 │  19.97 │ 39672 │  2527.1 │   4786 │    79776 │    39.96 │     49957 │           1.259 │ ███████████████████████  │
+└─────────┴────────┴────────┴───────┴─────────┴────────┴──────────┴──────────┴───────────┴─────────────────┴────────────────────────┘
+```
+
+<Callout type="exercise" title="练习">
+1. 用 `WITH FILL` 画出 6 月 15 日每小时的 PV 曲线，确认 0 点到 23 点每个小时都有行（即使 PV 为 0）。
+2. 用 `LIMIT n BY` 查出每个国家 PV 最高的 3 个页面。
+3. 用 `roundDown` + `bar()` 画出 `duration_ms` 的分布直方图，分桶为 `[0, 200, 500, 1000, 3000, 5000]`。
+4. 用 `WITH ROLLUP` 一次性查出「按国家×设备」「按国家」「总计」三个层级的 PV。
+5. 用 URL 函数从 `page` 里提取路径中的数字 ID（`/p/183` → `183`），统计访问量 top 10 的商品。分别用 `extract` 正则和 `splitByChar` 实现，对比 Elapsed。
+</Callout>
+
+## 小结
+
+- `SELECT * EXCEPT` / `REPLACE` / `COLUMNS` 让宽表查询简洁很多
+- `WITH` 既能定义标量常量也能定义 CTE，标量子查询只算一次
+- `GROUP BY ... WITH TOTALS / ROLLUP / CUBE` 一次查询出多个汇总层级
+- `LIMIT n BY expr` 是 ClickHouse 特有的分组取 TopN，比窗口函数简洁
+- `SAMPLE` 需要建表时声明 `SAMPLE BY`，且表达式要是均匀哈希
+- 字符串处理优先用 `startsWith` / `position` / `splitByChar`，正则是最后手段
+- URL 函数族（`domain`/`path`/`extractURLParameter`）是埋点分析必备
+- `toStartOfInterval` 做任意粒度时间分桶，`ORDER BY ... WITH FILL` 补齐缺失时间点
+- 类型转换用 `OrZero` / `OrNull` 变体避免脏数据中断查询
+- `bar()` 能在终端直接画图，探查数据很方便
+- 下一章深入聚合函数与组合子 →

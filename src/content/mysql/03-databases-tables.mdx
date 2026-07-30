@@ -1,0 +1,184 @@
+---
+title: 库、表与数据类型
+order: 3
+description: 整型、DECIMAL、字符串、日期时间与 JSON 类型的选型原则和常见坑
+---
+
+# 库、表与数据类型
+
+数据类型选错是最难返工的错误之一——表里有几亿行数据时再想把 `INT` 改成 `BIGINT`，就是一次伤筋动骨的在线 DDL。本章讲清每类类型该怎么选，以及那些教科书不会告诉你的坑。
+
+## 1. 整型
+
+| 类型 | 字节 | 有符号范围 | 无符号上限 |
+|---|---|---|---|
+| TINYINT | 1 | -128 ~ 127 | 255 |
+| SMALLINT | 2 | ±3.2 万 | 6.5 万 |
+| INT | 4 | ±21.4 亿 | 42.9 亿 |
+| BIGINT | 8 | ±922 京 | 极大 |
+
+选型原则：
+
+- **主键自增 ID 用 `BIGINT UNSIGNED`**。INT 上限 21 亿看似很大，但高并发系统的自增 ID 消耗速度远超行数（回滚、INSERT IGNORE 失败都会消耗 ID），用满 INT 的事故屡见不鲜。
+- 状态、类型这类枚举值用 `TINYINT`。
+- `INT(11)` 里的 11 **不是长度限制**，只是配合 ZEROFILL 的显示宽度，8.0 已废弃该写法，不要再写。
+
+```sql
+CREATE TABLE users (
+  id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  username   VARCHAR(50)  NOT NULL,
+  email      VARCHAR(100) NOT NULL,
+  status     TINYINT      NOT NULL DEFAULT 1 COMMENT '1正常 2冻结',
+  created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_email (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+## 2. 浮点与 DECIMAL：钱绝不用 FLOAT
+
+`FLOAT` / `DOUBLE` 是二进制浮点数，**不能精确表示大部分十进制小数**：
+
+```sql
+CREATE TABLE t_float (f FLOAT, d DECIMAL(10,2));
+INSERT INTO t_float VALUES (0.1 + 0.2, 0.1 + 0.2);
+SELECT f = 0.3, d = 0.3 FROM t_float;
+```
+
+```text
++---------+---------+
+| f = 0.3 | d = 0.3 |
++---------+---------+
+|       0 |       1 |
++---------+---------+
+```
+
+`DECIMAL(M, D)` 按十进制精确存储，M 是总位数、D 是小数位数。金额通用写法：
+
+```sql
+price DECIMAL(10, 2) NOT NULL   -- 最大 99999999.99，足够绝大多数商品
+```
+
+另一种工程做法是**以分为单位存 BIGINT**（`price_cents BIGINT`），避免小数运算，很多支付系统这么干。两种都对，团队统一即可。
+
+<Callout type="warn" title="FLOAT 存钱是事故级错误">
+用 FLOAT 存金额，累加对账时会出现几分钱的误差，财务系统直接对不上账。牢记：钱要么 DECIMAL，要么整数存分。
+</Callout>
+
+## 3. 字符串：CHAR、VARCHAR、TEXT
+
+| 类型 | 特点 | 适用 |
+|---|---|---|
+| CHAR(N) | 定长，不足补空格，读取快 | 长度固定：MD5(32)、国家码(2) |
+| VARCHAR(N) | 变长，额外 1–2 字节记长度 | 绝大多数字符串 |
+| TEXT / MEDIUMTEXT / LONGTEXT | 大文本，可能溢出页外存储 | 文章正文、日志 |
+
+关键认知：
+
+- `VARCHAR(N)` 的 N 是**字符数**不是字节数。utf8mb4 下一个字符最多 4 字节，所以 `VARCHAR(50)` 最多占 200 字节 + 长度前缀。
+- N 不要无脑写 255 或更大：虽然磁盘按实际长度存，但**内存临时表、排序缓冲区会按最大长度分配**，虚高的 N 浪费内存。够用略有余量即可。
+- 一行所有列（不含 TEXT/BLOB 溢出部分）合计不能超过 65535 字节，VARCHAR 开太大直接建表失败。
+- TEXT 列不能有默认值（8.0.13 之前），且尽量拆到附表——主表带着大 TEXT 会拖慢所有查询的 Buffer Pool 命中率。
+
+## 4. 日期时间：DATETIME vs TIMESTAMP
+
+| 维度 | DATETIME | TIMESTAMP |
+|---|---|---|
+| 存储 | 8 字节（无小数秒时 5 字节） | 4 字节 |
+| 范围 | 1000 ~ 9999 年 | 1970 ~ 2038-01-19 |
+| 时区 | 存字面值，不转换 | 存 UTC，按会话时区转换 |
+
+**2038 问题是真实存在的**：TIMESTAMP 用 32 位秒数存储，2038 年溢出。新表建议统一用 `DATETIME`，时区在应用层管理：
+
+```sql
+created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+           ON UPDATE CURRENT_TIMESTAMP
+```
+
+`ON UPDATE CURRENT_TIMESTAMP` 让该列在行被更新时自动刷新，是「最后修改时间」的标准实现。
+
+需要毫秒精度时用 `DATETIME(3)`，微秒用 `DATETIME(6)`。
+
+<Callout type="tip" title="不要用 VARCHAR 存时间">
+字符串存时间没法用日期函数、范围查询走不好索引、还存在格式不统一的风险。时间就用时间类型。
+</Callout>
+
+## 5. JSON 类型
+
+MySQL 5.7 起支持原生 JSON 类型：二进制存储、写入时校验合法性、支持路径查询。
+
+```sql
+CREATE TABLE products (
+  id    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name  VARCHAR(100) NOT NULL,
+  attrs JSON
+) ENGINE=InnoDB;
+
+INSERT INTO products (name, attrs) VALUES
+  ('iPhone 15', '{"color": "black", "storage_gb": 256, "5g": true}');
+
+-- ->> 提取并去引号；-> 提取保留 JSON 形态
+SELECT name,
+       attrs->>'$.color'      AS color,
+       attrs->'$.storage_gb'  AS storage_gb
+FROM products
+WHERE attrs->>'$.color' = 'black';
+```
+
+```text
++-----------+-------+------------+
+| name      | color | storage_gb |
++-----------+-------+------------+
+| iPhone 15 | black | 256        |
++-----------+-------+------------+
+```
+
+JSON 列本身不能直接建索引，8.0 的两种方案：
+
+```sql
+-- 方案 1：生成列 + 索引
+ALTER TABLE products
+  ADD COLUMN color VARCHAR(20)
+    GENERATED ALWAYS AS (attrs->>'$.color') STORED,
+  ADD INDEX idx_color (color);
+
+-- 方案 2：函数索引（8.0.13+）
+ALTER TABLE products
+  ADD INDEX idx_color2 ((CAST(attrs->>'$.color' AS CHAR(20))));
+```
+
+<Callout type="warn" title="JSON 不是偷懒不建模的借口">
+把整个业务对象塞进一个 JSON 列，等于放弃了类型检查、约束和大部分索引能力，查询和统计都会很痛苦。JSON 适合「结构不定的扩展属性」（如不同品类商品的规格参数），核心字段仍应是正经的列。
+</Callout>
+
+## 6. 其他常用类型速览
+
+- `BOOLEAN`：实际是 `TINYINT(1)` 的别名，存 0/1。
+- `ENUM('a','b')`：省空间但改枚举值要 DDL，业务上更推荐 TINYINT + 注释/字典表。
+- `BINARY / VARBINARY / BLOB`：二进制数据。图片、文件**不要存数据库**，存对象存储、库里只存 URL。
+- `DECIMAL` 之外还有 `BIT`，很少用，可读性差，不推荐。
+
+## 7. NULL 的代价
+
+允许 NULL 的列会带来一串麻烦：
+
+- `NULL = NULL` 结果不是真，必须用 `IS NULL` 判断（第 6 章细讲）；
+- 聚合函数默认跳过 NULL，`COUNT(col)` 与 `COUNT(*)` 结果可能不同；
+- 索引统计与比较逻辑更复杂。
+
+工程惯例：**能 NOT NULL 就 NOT NULL，配合 DEFAULT 给默认值**。字符串默认 `''`，数值默认 `0`——但注意别让默认值和业务语义冲突（「0 表示未填写」和「0 是合法值」不能混）。
+
+## 小结
+
+- 主键 `BIGINT UNSIGNED AUTO_INCREMENT`；枚举状态 `TINYINT`
+- 金额用 `DECIMAL(M,2)` 或整数存分，FLOAT/DOUBLE 禁止碰钱
+- 字符串首选 VARCHAR，N 按需给；大文本拆表
+- 时间用 DATETIME（防 2038），`DEFAULT CURRENT_TIMESTAMP` + `ON UPDATE` 管理创建/更新时间
+- JSON 只放非核心的扩展属性，需要查询的字段用生成列/函数索引
+- 尽量 NOT NULL + DEFAULT
+
+<Callout type="exercise" title="练习">
+1. 为 `shop` 库设计 `users` 表：主键、用户名、邮箱（唯一）、手机号、状态、余额、创建/更新时间，写出完整 CREATE TABLE 并说明每列类型的选择理由。
+2. 建一张测试表分别用 FLOAT 和 DECIMAL 存 `0.1`，各累加 100 次，对比 SUM 的结果。
+3. 给 products 表的 JSON 列加一个基于 `$.storage_gb` 的生成列并建索引，用 EXPLAIN 验证查询能走索引（EXPLAIN 详见第 14 章，先照猫画虎）。
+</Callout>

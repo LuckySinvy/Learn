@@ -24,6 +24,12 @@ export function LangOverview({ lang }: { lang: Language }) {
         {lang === 'langchain' && '用 Langchain.js 编排模型、链、检索与 Agent，构建 LLM 应用。'}
         {lang === 'dify' && '用 Dify 低代码搭建知识库、工作流与 Agent 应用并发布 API。'}
         {lang === 'k8s' && '从 Pod 到 Deployment、Service、Ingress 与自动扩缩容，掌握容器编排。'}
+        {lang === 'typescript' && '从类型注解到泛型、条件类型与类型体操，写出真正类型安全的代码。'}
+        {lang === 'mysql' && '从 SQL 基础到索引原理、事务与 MVCC、复制与调优，吃透关系型数据库。'}
+        {lang === 'redis' && '从数据结构到持久化、集群与分布式锁，掌握高性能内存数据库。'}
+        {lang === 'mongodb' && '从文档模型到聚合管道、索引策略与分片集群，系统掌握 MongoDB。'}
+        {lang === 'clickhouse' && '从列式存储原理到 MergeTree、物化视图与分布式集群，玩转 OLAP 分析。'}
+        {lang === 'kafka' && '从分区副本到消费组、事务与流处理，构建高吞吐的事件驱动架构。'}
       </p>
       <ul className="space-y-1">
         {chapters.map((c, i) => (
