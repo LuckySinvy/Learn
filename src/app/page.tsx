@@ -110,12 +110,6 @@ export default function HomePage() {
         />
       </Category>
 
-      <section className="mt-20 grid md:grid-cols-3 gap-6 text-sm">
-        <Feature title="📚 渐进式课程" desc="每门课程 18 章，从基础到企业级项目，难度平滑上升。" />
-        <Feature title="▶ 在线运行" desc="编程语言内置 Playground，所见即可运行，无需本地环境。" />
-        <Feature title="🤖 AI 工程实战" desc="RAG / Langchain.js / Dify 以真实场景贯穿，附可复制示例。" />
-      </section>
-
       <footer className="mt-20 text-center text-sm text-gray-500">
         <p>
           <Link href="/python" className="hover:underline">开始学习 →</Link>
@@ -145,11 +139,3 @@ function Category({
   );
 }
 
-function Feature({ title, desc }: { title: string; desc: string }) {
-  return (
-    <div className="rounded-lg border border-gray-200 dark:border-gray-800 p-4">
-      <div className="font-semibold mb-1">{title}</div>
-      <div className="text-gray-600 dark:text-gray-400">{desc}</div>
-    </div>
-  );
-}
