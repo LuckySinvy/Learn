@@ -129,7 +129,8 @@ export const LANG_CONFIG: Record<ExecutableLanguage, Omit<DockerRunConfig, 'cmd'
   },
   rust: {
     image: 'rust:slim',
-    cmd: 'rustc -O /code/main.rs -o /code/main && /code/main',
+    // /code 以只读挂载；rustc 会在工作目录写 rmeta 临时文件，故复制到可写的 /tmp 再编译运行
+    cmd: 'cp /code/main.rs /tmp/main.rs && cd /tmp && rustc -O /tmp/main.rs -o /tmp/main && /tmp/main',
     timeoutMs: 20000,
     memoryMb: 256,
     cpus: 1.0,
