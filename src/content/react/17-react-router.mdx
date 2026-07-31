@@ -1,18 +1,20 @@
 ---
 title: React Router
 order: 17
-description: 声明式路由、嵌套路由与布局、动态参数、loader 数据加载思想，以及路由匹配背后的模式解析
+description: URL 作为状态、路由匹配与排序原理、嵌套路由与 Outlet、searchParams、loader/action 数据加载与代码分割
 ---
 
 # React Router
 
-单页应用（SPA）没有「换页面」这回事，URL 变了只是换了一批组件渲染。React Router 是做这件事最流行的库：它把 URL 映射到组件树，让「前进后退」「刷新保持状态」「可分享链接」都自然成立。
+单页应用（SPA）没有"换页面"这回事：URL 变了，只是换了一批组件渲染。React Router 是做这件事最流行的库——它把 URL 映射到组件树，让"前进后退""刷新保持""可分享链接"这些浏览器原生能力在 SPA 里继续成立。
 
-这一章讲路由的核心心智，而不是 API 清单。理解了「URL 是一棵树的路径」，嵌套路由、动态参数都会顺理成章。
+第 15 章把状态分成四类，其中一类是 **URL 状态**。这一章讲的就是它：路由不只是"页面跳转"，更是一套**把界面状态存进地址栏**的机制。理解了"URL 是组件树的一条路径"，嵌套路由、动态参数、loader 都会顺理成章。
 
-## 1. 声明式路由
+## 1. 声明式路由与匹配原理
 
-最基础的用法：用组件声明「哪个路径渲染哪个界面」。
+### 1.1 路由表
+
+用一张配置表声明"哪个路径渲染哪个界面"：
 
 ```tsx
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
@@ -20,7 +22,8 @@ import { createBrowserRouter, RouterProvider } from "react-router-dom";
 const router = createBrowserRouter([
   { path: "/", element: <Home /> },
   { path: "/users/:id", element: <UserProfile /> },
-  { path: "/about", element: <About /> },
+  { path: "/files/*", element: <FileBrowser /> },
+  { path: "*", element: <NotFound /> },
 ]);
 
 function App() {
@@ -28,15 +31,15 @@ function App() {
 }
 ```
 
-`/users/:id` 里的 `:id` 是动态段。访问 `/users/42` 时，组件里用 `useParams()` 拿到 `{ id: "42" }`。注意 `id` 永远是字符串——要当数字用记得 `Number(params.id)`。
+三种路径段：**静态段**（`users`）、**动态段**（`:id`，匹配一段任意内容）、**通配段**（`*`，匹配剩余全部）。访问 `/users/42` 时组件里用 `useParams()` 拿到参数对象，`id` 的值是字符串 `"42"`。
 
-### 1.1 路由匹配是怎么做的
+### 1.2 匹配是怎么做的
 
-React Router 把模式编译成正则，`/users/:id` 变成 `^/users/([^/]+)$`，再按参数名把捕获组取出来。亲手实现一个最小版本就很清楚了：
+React Router 把模式编译成正则：`/users/:id` 变成 `^/users/([^/]+)$`，再按参数名把捕获组回填。亲手写一个最小版本就一目了然：
 
 <Playground
   language="typescript"
-  title="路由模式匹配"
+  title="手写路由匹配器：模式编译与优先级排序"
   id="react-17-1"
   code={`type Params = Record<string, string>;
 
@@ -45,156 +48,411 @@ function compile(pattern: string): { regex: RegExp; keys: string[] } {
   const keys: string[] = [];
   const source = pattern
     .split("/")
-    .map(function (seg) {
-      if (seg.startsWith(":")) {
-        keys.push(seg.slice(1));
-        return "([^/]+)";
-      }
+    .map((seg) => {
+      if (seg.startsWith(":")) { keys.push(seg.slice(1)); return "([^/]+)"; }
+      if (seg === "*") { keys.push("*"); return "(.*)"; }
       return seg;
     })
     .join("/");
-  return { regex: new RegExp("^" + source + "$"), keys: keys };
+  return { regex: new RegExp("^" + source + "$"), keys };
 }
 
 function match(pattern: string, path: string): Params | null {
   const built = compile(pattern);
   const m = path.match(built.regex);
-  if (!m) return null;
+  if (m === null) return null;
   const params: Params = {};
-  built.keys.forEach(function (k, i) {
-    params[k] = m[i + 1];
-  });
+  built.keys.forEach((k, i) => { params[k] = m[i + 1]; });
   return params;
 }
 
-console.log("匹配 /users/42 与模式 /users/:id");
-console.log(JSON.stringify(match("/users/:id", "/users/42")));
+console.log("== 基本匹配 ==");
+console.log("/users/:id  vs  /users/42        -> " + JSON.stringify(match("/users/:id", "/users/42")));
+console.log("/posts/:pid/comments/:cid        -> " + JSON.stringify(match("/posts/:pid/comments/:cid", "/posts/3/comments/7")));
+console.log("/posts/:pid vs  /users/42        -> " + JSON.stringify(match("/posts/:pid", "/users/42")));
+console.log("/files/*    vs  /files/a/b.txt   -> " + JSON.stringify(match("/files/*", "/files/a/b.txt")));
 
-console.log("匹配 /posts/3/comments/7");
-console.log(JSON.stringify(match("/posts/:pid/comments/:cid", "/posts/3/comments/7")));
+// 多个模式都能匹配时怎么选？按"具体程度"打分：静态段 > 动态段 > 通配段
+function score(pattern: string): number {
+  return pattern.split("/").filter((s) => s !== "").reduce((sum, seg) => {
+    if (seg === "*") return sum + 1;
+    if (seg.startsWith(":")) return sum + 3;
+    return sum + 10;
+  }, 0);
+}
 
-console.log("不匹配 /users/42 与 /posts/:pid");
-console.log(JSON.stringify(match("/posts/:pid", "/users/42")));`}
-  expectedOutput={`匹配 /users/42 与模式 /users/:id\n{"id":"42"}\n匹配 /posts/3/comments/7\n{"pid":"3","cid":"7"}\n不匹配 /users/42 与 /posts/:pid\nnull`}
+const patterns = ["/users/*", "/users/:id", "/users/new"];
+console.log("== 访问 /users/new，三个模式都能匹配 ==");
+patterns.forEach((p) => { console.log("  " + p + "  score=" + score(p) + "  match=" + JSON.stringify(match(p, "/users/new"))); });
+
+const winner = patterns
+  .filter((p) => match(p, "/users/new") !== null)
+  .sort((a, b) => score(b) - score(a))[0];
+console.log("胜出的是: " + winner + "  <- 静态段最具体，不会被 :id 抢走");`}
+  expectedOutput={`== 基本匹配 ==\n/users/:id  vs  /users/42        -> {"id":"42"}\n/posts/:pid/comments/:cid        -> {"pid":"3","cid":"7"}\n/posts/:pid vs  /users/42        -> null\n/files/*    vs  /files/a/b.txt   -> {"*":"a/b.txt"}\n== 访问 /users/new，三个模式都能匹配 ==\n  /users/*  score=11  match={"*":"new"}\n  /users/:id  score=13  match={"id":"new"}\n  /users/new  score=20  match={}\n胜出的是: /users/new  <- 静态段最具体，不会被 :id 抢走`}
 />
 
-这正是 React Router 在背后做的事：把动态段变成捕获组，再按位置回填参数名。
+打分排序这一步很关键：路由表的**书写顺序不重要**，React Router 会按具体程度排序后再匹配。这就是为什么 `/users/new` 不会被 `/users/:id` 误吞——你不需要小心翼翼地调整顺序（这一点和 Express 等按顺序匹配的服务端框架相反）。
 
-## 2. 嵌套路由与布局
+## 2. 嵌套路由：URL 是一条路径
 
-真实应用里，页面有公共外壳：顶栏、侧边栏、面包屑。与其每个页面重复写一遍，不如把它们抽成布局，让子路由「嵌」进布局的留白处。
+真实应用有公共外壳：顶栏、侧边栏、面包屑。与其每页重复，不如让子路由"嵌"进布局的留白处：
 
 ```tsx
 const router = createBrowserRouter([
   {
     path: "/",
-    element: <Layout />,                // 外壳，里面有 <Outlet />
+    element: <RootLayout />,              // 外壳，里面有 <Outlet />
     children: [
-      { index: true, element: <Home /> },
-      { path: "users/:id", element: <UserProfile /> },
-      { path: "settings", element: <Settings /> },
+      { index: true, element: <Home /> }, // 父路径自身
+      {
+        path: "users",
+        element: <UsersLayout />,         // 二级外壳（如用户列表侧栏）
+        children: [
+          { index: true, element: <UserList /> },
+          { path: ":id", element: <UserProfile /> },
+        ],
+      },
+      { path: "about", element: <About /> },
     ],
   },
 ]);
 ```
 
-`Layout` 内部用一个 `<Outlet />` 占位，子路由渲染的结果就出现在这里：
+布局组件里用 `<Outlet />` 占位，子路由的渲染结果出现在这个位置：
 
 ```tsx
-function Layout() {
+function RootLayout() {
   return (
     <div>
       <Sidebar />
       <main>
-        <Outlet />          {/* 子路由的组件渲染到这里 */}
+        <Outlet />
       </main>
     </div>
   );
 }
 ```
 
-`index: true` 表示「父路径自身」对应的默认子路由（比如 `/` 显示 Home，而不是空白）。
+所以一个 URL 匹配出的不是"一个组件"，而是**一条组件链**：
 
-### 2.1 嵌套路由的渲染模型
+<Playground
+  language="typescript"
+  title="嵌套路由匹配：从 URL 到组件链"
+  id="react-17-2"
+  code={`// 嵌套路由：URL 匹配出的不是"一个组件"，而是"一条组件链"
+type Route = { path: string; component: string; children?: Route[] };
 
-URL `/users/42` 会同时激活两层路由：外层 `Layout` 常驻，内层 `UserProfile` 填进 `<Outlet />`。所以切换用户时，只有 `UserProfile` 重渲染，`Layout` 不动——这正是「布局复用」的性能好处。
+const routes: Route[] = [
+  {
+    path: "/", component: "RootLayout",
+    children: [
+      { path: "", component: "Home" },                    // index 路由
+      {
+        path: "users", component: "UsersLayout",
+        children: [
+          { path: "", component: "UserList" },
+          { path: ":id", component: "UserProfile" },
+        ],
+      },
+      { path: "about", component: "About" },
+    ],
+  },
+];
 
-## 3. 导航：声明式与命令式
+type Matched = { chain: string[]; params: Record<string, string> };
 
-不要用 `<a href>` 跳转，那会触发整页刷新、丢掉 React 状态。改用：
+// 深度优先匹配：逐段消费 URL，命中就把组件压入链
+function matchRoutes(rs: Route[], segments: string[], params: Record<string, string>): Matched | null {
+  for (const r of rs) {
+    const own = r.path === "" ? [] : r.path.split("/").filter((s) => s !== "");
+    if (own.length > segments.length) continue;
+
+    const next = { ...params };
+    let ok = true;
+    for (let i = 0; i < own.length; i++) {
+      const pat = own[i];
+      if (pat.startsWith(":")) next[pat.slice(1)] = segments[i];
+      else if (pat !== segments[i]) { ok = false; break; }
+    }
+    if (!ok) continue;
+
+    const rest = segments.slice(own.length);
+    if (r.children !== undefined) {
+      const sub = matchRoutes(r.children, rest, next);
+      if (sub !== null) return { chain: [r.component, ...sub.chain], params: sub.params };
+      continue;
+    }
+    if (rest.length === 0) return { chain: [r.component], params: next };
+  }
+  return null;
+}
+
+function visit(url: string): void {
+  const segs = url.split("/").filter((s) => s !== "");
+  const m = matchRoutes(routes, segs, {});
+  if (m === null) { console.log(url + "  ->  404"); return; }
+  // 链条就是嵌套渲染顺序：外层组件的 Outlet 里放下一个
+  console.log(url + "  ->  " + m.chain.join(" > ") + "  params=" + JSON.stringify(m.params));
+}
+
+visit("/");
+visit("/about");
+visit("/users");
+visit("/users/42");
+visit("/nope");
+
+console.log("== 切换 /users/42 -> /users/7 时会发生什么 ==");
+const a = matchRoutes(routes, ["users", "42"], {});
+const b = matchRoutes(routes, ["users", "7"], {});
+if (a !== null && b !== null) {
+  console.log("组件链是否相同: " + String(a.chain.join(">") === b.chain.join(">")));
+  console.log("变化的只有 params: " + JSON.stringify(a.params) + " -> " + JSON.stringify(b.params));
+  console.log("外层 RootLayout / UsersLayout 状态保留，UserProfile 拿到新 id 更新");
+}`}
+  expectedOutput={`/  ->  RootLayout > Home  params={}\n/about  ->  RootLayout > About  params={}\n/users  ->  RootLayout > UsersLayout > UserList  params={}\n/users/42  ->  RootLayout > UsersLayout > UserProfile  params={"id":"42"}\n/nope  ->  404\n== 切换 /users/42 -> /users/7 时会发生什么 ==\n组件链是否相同: true\n变化的只有 params: {"id":"42"} -> {"id":"7"}\n外层 RootLayout / UsersLayout 状态保留，UserProfile 拿到新 id 更新`}
+/>
+
+最后那段输出点出了嵌套路由最大的实用价值：**外层复用**。从 `/users/42` 切到 `/users/7`，组件链完全相同，React 按第 2 章的协调规则复用这些节点——侧栏的滚动位置、展开状态全部保留，只有 `UserProfile` 因为 params 变化而更新。
+
+<Callout type="warn" title="切换详情页时，内部状态会残留">
+上面这个复用是双刃剑：`UserProfile` 组件实例没被销毁，它内部的 `useState`（比如"编辑中的草稿"）会带到下一个用户身上。需要"换 id 就彻底重来"时，给它一个 key：`<UserProfile key={params.id} />`——这是第 8 章"用 key 重置状态"技巧在路由场景的标准应用。
+</Callout>
+
+## 3. 导航：Link、NavLink 与命令式
+
+绝不要用 `<a href>` 做站内跳转——那会触发整页刷新，React 状态全丢、白屏一次。
 
 ```tsx
-import { Link, useNavigate } from "react-router-dom";
+import { Link, NavLink, useNavigate } from "react-router-dom";
 
 function Nav() {
-  const go = useNavigate();
+  const navigate = useNavigate();
+  return (
+    <nav>
+      <Link to="/about">关于</Link>
+
+      {/* NavLink 自带激活态，适合导航菜单 */}
+      <NavLink to="/users" className={({ isActive }) => (isActive ? "on" : "")}>
+        用户
+      </NavLink>
+
+      {/* 命令式：在事件回调、请求成功后跳转 */}
+      <button onClick={() => navigate("/users/42")}>看用户</button>
+      <button onClick={() => navigate(-1)}>返回上一页</button>
+      <button onClick={() => navigate("/login", { replace: true })}>去登录（不留历史）</button>
+    </nav>
+  );
+}
+```
+
+`replace: true` 的意义：登录跳转、重定向这类场景如果用 push，用户按后退会回到"刚被踢走的页面"，然后又被踢一次，陷入循环。这类导航必须 replace。
+
+## 4. searchParams：把筛选条件放进 URL
+
+路径参数适合表达"看哪个资源"，**查询参数**适合表达"怎么看"——筛选、排序、分页、关键词。第 15 章说过：能进 URL 的状态就别放 useState，因为 URL 里的状态天然可分享、可刷新、可后退。
+
+```tsx
+import { useSearchParams } from "react-router-dom";
+
+function TodoList() {
+  const [params, setParams] = useSearchParams();
+  const status = params.get("status") ?? "all";
+  const page = Number(params.get("page") ?? "1");
+
   return (
     <>
-      <Link to="/about">关于</Link>
-      <button onClick={() => go("/users/42")}>看用户</button>
+      <select value={status} onChange={(e) => setParams({ status: e.target.value, page: "1" })}>
+        <option value="all">全部</option>
+        <option value="active">未完成</option>
+      </select>
+      <Pager page={page} onChange={(p) => setParams({ status, page: String(p) })} />
     </>
   );
 }
 ```
 
-`Link` 是声明式跳转（渲染成 `<a>` 但拦截点击），`useNavigate()` 是命令式跳转（在事件里调用）。
+`setParams` 默认是 push（进历史）；输入框实时搜索这种高频更新要传 `{ replace: true }`，否则用户敲十个字符就在历史里塞了十条记录，后退键彻底不可用：
 
-## 4. loader：把数据加载移到路由层
+<Playground
+  language="typescript"
+  title="手写 mini history：push、replace 与后退语义"
+  id="react-17-3"
+  code={`// URL 就是状态：把筛选条件放进 search params，而不是 useState
+// 这里手写一个 mini history + searchParams，体会"可分享、可后退"的含义
+type Entry = { path: string; search: string };
 
-传统做法是在组件里 `useEffect` 拉数据，会先渲染空壳再闪一下。React Router 的 `loader` 让数据在**渲染组件之前**就准备好：
+class MiniHistory {
+  private stack: Entry[] = [];
+  private cursor = -1;
+
+  push(url: string): void {
+    // 新导航会截断"前进"的分支——和浏览器一致
+    this.stack = this.stack.slice(0, this.cursor + 1);
+    const [path, search = ""] = url.split("?");
+    this.stack.push({ path, search });
+    this.cursor = this.stack.length - 1;
+  }
+  replace(url: string): void {
+    const [path, search = ""] = url.split("?");
+    this.stack[this.cursor] = { path, search };
+  }
+  back(): void { if (this.cursor > 0) this.cursor--; }
+  forward(): void { if (this.cursor < this.stack.length - 1) this.cursor++; }
+
+  get current(): Entry { return this.stack[this.cursor]; }
+  get url(): string {
+    const e = this.current;
+    return e.search === "" ? e.path : e.path + "?" + e.search;
+  }
+}
+
+// 从 search 字符串里读状态（对应 useSearchParams）
+function readParams(search: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of search.split("&")) {
+    if (pair === "") continue;
+    const [k, v = ""] = pair.split("=");
+    out[k] = v;
+  }
+  return out;
+}
+
+function render(h: MiniHistory): void {
+  const p = readParams(h.current.search);
+  const status = p.status ?? "all";
+  const page = p.page ?? "1";
+  console.log("  URL " + h.url);
+  console.log("     界面渲染: 状态=" + status + " 第" + page + "页");
+}
+
+const history = new MiniHistory();
+
+console.log("用户打开列表页");
+history.push("/todos");
+render(history);
+
+console.log("点了筛选 active（push：进历史，可后退）");
+history.push("/todos?status=active&page=1");
+render(history);
+
+console.log("翻到第 2 页");
+history.push("/todos?status=active&page=2");
+render(history);
+
+console.log("按浏览器后退");
+history.back();
+render(history);
+
+console.log("再后退");
+history.back();
+render(history);
+
+console.log("前进");
+history.forward();
+render(history);
+
+console.log("输入框实时搜索用 replace（不污染历史，避免后退要按十几次）");
+history.replace("/todos?status=active&page=1&q=re");
+render(history);
+history.replace("/todos?status=active&page=1&q=react");
+render(history);
+console.log("后退一次就回到列表初始态，而不是逐字符回退：");
+history.back();
+render(history);`}
+  expectedOutput={`用户打开列表页\n  URL /todos\n     界面渲染: 状态=all 第1页\n点了筛选 active（push：进历史，可后退）\n  URL /todos?status=active&page=1\n     界面渲染: 状态=active 第1页\n翻到第 2 页\n  URL /todos?status=active&page=2\n     界面渲染: 状态=active 第2页\n按浏览器后退\n  URL /todos?status=active&page=1\n     界面渲染: 状态=active 第1页\n再后退\n  URL /todos\n     界面渲染: 状态=all 第1页\n前进\n  URL /todos?status=active&page=1\n     界面渲染: 状态=active 第1页\n输入框实时搜索用 replace（不污染历史，避免后退要按十几次）\n  URL /todos?status=active&page=1&q=re\n     界面渲染: 状态=active 第1页\n  URL /todos?status=active&page=1&q=react\n     界面渲染: 状态=active 第1页\n后退一次就回到列表初始态，而不是逐字符回退：\n  URL /todos\n     界面渲染: 状态=all 第1页`}
+/>
+
+这个 mini history 就是浏览器 `history.pushState` / `replaceState` 的行为模型：一个带游标的栈，push 会截断前进分支。React Router 在其上包了一层订阅机制，URL 变化时通知组件重渲染。
+
+## 5. loader 与 action：数据跟着路由走
+
+组件里 `useEffect` 拉数据有个固有顺序问题：**必须先渲染组件，才能开始请求**。父组件请求完渲染子组件、子组件再请求——瀑布就是这么来的（第 16 章的第四个缺陷）。
+
+React Router 的 `loader` 把数据获取提前到**导航阶段**：
 
 ```tsx
 {
   path: "users/:id",
   element: <UserProfile />,
-  loader: async ({ params }) => {
-    const user = await fetchUser(params.id);
-    return user;
+  errorElement: <RouteError />,           // loader 抛错时渲染它
+  loader: async ({ params, request }) => {
+    const res = await fetch(`/api/users/${params.id}`, { signal: request.signal });
+    if (!res.ok) throw new Response("Not Found", { status: 404 });
+    return res.json();
   },
 }
 ```
 
-组件里用 `useLoaderData()` 直接拿到结果，没有 loading 闪烁：
-
 ```tsx
 function UserProfile() {
-  const user = useLoaderData() as User;   // 数据已经在手
+  const user = useLoaderData() as User;   // 数据已经在手，没有 loading 分支
   return <h1>{user.name}</h1>;
 }
 ```
 
-这背后的思想很关键：**数据依赖跟着路由走**，而不是跟着组件走。好处是 URL 一确定，需要哪些数据就确定了，可以在导航时并行预取、做加载态、出错时显示 errorElement。
+三个连带好处，都源自"URL 一确定，需要哪些数据就确定了"：
 
-<Callout type="info" title="loader 不是 React 特性">
-`loader` 是 React Router 的路由层能力，和 React 的渲染循环无关。它本质是「在进入这个路由前跑一个函数」。下一章会看到，Next.js 把这个思想又往前推了一步——直接在服务端拿数据。
+- **并行**：一条 URL 上多层路由的 loader 同时发起，不再层层等待；
+- **无闪烁**：数据没到之前停在旧页面（可用 `useNavigation()` 显示顶部进度条），而不是先白屏再填充；
+- **可预取**：鼠标悬停在 `Link` 上时就能提前跑 loader。
+
+写操作对应 `action`，配合 `<Form method="post">` 使用，提交后自动重新运行当前路由的 loader（相当于自动 invalidate）——这套设计明显借鉴了传统服务端渲染的表单模型，也和第 16 章 mutation 后失效缓存是同一个思想。
+
+<Callout type="info" title="loader 与 TanStack Query 不是二选一">
+loader 解决"何时开始请求"，Query 解决"数据缓存与共享"。生产项目常见组合是在 loader 里调用 `queryClient.ensureQueryData(...)`：导航时预取进 Query 缓存，组件里照常 `useQuery` 读——既消除瀑布，又保留缓存与后台刷新。
 </Callout>
 
-<Callout type="tip" title="URL 是你的全局状态来源">
-把「当前看什么」放进 URL，而不是放进某个 React state。这样刷新、分享链接、前进后退都能复原界面。能用 URL 表达的状态，尽量不要藏在内存里。
+## 6. 路由级代码分割
+
+第 13 章讲过 `lazy` + `Suspense`。路由是代码分割最自然的切点——用户没进后台管理页，就不该下载那几百 KB：
+
+```tsx
+const Dashboard = lazy(() => import("./pages/Dashboard"));
+
+{
+  path: "dashboard",
+  element: (
+    <Suspense fallback={<PageSkeleton />}>
+      <Dashboard />
+    </Suspense>
+  ),
+}
+```
+
+配合 `errorElement` 处理 chunk 加载失败（网络差或发版后旧 chunk 404），是生产环境必备的兜底。
+
+<Callout type="tip" title="服务器也要配合：SPA 的 404 问题">
+`/users/42` 是前端路由，服务器上并没有这个文件。直接刷新这个地址，Nginx 会返回 404——必须配置"所有未匹配请求都回退到 index.html"（`try_files $uri /index.html`）。这是 SPA 部署第一坑，本地开发服务器默认帮你做了，上线才暴露。
 </Callout>
 
 <Callout type="warn" title="动态段永远是字符串">
-`useParams()` 返回的每一段都是 `string`。`/users/42` 拿到的 `id` 是 `"42"`，不是 `42`。直接拿去做数组索引或比较会踩坑，先 `Number()` 转换。
-</Callout>
-
-<Callout type="exercise" title="练习 1：设计路由树">
-一个后台有：登录页（无外壳）、带侧边栏的后台首页、文章列表、文章详情（带评论子路由）。画出 `createBrowserRouter` 的嵌套结构，并标出 `<Outlet />` 出现在哪一层。
-</Callout>
-
-<Callout type="exercise" title="练习 2：扩展匹配器">
-给本章 Playground 的 `compile` 增加「可选段」支持：模式写成 `/files/:path*` 能匹配 `/files` 和 `/files/a/b`。提示：把 `*` 段编译成 `(/.*)?`。
-</Callout>
-
-<Callout type="exercise" title="练习 3：loader 与组件取值">
-把「用户详情」从「组件内 useEffect 拉取」改成「loader 预取 + useLoaderData」。列出改动涉及的三处（路由配置、组件取值、错误边界），并说明为什么没有 loading 闪烁。
+`useParams()` 返回的每一段都是 `string`：`/users/42` 拿到的是 `"42"` 不是 `42`。直接拿去比较（`user.id === params.id`）或做数组索引必踩坑，先 `Number(params.id)` 并校验 `Number.isNaN`。同理 `searchParams.get()` 也总是字符串或 null。
 </Callout>
 
 ## 小结
 
-- 路由把 URL 映射到组件树；`/users/:id` 中的 `:id` 是动态段，由 `useParams()` 取回（字符串）
-- React Router 在背后把模式编译成正则、按捕获组回填参数名
-- 嵌套路由用 `<Outlet />` 让子路由填进布局，切换子路由时外壳不重渲染
-- 跳转用 `Link`（声明式）或 `useNavigate()`（命令式），不要用 `<a href>` 以免整页刷新
-- `loader` 在渲染前准备好数据，消除 loading 闪烁；数据依赖跟着路由走
-- 能用 URL 表达的状态就放进 URL，刷新和分享都能复原
+- 路由把 URL 映射到**组件链**；三种段：静态、动态 `:id`、通配 `*`；参数取值永远是字符串
+- 匹配按"具体程度"排序而非书写顺序，静态段优先级最高，不会被动态段吞掉
+- 嵌套路由用 `<Outlet />`；切换同层级路由时外层复用、状态保留，需要重置就加 `key`
+- 导航用 `Link` / `NavLink` / `useNavigate`；登录重定向类跳转要 `replace: true`
+- 筛选排序分页放 `searchParams`（可分享、可后退）；高频输入用 replace 避免污染历史
+- `loader` 把请求提前到导航阶段，消除瀑布与闪烁；`action` + 自动重跑 loader 对应写操作
+- 路由是代码分割的天然切点；SPA 部署必须配置回退到 index.html
 - 下一章讲并发特性：useTransition 与自动批处理 →
+
+<Callout type="exercise" title="练习 1：设计路由树">
+一个后台系统有：登录页（无外壳）、带侧边栏的首页、文章列表、文章详情（详情页内还有"评论"和"版本历史"两个 tab 子路由）。写出 `createBrowserRouter` 的嵌套配置，标出每层 `<Outlet />` 的位置，并说明访问 `/posts/9/comments` 时组件链是什么。
+</Callout>
+
+<Callout type="exercise" title="练习 2：扩展匹配器">
+给 Playground 1 的 `compile` 增加**可选段**支持：模式 `/files/:name?` 既能匹配 `/files` 也能匹配 `/files/a.txt`。再给 `score` 函数加上可选段的打分规则，说明它应该排在静态段和动态段的什么位置。
+</Callout>
+
+<Callout type="exercise" title="练习 3：判断 push 还是 replace">
+以下六个场景各该用 push 还是 replace，说明理由：点击导航菜单、搜索框输入联想、切换列表筛选、表单提交成功后跳详情、未登录被重定向到登录页、分页翻页。
+</Callout>
+
+<Callout type="exercise" title="练习 4：消除瀑布">
+现有代码：`Layout` 里 useEffect 拉取当前用户，`UserProfile` 里 useEffect 拉取用户详情，`PostList` 里再拉他的文章。画出三个请求的时间线，然后改写成 loader 方案，说明新时间线快在哪、快多少个 RTT。
+</Callout>
