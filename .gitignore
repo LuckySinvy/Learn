@@ -17,3 +17,7 @@ dist
 mdxcheck.mjs
 # 本地 React Playground 校验脚本（tsc + node 实跑）
 verify-react.mjs
+# 本地 MDX 正文 {expr} 扫描（定位会触发 MDX 运行时报错的裸露表达式）
+scan-mdx-expr.mjs
+# 服务器端 shell 类 Playground 实跑校验（learn-shell:1）
+verify-shell.mjs
