@@ -68,11 +68,11 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 for p in /app.8f3a2c.js /index.html /api/profile /api/token /logo.png; do
   echo "== $p =="
-  curl -sI http://127.0.0.1:8000$p | grep -i cache-control
+  curl -si http://127.0.0.1:8000$p | grep -i cache-control
 done`}
 />
 
@@ -95,12 +95,12 @@ python3 内置的文件服务器就支持 If-Modified-Since，先用它体验最
   id="http-09-2"
   code={`echo "cached content v1" > page.html
 python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 第一次请求：200，记下 Last-Modified =="
-curl -sI http://127.0.0.1:8000/page.html | grep -E "HTTP/|Last-Modified"
+curl -si http://127.0.0.1:8000/page.html | grep -E "HTTP/|Last-Modified"
 
-LM=$(curl -sI http://127.0.0.1:8000/page.html | grep -i last-modified | cut -d" " -f2-)
+LM=$(curl -si http://127.0.0.1:8000/page.html | grep -i last-modified | cut -d" " -f2-)
 
 echo "== 带 If-Modified-Since 再问：304，没有响应体 =="
 curl -s -o /dev/null -w "%{http_code} 下载了 %{size_download} 字节\n" \
@@ -153,7 +153,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 第一次：200，拿到 ETag =="
 curl -si http://127.0.0.1:8000/article | grep -E "HTTP/|ETag"

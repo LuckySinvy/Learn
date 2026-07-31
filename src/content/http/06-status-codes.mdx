@@ -92,15 +92,15 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 for p in /ok /created /nocontent /moved /unauth /forbidden /limited /boom /slowgw /nope; do
   curl -s -o /dev/null -w "%{http_code}  $p\n" http://127.0.0.1:8000$p
 done
 echo "---- 401 必须携带 WWW-Authenticate ----"
-curl -sI http://127.0.0.1:8000/unauth | grep -iE "HTTP/|www-auth"
+curl -si http://127.0.0.1:8000/unauth | grep -iE "HTTP/|www-auth"
 echo "---- 429 携带 Retry-After ----"
-curl -sI http://127.0.0.1:8000/limited | grep -iE "HTTP/|retry"`}
+curl -si http://127.0.0.1:8000/limited | grep -iE "HTTP/|retry"`}
 />
 
 ## 4. 实验：301/302 会偷偷改掉你的 POST
@@ -139,7 +139,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 # 注意：用 -d 让 curl 隐式 POST（如果写死 -X POST，curl 会强制每一跳都用 POST，
 # 反而掩盖了 302 的降级行为）
@@ -205,7 +205,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 路径不存在：404 =="
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/nope

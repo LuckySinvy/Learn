@@ -59,7 +59,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 白名单内的 Origin：响应带上了许可头 =="
 curl -si http://127.0.0.1:8000/api -H "Origin: http://app.example.com" \
@@ -120,7 +120,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 第一步：浏览器自动发出的预检 =="
 curl -si -X OPTIONS http://127.0.0.1:8000/api/users \
@@ -185,7 +185,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 正常接口：有许可头 =="
 curl -si http://127.0.0.1:8000/good -H "Origin: http://a.com" | grep -iE "HTTP/|access-control"

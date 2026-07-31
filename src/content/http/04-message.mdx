@@ -70,7 +70,7 @@ class Echo(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), Echo).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 # 一个最普通的 GET，再附加一个自定义头
 curl -s "http://127.0.0.1:8000/books?page=2" -H "X-Debug: 1"`}

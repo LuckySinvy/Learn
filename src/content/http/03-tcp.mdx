@@ -175,8 +175,13 @@ def rows(port_hex):
     out = []
     for line in open("/proc/net/tcp"):
         p = line.split()
-        if len(p) > 3 and port_hex in (p[1].split(":")[1], p[2].split(":")[1]):
-            local = int(p[1].split(":")[1], 16)
+        # 跳过表头（首行无冒号），且本地/远端地址必须含冒号
+        if len(p) < 4 or ":" not in p[1] or ":" not in p[2]:
+            continue
+        local_hex = p[1].split(":")[1]
+        remote_hex = p[2].split(":")[1]
+        if port_hex in (local_hex, remote_hex):
+            local = int(local_hex, 16)
             out.append((local, STATES.get(p[3], p[3])))
     return out
 

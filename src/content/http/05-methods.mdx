@@ -87,7 +87,7 @@ class API(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), API).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== POST 创建 =="
 curl -s -X POST http://127.0.0.1:8000/users -d '{"name":"Ada"}'
@@ -145,7 +145,7 @@ class API(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), API).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 同一个 POST 发 3 次（模拟超时重试）=="
 for i in 1 2 3; do
@@ -196,10 +196,10 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== HEAD（curl -I）：只有头，Content-Length 说体有 1000 字节 =="
-curl -sI http://127.0.0.1:8000/bigfile
+curl -si http://127.0.0.1:8000/bigfile
 echo "== OPTIONS：Allow 头列出支持的方法 =="
 curl -si -X OPTIONS http://127.0.0.1:8000/ | grep -iE "HTTP/|Allow"`}
 />

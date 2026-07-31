@@ -21,3 +21,8 @@ verify-react.mjs
 scan-mdx-expr.mjs
 # 服务器端 shell 类 Playground 实跑校验（learn-shell:1）
 verify-shell.mjs
+# 服务器端单 Playground 调试
+verify-one.mjs
+verify-one-debug.mjs
+# http 课程 sleep→就绪轮询 迁移脚本
+fix-http-sleep.mjs

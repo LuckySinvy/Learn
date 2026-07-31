@@ -135,7 +135,7 @@ echo "127.0.0.1 myapp.local" >> /etc/hosts
 
 # 起服务后，用域名（而非 IP）访问
 python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 echo "via-hosts-file" > index.html
 
 curl -s http://myapp.local:8000/index.html`}
@@ -152,7 +152,7 @@ curl -s http://myapp.local:8000/index.html`}
   title="curl --resolve 模拟 DNS 解析结果"
   id="http-02-3"
   code={`python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 echo "hello from fake-example" > index.html
 
 # 告诉 curl：api.example.com 的 8000 端口就解析到 127.0.0.1

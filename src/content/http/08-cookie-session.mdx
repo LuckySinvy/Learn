@@ -49,7 +49,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 第一次访问 /me：两手空空 =="
 curl -s -b /work/jar.txt -c /work/jar.txt http://127.0.0.1:8000/me
@@ -121,7 +121,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 下发的原始 Set-Cookie 头 =="
 curl -sv http://127.0.0.1:8000/issue 2>&1 | grep -i "set-cookie"
@@ -189,7 +189,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 A=/work/alice.jar; B=/work/bob.jar
 curl -s -c $A "http://127.0.0.1:8000/login?user=alice"

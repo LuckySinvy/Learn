@@ -81,7 +81,7 @@ class API(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), API).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 集合 + 过滤 =="
 curl -s "http://127.0.0.1:8000/v1/books?status=in-stock" | jq .
@@ -154,16 +154,16 @@ class API(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), API).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== offset 第 2 页 =="
 curl -s "http://127.0.0.1:8000/offset?page=2&per_page=5" | jq -c ".items | map(.id)"
 
 echo "== cursor 翻页：跟着 next_cursor 走 =="
 R=$(curl -s "http://127.0.0.1:8000/cursor?limit=5")
-echo $R | jq -c ".items | map(.id), .next_cursor"
+echo $R | jq -c "{ids:(.items | map(.id)), next:.next_cursor}"
 NEXT=$(echo $R | jq -r ".next_cursor")
-curl -s "http://127.0.0.1:8000/cursor?limit=5&cursor=$NEXT" | jq -c ".items | map(.id), .next_cursor"`}
+curl -s "http://127.0.0.1:8000/cursor?limit=5&cursor=$NEXT" | jq -c "{ids:(.items | map(.id)), next:.next_cursor}"`}
 />
 
 响应体里除了 items，务必带分页元信息（total/next_cursor）；讲究一点可以加 `Link` 响应头（GitHub 风格）给出 next/prev 的完整 URL。
@@ -216,7 +216,7 @@ class API(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), API).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 业务错误：422 + problem+json =="
 curl -s -X POST http://127.0.0.1:8000/v1/transfers -d '{"amount": 999}' | jq .

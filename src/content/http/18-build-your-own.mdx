@@ -113,7 +113,7 @@ subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "未知路径 -> %{http_c
   id="http-18-2"
   code={`echo "served by stdlib server" > data.txt
 python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 python3 -c '
 import socket

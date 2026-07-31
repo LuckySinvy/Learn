@@ -81,7 +81,7 @@ class Echo(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), Echo).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "===== 模拟浏览器请求 ====="
 curl -s http://127.0.0.1:8000/page \
@@ -144,11 +144,11 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 for p in /as-html /as-text /as-bin; do
   echo "== $p =="
-  curl -sI http://127.0.0.1:8000$p | grep -i "content-type"
+  curl -si http://127.0.0.1:8000$p | grep -i "content-type"
 done`}
 />
 
@@ -185,7 +185,7 @@ class Echo(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), Echo).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "1) 默认 -d：application/x-www-form-urlencoded"
 curl -s http://127.0.0.1:8000/ -d "name=Ada&city=beijing"

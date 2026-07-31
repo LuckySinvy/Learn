@@ -57,7 +57,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 裸访问：401 + WWW-Authenticate =="
 curl -si http://127.0.0.1:8000/admin | grep -E "HTTP/|WWW-Auth"

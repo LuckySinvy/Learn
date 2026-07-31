@@ -56,13 +56,13 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 curl -s http://127.0.0.1:8000/ -H "Accept-Language: zh-CN, en;q=0.5"
 curl -s http://127.0.0.1:8000/ -H "Accept-Language: ja, en;q=0.8"
 curl -s http://127.0.0.1:8000/ -H "Accept-Language: fr"
 echo "--- 响应头里的协商结果与 Vary ---"
-curl -sI http://127.0.0.1:8000/ -H "Accept-Language: zh" | grep -iE "content-language|vary"`}
+curl -si http://127.0.0.1:8000/ -H "Accept-Language: zh" | grep -iE "content-language|vary"`}
 />
 
 ### 1.1 Vary：协商资源的缓存钥匙
@@ -114,7 +114,7 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 ' &
-sleep 0.3
+for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo "== 不接受压缩 =="
 curl -s -o /dev/null -w "传输 %{size_download} 字节\n" \
@@ -125,7 +125,7 @@ curl -s --compressed -o /dev/null -w "传输 %{size_download} 字节\n" \
   http://127.0.0.1:8000/api
 
 echo "== 看响应头确认 =="
-curl -sI --compressed http://127.0.0.1:8000/api | grep -iE "content-encoding|content-length|vary"`}
+curl -si --compressed http://127.0.0.1:8000/api | grep -iE "content-encoding|content-length|vary"`}
 />
 
 一份 9KB 的 JSON 压到几百字节——这就是所有网关默认开启 gzip 的原因。两个注意点：**已压缩格式（jpg/png/mp4/woff2）别再压**，白耗 CPU 还可能变大；**Content-Encoding 与 Transfer-Encoding 是两层**，前者描述"体本身是压缩格式"，后者描述"传输方式"（见下节）。
