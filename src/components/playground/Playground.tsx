@@ -150,7 +150,7 @@ export function Playground({ language, code: initialCode, title, expectedOutput,
           )}
         </div>
         <span className="text-xs text-gray-500 font-mono">
-          {meta.label} · 超时 {language === 'python' ? '5s' : language === 'redis' ? '10s' : language === 'go' ? '15s' : '20s'}
+          {meta.label} · 超时 {language === 'python' ? '5s' : ['redis', 'linux', 'git'].includes(language) ? '10s' : ['go', 'http'].includes(language) ? '15s' : '20s'}
         </span>
       </div>
       <OutputArea status={status} output={output} expectedOutput={expectedOutput} />

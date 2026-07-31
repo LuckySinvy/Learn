@@ -34,7 +34,7 @@ git merge --ff-only origin/main
 echo "--- ensure playground images ---"
 # 注意：内容有变（如 seed.sql）需要 bump 镜像 tag（learn-mysql:2）并同步改
 # src/lib/runner/docker-runner.ts，否则这里不会重建。
-for spec in "learn-ts:1 docker/ts-runner" "learn-redis:1 docker/redis-runner" "learn-mysql:1 docker/mysql-runner"; do
+for spec in "learn-ts:1 docker/ts-runner" "learn-redis:1 docker/redis-runner" "learn-mysql:1 docker/mysql-runner" "learn-shell:1 docker/shell-runner"; do
   IMG=${spec%% *}
   DIR=${spec##* }
   if ! docker image inspect "$IMG" >/dev/null 2>&1; then

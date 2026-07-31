@@ -11,7 +11,16 @@ type Props = {
   onCmdEnter?: () => void;
 };
 
+// Monaco 没有 linux/git/http/redis 这些语言 id，映射到合适的高亮
+const MONACO_LANG: Partial<Record<Language, string>> = {
+  linux: 'shell',
+  git: 'shell',
+  http: 'shell',
+  redis: 'plaintext',
+};
+
 export function EditorPane({ value, onChange, language, onCmdEnter }: Props) {
+  const monacoLang = MONACO_LANG[language] ?? language;
   const handleMount: OnMount = useCallback(
     (editor, monaco: Monaco) => {
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
@@ -24,8 +33,8 @@ export function EditorPane({ value, onChange, language, onCmdEnter }: Props) {
   return (
     <Editor
       height="200px"
-      defaultLanguage={language}
-      language={language}
+      defaultLanguage={monacoLang}
+      language={monacoLang}
       value={value}
       onChange={(v) => onChange(v ?? '')}
       onMount={handleMount}

@@ -6,13 +6,14 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const MAX_CODE_LEN = 50_000;
-const VALID_LANGS: Language[] = ['python', 'go', 'java', 'rust', 'typescript', 'redis', 'mysql'];
+const VALID_LANGS: Language[] = ['python', 'go', 'java', 'rust', 'typescript', 'redis', 'mysql', 'linux', 'git', 'http'];
 
 // 分语言限流：服务器仅 ~1.8GB 可用内存，MariaDB 单实例峰值 ~250MB，
 // 必须单独收紧；Redis 极轻（~10MB）可放宽。另设全局上限兜底。
 const MAX_INFLIGHT_BY_LANG: Record<string, number> = {
   python: 5, go: 4, java: 3, rust: 3, typescript: 3,
   redis: 5, mysql: 2,
+  linux: 5, git: 5, http: 4,
 };
 const MAX_INFLIGHT_TOTAL = 8;
 const inFlight: Record<string, number> = {};

@@ -172,4 +172,30 @@ export const LANG_CONFIG: Record<ExecutableLanguage, Omit<DockerRunConfig, 'cmd'
     cpus: 1.0,
     filename: 'main.sql',
   },
+  // linux / git / http 共用 learn-shell:1（docker/shell-runner）。
+  // /code 只读，脚本在可写的 /work 里执行；--network none 下 loopback 可用。
+  linux: {
+    image: 'learn-shell:1',
+    cmd: 'cd /work && bash /code/main.sh',
+    timeoutMs: 10000,
+    memoryMb: 128,
+    cpus: 0.5,
+    filename: 'main.sh',
+  },
+  git: {
+    image: 'learn-shell:1',
+    cmd: 'cd /work && bash /code/main.sh',
+    timeoutMs: 10000,
+    memoryMb: 128,
+    cpus: 0.5,
+    filename: 'main.sh',
+  },
+  http: {
+    image: 'learn-shell:1',
+    cmd: 'cd /work && bash /code/main.sh',
+    timeoutMs: 15000,
+    memoryMb: 128,
+    cpus: 0.5,
+    filename: 'main.sh',
+  },
 };

@@ -13,13 +13,20 @@ export type Language =
   | 'redis'
   | 'mongodb'
   | 'clickhouse'
-  | 'kafka';
+  | 'kafka'
+  | 'react'
+  | 'linux'
+  | 'git'
+  | 'http';
 
 // 可在 Docker 沙箱中执行的语言。Rust 用 rustc 单文件编译后运行；
 // TypeScript 先 tsc --strict 类型检查再用 node --experimental-transform-types 运行；
 // redis / mysql 走一次性容器：每次执行现起一个 redis-server / mariadbd（预置电商示例库 shop），
 // 跑完即销毁，天然隔离无状态残留。Grafana / Kafka / ClickHouse / MongoDB 等暂不支持在线执行。
-export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust' | 'typescript' | 'redis' | 'mysql';
+// linux / git / http 三门课共用 learn-shell:1 沙箱（alpine + bash + git + curl + python3），
+// 容器内 loopback 可用，HTTP 课能在同一容器里起本地服务再 curl。
+// React 课的 Playground 直接用 language="typescript"（手写 hooks/diff 等核心机制），无独立沙箱。
+export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust' | 'typescript' | 'redis' | 'mysql' | 'linux' | 'git' | 'http';
 
 export type ExecuteRequest = {
   language: Language;
@@ -68,4 +75,8 @@ export const LANG_META: Record<Language, { label: string; color: string; emoji: 
   mongodb: { label: 'MongoDB', color: 'bg-green-500/10 text-green-600 dark:text-green-300', emoji: '🍃' },
   clickhouse: { label: 'ClickHouse', color: 'bg-amber-500/10 text-amber-600 dark:text-amber-300', emoji: '🧮' },
   kafka: { label: 'Kafka', color: 'bg-slate-500/10 text-slate-600 dark:text-slate-300', emoji: '🌊' },
+  react: { label: 'React', color: 'bg-sky-400/10 text-sky-600 dark:text-sky-300', emoji: '⚛️' },
+  linux: { label: 'Linux', color: 'bg-yellow-500/10 text-yellow-700 dark:text-yellow-300', emoji: '🐧' },
+  git: { label: 'Git', color: 'bg-orange-600/10 text-orange-700 dark:text-orange-300', emoji: '🌿' },
+  http: { label: 'HTTP', color: 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-300', emoji: '🌐' },
 };

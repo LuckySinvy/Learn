@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import {
   Code2, Terminal, Coffee, BarChart3, Brain, Link2, Blocks, Boxes, Flame,
-  FileCode2, Database, Zap, Leaf, Gauge, Waves,
+  FileCode2, Database, Zap, Leaf, Gauge, Waves, Atom, Squirrel, GitBranch, Globe,
 } from 'lucide-react';
 import { LanguageCard } from '@/components/layout/LanguageCard';
 import { getChapters } from '@/lib/content';
@@ -18,7 +18,7 @@ export default function HomePage() {
           编程 · 数据 · AI 工程 · 云原生 交互式学习
         </h1>
         <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
-          从零掌握 Python、Go、Java、Rust、TypeScript，以及 MySQL、Redis、MongoDB、ClickHouse、Kafka、Grafana、RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
+          从零掌握 Python、Go、Java、Rust、TypeScript、React，以及 MySQL、Redis、MongoDB、ClickHouse、Kafka、Linux、Git、HTTP、Grafana、RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
         </p>
       </section>
 
@@ -65,6 +65,50 @@ export default function HomePage() {
           icon={<FileCode2 className="w-8 h-8" />}
           accent="from-blue-400 to-indigo-500"
           chapters={count('typescript')}
+        />
+      </Category>
+
+      <Category
+        title="前端"
+        desc="现代前端开发，从组件模型到并发渲染与全栈框架。"
+      >
+        <LanguageCard
+          href="/react"
+          title="React"
+          description="声明式 UI：组件、Hooks 原理、状态管理、性能优化与 Server Components。"
+          icon={<Atom className="w-8 h-8" />}
+          accent="from-sky-400 to-cyan-500"
+          chapters={count('react')}
+        />
+      </Category>
+
+      <Category
+        title="工程基础"
+        desc="全栈工程师的地基：命令行、版本控制与网络协议。"
+      >
+        <LanguageCard
+          href="/linux"
+          title="Linux"
+          description="文件系统、进程、权限、文本三剑客与 Shell 脚本，可在线执行。"
+          icon={<Squirrel className="w-8 h-8" />}
+          accent="from-yellow-400 to-amber-500"
+          chapters={count('linux')}
+        />
+        <LanguageCard
+          href="/git"
+          title="Git"
+          description="提交、分支、rebase、冲突处理与团队工作流，命令可在线执行。"
+          icon={<GitBranch className="w-8 h-8" />}
+          accent="from-orange-400 to-red-500"
+          chapters={count('git')}
+        />
+        <LanguageCard
+          href="/http"
+          title="HTTP"
+          description="TCP 握手、HTTP/2/3、缓存、CORS 与 HTTPS，容器内实测请求响应。"
+          icon={<Globe className="w-8 h-8" />}
+          accent="from-indigo-400 to-violet-500"
+          chapters={count('http')}
         />
       </Category>
 
