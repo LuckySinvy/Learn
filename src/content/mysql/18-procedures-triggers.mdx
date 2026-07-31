@@ -12,8 +12,11 @@ MySQL 允许把逻辑放进数据库：存储过程封装多条 SQL、触发器�
 
 ### 1.1 基本语法
 
-```sql
-DELIMITER //
+<Playground
+  language="mysql"
+  id="mysql-18-1"
+  title="定义并调用存储过程"
+  code={`DELIMITER //
 
 CREATE PROCEDURE get_user_orders(IN p_user_id BIGINT, OUT p_total DECIMAL(12,2))
 BEGIN
@@ -31,8 +34,10 @@ DELIMITER ;
 
 -- 调用
 CALL get_user_orders(1, @total);
-SELECT @total;
-```
+SELECT @total AS paid_total;
+
+SHOW PROCEDURE STATUS WHERE db = 'shop';`}
+/>
 
 要点：
 
@@ -89,8 +94,11 @@ DROP PROCEDURE IF EXISTS get_user_orders;
 
 函数必须返回单值，能嵌进 SQL 表达式里用：
 
-```sql
-DELIMITER //
+<Playground
+  language="mysql"
+  id="mysql-18-2"
+  title="自定义函数"
+  code={`DELIMITER //
 
 CREATE FUNCTION order_status_text(p_status TINYINT)
 RETURNS VARCHAR(10)
@@ -103,8 +111,8 @@ END //
 
 DELIMITER ;
 
-SELECT order_no, order_status_text(status) AS st FROM orders;
-```
+SELECT order_no, order_status_text(status) AS st FROM orders;`}
+/>
 
 与过程的区别：函数有 RETURNS、在表达式中调用、限制更多（不能返回结果集、默认要求声明 DETERMINISTIC 等特性，开了 binlog 时未声明会报 1418 错误）。
 
@@ -114,8 +122,11 @@ SELECT order_no, order_status_text(status) AS st FROM orders;
 
 在表的 INSERT/UPDATE/DELETE 前后自动执行，`NEW` / `OLD` 引用新旧行：
 
-```sql
--- 审计：记录 products 价格变动
+<Playground
+  language="mysql"
+  id="mysql-18-3"
+  title="用触发器做价格审计"
+  code={`-- 审计：记录 products 价格变动
 CREATE TABLE product_price_log (
   id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   product_id BIGINT UNSIGNED NOT NULL,
@@ -138,9 +149,10 @@ END //
 
 DELIMITER ;
 
-UPDATE products SET price = 7599.00 WHERE id = 1;
-SELECT * FROM product_price_log;
-```
+UPDATE products SET price = 4599.00 WHERE id = 1;
+UPDATE products SET stock = stock - 1 WHERE id = 1;   -- 价格没变，不留痕
+SELECT * FROM product_price_log;`}
+/>
 
 时机与事件组合：BEFORE/AFTER × INSERT/UPDATE/DELETE，每张表每种组合各最多一个（8.0 允许同组合多个，按顺序执行）。BEFORE 触发器还能改 `NEW.列` 的值（如自动填充、标准化数据）。
 

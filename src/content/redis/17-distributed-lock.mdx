@@ -10,17 +10,21 @@ description: SET NX EX、锁误删与唯一标识、Lua 原子释放、看门狗
 
 ## 1. 第一版：SET NX EX
 
-```bash
-# 加锁: key 不存在才能设置成功, 同时带过期时间
-127.0.0.1:6379> SET lock:order:8801 "1" NX EX 30
-OK                      # 抢到锁
-# 另一个进程:
-127.0.0.1:6379> SET lock:order:8801 "1" NX EX 30
-(nil)                   # 抢锁失败, 等待重试
-# 业务完成, 释放:
-127.0.0.1:6379> DEL lock:order:8801
-(integer) 1
-```
+<Playground
+  language="redis"
+  title="第一版：SET NX EX 加锁与释放"
+  id="redis-17-1"
+  code={`# 进程 A 加锁: key 不存在才能设置成功, 同时带 30 秒过期
+SET lock:order:8801 "1" NX EX 30
+# 进程 B 来抢同一把锁: 返回 nil, 抢锁失败, 等待重试
+SET lock:order:8801 "1" NX EX 30
+# 锁会自动过期, 持有者崩溃也不会死锁
+TTL lock:order:8801
+# A 业务完成, 释放锁
+DEL lock:order:8801
+# 现在 B 可以抢到了
+SET lock:order:8801 "1" NX EX 30`}
+/>
 
 三个设计点缺一不可：
 
@@ -59,10 +63,21 @@ else
 end
 ```
 
-```bash
-$ redis-cli EVAL "$(cat unlock.lua)" 1 lock:order:8801 a1b2c3-uuid-of-A
-(integer) 1             # 1=释放成功; 0=锁不是你的(已过期易主), 别动
-```
+压成一行运行，对比"拿错 uuid"与"拿对 uuid"两种结果：
+
+<Playground
+  language="redis"
+  title="Lua 原子释放：只删自己的锁"
+  id="redis-17-2"
+  code={`# A 加锁, value 是 A 的唯一标识
+SET lock:order:8801 "uuid-of-A" NX EX 30
+# B 拿着自己的 uuid 来释放: 校验不通过, 返回 0, 锁纹丝不动
+EVAL "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end" 1 lock:order:8801 uuid-of-B
+EXISTS lock:order:8801
+# A 用自己的 uuid 释放: 返回 1, 释放成功
+EVAL "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end" 1 lock:order:8801 uuid-of-A
+EXISTS lock:order:8801`}
+/>
 
 到这里，一个**基本正确**的单机 Redis 锁已经成型：`SET key uuid NX EX ttl` 加锁 + Lua 校验释放。
 
@@ -88,6 +103,20 @@ else
   return 0
 end
 ```
+
+<Playground
+  language="redis"
+  title="看门狗续期：校验身份后 PEXPIRE"
+  id="redis-17-3"
+  code={`SET lock:order:8801 "uuid-of-A" NX EX 30
+TTL lock:order:8801
+# A 的看门狗续期: 校验通过, TTL 重置为 60 秒
+EVAL "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end" 1 lock:order:8801 uuid-of-A 60000
+TTL lock:order:8801
+# 别人的看门狗想续期: 返回 0, 续不了
+EVAL "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end" 1 lock:order:8801 uuid-of-B 60000
+TTL lock:order:8801`}
+/>
 
 Java 的 Redisson 内置了这一整套（默认 TTL 30 秒、每 10 秒续期），还提供可重入、公平锁、读写锁：
 

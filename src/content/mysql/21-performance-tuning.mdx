@@ -62,15 +62,21 @@ ORDER BY SUM_TIMER_WAIT DESC LIMIT 10;
 
 两个再补充的高频改写：
 
-```sql
--- COUNT 优化：不要 SELECT COUNT(*) 全表数（InnoDB 必须真数）
--- 需要精确值且高频 → 计数表/Redis 维护；允许近似 → 用统计信息
-SELECT TABLE_ROWS FROM information_schema.tables
-WHERE table_schema='shop' AND table_name='orders';   -- 近似值，够画仪表盘
+<Playground
+  language="mysql"
+  id="mysql-21-1"
+  title="COUNT 与存在性判断的改写"
+  code={`-- COUNT 优化：不要 SELECT COUNT(*) 全表数（InnoDB 必须真数）
+SELECT COUNT(*) AS exact_rows FROM orders;
 
--- 只判断存在性时，LIMIT 1 短路
-SELECT 1 FROM orders WHERE user_id = 1 LIMIT 1;      -- 好于 COUNT(*) > 0
-```
+-- 需要精确值且高频 → 计数表/Redis 维护；允许近似 → 用统计信息
+SELECT table_rows AS approx_rows FROM information_schema.tables
+WHERE table_schema = 'shop' AND table_name = 'orders';   -- 近似值，够画仪表盘
+
+-- 只判断存在性时，LIMIT 1 短路，好于 COUNT(*) > 0
+SELECT 1 AS has_order FROM orders WHERE user_id = 1 LIMIT 1;
+EXPLAIN SELECT 1 FROM orders WHERE user_id = 1 LIMIT 1;`}
+/>
 
 ## 3. 连接池：应用与数据库之间的闸门
 
@@ -86,11 +92,15 @@ SELECT 1 FROM orders WHERE user_id = 1 LIMIT 1;      -- 好于 COUNT(*) > 0
 - `maximumPoolSize`：不是越大越好！数据库同时真正干活的连接数上限约为 CPU 核数的 2–4 倍，池子给到几十就够，几百只会加剧上下文切换和锁竞争；
 - `maxLifetime` 要**小于** MySQL 的 `wait_timeout`（默认 8 小时），否则池里躺着已被服务端断开的死连接，业务偶发「Communications link failure」。
 
-```sql
-SHOW VARIABLES LIKE 'max_connections';
-SHOW STATUS LIKE 'Threads_connected';   -- 当前连接数
+<Playground
+  language="mysql"
+  id="mysql-21-2"
+  title="连接数观测"
+  code={`SHOW VARIABLES LIKE 'max_connections';
+SHOW STATUS LIKE 'Threads_connected';       -- 当前连接数
 SHOW STATUS LIKE 'Max_used_connections';
-```
+SHOW VARIABLES LIKE 'wait_timeout';`}
+/>
 
 ## 4. 关键服务器参数
 
@@ -106,11 +116,16 @@ innodb_buffer_pool_instances = 8       # 大池分片降低并发争用
 
 衡量效果看命中率与磁盘读：
 
-```sql
-SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+<Playground
+  language="mysql"
+  id="mysql-21-3"
+  title="Buffer Pool 命中率"
+  code={`SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+
 -- Innodb_buffer_pool_read_requests：逻辑读（内存）
 -- Innodb_buffer_pool_reads：真去磁盘读的次数，占比应低于 1%
-```
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';`}
+/>
 
 ### 4.2 redo log 容量
 
@@ -154,20 +169,40 @@ table_open_cache = 4000
 
 ### 5.2 分区表：库内的第一步
 
-```sql
--- 按月 RANGE 分区：查询带时间条件可裁剪分区，删旧数据秒级 DROP PARTITION
+<Playground
+  language="mysql"
+  id="mysql-21-4"
+  title="RANGE 分区与分区裁剪"
+  code={`-- 按月 RANGE 分区：查询带时间条件可裁剪分区，删旧数据秒级 DROP PARTITION
 CREATE TABLE orders_log (
   id BIGINT UNSIGNED NOT NULL,
   created_at DATETIME NOT NULL,
-  data JSON,
+  amount DECIMAL(12,2) NOT NULL DEFAULT 0,
   PRIMARY KEY (id, created_at)
 )
 PARTITION BY RANGE COLUMNS (created_at) (
-  PARTITION p202606 VALUES LESS THAN ('2026-07-01'),
-  PARTITION p202607 VALUES LESS THAN ('2026-08-01'),
+  PARTITION p202601 VALUES LESS THAN ('2026-02-01'),
+  PARTITION p202602 VALUES LESS THAN ('2026-03-01'),
   PARTITION pmax    VALUES LESS THAN (MAXVALUE)
 );
-```
+
+INSERT INTO orders_log (id, created_at, amount)
+SELECT id, created_at, total_amount FROM orders;
+
+ANALYZE TABLE orders_log;
+
+-- 每个分区各落了多少行
+SELECT partition_name, table_rows
+FROM information_schema.partitions
+WHERE table_schema = 'shop' AND table_name = 'orders_log';
+
+-- 带时间条件只扫一个分区（看 partitions 列）
+EXPLAIN PARTITIONS SELECT * FROM orders_log
+WHERE created_at >= '2026-01-01' AND created_at < '2026-02-01';
+
+-- 删旧数据：秒级，不产生大事务
+ALTER TABLE orders_log DROP PARTITION p202601;`}
+/>
 
 分区适合时间序数据的滚动清理；它不解决写吞吐（还在一个实例上）。
 

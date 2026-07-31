@@ -79,7 +79,19 @@ ALTER TABLE products
   ADD CONSTRAINT chk_stock CHECK (stock >= 0);
 ```
 
-5.7 会解析 CHECK 但**默默忽略**，8.0.16 起才真正执行。违反时报错 `Check constraint 'chk_price' is violated`。
+5.7 会解析 CHECK 但**默默忽略**，8.0.16 起才真正执行。违反时报错 `Check constraint 'chk_price' is violated`。亲手触发一次约束报错：
+
+<Playground
+  language="mysql"
+  id="mysql-04-1"
+  title="CHECK 约束：合法更新通过，非法更新报错"
+  code={`ALTER TABLE products
+  ADD CONSTRAINT chk_price CHECK (price >= 0),
+  ADD CONSTRAINT chk_stock CHECK (stock >= 0);
+UPDATE products SET price = 8888.00 WHERE id = 1;
+SELECT id, name, price FROM products WHERE id = 1;
+UPDATE products SET price = -1 WHERE id = 1;`}
+/>
 
 ## 3. 电商示例库完整 DDL
 
@@ -145,19 +157,36 @@ CREATE TABLE order_items (
 
 注意 `order_items.price` 存的是**下单时的价格快照**——商品价格会变，历史订单金额不能跟着变，这是电商建模的经典细节。
 
+在线沙箱里这五张表（连同示例数据）已经预置好了，直接查看结构验证：
+
+<Playground
+  language="mysql"
+  id="mysql-04-2"
+  title="查看示例库的表结构与索引"
+  code={`SHOW TABLES;
+DESCRIBE orders;
+SHOW INDEX FROM orders;`}
+/>
+
 ## 4. ALTER TABLE 与在线 DDL
 
 ### 4.1 常用改表操作
 
-```sql
-ALTER TABLE users ADD COLUMN nickname VARCHAR(50) NOT NULL DEFAULT '' AFTER username;
+沙箱每次运行都是全新环境，放心执行各种改表操作：
+
+<Playground
+  language="mysql"
+  id="mysql-04-3"
+  title="ALTER TABLE 常用操作"
+  code={`ALTER TABLE users ADD COLUMN nickname VARCHAR(50) NOT NULL DEFAULT '' AFTER username;
 ALTER TABLE users MODIFY COLUMN phone VARCHAR(30) NOT NULL DEFAULT '';
-ALTER TABLE users RENAME COLUMN nickname TO nick;   -- 8.0 语法
+DESCRIBE users;
+ALTER TABLE users RENAME COLUMN nickname TO nick;
 ALTER TABLE users DROP COLUMN nick;
 ALTER TABLE users ADD INDEX idx_status (status);
-ALTER TABLE users DROP INDEX idx_status;
-RENAME TABLE users TO members;                       -- 改表名（原子）
-```
+SHOW INDEX FROM users;
+ALTER TABLE users DROP INDEX idx_status;`}
+/>
 
 ### 4.2 在线 DDL：ALGORITHM 与 LOCK
 

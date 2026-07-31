@@ -26,6 +26,19 @@ INSERT INTO users (username, email, phone) VALUES
 
 批量快的原因：只需一次网络往返、一次 SQL 解析、一次事务提交（一次 redo/binlog 刷盘）。程序里攒 500–1000 行一批是常见实践；单条 SQL 别超过 `max_allowed_packet`（默认 64MB）。
 
+沙箱的 shop 库已预置了 alice 等 5 个用户，下面批量再插入 3 个新用户并验证：
+
+<Playground
+  language="mysql"
+  id="mysql-05-1"
+  title="批量 INSERT 并验证"
+  code={`INSERT INTO users (username, email, phone) VALUES
+  ('frank', 'frank@demo.com', '13900000006'),
+  ('grace', 'grace@demo.com', '13900000007'),
+  ('heidi', 'heidi@demo.com', '13900000008');
+SELECT id, username, email, phone FROM users;`}
+/>
+
 ### 1.2 INSERT ... SELECT：从查询结果插入
 
 ```sql
@@ -93,6 +106,23 @@ ON DUPLICATE KEY UPDATE phone = new.phone;
 
 这是最常用的 Upsert 姿势。注意：affected rows 为 1 表示插入、2 表示更新、0 表示更新了但值没变。
 
+下面完整演练一次：先插入一个新用户，再对同一 email 分别执行 INSERT IGNORE 和 Upsert，观察结果差异（email 上有唯一索引 uk_email）：
+
+<Playground
+  language="mysql"
+  id="mysql-05-2"
+  title="唯一键冲突：IGNORE 与 ON DUPLICATE KEY UPDATE"
+  code={`INSERT INTO users (username, email, phone)
+VALUES ('frank', 'frank@demo.com', '13900000006');
+INSERT IGNORE INTO users (username, email, phone)
+VALUES ('frank2', 'frank@demo.com', '13911111111');
+SELECT id, username, email, phone FROM users WHERE email = 'frank@demo.com';
+INSERT INTO users (username, email, phone)
+VALUES ('frank', 'frank@demo.com', '13922222222')
+ON DUPLICATE KEY UPDATE phone = VALUES(phone);
+SELECT id, username, email, phone FROM users WHERE email = 'frank@demo.com';`}
+/>
+
 ### 2.3 REPLACE INTO：冲突就先删再插
 
 ```sql
@@ -121,7 +151,20 @@ UPDATE products SET stock = stock - 1
 WHERE id = 1 AND stock >= 1;
 ```
 
-第二条是防超卖的经典写法：`stock >= 1` 放进 WHERE，让「检查 + 扣减」在一条语句里原子完成，靠 affected rows 判断是否扣成功——比「先 SELECT 再 UPDATE」在并发下可靠得多。
+第二条是防超卖的经典写法：`stock >= 1` 放进 WHERE，让「检查 + 扣减」在一条语句里原子完成，靠 affected rows 判断是否扣成功——比「先 SELECT 再 UPDATE」在并发下可靠得多。跑一遍看 affected rows 的变化：
+
+<Playground
+  language="mysql"
+  id="mysql-05-3"
+  title="原子扣库存：靠 WHERE 条件防超卖"
+  code={`UPDATE products SET stock = 1 WHERE id = 1;
+UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock >= 1;
+SELECT id, name, stock FROM products WHERE id = 1;
+UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock >= 1;
+SELECT id, name, stock FROM products WHERE id = 1;`}
+/>
+
+第二次扣减 affected rows 为 0、库存停在 0 而不是变成负数——这就是把检查写进 WHERE 的价值。
 
 多表联合更新：
 
@@ -176,15 +219,21 @@ InnoDB 删除只是把行标记为可复用，表空间文件（.ibd）不会收
 
 默认 `autocommit = 1`，每条 DML 自动提交。多条写操作要「同生共死」（下单 = 插订单 + 插明细 + 扣库存）时必须显式事务：
 
-```sql
-BEGIN;
+<Playground
+  language="mysql"
+  id="mysql-05-4"
+  title="显式事务：下单三件套"
+  code={`BEGIN;
 INSERT INTO orders (order_no, user_id, status, total_amount)
-  VALUES ('SO20260730005', 2, 0, 128.00);
+  VALUES ('DEMO20260730005', 2, 0, 128.00);
 INSERT INTO order_items (order_id, product_id, quantity, price)
   VALUES (LAST_INSERT_ID(), 5, 1, 128.00);
 UPDATE products SET stock = stock - 1 WHERE id = 5 AND stock >= 1;
 COMMIT;
-```
+SELECT id, order_no, user_id, total_amount FROM orders
+WHERE order_no = 'DEMO20260730005';
+SELECT * FROM order_items ORDER BY id DESC LIMIT 1;`}
+/>
 
 `LAST_INSERT_ID()` 返回当前会话最近一次自增插入的 ID，会话隔离、并发安全。事务的完整机制在第 15 章。
 

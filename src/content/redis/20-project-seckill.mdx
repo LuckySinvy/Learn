@@ -74,17 +74,29 @@ return 1
 
 ### 1.4 验证
 
-```bash
-$ redis-cli SCRIPT LOAD "$(cat seckill.lua)"
-"9f2b1c8e7d3a5f4b6c8d9e0f1a2b3c4d5e6f7a8b"
+把脚本压成一行 SCRIPT LOAD 进服务端，再用返回的 SHA1 反复 EVALSHA。库存只放 2 件，看它怎么拦住第 3 个人和重复下单的人：
 
-127.0.0.1:6379> EVALSHA 9f2b...a8b 2 seckill:stock:{2001} seckill:users:{2001} u1001
-(integer) 1             # u1001 抢到了
-127.0.0.1:6379> EVALSHA 9f2b...a8b 2 seckill:stock:{2001} seckill:users:{2001} u1001
-(integer) -1            # 重复购买, 拒绝
-127.0.0.1:6379> GET seckill:stock:{2001}
-"99"
-```
+<Playground
+  language="redis"
+  title="秒杀脚本实战：库存 2 件，4 次请求"
+  id="redis-20-1"
+  code={`# 活动预热: 库存 2 件, 已购用户集合清空
+SET seckill:stock:{2001} 2
+DEL seckill:users:{2001}
+# 加载脚本, 返回的 SHA1 就是下面 EVALSHA 用的那一串
+SCRIPT LOAD "if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return -1 end local stock = tonumber(redis.call('GET', KEYS[1]) or '0') if stock <= 0 then return 0 end redis.call('DECR', KEYS[1]) redis.call('SADD', KEYS[2], ARGV[1]) return 1"
+# u1001 抢到了
+EVALSHA c7cb59cd46d7ca92dd3421ea805f0f5f3a161b54 2 seckill:stock:{2001} seckill:users:{2001} u1001
+# u1001 再来一次: -1 重复购买, 拒绝
+EVALSHA c7cb59cd46d7ca92dd3421ea805f0f5f3a161b54 2 seckill:stock:{2001} seckill:users:{2001} u1001
+# u1002 抢到最后一件
+EVALSHA c7cb59cd46d7ca92dd3421ea805f0f5f3a161b54 2 seckill:stock:{2001} seckill:users:{2001} u1002
+# u1003 来晚了: 0 库存不足
+EVALSHA c7cb59cd46d7ca92dd3421ea805f0f5f3a161b54 2 seckill:stock:{2001} seckill:users:{2001} u1003
+# 最终: 库存精确归零, 成功用户恰好 2 人
+GET seckill:stock:{2001}
+SMEMBERS seckill:users:{2001}`}
+/>
 
 ### 1.5 服务端调用伪代码
 
@@ -113,23 +125,24 @@ def seckill(user_id, sku_id):
 
 秒杀成功后顺手更新商品销量榜与用户战绩榜（第 7 章 ZSet 的直接应用）：
 
-```bash
-# 订单落库成功后 (消费者侧执行, 保证只统计有效订单)
-127.0.0.1:6379> ZINCRBY rank:sales:20260730 1 sku:2001
-"101"
-# 实时 Top 10 商品
-127.0.0.1:6379> ZRANGE rank:sales:20260730 0 9 REV WITHSCORES
- 1) "sku:2001"
- 2) "101"
- 3) "sku:2002"
- 4) "87"
- ...
-# 某商品排名与销量 (排名从 0 起, 展示时 +1)
-127.0.0.1:6379> ZREVRANK rank:sales:20260730 sku:2001
-(integer) 0
-127.0.0.1:6379> ZSCORE rank:sales:20260730 sku:2001
-"101"
-```
+<Playground
+  language="redis"
+  title="ZSet 销量排行榜"
+  id="redis-20-2"
+  code={`# 订单落库成功后累加销量（消费者侧执行, 保证只统计有效订单）
+ZINCRBY rank:sales:20260730 3 sku:2001
+ZINCRBY rank:sales:20260730 5 sku:2002
+ZINCRBY rank:sales:20260730 1 sku:2003
+ZINCRBY rank:sales:20260730 4 sku:2001
+# 实时 Top 10: REV = 按分数从高到低
+ZRANGE rank:sales:20260730 0 9 REV WITHSCORES
+# 某商品的排名与销量（排名从 0 起, 展示时 +1）
+ZREVRANK rank:sales:20260730 sku:2001
+ZSCORE rank:sales:20260730 sku:2001
+# 日榜设 7 天过期, 历史数据归档到数据库
+EXPIRE rank:sales:20260730 604800
+TTL rank:sales:20260730`}
+/>
 
 工程细节：
 
@@ -199,20 +212,24 @@ return 1
 
 ### 3.2 验证与调用
 
-```bash
-$ redis-cli SCRIPT LOAD "$(cat ratelimit.lua)"
-"c4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
+时间戳由调用方传入，所以可以"伪造时间"把窗口滑动过程演出来：前三次放行、第四次被拒，再把时间往后拨 70 秒（超出 60 秒窗口），旧记录被清掉，重新放行。
 
-# 阈值设 3, 连续调用 4 次:
-127.0.0.1:6379> EVALSHA c4e5...d2e3 1 rate:{u1001}:seckill 60000 3 1722310000001 req-a
-(integer) 1
-127.0.0.1:6379> EVALSHA c4e5...d2e3 1 rate:{u1001}:seckill 60000 3 1722310000450 req-b
-(integer) 1
-127.0.0.1:6379> EVALSHA c4e5...d2e3 1 rate:{u1001}:seckill 60000 3 1722310000900 req-c
-(integer) 1
-127.0.0.1:6379> EVALSHA c4e5...d2e3 1 rate:{u1001}:seckill 60000 3 1722310001200 req-d
-(integer) 0             # 第 4 次, 窗口内已有 3 个, 拒绝
-```
+<Playground
+  language="redis"
+  title="滑动窗口限流：窗口 60 秒，阈值 3"
+  id="redis-20-3"
+  code={`SCRIPT LOAD "local window = tonumber(ARGV[1]) local limit = tonumber(ARGV[2]) local now = tonumber(ARGV[3]) redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window) local count = redis.call('ZCARD', KEYS[1]) if count >= limit then return 0 end redis.call('ZADD', KEYS[1], now, ARGV[4]) redis.call('PEXPIRE', KEYS[1], window + 1000) return 1"
+# 参数依次是: 窗口 60000 毫秒、阈值 3、当前毫秒时间戳、本次请求唯一 ID
+EVALSHA b2a99f31b8bb8e81ce293c18e2ec04bc285370c3 1 rate:{u1001}:seckill 60000 3 1722310000001 req-a
+EVALSHA b2a99f31b8bb8e81ce293c18e2ec04bc285370c3 1 rate:{u1001}:seckill 60000 3 1722310000450 req-b
+EVALSHA b2a99f31b8bb8e81ce293c18e2ec04bc285370c3 1 rate:{u1001}:seckill 60000 3 1722310000900 req-c
+# 第 4 次: 窗口内已有 3 个, 返回 0 被限流
+EVALSHA b2a99f31b8bb8e81ce293c18e2ec04bc285370c3 1 rate:{u1001}:seckill 60000 3 1722310001200 req-d
+ZCARD rate:{u1001}:seckill
+# 时间拨到 70 秒后: 前面 3 条已滑出窗口, 被清掉, 重新放行
+EVALSHA b2a99f31b8bb8e81ce293c18e2ec04bc285370c3 1 rate:{u1001}:seckill 60000 3 1722310070000 req-e
+ZRANGE rate:{u1001}:seckill 0 -1 WITHSCORES`}
+/>
 
 ```python
 def allow(user_id, api, window_ms=60000, limit=100):

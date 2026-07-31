@@ -75,13 +75,22 @@ MySQL 5.5 之后 InnoDB 是默认引擎。两者对比：
 
 结论很简单：**新表一律用 InnoDB**。MyISAM 唯一的「优势」（无条件 COUNT 快、占用略小）在现代业务里完全不值得用崩溃安全和事务去换。
 
-```sql
+<Playground
+  language="mysql"
+  id="mysql-01-1"
+  title="查看版本与存储引擎"
+  code={`SELECT VERSION();
+
 -- 查看当前支持的引擎
 SHOW ENGINES;
 
--- 查看某张表用的引擎
-SHOW TABLE STATUS LIKE 'users'\G
-```
+-- 查看各张表用的引擎
+SELECT table_name, engine, table_rows
+FROM information_schema.tables
+WHERE table_schema = 'shop';`}
+/>
+
+在 mysql 客户端里还可以用 `SHOW TABLE STATUS LIKE 'users'\G` 竖排查看单表的引擎与统计信息。
 
 <Callout type="info" title="为什么 InnoDB 的 COUNT(*) 慢？">
 InnoDB 支持 MVCC（多版本并发控制），不同事务在同一时刻看到的行数可能不同，所以没法维护一个全局计数器，只能真的去数。第 17 章讲 MVCC 时你会彻底理解这一点。
@@ -140,6 +149,25 @@ order_items  订单明细（订单与商品的多对多桥表）
 ```
 
 关系：一个用户有多个订单，一个订单包含多条明细，每条明细指向一个商品，每个商品属于一个分类。这套结构覆盖了一对多、多对多、自关联等所有常见建模场景，后面讲 JOIN、索引、事务、优化时全部基于它。
+
+本课程的 Playground 已经预置了这套 shop 库，先认识一下：
+
+<Playground
+  language="mysql"
+  id="mysql-01-2"
+  title="认识电商示例库"
+  code={`SHOW TABLES;
+
+DESC users;
+
+SELECT * FROM users;
+SELECT id, category_id, name, price, stock, status FROM products;
+SELECT id, order_no, user_id, status, total_amount, created_at FROM orders;`}
+/>
+
+<Callout type="info" title="Playground 说明">
+在线执行环境用的是 MySQL 兼容的 MariaDB 11，默认库就是 shop，每次运行都是一个全新的一次性容器——写操作（INSERT/UPDATE/DELETE 甚至 DROP）不会影响下一次运行，放心大胆地试。
+</Callout>
 
 ## 小结
 

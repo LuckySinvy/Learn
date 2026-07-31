@@ -107,22 +107,21 @@ io-threads-do-reads yes   # 读请求也用多线程（默认只有写回用）
 
 ## 5. 快速体验
 
-安装后（下一章详述）用 redis-cli 感受一下：
+安装后（下一章详述）用 redis-cli 感受一下。下面的代码块可以直接点「运行」——每次运行都会启动一个全新的空 Redis 实例执行你的命令：
 
-```bash
-127.0.0.1:6379> PING
-PONG
-127.0.0.1:6379> SET greeting "hello redis"
-OK
-127.0.0.1:6379> GET greeting
-"hello redis"
-127.0.0.1:6379> INCR page:view
-(integer) 1
-127.0.0.1:6379> INCR page:view
-(integer) 2
-127.0.0.1:6379> TYPE greeting
-string
-```
+<Playground
+  language="redis"
+  title="第一次和 Redis 对话"
+  id="redis-01-1"
+  code={`PING
+SET greeting "hello redis"
+GET greeting
+INCR page:view
+INCR page:view
+TYPE greeting`}
+/>
+
+`PING` 返回 PONG 说明连接正常；`INCR` 对不存在的 key 会先当作 0 再加一，所以两次调用依次返回 1 和 2。
 
 用 `redis-benchmark` 直观感受性能（本机测试）：
 

@@ -28,23 +28,21 @@ key: user:1001
 
 ### 2.1 写入与读取
 
-```bash
-127.0.0.1:6379> HSET user:1001 name "Ada" age 30 city "Shanghai"
-(integer) 3             # 新建的 field 数量
-127.0.0.1:6379> HGET user:1001 name
-"Ada"
-127.0.0.1:6379> HMGET user:1001 name age nonexist
-1) "Ada"
-2) "30"
-3) (nil)
-127.0.0.1:6379> HGETALL user:1001
-1) "name"
-2) "Ada"
-3) "age"
-4) "30"
-5) "city"
-6) "Shanghai"
-```
+<Playground
+  language="redis"
+  title="Hash 写入与读取"
+  id="redis-04-1"
+  code={`# 返回值是新建的 field 数量
+HSET user:1001 name "Ada" age 30 city "Shanghai"
+HGET user:1001 name
+HMGET user:1001 name age nonexist
+HGETALL user:1001
+HEXISTS user:1001 age
+HDEL user:1001 city
+HLEN user:1001
+HKEYS user:1001
+HVALS user:1001`}
+/>
 
 Redis 4 之后 `HSET` 支持一次写多个 field，`HMSET` 已废弃。
 
@@ -67,14 +65,18 @@ Redis 4 之后 `HSET` 支持一次写多个 field，`HMSET` 已废弃。
 
 ### 2.3 字段级自增
 
-```bash
-127.0.0.1:6379> HINCRBY user:1001 balance 100
-(integer) 100
-127.0.0.1:6379> HINCRBY user:1001 balance -30
-(integer) 70
-127.0.0.1:6379> HINCRBYFLOAT user:1001 score 0.5
-"0.5"
-```
+<Playground
+  language="redis"
+  title="字段级自增"
+  id="redis-04-2"
+  code={`HSET user:1001 name "Ada" age 30
+HINCRBY user:1001 balance 100
+HINCRBY user:1001 balance -30
+HINCRBYFLOAT user:1001 score 0.5
+# field 已存在时 HSETNX 不覆盖，返回 0
+HSETNX user:1001 name "Bob"
+HGETALL user:1001`}
+/>
 
 一个 key 管理一组相关计数器（如商品的浏览数/收藏数/销量），比一堆独立 String key 更好维护。
 
@@ -109,10 +111,19 @@ Redis 4 之后 `HSET` 支持一次写多个 field，`HMSET` 已废弃。
 
 ## 3. 底层编码：listpack 与 hashtable
 
-```bash
-127.0.0.1:6379> OBJECT ENCODING user:1001
-"listpack"
-```
+<Playground
+  language="redis"
+  title="listpack 转 hashtable 是单向的"
+  id="redis-04-3"
+  code={`HSET user:1001 name "Ada" age 30
+OBJECT ENCODING user:1001
+# 写入一个超过 64 字节的 value，触发编码升级
+HSET user:1001 bio "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+OBJECT ENCODING user:1001
+# 删掉长字段也不会降回 listpack
+HDEL user:1001 bio
+OBJECT ENCODING user:1001`}
+/>
 
 | 编码 | 条件 | 结构与代价 |
 |---|---|---|
@@ -155,18 +166,20 @@ Redis 7 用 listpack 全面替换了旧的 ziplist：两者思路一致（连续
 
 经验法则：**字段会被单独读写、或需要字段级原子自增，用 Hash；对象整存整取、含嵌套结构，用 String + JSON**。
 
-```bash
-# 购物车是 Hash 的经典场景: field=商品ID, value=数量
-127.0.0.1:6379> HSET cart:u1001 sku:2001 1 sku:2002 3
-(integer) 2
-127.0.0.1:6379> HINCRBY cart:u1001 sku:2001 1     # 商品数量 +1
-(integer) 2
-127.0.0.1:6379> HDEL cart:u1001 sku:2002          # 移除商品
-(integer) 1
-127.0.0.1:6379> HGETALL cart:u1001                # 结算时取整车
-1) "sku:2001"
-2) "2"
-```
+<Playground
+  language="redis"
+  title="用 Hash 实现购物车"
+  id="redis-04-4"
+  code={`# field = 商品 ID，value = 数量
+HSET cart:u1001 sku:2001 1 sku:2002 3
+# 商品数量 +1
+HINCRBY cart:u1001 sku:2001 1
+# 移除商品
+HDEL cart:u1001 sku:2002
+# 结算时取整车
+HGETALL cart:u1001
+HLEN cart:u1001`}
+/>
 
 ## 5. 大 key 风险
 

@@ -19,23 +19,18 @@ description: 聚合函数、GROUP BY、HAVING、ONLY_FULL_GROUP_BY 规则与 ROL
 | MAX / MIN | 最大/最小 | 跳过 NULL |
 | GROUP_CONCAT(col) | 组内拼接字符串 | 跳过 NULL |
 
-```sql
-SELECT COUNT(*)            AS order_count,
+<Playground
+  language="mysql"
+  id="mysql-08-1"
+  title="常用聚合函数"
+  code={`SELECT COUNT(*)            AS order_count,
        SUM(total_amount)   AS gmv,
        AVG(total_amount)   AS avg_amount,
        MAX(total_amount)   AS max_amount,
        MIN(created_at)     AS first_order_time
 FROM orders
-WHERE status IN (1, 2, 3);
-```
-
-```text
-+-------------+----------+-------------+------------+---------------------+
-| order_count | gmv      | avg_amount  | max_amount | first_order_time    |
-+-------------+----------+-------------+------------+---------------------+
-|           2 | 12126.00 | 6063.000000 |    8127.00 | 2026-07-01 10:00:00 |
-+-------------+----------+-------------+------------+---------------------+
-```
+WHERE status IN (1, 2, 3);`}
+/>
 
 两个易错点：
 
@@ -46,44 +41,30 @@ WHERE status IN (1, 2, 3);
 
 GROUP BY 的运行模型：**按分组列把行分堆，每堆坍缩成一行输出**，聚合函数在每堆内部计算。
 
-```sql
--- 每个用户的订单数与消费总额
+<Playground
+  language="mysql"
+  id="mysql-08-2"
+  title="GROUP BY：单列、多列与表达式分组"
+  code={`-- 每个用户的订单数与消费总额
 SELECT user_id,
        COUNT(*)          AS order_count,
        SUM(total_amount) AS total_spent
 FROM orders
 GROUP BY user_id;
-```
 
-```text
-+---------+-------------+-------------+
-| user_id | order_count | total_spent |
-+---------+-------------+-------------+
-|       1 |           2 |     8304.00 |
-|       2 |           1 |     3999.00 |
-|       3 |           1 |     8999.00 |
-+---------+-------------+-------------+
-```
-
-多列分组按「列组合」分堆：
-
-```sql
--- 每个用户在每种状态下的订单数
+-- 多列分组按「列组合」分堆
 SELECT user_id, status, COUNT(*) AS cnt
 FROM orders
 GROUP BY user_id, status;
-```
 
-按表达式分组（日报表的标准写法）：
-
-```sql
+-- 按表达式分组（日报表的标准写法）
 SELECT DATE(created_at)  AS order_date,
        COUNT(*)          AS order_count,
        SUM(total_amount) AS daily_gmv
 FROM orders
 GROUP BY DATE(created_at)
-ORDER BY order_date;
-```
+ORDER BY order_date;`}
+/>
 
 ## 3. ONLY_FULL_GROUP_BY：8.0 的严格模式
 
@@ -122,23 +103,18 @@ SELECT user_id, ANY_VALUE(order_no), COUNT(*) FROM orders GROUP BY user_id;
 
 WHERE 在**分组前**过滤行，HAVING 在**分组后**过滤组：
 
-```sql
--- 消费总额超过 5000 的用户（只统计已支付以上状态）
+<Playground
+  language="mysql"
+  id="mysql-08-3"
+  title="WHERE 分组前过滤，HAVING 分组后过滤"
+  code={`-- 消费总额超过 5000 的用户（只统计已支付以上状态）
 SELECT user_id, SUM(total_amount) AS total_spent
 FROM orders
 WHERE status IN (1, 2, 3)          -- 分组前：过滤行
 GROUP BY user_id
 HAVING SUM(total_amount) > 5000    -- 分组后：过滤组
-ORDER BY total_spent DESC;
-```
-
-```text
-+---------+-------------+
-| user_id | total_spent |
-+---------+-------------+
-|       1 |     8304.00 |
-+---------+-------------+
-```
+ORDER BY total_spent DESC;`}
+/>
 
 原则：**能写进 WHERE 的条件绝不放 HAVING**。WHERE 先减少参与分组的行数，还能利用索引；HAVING 是对分组结果的兜底过滤，只放必须依赖聚合值的条件。
 
@@ -154,15 +130,20 @@ FROM → WHERE → GROUP BY → 聚合 → HAVING → SELECT → ORDER BY → LI
 
 CASE 塞进聚合函数，是报表 SQL 的核心技巧：
 
-```sql
-SELECT DATE(created_at) AS d,
-       COUNT(*)                                            AS total_orders,
-       SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END)          AS cancelled,
-       SUM(CASE WHEN status IN (1,2,3) THEN total_amount ELSE 0 END) AS paid_gmv,
-       SUM(status = 4) / COUNT(*)                           AS cancel_rate
+<Playground
+  language="mysql"
+  id="mysql-08-4"
+  title="条件聚合：一条 SQL 出多指标"
+  code={`SELECT DATE(created_at) AS d,
+       COUNT(*)                                    AS total_orders,
+       SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END) AS cancelled,
+       SUM(CASE WHEN status IN (1,2,3)
+                THEN total_amount ELSE 0 END)      AS paid_gmv,
+       SUM(status = 4) / COUNT(*)                  AS cancel_rate
 FROM orders
-GROUP BY DATE(created_at);
-```
+GROUP BY DATE(created_at)
+ORDER BY d;`}
+/>
 
 `SUM(status = 4)` 是 MySQL 特有的简写：布尔表达式结果是 0/1，SUM 就是满足条件的行数（等价于 `COUNT(IF(status=4, 1, NULL))`）。一条 SQL 同时算出总单量、取消量、支付 GMV、取消率——不需要跑四次查询。
 

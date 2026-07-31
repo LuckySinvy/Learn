@@ -26,71 +26,67 @@ score      member
 
 ### 2.1 写入与更新
 
-```bash
-127.0.0.1:6379> ZADD rank:game 80 "dave" 98 "ada" 95.5 "bob"
-(integer) 3
-127.0.0.1:6379> ZADD rank:game 99 "ada"
-(integer) 0             # 成员已存在: 更新分数，返回新增数 0
-127.0.0.1:6379> ZADD rank:game NX 50 "ada"
-(integer) 0             # NX: 只新增不更新，ada 分数保持 99
-127.0.0.1:6379> ZADD rank:game GT 97 "ada"
-(integer) 0             # GT: 新分数更大才更新; 97 < 99, 不更新
-127.0.0.1:6379> ZINCRBY rank:game 10 "dave"
-"90"                    # 原子加分，返回新分数
-127.0.0.1:6379> ZSCORE rank:game "ada"
-"99"
-127.0.0.1:6379> ZCARD rank:game
-(integer) 3
-```
+<Playground
+  language="redis"
+  title="ZADD 的条件参数"
+  id="redis-07-1"
+  code={`ZADD rank:game 80 "dave" 98 "ada" 95.5 "bob"
+# 成员已存在：更新分数，返回新增数 0
+ZADD rank:game 99 "ada"
+# NX：只新增不更新，ada 分数保持 99
+ZADD rank:game NX 50 "ada"
+ZSCORE rank:game "ada"
+# GT：新分数更大才更新；97 小于 99，不更新
+ZADD rank:game GT 97 "ada"
+ZSCORE rank:game "ada"
+# 原子加分，返回新分数
+ZINCRBY rank:game 10 "dave"
+ZCARD rank:game`}
+/>
 
 ZADD 的条件参数：`NX` 只增不改、`XX` 只改不增、`GT`/`LT` 只在新分数更大/更小时更新（做"历史最高分"极方便）。
 
 ### 2.2 按排名取段：ZRANGE
 
-```bash
-127.0.0.1:6379> ZRANGE rank:game 0 -1 WITHSCORES
-1) "dave"
-2) "90"
-3) "bob"
-4) "95.5"
-5) "ada"
-6) "99"                 # 默认升序
-127.0.0.1:6379> ZRANGE rank:game 0 2 REV WITHSCORES
-1) "ada"
-2) "99"
-3) "bob"
-4) "95.5"
-5) "dave"
-6) "90"                 # REV 降序 = Top 3（6.2+ 语法，替代 ZREVRANGE）
-```
+<Playground
+  language="redis"
+  title="按排名与按分数取段"
+  id="redis-07-2"
+  code={`ZADD rank:game 90 "dave" 99 "ada" 95.5 "bob"
+# 默认升序
+ZRANGE rank:game 0 -1 WITHSCORES
+# REV 降序 = Top 3（6.2+ 语法，替代 ZREVRANGE）
+ZRANGE rank:game 0 2 REV WITHSCORES
+# 闭区间 [90, 96]
+ZRANGEBYSCORE rank:game 90 96
+# 左开括号排除 90；+inf / -inf 表示无穷
+ZRANGEBYSCORE rank:game (90 +inf
+# 分数区间内的成员数
+ZCOUNT rank:game 90 100`}
+/>
 
-### 2.3 按分数取段
+按分数取段用 `ZRANGEBYSCORE`：区间默认闭合，`(` 前缀表示开区间，`+inf`/`-inf` 表示无穷；只要数量时用 `ZCOUNT`。
 
-```bash
-127.0.0.1:6379> ZRANGEBYSCORE rank:game 90 96
-1) "dave"
-2) "bob"                # 闭区间 [90, 96]
-127.0.0.1:6379> ZRANGEBYSCORE rank:game (90 +inf
-1) "bob"
-2) "ada"                # 左开括号 = 排除 90; +inf/-inf 表示无穷
-127.0.0.1:6379> ZCOUNT rank:game 90 100
-(integer) 3             # 分数区间内的成员数
-```
+### 2.3 查排名与删除
 
-### 2.4 查排名与删除
-
-```bash
-127.0.0.1:6379> ZRANK rank:game "ada"
-(integer) 2             # 升序排名，从 0 开始
-127.0.0.1:6379> ZREVRANK rank:game "ada"
-(integer) 0             # 降序排名: ada 是第 1 名
-127.0.0.1:6379> ZREM rank:game "dave"
-(integer) 1
-127.0.0.1:6379> ZREMRANGEBYRANK rank:game 0 -101
-(integer) 0             # 只保留前 100 名（删掉降序 100 名之外的）
-127.0.0.1:6379> ZREMRANGEBYSCORE delay:queue -inf 1722310000
-(integer) 0             # 按分数区间删除（延时队列常用）
-```
+<Playground
+  language="redis"
+  title="排名查询与区间删除"
+  id="redis-07-3"
+  code={`ZADD rank:game 90 "dave" 99 "ada" 95.5 "bob"
+# 升序排名，从 0 开始
+ZRANK rank:game "ada"
+# 降序排名：ada 是第 1 名
+ZREVRANK rank:game "ada"
+ZREM rank:game "dave"
+ZRANGE rank:game 0 -1 WITHSCORES
+# 只保留前 1 名（删掉降序第 1 名之外的）
+ZREMRANGEBYRANK rank:game 0 -2
+ZRANGE rank:game 0 -1 WITHSCORES
+# 按分数区间删除（延时队列常用）
+ZADD delay:queue 1722310000 "order:1"
+ZREMRANGEBYSCORE delay:queue -inf 1722310000`}
+/>
 
 ## 3. 底层实现：skiplist + hashtable 双结构
 
@@ -158,17 +154,20 @@ L0:  head --> 10 --> 20 --> 30 --> 35 --> 50 --> 60 --> 70 --> NULL
 
 score 存"应执行的时间戳"，消费者轮询取"到期任务"：
 
-```bash
-# 生产: 30 分钟后关闭未支付订单
-127.0.0.1:6379> ZADD delay:close-order 1722312000 "order:8801"
-(integer) 1
-# 消费: 每秒取一批到期任务（当前时间之前的）
-127.0.0.1:6379> ZRANGEBYSCORE delay:close-order -inf 1722312000 LIMIT 0 10
-1) "order:8801"
-# 取到后用 ZREM 抢占（返回 1 才算抢到，防多个消费者重复处理）
-127.0.0.1:6379> ZREM delay:close-order "order:8801"
-(integer) 1
-```
+<Playground
+  language="redis"
+  title="ZSet 延时队列"
+  id="redis-07-4"
+  code={`# 生产：把"应执行时间戳"当作 score
+ZADD delay:close-order 1722312000 "order:8801"
+ZADD delay:close-order 1722315600 "order:8802"
+# 消费：取一批到期任务（当前时间之前的）
+ZRANGEBYSCORE delay:close-order -inf 1722312000 LIMIT 0 10
+# 取到后用 ZREM 抢占，返回 1 才算抢到，防多个消费者重复处理
+ZREM delay:close-order "order:8801"
+# 未到期的任务仍留在队列里
+ZRANGE delay:close-order 0 -1 WITHSCORES`}
+/>
 
 "ZRANGEBYSCORE 再 ZREM"两步之间存在竞态，严格场景用 Lua 脚本把"取+删"做成原子操作（第 12 章），或用 Redis 7 的 `ZMPOP`。
 

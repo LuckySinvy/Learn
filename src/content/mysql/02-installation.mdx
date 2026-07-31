@@ -93,16 +93,20 @@ mysql -uroot -p shop -e "SELECT COUNT(*) FROM users;"
 
 ### 3.2 客户端内的高频命令
 
-```sql
-SHOW DATABASES;              -- 列出所有库
+<Playground
+  language="mysql"
+  id="mysql-02-1"
+  title="客户端高频命令"
+  code={`SHOW DATABASES;              -- 列出所有库
 USE shop;                    -- 切换库
 SHOW TABLES;                 -- 列出当前库的表
 DESC users;                  -- 查看表结构（DESCRIBE 缩写）
-SHOW CREATE TABLE users\G    -- 查看完整建表语句
+SHOW CREATE TABLE users;     -- 查看完整建表语句
 SHOW PROCESSLIST;            -- 查看当前所有连接与正在执行的语句
-SELECT USER(), DATABASE();   -- 我是谁、我在哪个库
-STATUS;                      -- 连接信息汇总（字符集、版本、运行时长）
-```
+SELECT USER(), DATABASE();   -- 我是谁、我在哪个库`}
+/>
+
+在交互式客户端里还有两个纯客户端命令：`SHOW CREATE TABLE users\G` 竖排显示，`STATUS;` 汇总连接信息（字符集、版本、运行时长）。
 
 `\G` 是 mysql 客户端的技巧：把结果**竖排显示**，看宽表结构时比横排表格清晰得多。
 
@@ -166,18 +170,19 @@ default-character-set = utf8mb4
 
 MySQL 默认时区是 `SYSTEM`（跟随操作系统），Docker 容器默认是 UTC——于是经典的「数据库时间比北京时间慢 8 小时」就出现了。
 
-```sql
+<Playground
+  language="mysql"
+  id="mysql-02-2"
+  title="查看字符集与时区"
+  code={`SHOW VARIABLES LIKE 'character_set%';
+
 -- 查看时区
 SELECT @@global.time_zone, @@session.time_zone, NOW();
-```
 
-```text
-+--------------------+---------------------+---------------------+
-| @@global.time_zone | @@session.time_zone | NOW()               |
-+--------------------+---------------------+---------------------+
-| SYSTEM             | SYSTEM              | 2026-07-30 15:04:05 |
-+--------------------+---------------------+---------------------+
-```
+-- 改成东八区再看，NOW() 会跟着变
+SET time_zone = '+08:00';
+SELECT @@session.time_zone, NOW();`}
+/>
 
 设置为东八区：
 

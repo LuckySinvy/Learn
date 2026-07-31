@@ -28,34 +28,25 @@ stream: orders
 
 ### 2.1 XADD 写入
 
-```bash
-127.0.0.1:6379> XADD orders * action create sku 2001
-"1722310000000-0"       # * 表示让 Redis 自动生成 ID
-127.0.0.1:6379> XADD orders * action pay order 8801
-"1722310000000-1"
-127.0.0.1:6379> XLEN orders
-(integer) 2
-# 控制长度: 近似裁剪到 1 万条（~ 表示允许略多，性能好）
-127.0.0.1:6379> XADD orders MAXLEN ~ 10000 * action ship order 8801
-"1722310005123-0"
-```
+<Playground
+  language="redis"
+  title="XADD 生产与 XRANGE 回溯"
+  id="redis-09-1"
+  code={`# 星号表示让 Redis 自动生成 ID（毫秒时间戳-序号）
+XADD orders * action create sku 2001
+XADD orders * action pay order 8801
+XLEN orders
+# 控制长度：近似裁剪到 1 万条（波浪号表示允许略多，性能好）
+XADD orders MAXLEN ~ 10000 * action ship order 8801
+# 减号和加号是最小/最大 ID，读取全部消息
+XRANGE orders - +`}
+/>
 
 ### 2.2 XRANGE / XREAD 读取
 
-```bash
-127.0.0.1:6379> XRANGE orders - +
-1) 1) "1722310000000-0"
-   2) 1) "action"
-      2) "create"
-      3) "sku"
-      4) "2001"
-2) 1) "1722310000000-1"
-   2) 1) "action"
-      2) "pay"
-      3) "order"
-      4) "8801"
-# - 和 + 是最小/最大 ID; 也可以传具体 ID 做范围查询
+`XRANGE key - +` 读取全部消息，`-`/`+` 分别代表最小与最大 ID，也可以传具体 ID 做范围查询。想要"只等新消息"则用阻塞读：
 
+```bash
 # 阻塞读取新消息: $ 表示"只要从现在开始的新消息"
 127.0.0.1:6379> XREAD BLOCK 5000 STREAMS orders $
 （挂起, 等到新消息或 5 秒超时）
@@ -69,65 +60,59 @@ XREAD 模式下每个消费者独立维护自己读到的位置，适合"每个�
 
 ### 3.1 创建组与消费
 
-```bash
-127.0.0.1:6379> XGROUP CREATE orders g1 0
-OK                      # 从头(0)开始消费; 用 $ 则只消费此后的新消息
-
-# 消费者 c1 领取 2 条新消息（"新"指该组内从未投递过的）
-127.0.0.1:6379> XREADGROUP GROUP g1 c1 COUNT 2 BLOCK 5000 STREAMS orders >
-1) 1) "orders"
-   2) 1) 1) "1722310000000-0"
-         2) 1) "action"
-            2) "create"
-            3) "sku"
-            4) "2001"
-      2) 1) "1722310000000-1"
-         2) 1) "action"
-            2) "pay"
-            3) "order"
-            4) "8801"
-```
+<Playground
+  language="redis"
+  title="消费组：XGROUP + XREADGROUP"
+  id="redis-09-2"
+  code={`# 这里手写 ID 便于后面 XACK 引用，生产中用星号自动生成
+XADD orders 1-1 action create sku 2001
+XADD orders 1-2 action pay order 8801
+# 从头（0）开始消费；用美元符号则只消费此后的新消息
+XGROUP CREATE orders g1 0
+# 消费者 c1 领取 2 条新消息，大于号表示"从未投递给本组的消息"
+XREADGROUP GROUP g1 c1 COUNT 2 STREAMS orders >
+# 再读一次，已经没有新消息了
+XREADGROUP GROUP g1 c1 COUNT 2 STREAMS orders >`}
+/>
 
 `>` 是特殊 ID，表示"给我从未投递给本组的新消息"。消息投递后进入该消费者的 **PEL（Pending Entries List，待确认列表）**，直到被 ACK。
 
 ### 3.2 确认与查看积压
 
-```bash
-# 处理完成, 确认消息
-127.0.0.1:6379> XACK orders g1 1722310000000-0
-(integer) 1
-
-# 查看组内待确认消息概况
-127.0.0.1:6379> XPENDING orders g1
-1) (integer) 1          # 待确认总数
-2) "1722310000000-1"    # 最小待确认 ID
-3) "1722310000000-1"    # 最大待确认 ID
-4) 1) 1) "c1"
-      2) "1"            # 消费者 c1 有 1 条未确认
-
-# 详细列表: 每条的消费者、空闲时长、投递次数
-127.0.0.1:6379> XPENDING orders g1 - + 10
-1) 1) "1722310000000-1"
-   2) "c1"
-   3) (integer) 45210   # 已挂起 45 秒
-   4) (integer) 1       # 投递过 1 次
-```
+<Playground
+  language="redis"
+  title="XACK 确认与 XPENDING 查积压"
+  id="redis-09-3"
+  code={`XADD orders 1-1 action create sku 2001
+XADD orders 1-2 action pay order 8801
+XGROUP CREATE orders g1 0
+XREADGROUP GROUP g1 c1 COUNT 2 STREAMS orders >
+# 处理完成，确认第一条
+XACK orders g1 1-1
+# 组内待确认概况：总数、最小/最大 ID、各消费者的挂起数
+XPENDING orders g1
+# 详细列表：每条的消费者、空闲毫秒数、投递次数
+XPENDING orders g1 - + 10`}
+/>
 
 ### 3.3 故障转移：XAUTOCLAIM
 
 消费者 c1 崩溃后，它 PEL 里的消息不会自动重投。其他消费者用 `XAUTOCLAIM` 把"挂起超过一定时间"的消息认领过来：
 
-```bash
-# c2 认领 g1 组内空闲超过 60000ms 的消息
-127.0.0.1:6379> XAUTOCLAIM orders g1 c2 60000 0
-1) "0-0"                # 下一轮扫描的起始游标
-2) 1) 1) "1722310000000-1"
-      2) 1) "action"
-         2) "pay"
-         3) "order"
-         4) "8801"      # 这条消息现在归 c2 处理
-3) (empty array)
-```
+<Playground
+  language="redis"
+  title="XAUTOCLAIM 认领僵尸消息"
+  id="redis-09-4"
+  code={`XADD orders 1-1 action pay order 8801
+XGROUP CREATE orders g1 0
+# c1 领走消息但不 ACK，模拟处理到一半崩溃
+XREADGROUP GROUP g1 c1 COUNT 1 STREAMS orders >
+XPENDING orders g1 - + 10
+# c2 认领空闲超过 0ms 的消息（生产中填 60000 之类的阈值）
+XAUTOCLAIM orders g1 c2 0 0
+# 现在这条消息归 c2 了
+XPENDING orders g1 - + 10`}
+/>
 
 消费者应定期跑 XAUTOCLAIM 作为"补偿任务"。投递次数（delivery count）随每次认领递增，超过阈值（如 5 次）仍失败的消息应转入死信队列（另一个 Stream）人工处理，避免毒消息无限循环。
 

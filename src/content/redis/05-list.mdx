@@ -27,41 +27,36 @@ List 是一个**双端链表**语义的有序集合：两端都能推入弹出�
 
 ### 2.1 推入与弹出
 
-```bash
-127.0.0.1:6379> LPUSH tasks "job1"
-(integer) 1
-127.0.0.1:6379> LPUSH tasks "job2" "job3"
-(integer) 3             # 返回列表当前长度; 现在顺序: job3 job2 job1
-127.0.0.1:6379> RPUSH tasks "job0"
-(integer) 4             # job3 job2 job1 job0
-127.0.0.1:6379> RPOP tasks
-"job0"
-127.0.0.1:6379> LPOP tasks 2
-1) "job3"
-2) "job2"               # Redis 6.2+ 支持一次弹出多个
-127.0.0.1:6379> LLEN tasks
-(integer) 1
-```
+<Playground
+  language="redis"
+  title="推入与弹出"
+  id="redis-05-1"
+  code={`LPUSH tasks "job1"
+# 返回列表当前长度；现在顺序是 job3 job2 job1
+LPUSH tasks "job2" "job3"
+RPUSH tasks "job0"
+LRANGE tasks 0 -1
+RPOP tasks
+# Redis 6.2+ 支持一次弹出多个
+LPOP tasks 2
+LLEN tasks`}
+/>
 
 ### 2.2 范围读取与裁剪
 
-```bash
-127.0.0.1:6379> RPUSH timeline p1 p2 p3 p4 p5
-(integer) 5
-127.0.0.1:6379> LRANGE timeline 0 2
-1) "p1"
-2) "p2"
-3) "p3"
-127.0.0.1:6379> LRANGE timeline -2 -1     # 负下标从尾部数
-1) "p4"
-2) "p5"
-127.0.0.1:6379> LTRIM timeline 0 2        # 只保留前 3 个，其余删除
-OK
-127.0.0.1:6379> LRANGE timeline 0 -1      # 0 到 -1 = 全部
-1) "p1"
-2) "p2"
-3) "p3"
-```
+<Playground
+  language="redis"
+  title="范围读取与 LTRIM 裁剪"
+  id="redis-05-2"
+  code={`RPUSH timeline p1 p2 p3 p4 p5
+LRANGE timeline 0 2
+# 负下标从尾部数
+LRANGE timeline -2 -1
+# 只保留前 3 个，其余删除
+LTRIM timeline 0 2
+# 0 到 -1 表示全部
+LRANGE timeline 0 -1`}
+/>
 
 `LPUSH` + `LTRIM` 组合是"定长时间线"的标准姿势：
 
@@ -75,18 +70,20 @@ OK
 
 ### 2.3 按下标与按值操作
 
-```bash
-127.0.0.1:6379> LINDEX timeline 0
-"p1"
-127.0.0.1:6379> LSET timeline 0 "p1-edited"
-OK
-127.0.0.1:6379> LINSERT timeline BEFORE "p2" "p1.5"
-(integer) 4
-127.0.0.1:6379> LREM timeline 1 "p1.5"    # 从头开始删 1 个值为 p1.5 的元素
-(integer) 1
-127.0.0.1:6379> LPOS timeline "p3"        # 查找元素下标 (6.0.6+)
-(integer) 2
-```
+<Playground
+  language="redis"
+  title="按下标与按值操作"
+  id="redis-05-3"
+  code={`RPUSH timeline p1 p2 p3
+LINDEX timeline 0
+LSET timeline 0 "p1-edited"
+LINSERT timeline BEFORE "p2" "p1.5"
+LRANGE timeline 0 -1
+# 从头开始删 1 个值为 p1.5 的元素
+LREM timeline 1 "p1.5"
+# 查找元素下标（6.0.6+）
+LPOS timeline "p3"`}
+/>
 
 注意 `LINDEX`/`LSET`/`LINSERT` 都是 O(n)，长列表上慎用。
 
@@ -113,17 +110,20 @@ OK
 
 `RPOPLPUSH` 已废弃，Redis 6.2+ 用 `LMOVE`：原子地把元素从一个列表转移到另一个列表。
 
-```bash
-127.0.0.1:6379> RPUSH pending "task-1"
-(integer) 1
-127.0.0.1:6379> LMOVE pending processing LEFT RIGHT
-"task-1"                # 从 pending 左端取出，放入 processing 右端
-127.0.0.1:6379> LRANGE processing 0 -1
-1) "task-1"
-# 处理成功后从 processing 删除; 消费者崩溃则 task 还留在 processing 可被恢复
-127.0.0.1:6379> LREM processing 1 "task-1"
-(integer) 1
-```
+<Playground
+  language="redis"
+  title="LMOVE 双队列可靠消费"
+  id="redis-05-4"
+  code={`RPUSH pending "task-1" "task-2"
+# 从 pending 左端取出，放入 processing 右端
+LMOVE pending processing LEFT RIGHT
+LRANGE pending 0 -1
+LRANGE processing 0 -1
+# 处理成功后从 processing 删除
+# 消费者崩溃则 task 还留在 processing，可被恢复重投
+LREM processing 1 "task-1"
+LLEN processing`}
+/>
 
 这个"工作队列 + 处理中队列"模式让消息在消费者崩溃时不丢失，也有阻塞版 `BLMOVE`。
 

@@ -29,36 +29,46 @@ INNER JOIN：丢弃 order 4        LEFT JOIN：保留 order 4，用户列补 NUL
 
 ### 2.1 INNER JOIN：只保留两边都匹配的行
 
-```sql
-SELECT o.order_no, o.total_amount, u.username
+<Playground
+  language="mysql"
+  id="mysql-09-1"
+  title="INNER JOIN：只留匹配行"
+  code={`SELECT o.order_no, o.total_amount, u.username
 FROM orders o
 INNER JOIN users u ON o.user_id = u.id
-WHERE o.status = 1;
-```
+WHERE o.status = 1;`}
+/>
 
 `INNER` 可省略，`JOIN` 默认就是内连接。
 
 ### 2.2 LEFT JOIN：左表全保留，右表没匹配补 NULL
 
-```sql
--- 所有用户及其订单数（包括从没下过单的用户）
+<Playground
+  language="mysql"
+  id="mysql-09-2"
+  title="LEFT JOIN 统计与反连接"
+  code={`-- 所有用户及其订单数（包括从没下过单的用户）
 SELECT u.id, u.username, COUNT(o.id) AS order_count
 FROM users u
 LEFT JOIN orders o ON o.user_id = u.id
 GROUP BY u.id, u.username;
-```
 
-注意 `COUNT(o.id)` 而不是 `COUNT(*)`：没订单的用户，o.id 是 NULL，COUNT(o.id) 正确计为 0；COUNT(*) 会把那行 NULL 也数成 1。
-
-LEFT JOIN 的经典用法——**找「没有」的行**（反连接）：
-
-```sql
--- 从没下过单的用户
-SELECT u.*
+-- 对比：COUNT(*) 会把补 NULL 的那行也数成 1
+SELECT u.id, u.username, COUNT(*) AS wrong_count
 FROM users u
 LEFT JOIN orders o ON o.user_id = u.id
-WHERE o.id IS NULL;
-```
+GROUP BY u.id, u.username;
+
+-- 反连接：从没下过单的用户
+SELECT u.id, u.username
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id
+WHERE o.id IS NULL;`}
+/>
+
+注意 `COUNT(o.id)` 而不是 `COUNT(*)`：没订单的用户，o.id 是 NULL，COUNT(o.id) 正确计为 0；COUNT(*) 会把那行 NULL 也数成 1——上面第二条语句可以直观看到差异。
+
+第三条语句是 LEFT JOIN 的经典用法——**找「没有」的行**（反连接）。
 
 ### 2.3 RIGHT JOIN
 
@@ -72,31 +82,37 @@ WHERE o.id IS NULL;
 INNER JOIN 里条件放 ON 或 WHERE 结果一样；LEFT JOIN 里不一样：ON 里的右表条件只影响「怎么匹配」（不匹配的左表行照样保留、右表列补 NULL），而 WHERE 里的右表条件在拼接后过滤（会把补了 NULL 的行删掉，LEFT JOIN 悄悄退化成 INNER JOIN）。例：想看「所有用户及其已支付订单」，`o.status = 1` 必须放 ON；放 WHERE 就只剩有已支付订单的用户了。
 </Callout>
 
+亲手跑一遍，对比两者行数差异：
+
+<Playground
+  language="mysql"
+  id="mysql-09-3"
+  title="ON 与 WHERE 的差别"
+  code={`-- 条件放 ON：所有用户都在，没有已支付订单的补 NULL
+SELECT u.username, o.order_no, o.status
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id AND o.status = 1;
+
+-- 条件放 WHERE：补 NULL 的行被过滤，退化成 INNER JOIN
+SELECT u.username, o.order_no, o.status
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id
+WHERE o.status = 1;`}
+/>
+
 ## 3. 自连接与多表 JOIN
 
-自连接：同一张表用两个别名，当两张表用。分类的父子关系是典型场景：
+自连接：同一张表用两个别名，当两张表用，分类的父子关系是典型场景；多表 JOIN 则能串起完整业务链路。下面两条一起跑：
 
-```sql
+<Playground
+  language="mysql"
+  id="mysql-09-4"
+  title="自连接与五表 JOIN 报表"
+  code={`-- 自连接：分类的父子关系
 SELECT c.name AS child, p.name AS parent
 FROM categories c
 LEFT JOIN categories p ON c.parent_id = p.id;
-```
 
-```text
-+-----------+-----------+
-| child     | parent    |
-+-----------+-----------+
-| 电子产品   | NULL      |
-| 手机      | 电子产品   |
-| 笔记本     | 电子产品   |
-| 图书      | NULL      |
-| 技术书     | 图书      |
-+-----------+-----------+
-```
-
-多表 JOIN 串起完整业务链路：
-
-```sql
 -- 订单明细报表：谁、买了什么、什么分类、花了多少
 SELECT o.order_no, u.username, p.name AS product,
        c.name AS category, oi.quantity, oi.price
@@ -105,8 +121,8 @@ JOIN users u        ON u.id = o.user_id
 JOIN order_items oi ON oi.order_id = o.id
 JOIN products p     ON p.id = oi.product_id
 JOIN categories c   ON c.id = p.category_id
-WHERE o.status IN (1, 2, 3);
-```
+WHERE o.status IN (1, 2, 3);`}
+/>
 
 ## 4. 驱动表与 JOIN 顺序
 

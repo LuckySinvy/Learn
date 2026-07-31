@@ -57,6 +57,24 @@ slowlog-max-len 128
 OK
 ```
 
+自己动手看一遍这两件事——命中率从哪来、慢日志长什么样：
+
+<Playground
+  language="redis"
+  title="命中率与慢日志巡检"
+  id="redis-19-1"
+  code={`SET cache:a 1
+# 一次命中
+GET cache:a
+# 一次未命中
+GET cache:missing
+# 在输出里找 keyspace_hits 与 keyspace_misses, 命中率 = hits/(hits+misses)
+INFO stats
+# 慢日志条数与内容（本实例没有慢命令, 所以是空的）
+SLOWLOG LEN
+SLOWLOG GET 3`}
+/>
+
 慢日志只统计**命令执行时间**，不含网络与排队。榜上常客：KEYS、HGETALL/SMEMBERS 大集合、大范围 ZRANGE、DEL 大 key、复杂 Lua。
 
 ### 1.3 LATENCY 与延迟基线
@@ -84,6 +102,20 @@ min: 0, max: 3, avg: 0.12 (1032 samples)
 127.0.0.1:6379> MEMORY DOCTOR
 "Sam, I detected a few issues in this Redis instance memory implants..."
 ```
+
+<Playground
+  language="redis"
+  title="MEMORY USAGE 量体积，UNLINK 删大 key"
+  id="redis-19-2"
+  code={`SET small:key "hello"
+# 单个 key 占用的字节数（含 key、value 与元数据开销）
+MEMORY USAGE small:key
+HSET demo:hash f1 v1 f2 v2 f3 v3
+MEMORY USAGE demo:hash
+# 删除一律用 UNLINK: 主线程只摘链接, 内存回收交给后台线程, 不阻塞
+UNLINK demo:hash
+EXISTS demo:hash`}
+/>
 
 ## 2. 大 key：定位与治理
 

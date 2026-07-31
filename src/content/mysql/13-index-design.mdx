@@ -49,14 +49,35 @@ ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at);
 
 上一章讲过：二级索引查到主键后要**回表**取整行。如果查询需要的列全部在索引里（索引列 + 主键），就不用回表——这就是覆盖索引：
 
-```sql
--- 索引 (user_id, created_at)，主键 id
--- 覆盖：三列全在索引里，EXPLAIN Extra 显示 Using index
-SELECT id, user_id, created_at FROM orders WHERE user_id = 1;
+预置的 orders 表已经有 `idx_user_created (user_id, created_at)`，主键是 id。下面先把表灌到几百行（7 行的表优化器一律选全扫，看不出效果），再用 EXPLAIN 验证最左前缀与覆盖索引：
+
+<Playground
+  language="mysql"
+  id="mysql-13-1"
+  title="最左前缀与覆盖索引实测"
+  code={`-- 造数：把订单表放大到约 700 行
+INSERT INTO orders (order_no, user_id, status, total_amount, created_at)
+SELECT CONCAT(o.order_no, '-', d1.n, d2.n),
+       o.user_id, o.status, o.total_amount, o.created_at
+FROM orders o,
+     (SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+      UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d1,
+     (SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+      UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d2;
+ANALYZE TABLE orders;
+
+-- 命中最左列：key = idx_user_created
+EXPLAIN SELECT id, user_id, created_at FROM orders WHERE user_id = 1;
+
+-- 缺最左列：用不上这棵索引树
+EXPLAIN SELECT id, user_id, created_at FROM orders WHERE created_at >= '2026-02-01';
+
+-- 覆盖：三列全在索引里，Extra 显示 Using index
+EXPLAIN SELECT id, user_id, created_at FROM orders WHERE user_id = 1;
 
 -- 不覆盖：total_amount 不在索引里，每行都要回表
-SELECT id, user_id, total_amount FROM orders WHERE user_id = 1;
-```
+EXPLAIN SELECT id, user_id, total_amount FROM orders WHERE user_id = 1;`}
+/>
 
 实战手法：把 SELECT 里少数几个额外列**追加进联合索引尾部**，专门喂高频查询：
 
@@ -85,15 +106,20 @@ ICP 是自动的，你要做的是理解它：**联合索引里「用不上定�
 
 长字符串列（URL、邮箱）整列建索引太占空间，可以只索引前 N 个字符：
 
-```sql
--- 先测算不同前缀长度的区分度
-SELECT COUNT(DISTINCT LEFT(email, 8)) / COUNT(DISTINCT email) AS sel8,
-       COUNT(DISTINCT LEFT(email, 12)) / COUNT(DISTINCT email) AS sel12
-FROM users;
+<Playground
+  language="mysql"
+  id="mysql-13-2"
+  title="测算前缀长度并建前缀索引"
+  code={`-- 先测算不同前缀长度的区分度（越接近 1 越好）
+SELECT COUNT(DISTINCT LEFT(name, 3))  / COUNT(DISTINCT name) AS sel3,
+       COUNT(DISTINCT LEFT(name, 5))  / COUNT(DISTINCT name) AS sel5,
+       COUNT(DISTINCT LEFT(name, 10)) / COUNT(DISTINCT name) AS sel10
+FROM products;
 
 -- 选一个区分度接近 1 的最短长度
-ALTER TABLE users ADD INDEX idx_email_prefix (email(12));
-```
+ALTER TABLE products ADD INDEX idx_name_prefix (name(10));
+SHOW INDEX FROM products;`}
+/>
 
 代价：前缀索引**不能做覆盖索引**（索引里不是完整值，必须回表核对），也不能支持 `ORDER BY email` 免排序。区分度够就尽量短，但核心唯一列（如登录邮箱）通常还是全列唯一索引。
 
@@ -101,14 +127,19 @@ ALTER TABLE users ADD INDEX idx_email_prefix (email(12));
 
 对列做函数运算会让普通索引失效：
 
-```sql
--- 索引失效：函数包住了列
-SELECT * FROM orders WHERE DATE(created_at) = '2026-07-01';
+<Playground
+  language="mysql"
+  id="mysql-13-3"
+  title="函数让索引失效，改写成范围救回来"
+  code={`ALTER TABLE orders ADD INDEX idx_created (created_at);
+
+-- 索引失效：函数包住了列，key 为 NULL、走全表
+EXPLAIN SELECT id, order_no FROM orders WHERE DATE(created_at) = '2026-02-01';
 
 -- 改写成范围（首选方案，第 6 章讲过的左闭右开）
-SELECT * FROM orders
-WHERE created_at >= '2026-07-01' AND created_at < '2026-07-02';
-```
+EXPLAIN SELECT id, order_no FROM orders
+WHERE created_at >= '2026-02-01' AND created_at < '2026-02-02';`}
+/>
 
 改写不了的场景用**函数索引**：
 

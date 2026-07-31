@@ -68,23 +68,43 @@ UPDATE products SET stock = stock - 1 WHERE id = 1;
 
 ### 3.1 没走索引 = 锁全表的行
 
-```sql
--- phone 列没有索引：
-UPDATE users SET status = 2 WHERE phone = '13800000001';
-```
+<Playground
+  language="mysql"
+  id="mysql-16-1"
+  title="WHERE 走不走索引，决定锁多少行"
+  code={`-- phone 列没有索引：type=ALL，扫过的每一行都会被加锁
+EXPLAIN UPDATE users SET status = 2 WHERE phone = '13800000001';
+
+-- email 上有唯一索引：只锁命中的那一条记录
+EXPLAIN UPDATE users SET status = 2 WHERE email = 'alice@example.com';`}
+/>
 
 InnoDB 只能全表扫描，**扫过的每一行都会加锁**（RR 级别下还加间隙锁），效果接近锁全表。这是「一条不起眼的 UPDATE 让整个系统卡死」的经典案例——**UPDATE/DELETE 的 WHERE 条件必须能走索引**。
 
 ### 3.2 显式加锁读
 
-```sql
-SELECT * FROM products WHERE id = 1 LOCK IN SHARE MODE;  -- S 锁（8.0 写法 FOR SHARE）
-SELECT * FROM products WHERE id = 1 FOR UPDATE;          -- X 锁
+<Playground
+  language="mysql"
+  id="mysql-16-2"
+  title="显式加锁读"
+  code={`BEGIN;
 
--- 8.0 新姿势：抢不到锁怎么办
-SELECT * FROM products WHERE id = 1 FOR UPDATE NOWAIT;       -- 立即报错
-SELECT * FROM products WHERE id = 1 FOR UPDATE SKIP LOCKED;  -- 跳过被锁的行
-```
+SELECT id, name, stock FROM products WHERE id = 1 LOCK IN SHARE MODE;  -- S 锁
+SELECT id, name, stock FROM products WHERE id = 1 FOR UPDATE;          -- X 锁
+
+-- 抢不到锁怎么办：NOWAIT 立即报错，SKIP LOCKED 跳过被锁的行
+SELECT id, name FROM products WHERE status = 1 LIMIT 3 FOR UPDATE SKIP LOCKED;
+
+-- 当前事务锁了多少行
+SELECT trx_state, trx_rows_locked, trx_isolation_level
+FROM information_schema.innodb_trx;
+
+COMMIT;`}
+/>
+
+<Callout type="info" title="Playground 只有一个会话">
+本章大量示例需要**两个会话互相阻塞**才能观察，而 Playground 是单会话一次性容器（被阻塞会直接卡到超时）。上面的示例只演示语法与自身持锁情况；阻塞、间隙锁、死锁请在本地开两个 mysql 客户端窗口按章节里的时序复现。
+</Callout>
 
 `FOR UPDATE` 是「先锁再改」的悲观并发控制；`SKIP LOCKED` 是实现「多个 worker 抢任务队列」的利器（谁锁到算谁的，其他 worker 跳过去拿下一条）。
 

@@ -63,10 +63,20 @@ def update_user(uid, fields):
 
 ### 2.1 解法一：缓存空值
 
-```bash
-127.0.0.1:6379> SET cache:user:-1 "" EX 60
-OK                      # 空字符串代表"确认不存在", TTL 要短
-```
+<Playground
+  language="redis"
+  title="缓存空值挡住穿透"
+  id="redis-18-1"
+  code={`# 第一次查: 缓存里没有, 只能去查数据库（也查不到）
+GET cache:user:404
+# 把"确认不存在"这件事也缓存起来, 空字符串占位, TTL 要短
+SET cache:user:404 "" EX 60
+# 之后同样的请求: 拿到空串就直接返回"不存在", 不再打数据库
+GET cache:user:404
+# 注意区分: EXISTS 是 1（有这个 key）, 值才是空的
+EXISTS cache:user:404
+TTL cache:user:404`}
+/>
 
 查到空值直接返回"不存在"。简单有效，但海量随机不存在的 key 会占内存，且 TTL 内新插入的数据会被误判——所以空值 TTL 要短（30~120 秒）。
 
@@ -156,6 +166,22 @@ value = { data: {...}, expire_at: 1722310600 }
 ttl = 3600 + random.randint(0, 600)     # TTL 加随机抖动, 摊平过期时刻
 redis.set(key, value, ex=ttl)
 ```
+
+效果就是同一批预热的 key 各自散落在不同时刻过期：
+
+<Playground
+  language="redis"
+  title="TTL 随机抖动，摊平过期时刻"
+  id="redis-18-2"
+  code={`# 同一批预热的缓存, 基准 3600 秒 + 各自不同的随机抖动
+SET cache:sku:1 v1 EX 3611
+SET cache:sku:2 v2 EX 3754
+SET cache:sku:3 v3 EX 3902
+# 三个 key 的过期时刻被拉开了几百秒, 不会同一秒集体失效
+TTL cache:sku:1
+TTL cache:sku:2
+TTL cache:sku:3`}
+/>
 
 **成因二：Redis 实例整体宕机**，所有请求穿到数据库。
 

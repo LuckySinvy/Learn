@@ -24,6 +24,10 @@ QUEUED
 
 MULTI 之后的命令**不立即执行**，而是进入队列；EXEC 时整个队列一次性、无间隔地串行执行——期间不会插入其他客户端的命令。`DISCARD` 放弃队列。
 
+<Callout type="info" title="本章的事务示例为什么没有在线运行">
+MULTI/EXEC 与 WATCH 都**绑定在同一条连接**上：命令要排进同一个连接的队列才有意义。本页沙箱每行命令各自建连执行，跑不出事务语义，所以事务部分保留静态示例，请在本机 redis-cli 里演练；而 Lua 脚本一条命令就是一个原子单元，下面的示例都可以直接运行。
+</Callout>
+
 ### 1.1 两种错误，两种结局
 
 **入队时错误**（语法错误、不存在的命令）：整个事务被拒绝执行。
@@ -93,15 +97,17 @@ WATCH 的语义：被监视的 key 在 EXEC 之前被**任何客户端**修改�
 
 ### 2.1 基本用法
 
-```bash
-127.0.0.1:6379> EVAL "return 1 + 1" 0
-(integer) 2
-# KEYS 数组传 key, ARGV 数组传参数; numkeys 声明 key 个数
-127.0.0.1:6379> EVAL "return redis.call('SET', KEYS[1], ARGV[1])" 1 greeting "hello"
-OK
-127.0.0.1:6379> EVAL "return redis.call('GET', KEYS[1])" 1 greeting
-"hello"
-```
+<Playground
+  language="redis"
+  title="EVAL 基本用法：KEYS 与 ARGV"
+  id="redis-12-1"
+  code={`EVAL "return 1 + 1" 0
+# KEYS 数组传 key, ARGV 数组传参数; 中间的数字声明 key 个数
+EVAL "return redis.call('SET', KEYS[1], ARGV[1])" 1 greeting "hello world"
+EVAL "return redis.call('GET', KEYS[1])" 1 greeting
+# Lua 表会转换成多行数组回复
+EVAL "return {KEYS[1], ARGV[1], ARGV[2]}" 1 mykey a b`}
+/>
 
 为什么 key 必须走 KEYS 而不是拼进脚本？Cluster 需要根据 KEYS 判断脚本该路由到哪个节点；混在 ARGV 里会导致路由错误。
 
@@ -118,14 +124,19 @@ else
 end
 ```
 
-```bash
-$ redis-cli SET stock:sku:2001 5
-OK
-$ redis-cli EVAL "$(cat deduct.lua)" 1 stock:sku:2001 2
-(integer) 3
-$ redis-cli EVAL "$(cat deduct.lua)" 1 stock:sku:2001 9
-(integer) -1            # 库存不足, 拒绝, 且绝不会超卖
-```
+把它压成一行就能直接 EVAL（Lua 不需要分号，语句之间空格分隔即可）：
+
+<Playground
+  language="redis"
+  title="Lua 原子扣库存：绝不超卖"
+  id="redis-12-2"
+  code={`SET stock:sku:2001 5
+# 库存足够: 扣 2, 返回剩余 3
+EVAL "local stock = tonumber(redis.call('GET', KEYS[1]) or '0') local need = tonumber(ARGV[1]) if stock >= need then return redis.call('DECRBY', KEYS[1], need) else return -1 end" 1 stock:sku:2001 2
+# 库存不足: 返回 -1, 一个都不扣
+EVAL "local stock = tonumber(redis.call('GET', KEYS[1]) or '0') local need = tonumber(ARGV[1]) if stock >= need then return redis.call('DECRBY', KEYS[1], need) else return -1 end" 1 stock:sku:2001 9
+GET stock:sku:2001`}
+/>
 
 对比 WATCH 方案：无冲突重试、一次网络往返、逻辑集中在一处。这就是"检查再更新"类需求的标准解法。
 
@@ -133,14 +144,17 @@ $ redis-cli EVAL "$(cat deduct.lua)" 1 stock:sku:2001 9
 
 脚本体每次随请求传输很浪费。先 `SCRIPT LOAD` 得到 SHA1，之后用 `EVALSHA` 引用：
 
-```bash
-127.0.0.1:6379> SCRIPT LOAD "return redis.call('GET', KEYS[1])"
-"a5260dd66ce02462c5b5e49a19df58c1f438d81a"
-127.0.0.1:6379> EVALSHA a5260dd66ce02462c5b5e49a19df58c1f438d81a 1 greeting
-"hello"
-127.0.0.1:6379> SCRIPT EXISTS a5260dd66ce02462c5b5e49a19df58c1f438d81a
-1) (integer) 1
-```
+<Playground
+  language="redis"
+  title="SCRIPT LOAD 与 EVALSHA"
+  id="redis-12-3"
+  code={`SET greeting "hello"
+# 返回值就是脚本内容的 SHA1, 同样的脚本在任何实例上算出的 SHA1 都相同
+SCRIPT LOAD "return redis.call('GET', KEYS[1])"
+EVALSHA d3c21d0c2b9ca22f82737626a27bcaf5d288f99f 1 greeting
+# 1 = 该脚本已在服务端缓存中
+SCRIPT EXISTS d3c21d0c2b9ca22f82737626a27bcaf5d288f99f`}
+/>
 
 客户端库通常自动处理"EVALSHA 报 NOSCRIPT 就回退 EVAL"。注意脚本缓存**重启即失效，且不主从复制**——这是 Function 要解决的问题之一。
 

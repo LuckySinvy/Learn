@@ -102,56 +102,53 @@ redis-cli monitor         # 实时打印所有命令（调试用，生产慎用�
 
 ### 4.1 键的增删查
 
-```bash
-127.0.0.1:6379> SET user:1001:name "Ada"
-OK
-127.0.0.1:6379> EXISTS user:1001:name
-(integer) 1
-127.0.0.1:6379> TYPE user:1001:name
-string
-127.0.0.1:6379> DEL user:1001:name
-(integer) 1
-127.0.0.1:6379> EXISTS user:1001:name
-(integer) 0
-```
+<Playground
+  language="redis"
+  title="键的增删查"
+  id="redis-02-1"
+  code={`SET user:1001:name "Ada"
+EXISTS user:1001:name
+TYPE user:1001:name
+DEL user:1001:name
+EXISTS user:1001:name`}
+/>
 
 key 的命名建议用冒号分层：`业务:对象:ID:属性`，如 `shop:user:1001:profile`，便于按前缀管理。
 
 ### 4.2 KEYS 与 SCAN
 
-```bash
-127.0.0.1:6379> MSET user:1 a user:2 b order:1 c
-OK
-127.0.0.1:6379> KEYS user:*
-1) "user:2"
-2) "user:1"
-```
+<Playground
+  language="redis"
+  title="KEYS 与 SCAN 对比"
+  id="redis-02-2"
+  code={`MSET user:1 a user:2 b order:1 c
+KEYS user:*
+# SCAN 第一个参数是游标，0 表示从头开始
+SCAN 0 MATCH user:* COUNT 100
+DBSIZE`}
+/>
 
-`KEYS` 会一次性遍历整个键空间，**百万级 key 时会阻塞主线程数百毫秒**，生产禁用。替代方案是游标式的 `SCAN`：
-
-```bash
-127.0.0.1:6379> SCAN 0 MATCH user:* COUNT 100
-1) "0"                # 返回的游标，为 0 表示遍历结束
-2) 1) "user:2"
-   2) "user:1"
-```
+`KEYS` 会一次性遍历整个键空间，**百万级 key 时会阻塞主线程数百毫秒**，生产禁用。替代方案是游标式的 `SCAN`：它返回两部分，第一行是下次要传入的游标（为 0 表示遍历结束），后面是本批扫到的 key。
 
 用法：以游标 0 开始，每次调用把上次返回的游标传进去，直到游标再次为 0。`COUNT` 是每次扫描桶数量的**提示值**而非精确条数。SCAN 保证：遍历开始前就存在且一直存在的 key 一定会被返回（可能重复），遍历过程中新增的 key 可能返回也可能不返回。
 
 ### 4.3 过期时间 TTL
 
-```bash
-127.0.0.1:6379> SET session:abc "token-data"
-OK
-127.0.0.1:6379> EXPIRE session:abc 300
-(integer) 1
-127.0.0.1:6379> TTL session:abc
-(integer) 297           # 剩余 297 秒
-127.0.0.1:6379> PERSIST session:abc
-(integer) 1             # 移除过期时间，变为永不过期
-127.0.0.1:6379> TTL session:abc
-(integer) -1            # -1 = 永不过期; -2 = key 不存在
-```
+<Playground
+  language="redis"
+  title="TTL 的三种返回值"
+  id="redis-02-3"
+  code={`SET session:abc "token-data"
+EXPIRE session:abc 300
+TTL session:abc
+# PERSIST 移除过期时间，变为永不过期
+PERSIST session:abc
+TTL session:abc
+# 不存在的 key 返回 -2
+TTL session:not-exist`}
+/>
+
+TTL 的返回值有三种含义：正数是剩余秒数，`-1` 表示 key 存在但永不过期，`-2` 表示 key 不存在。
 
 ### 4.4 其他高频命令
 

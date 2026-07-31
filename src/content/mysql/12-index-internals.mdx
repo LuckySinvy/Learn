@@ -69,10 +69,19 @@ InnoDB 的表本身就是一棵按**主键**组织的 B+ 树，叶子节点存�
 
 在非主键列上建的索引叫二级索引（secondary index）。它也是一棵 B+ 树，但叶子节点**不存整行，只存「索引列值 + 主键值」**：
 
-```sql
--- users 表：id 主键，uk_email 二级索引
-SELECT * FROM users WHERE email = 'alice@ex.com';
-```
+<Playground
+  language="mysql"
+  id="mysql-12-1"
+  title="二级索引查询与回表"
+  code={`-- users 表：id 主键，uk_email 二级索引
+SELECT * FROM users WHERE email = 'alice@example.com';
+
+-- 需要 email 之外的列 → 走 uk_email 后必须回表
+EXPLAIN SELECT * FROM users WHERE email = 'alice@example.com';
+
+-- 只要 email 和主键 id，二级索引叶子上就有 → Extra 出现 Using index，不回表
+EXPLAIN SELECT id FROM users WHERE email = 'alice@example.com';`}
+/>
 
 执行过程分两步：
 
@@ -121,13 +130,23 @@ SELECT * FROM users WHERE email = 'alice@ex.com';
 - 变长列（VARCHAR/TEXT）太长时，页内只留 20 字节指针，数据放**溢出页**。这就是「大字段拖慢全表」的原因之一；
 - 一个页至少放 2 行，单行上限约 8000 字节（不含溢出部分）。
 
-```sql
--- 查看表的行格式与索引信息
-SHOW TABLE STATUS LIKE 'orders'\G
-SELECT index_name, seq_in_index, column_name
+<Playground
+  language="mysql"
+  id="mysql-12-2"
+  title="查看索引与行格式"
+  code={`-- 每个索引由哪些列按什么顺序组成
+SELECT index_name, seq_in_index, column_name, non_unique
 FROM information_schema.statistics
-WHERE table_schema = 'shop' AND table_name = 'orders';
-```
+WHERE table_schema = 'shop' AND table_name = 'orders'
+ORDER BY index_name, seq_in_index;
+
+-- 表的引擎、行格式与行数估算
+SELECT table_name, engine, row_format, table_rows
+FROM information_schema.tables
+WHERE table_schema = 'shop';`}
+/>
+
+在 mysql 客户端里也可以用 `SHOW TABLE STATUS LIKE 'orders'\G` 竖排查看同样的信息。
 
 <Callout type="warn" title="频繁 UPDATE 变长列会造成页碎片">
 把 VARCHAR 从短改长，原位置放不下就要迁移行、留下碎片；大量删除同样留洞。表经历大规模增删改后，`OPTIMIZE TABLE` 重建可回收空间、恢复页的紧凑度。

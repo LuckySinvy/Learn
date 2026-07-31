@@ -35,16 +35,20 @@ SET key value [NX | XX] [EX seconds | PX ms | EXAT ts | KEEPTTL] [GET]
 
 实操：
 
-```bash
-127.0.0.1:6379> SET lock:order:1001 "uuid-abc" NX EX 10
-OK                      # 抢锁成功
-127.0.0.1:6379> SET lock:order:1001 "uuid-def" NX EX 10
-(nil)                   # key 已存在，NX 失败 —— 别人持有锁
-127.0.0.1:6379> SET counter 100
-OK
-127.0.0.1:6379> SET counter 200 GET
-"100"                   # 返回旧值，同时已写入新值
-```
+<Playground
+  language="redis"
+  title="SET NX / GET 参数"
+  id="redis-03-1"
+  code={`# 抢锁成功
+SET lock:order:1001 "uuid-abc" NX EX 10
+# key 已存在，NX 失败，返回 nil —— 别人持有锁
+SET lock:order:1001 "uuid-def" NX EX 10
+GET lock:order:1001
+SET counter 100
+# GET 参数：返回旧值，同时写入新值
+SET counter 200 GET
+GET counter`}
+/>
 
 `SET key val NX EX 10` 一条命令同时完成"不存在才写入 + 设过期"，且是原子的——这正是分布式锁的标准写法（第 17 章展开）。
 
@@ -54,39 +58,37 @@ OK
 
 ### 2.2 读写与批量
 
-```bash
-127.0.0.1:6379> SET user:1:name "Ada"
-OK
-127.0.0.1:6379> GET user:1:name
-"Ada"
-127.0.0.1:6379> MSET user:2:name "Bob" user:3:name "Carol"
-OK
-127.0.0.1:6379> MGET user:1:name user:2:name user:404:name
-1) "Ada"
-2) "Bob"
-3) (nil)
-127.0.0.1:6379> SETEX cache:home 60 "<html>...</html>"    # 等价 SET ... EX 60
-OK
-```
+<Playground
+  language="redis"
+  title="读写与批量 MSET/MGET"
+  id="redis-03-2"
+  code={`SET user:1:name "Ada"
+GET user:1:name
+MSET user:2:name "Bob" user:3:name "Carol"
+# 不存在的 key 在结果里是 nil
+MGET user:1:name user:2:name user:404:name
+# SETEX 等价于 SET ... EX 60
+SETEX cache:home 60 "page-body"
+TTL cache:home`}
+/>
 
 `MGET`/`MSET` 一次网络往返处理多个 key，比循环单条快得多——**批量思维**是 Redis 性能优化的第一课（第 19 章还有 pipeline）。
 
 ### 2.3 原子计数
 
-```bash
-127.0.0.1:6379> SET article:1:pv 0
-OK
-127.0.0.1:6379> INCR article:1:pv
-(integer) 1
-127.0.0.1:6379> INCRBY article:1:pv 10
-(integer) 11
-127.0.0.1:6379> DECR article:1:pv
-(integer) 10
-127.0.0.1:6379> INCRBYFLOAT price 0.1
-"0.1"
-127.0.0.1:6379> INCR user:1:name
-(error) ERR value is not an integer or out of range
-```
+<Playground
+  language="redis"
+  title="原子计数 INCR 家族"
+  id="redis-03-3"
+  code={`SET article:1:pv 0
+INCR article:1:pv
+INCRBY article:1:pv 10
+DECR article:1:pv
+INCRBYFLOAT price 0.1
+# 对非数字内容自增会报错
+SET user:1:name "Ada"
+INCR user:1:name`}
+/>
 
 因为命令单线程执行，`INCR` 天然原子：100 个并发客户端各执行一次，结果一定是精确加 100，不需要任何锁。
 
@@ -111,20 +113,20 @@ OK
 
 Redis 对每个 String 值按内容自动选择三种编码之一，用 `OBJECT ENCODING` 查看：
 
-```bash
-127.0.0.1:6379> SET n 12345
-OK
-127.0.0.1:6379> OBJECT ENCODING n
-"int"
-127.0.0.1:6379> SET s1 "short string"
-OK
-127.0.0.1:6379> OBJECT ENCODING s1
-"embstr"
-127.0.0.1:6379> SET s2 "this string is definitely longer than forty-four bytes..."
-OK
-127.0.0.1:6379> OBJECT ENCODING s2
-"raw"
-```
+<Playground
+  language="redis"
+  title="三种编码：int / embstr / raw"
+  id="redis-03-4"
+  code={`SET n 12345
+OBJECT ENCODING n
+SET s1 "short string"
+OBJECT ENCODING s1
+SET s2 "this string is definitely longer than forty-four bytes so it becomes raw"
+OBJECT ENCODING s2
+# 对 embstr 执行修改命令后会转成 raw，且不会转回去
+APPEND s1 "!"
+OBJECT ENCODING s1`}
+/>
 
 | 编码 | 触发条件 | 存储方式 |
 |---|---|---|

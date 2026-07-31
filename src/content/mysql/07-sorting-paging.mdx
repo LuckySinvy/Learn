@@ -10,18 +10,22 @@ description: ORDER BY、LIMIT/OFFSET、深分页问题与游标分页、DISTINCT
 
 ## 1. ORDER BY
 
-```sql
--- 单列排序：ASC 升序（默认）、DESC 降序
+<Playground
+  language="mysql"
+  id="mysql-07-1"
+  title="单列、多列与表达式排序"
+  code={`-- 单列排序：ASC 升序（默认）、DESC 降序
 SELECT id, name, price FROM products ORDER BY price DESC;
 
 -- 多列排序：先按第一列，相同时再按第二列
-SELECT * FROM orders ORDER BY status ASC, created_at DESC;
+SELECT id, order_no, status, created_at FROM orders
+ORDER BY status ASC, created_at DESC;
 
 -- 按表达式、别名排序
 SELECT name, price * stock AS inventory_value
 FROM products
-ORDER BY inventory_value DESC;
-```
+ORDER BY inventory_value DESC;`}
+/>
 
 要点：
 
@@ -46,14 +50,23 @@ filesort 不一定慢（小结果集内存排序很快），但大结果集排�
 
 ## 2. LIMIT 分页
 
-```sql
--- 取前 10 条
-SELECT id, name, price FROM products ORDER BY id LIMIT 10;
+<Playground
+  language="mysql"
+  id="mysql-07-2"
+  title="LIMIT / OFFSET 分页与游标分页"
+  code={`-- 第 1 页：每页 3 条
+SELECT id, name, price FROM products ORDER BY id LIMIT 3;
 
--- 跳过 20 条取 10 条（第 3 页，每页 10 条）
-SELECT id, name, price FROM products ORDER BY id LIMIT 10 OFFSET 20;
--- 等价旧写法：LIMIT 20, 10（先 offset 后 count，容易记反，建议用 OFFSET 语法）
-```
+-- 第 2 页：跳过 3 条取 3 条
+SELECT id, name, price FROM products ORDER BY id LIMIT 3 OFFSET 3;
+
+-- 游标分页：不用 OFFSET，用上一页最后一条的 id 定位起点
+SELECT id, order_no, created_at FROM orders ORDER BY id DESC LIMIT 3;
+SELECT id, order_no, created_at FROM orders
+WHERE id < 5 ORDER BY id DESC LIMIT 3;`}
+/>
+
+旧写法 `LIMIT 20, 10`（先 offset 后 count）容易记反，建议统一用 OFFSET 语法。
 
 <Callout type="warn" title="LIMIT 没有 ORDER BY 等于随机取样">
 `LIMIT 10` 不配 ORDER BY，返回哪 10 条完全由执行计划决定，两次执行可能不同。分页查询必须有确定性的 ORDER BY，且排序列组合要能唯一确定顺序（通常补上主键：`ORDER BY created_at DESC, id DESC`），否则排序值相同的行在翻页时可能重复或丢失。
@@ -117,24 +130,19 @@ LIMIT 20;
 
 ## 4. DISTINCT 去重
 
-```sql
--- 有多少个不同的下单用户
+<Playground
+  language="mysql"
+  id="mysql-07-3"
+  title="DISTINCT 去重"
+  code={`-- 有多少个不同的下单用户
 SELECT DISTINCT user_id FROM orders;
 
 -- 多列 DISTINCT：按「列组合」去重，不是只对第一列
 SELECT DISTINCT user_id, status FROM orders;
 
 -- 统计去重数量
-SELECT COUNT(DISTINCT user_id) AS buyer_count FROM orders;
-```
-
-```text
-+-------------+
-| buyer_count |
-+-------------+
-|           3 |
-+-------------+
-```
+SELECT COUNT(DISTINCT user_id) AS buyer_count FROM orders;`}
+/>
 
 注意：
 

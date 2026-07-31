@@ -69,6 +69,25 @@ Pub/Sub 是 Redis 里最轻量的消息机制：发布者往频道扔消息，**
 (integer) 1             # 模式订阅的数量
 ```
 
+下面这段可以直接运行：**没有订阅者时发布，消息就地蒸发**——这就是"即发即失"最直观的证据。
+
+<Playground
+  language="redis"
+  title="没人订阅时，消息去哪了"
+  id="redis-13-1"
+  code={`# 返回 0 = 0 个订阅者收到这条消息, 它已经消失了, 无人可以补收
+PUBLISH news:tech "Redis 8 released"
+# 当前有订阅者的频道列表: 空
+PUBSUB CHANNELS
+PUBSUB NUMSUB news:tech
+# 模式订阅数量
+PUBSUB NUMPAT`}
+/>
+
+<Callout type="info" title="为什么这里没法在线演示 SUBSCRIBE">
+SUBSCRIBE 会让连接进入订阅态并**一直挂着等消息**，需要两个终端、两条长连接一收一发。本页沙箱每行命令各自建连、执行完即断开，演示不了收发过程，所以订阅侧保留静态示例，请在本机开两个 redis-cli 窗口演练。
+</Callout>
+
 进入订阅态的连接只能执行 SUBSCRIBE/UNSUBSCRIBE/PING/QUIT 等少数命令，**业务里必须用独立连接做订阅**，不能复用普通命令的连接池连接。
 
 ## 2. 消息为什么会丢

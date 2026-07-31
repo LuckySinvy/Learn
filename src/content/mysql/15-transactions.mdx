@@ -21,22 +21,34 @@ description: BEGIN/COMMIT/ROLLBACK、savepoint、redo log 与 undo log、两阶�
 
 ## 2. 事务的基本使用
 
-```sql
--- 显式事务：下单三件套
+<Playground
+  language="mysql"
+  id="mysql-15-1"
+  title="事务：提交与回滚"
+  code={`-- 显式事务：下单三件套
 BEGIN;   -- 或 START TRANSACTION
 
 INSERT INTO orders (order_no, user_id, status, total_amount)
-VALUES ('SO20260730006', 1, 0, 3999.00);
+VALUES ('NO20260730008', 1, 0, 5699.00);
 
 INSERT INTO order_items (order_id, product_id, quantity, price)
-VALUES (LAST_INSERT_ID(), 2, 1, 3999.00);
+VALUES (LAST_INSERT_ID(), 2, 1, 5699.00);
 
 UPDATE products SET stock = stock - 1 WHERE id = 2 AND stock >= 1;
 -- 检查 affected rows：为 0 说明库存不足，应 ROLLBACK
 
 COMMIT;     -- 全部生效
--- ROLLBACK; -- 或全部撤销
-```
+
+SELECT order_no, total_amount FROM orders WHERE order_no = 'NO20260730008';
+SELECT id, name, stock FROM products WHERE id = 2;
+
+-- 换成 ROLLBACK：改动全部撤销
+BEGIN;
+UPDATE products SET stock = 0 WHERE id = 2;
+SELECT stock AS stock_in_txn FROM products WHERE id = 2;
+ROLLBACK;
+SELECT stock AS stock_after_rollback FROM products WHERE id = 2;`}
+/>
 
 ### 2.1 autocommit
 
@@ -53,14 +65,19 @@ SET autocommit = 0;   -- 慎用：之后每条语句都在未提交事务里
 
 ### 2.2 SAVEPOINT：部分回滚
 
-```sql
-BEGIN;
-INSERT INTO orders (order_no, user_id) VALUES ('SO7', 1);
+<Playground
+  language="mysql"
+  id="mysql-15-2"
+  title="SAVEPOINT 部分回滚"
+  code={`BEGIN;
+INSERT INTO orders (order_no, user_id) VALUES ('SP-A', 1);
 SAVEPOINT sp1;
-INSERT INTO orders (order_no, user_id) VALUES ('SO8', 2);
-ROLLBACK TO sp1;   -- 只撤销 SO8，SO7 还在事务里
-COMMIT;            -- 最终只有 SO7 生效
-```
+INSERT INTO orders (order_no, user_id) VALUES ('SP-B', 2);
+ROLLBACK TO sp1;   -- 只撤销 SP-B，SP-A 还在事务里
+COMMIT;            -- 最终只有 SP-A 生效
+
+SELECT order_no, user_id FROM orders WHERE order_no LIKE 'SP-%';`}
+/>
 
 适合「批量处理中单条失败跳过」的场景，但逻辑复杂时更推荐拆小事务。
 

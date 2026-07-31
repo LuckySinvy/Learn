@@ -108,33 +108,42 @@ ANALYZE TABLE users, products, orders, order_items;
 
 ### 4.1 查询一：我的订单列表
 
-```sql
-SELECT id, order_no, status, total_amount, created_at
+在 Playground 里用缩小版走一遍完整闭环：先把订单放大到几百行，删掉索引看「病」，再建回索引看「药」。
+
+<Playground
+  language="mysql"
+  id="mysql-22-1"
+  title="查询一：订单列表，加索引前后对比"
+  code={`-- 缩小版造数：把订单表放大到约 700 行
+INSERT INTO orders (order_no, user_id, status, total_amount, created_at)
+SELECT CONCAT(o.order_no, '-', d1.n, d2.n),
+       o.user_id, o.status, o.total_amount, o.created_at
+FROM orders o,
+     (SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+      UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d1,
+     (SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+      UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d2;
+
+-- 先拆掉索引，让问题暴露：type=ALL + Using filesort
+ALTER TABLE orders DROP INDEX idx_user_created;
+ANALYZE TABLE orders;
+EXPLAIN SELECT id, order_no, status, total_amount, created_at
 FROM orders
-WHERE user_id = 4396 AND status IN (1,2,3)
+WHERE user_id = 1 AND status IN (1,2,3)
 ORDER BY created_at DESC
 LIMIT 20;
-```
 
-无索引时的 EXPLAIN：
-
-```text
-type: ALL   rows: 996482   Extra: Using where; Using filesort
-```
-
-全表扫 100 万行 + 排序，耗时数百毫秒。按第 13 章方法设计索引——等值列 user_id 在前，排序列 created_at 在后（status 是 IN 多值，放中间会截断 created_at 的有序性，放弃收编，靠 ICP 过滤）：
-
-```sql
+-- 等值列 user_id 在前，排序列 created_at 在后
 ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at);
-```
+ANALYZE TABLE orders;
+EXPLAIN SELECT id, order_no, status, total_amount, created_at
+FROM orders
+WHERE user_id = 1 AND status IN (1,2,3)
+ORDER BY created_at DESC
+LIMIT 20;`}
+/>
 
-再看：
-
-```text
-type: ref   key: idx_user_created   rows: 11   Extra: Using index condition
-```
-
-`rows` 从 99 万降到 11，filesort 消失（索引天然按 created_at 有序，倒序扫描即可），耗时进入亚毫秒级。**这就是本课程反复强调的「条件 + 排序一体设计」**。
+status 是 IN 多值，放中间会截断 created_at 的有序性，放弃收编，靠 ICP 过滤。索引建好后 `rows` 大幅下降，filesort 消失（索引天然按 created_at 有序，倒序扫描即可），耗时进入亚毫秒级。**这就是本课程反复强调的「条件 + 排序一体设计」**。
 
 ### 4.2 查询二：订单详情（三表 JOIN）
 
@@ -157,34 +166,59 @@ ALTER TABLE order_items ADD INDEX idx_order (order_id);
 
 ### 4.3 查询三：商品搜索（分类 + 价格区间 + 排序）
 
-```sql
+索引设计推演（第 13 章口诀）：等值 category_id、status 在前，范围/排序列 price 在最后。
+
+<Playground
+  language="mysql"
+  id="mysql-22-2"
+  title="查询三：商品搜索的联合索引"
+  code={`-- 先看看结果对不对
 SELECT id, name, price
 FROM products
-WHERE category_id = 2 AND status = 1 AND price BETWEEN 100 AND 2000
+WHERE category_id = 2 AND status = 1 AND price BETWEEN 100 AND 6000
 ORDER BY price
 LIMIT 20;
-```
 
-索引设计推演（第 13 章口诀）：等值 category_id、status 在前，范围/排序列 price 在最后：
+EXPLAIN SELECT id, name, price
+FROM products
+WHERE category_id = 2 AND status = 1 AND price BETWEEN 100 AND 6000
+ORDER BY price
+LIMIT 20;
 
-```sql
 ALTER TABLE products ADD INDEX idx_cat_status_price (category_id, status, price);
-```
+ANALYZE TABLE products;
+
+EXPLAIN SELECT id, name, price
+FROM products
+WHERE category_id = 2 AND status = 1 AND price BETWEEN 100 AND 6000
+ORDER BY price
+LIMIT 20;`}
+/>
 
 EXPLAIN 从 `ALL + filesort` 变为 `range + 无 filesort`——price 既当范围过滤又当排序，一列两吃。
 
 ### 4.4 查询四：运营日报（聚合）
 
-```sql
-SELECT DATE(created_at) AS d,
+<Playground
+  language="mysql"
+  id="mysql-22-3"
+  title="查询四：运营日报聚合"
+  code={`SELECT DATE(created_at) AS d,
        COUNT(*) AS orders_cnt,
        SUM(CASE WHEN status IN (1,2,3) THEN total_amount ELSE 0 END) AS gmv,
-       AVG(status = 4) AS cancel_rate
+       ROUND(AVG(status = 4), 4) AS cancel_rate
 FROM orders
-WHERE created_at >= '2026-07-01' AND created_at < '2026-08-01'
+WHERE created_at >= '2026-01-01' AND created_at < '2026-04-01'
 GROUP BY DATE(created_at)
 ORDER BY d;
-```
+
+-- 反面教材：函数包住列，索引用不上
+EXPLAIN SELECT COUNT(*) FROM orders WHERE DATE(created_at) = '2026-02-01';
+
+ALTER TABLE orders ADD INDEX idx_created (created_at);
+EXPLAIN SELECT COUNT(*) FROM orders
+WHERE created_at >= '2026-01-01' AND created_at < '2026-04-01';`}
+/>
 
 注意两点：WHERE 用**左闭右开范围**而不是 `DATE(created_at) = ...`（函数包列索引失效）；GROUP BY 的 `DATE()` 无妨——过滤已由范围完成。为它建 `(created_at)` 索引即可 range 扫描一个月的数据。数据量再大时，日报应落**汇总表**（每天定时聚合一次），而不是每次实时算——这是「空间换时间」在架构层的应用。
 

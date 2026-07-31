@@ -45,6 +45,23 @@ slave_read_only:1
 slave_repl_offset:4213      # 与主库 offset 一致 = 无延迟
 ```
 
+`INFO replication` 是复制排障的第一条命令，先在单实例上认清它的字段：
+
+<Playground
+  language="redis"
+  title="INFO replication：读懂复制状态"
+  id="redis-14-1"
+  code={`# 单实例: role 是 master、connected_slaves 为 0、没有 slave0 行
+# 关注 master_replid（血统标识）与 master_repl_offset（复制偏移量）
+INFO replication
+# 对本来就是主库的实例执行是空操作, 返回 OK
+REPLICAOF NO ONE`}
+/>
+
+<Callout type="info" title="主从实验请在本机做">
+本页沙箱只有一个孤立实例，起不了第二个节点，所以 REPLICAOF 建立复制、观察 Full resync 与 Partial resync、验证从库 READONLY 报错这些实验，需要用 Docker 起两个 Redis 自行演练（见章末练习）。
+</Callout>
+
 ## 2. 同步机制：全量与部分重同步
 
 ### 2.1 首次连接：全量同步

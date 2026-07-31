@@ -10,33 +10,67 @@ description: EXPIRE 家族、惰性删除与定期删除、maxmemory 八种淘�
 
 ## 1. 过期时间：EXPIRE 家族
 
-```bash
-127.0.0.1:6379> SET token:abc "data" EX 300     # 写入时直接带 TTL（推荐）
-OK
-127.0.0.1:6379> EXPIRE token:abc 600            # 重设为 600 秒
-(integer) 1
-127.0.0.1:6379> PEXPIRE token:abc 600000        # 毫秒版
-(integer) 1
-127.0.0.1:6379> EXPIREAT token:abc 1722400000   # 指定绝对时间戳(秒)
-(integer) 1
-127.0.0.1:6379> TTL token:abc
-(integer) 88000
-127.0.0.1:6379> PERSIST token:abc               # 移除 TTL
-(integer) 1
-127.0.0.1:6379> TTL token:abc
-(integer) -1
-```
+<Playground
+  language="redis"
+  title="EXPIRE 家族"
+  id="redis-10-1"
+  code={`# 写入时直接带 TTL（推荐）
+SET token:abc "data" EX 300
+TTL token:abc
+# 重设为 600 秒
+EXPIRE token:abc 600
+TTL token:abc
+# 毫秒版
+PEXPIRE token:abc 60000
+TTL token:abc
+# 指定绝对时间戳（秒），这里用 2100-01-01
+EXPIREAT token:abc 4102444800
+# 移除 TTL，之后 TTL 返回 -1
+PERSIST token:abc
+TTL token:abc`}
+/>
 
 Redis 7 的 EXPIRE 支持条件参数：`NX`（没有 TTL 才设置）、`XX`（有 TTL 才设置）、`GT`/`LT`（新 TTL 更长/更短才设置）：
 
-```bash
-127.0.0.1:6379> EXPIRE token:abc 100 NX
-(integer) 1
-127.0.0.1:6379> EXPIRE token:abc 50 GT
-(integer) 0             # 50 < 100, GT 条件不满足
-```
+<Playground
+  language="redis"
+  title="EXPIRE 的条件参数"
+  id="redis-10-2"
+  code={`SET token:abc "data"
+# NX：当前没有 TTL，设置成功
+EXPIRE token:abc 100 NX
+# NX：已经有 TTL 了，这次失败返回 0
+EXPIRE token:abc 200 NX
+# GT：50 小于 100，条件不满足
+EXPIRE token:abc 50 GT
+TTL token:abc
+# LT：50 小于 100，条件满足
+EXPIRE token:abc 50 LT
+TTL token:abc`}
+/>
 
-注意会**清除 TTL** 的操作：`SET` 覆盖同名 key（除非带 KEEPTTL）、`GETSET`。而 `INCR`、`HSET`、`LPUSH` 等修改值内容的命令**不影响** TTL。`RENAME` 会把 TTL 带到新名字。
+注意会**清除 TTL** 的操作：`SET` 覆盖同名 key（除非带 KEEPTTL）、`GETSET`。而 `INCR`、`HSET`、`LPUSH` 等修改值内容的命令**不影响** TTL。`RENAME` 会把 TTL 带到新名字。跑一遍就记住了：
+
+<Playground
+  language="redis"
+  title="哪些命令会清掉 TTL"
+  id="redis-10-3"
+  code={`SET counter 1 EX 300
+TTL counter
+# INCR 只改内容，不影响 TTL
+INCR counter
+TTL counter
+# SET 覆盖会清掉 TTL，变成 -1
+SET counter 100
+TTL counter
+# 带 KEEPTTL 则保留原有 TTL
+SET counter 5 EX 300
+SET counter 50 KEEPTTL
+TTL counter
+# RENAME 会把 TTL 带到新名字
+RENAME counter counter2
+TTL counter2`}
+/>
 
 ## 2. 过期的 key 什么时候真正被删？
 
@@ -149,12 +183,21 @@ lfu-decay-time 1       # 每 1 分钟衰减 1 点
 
 用 `OBJECT FREQ`（LFU 模式下）或 `OBJECT IDLETIME`（LRU 模式下）可以观察 key 的热度：
 
-```bash
-127.0.0.1:6379> OBJECT FREQ hot:key
-(integer) 42
-127.0.0.1:6379> OBJECT IDLETIME cold:key
-(integer) 86400         # 一天没被访问过
-```
+<Playground
+  language="redis"
+  title="观察 key 的热度"
+  id="redis-10-4"
+  code={`# LRU 模式下用 IDLETIME 看"多久没被访问"（秒）
+CONFIG SET maxmemory-policy allkeys-lru
+SET cold:key "v"
+OBJECT IDLETIME cold:key
+# 切到 LFU 模式后用 FREQ 看访问频率计数
+CONFIG SET maxmemory-policy allkeys-lfu
+SET hot:key "v"
+GET hot:key
+GET hot:key
+OBJECT FREQ hot:key`}
+/>
 
 ## 小结
 

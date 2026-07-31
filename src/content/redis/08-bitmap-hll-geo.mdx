@@ -14,44 +14,45 @@ Bitmap 本质是 String，把它当作 bit 数组来操作。一个 512 MB 的 S
 
 ### 1.1 基本操作
 
-```bash
-127.0.0.1:6379> SETBIT sign:u1001:202607 0 1     # 7 月 1 日(偏移 0)签到
-(integer) 0             # 返回该位的旧值
-127.0.0.1:6379> SETBIT sign:u1001:202607 1 1     # 7 月 2 日签到
-(integer) 0
-127.0.0.1:6379> SETBIT sign:u1001:202607 29 1    # 7 月 30 日签到
-(integer) 0
-127.0.0.1:6379> GETBIT sign:u1001:202607 1
-(integer) 1             # 7 月 2 日签过
-127.0.0.1:6379> GETBIT sign:u1001:202607 2
-(integer) 0             # 7 月 3 日没签
-127.0.0.1:6379> BITCOUNT sign:u1001:202607
-(integer) 3             # 本月共签到 3 天
-127.0.0.1:6379> BITPOS sign:u1001:202607 1
-(integer) 0             # 第一个 1 的位置: 首次签到日
-```
+<Playground
+  language="redis"
+  title="Bitmap 实现月签到"
+  id="redis-08-1"
+  code={`# 7 月 1 日（偏移 0）签到，返回该位的旧值
+SETBIT sign:u1001:202607 0 1
+# 7 月 2 日签到
+SETBIT sign:u1001:202607 1 1
+# 7 月 30 日签到
+SETBIT sign:u1001:202607 29 1
+# 7 月 2 日签过
+GETBIT sign:u1001:202607 1
+# 7 月 3 日没签
+GETBIT sign:u1001:202607 2
+# 本月共签到几天
+BITCOUNT sign:u1001:202607
+# 第一个 1 的位置：首次签到日
+BITPOS sign:u1001:202607 1`}
+/>
 
 一个用户一个月的签到只占 31 bit ≈ 4 字节；1 亿用户的月签到约 400 MB，而用 Set 存"签到用户 ID"要几十 GB。
 
 ### 1.2 位运算：BITOP
 
-```bash
-# day1 / day2 分别是两天的活跃用户位图（偏移=用户ID）
-127.0.0.1:6379> SETBIT active:day1 1001 1
-(integer) 0
-127.0.0.1:6379> SETBIT active:day1 1002 1
-(integer) 0
-127.0.0.1:6379> SETBIT active:day2 1002 1
-(integer) 0
-127.0.0.1:6379> BITOP AND active:both active:day1 active:day2
-(integer) 126           # 连续两天都活跃的用户位图
-127.0.0.1:6379> BITCOUNT active:both
-(integer) 1             # 连续活跃人数
-127.0.0.1:6379> BITOP OR active:any active:day1 active:day2
-(integer) 126
-127.0.0.1:6379> BITCOUNT active:any
-(integer) 2             # 两天内活跃过的总人数（精确去重）
-```
+<Playground
+  language="redis"
+  title="BITOP 算连续活跃与总活跃"
+  id="redis-08-2"
+  code={`# day1 / day2 分别是两天的活跃用户位图（偏移即用户 ID）
+SETBIT active:day1 1001 1
+SETBIT active:day1 1002 1
+SETBIT active:day2 1002 1
+# AND：连续两天都活跃的用户位图
+BITOP AND active:both active:day1 active:day2
+BITCOUNT active:both
+# OR：两天内活跃过的总人数（精确去重）
+BITOP OR active:any active:day1 active:day2
+BITCOUNT active:any`}
+/>
 
 `BITOP` 支持 AND/OR/XOR/NOT，连续 N 天活跃、留存率计算都是几条位运算的事。
 
@@ -65,19 +66,22 @@ Bitmap 本质是 String，把它当作 bit 数组来操作。一个 512 MB 的 S
 
 ### 2.1 使用
 
-```bash
-127.0.0.1:6379> PFADD uv:20260730 u1 u2 u3
-(integer) 1             # 1 表示估算值发生了变化
-127.0.0.1:6379> PFADD uv:20260730 u2
-(integer) 0             # 重复元素不影响
-127.0.0.1:6379> PFCOUNT uv:20260730
-(integer) 3
-# 合并多天得到周 UV（去重合并，不是相加）
-127.0.0.1:6379> PFMERGE uv:week1 uv:20260728 uv:20260729 uv:20260730
-OK
-127.0.0.1:6379> PFCOUNT uv:week1
-(integer) 3
-```
+<Playground
+  language="redis"
+  title="HyperLogLog 估算 UV"
+  id="redis-08-3"
+  code={`# 返回 1 表示估算值发生了变化
+PFADD uv:20260730 u1 u2 u3
+# 重复元素不影响，返回 0
+PFADD uv:20260730 u2
+PFCOUNT uv:20260730
+PFADD uv:20260729 u3 u4
+# 合并多天得到周 UV：去重合并，不是相加
+PFMERGE uv:week1 uv:20260729 uv:20260730
+PFCOUNT uv:week1
+# HLL 底层就是 String，看一眼类型
+TYPE uv:week1`}
+/>
 
 只有三个命令：PFADD 添加、PFCOUNT 估算基数、PFMERGE 合并。注意 **HLL 只能给出数量，无法回答"某个用户来过没有"**——它根本不存储元素本身。
 
@@ -104,17 +108,21 @@ GEO 把经纬度通过 **GeoHash 编码成 52 bit 整数存进 ZSet 的 score**�
 
 ### 3.1 写入与查询
 
-```bash
-127.0.0.1:6379> GEOADD riders 121.4737 31.2304 "rider:1"
-(integer) 1
-127.0.0.1:6379> GEOADD riders 121.4837 31.2404 "rider:2" 121.5037 31.2104 "rider:3"
-(integer) 2
-127.0.0.1:6379> GEOPOS riders rider:1
-1) 1) "121.47370249032974243"
-   2) "31.23039901743481792"    # 编码解码有厘米级精度损失
-127.0.0.1:6379> GEODIST riders rider:1 rider:2 km
-"1.4453"                # 两点距离 1.45 公里
-```
+<Playground
+  language="redis"
+  title="GEO 写入与半径搜索"
+  id="redis-08-4"
+  code={`GEOADD riders 121.4737 31.2304 "rider:1"
+GEOADD riders 121.4837 31.2404 "rider:2" 121.5037 31.2104 "rider:3"
+# 编码解码有厘米级精度损失
+GEOPOS riders rider:1
+# 两点距离，单位 km
+GEODIST riders rider:1 rider:2 km
+# 以坐标为圆心找 3 公里内的骑手，按距离升序
+GEOSEARCH riders FROMLONLAT 121.4737 31.2304 BYRADIUS 3 km ASC WITHDIST
+# GEO 底层就是 ZSet
+TYPE riders`}
+/>
 
 ### 3.2 半径搜索：GEOSEARCH（6.2+，替代 GEORADIUS）
 

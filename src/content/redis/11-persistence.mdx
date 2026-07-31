@@ -32,6 +32,26 @@ OK
 (integer) 1722310000
 ```
 
+持久化策略是**运行时可查**的，先看看当前实例被配置成了什么样：
+
+<Playground
+  language="redis"
+  title="查看持久化配置"
+  id="redis-11-1"
+  code={`# save 为空 = 关闭了自动 RDB 快照（本页沙箱是纯内存实例）
+CONFIG GET save
+# AOF 是否开启
+CONFIG GET appendonly
+# AOF 的 fsync 策略
+CONFIG GET appendfsync
+# 上次成功快照的 UNIX 时间戳
+LASTSAVE`}
+/>
+
+<Callout type="info" title="沙箱说明">
+本页的在线沙箱每次运行都会新起一个纯内存实例（save 为空、appendonly 为 no），所以 BGSAVE、BGREWRITEAOF、重启恢复这类实验请在自己的机器上做——它们要落盘、要重启，一次性容器演示不了。
+</Callout>
+
 ### 1.2 fork + 写时复制（COW）
 
 BGSAVE 时主进程 fork 出一个子进程，由子进程遍历内存写文件。关键问题：**子进程写文件要几十秒，期间主进程还在改数据，快照会不会脏？**
