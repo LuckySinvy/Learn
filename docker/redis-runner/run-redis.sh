@@ -27,8 +27,10 @@ while IFS= read -r line || [ -n "$line" ]; do
     \#*) continue ;;
   esac
   printf '127.0.0.1:6379> %s\n' "$trimmed"
-  # eval 以支持带引号参数：SET greeting "hello world"
-  out=$(eval "redis-cli --no-raw $trimmed" 2>&1)
+  # 用管道把整行喂给 redis-cli，由它自己做分词与引号解析。
+  # 不能用 eval：shell 会展开 ~（XADD MAXLEN ~ 1000）、把 ( 当语法错误
+  # （ZRANGEBYSCORE 的开区间 (90），也会吃掉引号。
+  out=$(printf '%s\n' "$trimmed" | redis-cli --no-raw 2>&1)
   rc=$?
   printf '%s\n' "$out"
   # redis-cli 对 -ERR 回复仍返回 0，需自行识别，否则 UI 会误报"执行成功"
