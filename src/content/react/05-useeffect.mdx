@@ -1,0 +1,468 @@
+---
+title: useEffect 与副作用
+order: 5
+description: 副作用的定义与时机、依赖数组的比较规则、清理函数的执行顺序、闭包陷阱，以及大多数场景其实不需要 effect
+---
+
+# useEffect 与副作用
+
+`useEffect` 是 React 里最容易误用的 Hook。它看起来像「生命周期钩子」，但它不是；它看起来能「监听某个值的变化」，但那通常是错误的用法。这一章先讲清楚它是什么，再讲什么时候**不该**用它。
+
+## 1. 什么是副作用
+
+### 1.1 定义
+
+第 3 章说过组件必须是纯函数：给定相同输入，返回相同输出，不影响外部世界。但真实应用总要做一些「影响外部世界」的事：
+
+- 发起网络请求
+- 订阅 WebSocket、事件监听、定时器
+- 手动操作 DOM（聚焦输入框、测量尺寸、集成第三方图表库）
+- 读写 localStorage
+- 修改文档标题
+
+这些统称**副作用**。它们不能写在渲染期间，必须放到两个地方之一：**事件处理函数**，或者 **useEffect**。
+
+### 1.2 优先考虑事件处理函数
+
+这是最重要的判断：**这个副作用是由「某个具体的用户操作」引起的，还是由「组件出现在屏幕上」引起的？**
+
+| 场景 | 归属 |
+|---|---|
+| 点击提交按钮发请求 | 事件处理函数 |
+| 组件挂载后拉取列表数据 | useEffect |
+| 点击后写入 localStorage | 事件处理函数 |
+| 订阅一个外部数据源 | useEffect |
+| 表单提交成功后跳转 | 事件处理函数 |
+| 根据 props 同步文档标题 | useEffect |
+
+初学者常犯的错是「点击按钮 → 改一个 state → 用 effect 监听这个 state → 在 effect 里发请求」。这中间的绕行毫无必要，而且带来了额外的渲染和时序问题。**能写在事件里就写在事件里。**
+
+## 2. useEffect 的基本用法
+
+### 2.1 三种依赖形式
+
+```tsx
+// 形式一：没有依赖数组 —— 每次渲染后都执行
+useEffect(() => {
+  console.log("每次渲染都跑");
+});
+
+// 形式二：空数组 —— 只在挂载后执行一次
+useEffect(() => {
+  console.log("只在挂载后跑一次");
+}, []);
+
+// 形式三：有依赖 —— 依赖变化时执行
+useEffect(() => {
+  document.title = "共 " + count + " 项";
+}, [count]);
+```
+
+执行时机是**在渲染结果被提交到 DOM 之后**，浏览器绘制之前（对于 `useEffect` 是绘制之后异步执行；需要在绘制前同步执行的用 `useLayoutEffect`，第 7 章会讲）。
+
+### 2.2 清理函数
+
+effect 可以返回一个函数，React 会在「下次执行这个 effect 之前」和「组件卸载时」调用它：
+
+```tsx
+useEffect(() => {
+  const timer = setInterval(() => tick(), 1000);
+  return () => clearInterval(timer);
+}, []);
+
+useEffect(() => {
+  const socket = connect(roomId);
+  socket.on("message", onMessage);
+  return () => socket.close();
+}, [roomId]);
+```
+
+第二个例子的完整时序值得记住：roomId 从 A 变成 B 时，React 会先执行**上一次**的清理（关闭 A 的连接），再执行新的 effect（连接 B）。所以「一个 effect 里建立的资源，一定在同一个 effect 的清理函数里释放」——这个配对关系是自洽的，不需要额外记录状态。
+
+<Callout type="warn" title="忘记清理是内存泄漏的第一大来源">
+定时器、事件监听、订阅、AbortController，只要是「会持续存在」的东西，都必须清理。忘记清理的典型症状是：路由切走后控制台报「不能在已卸载组件上更新 state」，或者页面用久了越来越卡（定时器越积越多）。
+</Callout>
+
+### 2.3 严格模式会执行两次
+
+React 18 的开发模式下，`StrictMode` 会把每个 effect 执行两遍：挂载 → 清理 → 再挂载。这不是 bug，是**故意的压力测试**——用来暴露「没有正确清理」的 effect。
+
+如果你的 effect 在执行两次后行为异常（比如数据重复了、连接建立了两个），说明清理逻辑有问题。生产构建不会有这个行为，但不要因此就把 StrictMode 关掉。
+
+## 3. 依赖数组的规则
+
+### 3.1 比较方式是浅比较 + Object.is
+
+React 保存上一次的依赖数组，和这次的逐位比较。只要有一位 `Object.is` 判定不同，就重新执行 effect。
+
+这意味着：
+
+```tsx
+// 每次渲染 options 都是新对象 → 依赖永远"变了" → effect 每次都跑
+const options = { limit: 10 };
+useEffect(() => {
+  fetchData(options);
+}, [options]);
+```
+
+对象、数组、函数字面量在每次渲染都是新引用，放进依赖数组等于没写依赖数组。解决办法有三种：把依赖拆成原始值（`[options.limit]`）、把对象移到组件外、或者用 `useMemo` 缓存（第 7 章）。
+
+### 3.2 亲手实现依赖比较
+
+下面这段纯 TypeScript 代码复刻了 React 内部的 effect 调度：依赖比较、执行、清理。跑一遍就能彻底搞清楚「什么时候会重新执行」。
+
+<Playground
+  language="typescript"
+  title="迷你 useEffect：依赖比较与清理"
+  id="react-05-1"
+  code={`type Deps = readonly unknown[] | null;
+type Cleanup = (() => void) | null;
+
+interface EffectSlot {
+  deps: Deps;
+  cleanup: Cleanup;
+}
+
+// React 内部为每个组件保存一组 effect 槽位
+const slots: EffectSlot[] = [];
+let cursor = 0;
+
+// 这就是依赖数组的比较规则：长度相同 + 逐位 Object.is
+function depsChanged(prev: Deps, next: Deps): boolean {
+  if (prev === null || next === null) return true; // 没写依赖数组，每次都跑
+  if (prev.length !== next.length) return true;
+  for (let i = 0; i < prev.length; i++) {
+    if (!Object.is(prev[i], next[i])) return true;
+  }
+  return false;
+}
+
+function useEffectMini(name: string, fn: () => Cleanup, deps: Deps): void {
+  const index = cursor;
+  cursor++;
+
+  const slot: EffectSlot | undefined = slots[index];
+
+  if (slot === undefined) {
+    console.log("  [" + name + "] 首次挂载，执行");
+    slots[index] = { deps: deps, cleanup: fn() };
+    return;
+  }
+
+  if (!depsChanged(slot.deps, deps)) {
+    console.log("  [" + name + "] 依赖未变，跳过");
+    return;
+  }
+
+  console.log("  [" + name + "] 依赖变了 -> 先清理上一次");
+  if (slot.cleanup !== null) slot.cleanup();
+  console.log("  [" + name + "] 再执行新的");
+  slot.deps = deps;
+  slot.cleanup = fn();
+}
+
+// 模拟一个组件：roomId 变化时重连，config 是每次渲染新建的对象
+function renderComponent(roomId: string): void {
+  cursor = 0; // 每次渲染前重置游标
+
+  useEffectMini(
+    "socket",
+    function () {
+      console.log("      connect(" + roomId + ")");
+      return function () {
+        console.log("      close(" + roomId + ")");
+      };
+    },
+    [roomId]
+  );
+
+  // 陷阱示范：对象字面量每次渲染都是新引用
+  const config = { limit: 10 };
+  useEffectMini(
+    "fetch",
+    function () {
+      console.log("      fetch(limit=" + config.limit + ")");
+      return null;
+    },
+    [config]
+  );
+}
+
+console.log("渲染 1: roomId=A");
+renderComponent("A");
+console.log("渲染 2: roomId=A （只是父组件重渲染）");
+renderComponent("A");
+console.log("渲染 3: roomId=B");
+renderComponent("B");
+
+console.log("组件卸载，执行所有清理");
+for (const s of slots) {
+  if (s.cleanup !== null) s.cleanup();
+}`}
+  expectedOutput={`渲染 1: roomId=A\n  [socket] 首次挂载，执行\n      connect(A)\n  [fetch] 首次挂载，执行\n      fetch(limit=10)\n渲染 2: roomId=A （只是父组件重渲染）\n  [socket] 依赖未变，跳过\n  [fetch] 依赖变了 -> 先清理上一次\n  [fetch] 再执行新的\n      fetch(limit=10)\n渲染 3: roomId=B\n  [socket] 依赖变了 -> 先清理上一次\n      close(A)\n  [socket] 再执行新的\n      connect(B)\n  [fetch] 依赖变了 -> 先清理上一次\n  [fetch] 再执行新的\n      fetch(limit=10)\n组件卸载，执行所有清理\n      close(B)`}
+/>
+
+注意「渲染 2」的输出：`roomId` 没变，socket 正确跳过了；但 `config` 因为是新对象，`fetch` 白跑了一次。真实项目里这就是「接口被重复请求」的常见原因。
+
+### 3.3 不要对 lint 规则说谎
+
+`react-hooks/exhaustive-deps` 会检查 effect 里用到的所有响应式值是否都在依赖数组里。它偶尔会误报，但**九成情况下它是对的**。
+
+```tsx
+// 危险：明明用了 userId 却不声明，userId 变化时不会重新请求
+useEffect(() => {
+  fetchUser(userId).then(setUser);
+}, []);  // eslint-disable-next-line ← 不要这样做
+```
+
+想减少依赖，正确的方向是**改代码结构**，而不是删依赖：
+
+- 把不需要响应的逻辑移出 effect
+- 用函数式更新去掉对 state 的依赖：`setCount(c => c + 1)` 而不是 `setCount(count + 1)`
+- 把函数移进 effect 内部，或用 `useCallback` 稳定它
+- 把对象依赖拆成原始值
+
+## 4. 闭包陷阱
+
+### 4.1 过期的闭包
+
+```tsx
+function Timer() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setCount(count + 1);   // 永远是 0 + 1
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);   // 空依赖，effect 只跑一次
+
+  return <p>{count}</p>;
+}
+```
+
+数字停在 1 不动了。原因是 effect 只在挂载时执行过一次，它内部的箭头函数**捕获了第一次渲染时的 count（值为 0）**。之后 count 变成 1、2、3，但定时器里的闭包看到的永远是那个 0。
+
+这就是「闭包陷阱」：**每次渲染都有自己独立的一套变量，effect 捕获的是它被创建那次渲染的变量。**
+
+三种解法：
+
+```tsx
+// 解法一：函数式更新，不再依赖外部的 count（推荐）
+useEffect(() => {
+  const id = setInterval(() => setCount((c) => c + 1), 1000);
+  return () => clearInterval(id);
+}, []);
+
+// 解法二：把 count 加进依赖（每秒重建定时器，可行但浪费）
+useEffect(() => {
+  const id = setInterval(() => setCount(count + 1), 1000);
+  return () => clearInterval(id);
+}, [count]);
+
+// 解法三：用 ref 保存最新值（第 7 章会详细讲）
+const countRef = useRef(count);
+countRef.current = count;
+```
+
+### 4.2 竞态条件
+
+异步请求带来另一类问题：请求 A 先发出，请求 B 后发出，但 B 先返回、A 后返回，结果界面显示的是过期的 A 的数据。
+
+```tsx
+// 有 bug 的版本
+useEffect(() => {
+  fetchUser(userId).then(setUser);
+}, [userId]);
+```
+
+用清理函数加一个「忽略标记」解决：
+
+```tsx
+useEffect(() => {
+  let ignore = false;
+
+  fetchUser(userId).then((data) => {
+    if (!ignore) setUser(data);
+  });
+
+  return () => {
+    ignore = true;
+  };
+}, [userId]);
+```
+
+或者用 AbortController 直接取消请求：
+
+```tsx
+useEffect(() => {
+  const ctrl = new AbortController();
+
+  fetch("/api/users/" + userId, { signal: ctrl.signal })
+    .then((r) => r.json())
+    .then(setUser)
+    .catch((e) => {
+      if (e.name !== "AbortError") setError(e);
+    });
+
+  return () => ctrl.abort();
+}, [userId]);
+```
+
+<Callout type="tip" title="这就是为什么大家用数据请求库">
+竞态、缓存、重试、加载态、错误态、聚焦刷新、去重……手写 effect 请求要处理的边界情况多得离谱。第 16 章会讲 TanStack Query 这类库如何把这些问题一次性解决。
+</Callout>
+
+## 5. 你可能不需要 effect
+
+这是 React 官方文档专门用一整篇讲的主题，也是本章最有价值的部分。
+
+### 5.1 反模式一：用 effect 计算派生数据
+
+```tsx
+// 不好
+const [items, setItems] = useState<Item[]>([]);
+const [total, setTotal] = useState(0);
+
+useEffect(() => {
+  setTotal(items.reduce((s, i) => s + i.price, 0));
+}, [items]);
+
+// 好：渲染时直接算
+const total = items.reduce((s, i) => s + i.price, 0);
+```
+
+坏处不只是多写代码：effect 版本会多触发一次渲染（先渲染出旧 total，再更新），而且 `total` 和 `items` 之间存在一帧的不一致。
+
+如果计算真的很昂贵，用 `useMemo` 而不是 effect。
+
+### 5.2 反模式二：用 effect 响应用户事件
+
+```tsx
+// 不好
+const [submitted, setSubmitted] = useState(false);
+useEffect(() => {
+  if (submitted) {
+    post("/api/order", data);
+    setSubmitted(false);
+  }
+}, [submitted]);
+
+// 好
+function handleSubmit() {
+  post("/api/order", data);
+}
+```
+
+### 5.3 反模式三：用 effect 同步 props 到 state
+
+```tsx
+// 不好
+const [value, setValue] = useState(props.value);
+useEffect(() => {
+  setValue(props.value);
+}, [props.value]);
+```
+
+如果只是想「props 变了就重置」，用第 2 章的 key 技巧；如果需要同时保留本地编辑能力，考虑「记录上一次的 props 值」这种模式，或者干脆把状态提升到父组件（第 11 章）。
+
+### 5.4 反模式四：用 effect 通知父组件
+
+```tsx
+// 不好：先改 state，再用 effect 通知外面
+const [isOpen, setIsOpen] = useState(false);
+useEffect(() => {
+  onToggle(isOpen);
+}, [isOpen]);
+
+// 好：在事件里一起做
+function toggle() {
+  const next = !isOpen;
+  setIsOpen(next);
+  onToggle(next);
+}
+```
+
+### 5.5 那什么时候该用 effect
+
+只剩下一类场景：**和 React 之外的系统同步**。
+
+- 订阅浏览器 API（resize、online/offline、媒体查询）
+- 建立和关闭连接（WebSocket、SSE）
+- 集成命令式的第三方库（地图、图表、编辑器）
+- 组件出现时就要发生的数据获取（更推荐交给数据请求库或框架）
+- 手动操作 DOM（聚焦、滚动、测量）
+
+判断口诀：**如果去掉 effect，React 树内部的数据流依然完整，那这个 effect 多半是多余的。**
+
+## 6. 一个完整的 effect 示例
+
+```tsx
+function useOnlineStatus(): boolean {
+  const [online, setOnline] = useState(() => navigator.onLine);
+
+  useEffect(() => {
+    function up() {
+      setOnline(true);
+    }
+    function down() {
+      setOnline(false);
+    }
+
+    window.addEventListener("online", up);
+    window.addEventListener("offline", down);
+
+    // 订阅后立刻同步一次，避免订阅前发生的变化被漏掉
+    setOnline(navigator.onLine);
+
+    return () => {
+      window.removeEventListener("online", up);
+      window.removeEventListener("offline", down);
+    };
+  }, []);
+
+  return online;
+}
+```
+
+这个例子集齐了所有要素：外部系统、订阅与取消订阅配对、空依赖数组（订阅目标不随 props 变化）、初始值同步。注意它已经被抽成了一个自定义 Hook——这是下一章的主题。
+
+<Callout type="exercise" title="练习 1：判断归属">
+下面每个副作用应该放在事件处理函数还是 useEffect 里？说明理由：
+
+1. 用户点击「收藏」，调接口并弹 toast
+2. 商品详情页打开时，上报一条浏览埋点
+3. 搜索框输入时，300ms 防抖后请求联想词
+4. 弹窗打开时禁止页面滚动，关闭时恢复
+5. 表单保存成功后跳转到列表页
+</Callout>
+
+<Callout type="exercise" title="练习 2：修复闭包陷阱">
+一个组件里有 `const [seconds, setSeconds] = useState(0)` 和 `const [step, setStep] = useState(1)`，effect 里用 setInterval 每秒执行 `setSeconds(seconds + step)`，依赖数组为空。
+
+这段代码有两个问题：秒数不增长，以及改变 step 后不生效。请给出两种不同的修复方案，并分析各自的代价（定时器是否会被重建）。
+</Callout>
+
+<Callout type="exercise" title="练习 3：消除多余的 effect">
+一个搜索页有 state：`query`、`allItems`、`filteredItems`、`isEmpty`。目前用两个 effect 分别在 query 变化时更新 filteredItems、在 filteredItems 变化时更新 isEmpty。
+
+重写这个组件，去掉所有 effect。说明你删掉了哪些 state。
+</Callout>
+
+<Callout type="exercise" title="练习 4：扩展 Playground">
+在本章的 Playground 里增加一个 useEffectMini 调用，依赖数组传 `null`（表示没写依赖数组），观察它在三次渲染中的行为。
+
+然后修复 fetch 那个 effect 的重复执行问题：把依赖从 `[config]` 改成 `[config.limit]`，重新运行看输出变化。
+</Callout>
+
+## 小结
+
+- 副作用只能放在**事件处理函数**或 **useEffect** 里，绝不能写在渲染期间
+- 优先问「这是用户操作引起的，还是组件出现引起的」——前者放事件里
+- 依赖数组用 `Object.is` 逐位浅比较；对象、数组、函数字面量每次渲染都是新引用
+- 清理函数在「下次执行前」和「卸载时」调用；建立与释放必须在同一个 effect 里配对
+- StrictMode 下 effect 执行两次是**故意的**，用于暴露清理缺陷
+- 闭包陷阱：effect 捕获的是它创建那次渲染的变量；用函数式更新或 ref 破解
+- 异步请求要处理**竞态**，用 ignore 标记或 AbortController
+- **大多数 effect 都是多余的**：派生数据现算、事件逻辑写事件里、props 同步用 key
+- 下一章讲 Hooks 的实现原理，你会明白为什么不能条件调用 →

@@ -1,0 +1,302 @@
+---
+title: 撤销与回退：restore、reset 三模式与 revert
+order: 4
+description: 改错了怎么救——按"改动在哪个区"选对撤销命令，以及 reset 与 revert 的本质区别
+---
+
+# 撤销与回退：restore、reset 三模式与 revert
+
+"我改错了，怎么退回去"是 Git 最高频的问题，也是最容易操作失误、把事情搞得更糟的地方。混乱的根源在于 Git 有五六个命令都能"撤销"，但它们作用在不同的区、后果完全不同。
+
+破解方法只有一条：**先问自己"我要撤销的东西现在在哪个区"，再选命令。**
+
+```text
+     工作区              暂存区              仓库(已提交)
+        |                   |                    |
+  git restore <f>    git restore --staged   reset / revert / amend
+   丢弃未暂存改动       取消暂存(改动保留)      回退或反做提交
+```
+
+## 1. 改动还在工作区：git restore
+
+<Playground
+  language="git"
+  title="restore：丢弃工作区改动 / 取消暂存"
+  id="git-04-1"
+  code={`git init -q
+echo 'good' > a.txt
+echo 'good' > b.txt
+git add . && git commit -q -m "init"
+
+echo '===== 场景1：文件改坏了，想丢弃改动 ====='
+echo 'OOPS 改坏了' > a.txt
+git status --short
+git restore a.txt
+echo 'restore 后 a.txt 内容：' && cat a.txt
+git status --short
+echo '(没有输出 = 干净了)'
+echo
+
+echo '===== 场景2：add 错了，想取消暂存但保留改动 ====='
+echo 'wip' > b.txt
+git add b.txt
+echo 'add 之后：' && git status --short
+git restore --staged b.txt
+echo 'restore --staged 之后：' && git status --short
+echo 'b.txt 内容仍然是：' && cat b.txt
+echo '(只是从暂存区退回工作区，内容没丢)'
+echo
+
+echo '===== 场景3：把文件恢复成某个历史提交的样子 ====='
+echo 'v2' > a.txt && git add . && git commit -q -m "v2"
+echo 'v3' > a.txt && git add . && git commit -q -m "v3"
+echo '当前 a.txt：' && cat a.txt
+git restore --source=HEAD~2 a.txt
+echo '恢复到 HEAD~2 后：' && cat a.txt
+git status --short
+echo '(恢复的内容作为「未暂存改动」出现，你可以决定要不要提交)'`}
+/>
+
+| 命令 | 作用 | 危险性 |
+|---|---|---|
+| `git restore <file>` | 用暂存区内容覆盖工作区，丢弃未暂存改动 | **高**：改动无法找回 |
+| `git restore --staged <file>` | 用 HEAD 覆盖暂存区，改动退回工作区 | 低 |
+| `git restore --staged --worktree <file>` | 两个区一起重置到 HEAD | **高** |
+| `git restore --source=<commit> <file>` | 用指定提交的版本覆盖工作区 | 中 |
+| `git restore .` | 对当前目录所有文件生效 | **高** |
+
+<Callout type="warn" title="git restore 丢弃的改动找不回来">
+未提交的改动不在 Git 的任何存储里，`git restore` 覆盖后就是真的没了——`reflog` 也救不了（第 14 章会说明为什么）。如果你只是"暂时不想要这些改动"，用 `git stash`（第 9 章）而不是 `restore`，stash 是可以找回来的。
+</Callout>
+
+<Callout type="info" title="restore / switch 与老命令 checkout">
+`git checkout` 一个命令干了三件不相干的事：切分支、恢复文件、检出提交。Git 2.23 把它拆成了两个语义清晰的新命令：
+
+- `git switch` 负责切分支
+- `git restore` 负责恢复文件
+
+老教程里的 `git checkout -- file.txt` 等价于 `git restore file.txt`；`git checkout branch` 等价于 `git switch branch`。`checkout` 仍然可用（也没有废弃计划），但新代码建议用新命令，语义更明确、更不容易误操作。
+</Callout>
+
+## 2. 已经提交了：reset 的三种模式
+
+`git reset <commit>` 做的事是**把当前分支指针移到 `<commit>`**。三个模式的区别只在于"移动指针之后，暂存区和工作区怎么办"：
+
+```text
+                    移动分支指针   重置暂存区   重置工作区
+git reset --soft       是            否          否
+git reset --mixed      是            是          否     <- 默认
+git reset --hard       是            是          是     <- 危险
+```
+
+眼见为实——同样的仓库、同样的 `HEAD~1`，三种模式跑一遍：
+
+<Playground
+  language="git"
+  title="reset 三模式对照实验"
+  id="git-04-2"
+  code={`setup() {
+  git init -q $1 && cd $1
+  for i in 1 2 3; do
+    echo "v$i" > f.txt
+    git add . && git commit -q -m "commit-$i"
+  done
+  # 制造一个已暂存的未提交改动
+  echo 'uncommitted-edit' >> f.txt
+  git add f.txt
+  cd ..
+}
+
+for MODE in soft mixed hard; do
+  setup r-$MODE
+  cd r-$MODE
+  echo "########## git reset --$MODE HEAD~1 ##########"
+  echo '--- 重置前：3 个提交 + 1 个已暂存改动 ---'
+  git log --oneline | head -3
+  git status --short
+  git reset --$MODE HEAD~1 >/dev/null 2>&1
+  echo '--- 重置后 ---'
+  echo 'log:'
+  git log --oneline | head -3
+  echo 'status:'
+  git status --short
+  echo 'f.txt 内容:'
+  cat f.txt
+  echo
+  cd ..
+done`}
+/>
+
+对照三段输出：
+
+| 模式 | log | status | f.txt |
+|---|---|---|---|
+| `--soft` | 退到 commit-2 | `M ` 已暂存 | 仍是 v3 + 编辑 |
+| `--mixed` | 退到 commit-2 | ` M` 未暂存 | 仍是 v3 + 编辑 |
+| `--hard` | 退到 commit-2 | 干净 | **变回 v2，全丢** |
+
+解读：
+
+- **`--soft`**：只回退提交，commit-3 的内容原封不动留在暂存区。这是"上一个提交拆了重来"的标准做法——`git reset --soft HEAD~1` 之后可以重新组织、重新写提交信息再 commit。
+- **`--mixed`**（默认）：回退提交，内容退到工作区。适合"这几个提交我要重新拆分"。
+- **`--hard`**：一切抹平。**唯一会丢失工作成果的模式**。
+
+### 2.1 reset 的典型用法
+
+```bash
+# 撤销上一个提交，内容留在暂存区，准备重新提交
+git reset --soft HEAD~1
+
+# 把最近 3 个提交合并成 1 个（软退 3 步再提交一次）
+git reset --soft HEAD~3
+git commit -m "feat: 完整的功能实现"
+
+# 取消暂存（reset 的老写法，等价于 git restore --staged）
+git reset HEAD file.txt
+
+# 彻底放弃本地所有改动，回到远程的样子（危险但常用）
+git reset --hard origin/main
+```
+
+<Callout type="warn" title="--hard 是全课最危险的命令">
+`git reset --hard` 会同时丢弃：未提交的工作区改动、暂存区内容、被跳过的那些提交（在工作区层面）。
+
+好消息是**已提交的内容仍能通过 `git reflog` 找回**（第 14 章专讲）；坏消息是**未提交的改动彻底消失**，任何手段都救不回来。
+
+执行前的自保动作：先跑一次 `git status`，确认没有你在乎的未提交改动；或者干脆先 `git stash` 一下。
+</Callout>
+
+## 3. 已经推送了：用 revert
+
+`reset` 是**改写历史**——它让某些提交从分支上消失。如果这些提交已经推到远程、别人已经拉走了，改写历史会造成灾难：他们下次 `pull` 会看到莫名其妙的冲突，或者把你删掉的提交又推回来。
+
+对于已推送的提交，正确做法是 `git revert`：**生成一个新提交，其内容是目标提交的反操作**。历史只增不减。
+
+<Playground
+  language="git"
+  title="revert：反向提交，历史只增不减"
+  id="git-04-3"
+  code={`git init -q
+echo 'feature A' > a.txt && git add . && git commit -q -m "feat: A"
+echo 'feature B 有bug' > b.txt && git add . && git commit -q -m "feat: B 带 bug"
+echo 'feature C' > c.txt && git add . && git commit -q -m "feat: C"
+
+echo '===== 当前状态 ====='
+git log --oneline
+echo '文件:' && ls
+echo
+
+echo '===== 只想撤销中间的 B（reset 会连 C 一起丢，所以只能 revert）====='
+BAD=$(git log --grep='B 带 bug' --format=%H)
+git revert --no-edit $BAD
+echo
+
+echo '===== 历史只增不减：多了一个反向提交，C 完好无损 ====='
+git log --oneline
+echo '文件（b.txt 没了，c.txt 还在）:' && ls
+echo
+
+echo '===== revert 掉那个 revert，就等于把 B 加回来 ====='
+git revert --no-edit HEAD
+git log --oneline
+echo '文件:' && ls`}
+/>
+
+`revert` 的常用参数：
+
+| 命令 | 作用 |
+|---|---|
+| `git revert <commit>` | 反做一个提交（会打开编辑器写信息） |
+| `git revert --no-edit <commit>` | 用默认信息，不打开编辑器 |
+| `git revert -n <commit>` | 只改工作区和暂存区，不自动提交（可连续 revert 多个后一起提交） |
+| `git revert <c1>..<c2>` | 反做一个范围 |
+| `git revert -m 1 <merge>` | 反做一个合并提交，`-m 1` 指定保留第一父线 |
+| `git revert --abort` | 反做过程中冲突了，放弃 |
+
+注意 `revert` 也可能产生冲突：如果目标提交之后有其他提交动过同一块代码，Git 无法自动反做，会停下来让你手工解决（第 6 章讲冲突处理）。
+
+## 4. 修补上一个提交：commit --amend
+
+刚提交完就发现提交信息写错了、或者漏了一个文件：
+
+```bash
+# 只改提交信息
+git commit --amend -m "fix(auth): 正确的提交信息"
+
+# 补一个漏掉的文件进上一个提交
+git add forgotten.py
+git commit --amend --no-edit      # --no-edit 表示沿用原来的提交信息
+```
+
+`--amend` 的本质**不是"修改"那个提交**——提交是不可变的。它是用新内容创建一个新提交，替换掉分支上的旧提交。所以它同样属于**改写历史**，同样只能对未推送的提交使用。
+
+<Callout type="tip" title="判断能不能改写历史的唯一标准">
+**这些提交推送过吗？别人可能基于它们工作吗？**
+
+- 只在本地：随便 `reset` / `amend` / `rebase`，怎么整理都行
+- 已推送到自己的个人分支、确认没人用：`push --force-with-lease` 也可以
+- 已推送到 main / develop 等公共分支：**只能 revert**
+
+这条规则在第 7 章会以"rebase 黄金法则"的形式再出现一次。
+</Callout>
+
+## 5. 场景对照表
+
+把上面所有命令收进一张表——这张表建议直接收藏：
+
+| 我想…… | 命令 |
+|---|---|
+| 丢弃某个文件的未暂存改动 | `git restore <file>` |
+| 丢弃所有未暂存改动 | `git restore .` |
+| 取消暂存，改动保留在工作区 | `git restore --staged <file>` |
+| 恢复文件到某个历史版本 | `git restore --source=<commit> <file>` |
+| 改上一个提交的信息 | `git commit --amend -m "..."` |
+| 往上一个提交补文件 | `git add <f> && git commit --amend --no-edit` |
+| 撤销上一个提交，内容留着重做 | `git reset --soft HEAD~1` |
+| 撤销最近 3 个提交，合并成 1 个 | `git reset --soft HEAD~3` + `git commit` |
+| 彻底回退到某个提交（丢弃之后的一切） | `git reset --hard <commit>` |
+| 撤销一个**已推送**的提交 | `git revert <commit>` |
+| 撤销一个已推送的**合并** | `git revert -m 1 <merge-commit>` |
+| 我 reset --hard 错了，想找回提交 | `git reflog` + `git reset --hard <找回的哈希>`（第 14 章） |
+| 删掉未跟踪的垃圾文件 | `git clean -n` 先预览，`git clean -fd` 真删 |
+
+<Callout type="warn" title="git clean 先加 -n">
+`git clean -fd` 删除所有未跟踪的文件和目录，**不经过回收站、不可恢复**。它经常误删你还没 add 的新文件、本地配置、日志。永远先用 `git clean -n`（dry run）看一遍要删什么，确认无误再去掉 `n`。
+</Callout>
+
+## 6. reset 与 revert 的本质对比
+
+```text
+原始历史：   A --- B --- C --- D (main)
+
+git reset --hard B:
+             A --- B (main)          C、D 从分支上消失（对象还在，靠 reflog 找）
+             
+git revert C:
+             A --- B --- C --- D --- C' (main)   C' 是 C 的反操作，历史完整保留
+```
+
+| | reset | revert |
+|---|---|---|
+| 历史 | 改写（提交消失） | 追加（新增反向提交） |
+| 能否用于已推送分支 | **不能** | 能 |
+| 能否只撤销中间某个提交 | 不能（会连带后面的） | 能 |
+| 留痕 | 无（历史上看不出发生过） | 有（Revert 提交明明白白） |
+| 适用场景 | 本地整理提交 | 生产回滚、公共分支纠错 |
+
+## 小结
+
+- 撤销前先定位：改动在工作区、暂存区，还是已提交？
+- 工作区/暂存区用 `git restore`；`--staged` 取消暂存，不加则丢弃改动（不可恢复）
+- `reset` 移动分支指针：`--soft` 只退提交、`--mixed` 连带清暂存区（默认）、`--hard` 连工作区一起抹平
+- `--hard` 是全课最危险的命令：已提交内容能靠 reflog 救，未提交改动救不回
+- 已推送的提交用 `revert` 生成反向提交，历史只增不减，团队安全
+- `commit --amend` 修补上一个提交，同属改写历史，只对未推送的提交用
+- 下一章：分支——Git 真正的杀手锏 →
+
+<Callout type="exercise" title="练习">
+1. 创建 3 个提交，然后分别用 `--soft` / `--mixed` / `--hard` 重置到 `HEAD~1`，每次都用 `git status --short` 和 `cat` 验证暂存区与工作区的差异，把结果填进本章那张三模式表格。
+2. 用 `git reset --soft HEAD~3` + `git commit` 把三个零碎提交合并成一个，用 `git log --oneline` 验证。
+3. 造一个 A→B→C 的历史，`revert` 掉中间的 B，观察 C 的内容是否受影响。然后再 `revert` 一次刚生成的 revert 提交，说明发生了什么。
+4. 判断题，说明理由：同事把一个含有密钥的提交推到了 main 分支，现在应该用 `reset --hard` 还是 `revert`？（提示：除了历史安全，还要考虑密钥已经泄露这个事实——两种做法都不能让密钥从远程历史里消失，正确动作是什么？）
+</Callout>

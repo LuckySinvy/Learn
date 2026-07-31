@@ -1,0 +1,425 @@
+---
+title: 错误边界与错误处理
+order: 14
+description: 错误边界能捕获什么、为什么必须用 class 组件、事件与异步错误的处理、降级 UI 设计与错误上报
+---
+
+# 错误边界与错误处理
+
+React 16 起有一条硬规则：**渲染过程中抛出的未捕获错误，会导致整棵组件树被卸载**——用户看到的是一片空白。
+
+这个设计是刻意的。React 团队认为，显示一个状态错乱的界面（比如支付页面金额算错了）比显示空白更危险。但空白页显然也不是好的用户体验，所以你需要错误边界。
+
+## 1. 错误边界是什么
+
+### 1.1 一个能捕获子树错误的组件
+
+错误边界是一个实现了特定生命周期方法的 class 组件。它捕获**子组件树**在渲染期间抛出的错误，显示降级 UI 而不是让整棵树崩溃。
+
+```tsx
+type Props = {
+  children: React.ReactNode;
+  fallback: React.ReactNode | ((error: Error, reset: () => void) => React.ReactNode);
+  onError?: (error: Error, info: React.ErrorInfo) => void;
+};
+
+type State = { error: Error | null };
+
+class ErrorBoundary extends React.Component<Props, State> {
+  state: State = { error: null };
+
+  // 渲染阶段调用：返回新 state，用于渲染降级 UI
+  static getDerivedStateFromError(error: Error): State {
+    return { error };
+  }
+
+  // 提交阶段调用：可以做副作用，比如上报
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    this.props.onError?.(error, info);
+    console.error("捕获到错误:", error, info.componentStack);
+  }
+
+  reset = () => this.setState({ error: null });
+
+  render() {
+    const { error } = this.state;
+    if (error !== null) {
+      const { fallback } = this.props;
+      return typeof fallback === "function" ? fallback(error, this.reset) : fallback;
+    }
+    return this.props.children;
+  }
+}
+```
+
+两个方法的分工：
+
+- `getDerivedStateFromError`：**静态方法**，在渲染阶段调用，只能返回 state，不能有副作用（因为渲染阶段可能被中断和重放）
+- `componentDidCatch`：在提交阶段调用，可以做上报、打日志等副作用；它还能拿到 `componentStack`，即出错组件的层级路径
+
+### 1.2 为什么至今只能用 class
+
+Hooks 没有对应的 API。React 团队多次讨论过 `useErrorBoundary`，但一直没有实现，主要因为：
+
+- 错误捕获必须发生在**子组件渲染时**，而 Hook 是在自己渲染时执行的，时序对不上
+- 需要「渲染子树 → 捕获异常 → 改变自己的状态 → 重新渲染」这套流程，函数组件缺少对应的钩子
+
+实践中不用自己写，直接用 `react-error-boundary` 这个库：
+
+```tsx
+import { ErrorBoundary } from "react-error-boundary";
+
+<ErrorBoundary
+  FallbackComponent={ErrorFallback}
+  onReset={() => refetch()}
+  resetKeys={[userId]}          // 这些值变化时自动重置
+>
+  <Profile userId={userId} />
+</ErrorBoundary>
+```
+
+它额外提供了 `useErrorBoundary` Hook，让你能从事件处理或异步代码里手动触发边界（下一节会用到）。
+
+## 2. 能捕获什么，不能捕获什么
+
+这是本章最需要记住的一张表：
+
+| 错误来源 | 能否捕获 |
+|---|---|
+| 子组件渲染期间抛错 | **能** |
+| 子组件的生命周期方法 | **能** |
+| 子组件的构造函数 | **能** |
+| 懒加载 chunk 失败 | **能** |
+| 事件处理函数里抛错 | **不能** |
+| setTimeout / Promise 回调 | **不能** |
+| async 函数里的错误 | **不能** |
+| useEffect 里的异步错误 | **不能** |
+| 服务端渲染的错误 | **不能**（走别的机制） |
+| 错误边界**自己**渲染时抛错 | **不能**（会冒泡给上层边界） |
+
+### 2.1 为什么事件处理不能捕获
+
+因为事件处理函数不在渲染流程里。React 不会包裹你的事件回调，它抛出的错误会直接冒泡到 window。
+
+而且这也是合理的：**事件里出错，界面本身还是一致的**，不需要卸载整棵树。你只需要在那个函数里处理错误：
+
+```tsx
+async function handleSubmit() {
+  try {
+    await api.save(data);
+    toast.success("保存成功");
+  } catch (e) {
+    toast.error(e instanceof Error ? e.message : "保存失败");
+  }
+}
+```
+
+### 2.2 如何把异步错误交给边界
+
+如果你确实想让某个异步错误触发降级 UI，有两种办法。
+
+**办法一：存进 state，在渲染时抛出。**
+
+```tsx
+function Widget() {
+  const [error, setError] = useState<Error | null>(null);
+
+  if (error !== null) throw error;    // 渲染期间抛，边界就能捕获
+
+  useEffect(() => {
+    load().catch(setError);
+  }, []);
+
+  return <div>…</div>;
+}
+```
+
+**办法二：用 `react-error-boundary` 的 Hook。**
+
+```tsx
+import { useErrorBoundary } from "react-error-boundary";
+
+function Widget() {
+  const { showBoundary } = useErrorBoundary();
+
+  useEffect(() => {
+    load().catch(showBoundary);
+  }, [showBoundary]);
+
+  return <div>…</div>;
+}
+```
+
+本质一样，后者更直白。
+
+<Callout type="warn" title="不要把所有异步错误都抛给边界">
+一次保存失败，不应该让整个页面变成错误页。用 toast 提示、在按钮旁显示错误、保留用户已填的数据，这些体验都比卸载子树好。
+
+抛给边界的应该是「这个区域已经没法正常工作了」的错误：核心数据加载失败、组件依赖的配置缺失、chunk 下载失败。
+</Callout>
+
+## 3. 边界该放在哪
+
+### 3.1 分层布置
+
+只在最外层放一个边界，等于「任何错误都白屏」——只不过白屏换成了错误页。正确做法是**分层布置**，让错误的影响范围最小：
+
+```tsx
+<ErrorBoundary fallback={<FullPageError />}>          {/* 应用级：兜底 */}
+  <Layout>
+    <Sidebar />
+    <ErrorBoundary fallback={<PageError />}>          {/* 路由级 */}
+      <Routes>…</Routes>
+    </ErrorBoundary>
+  </Layout>
+
+  <ErrorBoundary fallback={null}>                     {/* 非关键区域：静默降级 */}
+    <RecommendationWidget />
+  </ErrorBoundary>
+</ErrorBoundary>
+```
+
+三层的语义各不相同：
+
+- **应用级**：最后防线，通常显示「出错了，请刷新」
+- **路由级**：单个页面崩溃时，导航和侧边栏还能用，用户可以切到别的页面
+- **组件级**：广告位、推荐模块、评论区这类非关键功能挂了，不应该影响主内容——甚至可以直接不显示（fallback 为 null）
+
+### 3.2 判断标准
+
+对每个可能出错的区域问：**这里挂了，用户还能不能完成主要任务？**
+
+- 能 → 用小的局部边界，降级或隐藏
+- 不能 → 用页面级边界，给出明确的恢复路径
+
+## 4. 降级 UI 的设计
+
+### 4.1 一个好的错误 UI 包含什么
+
+```tsx
+function ErrorFallback({ error, resetErrorBoundary }: FallbackProps) {
+  return (
+    <div role="alert" className="error-page">
+      <h2>这个页面遇到了一点问题</h2>
+
+      {/* 给用户能理解的说明，不要直接显示技术错误 */}
+      <p>我们已经记录了这个问题，你可以尝试重新加载。</p>
+
+      {/* 明确的恢复动作 */}
+      <div>
+        <button onClick={resetErrorBoundary}>重试</button>
+        <button onClick={() => location.reload()}>刷新页面</button>
+        <a href="/">返回首页</a>
+      </div>
+
+      {/* 开发环境显示细节，生产环境藏起来 */}
+      {import.meta.env.DEV && (
+        <pre className="error-detail">{error.stack}</pre>
+      )}
+
+      {/* 给用户一个反馈渠道，附上错误 id 方便排查 */}
+      <p className="hint">如果问题持续，请联系客服并提供编号：{errorId}</p>
+    </div>
+  );
+}
+```
+
+要点：
+
+- **不要显示原始错误信息**给终端用户，`Cannot read property 'x' of undefined` 对他们毫无意义，还可能泄露内部结构
+- **一定要给恢复动作**，死路一条的错误页最让人恼火
+- **带上错误编号**，用户报障时能直接定位到日志
+
+### 4.2 重置的坑
+
+`resetErrorBoundary` 只是把边界的 state 清空、重新渲染子树。如果导致错误的原因还在（比如那个坏数据还在缓存里），会立刻再次报错，陷入循环。
+
+所以重置时通常要同时清掉错误源：
+
+```tsx
+<ErrorBoundary
+  FallbackComponent={ErrorFallback}
+  onReset={() => {
+    queryClient.resetQueries();     // 清掉缓存的坏数据
+    setInput("");                   // 重置可能导致错误的输入
+  }}
+  resetKeys={[route.pathname]}      // 路由变化时自动重置
+>
+```
+
+`resetKeys` 很实用：用户切到另一个页面时，边界自动恢复正常，不需要手动点重试。
+
+## 5. 错误上报
+
+### 5.1 三个入口
+
+一个完整的前端错误监控需要覆盖三处：
+
+```tsx
+// 1. 渲染错误 —— 错误边界
+componentDidCatch(error, info) {
+  report(error, { componentStack: info.componentStack });
+}
+
+// 2. 未捕获的同步错误
+window.addEventListener("error", (e) => {
+  report(e.error ?? new Error(e.message), { source: "window.error" });
+});
+
+// 3. 未处理的 Promise 拒绝
+window.addEventListener("unhandledrejection", (e) => {
+  report(e.reason, { source: "unhandledrejection" });
+});
+```
+
+第三个最容易被忘记，而它恰恰覆盖了所有 `async` 函数里漏掉 catch 的情况。
+
+### 5.2 上报要带什么
+
+```ts
+type ErrorReport = {
+  message: string;
+  stack?: string;
+  componentStack?: string;   // React 特有，能定位到具体组件
+  url: string;
+  userAgent: string;
+  userId?: string;
+  release: string;           // 版本号，用于关联 sourcemap
+  breadcrumbs: Action[];     // 出错前用户做了什么
+  timestamp: number;
+};
+```
+
+`componentStack` 和 `breadcrumbs`（用户操作路径）是排查效率的关键。只有一句 `undefined is not a function` 的报告基本没法查。
+
+### 5.3 sourcemap
+
+生产代码是压缩过的，堆栈里全是 `a.b.c is not a function`。必须上传 sourcemap 到监控平台（Sentry 等），让它还原成源码位置。
+
+注意 sourcemap **不要部署到公网**，只上传给监控服务——否则等于开源了你的代码。
+
+<Callout type="tip" title="别自己造监控轮子">
+Sentry 这类服务提供了错误聚合（相同错误合并计数）、影响用户数统计、版本对比、告警、sourcemap 自动还原、会话回放。
+
+自己写一个 `report` 函数发到日志服务，你会得到一堆无法聚合、无法排序、无法定位的散乱记录。
+</Callout>
+
+## 6. 预防性的错误处理
+
+错误边界是最后一道防线。更重要的是从源头减少错误。
+
+### 6.1 渲染期最常见的三类错误
+
+**读取 null / undefined 的属性**：
+
+```tsx
+// 危险
+<span>{user.profile.city}</span>
+
+// 安全
+<span>{user?.profile?.city ?? "未填写"}</span>
+```
+
+**对不是数组的东西调用数组方法**：
+
+```tsx
+// 接口返回 null 时崩溃
+{data.items.map(...)}
+
+// 安全
+{(data?.items ?? []).map(...)}
+```
+
+**类型断言掩盖了真实类型**：
+
+```tsx
+const user = JSON.parse(raw) as User;   // TS 相信了你，运行时不保证
+```
+
+跨越系统边界的数据（接口响应、localStorage、URL 参数）应该用 Zod 这类工具做**运行时校验**，而不是用断言。
+
+### 6.2 用类型消灭错误分支
+
+第 10 章讲的可辨识联合，在这里同样是最有效的手段：
+
+```tsx
+// 用类型保证：只有 success 状态下才能访问 data
+type Result =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "success"; data: Data };
+```
+
+不可能写出 `result.data.items` 而 data 为 undefined 的代码——因为 TS 会阻止你。
+
+### 6.3 给边界之外的地方加防线
+
+```tsx
+// 事件处理统一包一层
+function safeHandler<T extends unknown[]>(fn: (...args: T) => void) {
+  return (...args: T) => {
+    try {
+      fn(...args);
+    } catch (e) {
+      report(e);
+      toast.error("操作失败");
+    }
+  };
+}
+
+<button onClick={safeHandler(handleDelete)}>删除</button>
+```
+
+对于关键操作（支付、删除），这层保护值得加。
+
+<Callout type="exercise" title="练习 1：判断能否捕获">
+下面每种情况，错误边界能否捕获？说明理由：
+
+1. 组件渲染时 `items.map` 而 items 是 undefined
+2. `onClick` 里 `JSON.parse` 了非法字符串
+3. `useEffect` 里同步抛出错误
+4. `useEffect` 里 `fetch().then()` 中抛出错误
+5. lazy 加载的 chunk 返回 404
+6. 错误边界自己的 fallback 组件渲染时报错
+</Callout>
+
+<Callout type="exercise" title="练习 2：设计边界布局">
+一个电商详情页包含：顶部导航、商品主图与信息、价格与购买按钮、店铺信息、推荐商品、用户评价、页脚。
+
+设计错误边界的布置方案：每层放在哪、fallback 显示什么、哪些区域出错可以直接隐藏。说明你的判断依据。
+</Callout>
+
+<Callout type="exercise" title="练习 3：实现重试限制">
+给错误边界加一个功能：同一个错误连续重试超过 3 次后，不再显示「重试」按钮，改为显示「刷新页面」。
+
+需要考虑：怎么判断「同一个错误」？重试计数在什么时候清零？（提示：可以用 resetKeys 变化作为清零信号。）
+</Callout>
+
+<Callout type="exercise" title="练习 4：加固一个组件">
+```tsx
+function OrderDetail({ order }) {
+  return (
+    <div>
+      <h2>{order.title}</h2>
+      <p>{order.buyer.name} · {order.buyer.address.city}</p>
+      <ul>{order.items.map((i) => <li key={i.id}>{i.name}</li>)}</ul>
+      <p>合计 {order.items.reduce((s, i) => s + i.price, 0)}</p>
+    </div>
+  );
+}
+```
+接口返回的数据可能缺字段。列出所有可能崩溃的位置，用三种不同层次的手段加固：可选链、运行时校验（Zod）、错误边界。说明各自适合处理哪一类问题。
+</Callout>
+
+## 小结
+
+- 渲染期未捕获的错误会**卸载整棵树**，这是 React 的刻意设计
+- 错误边界是实现了 `getDerivedStateFromError`（渲染阶段，返回 state）和 `componentDidCatch`（提交阶段，做副作用）的 class 组件
+- **不能捕获**：事件处理、setTimeout、Promise、async、服务端渲染、边界自身的错误
+- 想让异步错误触发边界，把 error 存进 state 后在渲染期抛出，或用 `useErrorBoundary`
+- 边界要**分层布置**：应用级兜底、路由级隔离页面、组件级隔离非关键功能
+- 降级 UI 必须给**恢复动作**，不要显示原始错误信息，带上错误编号
+- `resetKeys` 让边界在路由或关键 props 变化时自动恢复
+- 错误监控要覆盖三个入口：错误边界、`window.error`、`unhandledrejection`
+- 预防优于捕获：可选链、运行时校验（Zod）、可辨识联合类型
+- 下一章讲状态管理生态的选型 →

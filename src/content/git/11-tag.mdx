@@ -1,0 +1,164 @@
+---
+title: 标签与版本发布：轻量标签、附注标签与语义化版本
+order: 11
+description: 轻量标签和附注标签的区别、如何给历史提交补打标签、用语义化版本号管理发布
+---
+
+# 标签与版本发布：轻量标签、附注标签与语义化版本
+
+里程碑式的提交值得一个固定记号。Git 的 **tag（标签）** 就是给某个提交起一个永不移动的名字——它比分支更"固执"：分支会随提交前进，标签一旦打好就钉死在那个提交上。这一章讲清两种标签，以及如何用标签管理软件发版。
+
+## 1. 两种标签：轻量 vs 附注
+
+Git 有两类标签，区别在于"它到底是个什么对象"。
+
+| | 轻量标签 lightweight | 附注标签 annotated |
+|---|---|---|
+| 是什么 | 一个指向提交的**指针** | 一个独立的 **tag 对象**（有自己的 SHA-1） |
+| 包含 | 只有目标提交 | 打标人、日期、说明信息、可签名 |
+| 命令 | `git tag v1.0` | `git tag -a v1.0 -m "..."` |
+| 用途 | 临时本地记号 | **正式发布**，应推送到远程 |
+
+经验法则：**发版一律用附注标签**。`-a` 的 `a` 就是 annotated。轻量标签就像一个不会移动的分支名，附注标签则是一份"这份代码就是 v2.0 正式版"的存证，可 GPG 签名、可审计。
+
+<Playground
+  language="git"
+  title="轻量标签与附注标签的区别"
+  id="git-11-1"
+  code={`echo '===== 打标签 ====='
+git init -q -b main repo && cd repo
+echo 'v1' > app.txt && git add . && git commit -q -m "feat: 1.0 功能"
+echo 'v2' > app.txt && git add . && git commit -q -m "feat: 2.0 功能"
+echo 'v3' > app.txt && git add . && git commit -q -m "feat: 3.0 功能"
+
+echo '打一个轻量标签（只是指向提交的指针）：'
+git tag v1.0
+echo '打一个附注标签（独立对象，有作者/日期/信息）：'
+git tag -a v2.0 -m "正式发布 2.0 版本"
+echo
+echo '标签列表：'
+git tag
+echo
+echo 'v2.0 是附注标签，能看到作者和信息：'
+git show v2.0 --no-patch --format='作者: %an  日期: %ad%n信息: %s' --date=short
+echo
+echo 'v1.0 是轻量标签，show 只显示提交本身：'
+git show v1.0 --no-patch --format='%h %s'
+cd ..`}
+/>
+
+### 查看、检出、删除
+
+```bash
+git tag                         # 列出所有标签
+git tag -l "v1.*"              # 按通配符过滤
+git show v2.0                  # 查看标签指向的提交/附注
+git checkout v2.0              # 检出到标签（进入分离 HEAD 状态）
+git tag -d v1.0                # 删除本地标签
+```
+
+<Callout type="warn" title="checkout 标签会进入分离 HEAD">
+标签是固定点，`git checkout v2.0` 后你不在任何分支上，新提交会"悬空"。要基于某个版本做修补，应该开新分支：`git checkout -b hotfix/v2.0.1 v2.0`。
+</Callout>
+
+## 2. 给历史中的旧提交补打标签
+
+标签不一定要打在最新的提交上。版本回溯、补发说明时，可以给任意一个历史提交贴标签——只要把提交哈希（或引用）写在最后。
+
+<Playground
+  language="git"
+  title="给旧的提交补打标签"
+  id="git-11-2"
+  code={`echo '===== 给历史中的旧提交补打标签 ====='
+cd repo
+echo '1.0 的功能其实在第一个提交，给旧提交补打 v0.9：'
+FIRST=$(git rev-list --max-parents=0 HEAD)
+git tag -a v0.9 -m "早期预览版" $FIRST
+echo '按照版本号排序查看所有标签：'
+git tag -l --sort=v:refname
+cd ..`}
+/>
+
+`git tag -l --sort=v:refname` 能按语义化版本号正确排序（`v:refname` 中的 `v:` 前缀表示把 `v` 当版本号解析），否则 `v1.10` 会排在 `v1.9` 前面这种字符串排序坑里。
+
+## 3. 语义化版本：MAJOR.MINOR.PATCH
+
+正式项目用 **SemVer**（[semver.org](https://semver.org)）约定版本号含义：
+
+| 位置 | 名称 | 何时 +1 | 示例 |
+|---|---|---|---|
+| MAJOR | 主版本 | **不兼容**的 API 变更 | 1.0.0 -> 2.0.0 |
+| MINOR | 次版本 | **向下兼容**的新功能 | 1.0.0 -> 1.1.0 |
+| PATCH | 修订号 | **向下兼容**的 bug 修复 | 1.0.0 -> 1.0.1 |
+
+预发布和构建元数据加在后面：`1.0.0-alpha.1`、`1.0.0+build.2024`。约定俗成地，项目根目录放一个 `CHANGELOG.md` 记录每次发版改了什么，配合 tag 使用。
+
+<Callout type="tip" title="发布一个版本的固定动作">
+```bash
+git tag -a v1.2.0 -m "Release 1.2.0：新增导出功能"
+git push origin v1.2.0          # 推单个标签
+# 或 git push origin --tags     # 推所有新标签
+```
+然后在 GitHub/GitLab 的 Releases 里基于这个 tag 写发布说明，并附上编译好的二进制包。
+</Callout>
+
+## 4. 推送与删除远程标签
+
+`git push` **默认不推送标签**，必须显式说明。这是和分支最大的不同点之一。
+
+<Playground
+  language="git"
+  title="推送标签与远程删除标签"
+  id="git-11-3"
+  code={`echo '===== 推送标签 / 删除标签 ====='
+git init -q --bare /tmp/origin.git
+cd repo
+git remote add origin /tmp/origin.git
+echo '默认 git push 不会推标签，需显式 --tags：'
+git push -q -u origin main 2>/dev/null
+git push -q origin --tags 2>/dev/null
+echo '远程现在有哪些标签：'
+git ls-remote --tags origin
+echo
+echo '误打了一个标签，本地删除 + 远程删除：'
+git tag -d v0.9
+git push -q origin :refs/tags/v0.9 2>/dev/null
+echo '远程标签列表（v0.9 已消失）：'
+git ls-remote --tags origin
+cd ..`}
+/>
+
+把本地标签推到远程有两种写法：
+
+```bash
+git push origin v1.2.0        # 推单个指定标签
+git push origin --tags        # 推所有本地有、远程没有的标签
+```
+
+删除远程标签的语法是"推一个空引用上去"：`git push origin :refs/tags/v0.9`（冒号左边为空，等于删除右边那个）。
+
+## 5. 常见标签问题速查
+
+| 问题 | 原因 | 解决 |
+|---|---|---|
+| `git push` 后别人看不到我的 tag | push 不自动带 tag | `git push origin --tags` |
+| checkout 标签后提交"丢了" | 分离 HEAD | 用 `git checkout -b 分支名 标签` 接住 |
+| 标签打错提交 | 哈希写错 | `git tag -d x` 删了重打 |
+| 想给已发布版本签名 | 轻量标签无签名 | 用 `git tag -s v1.0 -m "..."` 附注+GPG 签名 |
+
+## 小结
+
+- 标签是**钉死在某一提交**上的名字，不会像分支那样移动
+- 轻量标签只是指针；**附注标签是独立对象，发版必须用 `-a`**
+- 可以给历史任意提交补打标签：`git tag -a v0.9 -m "..." <提交>`
+- 排序用 `git tag -l --sort=v:refname` 避免字符串排序坑
+- 版本号用 SemVer：MAJOR.MINOR.PATCH（不兼容 / 新功能 / 修 bug）
+- `git push` 不带标签，要 `--tags` 或显式指定；删除远程标签用 `:refs/tags/x`
+- 下一章：`.gitignore` 与文件管理 →
+
+<Callout type="exercise" title="练习">
+1. 在一个仓库里分别用 `git tag v1.0` 和 `git tag -a v2.0 -m "发布"` 打两个标签，然后 `git cat-file -t v1.0` 和 `git cat-file -t v2.0` 看它们的对象类型有何不同（提示：一个指向 commit，一个指向 tag）。
+2. 故意把 `v1.0` 打在第二个提交上，然后给第一个提交补打 `v0.5`，用 `git tag -l --sort=v:refname` 验证排序正确。
+3. 本地克隆一个仓库，在克隆里 `git tag -a v9.9.9 -m test` 然后推到远程，再删除远程标签，原仓库 `git fetch` 后观察 `git tag` 是否还残留。
+4. 查阅语义化版本规范：版本号 `2.3.4`、`2.4.0`、`3.0.0` 分别代表什么性质的变更？（用一句话分别说明）
+</Callout>

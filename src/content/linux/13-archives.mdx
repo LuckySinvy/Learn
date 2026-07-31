@@ -1,0 +1,171 @@
+---
+title: 压缩与归档：tar、gzip 与 zip
+order: 13
+description: 归档与压缩的区别、tar 三大操作 czf/tzf/xzf、gzip/zcat 家族与跨平台 zip
+---
+
+# 压缩与归档：tar、gzip 与 zip
+
+备份目录、传输代码、下载软件包，都绕不开 `.tar.gz`。初学者常被 tar 的参数吓到——其实只要先分清两个概念：**归档**（把多个文件打成一个包，不减体积）和**压缩**（把一个文件变小），tar 的所有用法就都顺理成章了。
+
+## 1. 归档 ≠ 压缩
+
+- `tar`（tape archive）只负责**归档**：把整棵目录树连同权限、时间戳打进一个 `.tar` 文件；
+- `gzip` 只负责**压缩**：把**单个**文件变小，生成 `.gz`；
+- 所以 Linux 世界的标准打包是两步合一：先 tar 归档、再 gzip 压缩 → `.tar.gz`（等价后缀 `.tgz`）。
+
+这也是与 zip 的本质区别：zip 一个格式同时做两件事，而 Unix 风格是两个工具各司其职、用管道或参数组合。
+
+## 2. tar 三大操作：c、t、x
+
+tar 的参数看着多，主干只有三个动词（c 创建、t 查看、x 解开）加三个常用修饰（z 走 gzip、v 显示过程、f 指定文件名）：
+
+```bash
+tar czf site.tar.gz site/       # Create + gZip + File：打包压缩
+tar tzf site.tar.gz             # lisT：不解开，先看包里有什么
+tar xzf site.tar.gz             # eXtract：解包（还原目录树与权限）
+tar xzf site.tar.gz -C /tmp     # -C：解到指定目录
+```
+
+记忆口诀：**czf 压、tzf 看、xzf 解**，f 永远紧跟文件名放最后。
+
+<Playground
+  language="linux"
+  title="tar 打包、查看、解包全流程"
+  id="linux-13-1"
+  code={`# 造一个小项目
+mkdir -p site/css site/js
+echo '<h1>home</h1>' > site/index.html
+echo 'body-styles' > site/css/main.css
+echo 'console-log' > site/js/app.js
+chmod 755 site/js/app.js
+
+echo '$ tar czf site.tar.gz site/'
+tar czf site.tar.gz site/
+ls -lh site.tar.gz
+
+echo ''
+echo '$ tar tzf site.tar.gz   # 先看内容再解，好习惯'
+tar tzf site.tar.gz
+
+echo ''
+echo '$ 解到另一个目录并验证（权限也被还原）：'
+mkdir restore
+tar xzf site.tar.gz -C restore
+tree restore
+ls -l restore/site/js/app.js`}
+/>
+
+<Callout type="warn" title="解包前先 tzf，防 tar 炸弹">
+规范的包顶层是一个目录（如 `site/`），解开只多一个目录；不规范的包顶层直接是一堆散文件，解在当前目录会把几百个文件喷得到处都是（俗称 tar 炸弹），和已有文件混在一起极难清理。所以：解陌生的包，先 `tar tzf` 看结构，或干脆 `mkdir x && tar xzf pkg.tar.gz -C x` 隔离解包。
+</Callout>
+
+## 3. 常用进阶参数
+
+```bash
+tar czf logs.tar.gz --exclude='*.tmp' --exclude='cache' logs/   # 排除
+tar czf backup-$(date +%Y%m%d).tar.gz /etc/nginx                # 文件名带日期
+tar xzf big.tar.gz site/index.html                              # 只解出单个文件
+tar czf - src/ | wc -c        # f 后面的 - 表示 stdout：tar 流可以进管道
+```
+
+最后一条揭示了 tar 的管道亲和性——第 19 章会看到 `tar czf - dir | ssh host 'tar xzf -'` 这种不落盘的跨机传输。
+
+<Playground
+  language="linux"
+  title="排除文件与带日期的备份名"
+  id="linux-13-2"
+  code={`mkdir -p logs/cache
+echo 'important' > logs/app.log
+echo 'important2' > logs/err.log
+echo 'junk' > logs/debug.tmp
+echo 'junk2' > logs/cache/blob.bin
+
+echo '$ 打包时排除 .tmp 和 cache 目录：'
+tar czf logs-backup.tar.gz --exclude='*.tmp' --exclude='cache' logs/
+tar tzf logs-backup.tar.gz
+
+echo ''
+echo '$ 备份文件名带上日期（$(date) 命令替换）：'
+NAME=backup-$(date +%Y%m%d).tar.gz
+tar czf $NAME logs/
+ls -lh $NAME`}
+/>
+
+## 4. gzip 家族：单文件压缩与直读
+
+```bash
+gzip app.log             # 压缩：app.log 变成 app.log.gz（原文件消失！）
+gzip -k app.log          # -k 保留原文件（GNU gzip）
+gunzip app.log.gz        # 解压（等价 gzip -d）
+zcat app.log.gz          # 不解压直接看内容
+zgrep ERROR app.log.gz   # 不解压直接 grep——查轮转旧日志的神器
+```
+
+日志轮转（logrotate）会把旧日志压成 `access.log.1.gz`、`access.log.2.gz`……排查历史问题时，`zcat`/`zgrep` 免解压直查，配合管道无缝接入三剑客。
+
+<Playground
+  language="linux"
+  title="gzip、zcat 与 zgrep"
+  id="linux-13-3"
+  code={`printf 'INFO ok\nERROR db down\nINFO recovered\n' > app.log
+cp app.log app.log.1
+
+echo '$ gzip app.log.1 —— 模拟被轮转压缩的旧日志'
+gzip app.log.1
+ls -l app.log*
+
+echo ''
+echo '$ zcat 直接看压缩文件：'
+zcat app.log.1.gz
+
+echo ''
+echo '$ zgrep 直接搜压缩文件（精简容器若无 zgrep，用 zcat 接 grep 等价）：'
+zgrep ERROR app.log.1.gz 2>/dev/null || zcat app.log.1.gz | grep ERROR
+
+echo ''
+echo '$ 压缩比感受一下：重复内容压缩率极高'
+seq 100000 | tr '0-9' 'a' > big.txt
+gzip -k big.txt 2>/dev/null || gzip big.txt
+ls -lh big.txt* 2>/dev/null || ls -lh big.txt.gz`}
+/>
+
+其他压缩格式速览：`bzip2`（更小更慢，tar 参数 j，后缀 .tar.bz2）、`xz`（压缩率最高，参数 J，.tar.xz，内核源码用它发布）、`zstd`（新一代，速度与压缩率俱佳，容器镜像层广泛使用）。tar 用法完全同构，换个字母而已。
+
+## 5. zip / unzip：跨平台交换
+
+与 Windows/macOS 用户交换文件时用 zip（很多精简容器需自行安装 zip/unzip 包）：
+
+```bash
+zip -r site.zip site/           # 递归打包
+unzip -l site.zip               # 看内容（对应 tar tzf）
+unzip site.zip -d /tmp/out      # 解到指定目录（对应 tar -C）
+```
+
+zip 与 tar.gz 的实用差异：zip 对每个文件独立压缩，可以快速抽取单个文件，但整体压缩率通常低于 tar.gz（后者把所有文件当成连续流压缩，跨文件的重复也能利用）。
+
+## 6. 选型速查
+
+| 场景 | 选择 |
+|---|---|
+| Linux 间备份/传输目录 | `tar czf`（保留权限、软链接） |
+| 发给 Windows 用户 | `zip -r` |
+| 查压缩的旧日志 | `zcat` / `zgrep`，不解压 |
+| 追求极致压缩率（发布包） | `tar cJf`（xz） |
+| 大数据量要求速度 | zstd |
+
+## 小结
+
+- 归档（tar 合多为一）与压缩（gzip 缩小体积）是两件事，`.tar.gz` = 两步合一
+- 口诀：`czf` 压、`tzf` 看、`xzf` 解；`-C` 指定解包目录；解前先看防 tar 炸弹
+- `--exclude` 排除杂物；`$(date +%Y%m%d)` 给备份命名；`f -` 让 tar 流进管道
+- gzip 默认"压完删原件"；zcat/zgrep 免解压直查轮转日志
+- 跨平台交换用 zip；追压缩率用 xz；追速度用 zstd
+- 下一章：网络命令——curl、端口与 DNS 排查 →
+
+<Callout type="exercise" title="练习">
+1. 构造含三层子目录的项目，打包成 `proj-日期.tar.gz`，先 tzf 验证清单，再解到 /tmp 下并用 diff -r 对比原目录确认无损。
+2. 打包时排除所有 `.log` 文件和 `node_modules` 目录（自己造这些文件），用 tzf 验证排除生效。
+3. 造一个 5 行日志并 gzip，之后在**不解压**的前提下：查看全文、统计行数、grep 出其中一行（zcat 管道或 zgrep）。
+4. 思考题：为什么 100 个相似小文件打成 tar.gz 通常比逐个 zip 后再合并小得多？（提示：压缩窗口跨文件）
+</Callout>

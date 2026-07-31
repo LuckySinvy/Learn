@@ -1,0 +1,214 @@
+---
+title: TCP 连接：握手与挥手
+order: 3
+description: 三次握手、四次挥手、为什么是三次、TIME_WAIT 的意义与观察方法
+---
+
+# TCP 连接：握手与挥手
+
+HTTP 报文再优雅，也要先有一条 TCP 连接才能发出去。建立连接的"三次握手"和断开连接的"四次挥手"是面试必考，更是理解 keep-alive、TIME_WAIT 堆积、连接池等实际问题的地基。
+
+## 1. 三次握手：建立连接
+
+TCP 连接的本质是**双方各自维护的一组状态与序列号**。握手就是同步这些初始状态：
+
+```text
+客户端                                服务器
+CLOSED                                LISTEN
+  │  ① SYN, seq=x                       │
+  │ ───────────────────────────────────▶│  收到：知道"客户端能发"
+SYN_SENT                            SYN_RCVD
+  │  ② SYN+ACK, seq=y, ack=x+1          │
+  │ ◀─────────────────────────────────── │  客户端收到：知道"双向都通"
+  │  ③ ACK, ack=y+1                     │
+  │ ───────────────────────────────────▶│  服务器收到：知道"服务器发的能被收到"
+ESTABLISHED                        ESTABLISHED
+```
+
+- `seq`（序列号）：本方字节流的起始编号，随机初始化（防猜测攻击）；
+- `ack`（确认号）：期望对方下一个字节的编号，等于"我已收到 x 及之前的一切"。
+
+### 1.1 为什么是三次，不是两次？
+
+握手要确认**四件事**：客户端的发送与接收能力、服务器的发送与接收能力。
+
+- 第 ① 步后，服务器确认了"客户端能发、我能收"；
+- 第 ② 步后，客户端确认了全部四项——它发的被回应了，对方发的它也收到了；
+- 但此刻**服务器还不知道自己发出的 SYN+ACK 有没有被收到**，必须等第 ③ 步的 ACK。
+
+若只有两次：一个在网络中滞留很久的旧 SYN 迟到抵达，服务器直接建立连接并分配资源，而客户端根本不认这个连接——服务器就白白挂着一条死连接。第三次握手让客户端有机会"不认账"（不回 ACK），旧 SYN 造成的半连接会超时释放。
+
+### 1.2 握手的代价
+
+三次握手意味着**任何 HTTP 请求之前都先消耗 1 个 RTT**（第 ③ 步的 ACK 可以捎带数据）。北京到洛杉矶 RTT 约 150ms，这就是为什么：
+
+- HTTP/1.1 默认 keep-alive 复用连接（第 11 章）；
+- TLS 1.3 拼命把握手压缩到 1-RTT 甚至 0-RTT（第 12 章）；
+- HTTP/3 干脆抛弃 TCP，把传输握手与加密握手合并（第 14 章）。
+
+## 2. 动手观察连接状态
+
+Linux 把所有 TCP 连接状态暴露在 `/proc/net/tcp` 里（十六进制），我们直接读它来观察 ESTABLISHED 和 TIME_WAIT：
+
+<Playground
+  language="http"
+  title="观察 ESTABLISHED 与 TIME_WAIT"
+  id="http-03-1"
+  code={`python3 -c '
+import socket, time
+
+STATES = {"01": "ESTABLISHED", "06": "TIME_WAIT", "0A": "LISTEN",
+          "08": "CLOSE_WAIT", "05": "FIN_WAIT2"}
+
+def show(tag):
+    # 9000 的十六进制是 2328，筛出本实验相关的行
+    found = []
+    for line in open("/proc/net/tcp"):
+        p = line.split()
+        if len(p) > 3 and ("2328" in p[1] or "2328" in p[2]):
+            found.append(STATES.get(p[3], p[3]))
+    print(tag, found)
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 9000))
+srv.listen(5)
+show("listen 后:  ")
+
+cli = socket.create_connection(("127.0.0.1", 9000))
+conn, _ = srv.accept()
+show("握手完成后:")
+
+cli.close()          # 客户端主动关闭 -> 客户端一侧进入 TIME_WAIT
+conn.close()
+time.sleep(0.3)
+show("双方关闭后:")
+'`}
+/>
+
+输出里能看到：listen 后出现 LISTEN；握手完成后出现两条 ESTABLISHED（客户端一条、服务器一条，因为都在本机）；关闭后留下一条 **TIME_WAIT**——它属于**主动关闭的一方**（这里是客户端）。
+
+再看两个握手细节：连接被拒绝（RST）与"握手由内核完成"：
+
+<Playground
+  language="http"
+  title="RST 拒绝连接 与 内核代答握手"
+  id="http-03-2"
+  code={`python3 -c '
+import socket
+
+# 1) 目标端口没人监听：SYN 被内核直接回 RST，立刻失败
+try:
+    socket.create_connection(("127.0.0.1", 9999), timeout=2)
+except OSError as e:
+    print("无人监听的端口:", e)
+
+# 2) 服务器只 listen、从不 accept：客户端照样握手成功！
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 9001))
+srv.listen(5)
+
+cli = socket.create_connection(("127.0.0.1", 9001), timeout=2)
+cli.sendall(b"data lands in kernel buffer")
+print("未 accept 也连接成功:", cli.getpeername())
+cli.close()
+'`}
+/>
+
+第二个实验揭示一个常被误解的事实：**三次握手由内核协议栈完成**，与应用层是否调用 accept 无关。握手完成的连接先进入"全连接队列"，accept 只是从队列里取。队列满了（高并发 + 应用来不及 accept）新握手会被丢弃——这就是 backlog 参数与"连接超时"故障的来源。
+
+## 3. 四次挥手：断开连接
+
+TCP 是全双工的，两个方向要**分别关闭**，所以挥手是四次：
+
+```text
+主动方                                被动方
+ESTABLISHED                        ESTABLISHED
+  │  ① FIN  "我不再发数据了"            │
+  │ ───────────────────────────────────▶│
+FIN_WAIT_1                         CLOSE_WAIT
+  │  ② ACK                              │
+  │ ◀─────────────────────────────────── │   被动方可能还有数据要发
+FIN_WAIT_2                             │   （②③ 之间可以隔很久）
+  │  ③ FIN  "我也发完了"                 │
+  │ ◀─────────────────────────────────── │
+  │  ④ ACK                              │  LAST_ACK
+  │ ───────────────────────────────────▶│
+TIME_WAIT（等 2MSL）                  CLOSED
+  │
+CLOSED
+```
+
+为什么不能三次？因为 ② 和 ③ 通常不能合并：收到 FIN 时被动方可能还有数据没发完，只能先 ACK 表示"知道了"，等自己的数据发完再发 FIN。（若恰好没数据，②③ 可合并，抓包时常见"三次挥手"。）
+
+### 3.1 TIME_WAIT：最容易被误解的状态
+
+主动关闭方发出第 ④ 个 ACK 后，要在 TIME_WAIT 状态**等待 2 倍 MSL**（报文最大生存时间，Linux 上 2MSL 共 60 秒）才真正关闭。两个原因：
+
+1. **保证最后的 ACK 能重传**：若 ④ 丢了，对方会重发 FIN；此时若连接已消失，只能回 RST，对方就异常关闭了；
+2. **让旧连接的报文自然死亡**：等 2MSL 后，网络中残留的旧报文全部过期，避免"新连接（相同四元组）收到旧连接的数据"。
+
+工程影响：**谁主动关闭，谁背 TIME_WAIT**。高并发短连接的客户端（比如没开 keep-alive 的反向代理）会堆积大量 TIME_WAIT，耗尽本地端口。缓解手段：
+
+| 手段 | 说明 |
+|---|---|
+| 长连接复用 | 根治：keep-alive / 连接池，少建少拆 |
+| tcp_tw_reuse | 允许把 TIME_WAIT 的端口安全复用于**新的出站连接** |
+| 让对方主动关闭 | 反向代理场景调整关闭策略 |
+| SO_REUSEADDR | 仅解决服务器重启时 bind 失败，不减少 TIME_WAIT |
+
+<Callout type="warn" title="不要开启 tcp_tw_recycle">
+老资料常推荐 tcp_tw_recycle，它在 NAT 环境下会随机拒绝连接（同一出口 IP 的不同设备时间戳不单调），是著名的生产事故来源，Linux 4.12 已将其移除。
+</Callout>
+
+<Playground
+  language="http"
+  title="谁主动关闭谁 TIME_WAIT"
+  id="http-03-3"
+  code={`python3 -c '
+import socket, time
+
+STATES = {"01": "ESTABLISHED", "06": "TIME_WAIT", "08": "CLOSE_WAIT", "0A": "LISTEN"}
+
+def rows(port_hex):
+    out = []
+    for line in open("/proc/net/tcp"):
+        p = line.split()
+        if len(p) > 3 and port_hex in (p[1].split(":")[1], p[2].split(":")[1]):
+            local = int(p[1].split(":")[1], 16)
+            out.append((local, STATES.get(p[3], p[3])))
+    return out
+
+# 实验：这次让服务器一侧主动关闭
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 9002)); srv.listen(1)     # 9002 hex = 232A
+cli = socket.create_connection(("127.0.0.1", 9002))
+conn, _ = srv.accept()
+
+conn.close()      # 服务器先关 -> 服务器侧(9002端口) TIME_WAIT
+time.sleep(0.2)
+for local, st in rows("232A"):
+    who = "服务器侧" if local == 9002 else "客户端侧"
+    print(who, "端口", local, "状态", st)
+cli.close()
+'`}
+/>
+
+输出验证：服务器主动关闭后，**9002 端口（服务器侧）进入 TIME_WAIT，客户端侧是 CLOSE_WAIT**（还没调用 close）。如果生产上看到大量 CLOSE_WAIT，说明是**你的程序忘了关连接**——这是区分故障责任方的重要线索。
+
+## 小结
+
+- 三次握手同步双方序列号；三次是"确认双向可达"的最小次数，还能免疫迟到的旧 SYN；
+- 握手由内核完成，accept 只是取队列——backlog 满会导致握手被丢；
+- 挥手四次是因为两个方向独立关闭，被动方的 ACK 与 FIN 之间可能还要发数据；
+- TIME_WAIT 属于主动关闭方，等 2MSL 是为了重传最后的 ACK 并清空旧报文；
+- 大量 TIME_WAIT → 主动关闭太多，用长连接治本；大量 CLOSE_WAIT → 自己代码忘了 close。
+
+<Callout type="exercise" title="练习">
+1. 修改 Playground 1：改成服务器先 close，验证 TIME_WAIT 换边。
+2. 在 Playground 2 中，把 listen 的 backlog 改为 0，连续发起多个不被 accept 的连接，观察第几个开始失败。
+3. 画出完整状态机中主动方的路径：ESTABLISHED → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → CLOSED，标注触发每次迁移的报文。
+4. 思考：为什么 HTTP/1.1 响应头里带 Connection: close 的服务器，更容易在自己身上堆 TIME_WAIT？
+</Callout>

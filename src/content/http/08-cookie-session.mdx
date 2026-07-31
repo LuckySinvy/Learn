@@ -1,0 +1,236 @@
+---
+title: Cookie 与 Session：无状态协议的记忆术
+order: 8
+description: Set-Cookie 全属性（HttpOnly/Secure/SameSite）、会话机制、Cookie 与 Token 对比
+---
+
+# Cookie 与 Session：无状态协议的记忆术
+
+HTTP 是无状态的：每个请求相互独立，服务器天然"脸盲"。可购物车、登录态又必须记住你——Cookie 就是补上的那块"记忆"，Session 则是把记忆放回服务器的方案。这一章用实验完整走一遍会话机制。
+
+## 1. Cookie 的工作模型
+
+三步循环：
+
+```text
+① 服务器下发     响应头  Set-Cookie: sid=abc123; Path=/; HttpOnly
+② 浏览器保存     按域名 + 路径存储，管理过期
+③ 后续自动携带   请求头  Cookie: sid=abc123      （匹配的每个请求都带）
+```
+
+关键点：**下发用响应头 Set-Cookie（可多条），回传用请求头 Cookie（合并成一条）**。浏览器是自动执行的；curl 需要 `-c`（保存）和 `-b`（携带）模拟。
+
+<Playground
+  language="http"
+  title="Cookie 的一来一回"
+  id="http-08-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/login":
+            body = b"login ok, cookie issued\n"
+            self.send_response(200)
+            self.send_header("Set-Cookie", "sid=abc123; Path=/; HttpOnly")
+            self.send_header("Set-Cookie", "theme=dark; Path=/; Max-Age=3600")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            got = self.headers.get("Cookie", "(没有 Cookie)")
+            body = ("你带来的 Cookie: " + got + "\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 第一次访问 /me：两手空空 =="
+curl -s -b /work/jar.txt -c /work/jar.txt http://127.0.0.1:8000/me
+
+echo "== 访问 /login：服务器下发两条 Set-Cookie =="
+curl -sv -b /work/jar.txt -c /work/jar.txt http://127.0.0.1:8000/login 2>&1 | grep -i "set-cookie"
+
+echo "== 再访问 /me：curl 自动带上 Cookie =="
+curl -s -b /work/jar.txt -c /work/jar.txt http://127.0.0.1:8000/me
+
+echo "== Cookie Jar 文件内容 =="
+cat /work/jar.txt`}
+/>
+
+注意两条 Set-Cookie 是**两个独立的响应头**（Cookie 是少数允许同名重复的头），而回传时合并进一个 `Cookie` 头、分号分隔。
+
+## 2. Set-Cookie 属性详解
+
+```text
+Set-Cookie: sid=abc123; Max-Age=86400; Domain=example.com; Path=/;
+            Secure; HttpOnly; SameSite=Lax
+```
+
+| 属性 | 作用 | 不设的后果 |
+|---|---|---|
+| Max-Age / Expires | 存活时长（秒）/ 绝对过期时间 | 变成**会话 Cookie**，关浏览器即失效 |
+| Domain | 生效域（含子域） | 默认仅当前域，不含子域 |
+| Path | 生效路径前缀 | 默认当前路径目录 |
+| Secure | **仅 HTTPS** 连接才发送 | 明文 HTTP 也会带出，可被窃听 |
+| HttpOnly | JS 的 document.cookie **读不到** | XSS 脚本可直接偷走登录态 |
+| SameSite | 跨站请求时是否携带（详见下） | 各浏览器默认不一，CSRF 风险 |
+
+### 2.1 SameSite 三档
+
+| 值 | 跨站携带行为 | 适用 |
+|---|---|---|
+| Strict | 跨站请求一律不带（从别的网站点链接过来也不带） | 高敏感操作 Cookie |
+| Lax | 跨站的**顶级导航 GET** 可以带，表单 POST、iframe、fetch 不带 | 登录态默认选择（Chrome 默认值） |
+| None | 跨站也带，但**必须同时设 Secure** | 第三方嵌入场景 |
+
+SameSite=Lax 成为默认后，传统 CSRF 攻击（诱导用户浏览器向银行发 POST）大幅失效——这是近年 Web 安全最重要的默认值变化之一。
+
+<Playground
+  language="http"
+  title="观察各属性与'篡改 Cookie'"
+  id="http-08-2"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/issue":
+            self.send_response(200)
+            self.send_header("Set-Cookie",
+                "sid=server-signed-value; Path=/; HttpOnly; SameSite=Lax")
+            self.send_header("Set-Cookie",
+                "tracker=xyz; Path=/; Max-Age=60; SameSite=None; Secure")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            got = self.headers.get("Cookie", "(空)")
+            body = ("服务器视角收到: " + got + "\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 下发的原始 Set-Cookie 头 =="
+curl -sv http://127.0.0.1:8000/issue 2>&1 | grep -i "set-cookie"
+
+echo "== 客户端可以随便伪造 Cookie 头 =="
+curl -s http://127.0.0.1:8000/check -b "sid=i-am-admin; role=root"`}
+/>
+
+最后一行说明：**Cookie 的值完全由客户端回传，可任意伪造**。所以 Cookie 里要么只放"无意义的随机会话 ID"（Session 方案），要么放"带签名的自包含凭证"（JWT，第 16 章），绝不能放裸的 `role=admin`。
+
+## 3. Session：把状态放回服务器
+
+Session 方案：Cookie 里只存随机 `sid`，真实数据（用户 ID、权限）存在服务器的会话表里：
+
+```text
+浏览器                        服务器
+Cookie: sid=R7f3...           session 表
+                              R7f3... -> { user: "ada", role: "admin" }
+                              9k2Q... -> { user: "bob", role: "user"  }
+```
+
+<Playground
+  language="http"
+  title="完整会话机制：登录、识别、登出"
+  id="http-08-3"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlsplit, parse_qs
+import secrets
+
+sessions = {}
+
+class H(BaseHTTPRequestHandler):
+    def sid(self):
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "sid":
+                return v
+        return None
+    def reply(self, text, cookie=None):
+        body = text.encode()
+        self.send_response(200)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        u = urlsplit(self.path)
+        if u.path == "/login":
+            user = parse_qs(u.query).get("user", ["?"])[0]
+            sid = secrets.token_hex(8)
+            sessions[sid] = {"user": user}
+            self.reply("welcome " + user + "\n",
+                       "sid=" + sid + "; Path=/; HttpOnly; SameSite=Lax")
+        elif u.path == "/me":
+            s = sessions.get(self.sid())
+            self.reply(("当前用户: " + s["user"] if s else "未登录(401 才对)") + "\n")
+        elif u.path == "/logout":
+            sessions.pop(self.sid(), None)
+            # 删除 Cookie 的姿势：同名 + Max-Age=0
+            self.reply("bye\n", "sid=; Path=/; Max-Age=0")
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+A=/work/alice.jar; B=/work/bob.jar
+curl -s -c $A "http://127.0.0.1:8000/login?user=alice"
+curl -s -c $B "http://127.0.0.1:8000/login?user=bob"
+echo "-- 两个'浏览器'各自询问我是谁 --"
+curl -s -b $A http://127.0.0.1:8000/me
+curl -s -b $B http://127.0.0.1:8000/me
+echo "-- alice 登出后再问 --"
+curl -s -b $A -c $A http://127.0.0.1:8000/logout
+curl -s -b $A http://127.0.0.1:8000/me`}
+/>
+
+两个 cookie jar 模拟两台浏览器：同一服务器凭 sid 区分出 alice 和 bob。注意登出的实现细节——**删除 Cookie 没有专门指令，靠下发同名 Cookie 且 Max-Age=0**，同时服务端删掉会话记录（后者才是真正的安全保障）。
+
+## 4. Session vs Token：状态放哪边
+
+| 维度 | Session（状态在服务端） | JWT 等 Token（状态在客户端） |
+|---|---|---|
+| 服务端存储 | 需要（内存/Redis） | 不需要 |
+| 水平扩展 | 要共享会话存储 | 天然无状态 |
+| 主动失效 | 删记录立即生效 | 难（需黑名单，等于又有状态了） |
+| 体积 | sid 很小 | 携带数据，较大 |
+| 典型场景 | 传统 Web 应用 | API、微服务、移动端 |
+
+没有银弹：要"踢人下线、改密码立刻失效"选 Session（或 Token + 黑名单）；要免存储水平扩展选 Token。第 16 章展开 JWT。
+
+<Callout type="warn" title="会话安全三件套">
+登录态 Cookie 务必：HttpOnly（防 XSS 偷取）+ Secure（防明文窃听）+ SameSite=Lax 或 Strict（防 CSRF）。另外登录成功后必须**更换 sid**（防会话固定攻击：攻击者先塞给你一个已知 sid，等你登录后直接用它冒充你）。
+</Callout>
+
+## 小结
+
+- Cookie 循环：Set-Cookie 下发 → 浏览器按域存储 → Cookie 头自动回传；
+- 关键属性：Max-Age 定寿命、HttpOnly 防脚本读取、Secure 限 HTTPS、SameSite 控跨站携带；
+- Cookie 值可伪造，只能放随机 sid 或带签名的凭证；
+- Session 把状态放服务端，可控性强但要共享存储；Token 反之；
+- 删除 Cookie = 同名 + Max-Age=0；登录后要换 sid。
+
+<Callout type="exercise" title="练习">
+1. 修改 Playground 3：给 /me 在未登录时返回真正的 401 状态码，并带 WWW-Authenticate 头。
+2. 在 Playground 1 中给 theme Cookie 加上 Path=/settings，验证访问 /me 时它不再被携带（提示：curl 的 jar 会记录 Path）。
+3. 给 Playground 3 的会话加上过期时间：sessions 里记录创建时间，超过 5 秒的 sid 视为失效，用 sleep 验证。
+4. 解释：为什么"记住我 30 天"的网站，改密码后所有设备都应强制重新登录？用 Session 方案如何实现？
+</Callout>

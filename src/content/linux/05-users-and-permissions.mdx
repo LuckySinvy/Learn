@@ -1,0 +1,218 @@
+---
+title: 用户与权限：rwx、chmod/chown、umask 与 sudo
+order: 5
+description: 读懂 ls -l 的权限位、数字表示法换算、目录权限的特殊含义、umask 与 sudo 使用规范
+---
+
+# 用户与权限：rwx、chmod/chown、umask 与 sudo
+
+"Permission denied" 大概是 Linux 新手见得最多的报错。权限模型本身非常简洁——三种身份乘以三种权限——但细节里藏着不少反直觉的点（比如目录的 x 权限）。这一章把权限模型一次讲透。
+
+## 1. 用户与组
+
+每个用户有唯一的 UID，每个组有 GID；root 的 UID 恒为 0，拥有至高权限。用户信息存在两个"一切皆文件"的地方：
+
+```bash
+whoami                  # 当前用户名
+id                      # UID、GID 及所属的全部组
+head -n 3 /etc/passwd   # 用户数据库：用户名:x:UID:GID:备注:家目录:登录Shell
+head -n 3 /etc/group    # 组数据库
+```
+
+每个文件都记录**属主**（owner，一个用户）和**属组**（group，一个组）。权限检查时，系统把访问者归为三类身份之一：属主（u）、属组成员（g）、其他人（o）。
+
+## 2. 读懂 ls -l 的权限串
+
+```text
+-rwxr-x--- 1 ada dev 4096 Jul 31 10:00 deploy.sh
+│└┬┘└┬┘└┬┘
+│ │  │  └── 其他人(o)：--- 无任何权限
+│ │  └───── 属组(g)：r-x 可读可执行
+│ └──────── 属主(u)：rwx 全权限
+└────────── 文件类型：- 普通文件 / d 目录 / l 软链接
+```
+
+三种权限对**文件**和**目录**含义不同，这是理解权限的关键：
+
+| 权限 | 对文件 | 对目录 |
+|---|---|---|
+| r（read） | 读取内容 | 列出目录里的文件名（ls） |
+| w（write） | 修改内容 | 在目录中创建/删除/重命名文件 |
+| x（execute） | 作为程序执行 | **进入**目录（cd）、访问其中文件的 inode |
+
+两个高频反直觉点：
+
+- **删除文件看的是目录的 w 权限，不是文件本身的**——文件名是目录的数据（上一章讲过），所以对文件没有任何权限的人，只要对目录有 w+x，照样能删掉这个文件；
+- 目录只有 r 没有 x：能看到文件名列表，但无法 cd 进去、也读不了任何文件内容。
+
+## 3. 数字表示法
+
+r=4、w=2、x=1，三个身份各自求和，得到三位八进制数：
+
+| 数字 | 权限 | 常见用途 |
+|---|---|---|
+| 7 | rwx | 4+2+1 |
+| 6 | rw- | 4+2 |
+| 5 | r-x | 4+1 |
+| 4 | r-- | 只读 |
+| 0 | --- | 无权限 |
+
+经典组合：`644`（rw-r--r--，普通文件默认）、`755`（rwxr-xr-x，目录与可执行文件默认）、`600`（rw-------，私密文件如 SSH 私钥）、`700`（rwx------，私密目录如 ~/.ssh）。
+
+## 4. chmod：修改权限
+
+两种写法，数字法适合"整体设定"，符号法适合"增减某一位"：
+
+```bash
+chmod 644 note.txt          # 数字法：一次设定全部九位
+chmod u+x deploy.sh         # 符号法：给属主加执行权限
+chmod g-w,o-r report.txt    # 组去掉 w，其他人去掉 r
+chmod a+r public.txt        # a = 所有身份（u+g+o）
+chmod -R 755 site/          # -R 递归作用于整个目录树
+```
+
+<Playground
+  language="linux"
+  title="chmod 数字法与符号法"
+  id="linux-05-1"
+  code={`printf '#!/bin/bash\necho deploy ok\n' > deploy.sh
+
+echo '$ ls -l deploy.sh   # 新文件默认没有 x'
+ls -l deploy.sh
+
+echo '$ ./deploy.sh   # 没有执行权限，无法运行'
+./deploy.sh || echo '(失败：Permission denied)'
+
+echo '$ chmod u+x deploy.sh && ls -l deploy.sh'
+chmod u+x deploy.sh
+ls -l deploy.sh
+
+echo '$ ./deploy.sh   # 有 x 后可以执行了'
+./deploy.sh
+
+echo '$ chmod 600 deploy.sh && ls -l deploy.sh   # 数字法设为私密'
+chmod 600 deploy.sh
+ls -l deploy.sh
+
+echo '$ stat -c "%a %A %n" deploy.sh   # stat 直接输出数字权限'
+stat -c '%a %A %n' deploy.sh`}
+/>
+
+<Playground
+  language="linux"
+  title="目录权限：x 才能进门"
+  id="linux-05-2"
+  code={`mkdir vault
+echo 'secret data' > vault/key.txt
+
+echo '$ chmod 644 vault   # 目录只给 r，去掉 x'
+chmod 644 vault
+ls -ld vault
+
+echo '$ ls vault   # r 在：还能列出文件名（可能带报错）'
+ls vault 2>/dev/null
+
+echo '$ 注意：沙箱以 root 运行，root 不受 r/w 限制，普通用户此时 cd 会被拒绝'
+echo '$ 恢复 755 是目录的正确姿势'
+chmod 755 vault
+ls -ld vault`}
+/>
+
+<Callout type="warn" title="不要用 chmod 777 解决问题">
+777 意味着任何用户都能改写甚至替换你的文件——Web 目录 777 是被挂马的经典入口。遇到 Permission denied，正确做法是搞清楚"哪个用户在访问、缺哪一位权限"，精确授权（或用 chown 调整属主），而不是一把梭 777。同理，SSH 会直接拒绝使用权限过宽的私钥（必须 600）。
+</Callout>
+
+## 5. chown：修改属主与属组
+
+```bash
+chown ada app.log            # 属主改为 ada
+chown ada:dev app.log        # 属主 ada，属组 dev
+chown -R www-data:www-data /var/www/blog    # 递归修改，部署站点常用
+chgrp dev app.log            # 只改属组
+```
+
+改属主需要 root 权限（普通用户不能"把文件送给别人"）。典型场景：用 root 部署完代码后，把目录 chown 给运行服务的低权限用户（如 nginx 的 www-data）。
+
+<Playground
+  language="linux"
+  title="chown 修改属主"
+  id="linux-05-3"
+  code={`# 沙箱是 root，可以创建用户并转移文件属主（alpine 用 adduser）
+adduser -D alice 2>/dev/null
+echo 'owned by root' > app.log
+
+echo '$ ls -l app.log'
+ls -l app.log
+
+echo '$ chown alice app.log'
+chown alice app.log
+ls -l app.log
+
+echo '$ chown alice:alice app.log   # 同时改属组'
+chown alice:alice app.log
+ls -l app.log
+
+# 也可以直接用数字 UID
+chown 0:0 app.log
+echo '$ chown 0:0 之后（0 就是 root）：'
+ls -l app.log`}
+/>
+
+## 6. umask：新文件的默认权限从哪来
+
+新建文件的"理论满权限"是 666（文件不会默认给 x）、目录是 777，实际权限 = 满权限减去 umask 遮罩：
+
+```text
+umask 022：文件 666-022=644，目录 777-022=755   （最常见默认值）
+umask 077：文件 600，目录 700                    （只有自己可见，安全要求高的环境）
+```
+
+<Playground
+  language="linux"
+  title="umask 决定默认权限"
+  id="linux-05-4"
+  code={`echo '$ umask   # 当前遮罩值'
+umask
+
+touch default.txt && mkdir default.dir
+echo '$ umask 022 时新建的文件与目录：'
+stat -c '%a %n' default.txt default.dir
+
+echo '$ 把 umask 改成 077 再新建：'
+umask 077
+touch secret.txt && mkdir secret.dir
+stat -c '%a %n' secret.txt secret.dir`}
+/>
+
+## 7. sudo：临时借用 root 权限
+
+日常应以普通用户登录，需要特权时用 `sudo` 单条提权（sudo = superuser do）：
+
+```bash
+sudo systemctl restart nginx     # 以 root 身份执行这一条命令
+sudo -i                          # 切换成 root 的交互 Shell（慎用，用完 exit）
+sudo -u www-data ls /var/www     # 以指定用户身份执行
+```
+
+能否使用 sudo 由 `/etc/sudoers` 决定（通常"wheel"或"sudo"组成员可用），修改它必须用 `visudo` 命令——它会做语法检查，防止改坏后所有人都无法提权。沙箱容器本身就是 root 且未安装 sudo，因此本节命令请在真机体会。
+
+<Callout type="info" title="su 与 sudo 的区别">
+`su - ada` 是"切换用户"（需要目标用户的密码），`sudo` 是"以 root 执行"（验证的是**你自己的**密码，且每条命令留有审计日志）。生产环境的最佳实践是禁用 root 直接登录，全员通过 sudo 提权并留痕。
+</Callout>
+
+## 小结
+
+- 权限模型：三身份（u/g/o）× 三权限（r/w/x）；文件类型看 `ls -l` 首字符
+- 目录的 x 是"进门权"，w 是"增删文件权"——删除文件由**目录**权限决定
+- 数字法：r4 w2 x1；熟记 644/755/600/700 四个组合
+- `chmod` 改权限（数字或符号法），`chown` 改属主（需 root），`-R` 递归
+- umask 决定新文件默认权限：666/777 减去遮罩
+- 拒绝 777；日常普通用户 + sudo 按需提权
+- 下一章：find 与它的朋友们——在文件海里精确捞针 →
+
+<Callout type="exercise" title="练习">
+1. 不运行命令，先口算再验证：`chmod 640 f.txt` 后 `ls -l` 显示什么？属组成员能读吗？能写吗？其他人呢？
+2. 创建脚本 hello.sh（内容 `echo hi`），验证"没有 x 无法 `./hello.sh` 执行，但 `bash hello.sh` 却可以"——解释为什么（提示：后者执行的程序是 bash，脚本只是它读取的参数）。
+3. 在沙箱中把 umask 依次设为 022、027、077，各 touch 一个文件并用 `stat -c '%a %n'` 记录结果，总结换算规律。
+4. 思考题：某目录权限是 `dr-xr-xr-x`（555），root 之外的用户能在里面创建文件吗？属主自己呢？如何修复成"属主可增删、他人只读"？
+</Callout>

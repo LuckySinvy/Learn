@@ -1,0 +1,173 @@
+---
+title: 并发特性
+order: 18
+description: useTransition、useDeferredValue、React 18 自动批处理的原理与取舍，并亲手模拟批处理调度器
+---
+
+# 并发特性
+
+React 18 把「并发」从概念变成了默认行为的一部分。这一章讲三组常被误解的特性：自动批处理、`useTransition`、`useDeferredValue`。它们目标一致——**让用户输入始终流畅，把昂贵更新推迟、合并或降级**。
+
+注意一个前提：React 的并发是「可中断渲染」，不是 Web Worker 多线程。它仍然跑在主线程，只是学会了在渲染中途让出，去处理用户事件。
+
+## 1. 自动批处理（automatic batching）
+
+React 17 及以前，只在事件处理函数里批处理 setState；在 Promise、setTimeout、原生事件里连续调 setState，会一次次触发重渲染。
+
+```tsx
+// React 17：下面会渲染两次
+setTimeout(() => {
+  setCount((c) => c + 1);
+  setFlag((f) => !f);
+}, 0);
+```
+
+React 18 开始，**任何地方**的连续 setState 都会自动合并成一次重渲染。亲手模拟这个调度器：
+
+<Playground
+  language="typescript"
+  title="自动批处理调度器"
+  id="react-18-1"
+  code={`// 模拟 React 18 的自动批处理调度器
+type Update = () => void;
+
+let pending: Update[] = [];
+let scheduled = false;
+
+function flush(): void {
+  scheduled = false;
+  const batch = pending;
+  pending = [];
+  // 一次性执行所有更新（对应一次重渲染）
+  batch.forEach(function (u) { u(); });
+}
+
+function setState(mutator: Update): void {
+  pending.push(mutator);
+  if (!scheduled) {
+    scheduled = true;
+    // React 18 用调度器在「一个 tick」后刷新，而不是立刻
+    queueMicrotask(flush);
+  }
+}
+
+let count = 0;
+let flag = false;
+let renders = 0;
+
+function render(): void {
+  renders++;
+  console.log("render #" + renders + " -> count=" + count + ", flag=" + flag);
+}
+
+// 同一个 tick 里的多次 setState 会被合并
+setState(function () { count = 1; });
+setState(function () { flag = true; });
+setState(function () { count = 2; });
+
+// 微任务结束后才真正渲染（仅一次）
+queueMicrotask(function () {
+  render();
+  console.log("批处理效果：3 次 setState 只触发 " + renders + " 次渲染");
+});`}
+  expectedOutput={`render #1 -> count=2, flag=true\n批处理效果：3 次 setState 只触发 1 次渲染`}
+/>
+
+关键在 `scheduled` 标志：第一次 `setState` 排好刷新任务后，后面的更新只入队、不再排队。这就是「批」的由来——不是不执行，而是攒到一个 tick 后统一执行。
+
+## 2. useTransition：把更新分成「紧急」和「过渡」
+
+很多时候你有两类更新混在一起：用户输入是紧急的（必须立刻响应），而由输入触发的重渲染（比如过滤一个 1 万行的列表）是昂贵的。React 18 让你显式标记后者为「过渡」。
+
+```tsx
+import { useState, useTransition } from "react";
+
+function Search() {
+  const [query, setQuery] = useState("");
+  const [list, setList] = useState<Item[]>([]);
+  const [isPending, startTransition] = useTransition();
+
+  function onChange(e: React.ChangeEvent<HTMLInputElement>) {
+    setQuery(e.target.value);            // 紧急：输入框立刻跟着打字
+    startTransition(() => {
+      setList(filterHugeList(e.target.value)); // 过渡：可被中断、不卡输入
+    });
+  }
+
+  return (
+    <>
+      <input value={query} onChange={onChange} />
+      {isPending ? <Spinner /> : <List items={list} />}
+    </>
+  );
+}
+```
+
+`startTransition` 包住的更新被打上「低优先级」标签。如果用户在过滤过程中继续打字，`query` 更新会打断过渡更新、优先渲染输入框——输入始终跟手。
+
+### 2.1 什么时候用 useTransition
+
+- 输入触发的大型列表过滤、排序
+- 切换标签页/路由时整页重渲染
+- 任何「先让 UI 响应，重活稍后做」的场景
+
+<Callout type="warn" title="过渡更新会丢中间态">
+`startTransition` 里的状态可能被更高优先级的更新打断而**不提交**。所以不要在过渡更新里做有副作用、必须完成的事（比如写数据），只放「纯展示状态」。
+</Callout>
+
+## 3. useDeferredValue：把「值」推迟
+
+`useDeferredValue` 是 `useTransition` 的近亲，但粒度更细——它推迟的是「某个值」，而不是一包更新。
+
+```tsx
+const [query, setQuery] = useState("");
+const deferredQuery = useDeferredValue(query);   // 落后于 query 的副本
+
+// 用 deferredQuery 做昂贵计算，query 保持实时
+const results = useMemo(() => filterHugeList(deferredQuery), [deferredQuery]);
+```
+
+`deferredQuery` 会在紧急渲染之后、有空闲时再更新。如果 `query` 频繁变，React 会丢弃过期的 `deferredQuery` 计算，直接用最新的——再次保证输入跟手。
+
+### 3.1 两者如何选择
+
+| 场景 | 用哪个 |
+|---|---|
+| 有一包连续的更新要降级 | `useTransition` |
+| 只有一个值被多个地方用到，想降级它 | `useDeferredValue` |
+| 需要展示「加载中」占位 | `useTransition` 的 `isPending` |
+| 只是给某个派生值降级 | `useDeferredValue` |
+
+## 4. 并发的代价与心智
+
+并发特性给了我们「不卡」的能力，但也要求组件是**可中断、可重复渲染**的——这又回到第 6 章的 Hooks 规则和第 7 章的纯函数。如果组件有隐藏的副作用，中断重渲染会放大错误。
+
+<Callout type="tip" title="先测量，再并发">
+`useTransition` / `useDeferredValue` 不是默认就该加的。先用第 12 章的 Profiler 确认「确实卡在输入触发的重渲染」，再加。乱加只会让代码更难懂，性能没变化。
+</Callout>
+
+<Callout type="info" title="StrictMode 与并发">
+第 6 章提过 StrictMode 会双调用渲染函数。在并发语境下这更合理：既然渲染可能被中断重来，那「渲染函数能被安全地多次调用」就是必须的前提。StrictMode 帮你提前发现不纯的组件。
+</Callout>
+
+<Callout type="exercise" title="练习 1：批处理对比">
+在 React 18 下，分别写出「在 Promise.then 里连续调两次 setState」和「在 onClick 里连续调两次 setState」的代码。两者各自渲染几次？如果退回 React 17 行为，结论会变吗？
+</Callout>
+
+<Callout type="exercise" title="练习 2：用 useTransition 改写">
+一个搜索框每次输入都对 10000 条数据过滤，导致打字卡顿。给出用 `useTransition` 改写的关键代码，并说明 `isPending` 应该放在哪里（输入框还是结果区）。
+</Callout>
+
+<Callout type="exercise" title="练习 3：useTransition vs useDeferredValue">
+判断下面两个场景分别更适合哪个：①点击「切换主题」要重渲染全站 200 个组件；②一个输入框的值被用来做实时高亮匹配。说明理由。
+</Callout>
+
+## 小结
+
+- React 18 自动批处理：任何地方的连续 setState 都合并成一次重渲染（调度器攒批到下一个 tick）
+- `useTransition`：把更新分成紧急（输入）和过渡（昂贵），过渡更新可被中断、不卡输入
+- `useDeferredValue`：推迟「某个值」，落后实时值、自动丢弃过期计算
+- 并发是「可中断渲染」不是多线程；组件必须纯、可安全重复渲染
+- 过渡更新会丢中间态，别在里面放必须完成的副作用
+- 先用 Profiler 确认瓶颈，再决定要不要上并发特性
+- 下一章讲 Server Components 与 Next.js →

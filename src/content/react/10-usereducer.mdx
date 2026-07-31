@@ -1,0 +1,469 @@
+---
+title: useReducer 与复杂状态
+order: 10
+description: reducer 模式的本质、与 useState 的取舍、用状态机消除非法状态，以及 reducer + Context 的组合
+---
+
+# useReducer 与复杂状态
+
+当一个组件里出现五六个 `useState`，而且它们经常需要一起更新时，代码会变成这样：
+
+```tsx
+function handleSubmitSuccess(data: Data) {
+  setLoading(false);
+  setError(null);
+  setData(data);
+  setLastFetch(Date.now());
+  setRetryCount(0);
+}
+```
+
+五个 setter 必须一起调用，漏一个就产生不一致状态。`useReducer` 就是为这种情况准备的：**把「状态如何变化」的逻辑集中到一个纯函数里**。
+
+## 1. reducer 是什么
+
+### 1.1 一个纯函数
+
+```text
+(当前状态, 动作) => 新状态
+```
+
+就这么简单。它是纯函数：不发请求、不改 DOM、不读随机数、不改传入的 state，只根据输入算出新状态。
+
+```tsx
+type State = { count: number; step: number };
+type Action =
+  | { type: "increment" }
+  | { type: "decrement" }
+  | { type: "setStep"; step: number }
+  | { type: "reset" };
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case "increment":
+      return { ...state, count: state.count + state.step };
+    case "decrement":
+      return { ...state, count: state.count - state.step };
+    case "setStep":
+      return { ...state, step: action.step };
+    case "reset":
+      return { count: 0, step: 1 };
+  }
+}
+```
+
+### 1.2 在组件里用
+
+```tsx
+function Counter() {
+  const [state, dispatch] = useReducer(reducer, { count: 0, step: 1 });
+
+  return (
+    <div>
+      <p>{state.count}</p>
+      <button onClick={() => dispatch({ type: "increment" })}>+</button>
+      <button onClick={() => dispatch({ type: "decrement" })}>-</button>
+      <input
+        type="number"
+        value={state.step}
+        onChange={(e) => dispatch({ type: "setStep", step: Number(e.target.value) })}
+      />
+    </div>
+  );
+}
+```
+
+组件里只剩「派发意图」，不含任何状态计算逻辑。
+
+<Callout type="tip" title="action 描述「发生了什么」，不是「要怎么改」">
+好的 action 名：`addedTodo`、`submitFailed`、`stepChanged`——它们描述用户或系统做了什么。
+
+坏的 action 名：`setCount`、`updateState`——这只是把 setter 换了个写法，reducer 退化成一个大型 setState，失去了集中逻辑的意义。
+
+这个命名习惯直接决定了 reducer 能不能读懂。
+</Callout>
+
+### 1.3 用 TypeScript 保证穷尽
+
+联合类型的 action 配合 switch，能让 TS 帮你检查是否漏了分支：
+
+```tsx
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case "increment":
+      return { ...state, count: state.count + 1 };
+    default: {
+      // 如果 Action 联合里还有没处理的分支，这里会编译报错
+      const never: never = action;
+      throw new Error("未处理的 action: " + JSON.stringify(never));
+    }
+  }
+}
+```
+
+新增一种 action 时，忘记处理会立刻在编译期暴露。这是 reducer 相比一堆 setState 的一个隐性优势。
+
+## 2. 手写一个 store
+
+`useReducer` 的内核，加上订阅机制，就是 Redux。下面这段纯 TypeScript 把两者一起实现了，跑一遍就能理解「状态容器」这四个字。
+
+<Playground
+  language="typescript"
+  title="迷你 reducer store：dispatch 与订阅"
+  id="react-10-1"
+  code={`interface Todo {
+  id: number;
+  title: string;
+  done: boolean;
+}
+
+type Filter = "all" | "active" | "done";
+
+interface State {
+  todos: Todo[];
+  filter: Filter;
+  nextId: number;
+}
+
+type Action =
+  | { type: "added"; title: string }
+  | { type: "toggled"; id: number }
+  | { type: "filterChanged"; filter: Filter }
+  | { type: "clearedDone" };
+
+// 纯函数：给定 state 和 action，算出新 state
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case "added":
+      return {
+        todos: state.todos.concat([
+          { id: state.nextId, title: action.title, done: false },
+        ]),
+        filter: state.filter,
+        nextId: state.nextId + 1,
+      };
+    case "toggled":
+      return {
+        todos: state.todos.map(function (t) {
+          if (t.id !== action.id) return t;
+          return { id: t.id, title: t.title, done: !t.done };
+        }),
+        filter: state.filter,
+        nextId: state.nextId,
+      };
+    case "filterChanged":
+      return { todos: state.todos, filter: action.filter, nextId: state.nextId };
+    case "clearedDone":
+      return {
+        todos: state.todos.filter(function (t) {
+          return !t.done;
+        }),
+        filter: state.filter,
+        nextId: state.nextId,
+      };
+    default: {
+      const never: never = action;
+      throw new Error("未处理: " + JSON.stringify(never));
+    }
+  }
+}
+
+// 状态容器 = reducer + 当前状态 + 订阅列表
+interface Store<S, A> {
+  getState: () => S;
+  dispatch: (action: A) => void;
+  subscribe: (fn: (s: S) => void) => () => void;
+}
+
+function createStore<S, A>(
+  reduce: (s: S, a: A) => S,
+  initial: S
+): Store<S, A> {
+  let state = initial;
+  const listeners: Array<(s: S) => void> = [];
+
+  return {
+    getState: function () {
+      return state;
+    },
+    dispatch: function (action: A) {
+      const next = reduce(state, action);
+      if (Object.is(next, state)) return; // 状态没变就不通知（React 的 bailout）
+      state = next;
+      for (const fn of listeners) fn(state);
+    },
+    subscribe: function (fn: (s: S) => void) {
+      listeners.push(fn);
+      return function () {
+        const i = listeners.indexOf(fn);
+        if (i >= 0) listeners.splice(i, 1);
+      };
+    },
+  };
+}
+
+// 派生数据：从 state 算出来，不单独存
+function visibleTodos(state: State): Todo[] {
+  if (state.filter === "active") {
+    return state.todos.filter(function (t) {
+      return !t.done;
+    });
+  }
+  if (state.filter === "done") {
+    return state.todos.filter(function (t) {
+      return t.done;
+    });
+  }
+  return state.todos;
+}
+
+const store = createStore<State, Action>(reducer, {
+  todos: [],
+  filter: "all",
+  nextId: 1,
+});
+
+// 模拟一个组件订阅 store
+const unsubscribe = store.subscribe(function (s) {
+  const titles = visibleTodos(s).map(function (t) {
+    return (t.done ? "[x] " : "[ ] ") + t.title;
+  });
+  console.log("  render -> filter=" + s.filter + " | " + titles.join(" , "));
+});
+
+console.log('dispatch added "写 reducer"');
+store.dispatch({ type: "added", title: "写 reducer" });
+
+console.log('dispatch added "写测试"');
+store.dispatch({ type: "added", title: "写测试" });
+
+console.log("dispatch toggled #1");
+store.dispatch({ type: "toggled", id: 1 });
+
+console.log("dispatch filterChanged active");
+store.dispatch({ type: "filterChanged", filter: "active" });
+
+console.log("dispatch clearedDone");
+store.dispatch({ type: "clearedDone" });
+
+unsubscribe();
+console.log("已退订，再 dispatch 不会有 render 输出");
+store.dispatch({ type: "added", title: "不会显示" });
+console.log("最终 todo 数量: " + store.getState().todos.length);`}
+  expectedOutput={`dispatch added "写 reducer"\n  render -> filter=all | [ ] 写 reducer\ndispatch added "写测试"\n  render -> filter=all | [ ] 写 reducer , [ ] 写测试\ndispatch toggled #1\n  render -> filter=all | [x] 写 reducer , [ ] 写测试\ndispatch filterChanged active\n  render -> filter=active | [ ] 写测试\ndispatch clearedDone\n  render -> filter=active | [ ] 写测试\n已退订，再 dispatch 不会有 render 输出\n最终 todo 数量: 2`}
+/>
+
+这 60 行代码里包含了状态管理的全部核心概念：**纯函数 reducer、单一状态源、dispatch 派发、订阅通知、派生数据现算、引用相等即跳过**。第 15 章讲的所有状态库，无非是在这个骨架上加了选择性订阅、中间件和开发者工具。
+
+## 3. useState 还是 useReducer
+
+### 3.1 判断标准
+
+| 情况 | 选择 |
+|---|---|
+| 单个独立的值（开关、输入框、计数） | useState |
+| 两三个不相关的值 | useState |
+| 多个值必须同步更新 | useReducer |
+| 下一个状态依赖前一个状态的复杂逻辑 | useReducer |
+| 状态更新逻辑分散在很多事件处理函数里 | useReducer |
+| 需要给深层子组件传「更新能力」 | useReducer（传 dispatch 即可） |
+| 需要为状态逻辑写单元测试 | useReducer（reducer 是纯函数，好测） |
+| 需要撤销/重做、日志、时间旅行 | useReducer |
+
+### 3.2 传 dispatch 比传一堆回调好
+
+```tsx
+// useState 版本：要传五个回调下去
+<TodoItem todo={t} onToggle={toggle} onEdit={edit} onDelete={del} onMove={move} />
+
+// useReducer 版本：只传 dispatch
+<TodoItem todo={t} dispatch={dispatch} />
+```
+
+而且 **`dispatch` 的引用永远不变**（React 保证），所以它不需要 `useCallback`，放进依赖数组也永远不会导致重新执行。这在配合 `React.memo` 时是很大的优势。
+
+### 3.3 两者可以混用
+
+不需要非此即彼。常见的做法是：核心业务状态用 reducer，UI 局部状态（某个下拉是否展开）用 useState。
+
+## 4. 用状态机消除非法状态
+
+### 4.1 布尔标记的组合爆炸
+
+```tsx
+const [isLoading, setIsLoading] = useState(false);
+const [isError, setIsError] = useState(false);
+const [isSuccess, setIsSuccess] = useState(false);
+const [data, setData] = useState<Data | null>(null);
+```
+
+四个变量能组合出 16 种状态，但只有 4 种是合法的。剩下 12 种（比如 loading 和 error 同时为 true、success 为 true 但 data 是 null）都是 bug 的温床，而且总有一天会出现。
+
+### 4.2 用可辨识联合建模
+
+```tsx
+type State =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; data: Data }
+  | { status: "error"; message: string };
+
+type Action =
+  | { type: "fetch" }
+  | { type: "resolved"; data: Data }
+  | { type: "rejected"; message: string }
+  | { type: "retry" };
+
+function reducer(state: State, action: Action): State {
+  switch (state.status) {
+    case "idle":
+      return action.type === "fetch" ? { status: "loading" } : state;
+
+    case "loading":
+      if (action.type === "resolved") return { status: "success", data: action.data };
+      if (action.type === "rejected") return { status: "error", message: action.message };
+      return state;
+
+    case "success":
+      return action.type === "fetch" ? { status: "loading" } : state;
+
+    case "error":
+      return action.type === "retry" ? { status: "loading" } : state;
+  }
+}
+```
+
+注意这个 reducer 是**先 switch 状态、再判断动作**——这就是状态机的写法。它天然表达了「在某个状态下，只有某些动作是有意义的」。
+
+比如「已经在 loading 时又收到 fetch」会被忽略，这一行代码就消灭了重复请求的问题。
+
+组件里的消费也变得类型安全：
+
+```tsx
+switch (state.status) {
+  case "idle":
+    return <button onClick={() => dispatch({ type: "fetch" })}>加载</button>;
+  case "loading":
+    return <Spinner />;
+  case "error":
+    return <Error msg={state.message} onRetry={() => dispatch({ type: "retry" })} />;
+  case "success":
+    return <View data={state.data} />;   // TS 知道 data 一定存在
+}
+```
+
+**不可能再写出「success 状态下 data 为 null」的代码——因为类型系统不允许。**
+
+<Callout type="info" title="这就是 XState 的思路">
+把状态机写法推到极致就是 XState 这类库：显式声明状态、事件、转移规则，还能生成可视化状态图。
+
+对于表单向导、支付流程、播放器这类状态复杂的场景，值得考虑。但大多数情况下，手写一个「先 switch 状态」的 reducer 已经足够。
+</Callout>
+
+## 5. reducer + Context：轻量状态管理
+
+把第 9 章的 Context 拆分模式和 reducer 组合起来，就得到了一套够用的全局状态方案：
+
+```tsx
+const StateContext = createContext<State | null>(null);
+const DispatchContext = createContext<React.Dispatch<Action> | null>(null);
+
+export function TodoProvider({ children }: { children: React.ReactNode }) {
+  const [state, dispatch] = useReducer(reducer, initialState);
+
+  return (
+    // dispatch 引用永远不变，所以这个 Provider 的 value 天然稳定
+    <DispatchContext.Provider value={dispatch}>
+      <StateContext.Provider value={state}>{children}</StateContext.Provider>
+    </DispatchContext.Provider>
+  );
+}
+
+export function useTodos() {
+  const ctx = useContext(StateContext);
+  if (!ctx) throw new Error("需要 TodoProvider");
+  return ctx;
+}
+
+export function useTodoDispatch() {
+  const ctx = useContext(DispatchContext);
+  if (!ctx) throw new Error("需要 TodoProvider");
+  return ctx;
+}
+```
+
+只 dispatch 不读状态的组件（比如「添加」按钮）用 `useTodoDispatch()`，它永远不会因为列表变化而重渲染。
+
+这套方案的适用范围：**中小型应用、状态更新不频繁、不需要选择性订阅**。超出这个范围就该上第 15 章的库了。
+
+## 6. 处理副作用
+
+reducer 必须是纯的，那异步怎么办？答案是：**副作用在外面做，做完 dispatch 结果**。
+
+```tsx
+async function load(dispatch: React.Dispatch<Action>, id: string) {
+  dispatch({ type: "fetch" });
+  try {
+    const data = await api.get(id);
+    dispatch({ type: "resolved", data });
+  } catch (e) {
+    dispatch({ type: "rejected", message: String(e) });
+  }
+}
+
+// 组件里
+<button onClick={() => load(dispatch, id)}>加载</button>
+```
+
+这个函数在 Redux 生态里叫 thunk。它不需要任何框架支持——本质就是一个接收 dispatch 的普通异步函数。
+
+<Callout type="warn" title="reducer 里绝不能有副作用">
+不要在 reducer 里发请求、写 localStorage、生成随机 id 或读 `Date.now()`。
+
+原因：React 在 StrictMode 下会**故意调用 reducer 两次**来检测纯度；未来的并发特性也可能重放 action。有副作用的 reducer 会产生重复请求、重复写入这类难以复现的 bug。
+
+随机 id 和时间戳应该在 action 里传进来：`dispatch({ type: "added", id: crypto.randomUUID(), at: Date.now() })`。
+</Callout>
+
+<Callout type="exercise" title="练习 1：重构成 reducer">
+一个分页表格组件有这些 state：`page`、`pageSize`、`sortKey`、`sortOrder`、`filters`、`selectedIds`。
+
+已知的联动规则：改变 pageSize、sortKey 或 filters 时，page 要重置为 1；改变 filters 时，selectedIds 要清空。
+
+用 useState 实现需要在多个 handler 里重复这些规则。请设计 Action 类型并写出 reducer。
+</Callout>
+
+<Callout type="exercise" title="练习 2：设计状态机">
+一个文件上传组件有这些状态：未选择、已选择待上传、上传中（有进度）、上传成功（有 url）、上传失败（有原因）、已取消。
+
+用可辨识联合定义 State 和 Action，写出 reducer。要求：上传中才能取消，失败后才能重试，成功后只能重新选择文件。
+</Callout>
+
+<Callout type="exercise" title="练习 3：加撤销功能">
+给本章 Playground 的 store 加上撤销/重做：
+
+- 维护 `past`、`present`、`future` 三段
+- 增加 `undo` 和 `redo` 两个 action
+- 只有会改变数据的 action 才入栈（`filterChanged` 不应该被撤销）
+
+实现后验证：添加两项、切换 filter、撤销一次，得到的应该是只有一项且 filter 保持不变。
+</Callout>
+
+<Callout type="exercise" title="练习 4：加中间件">
+给 Playground 的 `createStore` 加一个日志中间件：每次 dispatch 时打印 action 类型、变更前后的 todo 数量。
+
+实现方式：包装原来的 dispatch 函数。想一想这个模式和 Express 的中间件、Nest 的拦截器有什么共同点。
+</Callout>
+
+## 小结
+
+- reducer 是 `(state, action) => newState` 的**纯函数**，把状态变化逻辑集中到一处
+- action 应该描述「发生了什么」而不是「怎么改」
+- 用联合类型 + `never` 兜底，让 TS 检查分支穷尽性
+- 选 useReducer 的信号：多值同步更新、逻辑分散、需要测试、需要传更新能力给深层子组件
+- **`dispatch` 引用永远不变**，不需要 useCallback，也不会破坏 memo
+- 用**可辨识联合建模状态机**能从类型层面消灭非法状态组合
+- 「先 switch 状态、再判断动作」的写法自然表达了状态转移规则
+- reducer + 拆分的 Context = 轻量全局状态方案，适合中小型应用
+- 副作用放在外部函数（thunk）里，做完再 dispatch 结果；reducer 内部绝不能有副作用
+- 下一章讲组件通信与状态提升 →

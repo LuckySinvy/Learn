@@ -1,0 +1,221 @@
+---
+title: submodule 与 monorepo：子模块机制、大仓库优化与多仓取舍
+order: 17
+description: git submodule 的工作机制与常见坑（游离 HEAD、忘记递归克隆）、subtree 简介、sparse-checkout 与 partial clone 在大仓库的用法、monorepo 与多仓库的取舍对比
+---
+
+# submodule 与 monorepo：子模块机制、大仓库优化与多仓取舍
+
+当项目需要引用另一个独立演进的仓库（第三方库、共享组件、文档站）时，Git 提供了 **submodule（子模块）** 与 **subtree（子树合并）** 两种"仓库套仓库"的方案。此外，超大型仓库还有 **sparse-checkout** 和 **partial clone** 来减轻负担。这一章讲清机制、坑点，以及"大仓 vs 多仓"的架构取舍。
+
+## 1. submodule：在主仓库里引用另一个仓库的某一提交
+
+子模块的本质：**主仓库不存子项目的文件内容，只存一个"gitlink"——指向子项目某个具体提交的哈希**。子项目自己是一个完整独立的仓库。
+
+```text
+主项目 myapp/
+  ├─ app.js
+  ├─ .gitmodules        <- 记录子模块 URL 与本地路径的映射
+  └─ libs/core/         <- 子模块（独立仓库，固定在其某次提交上）
+```
+
+<Playground
+  language="git"
+  title="submodule 的引入、克隆与更新"
+  id="git-17-1"
+  code={`echo '===== submodule：把另一个仓库作为子目录引用 ====='
+git config --global protocol.file.allow always
+git init -q --bare -b main /tmp/libcore.git
+git clone -q /tmp/libcore.git libwork && cd libwork
+echo 'API v1' > api.txt && git add . && git commit -q -m "lib: v1"
+git push -q -u origin main 2>/dev/null
+cd ..
+
+echo '在主项目里把上面的库作为 submodule 引入（记录的是库当前 main=v1 的哈希）：'
+git init -q -b main app && cd app
+git submodule add -q /tmp/libcore.git libs/core
+echo '.gitmodules 记录了子模块的 URL 与本地路径：'
+cat .gitmodules
+echo
+echo 'git submodule status（前面空格=已初始化且干净）：'
+git submodule status
+echo "app 记录的子模块 gitlink：$(git ls-files --stage libs/core)"
+echo
+echo '提交主项目（注意：提交的是子模块的「引用哈希」，不是内容）：'
+git add . && git commit -q -m "chore: 引入 core 库子模块"
+cd ..
+
+echo
+echo '===== 克隆含 submodule 的项目需要 --init ====='
+git clone -q app app2 && cd app2
+echo "app2 记录的子模块 gitlink（克隆时一并复制）：$(git ls-files --stage libs/core)"
+echo '刚克隆时子模块目录是空的（只复制了 gitlink，没复制内容）：'
+test -s libs/core/api.txt && echo '有内容' || echo '（空，需要 init）'
+echo '执行 git submodule update --init 拉取子模块内容：'
+git submodule update --init -q
+echo "现在 libs/core 内容是（应为引入时的 v1）：$(cat libs/core/api.txt)"
+cd ..
+
+echo
+echo '===== 更新子模块到新版本 ====='
+cd libwork && echo 'API v2' > api.txt && git add . && git commit -q -m "lib: v2" && git push -q 2>/dev/null && cd ..
+cd app2
+echo '在主项目里把子模块更新到上游最新：'
+git submodule update --remote -q
+git add libs/core && git commit -q -m "chore: 升级 core 到 v2"
+echo "主项目现在引用的子模块哈希变了：$(git ls-files --stage libs/core)"
+echo "libs/core 内容（应为 v2）：$(cat libs/core/api.txt)"
+cd ..`}
+/>
+
+关键点：
+
+- `git submodule add <url> <path>` 会生成 `.gitmodules` 并把子模块快照记录为 gitlink（模式 `160000`）。
+- 主仓库提交的是**引用哈希**，所以别人克隆后必须 `git submodule update --init` 才能拿到子模块内容——只复制 gitlink 不会自动拉内容。
+- 更新子模块：进到子模块目录 `git pull`，再回主项目 `git add` 那个子模块路径并提交新的 gitlink。或者用一步到位的 `git submodule update --remote`。
+
+## 2. submodule 的常见坑
+
+### 坑一：忘记递归克隆
+
+克隆别人带子模块的项目时，`git clone` 之后子模块目录是空的。必须：
+
+```bash
+git clone <url> myproj && cd myproj
+git submodule update --init --recursive   # --recursive 处理嵌套子模块
+# 或者一步到位：
+git clone --recurse-submodules <url> myproj
+```
+
+### 坑二：子模块里处于游离 HEAD
+
+进入子模块目录后，它默认**不是在任何分支上**（HEAD 直接指向那个固定提交），`git status` 会显示 "HEAD detached"。如果你在子模块里直接提交，提交会"悬空"——因为主项目记录的还是旧哈希，下次 `submodule update` 就会把你刚做的改动丢掉。
+
+```bash
+cd libs/core
+git checkout main        # 先切到真正分支再改
+# ... 修改、提交、push ...
+cd ..
+git add libs/core        # 把新哈希记录回主项目
+git commit -m "bump core"
+```
+
+<Callout type="warn" title="子模块修改的正确姿势">
+在子模块里改代码前，**务必先 `git checkout 分支名`** 离开游离 HEAD；改完 push 后，回主项目 `git add` 子模块路径并提交，让 gitlink 指向新提交。漏掉最后一步，你的改动就"漂"在主项目之外。
+</Callout>
+
+### 坑三：URL 写死、移动困难
+
+`.gitmodules` 里的 URL 是写死的。子模块源换了地址，要同时改 `.gitmodules` 和同步：
+
+```bash
+git config --file=.gitmodules submodule.libs/core.url <new-url>
+git submodule sync        # 把 .gitmodules 的新 URL 同步到 .git/config
+```
+
+## 3. subtree：另一种"仓库套仓库"
+
+`git subtree` 把子项目的**全部历史与文件**直接合并进主项目的某个目录，对外是普通目录，对内部是独立可推送的子树。
+
+```bash
+git subtree add --prefix=libs/core <url> main --squash   # 引入
+git subtree pull --prefix=libs/core <url> main --squash  # 更新
+git subtree push --prefix=libs/core <url> main          # 把改动推回子项目
+```
+
+| | submodule | subtree |
+|---|---|---|
+| 文件是否在主仓库 | 否（只存 gitlink） | 是（完整拷贝进目录） |
+| 克隆主仓库 | 需 `--recurse-submodules` | 普通 clone 即可，无需额外步骤 |
+| 子项目独立性 | 强，完全独立仓库 | 弱，历史混在一起 |
+| 新人上手 | 需理解子模块概念 | 无感，像普通目录 |
+| 适合 | 强耦合外部库、需固定版本 | 想把代码并进来的内部子项目 |
+
+经验：对外是硬依赖、要锁版本、对方仓库独立演进 → submodule；想把代码"吸收"进来的内部组件 → subtree。
+
+## 4. 大仓库优化：sparse-checkout 与 partial clone
+
+当主仓库动辄几十 GB（如 Android、Chromium），全量克隆不现实。两个救命特性：
+
+<Playground
+  language="git"
+  title="sparse-checkout 与 partial clone 实操"
+  id="git-17-2"
+  code={`echo '===== sparse-checkout：只检出需要的目录 ====='
+git config --global protocol.file.allow always
+git init -q --bare -b main /tmp/big.git
+git init -q -b main bigwork && cd bigwork
+git remote add origin /tmp/big.git
+mkdir -p src/api src/web src/docs assets
+echo 'api code' > src/api/a.js
+echo 'web code' > src/web/w.js
+echo 'doc' > src/docs/d.md
+echo 'big asset' > assets/logo.bin
+git add . && git commit -q -m "init big repo" && git push -q -u origin main 2>/dev/null
+cd ..
+
+echo '普通克隆：所有目录都下来了'
+git clone -q /tmp/big.git full && cd full
+echo "普通克隆后顶层内容：$(ls)"
+cd ..
+
+echo
+echo '用 sparse-checkout 只检出 src/api 和 src/web：'
+git clone -q /tmp/big.git sparse && cd sparse
+git sparse-checkout init --cone
+git sparse-checkout set src/api src/web
+echo "sparse 克隆后工作区只含：$(find . -path ./.git -prune -o -type f -print | sort)"
+echo '未检出的 src/docs 暂时看不到，但仍在仓库里（需要时再展开）'
+cd ..
+
+echo
+echo '===== partial clone：先不下载文件内容 ====='
+echo '用 --filter=blob:none 部分克隆（大仓库 CI/浅取常用）：'
+git clone -q --filter=blob:none file:///tmp/big.git part
+cd part
+echo "是否 promisor 仓库（按需取对象）：$(git config remote.origin.promisor)"
+echo '此时文件列表能看，但 blob 内容按需从源仓库现取：'
+git ls-files
+echo '查看某个文件内容（首次访问会按需 fetch）：'
+cat src/api/a.js
+cd ..`}
+/>
+
+- **sparse-checkout**：只把指定的目录/文件检出到工作区，其余历史仍在仓库里但不在磁盘上占位置。适合"只想改其中一个模块"的超大多模块仓库。`git sparse-checkout set a b` 切换可见范围。
+- **partial clone（部分克隆）**：克隆时**不下载 blob 和/或 tree**，用到再按需获取（`--filter=blob:none` 不取文件内容，`--filter=tree:0` 连目录树都不取）。CI 里尤其省时。
+
+<Callout type="info" title="沙箱内 partial clone 的说明">
+上面用 `file://` 协议克隆本地裸仓库时，Git 会提示 "filtering not recognized by server, ignoring"——因为本地文件协议的服务端不实现过滤协商。在真实的 GitHub/GitLab 服务端，部分克隆会真正生效：克隆瞬间完成、blob 按需取。命令本身、promisor 标记、按需 fetch 的机制与线上完全一致，只是本地无法演示"体积变小"那部分。
+</Callout>
+
+## 5. monorepo 还是多仓库？
+
+| 维度 | monorepo（单一大仓库） | 多仓库（每个服务一个） |
+|---|---|---|
+| 跨项目改动 | 一个提交搞定，原子性强 | 需跨多个仓库协调，易不一致 |
+| 依赖共享 | 直接引用，无版本地狱 | 靠发布版本号，易出现依赖漂移 |
+| 工具/规范统一 | 天然统一 | 各仓库易分化 |
+| 仓库体积/性能 | 巨大，需 sparse/partial 优化 | 每个都很小，克隆快 |
+| 权限管控 | 粗粒度，难按目录细控 | 天然按仓库隔离 |
+| 适合 | 强关联的代码库（前端+后端同仓、统一平台） | 松耦合、独立团队/独立发布节奏的服务 |
+
+<Callout type="tip" title="没有银弹">
+Google、Meta 用 monorepo（配强工具链）；大多数微服务团队用多仓库。决定因素不是"哪个更高级"，而是**你的代码变更是否经常需要跨项目联动**——是就倾向 monorepo，否就多仓库更清爽。
+</Callout>
+
+## 6. 小结
+
+- 子模块：主仓库只存 gitlink（指向子项目某提交的哈希），内容在独立仓库
+- 克隆带子模块的项目别忘了 `git submodule update --init --recursive`（或 `--recurse-submodules`）
+- 子模块里改代码前先 `git checkout 分支` 离开游离 HEAD，改完回主项目 `git add` 子模块路径提交
+- subtree 把子项目完整合并进目录，clone 无感但独立性弱；submodule 独立性强但上手成本高
+- 大仓库用 sparse-checkout（只检目录）+ partial clone（不取 blob）减负
+- monorepo vs 多仓库取舍看"变更是否频繁跨项目联动"
+- 下一章：实战演练，串起全课 →
+
+<Callout type="exercise" title="练习">
+1. 用本地裸仓库 `/tmp/sub.git` 造一个"库"，在另一个仓库里 `git submodule add` 它，提交后克隆到新目录，验证必须 `git submodule update --init` 才能看到内容。
+2. 在子模块目录里 `cd libs/core && git status`，观察是否处于"HEAD detached"。先 `git checkout main` 再改文件、提交、push，回主项目 `git add libs/core` 并提交，看 gitlink 是否更新。
+3. 对一个含多个目录的仓库，分别用普通 clone 和 `git clone --filter=blob:none <url>` 克隆，比较 `git config remote.origin.promisor` 的值，并说明部分克隆适合什么场景。
+4. 你们团队有"前端 + 后端 + 公共组件"三个部分，改动常常要一起改。请用本文的对比表，论证该用 monorepo 还是多仓库，并给出一条关键理由。
+</Callout>

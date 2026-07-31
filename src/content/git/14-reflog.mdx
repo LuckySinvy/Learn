@@ -1,0 +1,158 @@
+---
+title: reflog 与数据找回：几乎什么都能救回来
+order: 14
+description: reflog 如何记录 HEAD 的每一次移动、用 reflog 找回 reset 掉的提交与误删分支、git fsck 兜底悬空对象
+---
+
+# reflog 与数据找回：几乎什么都能救回来
+
+"我 `reset --hard` 把一天的工作弄丢了！"——别慌。只要那些提交曾经存在于你的仓库里，且还没被 Git 当垃圾回收，就**几乎总能找回来**。秘密武器是 `reflog`（引用日志）和 `git fsck`。
+
+## 1. reflog：HEAD 的"行车记录仪"
+
+`reflog` 默默记录着 **HEAD（以及各分支）每一次指向了哪个提交**，包括 `commit`、`reset`、`checkout`、`merge`、`rebase` 等所有移动。它**只在本地**存在，不会被 push，默认保留 90 天。
+
+<Playground
+  language="git"
+  title="reflog 记录 HEAD 的每一步移动"
+  id="git-14-1"
+  code={`echo '===== reflog：HEAD 的每一步移动都被记录 ====='
+git init -q -b main rl && cd rl
+echo 'v1' > a.txt && git add . && git commit -q -m "feat: v1"
+echo 'v2' > a.txt && git add . && git commit -q -m "feat: v2"
+echo 'v3' > a.txt && git add . && git commit -q -m "feat: v3"
+echo 'git reflog 记录 HEAD 何时指向了哪个提交：'
+git reflog
+echo
+echo '语法 HEAD@{n} 表示“第 n 步之前的 HEAD”：'
+echo "当前 HEAD     = $(git rev-parse --short HEAD)"
+echo "HEAD@{1}      = $(git rev-parse --short HEAD@{1})"
+echo "HEAD@{2}      = $(git rev-parse --short HEAD@{2})"
+echo
+echo 'reset 回退也会写进 reflog，所以回退本身可回退：'
+git reset -q --hard HEAD@{2}
+echo "回退后 HEAD   = $(git rev-parse --short HEAD)"
+echo '回退动作本身出现在 reflog 里：'
+git reflog | head -3
+cd ..`}
+/>
+
+`HEAD@{0}` 是当前，`HEAD@{1}` 是上一步，`HEAD@{2}` 是再上一步……时间写法 `HEAD@{10.minutes.ago}`、`master@{yesterday}` 也支持。每条记录的**最左边就是那个历史位置的 commit 哈希**——这就是找回数据的钥匙。
+
+<Callout type="warn" title="reflog 不是保险箱">
+reflog 有保质期：默认 `gc.reflogExpire` 是 90 天（已合并分支 30 天）。超过期限或被 `git gc --prune=now` 清理后，悬空对象会被真正删除。所以丢了东西**越早救越好**。另外 reflog 是**本地**的：克隆别人的仓库时 reflog 是空的，救不了别人机器上丢的东西。
+</Callout>
+
+## 2. 找回被 reset 掉的提交
+
+`git reset --hard` 只是把分支指针挪走了，原来的提交还在库里、只是"不可达"。从 reflog 找到它的哈希，再把分支指回去即可。
+
+<Playground
+  language="git"
+  title="用 reflog 救回 reset 掉的提交"
+  id="git-14-2"
+  code={`echo '===== 用 reflog 找回被 reset 掉的提交 ====='
+git init -q -b main lost && cd lost
+echo 'v1' > a.txt && git add . && git commit -q -m "feat: v1"
+echo 'v2' > a.txt && git add . && git commit -q -m "feat: v2  (重要工作)"
+echo "丢失前 HEAD = $(git rev-parse --short HEAD)"
+echo '误操作：git reset --hard HEAD~1，把 v2 弄丢了：'
+git reset -q --hard HEAD~1
+echo "reset 后 HEAD = $(git rev-parse --short HEAD)"
+echo '但 reflog 还记着 v2 的哈希：'
+git reflog | head -4
+echo
+echo '找回：把分支指回 reflog 里的那个提交（取 v2 那行开头的哈希）:'
+LOST=$(git reflog --format='%H %gs' | grep 'feat: v2' | head -1 | awk '{print $1}')
+echo "要恢复的提交 = $LOST"
+git reset -q --hard $LOST
+echo "恢复后 HEAD = $(git rev-parse --short HEAD)"
+echo 'a.txt 内容是否回来了：'
+cat a.txt
+cd ..
+
+echo
+echo '===== 找回被删除的分支 ====='
+git init -q -b main del && cd del
+echo 'base' > a.txt && git add . && git commit -q -m "init"
+git checkout -q -b feature/x
+echo 'work' > feature.txt && git add . && git commit -q -m "feat: x 的工作"
+git checkout -q main
+echo '误删分支 feature/x：'
+git branch -D feature/x
+echo 'git branch -a 已看不到它：'
+git branch -a
+echo '但 HEAD reflog 仍记着 feature/x 上的那次提交：'
+git reflog --oneline | grep 'feat: x'
+echo '从 reflog 找到分支 tip 哈希并重建分支：'
+TIP=$(git reflog --format='%H %gs' | grep 'feat: x' | head -1 | awk '{print $1}')
+git branch feature/x $TIP
+echo '分支重建成功，feature.txt 还在：'
+git checkout -q feature/x && cat feature.txt && git checkout -q main && cd ..`}
+/>
+
+要点：
+
+- 救 reset：`git reflog` 找到目标哈希，再 `git reset --hard <哈希>`（或 `git branch rescue <哈希>` 新建一个救援分支，更安全）。
+- 救误删分支：分支本身被删后它的专属 reflog 也没了，但那个提交曾出现在 **HEAD 的 reflog** 里（因为当时 HEAD 就在这个分支上），从 `git reflog` 里 grep 提交信息拿到 tip 哈希，然后 `git branch 原名 <哈希>` 重建。
+
+## 3. git fsck：reflog 之外的兜底
+
+如果连 reflog 都过期了（或者对象是从别处来的、从没出现在 reflog 里），还有最后一招：直接扫描对象数据库，找出**悬空（dangling）/不可达（unreachable）**的对象。
+
+<Playground
+  language="git"
+  title="git fsck 扫描悬空提交"
+  id="git-14-3"
+  code={`echo '===== git fsck 找出悬空对象（reflog 之外的兜底）====='
+git init -q -b main fs && cd fs
+echo 'v1' > a.txt && git add . && git commit -q -m "feat: v1"
+echo 'v2' > a.txt && git add . && git commit -q -m "feat: v2 悬空提交"
+echo "悬空提交哈希 = $(git rev-parse --short HEAD)"
+git reset -q --hard HEAD~1
+echo '现在普通 log 已经看不到 v2：'
+git log --oneline
+echo
+echo '情况 A：reflog 还在，直接查 reflog 找回来：'
+git reflog --all --oneline | grep 'v2' | head -2
+echo
+echo '情况 B：reflog 过期/不存在，用 git fsck 扫出所有悬空提交：'
+DAN=$(git fsck --no-reflogs --lost-found --unreachable 2>/dev/null | grep 'unreachable commit' | head -1 | awk '{print $3}')
+echo "fsck 找到悬空 commit = $DAN"
+echo '查看它的提交信息确认是不是我们要的：'
+git log --oneline -1 $DAN
+echo
+echo '把它恢复成分支：'
+git branch recovered $DAN
+echo "recovered 分支指向：$(git rev-parse --short recovered)"
+cd ..`}
+/>
+
+`git fsck --lost-found` 会把找到的悬空 commit / blob 的哈希分别写进 `.git/lost-found/commit/` 和 `.git/lost-found/other/`，方便你逐个检查。确认后 `git branch <name> <哈希>` 即可复活。
+
+## 4. 什么时候真的救不回来
+
+- 对象从未被提交过（比如只 `git add` 了、还没 `commit` 就 `reset`/`clean` 了某部分）——`git add` 会生成 blob，通常还在，用 `git fsck` 碰碰运气。
+- 已经超过 reflog 过期时间，且 `git gc` 已真正回收（`git gc --prune=now` 后基本没戏）。
+- **从未提交**的纯工作区改动（没 `add` 也没 `commit`）被 `git checkout`/`reset --hard` 覆盖——Git 从不曾见过它，无法恢复，只能靠编辑器本地历史。
+
+<Callout type="tip" title="养成提交习惯是终极保险">
+所有"找回"技巧都是事后补救。最稳的还是：**频繁做小提交**，重要改动立刻 commit（哪怕只是 `WIP`）。提交进了对象库，reflog 就能兜住你。哪怕推到远程（或自己的备份分支）一秒，那也是最可靠的保险。
+</Callout>
+
+## 小结
+
+- `reflog` 是 HEAD/分支的"行车记录仪"，记录每次移动与对应哈希，本地保存约 90 天
+- `HEAD@{n}` 表示第 n 步之前的 HEAD；记录最左就是当时的 commit 哈希
+- 救 reset：`git reflog` 找哈希 -> `git reset --hard <哈希>` 或 `git branch rescue <哈希>`
+- 救误删分支：从 HEAD reflog 里 grep 到分支 tip 哈希，再 `git branch 原名 <哈希>`
+- reflog 过期或没有时，用 `git fsck --lost-found` 扫悬空对象兜底
+- 真救不回：超过 reflog 过期且已 gc、或从未提交过的纯工作区改动
+- 下一章：团队协作工作流 →
+
+<Callout type="exercise" title="练习">
+1. 初始化仓库，连续做 3 个提交。执行 `git reset --hard HEAD~2`，再用 `git reflog` 找到被丢掉的提交哈希，把它恢复成一个名为 `rescue` 的分支（`git branch rescue <哈希>`），并 `git log rescue` 确认内容还在。
+2. 新建分支 `feature/temp`，在上面提交一次，切回 main 后 `git branch -D feature/temp`。用 `git reflog` 找出那次提交的哈希，重建 `feature/temp`，验证文件存在。
+3. 做两次提交后 `git reset --hard HEAD~1`，然后用 `git fsck --lost-found` 找出悬空 commit，把它恢复成分支。对比 `git reflog` 和 `git fsck` 两种找法。
+4. 为什么 `git reflog` 在刚克隆（clone）下来的仓库里是空的？这说明了 reflog 的哪一特性？（提示：它是否随仓库传输？）
+</Callout>

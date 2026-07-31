@@ -1,0 +1,311 @@
+---
+title: rebase：变基原理、与 merge 的取舍、黄金法则
+order: 7
+description: 变基如何"重放"提交、为什么哈希会变、rebase 冲突里 ours/theirs 为什么反了
+---
+
+# rebase：变基原理、与 merge 的取舍、黄金法则
+
+`merge` 和 `rebase` 解决的是同一个问题——**把主线的新进展纳入我的分支**，或者反过来。区别在于它们对"历史应该长什么样"有截然不同的主张，这也是 Git 社区里最经久不衰的争论。
+
+## 1. 变基在做什么
+
+假设历史长这样：
+
+```text
+              D --- E   (feature)
+             /
+        A --- B --- C   (main)
+```
+
+`git rebase main`（站在 feature 上执行）做四步：
+
+1. 找到 feature 与 main 的共同祖先 A
+2. 把 A 之后 feature 独有的提交（D、E）**存成一组补丁**
+3. 把 feature 指针临时移到 main 的顶端（C）
+4. 把补丁按顺序**重新应用**一遍，生成 D'、E'
+
+```text
+                          D' --- E'   (feature)
+                         /
+        A --- B --- C   (main)
+```
+
+结果是一条直线。注意 **D' 不是 D**：它的内容一样，但父提交变了（从 A 变成 C），因此**哈希完全不同**。这是理解 rebase 一切后果的关键：**rebase 不是移动提交，是用旧提交的内容创建新提交。**
+
+## 2. merge vs rebase 同场对比
+
+<Playground
+  language="git"
+  title="同一份历史，merge 与 rebase 的不同结果"
+  id="git-07-1"
+  code={`build() {
+  git init -q $1 && cd $1
+  echo 'base' > app.txt && git add . && git commit -q -m "A: 共同基础"
+  git switch -qc feature
+  echo 'f1' > f1.txt && git add . && git commit -q -m "D: feature 提交1"
+  echo 'f2' > f2.txt && git add . && git commit -q -m "E: feature 提交2"
+  git switch -q main
+  echo 'm1' > m1.txt && git add . && git commit -q -m "B: main 提交1"
+  echo 'm2' > m2.txt && git add . && git commit -q -m "C: main 提交2"
+  cd ..
+}
+
+echo '############ 起点：历史分叉 ############'
+build base0 && cd base0 && git log --oneline --graph --all && cd ..
+echo
+
+echo '############ 方案一：git merge main ############'
+build repo-merge && cd repo-merge
+git switch -q feature && git merge main --no-edit > /dev/null
+git log --oneline --graph --all
+echo '(多了一个合并提交，历史保留了分叉的形状)'
+cd ..
+echo
+
+echo '############ 方案二：git rebase main ############'
+build repo-rebase && cd repo-rebase
+git switch -q feature
+echo '变基前 feature 独有提交的哈希：'
+git log --format='%h %s' main..feature
+git rebase main
+echo '变基后的历史：'
+git log --oneline --graph --all
+echo '变基后 feature 独有提交的哈希（换了一批！）：'
+git log --format='%h %s' main..feature
+cd ..`}
+/>
+
+| | merge | rebase |
+|---|---|---|
+| 历史形状 | 保留分叉，有合并提交 | 线性，无合并提交 |
+| 提交哈希 | 不变 | **全部改变** |
+| 真实性 | 完整记录了"何时从哪合过来" | 伪造了"我一直基于最新主线开发" |
+| `git log` 可读性 | 大项目里像地铁线路图 | 干净好读 |
+| `git bisect` 二分定位 | 需要处理合并提交 | 每个提交都是完整可测状态，更好用 |
+| 冲突解决次数 | 一次（合并时统一解决） | **每个被重放的提交都可能冲突一次** |
+| 对已推送分支 | 安全 | **危险** |
+
+<Callout type="info" title="哪种更好？没有标准答案">
+两派观点都成立：
+
+- **保留真实历史派**：历史应该记录真正发生了什么，包括"我在周三把主线合了进来"。抹掉这些信息在排查问题时会丢失上下文。
+- **可读历史派**：历史是给人看的文档，`git log` 不该是一团意大利面。每个提交应该是"基于当时最新主线的完整改动"，这样 bisect、revert、cherry-pick 都更简单。
+
+实践中大多数团队采用折中：**功能分支内部用 rebase 保持整洁，合并回主线时用 `--no-ff` merge 保留功能边界**。这样既有线性的功能内历史，又能一眼看出每个功能的范围。
+</Callout>
+
+## 3. rebase 的冲突：ours 和 theirs 反了
+
+这是 rebase 最容易把人绕晕的地方。
+
+<Playground
+  language="git"
+  title="rebase 冲突：为什么 ours 变成了主线"
+  id="git-07-2"
+  code={`git init -q
+echo 'v0' > app.txt && git add . && git commit -q -m "init"
+git switch -qc feature
+echo 'feature-version' > app.txt && git commit -qam "feat: feature 改了这行"
+git switch -q main
+echo 'main-version' > app.txt && git commit -qam "feat: main 也改了这行"
+
+git switch -q feature
+echo '===== 在 feature 上执行 git rebase main ====='
+git rebase main
+echo
+
+echo '===== 冲突标记：HEAD 里居然是 main 的内容 ====='
+cat app.txt
+echo
+
+echo "索引 :2 (ours)   = $(git show :2:app.txt)"
+echo "索引 :3 (theirs) = $(git show :3:app.txt)"
+echo
+echo '原因：rebase 先把 HEAD 移到 main（所以 ours=main），'
+echo '      再把你的提交当成「外来补丁」逐个重放（所以 theirs=你自己）。'
+echo
+
+echo '===== 解决 -> add -> rebase --continue ====='
+echo 'merged: main + feature' > app.txt
+git add app.txt
+GIT_EDITOR=true git rebase --continue
+echo
+git log --oneline --graph --all`}
+/>
+
+记忆方法：**rebase 时你站在目标分支上"接收"自己的补丁**，所以：
+
+- `ours` = 你正在往上贴补丁的那个基底（main）
+- `theirs` = 你自己那些被重放的提交
+
+再强调一遍第 6 章的建议：**不要靠记忆，看标记后面跟的名字**。`>>>>>>> 472f859 (feat: feature 改了这行)` 已经把提交信息写出来了。
+
+### rebase 过程中的三个出口
+
+| 命令 | 作用 |
+|---|---|
+| `git rebase --continue` | 解决完当前冲突，继续重放下一个提交 |
+| `git rebase --skip` | 跳过当前这个提交（它的改动被丢弃） |
+| `git rebase --abort` | 全部放弃，回到 rebase 之前 |
+
+rebase 中途你处于 detached HEAD 状态，`git status` 会告诉你正在重放第几个、共几个。
+
+<Callout type="warn" title="rebase 冲突可能要解决很多次">
+merge 是"把两个终点状态合一次"，rebase 是"把 N 个提交逐个重放"。如果你的分支有 10 个提交，理论上最多要解决 10 次冲突，而且可能是同一处冲突反复出现。
+
+两个缓解手段：
+1. 开启 `git config --global rerere.enabled true`，让 Git 记住解决方案自动复用
+2. 先用交互式 rebase（第 8 章）把 10 个零碎提交 squash 成 2-3 个，再变基
+</Callout>
+
+## 4. rebase --onto：精确搬运
+
+标准 `git rebase <base>` 是"把当前分支自共同祖先以来的提交搬到 base 上"。`--onto` 允许你精确指定搬哪一段、搬到哪：
+
+```bash
+git rebase --onto <新基底> <旧基底> <要搬的分支>
+```
+
+典型场景：你从 `feature` 上又开了 `feature-sub`，后来发现 `feature` 那部分不要了，只想把 `feature-sub` 的提交搬到 main 上。
+
+<Playground
+  language="git"
+  title="rebase --onto 精确搬运一段提交"
+  id="git-07-3"
+  code={`git init -q
+echo base > a.txt && git add . && git commit -q -m "A: main 基础"
+git switch -qc feature
+echo f > f.txt && git add . && git commit -q -m "B: feature 基础功能"
+git switch -qc feature-sub
+echo s1 > s1.txt && git add . && git commit -q -m "C: 子功能1"
+echo s2 > s2.txt && git add . && git commit -q -m "D: 子功能2"
+git switch -q main
+echo m > m.txt && git add . && git commit -q -m "E: main 新提交"
+
+echo '===== 起点 ====='
+git log --oneline --graph --all
+echo
+echo '需求：只把 C、D 搬到 main 上，不要带上 B'
+echo '命令：git rebase --onto main feature feature-sub'
+echo '含义： 搬到 main   从 feature 之后   搬 feature-sub'
+echo
+
+git switch -q feature-sub
+git rebase --onto main feature feature-sub
+echo
+git log --oneline --graph --all
+echo
+echo '(C、D 挂到了 main 后面；B 仍然留在 feature 分支上)'`}
+/>
+
+`--onto` 的另一个常用姿势是**删掉中间的某个提交**：
+
+```bash
+# 删掉 HEAD~2 这个提交，保留它后面的两个
+git rebase --onto HEAD~3 HEAD~2 HEAD
+```
+
+不过这种操作用交互式 rebase 的 `drop` 更直观（下一章）。
+
+## 5. 黄金法则
+
+> **不要对已经推送到公共仓库、别人可能已经基于它工作的提交执行 rebase。**
+
+原因回到第 1 节那句话：rebase 生成的是**全新的提交**，旧提交虽然还在你的仓库里，但分支已经不指向它们了。
+
+推演一下违反规则的后果：
+
+```text
+1. 你推送了 feature 分支，包含提交 D、E
+   远程: A - B - D - E
+   
+2. 同事拉取，基于 E 写了提交 F
+   同事: A - B - D - E - F
+   
+3. 你在本地 rebase，D、E 变成了 D'、E'，然后 force push
+   远程: A - B - C - D' - E'
+   
+4. 同事再次 pull —— Git 看到远程的 D'、E' 和本地的 D、E 是不同的提交，
+   会把它们全部合并进来：
+   同事: A - B - C - D' - E' - D - E - F - M
+   
+   同一份改动出现了两次，还带一个莫名其妙的合并提交。
+```
+
+现实中这会引发一连串"我明明删掉的代码怎么又回来了"的灵异事件，排查成本极高。
+
+<Callout type="warn" title="能不能对已推送的个人分支 rebase">
+可以，但有前提：**这个分支只有你一个人在用**。
+
+典型流程是"提了 PR 后，reviewer 要求整理提交历史"：
+
+```bash
+git rebase -i main            # 整理
+git push --force-with-lease   # 推送
+```
+
+必须用 `--force-with-lease` 而不是 `--force`：前者会检查远程分支是否还是你上次看到的那个状态，如果别人在此期间推了东西，它会拒绝，从而保护对方的提交。`--force` 则无脑覆盖。
+
+**把 `--force` 从你的肌肉记忆里删掉，只用 `--force-with-lease`。**
+</Callout>
+
+## 6. pull 的两种模式
+
+`git pull` 默认是 `fetch + merge`，这会在你每次拉取时都可能产生一个 "Merge branch 'main' of ..." 的垃圾提交。改成 rebase 模式更干净：
+
+```bash
+# 单次
+git pull --rebase
+
+# 设为默认（推荐）
+git config --global pull.rebase true
+```
+
+```text
+pull（merge 模式）:
+   A - B - C ------ M   (你的 main)
+        \          /
+         D -- E ---        <- 你本地的提交 D、E 和远程的 C 合并
+
+pull --rebase:
+   A - B - C - D' - E'    (你的 main)   <- 你的提交被重放到远程之后
+```
+
+这里 rebase 的对象是**你本地还没推送的提交**，不违反黄金法则，所以是安全的。第 10 章还会再讲。
+
+## 7. 什么时候用哪个
+
+| 场景 | 推荐 |
+|---|---|
+| 把主线的新进展同步进我的功能分支 | `rebase`（本地未推送）或 `merge`（已推送共享） |
+| 功能分支合回主线 | `merge --no-ff`（保留功能边界） |
+| 拉取远程更新 | `pull --rebase` |
+| 整理自己的零碎提交 | `rebase -i`（第 8 章） |
+| 主线已推送、多人协作的分支 | **只能 merge** |
+| 需要保留完整审计记录的仓库 | 全部 `merge` |
+
+<Callout type="tip" title="一句话决策">
+**改的是自己没推过的提交 → rebase 随便用；改的是别人可能拿到的提交 → 只能 merge / revert。**
+
+这条规则和第 4 章 "reset vs revert" 的判断标准是同一条，只是换了个场景。
+</Callout>
+
+## 小结
+
+- rebase 的本质是"把提交的内容重新应用一遍生成新提交"，所以**哈希必然改变**
+- merge 保留分叉与真实时间线，rebase 产生线性历史但改写了历史
+- rebase 冲突时 `ours` 是目标基底（main），`theirs` 是你自己的提交——和 merge 相反
+- 冲突出口：`--continue` / `--skip` / `--abort`
+- `rebase --onto <新基底> <旧基底> <分支>` 可以精确搬运一段提交
+- **黄金法则：不 rebase 已推送且他人可能基于其工作的提交**
+- 确需强推时只用 `--force-with-lease`，绝不用 `--force`
+- `git config --global pull.rebase true` 消除 pull 产生的垃圾合并提交
+- 下一章：交互式 rebase，把凌乱的提交整理成能见人的历史 →
+
+<Callout type="exercise" title="练习">
+1. 构造分叉历史，在两个副本里分别执行 merge 和 rebase，对比 `git log --graph --all` 的输出，并记录 rebase 前后 feature 分支提交哈希的变化。
+2. 制造一次 rebase 冲突，在冲突现场用 `git show :2:` 和 `git show :3:` 确认 ours/theirs 分别是谁的内容，写一句话解释原因。
+3. 用 `git rebase --onto` 把一个三层分支（main → feature → feature-sub）中最上层的两个提交搬到 main 上，验证中间层的提交没有被带过去。
+4. 情景题：你的 feature 分支已经推到远程并提了 PR，reviewer 要求"把 5 个 WIP 提交合成 1 个"。写出你的完整命令序列，并说明为什么这里可以强推、要用哪个强推参数。
+</Callout>

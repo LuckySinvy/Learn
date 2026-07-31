@@ -1,0 +1,258 @@
+---
+title: RESTful API 设计：把 HTTP 用在刀刃上
+order: 17
+description: 资源建模与 URL 设计、版本策略、分页方案、RFC 7807 错误格式
+---
+
+# RESTful API 设计：把 HTTP 用在刀刃上
+
+前 16 章的知识在这里合流：方法语义、状态码、缓存、协商、认证——REST 风格的本质就是**顺着 HTTP 的纹理设计 API**，让协议自带的基础设施（缓存、重试、网关、文档工具）都能为你所用。
+
+## 1. 资源建模：URL 是名词，方法是动词
+
+REST 的第一原则：**把业务抽象成资源（名词），用统一的方法（动词）操作它们**。
+
+| 反模式（动词进 URL） | REST 风格 |
+|---|---|
+| POST /createUser | POST /users |
+| POST /getUserById | GET /users/42 |
+| POST /updateUser | PUT / PATCH /users/42 |
+| GET /deleteUser?id=42 | DELETE /users/42 |
+| POST /searchUsers | GET /users?name=ada&role=admin |
+
+URL 设计规约：
+
+- **复数名词**：/users、/orders（保持一致，别混用单复数）；
+- **层级表达从属**：/users/42/orders 表示 42 号用户的订单；嵌套**不超过两层**，更深改用查询参数；
+- **过滤/排序/分页进查询串**：/orders?status=paid&sort=-created_at&page=2；
+- 小写 + 连字符：/order-items 而非 /orderItems；
+- 真实世界的"动作"实在无法名词化时（如重启、搜索），务实处理：POST /servers/42/restart——教条不如清晰。
+
+<Playground
+  language="http"
+  title="一套规范的资源接口"
+  id="http-17-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlsplit, parse_qs
+import json, re
+
+books = {
+    "1": {"id": "1", "title": "HTTP 权威指南", "status": "in-stock"},
+    "2": {"id": "2", "title": "TCP/IP 详解", "status": "sold-out"},
+    "3": {"id": "3", "title": "图解 HTTP", "status": "in-stock"},
+}
+
+class API(BaseHTTPRequestHandler):
+    def reply(self, code, obj, extra=None):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        u = urlsplit(self.path)
+        m = re.fullmatch(r"/v1/books/(\w+)", u.path)
+        if m:
+            book = books.get(m.group(1))
+            self.reply(200, book) if book else self.reply(404, {"error": "not found"})
+        elif u.path == "/v1/books":
+            q = parse_qs(u.query)
+            result = list(books.values())
+            if "status" in q:
+                result = [b for b in result if b["status"] == q["status"][0]]
+            self.reply(200, {"items": result, "total": len(result)})
+        else:
+            self.reply(404, {"error": "not found"})
+    def do_POST(self):
+        if self.path != "/v1/books":
+            self.reply(404, {"error": "not found"}); return
+        n = int(self.headers.get("Content-Length", 0))
+        data = json.loads(self.rfile.read(n))
+        new_id = str(len(books) + 1)
+        books[new_id] = {"id": new_id, **data}
+        # 201 + Location 指向新资源
+        self.reply(201, books[new_id], {"Location": "/v1/books/" + new_id})
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), API).serve_forever()
+' &
+sleep 0.3
+
+echo "== 集合 + 过滤 =="
+curl -s "http://127.0.0.1:8000/v1/books?status=in-stock" | jq .
+echo "== 单个资源 =="
+curl -s http://127.0.0.1:8000/v1/books/2 | jq .
+echo "== 创建：201 + Location =="
+curl -si -X POST http://127.0.0.1:8000/v1/books -d '{"title":"HTTP/3 实战","status":"in-stock"}' \
+  | grep -E "HTTP/|Location"`}
+/>
+
+注意三个细节：路径带版本 `/v1`；过滤走查询参数而不是新端点；创建返回 **201 + Location**（客户端立刻知道新资源在哪）。
+
+## 2. 版本策略
+
+API 一旦有人用，破坏性变更（删字段、改类型）就必须走新版本。三种主流方案：
+
+| 方案 | 例子 | 特点 |
+|---|---|---|
+| URL 路径版本 | /v1/users | 最直白，缓存/日志/调试友好，**事实标准** |
+| 请求头版本 | Api-Version: 2026-07-01 | URL 干净；Stripe 风格按日期版本 |
+| Accept 协商版本 | Accept: application/vnd.api.v2+json | 最"正统 REST"，但工具链支持差 |
+
+比选哪种更重要的是**兼容纪律**：加字段随时可以（消费方必须容忍未知字段），删改字段必须等新版本；旧版本给出弃用时间表（`Deprecation` / `Sunset` 响应头是新兴标准）。
+
+## 3. 分页：offset 与 cursor
+
+### 3.1 页码分页（offset）
+
+`GET /orders?page=3&per_page=20`，SQL 对应 `LIMIT 20 OFFSET 40`。直观、可跳页，但有两个老毛病：深分页慢（OFFSET 100 万要扫过 100 万行）；翻页期间数据插入/删除会造成**重复或漏读**。
+
+### 3.2 游标分页（cursor）
+
+`GET /orders?limit=20&cursor=eyJpZCI6MTA0fQ`——游标编码了"上一页最后一条的位置"，SQL 对应 `WHERE id > 104 LIMIT 20`。索引直达、数据变动不错乱，代价是不能跳页。**信息流、日志、无限滚动一律用 cursor**。
+
+<Playground
+  language="http"
+  title="两种分页的行为对比"
+  id="http-17-2"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlsplit, parse_qs
+import json
+
+DATA = [{"id": i, "name": "item-" + str(i)} for i in range(1, 101)]
+
+class API(BaseHTTPRequestHandler):
+    def reply(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        u = urlsplit(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/offset":
+            page = int(q.get("page", ["1"])[0])
+            per = int(q.get("per_page", ["5"])[0])
+            items = DATA[(page - 1) * per : page * per]
+            self.reply({"items": items, "page": page, "total": len(DATA)})
+        elif u.path == "/cursor":
+            after = int(q.get("cursor", ["0"])[0])
+            limit = int(q.get("limit", ["5"])[0])
+            items = [d for d in DATA if d["id"] > after][:limit]
+            next_cursor = items[-1]["id"] if items else None
+            self.reply({"items": items, "next_cursor": next_cursor})
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), API).serve_forever()
+' &
+sleep 0.3
+
+echo "== offset 第 2 页 =="
+curl -s "http://127.0.0.1:8000/offset?page=2&per_page=5" | jq -c ".items | map(.id)"
+
+echo "== cursor 翻页：跟着 next_cursor 走 =="
+R=$(curl -s "http://127.0.0.1:8000/cursor?limit=5")
+echo $R | jq -c ".items | map(.id), .next_cursor"
+NEXT=$(echo $R | jq -r ".next_cursor")
+curl -s "http://127.0.0.1:8000/cursor?limit=5&cursor=$NEXT" | jq -c ".items | map(.id), .next_cursor"`}
+/>
+
+响应体里除了 items，务必带分页元信息（total/next_cursor）；讲究一点可以加 `Link` 响应头（GitHub 风格）给出 next/prev 的完整 URL。
+
+## 4. 错误格式：RFC 7807
+
+错误响应最忌讳各接口自由发挥。RFC 7807/9457 定义了标准的 `application/problem+json`：
+
+<Playground
+  language="http"
+  title="RFC 7807 风格的错误响应"
+  id="http-17-3"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+
+class API(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(n)
+        problem = None
+        try:
+            data = json.loads(raw)
+            if data.get("amount", 0) > 100:
+                problem = (422, {
+                    "type": "https://api.example.com/problems/insufficient-balance",
+                    "title": "余额不足",
+                    "status": 422,
+                    "detail": "本次需要 " + str(data["amount"]) + " 元，余额仅 100 元",
+                    "instance": "/v1/transfers",
+                    "balance": 100,
+                })
+        except json.JSONDecodeError:
+            problem = (400, {"type": "about:blank", "title": "请求体不是合法 JSON",
+                             "status": 400})
+        if problem:
+            code, body_obj = problem
+            body = json.dumps(body_obj, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/problem+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(201)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), API).serve_forever()
+' &
+sleep 0.3
+
+echo "== 业务错误：422 + problem+json =="
+curl -s -X POST http://127.0.0.1:8000/v1/transfers -d '{"amount": 999}' | jq .
+echo "== 格式错误：400 =="
+curl -s -X POST http://127.0.0.1:8000/v1/transfers -d 'not-json' | jq .`}
+/>
+
+字段约定：`type`（错误类型的 URI，可指向文档）、`title`（人类可读短语）、`status`（同状态码）、`detail`（本次具体说明）、`instance`（出错的资源），并允许扩展字段（如 balance）。配合正确的 4xx/5xx 状态码，网关限流、前端兜底、监控告警各取所需。
+
+## 5. 成熟度与务实清单
+
+Richardson 成熟度模型把 REST 分四级：L0 一个 URL 全 POST（RPC 式）→ L1 有资源 URL → L2 用对方法与状态码 → L3 响应带超链接（HATEOAS）。**业界共识：做到 L2 就是合格的 REST API**，L3 曲高和寡。
+
+上线前的检查清单：
+
+- 名词复数资源路径，动词交给方法；筛选排序分页进查询串；
+- 状态码语义正确：201 创建 + Location、204 删除、400/401/403/404/409/422 各归各位；
+- GET 可缓存（ETag）、PUT/DELETE 幂等、POST 提供幂等键（第 5、9 章）；
+- 版本策略与弃用流程先说清楚；
+- 错误统一 problem+json；时间统一 ISO 8601（UTC）；字段命名风格全局一致。
+
+<Callout type="tip" title="REST 不是宗教">
+批量操作、复杂查询、动作型接口不必硬套资源模型；GraphQL/gRPC 在各自场景（灵活取数/内部高性能 RPC）也是正解。REST 的真正遗产是：用 HTTP 的原生语义换取整个生态的免费基础设施。
+</Callout>
+
+## 小结
+
+- 资源建模：URL 名词化，方法表达操作，层级不过二，过滤进查询串；
+- 版本：URL 路径版本最务实；加字段自由，破坏性变更必须换版本；
+- 分页：可跳页用 offset，大数据量/信息流用 cursor；
+- 错误：状态码 + application/problem+json 双层表达，扩展字段承载业务细节；
+- 合格线是 Richardson L2：资源 + 正确的方法与状态码。
+
+<Callout type="exercise" title="练习">
+1. 给 Playground 1 补上 PUT /v1/books/:id 与 DELETE /v1/books/:id，注意幂等语义与 404 处理。
+2. 在 Playground 2 的 cursor 接口上模拟"翻页期间插入新数据"：验证 offset 分页会重复读到某条记录而 cursor 不会。
+3. 把 Playground 3 的余额不足错误改用 409 或 400 是否合适？对比 422 说明理由。
+4. 为"订单退款"设计接口：给出 URL、方法、成功与三种失败的状态码及 problem+json 响应体。
+</Callout>

@@ -1,0 +1,203 @@
+---
+title: 走进命令行：终端、Shell 与第一批命令
+order: 1
+description: 理解终端/Shell/内核的关系、认识发行版，掌握 pwd/ls/cd 与命令的通用结构
+---
+
+# 走进命令行：终端、Shell 与第一批命令
+
+图形界面里的每一次点击，在服务器世界都对应一行命令。Linux 服务器绝大多数没有图形界面——部署服务、排查故障、分析日志，全部通过命令行完成。这一章先把"命令行到底是什么"讲清楚，再上手第一批命令。
+
+## 1. 终端、Shell、内核：三层关系
+
+初学者最容易混淆的三个词，其实是清晰的三层：
+
+| 层 | 是什么 | 例子 |
+|---|---|---|
+| 终端（Terminal） | 输入输出的**窗口程序**，负责显示字符、接收键盘 | iTerm2、Windows Terminal、GNOME Terminal |
+| Shell | 解释你输入的命令的**解释器程序** | bash、zsh、sh、fish |
+| 内核（Kernel） | 真正操作硬件、管理进程和文件的**操作系统核心** | Linux kernel |
+
+流程是：你在**终端**里敲下 `ls`，**Shell** 解析这行文字、找到 ls 程序并请求执行，**内核**完成读取磁盘目录的实际工作，结果再沿原路显示回终端。
+
+<Callout type="info" title="bash 是本课程的默认 Shell">
+bash（Bourne Again Shell）是绝大多数 Linux 发行版的默认 Shell，服务器脚本也几乎都用 bash 编写。macOS 默认是 zsh，日常命令与 bash 高度兼容，但写脚本时（第 15、16 章）请始终以 bash 语义为准。
+</Callout>
+
+## 2. 发行版：同一个内核，不同的打包
+
+"Linux"严格说只是内核。内核加上软件包管理器、系统工具、默认配置，打包成可安装的系统，就是**发行版（Distribution）**：
+
+- **Debian / Ubuntu**：使用 apt 包管理，社区庞大，云服务器最常见；
+- **RHEL / CentOS / Rocky / Alma**：企业系，使用 yum/dnf；
+- **Alpine**：极小（基础镜像约 5 MB），使用 apk，是容器镜像的主流底座；
+- **Arch / openSUSE** 等：各有生态。
+
+发行版之间差异主要在**包管理器**（第 18 章）和部分工具版本，本课程讲的核心命令在所有发行版通用。本课程的在线沙箱正是一个 Alpine 容器。
+
+## 3. 读懂提示符
+
+打开终端后你会看到类似这样的一行，这叫**提示符（prompt）**：
+
+```text
+ada@web-01:~/projects$
+```
+
+从左到右：`ada` 是当前用户名，`web-01` 是主机名，`~/projects` 是当前所在目录（`~` 代表当前用户的家目录），末尾的 `$` 表示普通用户——如果是 `#`，说明当前是 root 超级用户，操作需要格外小心。
+
+## 4. 第一批命令：pwd、ls、cd
+
+命令行里你永远"站在"某个目录里，称为**当前工作目录**。三个命令构成最基本的移动能力：
+
+- `pwd`（print working directory）：我在哪；
+- `ls`（list）：这里有什么；
+- `cd`（change directory）：去别处。
+
+<Playground
+  language="linux"
+  title="pwd / ls / cd 基本导航"
+  id="linux-01-1"
+  code={`# 我在哪？
+echo '$ pwd'
+pwd
+
+# 先创建一点演示内容
+mkdir -p projects/blog notes
+touch projects/blog/index.html notes/todo.txt
+
+echo '$ ls'
+ls
+
+# 进入子目录，再确认位置
+echo '$ cd projects/blog && pwd'
+cd projects/blog
+pwd
+
+# .. 表示上一级目录
+echo '$ cd .. && pwd'
+cd ..
+pwd
+
+# cd 不带参数：回到家目录
+echo '$ cd && pwd'
+cd
+pwd`}
+/>
+
+关于路径的两个关键概念：
+
+- **绝对路径**：从根目录 `/` 写起，如 `/var/log/nginx`，在任何位置都指向同一个地方；
+- **相对路径**：从当前目录写起，如 `projects/blog`、`../notes`。`.` 代表当前目录，`..` 代表上一级。
+
+还有一个高频技巧：`cd -` 回到**上一次所在的目录**，在两个目录之间来回切换时非常好用。
+
+## 5. ls 的常用选项
+
+`ls` 不带选项时只给出名字，加上选项才能看到细节：
+
+<Playground
+  language="linux"
+  title="ls 的常用选项"
+  id="linux-01-2"
+  code={`mkdir -p demo/sub
+echo 'hello linux' > demo/a.txt
+echo 'a much longer line of text for size demo' > demo/b.log
+touch demo/.hidden
+cd demo
+
+echo '$ ls'
+ls
+
+echo '$ ls -a   # 连隐藏文件一起列出'
+ls -a
+
+echo '$ ls -l   # 长格式：权限/属主/大小/时间'
+ls -l
+
+echo '$ ls -lh  # 大小显示为 K/M/G'
+ls -lh
+
+echo '$ ls -lt  # 按修改时间排序，最新在前'
+ls -lt`}
+/>
+
+`ls -l` 每行的含义（第 5 章会详细拆解权限部分）：
+
+```text
+-rw-r--r--  1  root  root  12  Jul 31 10:00  a.txt
+└权限        │  └属主  └属组  └字节 └修改时间    └文件名
+             └硬链接数
+```
+
+以 `.` 开头的文件是**隐藏文件**（如 `.bashrc`、`.gitignore`），默认不显示，`ls -a` 才能看到。选项可以合并：`ls -alh` 等价于 `ls -a -l -h`。
+
+## 6. 命令的通用结构
+
+几乎所有命令都遵循同一套语法：
+
+```bash
+命令  [选项...]  [参数...]
+ls    -lh        /var/log
+```
+
+- **短选项**：一个横线加单字母，如 `-l`，可合并成 `-lh`；
+- **长选项**：两个横线加单词，如 `--help`、`--all`，可读性好；
+- **参数**：命令作用的对象，通常是文件或目录。
+
+<Playground
+  language="linux"
+  title="更多入门命令与 --help"
+  id="linux-01-3"
+  code={`echo '$ whoami  # 我是谁'
+whoami
+
+echo '$ uname -a  # 内核与系统信息'
+uname -a
+
+echo '$ date  # 当前时间'
+date
+
+echo '$ echo hello  # 原样输出参数'
+echo hello
+
+echo '$ cat /etc/os-release  # 看看这是什么发行版'
+cat /etc/os-release`}
+/>
+
+## 7. 获取帮助
+
+不需要背下所有选项，会查才是关键，按优先级：
+
+1. `命令 --help`：最快，一屏之内列出常用选项；
+2. `man 命令`：完整手册（manual），按 q 退出、`/关键词` 搜索（部分精简容器未安装 man）；
+3. `type 命令`：查看它是外部程序、内建命令还是别名。
+
+<Callout type="tip" title="三个效率习惯，从第一天养成">
+1. **Tab 补全**：输入前几个字母按 Tab，自动补全命令名和路径，按两次 Tab 列出所有候选。既省时间又避免拼错。
+2. **上下方向键**：翻阅历史命令；`history` 列出全部历史。
+3. **Ctrl+C** 中断当前命令；**Ctrl+L**（或 `clear`）清屏。
+</Callout>
+
+<Callout type="warn" title="Linux 严格区分大小写">
+`File.txt` 和 `file.txt` 是两个不同的文件，`LS` 也不是 `ls`。此外命令、选项、参数之间必须有空格：`ls-l` 会被当作一个（不存在的）命令名。
+</Callout>
+
+## 8. 沙箱说明
+
+本课程每个 Playground 都在一个全新的 Alpine 容器里执行整段脚本：预装 bash、coreutils、grep、sed、awk、find、curl、python3、jq、git 等常用工具，工作目录 `/work` 可写，无外网。所以每个示例都会**先创建自己需要的演示文件**，你可以放心修改代码反复运行——每次运行都是干净环境，怎么折腾都不会有残留。
+
+## 小结
+
+- 终端是窗口，Shell 是命令解释器（默认 bash），内核干实际的活
+- 发行版 = Linux 内核 + 包管理器 + 工具集，核心命令全发行版通用
+- `pwd` 看位置、`ls` 看内容、`cd` 移动；`~` 家目录、`.` 当前、`..` 上级、`cd -` 返回上次
+- 命令结构：`命令 [选项] [参数]`，短选项可合并，`--help` 是第一求助手段
+- Tab 补全和历史命令是最重要的效率习惯
+- 下一章：创建、复制、移动、删除文件 →
+
+<Callout type="exercise" title="练习">
+1. 在 Playground 中用一条 `mkdir -p` 创建 `a/b/c` 三层目录，进入 `a/b/c` 后分别用 `pwd`、`cd ../..`、`pwd` 验证相对路径的含义。
+2. 创建一个隐藏文件 `.secret` 和普通文件 `note.txt`，对比 `ls` 与 `ls -a` 的输出差异。
+3. 用 `ls -l` 和 `ls -lt` 观察排序区别：先 touch 三个文件，再修改其中最早创建的那个（用 `echo x > 文件`），看它是否跳到 `ls -lt` 的最前面。
+4. 运行 `uname -a` 和 `cat /etc/os-release`，说出沙箱容器用的是哪个发行版、内核版本是多少。
+</Callout>

@@ -1,0 +1,193 @@
+---
+title: 文件与目录操作：创建、复制、移动与删除
+order: 2
+description: mkdir/touch/cp/mv/rm 全套操作、通配符匹配，以及删除操作的安全守则
+---
+
+# 文件与目录操作：创建、复制、移动与删除
+
+上一章学会了"走动和看"，这一章学"动手改"：创建、复制、移动、重命名、删除。这几个命令每天都要用几十次，其中 `rm` 是整个 Linux 里最危险的命令——本章最后的安全守则请务必认真读完。
+
+## 1. 创建：mkdir 与 touch
+
+```bash
+mkdir docs              # 创建单个目录
+mkdir -p a/b/c          # -p：按需创建整条路径，父目录不存在也不报错
+touch note.txt          # 文件不存在则创建空文件；已存在则只更新修改时间
+```
+
+`mkdir -p` 是实际工作里的标准姿势：它既能一次建多层，又不会因目录已存在而报错，脚本里可以放心重复执行（这种"重复执行结果一致"的性质叫**幂等**）。
+
+<Playground
+  language="linux"
+  title="mkdir 与 touch"
+  id="linux-02-1"
+  code={`echo '$ mkdir -p app/src app/config app/logs'
+mkdir -p app/src app/config app/logs
+
+echo '$ touch app/src/main.py app/config/dev.yaml'
+touch app/src/main.py app/config/dev.yaml
+
+# tree 以树状结构展示目录（沙箱已预装）
+echo '$ tree app'
+tree app
+
+# 不加 -p 创建多层路径会失败
+echo '$ mkdir x/y/z'
+mkdir x/y/z || echo '失败了：父目录 x/y 不存在'
+
+echo '$ mkdir -p x/y/z && tree x'
+mkdir -p x/y/z && tree x`}
+/>
+
+## 2. 复制：cp
+
+```bash
+cp a.txt b.txt           # 复制文件并命名为 b.txt
+cp a.txt docs/           # 复制到目录里，保持原名
+cp -r docs docs_backup   # 复制目录必须加 -r（recursive，递归）
+cp -a docs docs_backup   # -a 归档模式：递归且保留权限、时间戳等属性
+```
+
+两个容易踩的点：
+
+- 复制**目录**忘加 `-r` 会报错 `omitting directory`；
+- 目标文件已存在时 `cp` **直接覆盖且不提示**，重要场合用 `cp -i`（交互确认）或 `cp -n`（不覆盖已存在文件）。
+
+## 3. 移动与重命名：mv
+
+Linux 没有单独的"重命名"命令，`mv` 一个命令承担两种语义：
+
+```bash
+mv old.txt new.txt       # 目标不存在 → 重命名
+mv new.txt docs/         # 目标是目录 → 移动进去
+mv docs archive          # 目录同理：archive 不存在则是改名
+```
+
+`mv` 与 `cp` 不同，移动目录**不需要** `-r`；同一文件系统内 `mv` 只是改目录项，瞬间完成，与文件大小无关。
+
+<Playground
+  language="linux"
+  title="cp 与 mv 实战"
+  id="linux-02-2"
+  code={`mkdir -p site/css
+echo 'body: none' > site/style.css
+echo '<h1>hi</h1>' > site/index.html
+
+echo '$ cp site/index.html site/about.html'
+cp site/index.html site/about.html
+
+echo '$ cp -r site site.bak   # 整目录备份'
+cp -r site site.bak
+
+echo '$ mv site/style.css site/css/   # 移动到子目录'
+mv site/style.css site/css/
+
+echo '$ mv site/about.html site/team.html   # 重命名'
+mv site/about.html site/team.html
+
+echo '--- 最终结构 ---'
+tree site site.bak
+
+# 覆盖演示：cp -n 保护已存在的文件
+echo 'v2' > new.txt
+echo 'v1' > old.txt
+cp -n new.txt old.txt
+echo '$ cat old.txt  # 仍是 v1，-n 阻止了覆盖'
+cat old.txt`}
+/>
+
+## 4. 删除：rm 与 rmdir
+
+```bash
+rm note.txt              # 删除文件
+rm -r docs               # 递归删除目录及其全部内容
+rm -f note.txt           # 强制：文件不存在也不报错、不提示
+rm -rf build/            # 递归 + 强制，最常用也最危险的组合
+rmdir empty_dir          # 只能删空目录，删非空目录会报错（更安全）
+```
+
+<Callout type="warn" title="rm 没有回收站，删了就是没了">
+命令行删除不经过任何回收站，也没有确认弹窗（默认），`rm -rf` 一旦执行完就无法撤销。历史上无数事故来自这几种写法：
+
+- `rm -rf /`（新版 rm 已拒绝，但 `rm -rf /*` 仍会执行）；
+- 变量为空导致的 `rm -rf $DIR/`——若 `$DIR` 未定义，就变成删根下的 `/`；
+- 多敲了一个空格：`rm -rf build /`（本想删 `build/`，实际删了 `build` 和 `/`）。
+
+安全守则：删除前先用 `ls` 确认同样的路径参数；对变量路径写成 `rm -rf "$DIR"` 并提前判空；生产服务器上优先 `mv` 到临时目录代替直接 `rm`。
+</Callout>
+
+## 5. 通配符：一次操作一批文件
+
+通配符（glob）由 Shell 在执行命令**之前**展开成文件名列表：
+
+| 模式 | 匹配 | 示例 |
+|---|---|---|
+| `*` | 任意长度任意字符（不含 `/`，默认不含隐藏文件） | `*.log` 匹配所有 .log 文件 |
+| `?` | 恰好一个字符 | `file?.txt` 匹配 file1.txt 不匹配 file10.txt |
+| `[abc]` | 方括号内任一字符 | `img[12].png` 匹配 img1.png、img2.png |
+| `[0-9]` | 范围 | `log[0-9].txt` |
+| `{a,b}` | 花括号展开（不算 glob，但常配合用） | `cp app.{yaml,yaml.bak}` |
+
+<Playground
+  language="linux"
+  title="通配符实战"
+  id="linux-02-3"
+  code={`mkdir -p logs
+touch logs/app.log logs/app.log.1 logs/app.log.2
+touch logs/error.log logs/access.log logs/readme.md
+
+echo '$ ls logs/*.log'
+ls logs/*.log
+
+echo '$ ls logs/app.log.?   # ? 恰好一个字符'
+ls logs/app.log.?
+
+echo '$ ls logs/[ae]*.log   # a 或 e 开头'
+ls logs/[ae]*.log
+
+# 通配符是 Shell 展开的：echo 可以直接看到展开结果
+echo '$ echo logs/*.log'
+echo logs/*.log
+
+# 批量操作：把所有 .log 移到 archive
+mkdir archive
+mv logs/*.log archive/
+echo '--- 移动后 ---'
+tree logs archive`}
+/>
+
+理解"**Shell 先展开、命令后执行**"很重要：`rm *.log` 里 rm 收到的不是 `*.log` 这个模式，而是展开后的一串文件名。如果没有任何匹配，bash 默认把 `*.log` 原样传给命令（通常导致"文件不存在"报错）。
+
+<Callout type="tip" title="删除前先用 ls 或 echo 预演">
+凡是带通配符的 `rm`/`mv`，先把命令里的 `rm` 换成 `ls` 跑一遍，确认列出来的正是你想删的那批文件，再改回 `rm` 执行。这个两秒钟的习惯能避免绝大多数误删。
+</Callout>
+
+## 6. 一个综合场景
+
+把"新项目初始化"串起来练一遍：
+
+```bash
+mkdir -p myapp/{src,tests,docs}     # 花括号展开：一次建三个子目录
+cd myapp
+touch src/main.py tests/test_main.py README.md
+cp README.md docs/
+mv docs/README.md docs/intro.md
+rm -r tests                         # 改主意了，删掉
+```
+
+## 小结
+
+- `mkdir -p` 幂等建目录；`touch` 建空文件或刷新时间戳
+- `cp` 复制（目录要 `-r`，默认静默覆盖）；`mv` 移动兼重命名（不需要 `-r`）
+- `rm -r` 删目录、`-f` 强制；**没有回收站**，先 `ls` 预演再删
+- 通配符 `*` `?` `[...]` 由 Shell 先展开再传给命令
+- 变量路径务必加引号并判空：`rm -rf "$DIR"`
+- 下一章：查看文件内容与 vim 生存指南 →
+
+<Callout type="exercise" title="练习">
+1. 用一条命令创建目录结构 `shop/{api,web,db}`，在 api 下 touch 三个文件 `v1.py v2.py v10.py`，然后分别用 `ls shop/api/v?.py` 和 `ls shop/api/v*.py` 观察 `?` 与 `*` 的区别。
+2. 把上题的 shop 目录完整备份为 shop.bak，删除 shop 里的 db 子目录，再对比 `tree shop shop.bak` 验证备份未受影响。
+3. 创建文件 `a1.txt a2.txt b1.txt b2.txt`，只用一条 `mv` 配合通配符把 a 开头的两个移动到新目录 `group-a/` 中。
+4. 思考题：`rm -rf $TMPDIR/cache` 在 `TMPDIR` 未定义时会删除什么？如何写才安全？（提示：引号 + 判空，或改用 `rm -rf "./tmp/cache"` 这类相对路径）
+</Callout>

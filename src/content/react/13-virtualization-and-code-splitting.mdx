@@ -1,0 +1,410 @@
+---
+title: 列表虚拟化与代码分割
+order: 13
+description: 只渲染可视区域的原理与实现要点、lazy 与 Suspense 的用法、按路由与按交互分割，以及预加载策略
+---
+
+# 列表虚拟化与代码分割
+
+第 12 章的结论是：真实性能瓶颈的前两名是「一次渲染太多 DOM 节点」和「包体积太大」。这一章分别解决它们。
+
+两者的思路其实是同一个：**只加载/渲染此刻真正需要的部分。**
+
+## 1. 为什么长列表会卡
+
+### 1.1 成本在哪
+
+渲染 10000 行的列表，成本分布是：
+
+| 环节 | 成本 |
+|---|---|
+| 执行 10000 次组件函数 | 中（几十毫秒） |
+| 创建 10000+ 个 DOM 节点 | 高 |
+| 浏览器计算样式与布局 | 很高 |
+| 内存占用 | 高（每个 DOM 节点上千字节） |
+
+关键在于后三项都是浏览器的成本，React 优化不了。10000 个 DOM 节点的布局计算轻松超过 1 秒，而且之后每次滚动、每次窗口大小变化都要重算。
+
+### 1.2 关键观察
+
+屏幕上一次最多能显示多少行？假设行高 40px，视口高度 800px，那就是 **20 行**。
+
+剩下的 9980 行，用户看不见，却付出了全部的渲染成本。虚拟化（也叫窗口化）就是：**只渲染这 20 行，加上前后各几行缓冲**。
+
+## 2. 虚拟化的原理
+
+### 2.1 三个要素
+
+```text
+1. 一个固定高度、可滚动的容器
+2. 一个撑起「假高度」的占位元素：height = 总行数 × 行高
+3. 只渲染可视区的那些行，用 transform 或 absolute 定位到正确位置
+```
+
+滚动条的长度和位置由第 2 点决定，所以用户感觉上和真的渲染了一万行一样。
+
+### 2.2 计算可视区间
+
+```ts
+const rowHeight = 40;
+const overscan = 3;                    // 上下各多渲染几行，避免快速滚动露白
+
+const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+const visibleCount = Math.ceil(viewportHeight / rowHeight) + overscan * 2;
+const endIndex = Math.min(total - 1, startIndex + visibleCount);
+const offsetTop = startIndex * rowHeight;
+```
+
+### 2.3 一个最小实现
+
+```tsx
+function VirtualList({ items, rowHeight = 40, height = 400 }: Props) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const overscan = 3;
+
+  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const count = Math.ceil(height / rowHeight) + overscan * 2;
+  const end = Math.min(items.length, start + count);
+  const visible = items.slice(start, end);
+
+  return (
+    <div
+      style={{ height, overflowY: "auto" }}
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+    >
+      {/* 撑起总高度，让滚动条正确 */}
+      <div style={{ height: items.length * rowHeight, position: "relative" }}>
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            transform: "translateY(" + start * rowHeight + "px)",
+          }}
+        >
+          {visible.map((item, i) => (
+            <div key={item.id} style={{ height: rowHeight }}>
+              {item.name}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+不到 30 行，10000 行的列表就流畅了。DOM 节点数从 10000 降到 20 左右。
+
+<Callout type="tip" title="用 transform 而不是 top">
+定位偏移用 `transform: translateY()` 而不是 `top`。前者只触发合成（compositing），后者会触发布局重排（layout）。在每帧都要更新的滚动场景里，这个差别很明显。
+</Callout>
+
+## 3. 虚拟化的难点
+
+上面的最小实现只处理了最简单的情况。真实场景要面对：
+
+### 3.1 高度不固定
+
+行高由内容决定时，无法直接算出偏移量。三种应对：
+
+| 策略 | 做法 | 适用 |
+|---|---|---|
+| 估算 + 修正 | 先用估计高度，渲染后测量真实高度并缓存，累加修正偏移 | 通用，主流库的做法 |
+| 强制固定高度 | 用 CSS 截断，牺牲一点展示效果 | 高度差异不大时 |
+| 分组固定 | 同类项高度一致，按组计算 | 结构规整的数据 |
+
+估算+修正需要维护一个「已测量高度」的映射表和前缀和，还要处理「测量后偏移变化导致视觉跳动」的问题——这就是不要自己造轮子的原因。
+
+### 3.2 其他坑
+
+- **Ctrl+F 搜不到内容**：因为没渲染的行不在 DOM 里。这是虚拟化的固有代价
+- **滚动到指定项**：需要根据 index 算 scrollTop，高度不定时更麻烦
+- **表格的表头吸顶和列对齐**
+- **快速滚动露白**：overscan 要够，或者渲染一个占位骨架
+- **无障碍**：屏幕阅读器需要 `aria-setsize` 和 `aria-posinset` 告知真实的总数和位置
+
+### 3.3 用现成的库
+
+| 库 | 特点 |
+|---|---|
+| TanStack Virtual | 无头（headless），只给你计算结果，DOM 自己写；支持动态高度、水平、网格 |
+| react-window | 轻量，API 简单，固定高度场景够用 |
+| react-virtuoso | 开箱即用，内置动态高度、分组、置顶 |
+
+TanStack Virtual 的用法示意：
+
+```tsx
+const parentRef = useRef<HTMLDivElement>(null);
+
+const virtualizer = useVirtualizer({
+  count: items.length,
+  getScrollElement: () => parentRef.current,
+  estimateSize: () => 40,
+  overscan: 5,
+});
+
+return (
+  <div ref={parentRef} style={{ height: 400, overflow: "auto" }}>
+    <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+      {virtualizer.getVirtualItems().map((v) => (
+        <div
+          key={v.key}
+          ref={virtualizer.measureElement}
+          data-index={v.index}
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: "100%",
+            transform: "translateY(" + v.start + "px)",
+          }}
+        >
+          {items[v.index].name}
+        </div>
+      ))}
+    </div>
+  </div>
+);
+```
+
+`measureElement` 那一行就是动态高度的自动测量。
+
+### 3.4 什么时候需要虚拟化
+
+- 列表超过 **200 行**且每行结构复杂 → 考虑
+- 列表超过 **1000 行** → 基本必须
+- 少于 100 行 → 不需要，加了反而增加复杂度和 bug 面
+
+也要先考虑更简单的替代方案：**分页**。用户真的需要一次看到一万条吗？分页在实现成本、可搜索性、无障碍上全面胜过虚拟化。
+
+## 4. 代码分割
+
+### 4.1 问题
+
+打包器默认把所有代码打成一个文件。一个中型应用轻松到 2MB，用户打开首页要下载全部代码——包括那个只有管理员才能进的后台页面、那个几百 KB 的图表库、那个巨大的富文本编辑器。
+
+代码分割就是把包拆成多个 chunk，按需加载。
+
+### 4.2 lazy + Suspense
+
+```tsx
+import { lazy, Suspense } from "react";
+
+// 这个组件的代码会被打成独立 chunk，首屏不加载
+const Chart = lazy(() => import("./Chart"));
+
+function Dashboard() {
+  return (
+    <Suspense fallback={<ChartSkeleton />}>
+      <Chart data={data} />
+    </Suspense>
+  );
+}
+```
+
+`lazy` 接收一个返回 Promise 的函数（`import()` 正好返回 Promise），Promise resolve 的模块必须有默认导出。
+
+`Suspense` 的作用是：在组件加载完成之前显示 fallback。它可以包裹多个 lazy 组件，也可以嵌套。
+
+### 4.3 具名导出怎么办
+
+`lazy` 要求默认导出。如果模块用的是具名导出：
+
+```tsx
+const Chart = lazy(() =>
+  import("./charts").then((m) => ({ default: m.BarChart }))
+);
+```
+
+### 4.4 按路由分割
+
+这是收益最大、最容易做的分割方式：
+
+```tsx
+const Home = lazy(() => import("./pages/Home"));
+const Settings = lazy(() => import("./pages/Settings"));
+const Admin = lazy(() => import("./pages/Admin"));
+
+<Suspense fallback={<PageSkeleton />}>
+  <Routes>
+    <Route path="/" element={<Home />} />
+    <Route path="/settings" element={<Settings />} />
+    <Route path="/admin" element={<Admin />} />
+  </Routes>
+</Suspense>
+```
+
+用户访问首页时，settings 和 admin 的代码完全不会被下载。
+
+Next.js 的 App Router 会**自动按路由分割**，不需要手写 lazy。
+
+### 4.5 按交互分割
+
+有些组件只在用户做了某个动作后才需要：
+
+```tsx
+const RichEditor = lazy(() => import("./RichEditor"));      // 500KB
+const VideoPlayer = lazy(() => import("./VideoPlayer"));
+
+function Post() {
+  const [editing, setEditing] = useState(false);
+
+  return editing ? (
+    <Suspense fallback={<div>加载编辑器…</div>}>
+      <RichEditor />
+    </Suspense>
+  ) : (
+    <button onClick={() => setEditing(true)}>编辑</button>
+  );
+}
+```
+
+弹窗、抽屉、图表、地图、编辑器、二维码扫描——这些都是典型的按交互分割对象。
+
+### 4.6 预加载：消除等待感
+
+按需加载的代价是「点击后要等一下」。用预加载抵消：
+
+```tsx
+const loadEditor = () => import("./RichEditor");
+const RichEditor = lazy(loadEditor);
+
+<button
+  onMouseEnter={loadEditor}        // 鼠标悬停就开始下载
+  onFocus={loadEditor}             // 键盘用户
+  onClick={() => setEditing(true)}
+>
+  编辑
+</button>
+```
+
+从鼠标移到按钮到实际点击，通常有 200-500ms，足够下载一个中等 chunk。用户完全感知不到加载。
+
+其他预加载时机：
+
+- **空闲时预加载**：`requestIdleCallback(() => import("./Next"))`
+- **视口内预加载**：用 IntersectionObserver 检测组件即将进入视口
+- **路由预测**：用户在列表页时预加载详情页
+
+<Callout type="warn" title="不要过度分割">
+每个 chunk 都有 HTTP 请求开销和运行时开销。把 50 个小组件各自分割成 chunk，会让页面发出 50 个请求，总耗时反而更长。
+
+经验值：单个 chunk 小于 20KB 就不值得单独分割。打包器通常有自动合并小 chunk 的策略，但手写的 `lazy` 会强制分割。
+</Callout>
+
+## 5. 减小包体积的其他手段
+
+代码分割是「推迟加载」，减小体积是「根本不加载」。后者优先级更高。
+
+### 5.1 找出谁占了空间
+
+```bash
+npx vite-bundle-visualizer          # Vite
+npx @next/bundle-analyzer           # Next.js
+npx source-map-explorer dist/*.js   # 通用
+```
+
+先看图，通常会有惊喜：一个 moment.js 带了 200KB 的语言包，一个图标库全量引入了 3000 个图标。
+
+### 5.2 常见的优化
+
+| 问题 | 解法 |
+|---|---|
+| moment.js 体积大 | 换 date-fns（可 tree-shake）或 dayjs（2KB） |
+| lodash 全量引入 | 改成 `import debounce from "lodash/debounce"` 或用 es-toolkit |
+| 图标库全量引入 | 按需引入具体图标，或用 unplugin-icons |
+| 引入了整个 UI 库 | 确认库支持 tree-shaking，检查 sideEffects 配置 |
+| 打包了 polyfill | 调整 browserslist，别为了 IE11 给现代浏览器加负担 |
+| 同一个库有多个版本 | `npm dedupe`，检查 lock 文件 |
+
+### 5.3 tree-shaking 的前提
+
+- 用 ESM（`import`/`export`），CommonJS 无法静态分析
+- `package.json` 里正确声明 `"sideEffects": false`（或列出有副作用的文件）
+- 避免会产生副作用的顶层代码
+
+## 6. Suspense 的更多用途
+
+`Suspense` 不只服务于 `lazy`。它是一个通用机制：**在子树「还没准备好」时显示 fallback**。
+
+```tsx
+// 支持 Suspense 的数据请求库（React Query、Relay、RSC）也能用它
+<Suspense fallback={<Skeleton />}>
+  <UserProfile id={id} />       {/* 内部在请求数据 */}
+</Suspense>
+```
+
+### 6.1 嵌套与粒度
+
+```tsx
+<Suspense fallback={<PageSkeleton />}>
+  <Header />
+  <Suspense fallback={<ListSkeleton />}>
+    <SlowList />
+  </Suspense>
+  <Footer />
+</Suspense>
+```
+
+内层 Suspense 让 `SlowList` 的加载不会阻塞 Header 和 Footer 的显示。**粒度越细，用户越早看到内容。**
+
+### 6.2 和错误边界配合
+
+`Suspense` 处理「加载中」，错误边界处理「加载失败」。两者要一起用：
+
+```tsx
+<ErrorBoundary fallback={<LoadFailed onRetry={retry} />}>
+  <Suspense fallback={<Skeleton />}>
+    <LazyComponent />
+  </Suspense>
+</ErrorBoundary>
+```
+
+chunk 加载失败是真实会发生的（网络抖动、部署后旧 chunk 404），必须有兜底。下一章专门讲错误边界。
+
+<Callout type="info" title="部署后的 chunk 404 问题">
+用户打开页面后你部署了新版本，旧的 chunk 文件名（带 hash）在服务器上没有了。此时用户点击一个懒加载路由，就会报「Failed to fetch dynamically imported module」。
+
+标准解法：在错误边界里检测这类错误，提示用户刷新页面（或直接 `location.reload()`）。另外服务器上保留几个版本的旧产物，能给用户留出缓冲时间。
+</Callout>
+
+<Callout type="exercise" title="练习 1：计算可视区间">
+一个虚拟列表：行高 48px，容器高 600px，overscan 为 4，总共 5000 行。
+
+当 scrollTop = 12000 时，计算 startIndex、endIndex、实际渲染的行数、偏移量 offsetTop。
+
+然后思考：如果 overscan 设为 0，快速滚动时会看到什么现象？为什么？
+</Callout>
+
+<Callout type="exercise" title="练习 2：设计分割方案">
+一个后台系统有这些部分：登录页、仪表盘（含 ECharts）、用户列表、用户详情（含富文本编辑器）、设置页、导出功能（含 xlsx 库）。
+
+设计代码分割方案：哪些按路由分割、哪些按交互分割、哪些预加载、在什么时机预加载。说明理由。
+</Callout>
+
+<Callout type="exercise" title="练习 3：实现 useVirtual">
+写一个 `useVirtual({ count, rowHeight, viewportHeight, overscan })` 自定义 Hook，返回 `startIndex`、`endIndex`、`offsetTop`、`totalHeight` 和一个 `onScroll` 处理函数。
+
+进阶：用 requestAnimationFrame 节流 scroll 事件（回顾第 12 章），对比节流前后 setState 的调用次数。
+</Callout>
+
+<Callout type="exercise" title="练习 4：分析取舍">
+一个商品列表页要展示 800 个商品卡片，每个卡片有图片、标题、价格、加购按钮。
+
+列出至少四种方案（虚拟化、分页、无限滚动、图片懒加载），从首屏速度、滚动流畅度、实现复杂度、SEO、无障碍五个维度对比，给出你的推荐和理由。
+</Callout>
+
+## 小结
+
+- 长列表的成本主要在**浏览器**（DOM 节点、样式计算、布局），React 优化不了
+- 虚拟化 = 撑起假高度的占位 + 只渲染可视区 + transform 定位，通常 30 行能实现基础版
+- 难点在**动态高度**、滚动到指定项、无障碍——所以用 TanStack Virtual 这类成熟库
+- 200 行以下不需要虚拟化；先考虑**分页**这个更简单的方案
+- `lazy` + `Suspense` 实现代码分割：**按路由分割**收益最大，**按交互分割**次之
+- 用 `onMouseEnter` / 空闲时间 / 视口检测**预加载**，消除点击后的等待感
+- 不要过度分割：小于 20KB 的 chunk 不值得单独拆
+- 减小体积优先于分割：先用分析工具找出体积大户，替换重型依赖
+- `Suspense` 嵌套得越细，用户越早看到内容；必须配合错误边界处理加载失败
+- 下一章讲错误处理与错误边界 →

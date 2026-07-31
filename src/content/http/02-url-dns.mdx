@@ -1,0 +1,186 @@
+---
+title: URL 与 DNS：从名字到地址
+order: 2
+description: URL 结构解剖、百分号编码、域名解析全过程、hosts 文件与 curl --resolve
+---
+
+# URL 与 DNS：从名字到地址
+
+HTTP 请求的第一步不是发包，而是回答两个问题：**去哪（URL 解析）**和**那是哪台机器（DNS 解析）**。这一章把这两步拆开看清楚。
+
+## 1. URL 结构解剖
+
+URL（统一资源定位符）的完整语法：
+
+```text
+scheme://user:password@host:port/path?query#fragment
+  |          |           |    |    |     |      |
+ 协议     用户信息(罕用)  主机  端口  路径  查询串  片段
+```
+
+一个饱满的例子：
+
+```text
+https://alice:secret@shop.example.com:8443/list/books?page=2&sort=price#reviews
+```
+
+| 组件 | 值 | 说明 |
+|---|---|---|
+| scheme | https | 协议，决定默认端口与语义 |
+| userinfo | alice:secret | 已废弃的明文认证方式，现代浏览器基本禁用 |
+| host | shop.example.com | 域名或 IP，DNS 解析的对象 |
+| port | 8443 | 省略时用默认值：http 80、https 443 |
+| path | /list/books | 服务器上的资源路径 |
+| query | page=2&sort=price | 键值对参数，`?` 开始、`&` 分隔 |
+| fragment | reviews | **不会发送给服务器**，纯浏览器行为（锚点/前端路由） |
+
+两个高频考点：
+
+- **端口省略规则**：`https://example.com/` 等价于 `https://example.com:443/`；
+- **fragment 不上网**：`#` 后面的内容不出现在 HTTP 请求里，这是 SPA 早期用 hash 路由的原因。
+
+### 1.1 百分号编码
+
+URL 只允许有限的 ASCII 字符。空格、中文、`&`、`=` 等出现在参数值里时必须**百分号编码**（Percent-Encoding）：字节值写成 `%XX` 十六进制。
+
+<Playground
+  language="http"
+  title="URL 解析与百分号编码"
+  id="http-02-1"
+  code={`python3 -c '
+from urllib.parse import urlsplit, parse_qs, quote, unquote
+
+u = urlsplit("https://shop.example.com:8443/list/books?page=2&sort=price&kw=%E5%9B%BE%E4%B9%A6#reviews")
+print("scheme  =", u.scheme)
+print("host    =", u.hostname)
+print("port    =", u.port)
+print("path    =", u.path)
+print("query   =", parse_qs(u.query))
+print("fragment=", u.fragment)
+print()
+# 编码与解码
+print(quote("北京 hello&world"))
+print(unquote("%E5%9B%BE%E4%B9%A6"))
+'`}
+/>
+
+<Callout type="warn" title="不要手动拼 URL 参数">
+把用户输入直接拼进查询串，`&` 和 `=` 会破坏参数结构，甚至造成参数注入。永远用库函数（JS 的 URLSearchParams、Python 的 urlencode）构造查询串。
+</Callout>
+
+## 2. DNS：把名字翻译成地址
+
+TCP/IP 只认 IP 地址，而人类只记得住域名。DNS（Domain Name System）就是全球分布式的"电话簿"。
+
+### 2.1 解析的完整过程
+
+以查询 `www.example.com` 为例，你的机器通常只问一个**递归解析器**（如运营商 DNS 或 8.8.8.8），由它代劳整个迭代过程：
+
+```text
+浏览器缓存 → 系统缓存 → /etc/hosts → 递归解析器
+                                        │ 1. 问根服务器: .com 归谁管？
+                                        │ 2. 问 .com 顶级域服务器: example.com 归谁管？
+                                        │ 3. 问 example.com 权威服务器: www 的 A 记录？
+                                        ▼
+                                   93.184.216.34（缓存 TTL 秒）
+```
+
+- **根服务器**只知道各顶级域（.com/.org/.cn）的服务器在哪；
+- **顶级域（TLD）服务器**知道各二级域的权威服务器在哪；
+- **权威服务器**存着真正的记录；
+- 每一步的结果都会按 **TTL** 缓存，所以绝大多数查询根本走不到根服务器。
+
+### 2.2 常见记录类型
+
+| 类型 | 含义 | 例子 |
+|---|---|---|
+| A | 域名 → IPv4 | example.com → 93.184.216.34 |
+| AAAA | 域名 → IPv6 | example.com → 2606:2800:... |
+| CNAME | 别名 → 另一个域名 | www → example.com |
+| MX | 邮件服务器 | 收件路由 |
+| TXT | 任意文本 | 域名所有权验证、SPF |
+| NS | 该域的权威服务器 | 委派链条的关键 |
+
+真实环境里用 `dig` 观察（沙箱无外网，以下是静态示例）：
+
+```bash
+$ dig +short www.example.com A
+93.184.216.34
+
+$ dig +trace example.com     # 展示从根开始的完整迭代路径
+.               518400  IN  NS  a.root-servers.net.
+com.            172800  IN  NS  a.gtld-servers.net.
+example.com.    172800  IN  NS  a.iana-servers.net.
+example.com.    86400   IN  A   93.184.216.34
+```
+
+<Callout type="info" title="沙箱无外网">
+容器内无法进行真实 DNS 查询，上面的 dig 输出为静态示例。但"名字到地址"的映射逻辑可以用 hosts 文件和 curl --resolve 在本地完整模拟——见下面两个 Playground。
+</Callout>
+
+### 2.3 hosts 文件：最古老的 DNS
+
+DNS 出现之前，全网就靠一份手工维护的 hosts 文件。它今天仍然是解析的**第一优先级**，常用于本地开发时把域名指向测试机：
+
+<Playground
+  language="http"
+  title="hosts 文件：本地域名映射"
+  id="http-02-2"
+  code={`# 查看容器的 hosts 文件
+cat /etc/hosts
+echo "---"
+
+# 追加一条自定义映射：myapp.local 指向回环地址
+echo "127.0.0.1 myapp.local" >> /etc/hosts
+
+# 起服务后，用域名（而非 IP）访问
+python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+sleep 0.3
+echo "via-hosts-file" > index.html
+
+curl -s http://myapp.local:8000/index.html`}
+/>
+
+解析顺序：hosts 命中就不再查 DNS。这也是它被用于广告屏蔽（把广告域名指向 0.0.0.0）和内网穿透调试的原因。
+
+### 2.4 curl --resolve：不改 hosts 的临时指向
+
+改 hosts 需要权限且影响全局。curl 提供了更优雅的 `--resolve`，只对本次请求生效——这是排查"域名切换新服务器后是否正常"的标准手法：
+
+<Playground
+  language="http"
+  title="curl --resolve 模拟 DNS 解析结果"
+  id="http-02-3"
+  code={`python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+sleep 0.3
+echo "hello from fake-example" > index.html
+
+# 告诉 curl：api.example.com 的 8000 端口就解析到 127.0.0.1
+# 请求里的 Host 头仍然是 api.example.com —— 服务器据此区分虚拟主机
+curl -sv --resolve api.example.com:8000:127.0.0.1 \
+  http://api.example.com:8000/index.html 2>&1 | grep -E "^(> Host|< HTTP|hello)"`}
+/>
+
+注意输出：TCP 连的是 127.0.0.1，但请求头里 `Host: api.example.com` 原样保留。**连接目标（IP）与逻辑目标（Host 头）是两回事**——这个区分在 CDN、虚拟主机、TLS SNI（第 12 章）中反复出现。
+
+## 3. DNS 与性能、安全
+
+- **TTL 权衡**：TTL 长则缓存命中率高、切换 IP 生效慢；做灾备切换的域名通常压到 60 秒以内；
+- **DNS 预解析**：HTML 里的 `dns-prefetch` 提示浏览器提前解析第三方域名；
+- **明文风险**：传统 DNS 走 UDP 53 明文，可被窃听与污染；DoT（DNS over TLS）、DoH（DNS over HTTPS）将查询加密；
+- **劫持排查**：怀疑 DNS 被劫持时，对比本地解析结果与 `--resolve` 直连真实 IP 的响应是否一致。
+
+## 小结
+
+- URL = scheme + host + port + path + query + fragment；fragment 不发给服务器；
+- 特殊字符必须百分号编码，构造查询串永远用库函数；
+- DNS 解析优先级：浏览器缓存 → 系统缓存 → hosts → 递归解析器（迭代问根/TLD/权威）；
+- TTL 控制缓存时长，是切换生效速度与查询压力的权衡旋钮；
+- `curl --resolve` 可绕过 DNS 定向测试，且保持 Host 头正确——运维排障必备。
+
+<Callout type="exercise" title="练习">
+1. 用 Playground 1 的 urlsplit 解析 `http://a.com/p?x=1#y=2`，验证 fragment 里的 `y=2` 不会出现在 query 中。
+2. 修改 Playground 2：把 myapp.local 映射后，再追加一行把它映射到 0.0.0.0，观察 curl 的行为（提示：hosts 取第一条匹配）。
+3. 在 Playground 3 中去掉 --resolve 参数直接请求 api.example.com:8000，观察 curl 报什么错，理解"解析失败"和"连接失败"的区别。
+4. 思考：为什么 CDN 厂商普遍用 CNAME 而不是 A 记录接入客户域名？
+</Callout>

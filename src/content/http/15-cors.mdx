@@ -1,0 +1,213 @@
+---
+title: 跨域与 CORS：浏览器的边境管制
+order: 15
+description: 同源策略、简单请求与预检请求、凭证模式、常见配置错误清单
+---
+
+# 跨域与 CORS：浏览器的边境管制
+
+"CORS 报错"大概是前后端联调中出现频率最高的红字。要根治它，先要理解一个反直觉的事实：**跨域限制是浏览器单方面的安全策略，与服务器、与 curl 都无关**——服务器其实收到了请求，甚至执行了它。
+
+## 1. 同源策略：为什么要有边境
+
+**源（Origin）= 协议 + 域名 + 端口**，三者完全相同才是同源：
+
+| URL A | URL B | 同源？ |
+|---|---|---|
+| https://a.com/x | https://a.com/y | ✅ 路径不同不影响 |
+| https://a.com | http://a.com | ❌ 协议不同 |
+| https://a.com | https://api.a.com | ❌ 子域也算不同 |
+| https://a.com | https://a.com:8443 | ❌ 端口不同 |
+
+同源策略（SOP）限制：**页面里的脚本读取跨源响应**。没有它的世界很可怕：你登录着网银，随手打开一个恶意网页，它的 JS 用你的 Cookie 向银行发请求并**读取余额**——SOP 掐断的正是"读取"这一步。
+
+注意精确措辞：SOP 限制的主要是**读响应**，跨源的 img/script/表单提交历来是允许的（这也是 CSRF 的口子，靠 SameSite Cookie 补，见第 8 章）。
+
+## 2. CORS：受控地打开边境
+
+CORS（跨源资源共享）的机制：**浏览器带上 Origin 请求头，服务器用 Access-Control-* 响应头声明许可，浏览器执行判决**。按风险分两类流程。
+
+### 2.1 简单请求：先斩后奏
+
+满足全部条件才算"简单请求"：方法是 GET/HEAD/POST；头部只有安全白名单（Accept、Accept-Language、Content-Language、Content-Type）；Content-Type 仅限三种（text/plain、application/x-www-form-urlencoded、multipart/form-data）。
+
+流程：直接发请求（带 Origin 头）→ 浏览器检查响应里的 `Access-Control-Allow-Origin` → 匹配则把响应交给 JS，否则丢弃并报红。
+
+<Playground
+  language="http"
+  title="简单请求：Origin 与 Allow-Origin 的对答"
+  id="http-15-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+ALLOWED = {"http://app.example.com", "http://localhost:3000"}
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        origin = self.headers.get("Origin", "")
+        body = b"{\"data\": \"secret numbers\"}"
+        self.send_response(200)
+        if origin in ALLOWED:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")   # 按 Origin 回显时必须加
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 白名单内的 Origin：响应带上了许可头 =="
+curl -si http://127.0.0.1:8000/api -H "Origin: http://app.example.com" \
+  | grep -iE "HTTP/|access-control|vary|data"
+
+echo "== 陌生 Origin：注意！响应体照样返回了 =="
+curl -si http://127.0.0.1:8000/api -H "Origin: http://evil.com" \
+  | grep -iE "HTTP/|access-control|data"`}
+/>
+
+划重点：第二个请求**服务器照样返回了数据**，只是没带许可头。真实浏览器里，是浏览器收到响应后发现没有许可头，才**拦下不给 JS**。curl 没有同源策略，所以照收不误——"CORS 不是服务器防线，只是浏览器的阅后即焚"。**防护数据要靠认证鉴权，不能指望 CORS。**
+
+### 2.2 预检请求：先礼后兵
+
+超出"简单"范围的请求（PUT/DELETE、Content-Type: application/json、自定义头……）有副作用风险，浏览器先派 **OPTIONS 预检**探路：
+
+```text
+① 预检   OPTIONS /api/users
+         Origin: http://app.example.com
+         Access-Control-Request-Method: PUT          我想用 PUT
+         Access-Control-Request-Headers: x-token     我想带这个头
+
+② 放行   204 No Content
+         Access-Control-Allow-Origin: http://app.example.com
+         Access-Control-Allow-Methods: GET, PUT, DELETE
+         Access-Control-Allow-Headers: x-token
+         Access-Control-Max-Age: 600                 十分钟内免预检
+
+③ 真实请求  PUT /api/users （带 x-token）
+```
+
+<Playground
+  language="http"
+  title="完整预检流程"
+  id="http-15-2"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+ORIGIN = "http://app.example.com"
+
+class H(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", ORIGIN)
+        self.send_header("Access-Control-Allow-Methods", "GET, PUT, DELETE")
+        self.send_header("Access-Control-Allow-Headers", "X-Token, Content-Type")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
+    def do_PUT(self):
+        body = b"updated"
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", ORIGIN)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 第一步：浏览器自动发出的预检 =="
+curl -si -X OPTIONS http://127.0.0.1:8000/api/users \
+  -H "Origin: http://app.example.com" \
+  -H "Access-Control-Request-Method: PUT" \
+  -H "Access-Control-Request-Headers: X-Token" | grep -iE "HTTP/|access-control"
+
+echo "== 第二步：预检通过后的真实请求 =="
+curl -si -X PUT http://127.0.0.1:8000/api/users \
+  -H "Origin: http://app.example.com" -H "X-Token: abc" \
+  | grep -iE "HTTP/|access-control|updated"`}
+/>
+
+`Access-Control-Max-Age` 让预检结果缓存 10 分钟，避免每个请求都翻倍。生产上 JSON API 几乎每个请求都触发预检（Content-Type: application/json 不在白名单），把 Max-Age 配起来是免费的性能优化。
+
+### 2.3 凭证模式：Cookie 的额外关卡
+
+跨源请求默认**不带 Cookie**。前端要显式声明（fetch 的 `credentials: "include"`），且服务器必须：
+
+1. `Access-Control-Allow-Credentials: true`；
+2. `Access-Control-Allow-Origin` **不能是通配符 `*`**，必须回显具体源。
+
+这是 CORS 配置错误的重灾区，浏览器控制台的报错原文都背下来了："The value of the Access-Control-Allow-Origin header must not be the wildcard when the request's credentials mode is include."
+
+## 3. 常见配置错误清单
+
+| 错误 | 症状 | 修正 |
+|---|---|---|
+| 通配符 * 配 Cookie | 带凭证请求全挂 | 回显具体 Origin + Allow-Credentials |
+| 回显 Origin 却漏 Vary: Origin | CDN 把 A 站的许可头缓存给 B 站 | 加 Vary: Origin |
+| 只处理了简单请求 | GET 好好的，PUT/JSON 全 405 | 补 OPTIONS 路由与 Allow-Methods/Headers |
+| 许可头只在 2xx 时添加 | 接口报错时"变成了 CORS 错误" | 4xx/5xx 响应同样要带许可头 |
+| 后端拿 Origin 做鉴权 | 被 curl 伪造绕过 | Origin 只能用于 CORS 决策，鉴权靠凭证 |
+| 双层都加许可头 | 网关和应用各加一份，头重复非法 | 只在一层统一处理 |
+
+第四条最阴险：接口 500 时错误响应没带许可头，浏览器只报"CORS error"，把后端异常伪装成了跨域问题——**看到 CORS 报错，先查 Network 面板里的真实状态码**。
+
+<Playground
+  language="http"
+  title="经典错误：错误响应忘了带许可头"
+  id="http-15-3"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        origin = self.headers.get("Origin", "")
+        if self.path == "/good":
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            # 模拟常见框架行为：异常路径直接抛 500，中间件没来得及加 CORS 头
+            self.send_response(500)
+            self.send_header("Content-Length", "5")
+            self.end_headers()
+            self.wfile.write(b"boom\n")
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 正常接口：有许可头 =="
+curl -si http://127.0.0.1:8000/good -H "Origin: http://a.com" | grep -iE "HTTP/|access-control"
+echo "== 报错接口：500 且没有许可头 -> 浏览器只会显示 CORS error =="
+curl -si http://127.0.0.1:8000/bad -H "Origin: http://a.com" | grep -iE "HTTP/|access-control"`}
+/>
+
+<Callout type="tip" title="开发环境的另一条路：代理">
+开发时也可以完全绕开 CORS：前端 dev server（Vite/webpack）把 /api 代理到后端——浏览器眼里一切请求都同源，跨域只发生在服务器之间（服务器间没有同源策略）。生产环境用网关统一域名也是同理。CORS 配置与代理二选一即可，别都上。
+</Callout>
+
+## 小结
+
+- 源 = 协议 + 域名 + 端口；同源策略拦的是"脚本读取跨源响应"，且只存在于浏览器；
+- 简单请求直接发、看响应头定生死；非简单请求先 OPTIONS 预检，Max-Age 可缓存预检结果；
+- 带 Cookie 必须：credentials 声明 + Allow-Credentials: true + 具体 Origin（禁用 *）+ Vary: Origin；
+- 错误响应也要带许可头，否则 500 会伪装成 CORS 错误；
+- CORS 不是安全防线：数据保护靠鉴权，防 CSRF 靠 SameSite。
+
+<Callout type="exercise" title="练习">
+1. 修改 Playground 2 的预检：故意不把 X-Token 加进 Allow-Headers，思考真实浏览器会在哪一步失败、控制台报什么。
+2. 给 Playground 1 增加凭证模式支持：Allow-Credentials: true 并回显 Origin，用 curl -b "sid=xxx" 验证响应头组合。
+3. 用第 8 章的知识解释：SameSite=Lax 与 CORS 分别防住了跨站攻击的哪个环节（发出请求 / 读取响应）？
+4. 排障题：前端报 CORS 错误，但后端同事坚称"我配了 Allow-Origin: *"。列出三个仍会失败的可能原因。
+</Callout>

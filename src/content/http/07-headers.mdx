@@ -1,0 +1,222 @@
+---
+title: 请求头与响应头：字段速查与 MIME
+order: 7
+description: 常用头字段分类速查、Content-Type 与 MIME 类型、字符集与嗅探风险
+---
+
+# 请求头与响应头：字段速查与 MIME
+
+头部是 HTTP 的"配置面板"：内容格式、缓存策略、身份凭证、代理链路……全靠头部字段传递。本章建立一张分类地图，再重点吃透最重要的一个头：Content-Type。
+
+## 1. 头部字段分类地图
+
+### 1.1 常用请求头
+
+| 字段 | 作用 | 示例值 |
+|---|---|---|
+| Host | 目标主机（虚拟主机路由依据），HTTP/1.1 必需 | api.example.com |
+| User-Agent | 客户端标识 | Mozilla/5.0 ... |
+| Accept | 期望的响应类型（内容协商，第 10 章） | application/json |
+| Accept-Encoding | 可接受的压缩算法 | gzip, br |
+| Accept-Language | 语言偏好 | zh-CN, en;q=0.8 |
+| Content-Type | **请求体**的类型 | application/json |
+| Content-Length | 请求体字节数 | 348 |
+| Authorization | 认证凭证（第 16 章） | Bearer eyJhb... |
+| Cookie | 携带的 Cookie（第 8 章） | sid=abc123 |
+| Referer | 从哪个页面发起的请求（防盗链/统计） | https://a.com/page |
+| Origin | 发起请求的源（CORS，第 15 章） | https://a.com |
+| Range | 只取部分字节（断点续传） | bytes=0-1023 |
+| If-None-Match | 协商缓存（第 9 章） | "abc123" |
+
+### 1.2 常用响应头
+
+| 字段 | 作用 | 示例值 |
+|---|---|---|
+| Content-Type | 响应体的类型与字符集 | text/html; charset=utf-8 |
+| Content-Length | 响应体字节数 | 5120 |
+| Content-Encoding | 实际使用的压缩算法 | gzip |
+| Cache-Control | 缓存策略（第 9 章） | max-age=3600 |
+| ETag | 资源版本指纹（第 9 章） | "33a64df5" |
+| Set-Cookie | 下发 Cookie（第 8 章） | sid=abc; HttpOnly |
+| Location | 重定向目标 / 新资源地址 | /users/42 |
+| Server | 服务器软件标识 | nginx/1.24 |
+| Allow | 资源支持的方法 | GET, POST |
+| Access-Control-Allow-Origin | CORS 许可（第 15 章） | https://a.com |
+
+### 1.3 代理链路头（排障常客）
+
+| 字段 | 作用 |
+|---|---|
+| X-Forwarded-For | 逐跳追加的客户端 IP 链，取真实 IP 的惯用来源 |
+| X-Forwarded-Proto | 原始请求协议（https 卸载后告知后端） |
+| X-Request-Id | 全链路追踪 ID（非标准但普遍） |
+| Via | 途经的代理列表（标准字段） |
+
+<Callout type="warn" title="X-Forwarded-For 可以伪造">
+XFF 是客户端可自由填写的普通头，只有"离你最近的可信代理追加的那一段"可信。用它做限流、白名单时，必须只取自己边缘代理写入的值，否则一条 curl -H 就能绕过。
+</Callout>
+
+## 2. 动手：观察请求头的旅程
+
+<Playground
+  language="http"
+  title="回显服务器观察各种请求头"
+  id="http-07-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Echo(BaseHTTPRequestHandler):
+    def do_GET(self):
+        lines = ["我收到的请求头:"]
+        for k, v in self.headers.items():
+            lines.append("  " + k + ": " + v)
+        body = ("\n".join(lines) + "\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), Echo).serve_forever()
+' &
+sleep 0.3
+
+echo "===== 模拟浏览器请求 ====="
+curl -s http://127.0.0.1:8000/page \
+  -H "User-Agent: Mozilla/5.0 (Macintosh)" \
+  -H "Accept: text/html,application/xhtml+xml" \
+  -H "Accept-Language: zh-CN,zh;q=0.9" \
+  -H "Referer: http://127.0.0.1:8000/home"
+
+echo "===== 模拟伪造 X-Forwarded-For ====="
+curl -s http://127.0.0.1:8000/api -H "X-Forwarded-For: 8.8.8.8"`}
+/>
+
+任何请求头都能随手伪造——这是"永远不要信任客户端输入"在头部层面的体现。
+
+## 3. Content-Type 与 MIME
+
+Content-Type 的值是 **MIME 类型**（media type），格式为 `主类型/子类型; 参数`：
+
+| MIME 类型 | 对应内容 |
+|---|---|
+| text/html | HTML 页面 |
+| text/plain | 纯文本 |
+| text/css | 样式表 |
+| application/json | JSON |
+| application/javascript | JS 脚本 |
+| application/octet-stream | 未知二进制（浏览器会下载而非展示） |
+| application/x-www-form-urlencoded | 传统表单编码 |
+| multipart/form-data | 带文件的表单（boundary 分隔） |
+| image/png、image/webp | 图片 |
+
+`charset=utf-8` 参数声明文本编码，漏写时中文乱码的元凶多半是它。
+
+**同样的字节，不同的 Content-Type，客户端行为天差地别**：
+
+<Playground
+  language="http"
+  title="同一份内容，三种 Content-Type"
+  id="http-07-2"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PAYLOAD = b"<h1>hello</h1><script>alert(1)</script>"
+
+TYPES = {
+    "/as-html":  "text/html; charset=utf-8",
+    "/as-text":  "text/plain; charset=utf-8",
+    "/as-bin":   "application/octet-stream",
+}
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        ctype = TYPES.get(self.path, "text/plain")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(PAYLOAD)))
+        self.end_headers()
+        self.wfile.write(PAYLOAD)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+for p in /as-html /as-text /as-bin; do
+  echo "== $p =="
+  curl -sI http://127.0.0.1:8000$p | grep -i "content-type"
+done`}
+/>
+
+同一串字节：标成 text/html 浏览器会渲染（脚本会执行！）、标成 text/plain 只当文字显示、标成 octet-stream 直接弹下载框。
+
+<Callout type="warn" title="MIME 嗅探是安全隐患">
+Content-Type 缺失或含糊时，老浏览器会"嗅探"内容猜类型——用户上传的"图片"如果内容像 HTML，可能被当 HTML 执行，造成存储型 XSS。防御：响应加 X-Content-Type-Options: nosniff，并给用户上传内容设置准确的 Content-Type 与独立域名。
+</Callout>
+
+## 4. 表单的两种 Content-Type
+
+前后端联调最常打交道的三种请求体格式：
+
+<Playground
+  language="http"
+  title="urlencoded / JSON / multipart 三种请求体"
+  id="http-07-3"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Echo(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(n)
+        out = ("Content-Type: " + str(self.headers.get("Content-Type")) +
+               "\n体的前 200 字节:\n" + raw[:200].decode(errors="replace") + "\n\n")
+        body = out.encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), Echo).serve_forever()
+' &
+sleep 0.3
+
+echo "1) 默认 -d：application/x-www-form-urlencoded"
+curl -s http://127.0.0.1:8000/ -d "name=Ada&city=beijing"
+
+echo "2) JSON：需要手动声明 Content-Type"
+curl -s http://127.0.0.1:8000/ -H "Content-Type: application/json" -d '{"name":"Ada"}'
+
+echo "3) multipart/form-data：-F 参数，注意 boundary"
+echo "file-content-here" > up.txt
+curl -s http://127.0.0.1:8000/ -F "name=Ada" -F "avatar=@up.txt"`}
+/>
+
+观察三点：`-d` 默认按 urlencoded 发送；发 JSON 必须自己声明 Content-Type（后端才知道怎么解析）；`-F` 自动使用 multipart 并生成随机 **boundary** 分隔各字段——文件上传必须用它，因为二进制内容没法 urlencode 进一行文本。
+
+## 5. 头部使用的三个惯例
+
+1. **自定义头**：历史惯例加 `X-` 前缀（X-Request-Id），RFC 6648 已不再推荐，但存量极大；新项目可直接用语义化名字；
+2. **头是给机器看的**：不要把业务数据大量塞进头部（有大小限制，且中间设备可能改动/丢弃）；
+3. **逐跳头 vs 端到端头**：`Connection`、`Keep-Alive`、`Transfer-Encoding` 等只作用于当前这一跳，代理必须摘掉重写；`Content-Type` 等端到端头会一路透传。
+
+## 小结
+
+- 请求头描述"我是谁、我要什么、我发的是什么"，响应头描述"我给的是什么、你该怎么缓存/存 Cookie"；
+- Content-Type 用 MIME 类型 + charset 声明体的格式，错标会导致乱码、下载框甚至 XSS；
+- 三种请求体：urlencoded（简单表单）、json（API 主流）、multipart（文件上传）；
+- XFF 等客户端可控头不可直接信任；逐跳头与端到端头行为不同；
+- 记不住的头不用背，用回显服务器 + curl -H 随时做实验。
+
+<Callout type="exercise" title="练习">
+1. 用 Playground 1 观察：curl 不加任何 -H 时默认发送哪几个头？再用 -A 参数改掉 User-Agent。
+2. 修改 Playground 2：给 /as-html 响应加上 X-Content-Type-Options: nosniff 头，用 curl -I 验证。
+3. 在 Playground 3 中用 -F 同时上传两个文件，观察 multipart 体中 boundary 如何分隔多个部分。
+4. 后端收到 POST 报 "Unsupported Media Type (415)"，列出你会检查的三个头字段。
+</Callout>

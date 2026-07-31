@@ -1,0 +1,152 @@
+---
+title: hooks 与自动化：用钩子把团队规范焊死在提交流程里
+order: 16
+description: 客户端钩子机制、pre-commit 与 commit-msg 实战、husky + lint-staged 工程化方案
+---
+
+# hooks 与自动化：用钩子把团队规范焊死在提交流程里
+
+Git 在关键动作前后会调用 `.git/hooks/` 里的脚本，这就是 **hooks（钩子）**。它是把"代码规范、测试、格式检查"自动嵌入工作流的零成本手段——开发者照常 `commit`，钩子却在背后默默把关。
+
+## 1. 钩子是什么、放在哪
+
+钩子是 `.git/hooks/` 目录下的**可执行脚本**（Shell/Python/Ruby 都行），文件名就是触发时机。Git 安装仓库时已自带一批 `*.sample` 模板，去掉 `.sample` 后缀并加上可执行权限即可启用。
+
+常用客户端钩子：
+
+| 钩子 | 触发时机 | 典型用途 |
+|---|---|---|
+| `pre-commit` | `commit` 前、生成快照后 | 跑 lint、检查密钥泄露、阻止大文件 |
+| `prepare-commit-msg` | 编辑器打开前 | 自动填充/改写提交信息模板 |
+| `commit-msg` | 提交信息写定后 | 校验信息格式（如 Conventional Commits） |
+| `post-commit` | 提交完成后 | 通知、缓存更新 |
+| `pre-push` | `push` 前 | 跑测试套件，失败则阻止推送 |
+| `post-merge` | `merge`/`pull` 完成后 | 自动 `npm install` 等 |
+
+<Callout type="warn" title="钩子不会被提交，也不随 clone 传播">
+`.git/hooks/` 在 **`.git` 内部**，不会被版本管理，别人 clone 你的仓库**拿不到**你的钩子。这就是团队落地钩子的痛点——解决方案见第 3 节的 husky。另外钩子是本地的、可被 `git commit --no-verify`（`-n`）绕过，所以它管"习惯"而非"安全"，真正的强制校验要放在 CI。
+</Callout>
+
+## 2. 动手写两个钩子
+
+钩子脚本从标准输入/参数拿到信息，靠**退出码**决定放行（0）还是拦截（非 0）。
+
+<Playground
+  language="git"
+  title="pre-commit 钩子拦截含禁用词的提交"
+  id="git-16-1"
+  code={`echo '===== pre-commit 钩子：拦截含禁用词的提交 ====='
+git init -q -b main hk && cd hk
+echo 'hello' > app.txt && git add . && git commit -q -m "init"
+
+echo '写一个 pre-commit 钩子：禁止提交包含 FORBIDDEN 的内容'
+cat > .git/hooks/pre-commit <<'EOF'
+#!/bin/sh
+if git diff --cached --name-only -z | xargs -0 grep -l 'FORBIDDEN' >/dev/null 2>&1; then
+  echo '【pre-commit】提交被拦截：检测到 FORBIDDEN 字样'
+  exit 1
+fi
+echo '【pre-commit】检查通过'
+exit 0
+EOF
+chmod +x .git/hooks/pre-commit
+
+echo '正常提交（不含禁用词）：'
+echo 'good code' > app.txt && git add . && git commit -q -m "feat: 正常改动"
+
+echo
+echo '尝试提交含 FORBIDDEN 的内容（应被拦截）：'
+echo 'some FORBIDDEN stuff' > app.txt && git add .
+git commit -m "feat: 偷偷加点东西" 2>&1 | head -3
+echo "提交是否被拦下（git log 条数应为 2）："
+git log --oneline | wc -l
+cd ..`}
+/>
+
+逻辑拆解：钩子用 `git diff --cached` 只看**已暂存**的内容（避免漏网），`grep -l 'FORBIDDEN'` 找到就 `exit 1` 中断提交。注意它读的是暂存区而非工作区——这正是钩子该有的正确视角。
+
+再写一个 `commit-msg` 钩子，强制提交信息符合 **Conventional Commits** 规范（第 3 章提过）：
+
+<Playground
+  language="git"
+  title="commit-msg 钩子校验提交信息格式"
+  id="git-16-2"
+  code={`echo '===== commit-msg 钩子：校验 Conventional Commits ====='
+git init -q -b main cm && cd cm
+echo 'hi' > a.txt && git add . && git commit -q -m "init"
+
+cat > .git/hooks/commit-msg <<'EOF'
+#!/bin/sh
+msg=$(cat "$1")
+if ! echo "$msg" | grep -qE '^(feat|fix|docs|style|refactor|test|chore|perf|build|ci|revert)(\(.+\))?: .+'; then
+  echo '【commit-msg】提交信息不符合 Conventional Commits 规范！'
+  echo '格式应为：feat: 描述 / fix(api): 描述'
+  exit 1
+fi
+echo '【commit-msg】提交信息格式正确'
+exit 0
+EOF
+chmod +x .git/hooks/commit-msg
+
+echo '符合规范的提交：'
+echo 'a' > a.txt && git add . && git commit -q -m "feat: 新增功能"
+
+echo
+echo '不符合规范的提交（应被拦截）：'
+echo 'b' > b.txt && git add .
+git commit -m "随便写写" 2>&1 | head -3
+echo "提交是否被拦下（git log 条数应为 2）："
+git log --oneline | wc -l
+cd ..`}
+/>
+
+`commit-msg` 钩子通过第一个参数 `$1` 拿到**存放提交信息的临时文件路径**，读取后校验。格式用正则匹配 `type(scope): description`，团队可在 CI 端用同样的规则做二次把关。
+
+## 3. 工程化：husky + lint-staged（沙箱外）
+
+手写 `.git/hooks` 无法随仓库分发，团队方案是用 **husky** 把钩子脚本存进版本库（放在 `.husky/` 目录），安装依赖时自动软链到 `.git/hooks`：
+
+```bash
+npx husky init                 # 生成 .husky/ 并配置 prepare 脚本
+# 之后在 .husky/pre-commit 里写：
+npx lint-staged                # 只对暂存文件做 lint + 格式化
+```
+
+配合 **lint-staged**，只在 `pre-commit` 时对**本次暂存的文件**跑 ESLint/Prettier，而不是全仓扫描，又快又准：
+
+```json
+// package.json
+"lint-staged": {
+  "*.{js,ts}": ["eslint --fix", "prettier --write"]
+}
+```
+
+<Callout type="info" title="沙箱内为何不直接演示 husky">
+husky 依赖 npm 安装与 Node 环境、且需要 `git config core.hooksPath` 指向 `.husky/_`，在当前无网络的 Alpine 沙箱里无法完整复现。但它的原理就是"把钩子脚本版本化 + 自动链接"，上面两个手写钩子已经展示了钩子本身的全部机制，落地到 husky 只是工程管理上的封装。
+</Callout>
+
+## 4. 服务端钩子与 CI
+
+客户端钩子可被 `--no-verify` 跳过，不能作为强制门禁。真正"卡死"规范的关卡在**服务端**：
+
+- `pre-receive` / `update`：推送到服务器时触发，可拒绝不符合规范的提交（如禁止推到 `main` 直接、要求 PR 审查）。
+- **CI（持续集成）**：GitHub Actions / GitLab CI 在每次 push / PR 跑测试、lint、安全扫描，失败则标记红叉。这是现代团队真正的"强制校验层"。
+
+工程上常见组合：**husky 本地即时反馈（快、个人） + CI 服务端兜底（强制、团队）**。
+
+## 5. 小结
+
+- 钩子是 `.git/hooks/` 下的可执行脚本，按触发时机命名，靠退出码 0/非0 放行或拦截
+- 常用：`pre-commit`（暂存内容检查）、`commit-msg`（信息格式）、`pre-push`（跑测试）
+- 钩子读**暂存区**（`git diff --cached`），不是工作区
+- 钩子不随 clone 传播、可被 `--no-verify` 绕过，只管习惯不管安全
+- 团队落地用 husky（钩子版本化 + 自动链接）+ lint-staged（只查暂存文件）
+- 强制门禁放在服务端 `pre-receive` 与 CI
+- 下一章：submodule 与 monorepo →
+
+<Callout type="exercise" title="练习">
+1. 初始化仓库，写一个 `pre-commit` 钩子：禁止提交任何体积超过 1KB 的文件（提示：用 `git diff --cached --name-only` 遍历暂存文件，检查 `wc -c`）。测试提交一个小文件通过、一个大文件被拦。
+2. 写一个 `commit-msg` 钩子，要求提交信息**必须**以英文半角括号包裹的 issue 号开头，如 `[#123] fix bug`。故意用不合规信息提交验证被拦截。
+3. 为什么钩子检查应该读 `git diff --cached` 而不是工作区文件？如果读工作区，可能出现什么"漏网"情况？
+4. 查阅 husky 文档（团队外资料），说明 `core.hooksPath` 这个 Git 配置的作用，以及它如何解决了"钩子不随仓库分发"的问题。
+</Callout>

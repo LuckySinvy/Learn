@@ -1,0 +1,228 @@
+---
+title: 请求方法与幂等性
+order: 5
+description: GET/POST/PUT/PATCH/DELETE 语义、安全性与幂等性、HEAD 与 OPTIONS
+---
+
+# 请求方法与幂等性
+
+方法（Method）是请求行的第一个词，声明"我想对这个资源做什么"。方法用错不会立刻报错，但会在重试、缓存、代理等环节埋下地雷——理解**安全性**与**幂等性**这两个属性，比背方法列表重要得多。
+
+## 1. 方法总览
+
+| 方法 | 语义 | 安全 | 幂等 | 常见用途 |
+|---|---|---|---|---|
+| GET | 读取资源 | ✅ | ✅ | 查询、下载 |
+| HEAD | 只要响应头，不要体 | ✅ | ✅ | 探活、看文件大小 |
+| OPTIONS | 询问服务器支持哪些方法 | ✅ | ✅ | CORS 预检 |
+| POST | 提交数据，语义由服务器定 | ❌ | ❌ | 创建资源、触发动作 |
+| PUT | 用请求体**整体替换**目标资源 | ❌ | ✅ | 全量更新、按已知 ID 创建 |
+| PATCH | **部分修改**资源 | ❌ | ❌* | 局部更新 |
+| DELETE | 删除资源 | ❌ | ✅ | 删除 |
+
+*PATCH 不保证幂等，取决于补丁内容（"把余额设为 100"幂等，"把余额加 10"不幂等）。
+
+### 1.1 安全（Safe）：只读不写
+
+安全 = **不改变服务器状态**。GET/HEAD/OPTIONS 是安全方法。这不是摆设：
+
+- 浏览器预加载、爬虫会随意发 GET——如果你的"删除"功能做成 `GET /delete?id=1`，爬虫路过就把数据清空了（真实事故屡见不鲜）；
+- 缓存系统默认只缓存安全方法的响应。
+
+### 1.2 幂等（Idempotent）：重复执行结果不变
+
+幂等 = **执行 1 次和执行 N 次，服务器最终状态相同**。GET/PUT/DELETE 幂等，POST 不幂等。
+
+幂等的工程价值在于**重试安全**：网络超时后客户端不知道请求到底成没成功——
+
+- 幂等方法（PUT/DELETE）：闭眼重试即可；
+- POST：重试可能创建两笔订单、扣两次款。所以支付类接口必须额外设计**幂等键**（客户端生成唯一 ID，服务端去重）。
+
+注意：幂等说的是**服务器状态**，不是响应内容。第二次 DELETE 同一资源返回 404 而不是 200，依然算幂等——资源"不存在"这个状态没变。
+
+## 2. 动手：一个内存版 REST 服务
+
+起一个支持全套方法的小服务（数据存内存 dict），用 curl 逐个体验：
+
+<Playground
+  language="http"
+  title="GET / POST / PUT / DELETE 全家桶"
+  id="http-05-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+
+store = {}
+seq = {"next": 1}
+
+class API(BaseHTTPRequestHandler):
+    def reply(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def read_body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(n) or b"{}")
+    def do_GET(self):
+        self.reply(200, store)
+    def do_POST(self):
+        uid = str(seq["next"]); seq["next"] += 1
+        store[uid] = self.read_body()
+        self.reply(201, {"created_id": uid})
+    def do_PUT(self):
+        uid = self.path.rsplit("/", 1)[-1]
+        store[uid] = self.read_body()
+        self.reply(200, {"replaced": uid})
+    def do_DELETE(self):
+        uid = self.path.rsplit("/", 1)[-1]
+        if store.pop(uid, None) is None:
+            self.reply(404, {"error": "not found"})
+        else:
+            self.reply(200, {"deleted": uid})
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), API).serve_forever()
+' &
+sleep 0.3
+
+echo "== POST 创建 =="
+curl -s -X POST http://127.0.0.1:8000/users -d '{"name":"Ada"}'
+echo
+echo "== PUT 按已知 ID 写入 =="
+curl -s -X PUT http://127.0.0.1:8000/users/42 -d '{"name":"Bob"}'
+echo
+echo "== GET 查看全部 =="
+curl -s http://127.0.0.1:8000/users
+echo
+echo "== DELETE 删除 =="
+curl -s -X DELETE http://127.0.0.1:8000/users/42
+echo
+curl -s http://127.0.0.1:8000/users`}
+/>
+
+POST 由**服务器分配 ID**（201 + 新 ID），PUT 由**客户端指定 ID**（URL 里就是身份）——这是两者选型的核心分水岭。
+
+## 3. 亲手验证幂等性
+
+同一请求各发 3 次，对比 POST 和 PUT 对服务器状态的影响：
+
+<Playground
+  language="http"
+  title="POST 重复三次 vs PUT 重复三次"
+  id="http-05-2"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+
+store = {}
+seq = {"next": 1}
+
+class API(BaseHTTPRequestHandler):
+    def reply(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def read_body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(n) or b"{}")
+    def do_POST(self):
+        uid = str(seq["next"]); seq["next"] += 1
+        store[uid] = self.read_body()
+        self.reply(201, {"id": uid})
+    def do_PUT(self):
+        store[self.path.rsplit("/", 1)[-1]] = self.read_body()
+        self.reply(200, {"ok": 1})
+    def do_GET(self):
+        self.reply(200, store)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), API).serve_forever()
+' &
+sleep 0.3
+
+echo "== 同一个 POST 发 3 次（模拟超时重试）=="
+for i in 1 2 3; do
+  curl -s -X POST http://127.0.0.1:8000/orders -d '{"item":"book"}'
+  echo
+done
+echo "== 同一个 PUT 发 3 次 =="
+for i in 1 2 3; do
+  curl -s -X PUT http://127.0.0.1:8000/orders/A1 -d '{"item":"book"}'
+  echo
+done
+echo "== 最终状态 =="
+curl -s http://127.0.0.1:8000/orders | python3 -m json.tool`}
+/>
+
+结果一目了然：3 次 POST 造出 3 条订单（灾难），3 次 PUT 始终只有 1 条 A1。**"网络会超时、客户端会重试"是常态，接口必须为重试而设计。**
+
+## 4. HEAD 与 OPTIONS
+
+- **HEAD**：与 GET 完全相同，但响应**只有头没有体**。用于探测资源是否存在、看 Content-Length 决定要不要下载；
+- **OPTIONS**：询问目标资源支持哪些方法（响应的 `Allow` 头），CORS 预检请求（第 15 章）就是 OPTIONS。
+
+<Playground
+  language="http"
+  title="HEAD 只取头，OPTIONS 询问能力"
+  id="http-05-3"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"a" * 1000
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_HEAD(self):
+        # 头和 GET 一致，但不写体
+        self.send_response(200)
+        self.send_header("Content-Length", "1000")
+        self.end_headers()
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Allow", "GET, HEAD, OPTIONS")
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== HEAD（curl -I）：只有头，Content-Length 说体有 1000 字节 =="
+curl -sI http://127.0.0.1:8000/bigfile
+echo "== OPTIONS：Allow 头列出支持的方法 =="
+curl -si -X OPTIONS http://127.0.0.1:8000/ | grep -iE "HTTP/|Allow"`}
+/>
+
+<Callout type="tip" title="GET 能带请求体吗？">
+协议没有禁止，但语义未定义：大量代理、服务器会忽略甚至拒绝 GET 的体。Elasticsearch 曾因查询 DSL 太复杂而在 GET 里塞体，争议多年后也提供了 POST 等价接口。实践准则：GET 的参数放 URL，复杂查询用 POST。
+</Callout>
+
+<Callout type="warn" title="方法语义靠自觉，更靠约束">
+HTTP 不会阻止你用 GET 删数据、用 POST 查数据——语义是给人、缓存、代理、爬虫看的契约。团队应在网关或代码评审层面强制约束，否则"全 POST 走天下"的接口会让缓存与重试机制全部失效。
+</Callout>
+
+## 小结
+
+- 安全方法（GET/HEAD/OPTIONS）不改状态；幂等方法（GET/PUT/DELETE）重试无副作用；
+- POST 不幂等：超时重试有重复风险，支付类接口要引入幂等键；
+- PUT 是整体替换、客户端定 ID；POST 是服务器定 ID；PATCH 是局部修改；
+- HEAD 用于"只看元信息"，OPTIONS 用于能力探测与 CORS 预检；
+- 为重试设计接口，是分布式系统的基本修养。
+
+<Callout type="exercise" title="练习">
+1. 在 Playground 2 的服务里给 POST 增加幂等键支持：读取 X-Idempotency-Key 请求头，相同 key 直接返回上次结果，验证 3 次重试只创建 1 条订单。
+2. 用 Playground 1 验证"DELETE 两次"：第二次返回 404，思考这为什么不违反幂等性。
+3. 给 Playground 1 的服务加 do_PATCH：只更新请求体里出现的字段，用 curl -X PATCH 验证与 PUT 的差异。
+4. 设计一个"点赞"接口：分别用 POST /likes 和 PUT /likes/user42-post7 两种方案实现，比较重复点击时的行为差异。
+</Callout>

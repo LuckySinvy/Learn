@@ -1,0 +1,269 @@
+---
+title: Shell 脚本进阶：循环、函数与健壮性
+order: 16
+description: for/while 循环、函数与参数处理、case 分支，以及 set -euo pipefail 安全带
+---
+
+# Shell 脚本进阶：循环、函数与健壮性
+
+上一章的脚本还是"直线执行"，这一章补齐循环与函数，让脚本能处理批量任务、能模块化复用；最后引入生产脚本的安全带 `set -euo pipefail`——它能把大量"静默出错继续跑"的事故扼杀在第一现场。
+
+## 1. for 循环
+
+```bash
+for i in 1 2 3; do echo "round $i"; done      # 遍历字面列表
+for f in *.log; do gzip "$f"; done            # 遍历通配符匹配的文件
+for i in $(seq 1 5); do ...; done             # 遍历命令输出
+for ((i=0; i<5; i++)); do ...; done           # C 风格（bash 专属）
+```
+
+<Playground
+  language="linux"
+  title="for：批量处理文件"
+  id="linux-16-1"
+  code={`mkdir -p reports
+for name in jan feb mar apr; do
+  echo "sales data of $name" > reports/$name.csv
+done
+ls reports
+
+echo ''
+echo '$ 批量重命名：.csv 改成 .txt（basename 去掉路径和后缀）'
+for f in reports/*.csv; do
+  BASE=$(basename "$f" .csv)
+  mv "$f" "reports/$BASE.txt"
+done
+ls reports
+
+echo ''
+echo '$ seq 生成数字序列 + 格式化：'
+for i in $(seq 1 3); do
+  echo "worker-$i starting"
+done`}
+/>
+
+遍历文件务必用通配符（`for f in *.log`）而不是 `for f in $(ls)`——后者会被空格文件名撕碎，是经典反模式。
+
+## 2. while 循环与逐行读文件
+
+```bash
+while [ 条件 ]; do ...; done                  # 条件循环
+while read -r line; do ...; done < file      # 逐行读文件的标准姿势
+```
+
+<Playground
+  language="linux"
+  title="while read 逐行处理"
+  id="linux-16-2"
+  code={`cat > hosts.txt << 'EOF'
+web-01 10.0.0.11
+web-02 10.0.0.12
+db-01 10.0.0.21
+EOF
+
+echo '$ 逐行读并拆字段（read 可以一次读进多个变量）：'
+while read -r NAME IP; do
+  echo "checking $NAME at $IP ... ok"
+done < hosts.txt
+
+echo ''
+echo '$ 计数循环：'
+COUNT=0
+while [ $COUNT -lt 3 ]; do
+  COUNT=$((COUNT + 1))
+  echo "retry #$COUNT"
+done
+
+echo ''
+echo '$ 经典重试模式：失败就等待重试，最多 3 次'
+ATTEMPT=1
+until [ -f /tmp/ready.flag ] || [ $ATTEMPT -gt 3 ]; do
+  echo "waiting... attempt $ATTEMPT"
+  ATTEMPT=$((ATTEMPT + 1))
+  test $ATTEMPT -eq 3 && touch /tmp/ready.flag
+done
+echo 'ready!'`}
+/>
+
+`read -r` 的 -r 防止反斜杠被吃掉，养成肌肉记忆。`until` 是 while 的反义版（条件为假时循环），写重试逻辑更顺口。
+
+## 3. 函数
+
+```bash
+log() {                        # 定义（也可写 function log）
+  echo "[$(date +%T)] $1"      # $1 是函数的第一个参数（不是脚本的）
+}
+log "server started"           # 调用：像命令一样，不写括号
+```
+
+函数内 `local` 声明局部变量（否则默认全局，极易互相污染）；`return N` 设定函数退出码（不能返回字符串——要"返回"数据就 echo 出来，调用方用 `$()` 接）。
+
+<Playground
+  language="linux"
+  title="函数：封装与返回值"
+  id="linux-16-3"
+  code={`#!/bin/bash
+log() {
+  local LEVEL=$1
+  local MSG=$2
+  echo "[$(date +%T)] [$LEVEL] $MSG"
+}
+
+# 用退出码表达成败，用 echo 传回数据
+disk_usage() {
+  local DIR=$1
+  if [ ! -d "$DIR" ]; then
+    return 1
+  fi
+  du -sk "$DIR" | awk '{print $1}'
+}
+
+log INFO 'script started'
+
+mkdir -p data && truncate -s 300K data/blob.bin
+USAGE=$(disk_usage data)
+if [ $? -eq 0 ]; then
+  log INFO "data 目录占用 $USAGE KB"
+else
+  log ERROR 'data 目录不存在'
+fi
+
+disk_usage /nope || log WARN '/nope 检查失败（演示 return 1）'
+log INFO 'script finished'`}
+/>
+
+## 4. 脚本参数处理
+
+脚本（和函数）通过位置变量拿参数：
+
+| 变量 | 含义 |
+|---|---|
+| `$0` | 脚本名 |
+| `$1` `$2` ... | 第 1、2 个参数 |
+| `$#` | 参数个数 |
+| `"$@"` | 全部参数（各自保持完整，**永远配双引号用**） |
+| `shift` | 丢弃 `$1`，后面的参数整体左移 |
+
+```bash
+#!/bin/bash
+# 常用默认值语法（参数展开）：
+NAME=${1:-guest}        # $1 为空时用 guest
+DIR=${DEPLOY_DIR:?未设置 DEPLOY_DIR}    # 为空直接报错退出
+echo "hello $NAME"
+```
+
+<Playground
+  language="linux"
+  title="$#、$@ 与 shift"
+  id="linux-16-4"
+  code={`cat > args.sh << 'EOF'
+#!/bin/bash
+echo "脚本名: $0, 参数个数: $#"
+echo "第一个参数: $1"
+for ARG in "$@"; do
+  echo "  got: $ARG"
+done
+FIRST=$1
+shift
+echo "shift 后剩余 $# 个: $*"
+echo "first 已存为: $FIRST"
+EOF
+chmod +x args.sh
+
+echo '$ ./args.sh apple "big banana" cherry'
+./args.sh apple 'big banana' cherry`}
+/>
+
+注意输出里 `big banana` 始终是一个参数——这就是 `"$@"` 的价值；换成 `$*` 或裸 `$@` 它就会被拆成两个。
+
+## 5. case 分支
+
+多路分支比 if/elif 链清晰得多，服务管理脚本的经典结构：
+
+```bash
+case $1 in
+  start)   echo 'starting...' ;;
+  stop)    echo 'stopping...' ;;
+  restart) echo 'restarting...' ;;
+  status)  echo 'running' ;;
+  *)       echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+```
+
+模式支持通配符（`*.log)`、`[Yy]*)` 匹配 yes/Y/y 等），每个分支以 `;;` 结束。
+
+## 6. set -euo pipefail：生产脚本安全带
+
+bash 默认的宽容是脚本事故之源：命令失败继续往下跑、打错的变量名当空串用。三个开关逆转这些默认：
+
+| 开关 | 作用 |
+|---|---|
+| `set -e` | 任何命令失败（非 0 退出）立即终止脚本 |
+| `set -u` | 使用未定义变量直接报错（拼写错误现形） |
+| `set -o pipefail` | 管道中**任何一环**失败都算整条管道失败（默认只看最后一环） |
+
+<Playground
+  language="linux"
+  title="有无安全带的对比"
+  id="linux-16-5"
+  code={`cat > unsafe.sh << 'EOF'
+#!/bin/bash
+TARGET_DIR=/data/output
+rm -rf "$TAGRET_DIR/cache"   # 变量名拼错了！$TAGRET_DIR 是空串
+echo "unsafe.sh 跑完了，rm 实际执行的是: rm -rf /cache（好险）"
+EOF
+
+cat > safe.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+TARGET_DIR=/data/output
+rm -rf "$TAGRET_DIR/cache"
+echo '这行永远不会执行'
+EOF
+chmod +x unsafe.sh safe.sh
+
+echo '$ ./unsafe.sh   # 拼错变量静默通过，险些酿祸：'
+./unsafe.sh
+
+echo ''
+echo '$ ./safe.sh     # set -u 当场抓获：'
+./safe.sh
+echo "exit code = $?"`}
+/>
+
+<Callout type="warn" title="set -e 的边界">
+`set -e` 不是万能的：出现在 if 条件、&& / || 链中的失败不会触发退出（这是设计使然——那些位置的失败是"被检查的"）。预期可能失败且要继续的命令，显式写 `cmd || true`。团队规范建议：**所有生产脚本第一行逻辑就是 `set -euo pipefail`**，需要豁免的地方逐个显式标注。
+</Callout>
+
+## 7. 收尾清理：trap
+
+脚本中途退出（出错或被 Ctrl+C）时，临时文件、锁不能留在现场。`trap` 注册退出时的清理函数：
+
+```bash
+#!/bin/bash
+set -euo pipefail
+TMP=$(mktemp -d)
+cleanup() { rm -rf "$TMP"; echo 'cleaned up'; }
+trap cleanup EXIT        # 无论正常结束、报错还是被信号打断，都执行 cleanup
+
+# ...使用 $TMP 干活...
+```
+
+`mktemp -d` 创建不会撞名的临时目录，与 trap 是黄金搭档。
+
+## 小结
+
+- for 遍历列表/通配符/`$(seq)`；遍历文件用通配符，别用 `$(ls)`
+- `while read -r` 逐行处理；until + 计数器实现重试
+- 函数用 local 保护变量、return 传状态、echo 传数据
+- 参数：`$1`、`$#`、`"$@"`（带引号！）、shift；默认值 `${1:-默认}`
+- case 写多路分支；`set -euo pipefail` 是生产脚本标配
+- trap EXIT + mktemp 保证善后，脚本才算"工业级"
+- 下一章：cron 定时任务与 systemd 服务 →
+
+<Callout type="exercise" title="练习">
+1. 写脚本批量生成 10 个文件 `log-01.txt` 到 `log-10.txt`（printf '%02d' 格式化序号），再用第二个循环把序号为偶数的文件改名加 `.bak` 后缀。
+2. 写函数 `check_port`，参数是端口号：小于 1024 输出 privileged 并 return 1，否则输出 ok return 0；用 80、8080 两个输入验证 `$?`。
+3. 写一个 `svc.sh`，用 case 实现 start/stop/status 三个子命令（用 touch/rm/检查一个 .pid 文件模拟），无参数时打印 usage 并 exit 1。
+4. 把第 1 题脚本加上 `set -euo pipefail`，故意在循环里引用一个拼错的变量名，观察脚本在哪一步停下、退出码是什么。
+</Callout>

@@ -1,0 +1,180 @@
+---
+title: 网络命令：curl、端口与 DNS 排查
+order: 14
+description: curl 调接口的完整姿势、ss/netstat 查端口、ping 连通性与 DNS 排查思路
+---
+
+# 网络命令：curl、端口与 DNS 排查
+
+"服务起了吗？端口通吗？域名解析对吗？接口返回什么？"——网络排查四连问，对应本章四组工具。沙箱没有外网，但有回环网络（127.0.0.1），我们用 python 起一个本地服务，把 curl 和端口检查完整练一遍；DNS 部分给出真机排查思路。
+
+## 1. curl：命令行的 HTTP 客户端
+
+curl 是接口调试与脚本拉取数据的标准工具：
+
+```bash
+curl https://api.example.com/users        # GET，响应体打到 stdout
+curl -i https://api.example.com/users     # -i 连响应头一起显示
+curl -s https://api.example.com/users     # -s 静默：去掉进度条（脚本必加）
+curl -o page.html https://example.com     # 存文件；-O 用远端文件名
+curl -L http://example.com                # -L 跟随 301/302 跳转
+curl -X POST -H 'Content-Type: application/json' -d '{"name":"ada"}' https://api.example.com/users
+#    └ 指定方法    └ 加请求头                        └ 请求体
+curl -s -w '%{http_code}\n' -o /dev/null https://example.com   # 只要状态码（健康检查）
+```
+
+<Playground
+  language="linux"
+  title="本地起服务，curl 完整体验"
+  id="linux-14-1"
+  code={`# 用 python 在 127.0.0.1:8000 起一个静态文件服务
+mkdir -p www
+echo '{"service":"demo","status":"ok"}' > www/health.json
+echo '<h1>hello</h1>' > www/index.html
+cd www
+python3 -m http.server 8000 --bind 127.0.0.1 > /dev/null 2>&1 &
+sleep 1
+
+echo '$ curl -s http://127.0.0.1:8000/health.json'
+curl -s http://127.0.0.1:8000/health.json
+
+echo ''
+echo '$ curl -i 查看响应头：'
+curl -si http://127.0.0.1:8000/health.json | head -n 6
+
+echo ''
+echo '$ 只取状态码（脚本健康检查的标准写法）：'
+curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/index.html
+echo ''
+curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/missing.html
+echo ' <- 404'`}
+/>
+
+<Callout type="tip" title="curl 配 jq：接口调试黄金组合">
+JSON 接口的返回配合 jq 格式化与提取：`curl -s api/users | jq .`（美化全文）、`| jq '.data[0].name'`（取字段）、`| jq length`（数组长度）。jq 沙箱已预装，值得单独花一小时学。
+</Callout>
+
+<Playground
+  language="linux"
+  title="curl + jq 处理 JSON 接口"
+  id="linux-14-2"
+  code={`mkdir -p www && cd www
+cat > users.json << 'EOF'
+{"code":0,"data":[{"id":1,"name":"ada","role":"admin"},{"id":2,"name":"bob","role":"dev"}]}
+EOF
+python3 -m http.server 8001 --bind 127.0.0.1 > /dev/null 2>&1 &
+sleep 1
+
+echo '$ 原始返回是一行压缩 JSON：'
+curl -s http://127.0.0.1:8001/users.json
+
+echo ''
+echo '$ jq . 美化：'
+curl -s http://127.0.0.1:8001/users.json | jq .
+
+echo '$ 提取所有用户名：'
+curl -s http://127.0.0.1:8001/users.json | jq -r '.data[].name'
+
+echo '$ 过滤 role 为 admin 的：'
+curl -s http://127.0.0.1:8001/users.json | jq '.data[] | select(.role == "admin")'`}
+/>
+
+## 2. 端口检查：ss 与 netstat
+
+"服务到底起没起来"，看端口监听最直接。现代 Linux 用 `ss`（socket statistics），老系统用 `netstat`，参数记法相同：
+
+```bash
+ss -tlnp        # t=TCP l=监听中 n=数字端口 p=显示进程（p 需 root）
+ss -tunp        # u 加上 UDP；不带 l 则看已建立的连接
+netstat -tlnp   # 老系统等价写法
+```
+
+输出关键看两列：`Local Address:Port`（0.0.0.0:80 表示监听所有网卡，127.0.0.1:3306 表示只有本机能连——这是"本机能连、外面连不上"的头号原因）和进程名。
+
+<Playground
+  language="linux"
+  title="netstat 观察监听端口"
+  id="linux-14-3"
+  code={`# 起两个服务：一个只绑回环，一个绑所有地址
+mkdir -p www && cd www && echo ok > ping.txt
+python3 -m http.server 9001 --bind 127.0.0.1 > /dev/null 2>&1 &
+python3 -m http.server 9002 --bind 0.0.0.0 > /dev/null 2>&1 &
+sleep 1
+
+echo '$ netstat -tln   # 沙箱是 busybox netstat，参数与 ss 类似'
+netstat -tln 2>/dev/null | grep -E '900[12]|Local|Proto' || netstat -an | grep -E '900[12]'
+
+echo ''
+echo '$ 9001 只监听 127.0.0.1，9002 监听 0.0.0.0（对外可见）'
+echo '$ 验证连通性：'
+curl -s -o /dev/null -w '9001 -> %{http_code}' http://127.0.0.1:9001/ping.txt
+echo ''
+curl -s -o /dev/null -w '9002 -> %{http_code}' http://127.0.0.1:9002/ping.txt
+echo ''`}
+/>
+
+## 3. ping：连通性第一步
+
+```bash
+ping -c 4 10.0.0.8        # -c 4 发四个包就停（Linux 默认不停）
+```
+
+看两个指标：丢包率（100% loss 说明不通或对方禁 ping）和延迟 time（同机房应小于 1ms，跨国 200ms 量级）。注意 ping 走 ICMP 协议：**ping 通不代表端口通**（防火墙可能只放 ICMP），ping 不通也不代表服务挂了（很多云主机默认禁 ping）。测"某端口是否可达"用 `nc -zv host 端口` 或直接 curl。
+
+## 4. DNS 排查思路
+
+域名解析出错的典型症状：`curl: (6) Could not resolve host`。真机上的排查链路（需外网，此处给思路）：
+
+```bash
+# 1. 系统在用哪个 DNS 服务器？
+cat /etc/resolv.conf
+
+# 2. 有没有被 hosts 文件劫持/覆盖？（hosts 优先级高于 DNS）
+cat /etc/hosts
+
+# 3. 用 dig 直接问 DNS（bind-tools 包提供；简易版可用 nslookup）
+dig api.example.com            # 看 ANSWER SECTION 的 A 记录与 TTL
+dig @8.8.8.8 api.example.com   # 指定公共 DNS 对比：结果不同 → 本地 DNS 有问题
+dig +short api.example.com     # 只要 IP
+
+# 4. 绕过 DNS 直连 IP 验证服务本身是否正常
+curl -H 'Host: api.example.com' http://93.184.216.34/
+```
+
+这套"resolv.conf → hosts → dig 对比 → 绕过验证"的漏斗，能把"域名问题"与"服务问题"干净地切分开。
+
+<Callout type="info" title="沙箱无外网，本节请在真机练习">
+dig/nslookup 与公网 ping 需要外网与相应工具包（Debian 系 `apt install dnsutils`，Alpine `apk add bind-tools`）。沙箱里可以做的是读 /etc/hosts 与 /etc/resolv.conf、用回环地址练 curl 与端口检查——这正是上面三个 Playground 覆盖的部分。
+</Callout>
+
+## 5. 排查路线图：由内向外
+
+服务连不上时，按层推进，每一步都有专属命令：
+
+```text
+1. 进程活着吗？          ps aux | grep app
+2. 端口监听了吗？        ss -tlnp | grep 8080
+3. 监听地址对吗？        127.0.0.1 还是 0.0.0.0 ？
+4. 本机回环能通吗？      curl -s http://127.0.0.1:8080/health
+5. 防火墙/安全组放行了吗？ iptables -L / 云控制台安全组
+6. 域名解析对吗？        dig +short api.example.com
+7. 外部真的通吗？        从另一台机器 curl / nc -zv
+```
+
+新手最常卡在第 3 步（服务只绑了 127.0.0.1）和第 5 步（云安全组没开端口）——这两处合计能解决大半"为什么外面访问不到"的问题。
+
+## 小结
+
+- curl：`-s` 脚本静默、`-i` 看头、`-X/-H/-d` 发 POST、`-w '%{http_code}'` 做健康检查；配 jq 处理 JSON
+- 端口监听：`ss -tlnp`；分清 0.0.0.0（对外）与 127.0.0.1（仅本机）
+- ping 测 ICMP 连通与延迟，但 ping 通不等于端口通；测端口用 nc/curl
+- DNS 漏斗：resolv.conf → hosts → dig（对比公共 DNS）→ 直连 IP 绕过验证
+- 记住七步排查路线图，从进程一路查到外网
+- 下一章：Shell 脚本入门——把命令沉淀成脚本 →
+
+<Callout type="exercise" title="练习">
+1. 在沙箱用 python3 起一个服务，写一条 curl 命令：若 /health.json 返回 200 则输出 OK，否则输出 FAIL（提示：`-w '%{http_code}'` 配合 if 或 &&）。
+2. 造一个多字段的 JSON 文件经本地服务返回，用 jq 完成：美化输出、提取某数组全部 id、select 过滤某条件的对象。
+3. 分别以 `--bind 127.0.0.1` 和 `--bind 0.0.0.0` 起两个端口，用 netstat 截图对比 Local Address 列，说明哪个能被外部访问。
+4. 真机作业：对任一公网域名执行 dig（或 nslookup），找出它的 A 记录与 TTL；再改 /etc/hosts 把它指向 127.0.0.1，观察 curl 行为变化后**记得改回**。
+</Callout>

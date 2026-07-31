@@ -1,0 +1,187 @@
+---
+title: HTTP/2：二进制分帧与多路复用
+order: 13
+description: 帧结构、流与多路复用、HPACK 头部压缩、服务器推送的兴衰
+---
+
+# HTTP/2：二进制分帧与多路复用
+
+第 11 章留下的病根——一条连接同时只能跑一个请求、管线化因乱序无法对号而失败——HTTP/2（2015，RFC 7540）用一个釜底抽薪的办法解决：**把报文切成带编号的二进制帧**。语义（方法、状态码、头部）原封不动，变的只是"怎么装车运输"。
+
+<Callout type="info" title="本章实验说明">
+沙箱内的 curl 未编译 HTTP/2 支持且无外网，无法发起真实 h2 请求。但 HTTP/2 的两个核心创新——帧结构与头部压缩——都可以用 python 在字节层面亲手构造和解析，比真实抓包看得更透。
+</Callout>
+
+## 1. 核心概念：帧、流、多路复用
+
+三个术语的关系：
+
+```text
+连接 (Connection)  一条 TCP 连接
+ └── 流 (Stream)   一次请求-响应 = 一个流，有唯一 ID（客户端发起用奇数）
+      └── 帧 (Frame) 流被切成的最小传输单位，带着流 ID
+
+一条连接上的字节序列（多路复用）：
+[流1-HEADERS][流3-HEADERS][流1-DATA][流5-HEADERS][流3-DATA][流1-DATA]...
+       ▲ 不同流的帧交错发送，接收方按流 ID 重组，互不等待
+```
+
+**多路复用**由此实现：慢响应的帧可以晚点发，快响应的帧先走，同一连接上百个请求并发飞行——HTTP/1.1 的应用层队头阻塞消失，浏览器 6 连接、域名分片、雪碧图统统不再需要。
+
+### 1.1 帧的二进制结构
+
+每个帧有 9 字节固定头：
+
+```text
++-----------------------------------------------+
+| Length (24 bit)  载荷长度                       |
++---------------+---------------+---------------+
+| Type (8)      | Flags (8)     |                |
++-+-------------+---------------+---------------+
+|R|  Stream Identifier (31 bit) 流 ID            |
++=+=============================================+
+|  Frame Payload 载荷 ...                        |
++-----------------------------------------------+
+```
+
+常见帧类型：HEADERS（0x1，头部）、DATA（0x0，体）、SETTINGS（0x4，连接参数）、RST_STREAM（0x3，取消单个流）、GOAWAY（0x7，优雅关连接）、WINDOW_UPDATE（0x8，流量控制）。
+
+亲手构造并解析一个 DATA 帧：
+
+<Playground
+  language="http"
+  title="手工构造与解析 HTTP/2 帧"
+  id="http-13-1"
+  code={`python3 -c '
+import struct
+
+FRAME_TYPES = {0: "DATA", 1: "HEADERS", 3: "RST_STREAM", 4: "SETTINGS",
+               7: "GOAWAY", 8: "WINDOW_UPDATE"}
+
+def build_frame(ftype, flags, stream_id, payload):
+    length = len(payload)
+    # 24bit 长度 + 8bit 类型 + 8bit 标志 + 32bit 流ID(最高位保留)
+    header = struct.pack(">I", length)[1:] + bytes([ftype, flags]) + struct.pack(">I", stream_id)
+    return header + payload
+
+def parse_frame(raw):
+    length = int.from_bytes(raw[0:3], "big")
+    ftype, flags = raw[3], raw[4]
+    stream_id = int.from_bytes(raw[5:9], "big") & 0x7FFFFFFF
+    return length, FRAME_TYPES.get(ftype, ftype), flags, stream_id, raw[9:9+length]
+
+# 模拟一条连接上交错的三个帧（两个流）
+wire = b""
+wire += build_frame(1, 0x4, 1, b"\x82\x86\x84")        # 流1 HEADERS(END_HEADERS)
+wire += build_frame(1, 0x4, 3, b"\x82\x86\x84")        # 流3 HEADERS
+wire += build_frame(0, 0x1, 1, b"hello stream 1")       # 流1 DATA(END_STREAM)
+
+print("线路上的原始字节:", wire.hex())
+print()
+pos = 0
+while pos < len(wire):
+    length, ftype, flags, sid, payload = parse_frame(wire[pos:])
+    print("帧:", ftype, "| 流ID:", sid, "| flags:", hex(flags),
+          "| 载荷:", payload if ftype == "DATA" else payload.hex())
+    pos += 9 + length
+'`}
+/>
+
+看到了吗：流 1 和流 3 的帧在同一条字节流里**交错**，接收端靠流 ID 各归各位。管线化做不到的"乱序返回"，在这里天然成立。
+
+## 2. HPACK：头部压缩
+
+HTTP/1.x 的头部是明文重复发送的：同一页面 100 个请求，`User-Agent`、`Cookie` 等一模一样的头发 100 遍，动辄浪费几十 KB。且 gzip 压头部曾因 CRIME 攻击被判死刑。HPACK（RFC 7541）的方案：
+
+1. **静态表**：61 个最常见的头（`:method: GET`、`:status: 200`...）预编号，一个字节搞定；
+2. **动态表**：连接内出现过的头（比如你的大 Cookie）双方同步记录，之后只发索引；
+3. **哈夫曼编码**：没法索引的新值用专用哈夫曼表压缩。
+
+用实验感受索引机制的威力：
+
+<Playground
+  language="http"
+  title="模拟 HPACK：重复头从几百字节变一字节"
+  id="http-13-2"
+  code={`python3 -c '
+# 简化模拟：首次全量 + 入表，之后只发 1 字节索引
+headers = [
+    ("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X) Chrome/126.0"),
+    ("cookie", "sid=a1b2c3d4e5f6; theme=dark; lang=zh-CN; tracker=xyz789"),
+    ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9"),
+]
+
+dynamic_table = {}
+def hpack_size(kv):
+    if kv in dynamic_table:
+        return 1                       # 命中动态表：一个索引字节
+    dynamic_table[kv] = len(dynamic_table) + 62
+    k, v = kv
+    return 2 + len(k) + len(v)         # 首次：长度前缀+字面量（忽略哈夫曼）
+
+raw_per_req = sum(len(k) + 2 + len(v) + 2 for k, v in headers)
+
+total_raw, total_hpack = 0, 0
+for i in range(1, 101):
+    total_raw += raw_per_req
+    total_hpack += sum(hpack_size(kv) for kv in headers)
+    if i in (1, 2, 100):
+        print("第", i, "个请求后  明文累计:", total_raw, "字节   HPACK 累计:", total_hpack, "字节")
+
+print()
+print("100 个请求节省:", round(100 - total_hpack * 100 / total_raw), "%")
+'`}
+/>
+
+第一个请求之后，这三个头每次只花 3 字节。真实 HPACK 还有静态表和哈夫曼，压缩率更高。这就是"HTTP/2 对请求头大户（移动端、重 Cookie 站点）收益最大"的原因。
+
+## 3. 其他机制速览
+
+| 机制 | 作用 |
+|---|---|
+| 流优先级 | 提示服务器先传关键资源（CSS 先于图片）；实现混乱，HTTP/3 已简化重做 |
+| 流量控制 | 连接级 + 流级双层 WINDOW_UPDATE，防止快发送方淹死慢接收方 |
+| RST_STREAM | 取消单个流不断连接（用户取消下载时，HTTP/1.1 只能断整条连接） |
+| GOAWAY | 优雅关闭：告知"N 号流之后的我没处理"，方便重试不重复 |
+
+### 3.1 服务器推送的兴衰
+
+设计初衷很美好：请求 HTML 时，服务器"预判"你马上要 CSS，主动推过来省一个 RTT。
+
+现实却是一地鸡毛：**服务器不知道浏览器已有缓存**，反复推送浏览器已缓存的资源纯属浪费；推送与缓存、认证的交互复杂；实测收益微弱。结局：Chrome 2022 年移除支持，各大 CDN 下线功能。替代方案：
+
+- `103 Early Hints` 临时响应 + `Link: rel=preload` 头：服务器早早"提示"，浏览器自己决定拉不拉——把决策权还给了拥有缓存信息的一方；
+- 资源内联关键 CSS。
+
+这是协议设计的经典教训：**猜测客户端状态的优化，不如把信息给客户端让它自己决定。**
+
+## 4. 遗留问题：TCP 队头阻塞
+
+HTTP/2 消灭了**应用层**队头阻塞，但所有流仍挤在**一条 TCP 连接**上。TCP 保证字节严格有序：一个包丢了，它后面已到达的所有字节都得在内核缓冲区里等重传——**所有流一起被堵住**，哪怕丢的包只属于其中一个流。
+
+```text
+弱网丢包时的讽刺场景：
+HTTP/1.1: 6 条连接，丢包只堵其中 1 条 —— 另外 5 条照跑
+HTTP/2:   1 条连接，丢包全体罚站     —— 高丢包率下反而更慢
+```
+
+TCP 队头阻塞在内核协议栈里，应用层无解——除非换掉 TCP。这正是第 14 章 QUIC 的使命。
+
+<Callout type="tip" title="升级 HTTP/2 的实务">
+主流服务器（Nginx: listen 443 ssl http2，或新版 http2 on）一行配置开启；浏览器只在 HTTPS 上启用 h2（通过 TLS 握手的 ALPN 扩展协商协议版本）。升级后记得回退 HTTP/1.1 时代的域名分片——分片会拆散连接，破坏多路复用与 HPACK 动态表的收益。
+</Callout>
+
+## 小结
+
+- HTTP/2 语义不变，传输层重造：报文 → 带流 ID 的二进制帧，交错发送按 ID 重组；
+- 多路复用根治应用层队头阻塞，一条连接跑满所有请求；
+- HPACK 用静态表 + 动态表 + 哈夫曼把重复头压到一两个字节；
+- 服务器推送因"猜不透客户端缓存"而死，103 Early Hints 接棒；
+- 残留死穴：TCP 层队头阻塞，丢包时全流罚站——QUIC 由此登场。
+
+<Callout type="exercise" title="练习">
+1. 修改 Playground 1：构造一个 RST_STREAM 帧（类型 0x3，载荷为 4 字节错误码），并让解析器打印错误码。
+2. 在 Playground 2 中给每个请求加一个每次都变化的头（如 x-request-id），观察压缩率下降多少，理解"动态表对变化值无效"。
+3. 解释：为什么 HPACK 的动态表要求"同一连接"内共享？域名分片为什么会破坏它？
+4. 你的站点在地铁弱网环境下 HTTP/2 反而比 HTTP/1.1 慢，用本章知识给出解释与验证思路。
+</Callout>

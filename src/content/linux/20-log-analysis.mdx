@@ -1,0 +1,276 @@
+---
+title: 实战：日志分析流水线
+order: 20
+description: 综合运用 grep/awk/sort/uniq/sed 完成访问日志的全套分析：Top IP、错误率、慢请求与分钟级曲线
+---
+
+# 实战：日志分析流水线
+
+最后一章不学新命令，而是把整门课串起来打一场硬仗：拿到一份 Web 访问日志，用纯命令行回答运营和排障最关心的问题——谁在访问？错误率多少？哪些接口慢？流量什么时候突增？这套"日志分析流水线"是 Linux 文本处理能力的毕业考，也是你在没有监控平台的机器上安身立命的本事。
+
+## 1. 数据准备与"看一眼"
+
+真实场景里日志是 nginx/应用生成的；沙箱里我们用 awk 造一份 400 行、字段规整的简化访问日志（能跑通的分析思路对真实格式同样适用，只是字段序号不同）：
+
+```text
+字段：IP 时间 方法 路径 状态码 字节数 耗时ms
+10.0.0.5 10:03:21 GET /api/users 200 532 245
+```
+
+拿到任何日志，第一步永远是"看一眼、数一数"——确认格式、字段、量级，再谈分析：
+
+<Playground
+  language="linux"
+  title="生成日志 + 初步侦查"
+  id="linux-20-1"
+  code={`# 生成 400 行模拟访问日志（每次运行数据相同，便于核对结果）
+awk 'BEGIN {
+  srand(7)
+  ni = split("10.0.0.5,10.0.0.9,192.168.1.3,172.16.0.7,203.0.113.9", ips, ",")
+  np = split("/index,/api/users,/api/orders,/login,/static/app.js", paths, ",")
+  nc = split("200,200,200,200,200,200,302,404,500", codes, ",")
+  for (i = 0; i < 400; i++) {
+    ip = ips[int(rand()*ni)+1]
+    pa = paths[int(rand()*np)+1]
+    co = codes[int(rand()*nc)+1]
+    ms = int(rand()*300) + 5
+    if (pa == "/api/orders") ms = ms + int(rand()*900)
+    printf "%s 10:%02d:%02d %s %s %s %d %d\\n", ip, int(i/60), i%60, "GET", pa, co, int(rand()*2000)+100, ms
+  }
+}' > access.log
+
+echo '$ wc -l access.log   # 量级'
+wc -l access.log
+
+echo '$ head -n 3 access.log   # 格式与字段'
+head -n 3 access.log
+
+echo '$ awk 检查字段数是否一致（脏数据探测）：'
+awk '{print NF}' access.log | sort -u`}
+/>
+
+## 2. 铁三角：sort | uniq -c | sort -rn
+
+流水线分析的核心骨架就一句：**取出关键列 → 排序 → 去重计数 → 按次数排序**。它能回答一切"Top N"问题：
+
+<Playground
+  language="linux"
+  title="Top IP 与热门路径"
+  id="linux-20-2"
+  code={`# （每个 Playground 独立容器，先重新生成同一份日志）
+awk 'BEGIN {
+  srand(7)
+  ni = split("10.0.0.5,10.0.0.9,192.168.1.3,172.16.0.7,203.0.113.9", ips, ",")
+  np = split("/index,/api/users,/api/orders,/login,/static/app.js", paths, ",")
+  nc = split("200,200,200,200,200,200,302,404,500", codes, ",")
+  for (i = 0; i < 400; i++) {
+    ip = ips[int(rand()*ni)+1]; pa = paths[int(rand()*np)+1]; co = codes[int(rand()*nc)+1]
+    ms = int(rand()*300) + 5
+    if (pa == "/api/orders") ms = ms + int(rand()*900)
+    printf "%s 10:%02d:%02d %s %s %s %d %d\\n", ip, int(i/60), i%60, "GET", pa, co, int(rand()*2000)+100, ms
+  }
+}' > access.log
+
+echo '=== Top 5 访问 IP（谁在刷？）==='
+awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -n 5
+
+echo ''
+echo '=== 热门路径 Top 5 ==='
+awk '{print $5}' access.log | sort | uniq -c | sort -rn | head -n 5
+
+echo ''
+echo '=== UV：独立 IP 数 ==='
+awk '{print $1}' access.log | sort -u | wc -l
+
+echo ''
+echo '=== 每个 IP 消耗的总流量（分组求和 + 排序）==='
+awk '{bytes[$1] += $7} END {for (ip in bytes) print bytes[ip], ip}' access.log | sort -rn`}
+/>
+
+逐环拆解这条骨架：`awk '{print $1}'` 抽列 → `sort` 让相同值相邻（uniq 的前提！）→ `uniq -c` 合并计数 → `sort -rn` 按数值倒序 → `head` 截取 Top N。五个小工具各干一件事，管道拼成报表——这正是 Unix 哲学的完整演绎。
+
+## 3. 错误分析：状态码、错误率与"抓现行"
+
+<Playground
+  language="linux"
+  title="状态码分布与错误率"
+  id="linux-20-3"
+  code={`awk 'BEGIN {
+  srand(7)
+  ni = split("10.0.0.5,10.0.0.9,192.168.1.3,172.16.0.7,203.0.113.9", ips, ",")
+  np = split("/index,/api/users,/api/orders,/login,/static/app.js", paths, ",")
+  nc = split("200,200,200,200,200,200,302,404,500", codes, ",")
+  for (i = 0; i < 400; i++) {
+    ip = ips[int(rand()*ni)+1]; pa = paths[int(rand()*np)+1]; co = codes[int(rand()*nc)+1]
+    ms = int(rand()*300) + 5
+    if (pa == "/api/orders") ms = ms + int(rand()*900)
+    printf "%s 10:%02d:%02d %s %s %s %d %d\\n", ip, int(i/60), i%60, "GET", pa, co, int(rand()*2000)+100, ms
+  }
+}' > access.log
+
+echo '=== 状态码分布 ==='
+awk '{c[$6]++} END {for (k in c) print k, c[k]}' access.log | sort
+
+echo ''
+echo '=== 总错误率（一条 awk 出报表）==='
+awk '$6 >= 400 {err++} END {printf "total=%d errors=%d rate=%.1f%%\\n", NR, err, err*100/NR}' access.log
+
+echo ''
+echo '=== 500 都打在哪些路径上？ ==='
+grep ' 500 ' access.log | awk '{print $5}' | sort | uniq -c | sort -rn
+
+echo ''
+echo '=== 抓现行：看几条 500 的原始日志 ==='
+grep ' 500 ' access.log | head -n 3`}
+/>
+
+注意 `grep ' 500 ' 两侧留了空格`——裸搜 500 会误伤字节数或耗时里恰好含 500 的行（第 7 章 `-F`/精确匹配的实战版）。更严谨的写法是用 awk 按字段判断：`awk '$6 == 500'`，列语义清晰、绝无误伤。
+
+## 4. 性能分析：慢请求与分位感
+
+<Playground
+  language="linux"
+  title="慢请求 Top、按路径统计平均耗时"
+  id="linux-20-4"
+  code={`awk 'BEGIN {
+  srand(7)
+  ni = split("10.0.0.5,10.0.0.9,192.168.1.3,172.16.0.7,203.0.113.9", ips, ",")
+  np = split("/index,/api/users,/api/orders,/login,/static/app.js", paths, ",")
+  nc = split("200,200,200,200,200,200,302,404,500", codes, ",")
+  for (i = 0; i < 400; i++) {
+    ip = ips[int(rand()*ni)+1]; pa = paths[int(rand()*np)+1]; co = codes[int(rand()*nc)+1]
+    ms = int(rand()*300) + 5
+    if (pa == "/api/orders") ms = ms + int(rand()*900)
+    printf "%s 10:%02d:%02d %s %s %s %d %d\\n", ip, int(i/60), i%60, "GET", pa, co, int(rand()*2000)+100, ms
+  }
+}' > access.log
+
+echo '=== 最慢的 5 个请求（按最后一列数值排序）==='
+sort -k8 -rn access.log | head -n 5
+
+echo ''
+echo '=== 每个路径的请求数与平均耗时：性能画像 ==='
+awk '{n[$5]++; sum[$5] += $8}
+     END {for (p in n) printf "%-16s %4d 次  avg %6.1f ms\\n", p, n[p], sum[p]/n[p]}' access.log | sort -k4 -rn
+
+echo ''
+echo '=== 超过 500ms 的慢请求占比 ==='
+awk '$8 > 500 {slow++} END {printf "slow=%d/%d (%.1f%%)\\n", slow, NR, slow*100/NR}' access.log
+
+echo ''
+echo '=== P95 耗时（排序后取 95% 位置的值）==='
+awk '{print $8}' access.log | sort -n | awk '{a[NR]=$1} END {print a[int(NR*0.95)] " ms"}'`}
+/>
+
+结论立刻浮现：`/api/orders` 平均耗时远高于其他路径（数据生成时故意注入的"慢接口"）——真实排障中，这一步就是把"系统慢"定位成"某接口慢"的关键跃迁。P95 的算法也值得记住：排序后取 95% 分位下标，两条 awk 搞定，不需要任何分析平台。
+
+## 5. 时间维度：流量曲线与突增定位
+
+<Playground
+  language="linux"
+  title="分钟级请求数：文本版流量曲线"
+  id="linux-20-5"
+  code={`awk 'BEGIN {
+  srand(7)
+  ni = split("10.0.0.5,10.0.0.9,192.168.1.3,172.16.0.7,203.0.113.9", ips, ",")
+  np = split("/index,/api/users,/api/orders,/login,/static/app.js", paths, ",")
+  nc = split("200,200,200,200,200,200,302,404,500", codes, ",")
+  for (i = 0; i < 400; i++) {
+    ip = ips[int(rand()*ni)+1]; pa = paths[int(rand()*np)+1]; co = codes[int(rand()*nc)+1]
+    ms = int(rand()*300) + 5
+    if (pa == "/api/orders") ms = ms + int(rand()*900)
+    printf "%s 10:%02d:%02d %s %s %s %d %d\\n", ip, int(i/60), i%60, "GET", pa, co, int(rand()*2000)+100, ms
+  }
+}' > access.log
+
+echo '=== 每分钟请求数（时间字段切到分钟粒度）==='
+cut -d ' ' -f 2 access.log | cut -d : -f 1,2 | sort | uniq -c
+
+echo ''
+echo '=== 加上字符条形图：纯文本也能可视化 ==='
+cut -d ' ' -f 2 access.log | cut -d : -f 1,2 | sort | uniq -c |
+  awk '{bar = ""; for (i = 0; i < $1/5; i++) bar = bar "#"; printf "%s %4d %s\\n", $2, $1, bar}'
+
+echo ''
+echo '=== 错误集中在哪一分钟？（先过滤再聚合）==='
+awk '$6 >= 400 {print $2}' access.log | cut -d : -f 1,2 | sort | uniq -c | sort -rn | head -n 3`}
+/>
+
+真实事故排查的节奏正是如此：分钟曲线找到**突增时刻** → 过滤该时间段的日志 → Top IP / Top 路径看**谁和什么**在突增 → 结合状态码判断是攻击、爬虫还是故障重试风暴。
+
+## 6. 毕业作品：一键日志报告脚本
+
+把全部分析封装成第 15、16 章式样的健壮脚本——参数化、可复用、带安全带：
+
+<Playground
+  language="linux"
+  title="report.sh：一条命令输出完整报告"
+  id="linux-20-6"
+  code={`awk 'BEGIN {
+  srand(7)
+  ni = split("10.0.0.5,10.0.0.9,192.168.1.3,172.16.0.7,203.0.113.9", ips, ",")
+  np = split("/index,/api/users,/api/orders,/login,/static/app.js", paths, ",")
+  nc = split("200,200,200,200,200,200,302,404,500", codes, ",")
+  for (i = 0; i < 400; i++) {
+    ip = ips[int(rand()*ni)+1]; pa = paths[int(rand()*np)+1]; co = codes[int(rand()*nc)+1]
+    ms = int(rand()*300) + 5
+    if (pa == "/api/orders") ms = ms + int(rand()*900)
+    printf "%s 10:%02d:%02d %s %s %s %d %d\\n", ip, int(i/60), i%60, "GET", pa, co, int(rand()*2000)+100, ms
+  }
+}' > access.log
+
+cat > report.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+LOG=$1
+if [ ! -f "$LOG" ]; then echo "usage: report.sh <logfile>"; exit 1; fi
+
+section() { echo ''; echo "===== $1 ====="; }
+
+echo "日志报告: $LOG ($(wc -l < "$LOG") 行)"
+
+section 'Top 3 IP'
+awk '{print $1}' "$LOG" | sort | uniq -c | sort -rn | head -n 3
+
+section '状态码分布'
+awk '{c[$6]++} END {for (k in c) print k, c[k]}' "$LOG" | sort
+
+section '错误率'
+awk '$6 >= 400 {e++} END {printf "%.1f%% (%d/%d)\\n", e*100/NR, e, NR}' "$LOG"
+
+section '最慢路径 Top 3 (平均耗时)'
+awk '{n[$5]++; s[$5] += $8} END {for (p in n) printf "%8.1f ms  %s\\n", s[p]/n[p], p}' "$LOG" | sort -rn | head -n 3
+EOF
+chmod +x report.sh
+
+./report.sh access.log`}
+/>
+
+这个脚本可以直接带去真实服务器：改一下字段序号适配 nginx 日志格式，加个 cron（第 17 章）每天早上把报告追加到文件或发送出去——课程里的散装知识，在这里拼成了完整的生产力。
+
+## 7. 通用方法论
+
+回望这条流水线，沉淀出四步方法论，适用于任何文本数据分析：
+
+1. **侦查**：wc/head/awk NF——搞清格式、字段、量级、脏数据；
+2. **过滤**：grep/awk 模式——只留下与问题相关的行；
+3. **投影**：awk print/cut——只留下需要的列；
+4. **聚合**：sort | uniq -c | sort -rn，或 awk 关联数组——计数、求和、均值、分位。
+
+监控平台（Grafana/ELK）做的本质是同一件事，只是预先建好了索引和图表。当平台不可用、日志只在机器上时，这四步就是你的分析引擎。
+
+## 小结
+
+- 分析骨架：抽列 → sort → uniq -c → sort -rn → head，回答一切 Top N
+- 数值判断用 awk 按字段（`$6 == 500`），比裸 grep 精确；grep 留空格是最低保险
+- 分组统计靠关联数组：计数 `n[$5]++`、求和 `s[$5]+=$8`、END 里算均值
+- P95 = 排序后取 95% 位置；分钟级聚合 = 时间字段截断 + uniq -c
+- 突增排查节奏：曲线定位时刻 → 过滤时段 → Top IP/路径 → 状态码定性
+- 把流水线沉淀成带 set -euo pipefail 的脚本，配 cron 就是一个极简监控系统
+
+<Callout type="exercise" title="练习">
+1. 基于本章日志：统计每个 IP 的**错误请求**数（状态码大于等于 400），输出错误数前 3 的 IP——需要先过滤再聚合。
+2. 计算每个路径的 P95 耗时（提示：对每个路径分别收集耗时到文件或用 awk 二维思路：先 sort -k5 -k8n 再分组取位）。
+3. 给 report.sh 增加"每分钟请求数条形图"小节，并让 Top N 的 N 变成可选的第二个参数（默认 3，用 `$2` 加判空实现）。
+4. 真机挑战：找一份真实 nginx access.log（或网上的样例日志），调整字段序号跑通整套流水线，写出你发现的三个事实。
+</Callout>

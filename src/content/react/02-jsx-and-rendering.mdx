@@ -1,0 +1,374 @@
+---
+title: JSX 与渲染
+order: 2
+description: JSX 编译成什么、表达式插值的规则、条件与列表渲染的惯用写法，以及 key 为什么必须稳定唯一
+---
+
+# JSX 与渲染
+
+第 1 章说组件返回「界面应该长什么样的描述」。这一章我们看清楚这个描述是怎么写出来的，以及它被编译成了什么。
+
+## 1. JSX 只是函数调用
+
+### 1.1 编译前后
+
+JSX 看起来像 HTML，但它既不是 HTML，也不是字符串模板。它是一段会被编译器改写的语法糖。
+
+写下这段 JSX：
+
+```tsx
+const el = <h1 className="title">Hello</h1>;
+```
+
+编译后（经典模式）等价于：
+
+```js
+const el = React.createElement("h1", { className: "title" }, "Hello");
+```
+
+嵌套结构也一样，只是变成了嵌套调用：
+
+```tsx
+<div className="card">
+  <h2>标题</h2>
+  <p>正文</p>
+</div>
+```
+
+```js
+React.createElement(
+  "div",
+  { className: "card" },
+  React.createElement("h2", null, "标题"),
+  React.createElement("p", null, "正文")
+);
+```
+
+`createElement` 做的事情非常简单：把参数打包成一个普通对象返回。这个对象就是第 1 章说的虚拟 DOM 节点，React 内部叫它 **element**。
+
+<Callout type="info" title="现代 JSX 转换">
+React 17 起引入了新的 JSX 转换，编译产物变成从 `react/jsx-runtime` 引入的 `jsx()` 函数，不再需要在每个文件顶部手动引入 React。语义基本一致，只是 children 的传递方式和性能优化细节有差别。你在项目里看到「没引入 React 也能写 JSX」，就是因为用了新转换。
+</Callout>
+
+### 1.2 这个结论能解释很多现象
+
+一旦接受「JSX 就是函数调用」，很多规则就不需要死记：
+
+- **为什么必须有唯一的根节点**？因为一个函数只能返回一个值。想返回并列的兄弟节点，就得用 Fragment（写作空标签对）把它们包起来
+- **为什么标签名首字母大写才被当作组件**？编译器靠首字母区分：小写编译成字符串 `"div"`，大写编译成变量引用 `MyButton`
+- **为什么 JSX 可以放进变量、数组、函数返回值里**？因为它就是一个表达式，能出现在任何表达式能出现的位置
+- **为什么 class 要写成 className**？因为 props 最终是一个 JS 对象的键，而 `class` 是保留字（历史原因，现在其实可以，但约定沿用至今）
+
+### 1.3 手写一遍 createElement
+
+理解一件事最快的方式是把它实现一遍。下面这段纯 TypeScript 代码复刻了 `createElement` 和一个「渲染成 HTML 字符串」的过程，你能清楚看到 JSX 的产物到底是什么形状。
+
+<Playground
+  language="typescript"
+  title="手写 createElement 与渲染"
+  id="react-02-1"
+  code={`type VChild = VNode | string | number;
+
+interface VNode {
+  type: string;
+  props: Record<string, string>;
+  children: VChild[];
+}
+
+// 这就是 JSX 编译后调用的函数
+function h(
+  type: string,
+  props: Record<string, string> | null,
+  ...children: VChild[]
+): VNode {
+  return { type: type, props: props === null ? {} : props, children: children };
+}
+
+// 把 element 树渲染成 HTML 字符串（真实 React 是渲染成 DOM 节点）
+function render(node: VChild): string {
+  if (typeof node === "string") return node;
+  if (typeof node === "number") return String(node);
+
+  let attrs = "";
+  for (const key of Object.keys(node.props)) {
+    attrs += " " + key + '="' + node.props[key] + '"';
+  }
+
+  let inner = "";
+  for (const child of node.children) {
+    inner += render(child);
+  }
+
+  return "<" + node.type + attrs + ">" + inner + "</" + node.type + ">";
+}
+
+// 等价的 JSX 见文章中的说明
+const tree = h(
+  "div",
+  { class: "card" },
+  h("h2", null, "标题"),
+  h("p", null, "计数：", 42)
+);
+
+console.log(JSON.stringify(tree.type));
+console.log(Object.keys(tree.props).join(","));
+console.log("children 数量: " + tree.children.length);
+console.log(render(tree));`}
+  expectedOutput={`"div"\nclass\nchildren 数量: 2\n<div class="card"><h2>标题</h2><p>计数：42</p></div>`}
+/>
+
+上面这棵树对应的 JSX 是：
+
+```tsx
+<div class="card">
+  <h2>标题</h2>
+  <p>计数：{42}</p>
+</div>
+```
+
+注意 `h("p", null, "计数：", 42)` 传了两个 children——这正是 JSX 里文本和插值表达式相邻时的编译结果。
+
+## 2. 表达式插值
+
+### 2.1 大括号里放的是表达式
+
+JSX 里用一对大括号嵌入 JS 表达式。注意是**表达式**，不是语句：能出现在赋值号右边的都行，`if`、`for`、`switch` 都不行。
+
+```tsx
+function Profile({ user }: { user: User }) {
+  const fullName = user.first + " " + user.last;
+
+  return (
+    <div>
+      <h1>{fullName}</h1>
+      <p>{user.age >= 18 ? "成年" : "未成年"}</p>
+      <p>{user.tags.join(" / ")}</p>
+      <img src={user.avatar} alt={fullName} width={64} />
+    </div>
+  );
+}
+```
+
+属性值也用大括号传非字符串的值。`width={64}` 传的是数字 64，`width="64"` 传的是字符串。对原生 DOM 属性这两者差别不大，但传给自定义组件时就是完全不同的类型。
+
+### 2.2 哪些值不会被渲染
+
+这条规则很关键，直接影响条件渲染怎么写：
+
+| 值 | 渲染结果 |
+|---|---|
+| `null` | 什么都不渲染 |
+| `undefined` | 什么都不渲染 |
+| `true` / `false` | 什么都不渲染 |
+| 空数组 | 什么都不渲染 |
+| `0` | **渲染出字符 0** |
+| 空字符串 | 什么都不渲染（但占位） |
+| 数组 | 依次渲染每一项 |
+
+倒数第三行是无数人踩过的坑，下一节详细说。
+
+## 3. 条件渲染
+
+### 3.1 三种常见写法
+
+```tsx
+function Panel({ status, items }: Props) {
+  // 写法一：三元表达式，适合二选一
+  return (
+    <div>
+      {status === "loading" ? <Spinner /> : <List items={items} />}
+
+      {/* 写法二：逻辑与，适合「满足条件才显示」 */}
+      {status === "error" && <ErrorBanner />}
+
+      {/* 写法三：提前 return，适合整体形态差异大的情况 */}
+    </div>
+  );
+}
+
+function Page({ user }: PageProps) {
+  if (!user) return <LoginPrompt />;
+  if (user.banned) return <BannedNotice />;
+
+  return <Dashboard user={user} />;
+}
+```
+
+三种写法没有优劣之分，看可读性选：分支多、结构差异大时用提前 return；局部小差异用三元；单向显示用逻辑与。
+
+<Callout type="warn" title="逻辑与的数字陷阱">
+`items.length && <List />` 这种写法在数组为空时会渲染出一个字符 `0`——因为 `0 && x` 的结果是 `0`，而 `0` 是会被渲染的。
+
+正确写法是把左侧转成布尔值：`items.length > 0 && <List />`，或者用三元：`items.length ? <List /> : null`。
+
+这个 bug 的隐蔽之处在于，它只在数据为空时出现，而开发时数据往往不为空。
+</Callout>
+
+### 3.2 用变量拆分复杂条件
+
+当条件嵌套超过两层，JSX 的可读性会急剧下降。把分支结果先赋给变量是个好习惯：
+
+```tsx
+function Content({ state, data, error }: ContentProps) {
+  let body: React.ReactNode;
+
+  if (state === "loading") {
+    body = <Skeleton rows={5} />;
+  } else if (state === "error") {
+    body = <ErrorView message={error} onRetry={retry} />;
+  } else if (data.length === 0) {
+    body = <EmptyState />;
+  } else {
+    body = <Table rows={data} />;
+  }
+
+  return (
+    <section>
+      <Header />
+      {body}
+      <Footer />
+    </section>
+  );
+}
+```
+
+这个写法还有个好处：状态机的所有分支被集中在一处，一眼就能看出有没有漏掉某种状态。
+
+## 4. 列表渲染
+
+### 4.1 用 map 生成数组
+
+JSX 能直接渲染数组，所以列表渲染就是 `map`：
+
+```tsx
+function TodoList({ todos }: { todos: Todo[] }) {
+  return (
+    <ul>
+      {todos.map((todo) => (
+        <li key={todo.id} className={todo.done ? "done" : ""}>
+          {todo.title}
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+注意箭头函数用了圆括号包裹返回值——这是**返回**一个 JSX，不是执行语句。如果写成大括号函数体，记得加 `return`。
+
+### 4.2 过滤与排序放在 map 之前
+
+```tsx
+const visible = todos
+  .filter((t) => filter === "all" || (filter === "done") === t.done)
+  .sort((a, b) => b.createdAt - a.createdAt);
+
+return <ul>{visible.map((t) => <TodoItem key={t.id} todo={t} />)}</ul>;
+```
+
+不要在 `map` 回调里写 `if` 然后返回 `null`——虽然能工作，但语义不清晰，而且会让 key 的分布变得难以推理。
+
+## 5. key：整章最重要的概念
+
+### 5.1 React 靠什么认出「这还是刚才那个元素」
+
+diff 算法在比较新旧两个列表时，需要回答一个问题：新列表里的第 3 项，是旧列表里的哪一项？
+
+没有 key 时，React 只能按**位置**匹配：新的第 3 项对应旧的第 3 项。有 key 时，React 按 **key 值**匹配：找到 key 相同的那一项。
+
+这个差别在列表顺序不变时无所谓，一旦涉及插入、删除、排序，结果天差地别。
+
+### 5.2 用索引当 key 会发生什么
+
+假设列表是 `[A, B, C]`，你在开头插入了 D，变成 `[D, A, B, C]`。
+
+用索引作 key（`key={index}`）时，React 看到的是：
+
+| 位置 | 旧 | 新 | React 的判断 |
+|---|---|---|---|
+| key=0 | A | D | 同一个元素，内容变了 → 更新文本 |
+| key=1 | B | A | 同一个元素，内容变了 → 更新文本 |
+| key=2 | C | B | 同一个元素，内容变了 → 更新文本 |
+| key=3 | 无 | C | 新增 → 创建节点 |
+
+结果是：**4 次操作，且前三个 DOM 节点被复用了**。功能上文本是对的，但如果这些 li 里有输入框，输入框里的内容不会跟着移动——你在 A 行输的字，现在显示在 D 行。同理，组件内部的 state、动画状态、滚动位置全都错位。
+
+用稳定 id 作 key 时，React 看到的是：
+
+| key | 旧 | 新 | React 的判断 |
+|---|---|---|---|
+| a | 有 | 有 | 复用，位置移动 |
+| b | 有 | 有 | 复用，位置移动 |
+| c | 有 | 有 | 复用，位置移动 |
+| d | 无 | 有 | 新增 |
+
+结果是：**1 次真实创建 + 位置调整**，且 A、B、C 三个组件的内部状态完整保留。
+
+### 5.3 key 的规则
+
+- **必须在兄弟节点间唯一**，不需要全局唯一
+- **必须稳定**：同一条数据在多次渲染中 key 不变
+- **不要用数组索引**，除非列表是纯静态的（永不排序、不增删）
+- **不要用随机数**：`key={Math.random()}` 会导致每次渲染都被认为是全新元素，全部销毁重建，性能和状态双输
+- **key 不是 prop**：组件内部拿不到 `props.key`，需要的话额外传一个 `id`
+
+<Callout type="tip" title="没有 id 怎么办">
+如果数据源确实没有唯一标识，优先考虑在数据进入应用时生成一次（比如请求回来后 map 一遍加上 `crypto.randomUUID()`），而不是在渲染时生成。关键在于「同一条数据的 key 在多次渲染中保持不变」，在渲染函数里生成必然做不到这一点。
+</Callout>
+
+### 5.4 key 还能用来强制重置组件
+
+反过来利用「key 变了就是新元素」这条规则，可以主动销毁重建一个组件：
+
+```tsx
+// 切换用户时，让整个表单重置为初始状态
+<ProfileForm key={userId} user={user} />
+```
+
+`userId` 一变，React 认为这是一个全新的组件，会卸载旧的、挂载新的，内部所有 state 回到初始值。这比在组件里写一堆「监听 userId 变化然后重置各个 state」的代码干净得多。
+
+## 6. JSX 的一些细节
+
+- **注释**：在 JSX 里写注释要包在大括号中，即一对大括号里放块注释
+- **空白处理**：JSX 会去掉行首行尾空白和纯空白行，需要显式空格时用字符串表达式
+- **自闭合**：所有没有子节点的标签都必须自闭合，包括 br、img 这类原生空元素
+- **属性展开**：`<Button {...props} />` 会把对象的每个键作为 prop 传入，注意顺序——后写的覆盖先写的
+- **布尔属性简写**：`<input disabled />` 等价于 `disabled={true}`
+
+<Callout type="exercise" title="练习 1：手动编译">
+把下面这段 JSX 手写成 `createElement` 调用（不用运行，写在纸上或注释里即可）：
+
+一个 section 元素，class 为 box，里面有一个 h3 标题「用户」，和一个 ul，ul 里用 map 渲染了 users 数组，每项是一个带 key 的 li 显示用户名。
+
+重点思考：map 返回的数组作为 children 传入时，是一个参数还是多个参数？
+</Callout>
+
+<Callout type="exercise" title="练习 2：修复条件渲染">
+下面几行代码各有一个问题，指出并修正：
+
+1. `{cart.length && <Badge count={cart.length} />}`
+2. `{user.name || <Anonymous />}`（当 name 为空字符串时的行为是否符合预期）
+3. `{isVip ? <VipTag /> : ""}`（有没有更好的写法）
+</Callout>
+
+<Callout type="exercise" title="练习 3：key 推理">
+列表初始为 `[{id:1,t:"A"},{id:2,t:"B"},{id:3,t:"C"}]`，每一项渲染成一个带独立输入框的组件。
+
+现在删除中间那项，变成 A、C 两项。请分别推理：用 `key={index}` 和用 `key={item.id}` 两种情况下，原来在 C 行输入框里的文字会显示在哪一行？为什么？
+</Callout>
+
+<Callout type="exercise" title="练习 4：扩展 Playground">
+在本章的 Playground 基础上，给 `render` 函数增加对布尔值和 null 的处理：当 child 是 `false` 或 `null` 时不输出任何内容。
+
+提示：需要扩展 `VChild` 的类型定义，并在 `render` 开头加上判断。改完后构造一棵包含条件子节点的树，验证输出正确。
+</Callout>
+
+## 小结
+
+- JSX 是语法糖，编译成 `createElement`（或新转换的 `jsx`）调用，产物是普通 JS 对象
+- 大括号里放的是**表达式**；`null`、`undefined`、布尔值不渲染，但数字 `0` 会渲染
+- 条件渲染三种写法：三元、逻辑与、提前 return；用逻辑与时注意把左侧转成布尔
+- 列表用 `map`，过滤排序在 map 之前完成
+- **key 决定 diff 时的元素匹配方式**：稳定唯一的 key 能保留组件状态并最小化 DOM 操作；索引 key 在增删排序时会导致状态错位
+- key 变化会强制组件重建，可用于主动重置状态
+- 下一章讲组件的组合与 props 传递 →

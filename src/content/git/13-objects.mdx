@@ -1,0 +1,168 @@
+---
+title: Git 对象模型：blob、tree、commit 与内容寻址
+order: 13
+description: .git 目录里到底存了什么、三种对象如何串成快照、SHA-1 内容寻址为何高效、引用与 HEAD 的本质
+---
+
+# Git 对象模型：blob、tree、commit 与内容寻址
+
+前面的章节一直在"用" Git，这一章钻进 `.git` 目录，看它到底怎么存数据。理解了对象模型，很多"魔法"——比如为什么 rebase 改了哈希、为什么相同文件只占一份空间、为什么分支如此轻量——都会变得理所当然。
+
+## 1. Git 是一个内容寻址的文件系统
+
+Git 的底层是一个简单的**键值数据库**：你存一个对象进去，它返回一个 SHA-1 哈希作为"键"；以后用这个哈希就能取回对象。所有 Git 数据都在这四类对象里：
+
+| 对象 | 存什么 | 由谁产生 |
+|---|---|---|
+| **blob** | 文件的**内容**（不含文件名） | 每次 `git add` |
+| **tree** | 目录快照：文件名 + 权限 + 对应 blob/tree 的哈希 | 每次提交 |
+| **commit** | 指向一个 tree、父提交、作者/提交者、提交信息 | 每次 `git commit` |
+| **tag** | 附注标签对象（第 11 章） | `git tag -a` |
+
+<Playground
+  language="git"
+  title="拆解一次提交：blob / tree / commit"
+  id="git-13-1"
+  code={`echo '===== 对象模型：blob / tree / commit ====='
+git init -q -b main obj && cd obj
+echo 'hello' > a.txt
+echo 'world' > b.txt
+mkdir sub && echo 'nested' > sub/c.txt
+git add .
+git commit -q -m "feat: 初始文件"
+
+echo '最新提交的哈希（commit 对象）：'
+COMMIT=$(git rev-parse HEAD)
+echo "$COMMIT"
+echo
+echo 'commit 对象里存了什么（作者、树、父、信息）：'
+git cat-file -p $COMMIT
+echo
+echo 'commit 引用的 tree 对象：'
+TREE=$(git cat-file -p $COMMIT | grep '^tree' | awk '{print $2}')
+echo "tree = $TREE"
+echo 'tree 对象列出它包含的文件/子目录：'
+git cat-file -p $TREE
+echo
+echo 'blob 对象就是文件内容本身（去标识看 a.txt 的内容）：'
+ABLOB=$(git rev-parse HEAD:a.txt)
+echo "a.txt 的 blob = $ABLOB"
+git cat-file -p $ABLOB
+echo
+echo '三种对象的类型确认：'
+echo "commit -> $(git cat-file -t $COMMIT)"
+echo "tree   -> $(git cat-file -t $TREE)"
+echo "blob   -> $(git cat-file -t $ABLOB)"
+cd ..`}
+/>
+
+一次提交在 `.git` 里是这样串起来的：
+
+```text
+commit  ──>  tree  ──>  blob (a.txt 的内容)
+   |          │
+   |          ├──>  blob (b.txt 的内容)
+   |          └──>  tree (sub/)  ──>  blob (c.txt)
+   └──>  父 commit（上一个提交）
+```
+
+注意 commit 和 tree 里**没有文件名**——文件名和目录结构由 tree 对象记录（`100644` 是权限，`blob` 后面是哈希）。这就是为什么改个文件名、内容不变，blob 哈希完全不变。
+
+## 2. 内容寻址：相同内容只存一份
+
+blob 的哈希完全由**文件内容**算出，和文件名、路径、历史都无关。两份内容相同的文件会共享**同一个** blob 对象。
+
+<Playground
+  language="git"
+  title="相同内容共享一个 blob，引用只是记录名字"
+  id="git-13-2"
+  code={`echo '===== 内容寻址：相同内容共享一个 blob ====='
+git init -q -b main dup && cd dup
+echo 'SAME' > f1.txt
+echo 'SAME' > f2.txt
+echo 'DIFFERENT' > f3.txt
+git add .
+git commit -q -m "feat: 两个内容相同的文件"
+echo 'f1.txt 与 f2.txt 虽然是两个文件，但内容相同：'
+B1=$(git rev-parse HEAD:f1.txt)
+B2=$(git rev-parse HEAD:f2.txt)
+B3=$(git rev-parse HEAD:f3.txt)
+echo "f1 blob = $B1"
+echo "f2 blob = $B2"
+echo "f3 blob = $B3"
+echo
+if [ "$B1" = "$B2" ]; then echo '结论：f1 和 f2 指向【同一个】blob 对象（内容寻址）'; fi
+if [ "$B1" != "$B3" ]; then echo '结论：内容不同则 blob 哈希不同'; fi
+echo
+echo 'Git 通过内容算 SHA-1，不关心文件名。文件名由 tree 对象记录：'
+git cat-file -p HEAD^{tree}
+cd ..
+
+echo
+echo '===== 引用（refs）与 HEAD ====='
+git init -q -b main refs && cd refs
+echo 'x' > a.txt && git add . && git commit -q -m "init"
+echo '分支文件就是 41 字节、存着 commit 哈希的文本：'
+echo "refs/heads/main 内容：$(cat .git/refs/heads/main)"
+echo 'HEAD 指向当前分支（而非直接指向 commit）：'
+cat .git/HEAD
+echo '通过 HEAD 解析出真正的 commit：'
+git rev-parse HEAD
+echo '标签 v1 同样是一个引用（指向 commit 或 tag 对象）：'
+git tag v1
+echo "refs/tags/v1 内容：$(cat .git/refs/tags/v1)"
+cd ..`}
+/>
+
+### 由此看懂几个"为什么"
+
+- **为什么 rebase 后哈希全变？** rebase 生成的是**新 commit 对象**（父提交变了，哪怕内容一样，SHA-1 也不同），旧提交仍在库里，新分支指向新提交。
+- **为什么 Git 占空间小？** 相同内容只存一份 blob；历史里没改的文件，新 tree 直接复用旧 blob 的哈希。
+- **为什么分支切换快？** 分支只是个存哈希的小文件，切换就是改写 HEAD 指向谁。
+
+## 3. 引用（refs）与 HEAD
+
+分支、标签在 Git 眼里都是 **ref（引用）**——一个存着某个对象哈希的小文件。
+
+```text
+.git/
+  HEAD                 ->  ref: refs/heads/main   （当前在哪）
+  refs/
+    heads/
+      main             ->  <40位 commit 哈希>       （分支）
+      dev              ->  <40位 commit 哈希>
+    tags/
+      v1.0             ->  <hash>                   （标签）
+```
+
+几个要点：
+
+- **HEAD 不直接指向 commit**，而是指向当前分支（`ref: refs/heads/main`）。你提交时，新 commit 的哈希被写进 `refs/heads/main`，HEAD 始终跟着分支走。
+- 处于"分离 HEAD"时，HEAD 才直接写一个 commit 哈希（如 `git checkout v1.0`），此时新提交无处挂靠，容易悬空。
+- 所有 ref 都可以通过 `git rev-parse <name>` 解析成哈希；`refs/heads/main` 简化为 `main`。
+- 除了 `refs/heads` 和 `refs/tags`，还有 `refs/remotes`（远程跟踪分支）、`refs/stash` 等。
+
+<Callout type="info" title="底层命令（plumbing）与上层命令（porcelain）">
+`git cat-file`、`git rev-parse`、`git hash-object` 这类直接操作对象的命令叫 **plumbing（管道）**，是 Git 的"内核 API"；而 `git commit`、`git log` 叫 **porcelain（瓷器）**，是给人用的漂亮外壳。平时用 porcelain 就够了，但理解对象模型后，plumbing 命令是排查疑难、写脚本的利器。
+</Callout>
+
+## 4. 对象的存储与打包
+
+`git add` 产生的对象先以**松散对象**存进 `.git/objects/<前2位>/<后38位>`。时间久了对象很多，Git 会在 `git gc` 时把它们**打包**进 `.git/objects/pack/*.pack`（增量压缩），大幅节省空间。这也是为什么你删了文件、但历史里还在，`.git` 并不会立刻变小——要等 `gc` 真正回收。
+
+## 小结
+
+- Git 是内容寻址的键值库，四种对象：blob（内容）/ tree（目录）/ commit（快照）/ tag
+- 一次提交 = commit 指向 tree，tree 指向 blob 和子 tree；文件名由 tree 记录，内容由 blob 记录
+- blob 哈希只由**内容**决定：相同内容共享一个 blob，改文件名不动 blob
+- 由此理解：rebase 改哈希、Git 省空间、分支切换快
+- 分支/标签都是 **ref**——存哈希的小文件；HEAD 指向"当前分支"而非直接指向 commit
+- plumbing 命令（cat-file / rev-parse）是理解底层与排错的工具
+- 下一章：reflog 与数据找回 →
+
+<Callout type="exercise" title="练习">
+1. 初始化仓库，写一个 `a.txt` 提交。用 `git rev-parse HEAD:a.txt` 得到它的 blob 哈希，再用 `git cat-file -p <哈希>` 看内容；用 `git cat-file -t <哈希>` 确认它是 blob。
+2. 新建 `b.txt` 写入与 `a.txt` **完全相同**的内容并提交，比较两者 `git rev-parse HEAD:a.txt` 与 `HEAD:b.txt` 的哈希，验证共享 blob。
+3. 查看 `.git/HEAD` 的内容，然后用 `git branch` 新建一个分支，观察 `.git/refs/heads/` 下是否多出一个同名文件、其内容与 HEAD 指向的 commit 是否一致。
+4. `git cat-file -p HEAD`（commit）和 `git cat-file -p HEAD^{tree}`（tree）的输出分别是什么结构？各列出哪些信息？
+</Callout>

@@ -1,0 +1,196 @@
+---
+title: 认证方案：Basic、Bearer/JWT 与 OAuth2
+order: 16
+description: Authorization 头、Basic 认证、手工构造与校验 JWT、OAuth2 授权码流程
+---
+
+# 认证方案：Basic、Bearer/JWT 与 OAuth2
+
+第 8 章的 Session 靠 Cookie 自动携带，天然适合浏览器。但 API 的世界里还有 CLI、移动端、服务器互调——它们的通用姿势是 `Authorization` 请求头。这一章从最古老的 Basic 讲到 JWT，再鸟瞰 OAuth2。
+
+## 1. 通用骨架：401 与 Authorization
+
+HTTP 认证的标准对话：
+
+```text
+① 客户端裸访问受保护资源
+② 服务器: 401 Unauthorized
+          WWW-Authenticate: Basic realm="admin"    <- 告知用什么方案
+③ 客户端: Authorization: <方案> <凭证>  重新请求
+④ 服务器验证，放行或再 401
+```
+
+`Authorization` 的值是"方案 + 空格 + 凭证"，常见方案：`Basic`（用户名密码）、`Bearer`（令牌）、`Digest`（已过时）。
+
+## 2. Basic：最简单也最裸露
+
+凭证 = `base64(用户名:密码)`。**base64 是编码不是加密**——亲手验证这一点：
+
+<Playground
+  language="http"
+  title="Basic 认证全流程（与它的裸奔本质）"
+  id="http-16-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import base64
+
+VALID = "ada:s3cret"
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            decoded = base64.b64decode(auth[6:]).decode()
+            if decoded == VALID:
+                body = ("welcome, " + decoded.split(":")[0] + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", "Basic realm=\"demo\"")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 裸访问：401 + WWW-Authenticate =="
+curl -si http://127.0.0.1:8000/admin | grep -E "HTTP/|WWW-Auth"
+
+echo "== curl -u 自动构造 Basic 头 =="
+curl -s -u ada:s3cret http://127.0.0.1:8000/admin
+
+echo "== 看看头里到底是什么 =="
+curl -sv -u ada:s3cret -o /dev/null http://127.0.0.1:8000/admin 2>&1 | grep -i "authorization"
+
+echo "== 任何人都能解码：base64 不是加密 =="
+echo "YWRhOnMzY3JldA==" | base64 -d && echo`}
+/>
+
+结论：Basic **只能在 HTTPS 上使用**，且每个请求都携带原始密码（一旦泄露即全盘沦陷）。适用场景：内部工具、配合网关的简单防护、脚本调试。生产 API 请用令牌。
+
+## 3. Bearer 与 JWT：自包含的令牌
+
+`Authorization: Bearer <token>`——凭证是一个令牌（token），持有即认证（bearer = 持票人）。令牌可以是服务端存储的随机串（本质是 Session 换个位置），更流行的是**自包含**的 JWT（JSON Web Token）。
+
+### 3.1 JWT 的三段结构
+
+```text
+eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiJhZGEiLCJyb2xlIjoiYWRtaW4ifQ . dBjftJeZ4CVP...
+       头部(Header)          载荷(Payload)                       签名(Signature)
+
+Header:    {"alg": "HS256", "typ": "JWT"}     用什么算法签名
+Payload:   {"sub": "ada", "role": "admin", "exp": 1735689600}   声明(claims)
+Signature: HMAC-SHA256(base64url(header) + "." + base64url(payload), 密钥)
+```
+
+前两段只是 base64url（**任何人可读，别放敏感数据**），第三段签名保证**改不了**：改动任何一个字节，签名校验即失败。亲手造一个、验一个、再篡改一个：
+
+<Playground
+  language="http"
+  title="手工实现 JWT：签发、校验、防篡改"
+  id="http-16-2"
+  code={`python3 -c '
+import base64, hmac, hashlib, json, time
+
+SECRET = b"server-side-secret"
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+def sign(header_payload: str) -> str:
+    return b64url(hmac.new(SECRET, header_payload.encode(), hashlib.sha256).digest())
+
+def issue(claims: dict) -> str:
+    hp = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()) + "." + \
+         b64url(json.dumps(claims).encode())
+    return hp + "." + sign(hp)
+
+def verify(token: str):
+    try:
+        hp, _, sig = token.rpartition(".")
+        if not hmac.compare_digest(sig, sign(hp)):
+            return None, "签名不匹配（被篡改或密钥不对）"
+        payload = json.loads(base64.urlsafe_b64decode(hp.split(".")[1] + "=="))
+        if payload.get("exp", 0) < time.time():
+            return None, "令牌已过期"
+        return payload, "OK"
+    except Exception as e:
+        return None, "格式错误: " + str(e)
+
+token = issue({"sub": "ada", "role": "user", "exp": int(time.time()) + 3600})
+print("签发的 JWT:", token[:60], "...")
+print("校验结果:", verify(token)[1], "->", verify(token)[0])
+print()
+
+# 攻击者解码 payload，把 role 改成 admin，重新编码拼回去
+hp = token.rsplit(".", 1)[0]
+head, pay = hp.split(".")
+hacked_pay = b64url(json.dumps({"sub": "ada", "role": "admin", "exp": 9999999999}).encode())
+forged = head + "." + hacked_pay + "." + token.rsplit(".", 1)[1]
+print("篡改 role=admin 后校验:", verify(forged)[1])
+'`}
+/>
+
+### 3.2 JWT 实战守则
+
+| 守则 | 原因 |
+|---|---|
+| 必须校验 alg，拒绝 "none" | 经典漏洞：把算法改成 none 绕过签名 |
+| 必须校验 exp（并设置得短） | JWT 无法主动吊销，短命 + refresh token 续期 |
+| payload 不放敏感数据 | base64 可解码，等于明文 |
+| 密钥要够长且轮换 | HS256 弱密钥可被爆破离线伪造 |
+| 敏感系统配黑名单 | "登出立即失效"的唯一办法（牺牲无状态） |
+
+第 8 章的对比在此闭环：**JWT = 把 Session 数据签名后交给客户端保管**。省了服务端存储，代价是吊销困难、体积膨胀（每个请求都背着完整 payload）。
+
+## 4. OAuth2：把"授权"标准化
+
+场景变了：不是"你登录我的网站"，而是"**你允许 A 应用访问你在 B 平台的数据**"——比如让打印店应用读取你的网盘照片。绝不能把网盘密码交给打印店，OAuth2 就是这套授权的标准流程。
+
+四个角色：**资源所有者**（你）、**客户端**（打印店应用）、**授权服务器**（网盘的登录/授权页）、**资源服务器**（网盘 API）。
+
+最常用的**授权码模式（Authorization Code）**：
+
+```text
+① 打印店把你重定向到网盘授权页（带 client_id、scope、redirect_uri、state）
+② 你在网盘页面上登录并点击"同意授权（仅读取照片）"
+③ 网盘把你重定向回打印店，URL 上带一个一次性授权码 code
+④ 打印店后端拿 code + client_secret 找网盘换 access_token（服务器间通信）
+⑤ 打印店用 Bearer access_token 调网盘 API 读照片
+```
+
+为什么绕一道"授权码"，而不在 ③ 直接给令牌？因为 ③ 走的是**浏览器重定向（前端信道，URL 会进历史记录/日志）**，而 ④ 是**后端对后端（安全信道）**；令牌只出现在安全信道里。授权码即使被截获，没有 client_secret 也换不到令牌。
+
+- `state` 参数防 CSRF（回跳时校验一致性）；
+- `scope` 限定权限范围（只读照片，动不了文件）；
+- 移动端/SPA 没有能藏住 secret 的后端，用 **PKCE** 扩展（动态生成校验对）替代 client_secret；
+- "微信/GitHub 登录"= OAuth2 授权拿到用户身份信息，再加一层标准化就是 OIDC（OpenID Connect）。
+
+<Callout type="info" title="选型速查">
+内部工具/脚本：Basic over HTTPS 或长效 API Key。第一方 Web 应用：Session Cookie（HttpOnly + SameSite）。移动端与开放 API：Bearer + JWT（短 exp + refresh token）。第三方接入你的用户数据：OAuth2 + scope。社交登录：OIDC。
+</Callout>
+
+<Callout type="warn" title="令牌就是钥匙">
+Bearer 的含义是"持票即入"，令牌泄露 = 密码泄露。日志、URL、前端 localStorage 都是高危存放点（XSS 可读 localStorage）。浏览器端存放令牌的相对安全解：HttpOnly Cookie（回到 Session 模式）或内存 + 静默刷新。
+</Callout>
+
+## 小结
+
+- 标准对话：401 + WWW-Authenticate 挑战，Authorization 头应答；
+- Basic = base64(用户名:密码)，可解码非加密，仅限 HTTPS 与低敏场景；
+- JWT 三段式：可读的 header/payload + 防篡改的签名；短 exp + refresh，敏感数据不进 payload；
+- OAuth2 解决第三方授权：授权码模式把令牌交换放进后端安全信道，state 防 CSRF、PKCE 救无后端场景；
+- 没有万能方案：按"第一方/第三方、浏览器/非浏览器"两个维度选型。
+
+<Callout type="exercise" title="练习">
+1. 组合 Playground 1 和 2：写一个 /login 路由用 Basic 认证换发 JWT，其余路由用 Bearer 校验。
+2. 在 Playground 2 中给 verify 增加 alg 白名单校验，构造一个 header 里 alg 字段为 none 的令牌，验证它被拒绝。
+3. 把 Playground 2 的 exp 设为过去时间，验证过期分支；再实现一个 refresh 函数：旧令牌未过期超过 7 天时允许换发新令牌。
+4. 画出"用 GitHub 账号登录某网站"的完整时序图，标注授权码与 access_token 分别出现在哪条信道上。
+</Callout>

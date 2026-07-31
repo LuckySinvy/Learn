@@ -1,0 +1,392 @@
+---
+title: 组件通信与状态提升
+order: 11
+description: 单向数据流的实践、状态该放在哪一层、兄弟组件通信、受控与非受控组件的设计，以及组件 API 的取舍
+---
+
+# 组件通信与状态提升
+
+React 的数据流只有一个方向：**props 向下，事件向上**。这个约束看起来限制很多，但它换来的是可追踪性——任何一个值的来源都能沿着组件树一路找到源头。
+
+这一章讲的是在这个约束下，各种通信需求该怎么实现，以及状态到底该放在哪一层。
+
+## 1. 状态该放在哪
+
+### 1.1 唯一数据源原则
+
+同一份数据只能有一个「所有者」。如果两个组件都存了同一份数据的副本，你就要负责同步它们——又回到了第 1 章说的两份真相问题。
+
+### 1.2 确定位置的方法
+
+对每一份状态，问三个问题：
+
+1. **哪些组件需要读它？**
+2. **哪些组件需要改它？**
+3. **它们最近的共同祖先是谁？**
+
+答案就是：**把状态放在那个共同祖先里**（或者更上层，如果那样更方便的话）。
+
+举例：一个搜索页面有搜索框、结果列表、结果数量三个组件。
+
+- `query` 被搜索框读写，被结果列表读 → 放在它们的共同父组件 `SearchPage`
+- 结果列表的滚动位置只有它自己需要 → 放在结果列表内部
+- 「是否显示高级筛选面板」只有筛选区域需要 → 放在筛选区域内部
+
+### 1.3 不要过早提升
+
+新手常见的过度设计是「把所有状态都放最顶层，方便以后用」。代价是：
+
+- 顶层组件变成巨大的状态仓库，难以阅读
+- 任何一个小交互都触发顶层重渲染，整棵树跟着重算
+- 组件失去独立性，无法单独复用和测试
+
+**原则：状态应该放在「需要它的组件们的最近共同祖先」，一层都不要更高。** 等真的有更远的组件需要它时，再提升也不迟——这个重构成本很低。
+
+## 2. 状态提升的典型场景
+
+### 2.1 从「各自为政」到「统一管理」
+
+假设两个输入框分别输入摄氏度和华氏度，需要联动。初始版本各自持有 state：
+
+```tsx
+function Celsius() {
+  const [c, setC] = useState("");   // 独立的状态，无法联动
+  return <input value={c} onChange={(e) => setC(e.target.value)} />;
+}
+```
+
+提升后：
+
+```tsx
+function Converter() {
+  // 关键决策：只存一个真相 —— 温度值 + 它的单位
+  const [temp, setTemp] = useState("");
+  const [unit, setUnit] = useState<"c" | "f">("c");
+
+  const celsius = unit === "c" ? temp : toCelsius(temp);
+  const fahrenheit = unit === "f" ? temp : toFahrenheit(temp);
+
+  return (
+    <div>
+      <TempInput
+        scale="c"
+        value={celsius}
+        onChange={(v) => {
+          setTemp(v);
+          setUnit("c");
+        }}
+      />
+      <TempInput
+        scale="f"
+        value={fahrenheit}
+        onChange={(v) => {
+          setTemp(v);
+          setUnit("f");
+        }}
+      />
+    </div>
+  );
+}
+
+function TempInput({ scale, value, onChange }: TempInputProps) {
+  return (
+    <label>
+      {scale === "c" ? "摄氏度" : "华氏度"}
+      <input value={value} onChange={(e) => onChange(e.target.value)} />
+    </label>
+  );
+}
+```
+
+注意状态的设计：**不是存两个温度值，而是存「一个值 + 它是哪个单位」**。另一个值现算。这样就不可能出现两个值互相矛盾的情况——又一次体现了第 4 章的「不存冗余数据」原则。
+
+### 2.2 兄弟组件通信
+
+兄弟之间不能直接通信，必须通过共同的父组件中转：
+
+```tsx
+function Parent() {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  return (
+    <div className="split">
+      <List items={items} selectedId={selectedId} onSelect={setSelectedId} />
+      <Detail id={selectedId} />
+    </div>
+  );
+}
+```
+
+`List` 触发 `onSelect` → 父组件 state 变化 → `Detail` 收到新的 id。这就是「事件向上、数据向下」的完整闭环。
+
+### 2.3 深层组件通信
+
+层级很深时，有四种选择，按推荐顺序：
+
+| 方案 | 适用 |
+|---|---|
+| 组合（把元素传下去） | 中间层不需要知道数据存在（第 3 章） |
+| 传 dispatch | 用了 useReducer，只需要「改」的能力（第 10 章） |
+| Context | 读多写少的全局数据（第 9 章） |
+| 状态管理库 | 大型可变状态、需要选择性订阅（第 15 章） |
+
+**先试前两个**。它们不引入新概念，也没有性能陷阱。
+
+## 3. 回调 props 的设计
+
+### 3.1 命名约定
+
+- **prop 名用 `onXxx`**：`onSelect`、`onClose`、`onValueChange`
+- **实现函数用 `handleXxx`**：`handleSelect`、`handleClose`
+
+这个区分能让你一眼看出「这是我接收的回调」还是「这是我自己的处理函数」。
+
+### 3.2 传什么参数
+
+回调应该传**语义化的值**，而不是原始事件对象：
+
+```tsx
+// 不好：子组件泄露了实现细节（我用的是 input 还是 select？）
+onChange: (e: React.ChangeEvent<HTMLInputElement>) => void
+
+// 好：只传父组件关心的东西
+onChange: (value: string) => void
+onSelect: (item: Item) => void
+onPageChange: (page: number, pageSize: number) => void
+```
+
+这样子组件内部换成别的实现（input 换成自定义的富文本框）时，父组件不用改。
+
+### 3.3 避免回调地狱式的透传
+
+```tsx
+// 五个回调层层往下传，每一层都要写一遍
+<A onX={onX} onY={onY} onZ={onZ} onW={onW} onV={onV} />
+```
+
+出现这种情况说明该换方案了：改用 dispatch、Context，或者重新审视组件划分——很可能是拆分方式不对。
+
+## 4. 受控与非受控组件的设计
+
+第 8 章讲的是表单元素的受控/非受控。同样的概念也适用于**你自己写的组件**。
+
+### 4.1 两种模式
+
+```tsx
+// 非受控：组件自己管状态，只在变化时通知外部
+<Accordion defaultOpen={["a"]} onOpenChange={log} />
+
+// 受控：外部管状态，组件只负责渲染和触发
+<Accordion open={openKeys} onOpenChange={setOpenKeys} />
+```
+
+非受控用起来省事，受控给了调用方完全的控制权（比如「点击时先弹确认框，确认后才真的展开」）。
+
+### 4.2 同时支持两种（社区标准做法）
+
+好的组件库组件都同时支持。实现模式如下：
+
+```tsx
+type Props = {
+  open?: string[];              // 传了就是受控
+  defaultOpen?: string[];       // 非受控时的初始值
+  onOpenChange?: (keys: string[]) => void;
+};
+
+function useControllable<T>(
+  controlled: T | undefined,
+  defaultValue: T,
+  onChange?: (v: T) => void
+) {
+  const [uncontrolled, setUncontrolled] = useState(defaultValue);
+  const isControlled = controlled !== undefined;
+  const value = isControlled ? controlled : uncontrolled;
+
+  const setValue = useCallback(
+    (next: T) => {
+      if (!isControlled) setUncontrolled(next);
+      onChange?.(next);        // 两种模式下都要通知外部
+    },
+    [isControlled, onChange]
+  );
+
+  return [value, setValue] as const;
+}
+
+function Accordion({ open, defaultOpen = [], onOpenChange }: Props) {
+  const [keys, setKeys] = useControllable(open, defaultOpen, onOpenChange);
+  // 后面统一用 keys 和 setKeys，不用再关心是哪种模式
+}
+```
+
+要点：
+
+- 用 `controlled !== undefined` 判断模式，**不要**用 `!== null`（null 可能是合法的值）
+- 受控模式下不更新内部 state，但**仍然要调 onChange**
+- 模式不能中途切换，开发模式下可以加一个警告
+
+## 5. 一个完整的例子
+
+把上面的原则综合起来，实现一个可搜索、可多选的列表：
+
+```tsx
+type Props = {
+  items: Item[];
+  selectedIds?: string[];
+  defaultSelectedIds?: string[];
+  onSelectionChange?: (ids: string[]) => void;
+  maxSelection?: number;
+};
+
+function MultiSelect({
+  items,
+  selectedIds,
+  defaultSelectedIds = [],
+  onSelectionChange,
+  maxSelection = Infinity,
+}: Props) {
+  // 选中项：支持受控/非受控（外部可能关心）
+  const [selected, setSelected] = useControllable(
+    selectedIds,
+    defaultSelectedIds,
+    onSelectionChange
+  );
+
+  // 搜索词：纯内部状态（外部不关心，也无需控制）
+  const [query, setQuery] = useState("");
+
+  // 派生数据：现算，不存 state
+  const visible = useMemo(
+    () => items.filter((i) => i.name.includes(query)),
+    [items, query]
+  );
+  const isFull = selected.length >= maxSelection;
+
+  function toggle(id: string) {
+    if (selected.includes(id)) {
+      setSelected(selected.filter((x) => x !== id));
+    } else if (!isFull) {
+      setSelected([...selected, id]);
+    }
+  }
+
+  return (
+    <div>
+      <input
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="搜索"
+      />
+      {isFull && <p className="hint">最多选择 {maxSelection} 项</p>}
+      <ul>
+        {visible.map((item) => {
+          const checked = selected.includes(item.id);
+          return (
+            <li key={item.id}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={!checked && isFull}
+                  onChange={() => toggle(item.id)}
+                />
+                {item.name}
+              </label>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+```
+
+三个状态决策值得注意：
+
+- `selected` 支持受控——外部很可能需要读取和控制
+- `query` 是纯内部状态——外部通常不关心搜索框里输了什么
+- `visible` 和 `isFull` 是**派生数据**，不是状态
+
+这三种分类，基本覆盖了组件设计中的所有状态。
+
+## 6. 单向数据流的价值
+
+### 6.1 和双向绑定的对比
+
+Vue 的 `v-model`、Angular 的 `ngModel` 提供双向绑定：写起来更短，改一处两边都变。
+
+React 坚持单向，代价是要多写一个 onChange。收益是：
+
+- **可追踪**：任何值的修改都必须经过一次显式的函数调用，你可以在那里打断点、加日志、加校验
+- **可拦截**：修改前可以改写、可以拒绝（第 4 章的转大写、限长度）
+- **无循环**：不会出现「A 改 B、B 又改 A」的无限循环
+- **可预测**：数据流是一棵树，不是一张图
+
+在小组件上，双向绑定确实更方便。在大型应用里，「所有修改都是显式的」这个性质会救你很多次。
+
+### 6.2 调试时的推理方式
+
+界面显示错了，沿着数据流反推：
+
+1. 这个值是从哪个 prop 来的？
+2. 那个 prop 是父组件的哪个变量？
+3. 那个变量是 state 还是派生的？
+4. 如果是 state，哪些地方调用了它的 setter？
+
+这条链路永远是有限的、可枚举的。这就是单向数据流最实际的好处。
+
+<Callout type="tip" title="用 React DevTools 沿着链路走">
+DevTools 的组件树能直接查看每个组件的 props 和 hooks 值，选中组件后还能在控制台用 `$r` 访问它。
+
+配合「Highlight updates when components render」，能直观看到一次交互引起了哪些组件重渲染——这既是调试工具，也是发现性能问题的入口。
+</Callout>
+
+<Callout type="exercise" title="练习 1：确定状态位置">
+一个看板应用的组件树：App → Board → Column → Card，同时 App 下还有 Toolbar 和 CardDetailModal。
+
+下面这些状态该放在哪一层？说明理由：
+
+1. 每张卡片的标题
+2. 当前正在拖拽的卡片 id
+3. Column 的折叠状态
+4. 「显示已归档卡片」的开关（Toolbar 切换，Column 需要用）
+5. 详情弹窗打开的卡片 id
+6. 某个 Card 上的「更多操作」下拉菜单是否展开
+</Callout>
+
+<Callout type="exercise" title="练习 2：消除矛盾状态">
+一个日期范围选择器目前有四个 state：`startDate`、`endDate`、`isSelectingEnd`、`hoverDate`。
+
+用户报告了一个 bug：偶尔会出现 endDate 早于 startDate 的情况。
+
+重新设计状态结构，让「结束日期早于开始日期」在类型或结构上不可能发生。提示：可以考虑用可辨识联合表示「选择中」和「已完成」两种阶段。
+</Callout>
+
+<Callout type="exercise" title="练习 3：实现可受控组件">
+实现一个 `Rating` 星级评分组件，要求：
+
+- 同时支持受控（传 `value`）和非受控（传 `defaultValue`）
+- 支持 `onChange`，两种模式下都触发
+- 支持 `readOnly`
+- 鼠标悬停时预览（这个状态一定是内部的，为什么？）
+
+写完后思考：如果调用方从「不传 value」变成「传 value」，应该怎么处理？
+</Callout>
+
+<Callout type="exercise" title="练习 4：重构回调透传">
+一个组件树 Page → Section → Group → Field，Field 需要触发四种操作：修改值、删除自己、上移、复制。目前这四个回调从 Page 一路传到 Field。
+
+用两种不同方案重构：一是 useReducer + 传 dispatch，二是 Context。分别写出关键代码，并比较两种方案在「Field 组件用 React.memo 包裹」时的重渲染表现。
+</Callout>
+
+## 小结
+
+- 状态的位置 = **需要读它和改它的组件的最近共同祖先**，不要更高
+- 不要过早提升状态，等真的需要时再提升，重构成本很低
+- 设计状态时优先消灭冗余：存「一个值 + 一个单位」而不是两个可能矛盾的值
+- 兄弟通信必须经过共同父组件；深层通信优先用**组合**和 **dispatch**，其次才是 Context
+- 回调 prop 用 `onXxx` 命名，参数传**语义化的值**而不是原始事件对象
+- 自己写的组件也可以同时支持**受控与非受控**，用 `controlled !== undefined` 判断模式
+- 状态分三类：可受控的对外状态、纯内部状态、派生数据（不要存）
+- 单向数据流的价值是**可追踪、可拦截、无循环**，调试时能沿链路反推
+- 下一章讲性能优化：什么导致重渲染，以及怎么测量 →

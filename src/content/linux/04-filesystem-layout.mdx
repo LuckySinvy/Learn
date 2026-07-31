@@ -1,0 +1,186 @@
+---
+title: 文件系统布局：FHS、inode 与链接
+order: 4
+description: 读懂 / 下每个目录的用途、理解"一切皆文件"、inode 本质与硬链接/软链接的区别
+---
+
+# 文件系统布局：FHS、inode 与链接
+
+Windows 有 C 盘 D 盘，Linux 则是一棵从 `/`（根目录）出发的单一目录树——所有磁盘、设备甚至内核状态都挂在这棵树上。理解这棵树的布局（FHS 标准），你就知道配置该去哪找、日志会写到哪、程序装在了哪。本章下半部分深入一层：文件名之下的 inode，以及由此衍生的硬链接与软链接。
+
+## 1. FHS：根目录下都是什么
+
+FHS（Filesystem Hierarchy Standard）规定了各目录的职责，主流发行版都遵循：
+
+| 目录 | 用途 | 你会在这里做什么 |
+|---|---|---|
+| `/etc` | 系统与软件的**配置文件** | 改 nginx 配置、hosts、ssh 配置 |
+| `/var` | **可变数据**：日志、缓存、队列 | 看 `/var/log` 排查故障 |
+| `/home` | 普通用户的家目录 | `/home/ada` 即用户 ada 的 `~` |
+| `/root` | root 用户的家目录（不在 /home 下） | root 登录后的默认位置 |
+| `/tmp` | 临时文件，重启可能清空 | 放中间产物、下载的临时包 |
+| `/bin` `/usr/bin` | 可执行程序 | `ls`、`grep` 都住在这 |
+| `/sbin` `/usr/sbin` | 系统管理类程序 | `reboot`、`fdisk` 等 |
+| `/usr` | 用户程序主体（Unix System Resources） | 大部分软件安装于此 |
+| `/usr/local` | 管理员手动安装的软件 | 源码编译的程序装这里 |
+| `/opt` | 第三方大型软件整包安装 | 商业软件常自带全套目录放这 |
+| `/dev` | **设备文件** | `/dev/null`、磁盘 `/dev/sda` |
+| `/proc` | 内核与进程状态的**虚拟文件系统** | 看 CPU、内存、进程信息 |
+| `/lib` `/usr/lib` | 共享库 | 类似 Windows 的 DLL |
+| `/boot` | 内核与引导文件 | 升级内核时涉及 |
+| `/mnt` `/media` | 挂载点 | 临时挂载磁盘、U 盘 |
+
+<Playground
+  language="linux"
+  title="逛一逛根目录"
+  id="linux-04-1"
+  code={`echo '$ ls /'
+ls /
+
+echo '$ ls /etc | head -n 10   # 配置文件大本营（前 10 个）'
+ls /etc | head -n 10
+
+echo '$ cat /etc/hostname'
+cat /etc/hostname
+
+# /dev/null：黑洞设备，写入的一切都消失
+echo '$ echo something > /dev/null（无输出，数据被丢弃）'
+echo something > /dev/null
+
+# /proc 是虚拟的：文件大小为 0 但能读出内容
+echo '$ cat /proc/version'
+cat /proc/version
+echo '$ ls -l /proc/version   # 注意大小是 0'
+ls -l /proc/version`}
+/>
+
+记住三个最高频的定位直觉：**配置去 /etc，日志去 /var/log，程序在 /usr/bin 或 /usr/local/bin**。
+
+## 2. 一切皆文件
+
+Linux 的核心哲学：磁盘是文件（`/dev/sda`）、终端是文件（`/dev/tty`）、随机数是文件（`/dev/urandom`）、内核状态是文件（`/proc/*`）、甚至进程间通信的管道和网络套接字也是文件。好处是**统一接口**——read/write 那一套系统调用通吃一切，`cat`、重定向这些工具因此能操作任何对象。
+
+```bash
+cat /proc/loadavg          # "读文件"就能拿到系统负载
+head -c 8 /dev/urandom     # "读文件"就能拿到随机字节
+echo big-data > /dev/null  # "写文件"就能丢弃数据
+```
+
+## 3. inode：文件名之下的真身
+
+在文件系统里，一个文件由三部分构成：
+
+```text
+目录项（文件名 → inode 号） → inode（元数据） → 数据块（实际内容）
+
+  report.txt ── 指向 ──→ inode 52801 ── 指向 ──→ [数据块...]
+                          ├ 权限 rw-r--r--
+                          ├ 属主/属组
+                          ├ 大小、三种时间戳
+                          └ 链接计数
+```
+
+关键认知：**文件名不属于文件本身**。文件的真身是 inode（存元数据）加数据块（存内容），文件名只是目录里的一条"名字 → inode 号"映射。这解释了很多现象：
+
+- 重命名/移动（同分区）瞬间完成——只改目录项，不动数据；
+- 一个 inode 可以有**多个名字**——这就是硬链接；
+- 删除文件其实是删目录项，inode 的链接计数减一，**减到 0 才真正释放空间**（所以被进程占用的"已删除"日志仍占磁盘）。
+
+用 `ls -i` 看 inode 号，`stat` 看完整元数据。
+
+## 4. 硬链接与软链接
+
+```bash
+ln 源文件 硬链接名           # 硬链接：同一 inode 的另一个名字
+ln -s 源文件 软链接名        # 软链接（符号链接）：存着"路径"的特殊文件
+```
+
+<Playground
+  language="linux"
+  title="硬链接 vs 软链接"
+  id="linux-04-2"
+  code={`echo 'v1 content' > data.txt
+
+ln data.txt hard.txt
+ln -s data.txt soft.txt
+
+echo '$ ls -li   # 第一列是 inode 号'
+ls -li
+
+# 硬链接与原文件 inode 相同、链接数变 2；软链接是独立的小文件，箭头指向路径
+echo '$ 修改原文件，两个链接都能看到新内容'
+echo 'v2 content' > data.txt
+cat hard.txt
+cat soft.txt
+
+# 删除原文件名
+rm data.txt
+echo '$ rm data.txt 之后：'
+echo '- 硬链接仍可读（inode 还有一个名字，数据不会释放）：'
+cat hard.txt
+echo '- 软链接失效（指向的路径没了）：'
+cat soft.txt || echo 'soft.txt 已成悬空链接（dangling symlink）'
+ls -l soft.txt`}
+/>
+
+两者对比：
+
+| 特性 | 硬链接 | 软链接 |
+|---|---|---|
+| 本质 | 同一 inode 的又一个目录项 | 内容为"目标路径"的独立文件 |
+| 跨文件系统/分区 | 不行 | 可以 |
+| 链接目录 | 不允许 | 可以 |
+| 原文件删除后 | 数据仍在，链接照常可用 | 悬空失效 |
+| `ls -l` 外观 | 与普通文件无异（链接数大于 1） | `l` 开头，显示 `-> 目标` |
+
+实际工作中**软链接使用率远高于硬链接**，典型用法：
+
+```bash
+ln -s /opt/app/releases/v2.3.1 /opt/app/current   # 版本切换：改一个链接即可回滚
+ln -s /etc/nginx/sites-available/blog.conf /etc/nginx/sites-enabled/   # nginx 启用站点
+ln -s /usr/local/python3.12/bin/python3 /usr/local/bin/python3          # 命令指向具体版本
+```
+
+<Callout type="tip" title="stat：一次看全文件元数据">
+`stat 文件` 输出 inode 号、链接数、权限、属主，以及三种时间戳：Access（最近读取）、Modify（内容最近修改）、Change（元数据最近变更，如 chmod）。注意 Linux 默认不记录"创建时间"这一常见误解——多数场景下你能拿到的"最早时间"就是 Modify。
+</Callout>
+
+<Playground
+  language="linux"
+  title="用 stat 观察元数据与链接计数"
+  id="linux-04-3"
+  code={`echo 'hello' > f.txt
+echo '$ stat f.txt'
+stat f.txt
+
+echo '$ 创建两个硬链接后，Links 计数变化：'
+ln f.txt f2.txt
+ln f.txt f3.txt
+stat -c 'name=%n inode=%i links=%h size=%s' f.txt
+
+echo '$ chmod 只改元数据，观察 Change 时间与 Modify 时间分离'
+sleep 1
+chmod 600 f.txt
+stat -c 'Modify=%y' f.txt
+stat -c 'Change=%z' f.txt`}
+/>
+
+## 5. 磁盘、分区与挂载（概念）
+
+一块磁盘（`/dev/sda`）分成若干分区（`/dev/sda1`），每个分区格式化为某种文件系统（ext4、xfs 等），再**挂载**（mount）到目录树的某个目录上。挂载后访问该目录就是访问那个分区——目录树是逻辑视图，物理上可能横跨多块盘。`mount` 命令可查看当前所有挂载；`df -h`（第 12 章）按挂载点查看各分区用量。容器环境下你看到的根文件系统本身就是宿主机上挂载出来的一层。
+
+## 小结
+
+- 单一目录树从 `/` 出发；配置在 `/etc`，日志在 `/var/log`，程序在 `/usr/bin`、`/usr/local/bin`
+- 一切皆文件：设备、内核状态、随机数都用读写文件的方式访问
+- 文件真身 = inode + 数据块；文件名只是目录里的映射，链接计数归零才释放空间
+- 硬链接是同 inode 别名（不跨分区、不链目录）；软链接存路径（用途广，但会悬空）
+- 版本切换、配置启用等场景优先用软链接
+- 下一章：权限模型 rwx 与 chmod/chown →
+
+<Callout type="exercise" title="练习">
+1. 在沙箱里 `ls /`，对照 FHS 表格说出每个目录的用途；然后分别 `cat /proc/loadavg` 和 `cat /proc/uptime`，猜测两个文件各字段的含义。
+2. 创建文件 a.txt，做一个硬链接 b.txt 和一个软链接 c.txt；用 `ls -li` 记录三者的 inode 号，然后 `mv a.txt d.txt`（重命名原文件），验证硬链接和软链接各自是否仍然可读，解释原因。
+3. 用 `stat -c 'inode=%i links=%h' 文件` 观察：对一个文件连续创建 3 个硬链接、再逐个删除，链接计数如何变化？
+4. 思考题：为什么"进程还开着的日志文件被 rm 后，df 显示磁盘空间没有释放"？（提示：目录项、链接计数、进程持有的文件描述符）
+</Callout>

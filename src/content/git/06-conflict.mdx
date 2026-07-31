@@ -1,0 +1,326 @@
+---
+title: 冲突处理：制造、读懂、解决
+order: 6
+description: 什么情况会冲突、冲突标记怎么读、三方版本如何取舍、abort 与善后
+---
+
+# 冲突处理：制造、读懂、解决
+
+合并冲突是初学者最怕的东西，但它其实是 Git 最诚实的时刻——Git 说的是"这块代码两个人都改了，我不敢替你决定"。冲突不是错误，是**需要人类判断的信号**。
+
+这一章我们主动制造冲突，然后拆解每一步。
+
+## 1. 什么时候会冲突
+
+三方合并时，Git 找到共同祖先，逐个文件、逐个区块地比对：
+
+| 情况 | Git 的处理 |
+|---|---|
+| 只有一方改了某个文件 | 直接采用那一方 |
+| 两方都改了，但改的是**不同区域** | 自动合并，两处改动都保留 |
+| 两方都改了**同一区域** | **冲突**，交给人处理 |
+| 一方改了文件，另一方删了文件 | **冲突**（modify/delete） |
+| 两方都新增了同名文件，内容不同 | **冲突**（add/add） |
+| 一方重命名，另一方改了原文件 | 通常能自动处理（ort 策略会追踪重命名） |
+
+先看不冲突的情况——很多人以为"改同一个文件就会冲突"，其实不是：
+
+<Playground
+  language="git"
+  title="改同一文件的不同区域不会冲突；merge --abort 一键反悔"
+  id="git-06-1"
+  code={`echo '######## A. 不冲突：两边改同一文件的不同区域 ########'
+git init -q ok && cd ok
+gen() {
+  echo "$1" > f.txt
+  for i in 2 3 4 5 6 7 8; do echo "line$i" >> f.txt; done
+  echo "$2" >> f.txt
+}
+gen line1 line9
+git add . && git commit -q -m "init"
+
+git switch -qc b1
+gen line1-CHANGED-BY-B1 line9
+git commit -qam "b1: 改第 1 行"
+
+git switch -q main
+gen line1 line9-CHANGED-BY-MAIN
+git commit -qam "main: 改第 9 行"
+
+echo '两边改的是同一个文件，但区域相隔很远：'
+git merge b1 --no-edit
+echo '合并结果（两处改动都在）：'
+cat f.txt
+cd ..
+echo
+
+echo '######## B. merge --abort：一键反悔 ########'
+git init -q bad && cd bad
+echo 'v0' > f.txt && git add . && git commit -q -m "init"
+git switch -qc b2 && echo 'v-b2' > f.txt && git commit -qam "b2 版本"
+git switch -q main && echo 'v-main' > f.txt && git commit -qam "main 版本"
+git merge b2
+echo
+echo '此时文件被塞进了冲突标记：'
+cat f.txt
+echo '-- git merge --abort --'
+git merge --abort
+echo '放弃后文件恢复原样：'
+cat f.txt
+echo '状态：'
+git status --short
+echo '(干净，就像什么都没发生过)'
+cd ..`}
+/>
+
+<Callout type="info" title="Git 判断冲突的粒度是「行」">
+Git 不理解你的代码语义，它只看文本行。这导致两个后果：
+
+- 两个人在同一行做**完全相同**的修改，不会冲突（内容一致，无需选择）
+- 两个人改了相邻的不同行，也可能冲突——因为 diff 的 hunk 有上下文窗口，改动挨得太近会被算作同一区块
+- 反过来，**没有冲突不代表合并正确**。A 分支改了函数签名，B 分支在另一个文件里调用了这个函数，Git 会安静地合并，然后代码跑不起来。这叫"语义冲突"，只有测试能发现
+</Callout>
+
+## 2. 制造并读懂冲突
+
+<Playground
+  language="git"
+  title="制造一次真实冲突"
+  id="git-06-2"
+  code={`git init -q
+echo 'def greet():' > app.py
+echo '    print("hello")' >> app.py
+git add . && git commit -q -m "init"
+
+git switch -qc feature
+echo 'def greet():' > app.py
+echo '    print("hello from feature")' >> app.py
+git add . && git commit -q -m "feat: 改成 feature 版问候"
+
+git switch -q main
+echo 'def greet():' > app.py
+echo '    print("hello from main")' >> app.py
+git add . && git commit -q -m "feat: 改成 main 版问候"
+
+echo '===== 两个分支改了同一行 ====='
+git log --oneline --graph --all
+echo
+
+echo '===== git merge -> 冲突 ====='
+git merge feature
+echo
+
+echo '===== git status：谁冲突了、下一步怎么办 ====='
+git status
+echo
+
+echo '===== 冲突文件的样子 ====='
+cat app.py`}
+/>
+
+### 2.1 冲突标记的结构
+
+```text
+def greet():
+<<<<<<< HEAD
+    print("hello from main")
+=======
+    print("hello from feature")
+>>>>>>> feature
+```
+
+| 部分 | 含义 |
+|---|---|
+| `<<<<<<< HEAD` 到 `=======` | **ours**：当前分支（你所在的分支）的版本 |
+| `=======` 到 `>>>>>>> feature` | **theirs**：被合并进来的分支的版本 |
+| 标记之外的行 | 没有冲突，Git 已经合好了 |
+
+**关键提醒：ours/theirs 的含义会随操作变化。** 在 `git merge` 时，ours = 你当前分支；但在 `git rebase` 时两者是**反过来**的（第 7 章会解释原因）。判断方法：永远看标记后面跟的那个名字（`HEAD` / `feature`），而不是靠记忆。
+
+### 2.2 更好的显示方式：diff3
+
+默认的两段式看不到"原本是什么"，很容易误判。打开 diff3 模式会多显示共同祖先：
+
+```bash
+git config --global merge.conflictStyle zdiff3
+```
+
+```text
+<<<<<<< ours
+    print("hello from main")
+||||||| base
+    print("hello")            <- 共同祖先：原本长这样
+=======
+    print("hello from feature")
+>>>>>>> theirs
+```
+
+有了 base，你立刻能看出**双方各自改了什么**，而不是只看到两个结果。`zdiff3` 是 Git 2.35+ 的改进版，会把双方共同的部分从冲突块里提出去，冲突范围更小。**强烈建议全局打开这个配置。**
+
+## 3. 解决冲突的三条路
+
+<Playground
+  language="git"
+  title="三种解决方式：手工合并 / 选一方 / 查看三个版本"
+  id="git-06-3"
+  code={`git init -q
+echo 'hello' > app.py && git add . && git commit -q -m "init"
+git switch -qc feature && echo 'feature ver' > app.py && git commit -qam "feat"
+git switch -q main && echo 'main ver' > app.py && git commit -qam "main"
+git merge feature > /dev/null 2>&1
+
+echo '===== 1. 只列出冲突文件 ====='
+git diff --name-only --diff-filter=U
+echo
+
+echo '===== 2. 冲突现场 ====='
+cat app.py
+echo
+
+echo '===== 3. 切成 diff3 风格，多显示共同祖先 ====='
+git checkout --conflict=diff3 app.py
+cat app.py
+echo
+
+echo '===== 4. 从索引里直接取三个版本 ====='
+echo '-- 共同祖先 :1 --' && git show :1:app.py
+echo '-- 我方 HEAD :2 --' && git show :2:app.py
+echo '-- 对方      :3 --' && git show :3:app.py
+echo
+
+echo '===== 5. 无脑选一方 ====='
+git checkout --theirs app.py && echo '选对方: ' && cat app.py
+git checkout --ours app.py   && echo '选我方: ' && cat app.py
+echo
+
+echo '===== 6. 手工写出正确结果 -> add -> commit ====='
+echo 'merged ver: 融合了 main 和 feature' > app.py
+git add app.py
+git commit -q --no-edit
+echo '合并完成：'
+git log --oneline --graph
+git status --short
+echo '(工作区干净)'`}
+/>
+
+### 3.1 标准流程
+
+```bash
+git merge feature
+# CONFLICT ...
+
+git status                       # 1. 看哪些文件冲突
+# 2. 用编辑器逐个打开，删掉标记，写出正确内容
+git add <resolved-file>          # 3. add 就等于"我解决好了"
+git status                       # 4. 确认没有 unmerged 了
+git commit                       # 5. 提交（会自动带出 Merge 信息）
+```
+
+`git add` 在冲突场景下有特殊含义：**标记为已解决**。只要还有文件处于 unmerged 状态，`git commit` 就会拒绝。
+
+### 3.2 冲突时索引里有三份内容
+
+平时索引里每个文件只有一条记录（stage 0）。冲突时会变成三条：
+
+| 编号 | 含义 | 取法 |
+|---|---|---|
+| `:1:file` | base，共同祖先 | `git show :1:app.py` |
+| `:2:file` | ours，当前分支 | `git show :2:app.py` |
+| `:3:file` | theirs，被合并分支 | `git show :3:app.py` |
+
+用 `git ls-files -u` 能看到这三条记录。这解释了 Git 为什么能实现 `--ours` / `--theirs` 这类操作：三个版本一直都在索引里躺着。
+
+### 3.3 整文件二选一
+
+对于"这个文件我就要 A 分支的版本"的场景：
+
+```bash
+git checkout --ours   config.yml   # 要当前分支的
+git checkout --theirs config.yml   # 要对方分支的
+git add config.yml
+```
+
+<Callout type="warn" title="--ours/--theirs 是整个文件替换">
+这两个命令不是"这一处冲突选某方"，而是**整个文件都用那一方的版本**——包括那些本来已经自动合好的部分。对于 `package-lock.json`、编译产物这类"重新生成即可"的文件很合适；对于源代码文件，通常需要真正的人工合并。
+</Callout>
+
+### 3.4 用可视化工具
+
+```bash
+git mergetool                       # 打开配置好的三方合并工具
+git config --global merge.tool vimdiff   # 或 meld / kdiff3 / vscode
+```
+
+VS Code 内置的合并编辑器体验最好：它把 base / ours / theirs 并排显示，点击就能逐块采纳。设置方式：
+
+```bash
+git config --global merge.tool vscode
+git config --global mergetool.vscode.cmd 'code --wait $MERGED'
+```
+
+## 4. 冲突中的紧急出口
+
+| 情况 | 命令 |
+|---|---|
+| 合并太乱，不想合了 | `git merge --abort` |
+| rebase 中冲突，不想变基了 | `git rebase --abort` |
+| cherry-pick 中冲突 | `git cherry-pick --abort` |
+| revert 中冲突 | `git revert --abort` |
+| 解决错了，想把某个文件退回冲突状态 | `git checkout -m <file>` |
+
+`--abort` 会把仓库完整恢复到操作开始前的状态，非常安全。**卡住时不要慌，先 abort，想清楚再来。**
+
+## 5. 从源头减少冲突
+
+冲突处理再熟练，也不如少产生冲突：
+
+1. **小步提交、频繁合并主线**。一个分支活得越久，冲突面越大。每天把 main 合进来一次，冲突永远是小份的。
+2. **一个分支只做一件事**。功能分支同时改重构、改样式、改配置，冲突概率呈乘法增长。
+3. **约定代码风格并自动化**。格式化差异（缩进、引号、行尾）是最没价值的冲突来源。用 Prettier / gofmt + pre-commit hook（第 16 章）统一，让格式永远不进入冲突。
+4. **别把生成物提交进仓库**。`dist/`、`*.lock` 之外的构建产物、IDE 配置，写进 `.gitignore`（第 12 章）。
+5. **模块化拆分**。所有人都改 `utils.js` 必然天天冲突，拆成职责清晰的多个文件后各改各的。
+6. **提前沟通**。要做大范围重构、重命名，先在群里说一声，让别人先合并或先等等。
+
+<Callout type="tip" title="rerere：让 Git 记住你怎么解决的">
+```bash
+git config --global rerere.enabled true
+```
+
+rerere = **RE**use **RE**corded **RE**solution。开启后 Git 会记录你对每一处冲突的解决方式，下次遇到**完全相同**的冲突时自动套用。
+
+对于长期分支反复 rebase 主线的场景，这个开关能省掉大量重复劳动——同一个冲突你只需要解决一次。它是纯本地的记录，不影响别人，几乎没有副作用，建议直接打开。
+</Callout>
+
+## 6. 冲突处理速查
+
+| 我想…… | 命令 |
+|---|---|
+| 看哪些文件冲突了 | `git status` 或 `git diff --name-only --diff-filter=U` |
+| 看冲突的具体内容 | `git diff`（冲突时显示组合 diff） |
+| 看共同祖先版本 | `git show :1:<file>` |
+| 整个文件用我方 | `git checkout --ours <file>` |
+| 整个文件用对方 | `git checkout --theirs <file>` |
+| 标记某文件已解决 | `git add <file>` |
+| 完成合并 | `git commit`（信息已预填） |
+| 全部放弃 | `git merge --abort` |
+| 让 Git 记住解决方案 | `git config --global rerere.enabled true` |
+| 显示共同祖先 | `git config --global merge.conflictStyle zdiff3` |
+
+## 小结
+
+- 冲突只在**双方改了同一区域**时发生；改不同文件、同文件不同区域都会自动合并
+- 没有冲突 ≠ 合并正确，语义冲突只有测试能发现
+- 冲突标记：`<<<<<<<` 到 `=======` 是 ours，到 `>>>>>>>` 是 theirs；名字为准，别靠记忆
+- 打开 `merge.conflictStyle=zdiff3`，多出来的 base 段能让你看清双方各改了什么
+- 解决流程：编辑文件 → `git add` 标记已解决 → `git commit`
+- 冲突时索引里有 `:1` base / `:2` ours / `:3` theirs 三个版本可取
+- 卡住就 `--abort`，完整回到操作前，零风险
+- 减少冲突靠：勤同步主线、分支职责单一、格式化自动化、模块化拆分
+- 下一章：rebase——另一种"合并"方式 →
+
+<Callout type="exercise" title="练习">
+1. 制造一次冲突，先用默认样式看一遍，再执行 `git checkout --conflict=diff3 <file>` 看一遍，说明多出来的 base 段对你判断有什么帮助。
+2. 在冲突状态下用 `git show :1:` `:2:` `:3:` 分别打印三个版本，并画出这次合并的"祖先-我方-对方"三角关系。
+3. 制造 modify/delete 冲突：一个分支修改文件，另一个分支删除同一文件，然后合并。读懂 Git 给出的提示，并用 `git rm` 或 `git add` 两种方式分别完成解决。
+4. 构造两个分支改同一文件相隔 1 行和相隔 10 行的两种情况，验证前者冲突、后者自动合并，并解释为什么（提示：diff hunk 的上下文行数）。
+</Callout>

@@ -1,0 +1,458 @@
+---
+title: state 与事件
+order: 4
+description: useState 的工作方式、状态更新的异步与批处理、不可变更新的必要性与写法，以及受控组件
+---
+
+# state 与事件
+
+props 是从外面传进来的、只读的数据。state 是组件自己拥有的、可以变化的数据。这一章讲清楚 state 怎么用、怎么改，以及为什么「改」必须是「换成新的」。
+
+## 1. useState 基础
+
+### 1.1 声明与更新
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  return <button onClick={() => setCount(count + 1)}>点了 {count} 次</button>;
+}
+```
+
+`useState` 返回一个长度为 2 的数组：当前值和更新函数。用数组解构是为了让你自由命名（约定是 `x` 和 `setX`）。
+
+初始值只在**首次渲染**时生效。之后每次渲染，`useState` 都会返回 React 保存的最新值，初始值参数会被忽略。
+
+```tsx
+function Bad({ initial }: { initial: number }) {
+  const [count, setCount] = useState(initial);
+  // 父组件把 initial 从 0 改成 10，count 不会变成 10
+  return <span>{count}</span>;
+}
+```
+
+这是新手最常见的困惑之一。如果确实需要「props 变化时重置 state」，用第 2 章讲过的 key 技巧：给组件加 `key={initial}`。
+
+### 1.2 惰性初始化
+
+如果初始值需要昂贵的计算，直接写会导致每次渲染都算一遍（虽然结果被丢弃）：
+
+```tsx
+// 每次渲染都会执行 parseHugeJSON
+const [data, setData] = useState(parseHugeJSON(raw));
+
+// 只在首次渲染执行
+const [data, setData] = useState(() => parseHugeJSON(raw));
+```
+
+传函数进去，React 只会在初始化时调用它一次。规则很好记：**参数位置是「值」就每次算，是「函数」就只算一次**。
+
+### 1.3 更新会触发重新渲染
+
+调用 `setCount` 做了两件事：记录新值、**把组件标记为需要重新渲染**。第二件事是关键——直接改一个普通变量不会触发渲染，这就是为什么必须用 state 而不是普通变量存放「会影响界面的数据」。
+
+反过来说，**不影响界面的数据不该放 state**。比如一个只在事件回调里用到的计时器 id，放 state 只会导致无谓的重渲染，应该用 `useRef`（第 7 章）。
+
+## 2. 更新是异步的（准确说是「批处理的」）
+
+### 2.1 一个经典的坑
+
+```tsx
+function Broken() {
+  const [count, setCount] = useState(0);
+
+  function handleClick() {
+    setCount(count + 1);
+    setCount(count + 1);
+    setCount(count + 1);
+    console.log(count);   // 打印的是 0，不是 3
+  }
+
+  return <button onClick={handleClick}>{count}</button>;
+}
+```
+
+点一次，count 只变成 1，而不是 3。控制台打印的还是旧值 0。
+
+原因：**在一次事件处理的过程中，`count` 是一个被闭包捕获的常量**。这次渲染里它就是 0，三次调用都是 `setCount(0 + 1)`，最后一次生效。而 `console.log(count)` 读的也是这个常量。
+
+<Callout type="info" title="不要说「state 更新是异步的」">
+更准确的说法是：**state 变量在一次渲染中是不变的快照**。React 把一个事件处理函数中的所有更新收集起来，处理完后统一重新渲染一次（这叫批处理）。新值只会在**下一次渲染**中出现。
+
+把它理解成「异步」容易误以为 `await` 一下就能拿到新值——并不能。
+</Callout>
+
+### 2.2 函数式更新
+
+需要基于最新值连续更新时，给 setter 传函数：
+
+```tsx
+function handleClick() {
+  setCount((c) => c + 1);
+  setCount((c) => c + 1);
+  setCount((c) => c + 1);
+  // 结果是 3
+}
+```
+
+React 会把这些「更新函数」排成一个队列，重新渲染前依次执行，每个函数拿到的都是前一个的结果。
+
+什么时候必须用函数式更新？
+
+- 在同一个事件里多次更新同一个 state
+- 在异步回调（setTimeout、Promise、事件监听器）里更新，因为那时的闭包可能已经过期
+- 在 `useEffect` 里更新，可以避免把 state 写进依赖数组（第 5 章会看到这有多重要）
+
+**经验法则：只要新值依赖旧值，就用函数式更新。** 这几乎没有代价，可以作为默认写法。
+
+## 3. 不可变更新
+
+### 3.1 为什么不能直接改
+
+React 判断「state 是否变了」用的是 `Object.is`，也就是**引用比较**，不是深度比较。
+
+```tsx
+const [user, setUser] = useState({ name: "Ada", age: 36 });
+
+function birthday() {
+  user.age += 1;      // 改了，但引用没变
+  setUser(user);      // React: 引用相同，不需要重渲染
+}
+```
+
+界面不会更新。深度比较为什么不可行？因为它的成本是 O(n)，而 React 每次更新都要做无数次这样的比较——引用比较是 O(1)，这是性能上唯一可行的选择。第 12 章讲的 `React.memo` 优化，同样建立在这个前提上。
+
+正确写法是造一个新对象：
+
+```tsx
+function birthday() {
+  setUser({ ...user, age: user.age + 1 });
+}
+```
+
+### 3.2 常见结构的更新写法
+
+| 操作 | 写法 |
+|---|---|
+| 改对象某个字段 | `setU({ ...u, age: 37 })` |
+| 改嵌套字段 | `setU({ ...u, addr: { ...u.addr, city: "杭州" } })` |
+| 数组末尾添加 | `setList([...list, item])` |
+| 数组开头添加 | `setList([item, ...list])` |
+| 删除某项 | `setList(list.filter((x) => x.id !== id))` |
+| 修改某项 | `setList(list.map((x) => (x.id === id ? { ...x, done: true } : x)))` |
+| 插入到中间 | `setList([...list.slice(0, i), item, ...list.slice(i)])` |
+| 排序 | `setList([...list].sort(cmp))` |
+
+要点：`push`、`pop`、`splice`、`sort`、`reverse` 这几个方法会修改原数组，**必须先复制**。而 `map`、`filter`、`slice`、`concat` 返回新数组，可以直接用。
+
+### 3.3 只需要复制「变化路径上的节点」
+
+一个常见误解是「不可变更新要深拷贝整个 state」。不是的——只需要复制从根到被修改节点这条路径上的对象，其他分支可以直接复用引用。
+
+```tsx
+setState({
+  ...state,                       // 复制根
+  user: {
+    ...state.user,                // 复制 user
+    profile: {
+      ...state.user.profile,      // 复制 profile
+      city: "杭州",                // 改这里
+    },
+  },
+  // state.settings 等其他分支保持原引用，未被复制
+});
+```
+
+这个特性是性能优化的基础：没变的子树引用不变，`React.memo` 就能直接跳过它们的重渲染。
+
+### 3.4 亲手验证引用比较
+
+下面这段纯 TypeScript 代码模拟了 React 的判断逻辑：先用「直接修改」的方式改 state，再用「不可变」的方式改，观察 `Object.is` 的结果差异，以及未改动分支的引用是否被保留。
+
+<Playground
+  language="typescript"
+  title="不可变更新与引用比较"
+  id="react-04-1"
+  code={`interface Todo {
+  id: number;
+  title: string;
+  done: boolean;
+}
+
+interface State {
+  todos: Todo[];
+  filter: string;
+}
+
+// React 用来判断「要不要重新渲染」的逻辑，本质就是这一行
+function shouldRerender(prev: unknown, next: unknown): boolean {
+  return !Object.is(prev, next);
+}
+
+function makeState(): State {
+  return {
+    filter: "all",
+    todos: [
+      { id: 1, title: "学 JSX", done: true },
+      { id: 2, title: "学 state", done: false },
+      { id: 3, title: "学 effect", done: false },
+    ],
+  };
+}
+
+// 写法一：直接修改（错误示范）
+function toggleMutable(state: State, id: number): State {
+  for (const t of state.todos) {
+    if (t.id === id) t.done = !t.done;
+  }
+  return state;
+}
+
+// 写法二：不可变更新（正确）
+function toggleImmutable(state: State, id: number): State {
+  return {
+    filter: state.filter,
+    todos: state.todos.map(function (t) {
+      if (t.id !== id) return t;
+      return { id: t.id, title: t.title, done: !t.done };
+    }),
+  };
+}
+
+const s1 = makeState();
+const s2 = toggleMutable(s1, 2);
+console.log("[直接修改] 数据变了吗: " + (s2.todos[1].done === true));
+console.log("[直接修改] React 会重渲染吗: " + shouldRerender(s1, s2));
+
+const s3 = makeState();
+const s4 = toggleImmutable(s3, 2);
+console.log("[不可变] 数据变了吗: " + (s4.todos[1].done === true));
+console.log("[不可变] React 会重渲染吗: " + shouldRerender(s3, s4));
+
+// 关键：没被修改的那些项，引用是复用的
+console.log("--- 逐项引用比较 ---");
+for (let i = 0; i < s3.todos.length; i++) {
+  const same = Object.is(s3.todos[i], s4.todos[i]);
+  console.log("todo#" + s3.todos[i].id + " 引用未变: " + same);
+}
+
+console.log("只有被修改的那一项换了新对象，其余可被 memo 跳过");`}
+  expectedOutput={`[直接修改] 数据变了吗: true\n[直接修改] React 会重渲染吗: false\n[不可变] 数据变了吗: true\n[不可变] React 会重渲染吗: true\n--- 逐项引用比较 ---\ntodo#1 引用未变: true\ntodo#2 引用未变: false\ntodo#3 引用未变: true\n只有被修改的那一项换了新对象，其余可被 memo 跳过`}
+/>
+
+第一组输出是最值得琢磨的：数据明明改对了，但 React 判断「没变」，界面纹丝不动。这就是「改了 state 但界面不更新」这类问题的根源。
+
+<Callout type="tip" title="嵌套太深就用 Immer">
+当 state 嵌套超过三层，手写展开运算符会变得又长又容易出错。Immer 库允许你用「看起来像直接修改」的写法，底层自动生成不可变的新对象。Redux Toolkit 和 Zustand 都内置了它。
+
+但即使用了 Immer，也要理解背后的原理——否则遇到「为什么这里改了不生效」时会完全无从下手。
+</Callout>
+
+## 4. 事件处理
+
+### 4.1 合成事件
+
+React 的事件属性用驼峰命名，值传函数而不是字符串：
+
+```tsx
+<button onClick={handleClick}>点击</button>
+<input onChange={handleChange} onFocus={handleFocus} />
+<form onSubmit={handleSubmit}>
+```
+
+传入的事件对象是 React 包装过的 **SyntheticEvent**，抹平了浏览器差异，API 和原生基本一致：`e.target`、`e.preventDefault()`、`e.stopPropagation()` 都能用。需要原生对象时读 `e.nativeEvent`。
+
+React 17 起，事件监听器挂在渲染根节点上（不是 document），通过冒泡统一分发。这个实现细节在需要和第三方库混用时才会遇到，日常可以忽略。
+
+### 4.2 传参数的两种写法
+
+```tsx
+// 用箭头函数包一层
+<button onClick={() => remove(item.id)}>删除</button>
+
+// 用柯里化（函数返回函数）
+const handleRemove = (id: string) => () => remove(id);
+<button onClick={handleRemove(item.id)}>删除</button>
+```
+
+第一种更常见也更直观。有人担心「箭头函数每次渲染都新建，会影响性能」——绝大多数情况下这个开销可以忽略，只有在配合 `React.memo` 的场景下才需要用 `useCallback` 处理（第 7、12 章会详细分析）。
+
+### 4.3 阻止默认行为
+
+```tsx
+function Form() {
+  const [email, setEmail] = useState("");
+
+  function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();          // 阻止表单跳转刷新
+    submit(email);
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input value={email} onChange={(e) => setEmail(e.target.value)} />
+      <button type="submit">提交</button>
+    </form>
+  );
+}
+```
+
+注意 React 里**不能通过 return false 阻止默认行为**，必须显式调用 `preventDefault`。
+
+## 5. 受控组件
+
+### 5.1 什么是受控
+
+表单元素的值由 React state 控制，就叫受控组件：
+
+```tsx
+const [name, setName] = useState("");
+
+<input value={name} onChange={(e) => setName(e.target.value)} />
+```
+
+数据流是一个闭环：state 决定输入框显示什么 → 用户输入触发 onChange → 更新 state → 重新渲染 → 输入框显示新值。
+
+这个闭环让你可以在任何环节插手：
+
+```tsx
+// 强制转大写
+onChange={(e) => setCode(e.target.value.toUpperCase())}
+
+// 限制长度和字符
+onChange={(e) => setPhone(e.target.value.replace(/\D/g, "").slice(0, 11))}
+```
+
+<Callout type="warn" title="传了 value 却不传 onChange">
+`<input value={name} />` 而没有 onChange，输入框会变成只读——因为每次输入后重新渲染，值又被拽回 state 的值。React 开发模式会打印警告。
+
+如果确实要只读，写 `readOnly`；如果只想设置初始值后不再管，用 `defaultValue`（非受控）。
+</Callout>
+
+### 5.2 各类表单元素
+
+```tsx
+// 文本框 / 文本域
+<input value={text} onChange={(e) => setText(e.target.value)} />
+<textarea value={text} onChange={(e) => setText(e.target.value)} />
+
+// 复选框：读 checked 而不是 value
+<input type="checkbox" checked={agree} onChange={(e) => setAgree(e.target.checked)} />
+
+// 下拉：value 放在 select 上，不是 option 上
+<select value={city} onChange={(e) => setCity(e.target.value)}>
+  <option value="hz">杭州</option>
+  <option value="sh">上海</option>
+</select>
+
+// 单选组：靠 checked 判断
+<input type="radio" value="a" checked={pick === "a"} onChange={(e) => setPick(e.target.value)} />
+```
+
+第 8 章会系统讲多字段表单、校验和非受控写法。
+
+### 5.3 一个完整的例子
+
+```tsx
+type Todo = { id: string; title: string; done: boolean };
+
+function TodoApp() {
+  const [todos, setTodos] = useState<Todo[]>([]);
+  const [draft, setDraft] = useState("");
+
+  function add() {
+    const title = draft.trim();
+    if (!title) return;
+    setTodos((prev) => [...prev, { id: crypto.randomUUID(), title, done: false }]);
+    setDraft("");
+  }
+
+  function toggle(id: string) {
+    setTodos((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t))
+    );
+  }
+
+  function remove(id: string) {
+    setTodos((prev) => prev.filter((t) => t.id !== id));
+  }
+
+  const remaining = todos.filter((t) => !t.done).length;
+
+  return (
+    <div>
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && add()}
+      />
+      <button onClick={add} disabled={!draft.trim()}>添加</button>
+
+      <ul>
+        {todos.map((t) => (
+          <li key={t.id}>
+            <input type="checkbox" checked={t.done} onChange={() => toggle(t.id)} />
+            <span className={t.done ? "done" : ""}>{t.title}</span>
+            <button onClick={() => remove(t.id)}>删除</button>
+          </li>
+        ))}
+      </ul>
+
+      <p>还剩 {remaining} 项</p>
+    </div>
+  );
+}
+```
+
+注意 `remaining` 不是 state，而是**从 state 算出来的**。这是一条重要原则：**能推导出来的值就不要单独存**，否则你就要负责在每次 todos 变化时同步它，又回到了第 1 章说的「两份真相」。
+
+## 6. 设计 state 的几条原则
+
+1. **不存冗余数据**：能从 props 或其他 state 算出来的，就现算
+2. **不存重复数据**：不要同时存 `selectedItem` 对象和 `items` 数组，只存 `selectedId`
+3. **避免深层嵌套**：扁平化的结构更新起来简单得多，必要时用 id 映射代替嵌套数组
+4. **相关的 state 放一起**：如果两个 state 总是同时变化，考虑合并成一个对象或用 `useReducer`（第 10 章）
+5. **避免矛盾状态**：不要同时有 `isLoading` 和 `isError` 两个布尔（可能同时为 true），用一个 `status` 联合类型
+
+<Callout type="exercise" title="练习 1：预测输出">
+```tsx
+const [n, setN] = useState(0);
+
+function click() {
+  setN(n + 1);
+  setN((v) => v + 10);
+  setN(n + 100);
+}
+```
+点击一次后，n 的值是多少？完整推理三次调用分别往队列里放了什么，以及队列是怎么被消费的。
+</Callout>
+
+<Callout type="exercise" title="练习 2：写不可变更新">
+state 结构是：一个包含 `boards` 数组的对象，每个 board 有 `id` 和 `columns` 数组，每个 column 有 `id` 和 `cards` 数组。
+
+写出「往 board=b1 的 column=c2 里追加一张新卡片」的不可变更新代码，并说明哪些对象被复制了、哪些保持了原引用。
+</Callout>
+
+<Callout type="exercise" title="练习 3：消除冗余 state">
+某组件有这些 state：`items`、`filteredItems`、`filterText`、`itemCount`、`hasItems`、`selectedItem`、`selectedIndex`。
+
+指出哪些是冗余的，重新设计一套最小 state 集合，并写出被删掉的那些值该如何计算得到。
+</Callout>
+
+<Callout type="exercise" title="练习 4：改造 Playground">
+在本章 Playground 里加一个 `addTodo` 函数，要求返回新 state 且保持所有原有 todo 的引用不变。
+
+然后写一个 `countReused(prev, next)` 函数统计有多少项引用被复用了，验证追加一项后复用数等于原数组长度。
+</Callout>
+
+## 小结
+
+- `useState` 的初始值只在首次渲染生效；昂贵计算用惰性初始化（传函数）
+- state 变量在一次渲染中是**不变的快照**；更新会被批处理，新值在下次渲染才出现
+- 新值依赖旧值时用**函数式更新**，这应该成为默认习惯
+- React 用 `Object.is` 做引用比较，所以必须**不可变更新**——只复制变化路径上的节点，其余复用引用
+- 事件用驼峰命名 + 函数值；阻止默认行为必须调 `preventDefault`
+- 受控组件让 state 成为输入值的唯一来源，从而能在中途拦截和转换
+- state 设计原则：不冗余、不重复、不嵌套、不矛盾
+- 下一章讲副作用：useEffect →

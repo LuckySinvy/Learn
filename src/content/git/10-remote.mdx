@@ -1,0 +1,352 @@
+---
+title: 远程仓库：clone、fetch、pull、push 与跟踪分支
+order: 10
+description: 远程跟踪分支到底是什么、fetch 与 pull 的区别、push 被拒绝时怎么办
+---
+
+# 远程仓库：clone、fetch、pull、push 与跟踪分支
+
+到目前为止所有操作都在本地完成。这一章把 Git 接上网——虽然沙箱**没有外网**，但 Git 的远程仓库可以是任意路径，我们用一个**本地裸仓库**当"远程"，所有命令、所有输出都和真实的 GitHub 协作一模一样。
+
+## 1. 远程仓库其实就是另一个仓库
+
+Git 的 remote 只是一个"地址别名"。地址可以是：
+
+| 协议 | 示例 |
+|---|---|
+| HTTPS | `https://github.com/user/repo.git` |
+| SSH | `git@github.com:user/repo.git` |
+| 本地路径 | `/srv/git/repo.git` 或 `../other-repo` |
+| Git 协议 | `git://example.com/repo.git`（无认证，只读，已少见） |
+
+服务端的仓库通常是**裸仓库**（bare repository）：没有工作区，只有 `.git` 里的那些内容。因为没人会在服务器上直接编辑文件，工作区纯属浪费，而且如果有工作区，别人往它当前分支推送会造成状态混乱。
+
+<Playground
+  language="git"
+  title="用本地裸仓库完整模拟一次远程协作"
+  id="git-10-1"
+  code={`echo '===== 1. 造一个「远程」：裸仓库 ====='
+git init -q --bare /tmp/origin.git
+echo '裸仓库里没有工作区，直接就是 .git 的内容：'
+ls /tmp/origin.git
+echo
+
+echo '===== 2. 本地仓库关联并推送 ====='
+git init -q local && cd local
+echo 'hello' > README.md && git add . && git commit -q -m "docs: 初始 README"
+git remote add origin /tmp/origin.git
+git remote -v
+git push -u origin main 2>&1 | grep -v -E 'Counting|Writing|Enumerating|Total'
+echo
+echo '-u 建立了跟踪关系（方括号里就是上游分支）：'
+git branch -vv
+cd ..
+echo
+
+echo '===== 3. 另一个人 clone ====='
+git clone -q /tmp/origin.git bob
+cd bob
+echo 'bob 拿到了完整历史：'
+git log --oneline
+echo
+echo 'clone 自动配好了 remote：'
+git remote -v
+echo '也自动建立了跟踪关系：'
+git branch -vv
+echo '所有分支（含远程跟踪分支）：'
+git branch -a
+cd ..`}
+/>
+
+### remote 的管理命令
+
+```bash
+git remote -v                                  # 查看所有远程
+git remote add origin <url>                    # 添加
+git remote rename origin upstream              # 改名
+git remote remove origin                       # 删除
+git remote set-url origin <new-url>            # 换地址（HTTPS 转 SSH 常用）
+git remote show origin                         # 详细信息：分支映射、跟踪关系
+```
+
+`origin` 只是一个默认的名字约定，不是关键字。开源项目常见的双 remote 配置：
+
+```bash
+git remote add origin   git@github.com:me/project.git       # 我的 fork
+git remote add upstream git@github.com:official/project.git # 上游官方
+```
+
+## 2. 远程跟踪分支：Git 的"上次看到的样子"
+
+这是新手最容易懵的概念。执行 `git clone` 后 `git branch -a` 会看到：
+
+```text
+* main                          <- 本地分支，你能提交
+  remotes/origin/main           <- 远程跟踪分支，只读快照
+  remotes/origin/HEAD -> origin/main
+```
+
+**`origin/main` 不是远程仓库上的 main**，而是**你上次和远程通信时，远程 main 所在的位置**。它是一个本地的、只读的书签。你不能在它上面提交，它只有在 `fetch` / `pull` / `push` 时才会更新。
+
+```text
+     远程仓库（真实状态，可能随时被别人推新提交）
+           |
+           |  只在 fetch / pull / push 时同步
+           v
+     origin/main   <- 远程跟踪分支（本地缓存，你上次看到的样子）
+           
+     main          <- 你的本地分支
+```
+
+理解这一点，就能解释为什么 `git status` 能在**离线**状态下告诉你 "Your branch is ahead of 'origin/main' by 2 commits"——它比较的是本地 main 和本地缓存的 origin/main，根本没联网。
+
+### 跟踪关系（upstream）
+
+本地分支可以"跟踪"一个远程分支，建立跟踪后：
+
+- `git status` 会显示 ahead/behind
+- `git pull` / `git push` 不用写参数
+- `git branch -vv` 会在方括号里显示上游
+
+```bash
+git push -u origin main                   # -u 建立跟踪（首次推送）
+git branch --set-upstream-to=origin/main  # 事后建立
+git branch -vv                            # 查看
+```
+
+## 3. fetch vs pull
+
+这是本章最重要的区分：
+
+| | fetch | pull |
+|---|---|---|
+| 下载远程新提交 | 是 | 是 |
+| 更新 `origin/main` | 是 | 是 |
+| 修改你的本地分支 | **否** | **是** |
+| 修改工作区文件 | **否** | **是** |
+| 安全性 | 绝对安全 | 可能产生冲突/合并提交 |
+
+**`git pull` = `git fetch` + `git merge origin/main`**（或 `rebase`）。
+
+<Playground
+  language="git"
+  title="fetch 只下载不合并"
+  id="git-10-2"
+  code={`git init -q --bare /tmp/origin.git
+git clone -q /tmp/origin.git alice
+cd alice && echo 'v1' > app.txt && git add . && git commit -q -m "feat: 初版"
+git push -q -u origin main 2>/dev/null && cd ..
+git clone -q /tmp/origin.git bob
+
+echo '===== bob 干活并推送 ====='
+cd bob && echo 'bob-change' > bob.txt && git add . && git commit -q -m "feat: bob 的改动"
+git push -q origin main 2>/dev/null && cd ..
+
+echo '===== alice 此时还不知道远程有更新 ====='
+cd alice
+git log --oneline --all
+echo
+
+echo '===== git fetch：只下载，不动本地分支和工作区 ====='
+git fetch origin 2>/dev/null
+echo 'fetch 之后的全部提交：'
+git log --oneline --all --graph
+echo
+echo '工作区文件（bob.txt 还没出现！）：'
+ls
+echo
+echo '本地 main 与 origin/main 的关系：'
+git status -sb
+echo
+echo '远程比我多了什么：'
+git log --oneline main..origin/main
+echo
+
+echo '===== git merge origin/main 才真正合并进来 ====='
+git merge origin/main
+ls
+echo
+git status -sb
+echo '(这两步合起来就等于 git pull)'
+cd ..`}
+/>
+
+<Callout type="tip" title="养成先 fetch 后看的习惯">
+```bash
+git fetch                          # 安全地把远程状态拉到本地缓存
+git log --oneline main..origin/main   # 看看别人做了什么
+git diff main origin/main          # 看看具体改了哪些代码
+git merge origin/main              # 确认没问题再合并
+```
+
+尤其是在长期分支上、或者远程有大量变更时，直接 `git pull` 可能让你瞬间陷入一堆冲突，而 fetch 让你有机会先评估再决定。
+</Callout>
+
+## 4. push 被拒绝，以及两种解决方式
+
+push 的前提是**能 fast-forward**：远程分支的最新提交必须是你本地历史的祖先。如果别人先推了，你的 push 会被拒绝。
+
+<Playground
+  language="git"
+  title="push 被拒绝：pull（merge）与 pull --rebase 的差别"
+  id="git-10-3"
+  code={`git init -q --bare /tmp/origin.git
+git clone -q /tmp/origin.git alice
+cd alice && echo 'v1' > app.txt && git add . && git commit -q -m "feat: 初版"
+git push -q -u origin main 2>/dev/null && cd ..
+git clone -q /tmp/origin.git bob
+
+echo '===== bob 先推了一个提交 ====='
+cd bob && echo 'bob' > bob.txt && git add . && git commit -q -m "feat: bob 的提交"
+git push -q origin main 2>/dev/null && cd ..
+
+echo '===== alice 也在本地提交了（还不知道 bob 推过）====='
+cd alice && echo 'alice' > alice.txt && git add . && git commit -q -m "feat: alice 的提交"
+echo
+echo '===== alice 直接 push -> 被拒绝 ====='
+git push origin main 2>&1 | head -8
+echo
+
+echo '===== 方案一：git pull（merge 模式）====='
+git -c pull.rebase=false pull --no-edit origin main 2>/dev/null
+git log --oneline --graph -5
+echo '(多了一个 Merge branch 提交，历史有了分叉气泡)'
+echo
+
+echo '===== 方案二：回退重来，改用 pull --rebase ====='
+git reset -q --hard HEAD~1
+git -c pull.rebase=true pull origin main 2>/dev/null
+echo '历史变成一条直线：'
+git log --oneline --graph -5
+echo
+git push -q origin main 2>/dev/null
+echo 'push 成功，远程最终历史：'
+git log --oneline origin/main
+cd ..`}
+/>
+
+对比两种结果：
+
+```text
+pull（merge 模式）：
+   *   7dbbd55 Merge branch 'main' of /tmp/origin
+   |\
+   | * d8ff6f0 feat: bob 的提交
+   * | c95e98e feat: alice 的提交
+   |/
+   * fa92190 feat: 初版
+
+pull --rebase：
+   * 203f661 feat: alice 的提交       <- 被重放到 bob 之后
+   * d8ff6f0 feat: bob 的提交
+   * fa92190 feat: 初版
+```
+
+merge 模式在多人频繁提交的仓库里会制造大量 "Merge branch 'main' of github.com:..." 的垃圾提交，把历史图搅成毛线团。**建议全局改成 rebase 模式：**
+
+```bash
+git config --global pull.rebase true
+```
+
+这里 rebase 的对象是你**本地还没推送**的提交，不违反第 7 章的黄金法则。
+
+<Callout type="warn" title="不要用 git push --force 解决被拒绝">
+看到 rejected 就 `--force` 是新手最危险的习惯：它会把别人推上去的提交**直接从远程删除**，对方的工作凭空消失。
+
+- 正确做法：`git pull --rebase` 然后正常 push
+- 确实需要强推（例如整理过自己的分支）：只用 `git push --force-with-lease`，它会在远程状态与你的预期不符时拒绝执行
+</Callout>
+
+## 5. push 的各种姿势
+
+```bash
+git push                              # 推当前分支到其跟踪的上游
+git push origin main                  # 显式指定
+git push -u origin feature/login      # 首次推送新分支并建立跟踪
+git push origin --all                 # 推所有分支
+git push origin --tags                # 推所有标签（第 11 章）
+git push origin --delete feature/x    # 删除远程分支
+git push origin :feature/x            # 同上，老写法
+git push --force-with-lease           # 安全的强推
+```
+
+删除远程分支后，其他人本地的 `origin/feature/x` 不会自动消失，需要：
+
+```bash
+git fetch --prune          # 清理已在远程删除的跟踪分支
+git config --global fetch.prune true   # 设为默认
+```
+
+## 6. clone 的选项
+
+```bash
+git clone <url>                       # 完整克隆
+git clone <url> mydir                 # 指定目录名
+git clone -b develop <url>            # 克隆并检出指定分支
+git clone --depth 1 <url>             # 浅克隆：只要最近 1 个提交（CI 常用，快很多）
+git clone --filter=blob:none <url>    # 部分克隆：先不下载文件内容，用到再取
+git clone --single-branch -b main <url>  # 只克隆一个分支
+```
+
+浅克隆的仓库缺少历史，`git log` 看不全、`git blame` 不准，也不能推送某些操作。需要补全时：
+
+```bash
+git fetch --unshallow
+```
+
+## 7. 认证方式
+
+<Callout type="info" title="HTTPS vs SSH（沙箱内无法演示）">
+**SSH（推荐）**：生成密钥对，把公钥贴到 GitHub 设置里。
+
+```bash
+ssh-keygen -t ed25519 -C "you@example.com"
+cat ~/.ssh/id_ed25519.pub          # 复制到 GitHub -> Settings -> SSH keys
+ssh -T git@github.com              # 测试连通
+```
+
+**HTTPS**：需要 Personal Access Token（GitHub 已不支持密码）。配合凭证助手避免每次输入：
+
+```bash
+git config --global credential.helper store      # 明文存文件（不安全）
+git config --global credential.helper osxkeychain # macOS 钥匙串
+git config --global credential.helper manager     # Windows
+```
+
+**已有仓库从 HTTPS 换成 SSH：**
+
+```bash
+git remote set-url origin git@github.com:user/repo.git
+```
+</Callout>
+
+## 8. 常见远程问题速查
+
+| 问题 | 原因 | 解决 |
+|---|---|---|
+| `! [rejected] (fetch first)` | 远程有你没有的提交 | `git pull --rebase` 后再 push |
+| `! [rejected] (non-fast-forward)` | 你改写了历史 | 确认安全后 `--force-with-lease` |
+| `fatal: refusing to merge unrelated histories` | 两个仓库没有共同祖先 | `git pull --allow-unrelated-histories` |
+| `Permission denied (publickey)` | SSH 密钥没配好 | `ssh -T git@github.com` 排查 |
+| `git status` 显示 behind 但 pull 没反应 | 缓存的 `origin/main` 过期 | `git fetch` 更新 |
+| 远程分支已删除但本地还看得到 | 跟踪分支没清理 | `git fetch --prune` |
+| pull 之后多了一堆 Merge 提交 | pull 用的 merge 模式 | `git config --global pull.rebase true` |
+
+## 小结
+
+- remote 只是一个地址别名，地址可以是 URL 也可以是本地路径；服务端一般用**裸仓库**
+- `origin/main` 是**远程跟踪分支**——你上次通信时远程的样子，是本地只读缓存
+- 因为有这个缓存，`git status` 的 ahead/behind 判断是离线完成的
+- `git fetch` 只更新缓存，绝对安全；`git pull` = fetch + merge/rebase，会动工作区
+- 推荐流程：`fetch` → `log main..origin/main` 看一眼 → 再决定合并
+- push 被拒绝说明远程有新提交，用 `pull --rebase` 而不是 `--force`
+- 全局建议：`pull.rebase true` + `fetch.prune true`
+- 强推只用 `--force-with-lease`
+- 下一章：tag 与版本发布 →
+
+<Callout type="exercise" title="练习">
+1. 用 `git init --bare /tmp/myorigin.git` 造一个远程，克隆两份（模拟两个人），让其中一个推送提交，另一个用 `git fetch` 后观察 `git status -sb` 的 behind 提示，然后用 `git log main..origin/main` 看远程多了什么。
+2. 在同一个实验里制造 push 被拒绝，分别用 `pull`（merge）和 `pull --rebase` 解决，对比 `git log --graph` 的形状。
+3. 解释：为什么 `git status` 显示 "behind 3 commits" 时，我在断网状态下也能看到这个提示？它比较的是哪两个东西？
+4. 用 `git push origin --delete <branch>` 删除一个远程分支，然后在另一个克隆里执行 `git branch -a`，观察它是否还显示。用什么命令清理？
+</Callout>

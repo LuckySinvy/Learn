@@ -1,0 +1,443 @@
+---
+title: 表单处理
+order: 8
+description: 受控与非受控的取舍、多字段状态管理、校验时机与错误展示、提交流程，以及表单库解决了什么
+---
+
+# 表单处理
+
+表单是前端最琐碎也最容易写乱的部分：十几个字段、各自的校验规则、什么时候提示错误、提交时怎么防重复、失败了怎么回填。这一章给出一套可以直接用的做法。
+
+## 1. 受控与非受控
+
+### 1.1 两种模式
+
+**受控**：值存在 React state 里，输入框显示的是 state 的值。
+
+```tsx
+const [name, setName] = useState("");
+<input value={name} onChange={(e) => setName(e.target.value)} />
+```
+
+**非受控**：值存在 DOM 自己身上，React 只在需要时去读。
+
+```tsx
+const nameRef = useRef<HTMLInputElement>(null);
+<input ref={nameRef} defaultValue="" />
+// 提交时才读：nameRef.current?.value
+```
+
+### 1.2 怎么选
+
+| 需求 | 受控 | 非受控 |
+|---|---|---|
+| 输入时实时校验、实时联动 | 适合 | 做不到 |
+| 根据输入内容禁用按钮 | 适合 | 麻烦 |
+| 格式化输入（自动加空格、转大写） | 适合 | 做不到 |
+| 超长表单（50+ 字段）的性能 | 每次输入都重渲染 | 无渲染开销 |
+| 文件上传 input | **不支持**（只读属性） | 必须用 |
+| 集成非 React 的第三方组件 | 麻烦 | 适合 |
+| 代码量 | 多 | 少 |
+
+**默认选受控**。它让 state 成为唯一数据源，行为可预测，也和 React 的心智模型一致。只有在遇到性能瓶颈（真实测量出来的，不是想象的）或者必须用非受控的场景（文件输入）时才切换。
+
+<Callout type="warn" title="受控与非受控不能中途切换">
+`value` 从 `undefined` 变成有值（或反过来），React 会警告「组件正在从非受控变为受控」。
+
+根源通常是初始值来自异步数据：`useState(user?.name)` 在数据没回来时是 `undefined`。修复办法是保证初始值永远不是 undefined：`useState(user?.name ?? "")`。
+</Callout>
+
+### 1.3 非受控 + 一次性读取
+
+对于简单的提交型表单，非受控其实很优雅：
+
+```tsx
+function LoginForm({ onLogin }: Props) {
+  function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const data = new FormData(e.currentTarget);
+    onLogin({
+      email: String(data.get("email")),
+      password: String(data.get("password")),
+    });
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input name="email" type="email" required />
+      <input name="password" type="password" required minLength={8} />
+      <button type="submit">登录</button>
+    </form>
+  );
+}
+```
+
+零 state、零重渲染，还免费获得了浏览器原生校验（`required`、`minLength`、`type="email"`）。表单简单时这是最省事的写法。
+
+## 2. 多字段状态管理
+
+### 2.1 一个 state 存一个对象
+
+字段多了以后，写十几个 `useState` 会很啰嗦。用一个对象：
+
+```tsx
+type Form = {
+  name: string;
+  email: string;
+  age: number;
+  subscribe: boolean;
+};
+
+const [form, setForm] = useState<Form>({
+  name: "",
+  email: "",
+  age: 18,
+  subscribe: false,
+});
+
+function update<K extends keyof Form>(key: K, value: Form[K]) {
+  setForm((prev) => ({ ...prev, [key]: value }));
+}
+
+// 使用
+<input value={form.name} onChange={(e) => update("name", e.target.value)} />
+<input
+  type="checkbox"
+  checked={form.subscribe}
+  onChange={(e) => update("subscribe", e.target.checked)}
+/>
+```
+
+`update` 用泛型约束保证了 key 和 value 的类型匹配：写 `update("age", "abc")` 会在编译期报错。这是类型化表单里最值钱的一个技巧。
+
+### 2.2 用 name 属性统一处理
+
+如果字段都是文本类型，可以再简化：
+
+```tsx
+function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
+  const { name, value, type, checked } = e.target;
+  setForm((prev) => ({
+    ...prev,
+    [name]: type === "checkbox" ? checked : value,
+  }));
+}
+
+<input name="name" value={form.name} onChange={handleChange} />
+<input name="email" value={form.email} onChange={handleChange} />
+```
+
+代价是失去了类型安全（`name` 是字符串，TS 无法保证它是 Form 的键）。字段多且规则统一时可以接受，否则还是前一种写法更稳。
+
+### 2.3 复杂表单用 useReducer
+
+当表单有联动逻辑（选了 A 就清空 B、切换类型时重置一批字段），`useReducer` 比多个 setState 清晰得多：
+
+```tsx
+type Action =
+  | { type: "change"; key: keyof Form; value: unknown }
+  | { type: "changeCountry"; value: string }
+  | { type: "reset" };
+
+function reducer(state: Form, action: Action): Form {
+  switch (action.type) {
+    case "change":
+      return { ...state, [action.key]: action.value };
+    case "changeCountry":
+      // 换国家时，省市要一起清空 —— 这种联动写在 reducer 里最清楚
+      return { ...state, country: action.value, province: "", city: "" };
+    case "reset":
+      return initialForm;
+  }
+}
+```
+
+第 10 章会系统讲 `useReducer`。
+
+## 3. 校验
+
+### 3.1 校验时机
+
+这是表单体验的核心问题。四种时机：
+
+| 时机 | 体验 | 建议 |
+|---|---|---|
+| 输入时（onChange） | 刚打第一个字就报「格式错误」，很烦 | 只用于「已经错过一次」的字段 |
+| 失焦时（onBlur） | 用户填完一项才提示，体验好 | **推荐的默认时机** |
+| 提交时 | 一次性暴露所有问题 | 必须有，作为最后防线 |
+| 实时（防抖） | 适合需要查服务端的校验（用户名占用） | 配合防抖使用 |
+
+业界公认的最佳组合是：**首次校验在失焦时，之后改为输入时实时校验**。这样既不会打断填写，又能在用户修正错误时立刻给出正反馈。
+
+实现上需要记录每个字段是否「被碰过」：
+
+```tsx
+const [values, setValues] = useState(initial);
+const [touched, setTouched] = useState<Record<string, boolean>>({});
+const [errors, setErrors] = useState<Record<string, string>>({});
+
+function handleBlur(key: string) {
+  setTouched((t) => ({ ...t, [key]: true }));
+  setErrors((e) => ({ ...e, [key]: validateField(key, values) }));
+}
+
+function handleChange(key: string, value: string) {
+  const next = { ...values, [key]: value };
+  setValues(next);
+  // 只有已经碰过的字段才实时校验
+  if (touched[key]) {
+    setErrors((e) => ({ ...e, [key]: validateField(key, next) }));
+  }
+}
+
+// 展示时同时看 touched 和 errors
+{touched.email && errors.email && <span className="err">{errors.email}</span>}
+```
+
+### 3.2 校验规则的组织
+
+把规则写成纯函数，和组件解耦：
+
+```tsx
+type Validator = (value: string, all: Form) => string | null;
+
+const required = (msg = "必填"): Validator => (v) => (v.trim() ? null : msg);
+
+const minLen = (n: number): Validator => (v) =>
+  v.length >= n ? null : "至少 " + n + " 个字符";
+
+const isEmail: Validator = (v) =>
+  /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v) ? null : "邮箱格式不正确";
+
+const sameAs = (key: keyof Form, msg: string): Validator => (v, all) =>
+  v === all[key] ? null : msg;
+
+const rules: Record<string, Validator[]> = {
+  email: [required(), isEmail],
+  password: [required(), minLen(8)],
+  confirm: [required(), sameAs("password", "两次输入不一致")],
+};
+
+function validateField(key: string, all: Form): string {
+  for (const rule of rules[key] ?? []) {
+    const err = rule(String(all[key as keyof Form] ?? ""), all);
+    if (err) return err;
+  }
+  return "";
+}
+
+function validateAll(all: Form): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of Object.keys(rules)) {
+    const err = validateField(key, all);
+    if (err) out[key] = err;
+  }
+  return out;
+}
+```
+
+规则是纯函数，可以单独写单元测试，也能在服务端复用。
+
+### 3.3 用 schema 库
+
+手写规则到一定规模后，推荐用 Zod 这类 schema 库——它同时给你**运行时校验**和**类型推导**：
+
+```tsx
+import { z } from "zod";
+
+const schema = z.object({
+  email: z.string().email("邮箱格式不正确"),
+  password: z.string().min(8, "至少 8 位"),
+  age: z.coerce.number().int().min(18, "需年满 18 岁"),
+});
+
+type Form = z.infer<typeof schema>;   // 类型自动推导出来
+
+function validate(data: unknown) {
+  const result = schema.safeParse(data);
+  if (result.success) return { ok: true as const, data: result.data };
+
+  const errors: Record<string, string> = {};
+  for (const issue of result.error.issues) {
+    errors[String(issue.path[0])] = issue.message;
+  }
+  return { ok: false as const, errors };
+}
+```
+
+一份 schema 同时承担类型定义、前端校验、接口响应校验三个职责——这是它最大的价值。
+
+## 4. 提交流程
+
+### 4.1 完整的提交处理
+
+```tsx
+type Status = "idle" | "submitting" | "success" | "error";
+
+function SignupForm() {
+  const [values, setValues] = useState(initial);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [status, setStatus] = useState<Status>("idle");
+  const [serverError, setServerError] = useState("");
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (status === "submitting") return;    // 防重复提交
+
+    const found = validateAll(values);
+    if (Object.keys(found).length > 0) {
+      setErrors(found);
+      // 滚动到第一个错误字段，这个细节能显著提升体验
+      document.querySelector("[data-error]")?.scrollIntoView({ block: "center" });
+      return;
+    }
+
+    setStatus("submitting");
+    setServerError("");
+
+    try {
+      await api.signup(values);
+      setStatus("success");
+    } catch (err) {
+      setStatus("error");
+      setServerError(err instanceof Error ? err.message : "提交失败，请重试");
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} noValidate>
+      {/* 字段们 */}
+      {serverError && <div role="alert">{serverError}</div>}
+      <button type="submit" disabled={status === "submitting"}>
+        {status === "submitting" ? "提交中…" : "注册"}
+      </button>
+    </form>
+  );
+}
+```
+
+几个容易漏掉的点：
+
+- **防重复提交**：提交中直接 return，同时禁用按钮（两层保险，因为回车键能绕过禁用的按钮）
+- **`noValidate`**：关掉浏览器原生校验气泡，用自己的错误提示（否则两套提示会打架）
+- **服务端错误单独存**：字段级错误和整体错误是两回事
+- **滚动到第一个错误**：长表单里这个细节非常重要
+
+### 4.2 服务端返回的字段错误
+
+后端返回 422 带字段错误时，把它合并进 errors：
+
+```tsx
+catch (err) {
+  if (err instanceof ApiError && err.status === 422) {
+    setErrors((prev) => ({ ...prev, ...err.fieldErrors }));
+  } else {
+    setServerError("网络异常");
+  }
+}
+```
+
+<Callout type="warn" title="前端校验不能替代后端校验">
+前端校验是**体验优化**，不是安全措施。任何人都能绕过它直接调接口。后端必须独立做一遍完整校验——这不是重复劳动，是两个不同层次的职责。
+</Callout>
+
+## 5. 无障碍与体验细节
+
+这部分经常被忽略，但成本很低、收益很高：
+
+```tsx
+<div>
+  <label htmlFor="email">邮箱</label>
+  <input
+    id="email"
+    name="email"
+    type="email"
+    value={values.email}
+    onChange={...}
+    onBlur={...}
+    aria-invalid={Boolean(errors.email)}
+    aria-describedby={errors.email ? "email-err" : undefined}
+    autoComplete="email"
+  />
+  {errors.email && (
+    <span id="email-err" role="alert" data-error>
+      {errors.email}
+    </span>
+  )}
+</div>
+```
+
+要点：
+
+- **label 的 htmlFor 关联 input 的 id**：点击标签能聚焦输入框，屏幕阅读器能念出字段名
+- **`aria-invalid` 和 `aria-describedby`**：让辅助技术知道哪个字段错了、错误信息在哪
+- **`role="alert"`**：错误出现时屏幕阅读器会主动播报
+- **`autoComplete`**：让浏览器和密码管理器正确填充，用户体验提升巨大
+- **输入类型**：手机号用 `type="tel"`、数字用 `inputMode="numeric"`，移动端会弹出合适的键盘
+
+## 6. 什么时候该上表单库
+
+自己写到上面这个程度，代码量已经不小了。React Hook Form 和 TanStack Form 这类库解决的是：
+
+- **非受控为主的性能模型**：单个字段输入不会触发整个表单重渲染
+- **注册式 API**：`{...register("email")}` 一行搞定 value、onChange、onBlur、ref
+- **校验集成**：直接接 Zod / Yup schema
+- **数组字段**：动态增删的表单项（`useFieldArray`）
+- **依赖字段的 watch 机制**：只订阅关心的字段
+
+判断标准：
+
+- 3 个字段以内的简单表单 → 手写，用库反而更重
+- 10 个字段以上、有联动和复杂校验 → 用库
+- 表单是产品核心（如报税、保险投保）→ 一定用库
+
+<Callout type="tip" title="React Hook Form 的核心思路">
+它默认用**非受控**模式：通过 `register` 把 ref 挂到 DOM 上，输入时不更新 React state，所以打字完全不触发渲染。只有在校验失败、或者你显式 `watch` 某个字段时，才会触发局部更新。
+
+理解了这一点，就明白它为什么快，也明白它为什么在需要「每次输入都联动整个表单」的场景下优势会缩小。
+</Callout>
+
+<Callout type="exercise" title="练习 1：选择模式">
+下面几个表单，各自该用受控还是非受控？说明理由：
+
+1. 搜索框，输入时实时显示联想结果
+2. 一个 30 字段的企业信息录入表单，提交时统一校验
+3. 头像上传
+4. 验证码输入框，输满 6 位自动提交
+5. 富文本编辑器（第三方库）
+</Callout>
+
+<Callout type="exercise" title="练习 2：实现 touched 逻辑">
+写一个 `useField(name, validators)` 自定义 Hook，返回 `value`、`error`、`touched` 和一组可以直接展开到 input 上的 props（value、onChange、onBlur）。
+
+要求：首次校验在 blur，之后每次 change 都校验。写完后用它重构一个三字段的登录表单，对比代码量。
+</Callout>
+
+<Callout type="exercise" title="练习 3：动态字段">
+设计一个「联系人列表」表单：可以添加任意多行，每行有姓名和电话两个字段，每行可删除，至少要有一行。
+
+写出 state 的结构、增删改的不可变更新代码，以及 key 应该用什么（回顾第 2 章：为什么不能用索引）。
+</Callout>
+
+<Callout type="exercise" title="练习 4：提交流程加固">
+给第 4 节的提交流程再加三个功能：
+
+1. 提交成功后 3 秒自动跳转，期间显示倒计时
+2. 用户在提交中途关闭页面时弹出确认（提示：beforeunload 事件）
+3. 表单有未保存修改时，路由跳转前弹出确认
+
+思考每个功能该用 effect 还是事件处理，以及清理逻辑写在哪。
+</Callout>
+
+## 小结
+
+- **默认用受控**：state 是唯一数据源，行为可预测；非受控用于文件输入、超大表单、第三方集成
+- 受控与非受控不能中途切换，初始值要保证不是 `undefined`
+- 多字段用一个对象 state + 泛型 `update` 函数，保持类型安全
+- 有字段联动时改用 `useReducer`
+- 校验时机的最佳实践：**首次在失焦，之后实时**；提交时做最后一次全量校验
+- 校验规则写成纯函数或 Zod schema，与组件解耦，可测试可复用
+- 提交流程要处理：防重复、noValidate、服务端错误、滚动到第一个错误
+- 无障碍成本很低：label 关联、`aria-invalid`、`role="alert"`、`autoComplete`
+- 字段多、校验复杂时用 React Hook Form，它靠非受控模式避免逐字渲染
+- 下一章讲 Context 与跨层级数据传递 →

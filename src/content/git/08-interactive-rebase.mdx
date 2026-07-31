@@ -1,0 +1,314 @@
+---
+title: 交互式 rebase：把凌乱的提交整理成能见人的历史
+order: 8
+description: squash / fixup / reword / edit / drop / reorder，以及 --autosquash 工作流
+---
+
+# 交互式 rebase：把凌乱的提交整理成能见人的历史
+
+真实的开发过程是凌乱的：`wip`、`又改了一点`、`fix typo`、`真的修好了`。这些提交对当时的你有意义（随时能回退），但对未来的读者是纯噪音。
+
+`git rebase -i` 就是那把梳子：**在推送之前，把凌乱的过程重写成清晰的结果。**
+
+## 1. todo 清单
+
+执行 `git rebase -i HEAD~4`，Git 会打开一个编辑器，里面是一份"接下来要做什么"的清单：
+
+```text
+pick 77e752d feat: 实现登录表单
+pick 9e8d6fa wip
+pick 29e30d5 又改了一点
+pick a1b2c3d fix typo
+
+# Commands:
+# p, pick   = 保留这个提交
+# r, reword = 保留提交，但改提交信息
+# e, edit   = 保留提交，但停下来让你修改内容
+# s, squash = 合并进上一个提交，两条信息都保留（会让你编辑）
+# f, fixup  = 合并进上一个提交，丢弃本提交的信息
+# d, drop   = 删除这个提交
+# x, exec   = 执行一条 shell 命令
+# b, break  = 在这里暂停
+```
+
+三个关键认知：
+
+1. **顺序是从旧到新**，和 `git log` 相反。最上面那行是最老的提交。
+2. **你编辑的是"操作计划"，不是提交本身**。保存退出后 Git 才按计划逐条执行。
+3. **删掉一行 = 丢弃那个提交**；调换两行 = 调换提交顺序。
+
+`HEAD~4` 的含义是"整理最近 4 个提交"。注意清单里出现的是 `HEAD~4` **之后**的 4 个提交，`HEAD~4` 自己是不动的基底。
+
+<Callout type="info" title="沙箱里怎么演示交互式操作">
+Playground 无法交互输入，但 Git 提供了两个环境变量可以把"编辑器"替换成脚本，从而非交互地完成同样的事：
+
+- `GIT_SEQUENCE_EDITOR` —— 负责编辑 todo 清单
+- `GIT_EDITOR` —— 负责编辑提交信息
+
+下面的例子都用这个技巧。**你在自己机器上操作时不需要这么做**，直接 `git rebase -i` 用编辑器改就行。
+</Callout>
+
+## 2. squash：把一串零碎提交合成一个
+
+最常用的操作。把 `wip`、`又改了一点`、`fix typo` 全部并进第一个有意义的提交：
+
+<Playground
+  language="git"
+  title="squash：4 个提交合成 1 个"
+  id="git-08-1"
+  code={`git init -q
+echo 'base' > base.txt && git add . && git commit -q -m "chore: 项目初始化"
+echo 'a' > f.txt && git add . && git commit -q -m "feat: 实现登录表单"
+echo 'b' >> f.txt && git add . && git commit -q -m "wip"
+echo 'c' >> f.txt && git add . && git commit -q -m "又改了一点"
+echo 'd' >> f.txt && git add . && git commit -q -m "fix typo"
+
+echo '===== 整理前：后 3 个提交是噪音 ====='
+git log --oneline
+echo
+
+echo '===== rebase -i HEAD~4 打开的 todo 清单长这样 ====='
+printf '%s' 'cat "$1"' > /tmp/show.sh
+GIT_SEQUENCE_EDITOR='sh /tmp/show.sh' git rebase -i HEAD~4 > /tmp/todo.txt 2>&1
+head -4 /tmp/todo.txt
+echo
+
+echo '===== 把第 2 行起的 pick 全部改成 squash，再给一个新提交信息 ====='
+cat > /tmp/seq.sh <<'SH'
+awk 'NR==1 {print; next} /^pick/ {sub(/^pick/, "squash")} {print}' "$1" > "$1.new"
+mv "$1.new" "$1"
+SH
+cat > /tmp/msg.sh <<'SH'
+echo 'feat(auth): 实现登录表单' > "$1"
+SH
+GIT_SEQUENCE_EDITOR='sh /tmp/seq.sh' GIT_EDITOR='sh /tmp/msg.sh' git rebase -i HEAD~4 2>&1 | grep -v Waiting
+echo
+
+echo '===== 整理后：一个干净的提交，内容一点没少 ====='
+git log --oneline
+echo 'f.txt 内容:'
+cat f.txt`}
+/>
+
+要点：**squash 只改变历史的组织方式，不改变最终的文件内容**。整理前后 `f.txt` 完全一样。
+
+### squash 与 fixup 的区别
+
+| | squash | fixup |
+|---|---|---|
+| 内容 | 合并进上一个提交 | 合并进上一个提交 |
+| 提交信息 | 两条信息都保留，打开编辑器让你合并 | **丢弃本提交的信息**，直接用上一个的 |
+| 适用 | 两个提交都有实质内容要记录 | 本提交只是修补，信息没价值（`fix typo`） |
+
+## 3. reword、drop 与 reorder
+
+<Playground
+  language="git"
+  title="drop 删提交、reword 改信息"
+  id="git-08-2"
+  code={`git init -q
+echo base > base.txt && git add . && git commit -q -m "chore: 初始化"
+echo a > a.txt && git add . && git commit -q -m "feat: 加了个功能"
+echo b > b.txt && git add . && git commit -q -m "debug: 临时打印日志"
+echo c > c.txt && git add . && git commit -q -m "feat: 又一个功能"
+
+echo '===== 整理前 ====='
+git log --oneline
+echo
+
+echo '目标：删掉 debug 提交，并把含糊的提交信息改清楚'
+echo '手工操作时就是把 debug 那行删掉、把另一行的 pick 改成 reword'
+echo
+
+cat > /tmp/seq2.sh <<'SH'
+awk '
+  /debug: 临时打印日志/ { next }
+  /feat: 加了个功能/    { sub(/^pick/, "reword") }
+  { print }
+' "$1" > "$1.new"
+mv "$1.new" "$1"
+SH
+cat > /tmp/msg2.sh <<'SH'
+if grep -q '加了个功能' "$1"; then
+  echo 'feat(cart): 支持批量加入购物车' > "$1"
+fi
+SH
+GIT_SEQUENCE_EDITOR='sh /tmp/seq2.sh' GIT_EDITOR='sh /tmp/msg2.sh' git rebase -i HEAD~3 2>&1 | grep -v Waiting
+echo
+
+echo '===== 整理后 ====='
+git log --oneline
+echo '文件列表（b.txt 随 drop 一起消失）:'
+ls`}
+/>
+
+| 操作 | 怎么做 | 注意 |
+|---|---|---|
+| **reword** | `pick` 改成 `reword` | 只改信息，内容不变 |
+| **drop** | `pick` 改成 `drop`，或**直接删掉该行** | 该提交的改动会消失，后续提交可能因此冲突 |
+| **reorder** | 上下移动整行 | 顺序变了，后续提交可能冲突 |
+| **edit** | `pick` 改成 `edit` | rebase 会在该提交处**停下来**，让你改文件、`git add`、`git commit --amend`，然后 `git rebase --continue` |
+
+<Callout type="warn" title="drop 和 reorder 容易引发连锁冲突">
+被 drop 的提交如果创建了后续提交依赖的内容，重放后续提交时就会冲突。reorder 同理。
+
+如果一次整理里 drop/reorder 了好几处，很容易陷入"解决完这个冲突又冒出下一个"的循环。此时冷静地 `git rebase --abort`，改成分几次小步整理，会快得多。
+</Callout>
+
+## 4. edit：回到过去修改某个提交
+
+`edit` 是最强大也最少用的模式。它让 rebase 在指定提交处暂停，把工作区恢复到那个时刻，你可以：
+
+```bash
+git rebase -i HEAD~3
+# 把某行改成 edit，保存退出，rebase 停在那个提交
+
+# 此时你就"站在"那个提交上了
+vim src/config.py            # 改点什么
+git add src/config.py
+git commit --amend --no-edit # 把改动并入这个历史提交
+
+# 或者：把这个提交拆成两个
+git reset HEAD~1             # 撤销提交，内容回到工作区
+git add part1 && git commit -m "feat: 第一部分"
+git add part2 && git commit -m "feat: 第二部分"
+
+git rebase --continue        # 继续重放后面的提交
+```
+
+"把一个巨大的提交拆成几个小提交"就是靠 `edit` + `reset` 完成的。
+
+## 5. fixup + autosquash：日常最顺手的工作流
+
+上面的手工整理还是有点麻烦。真正高效的做法是**在制造修补提交时就标记好它属于谁**：
+
+```bash
+git commit --fixup=<目标提交哈希>     # 生成一个 "fixup! xxx" 提交
+git rebase -i --autosquash HEAD~5    # 自动把它排到目标后面并设成 fixup
+```
+
+<Playground
+  language="git"
+  title="fixup + autosquash 自动归位"
+  id="git-08-3"
+  code={`git init -q
+echo base > base.txt && git add . && git commit -q -m "chore: 初始化"
+echo 'login v1' > login.py && git add . && git commit -q -m "feat: 登录功能"
+echo 'order v1' > order.py && git add . && git commit -q -m "feat: 订单功能"
+
+TARGET=$(git log --format=%H --grep='登录功能')
+SHORT=$(git log --format=%h --grep='登录功能')
+echo "===== 事后发现登录功能有个小 bug，目标提交是 $SHORT ====="
+echo 'login v1 + bugfix' > login.py
+git add .
+git commit -q --fixup=$TARGET
+
+echo '现在的历史（fixup 提交排在最后，跨了一个订单提交）：'
+git log --oneline
+echo
+
+echo '===== git rebase -i --autosquash：自动排序 + 自动设成 fixup ====='
+GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash HEAD~3 2>&1 | grep -v Waiting
+echo
+
+echo '===== 结果：修补无声无息地并进了「feat: 登录功能」====='
+git log --oneline
+echo 'login.py 内容:'
+cat login.py`}
+/>
+
+注意这里 `GIT_SEQUENCE_EDITOR=true`——`true` 是一个什么都不做就成功退出的命令。因为 `--autosquash` 已经把 todo 排好了，我们不需要再改任何东西。你在本地操作时，效果就是编辑器打开后你直接保存退出。
+
+把 autosquash 设成默认，以后连参数都不用加：
+
+```bash
+git config --global rebase.autosquash true
+```
+
+还有 `--squash` 版本（保留信息）：
+
+```bash
+git commit --squash=<hash> -m "补充说明"
+```
+
+<Callout type="tip" title="推荐的日常节奏">
+1. 干活时**随便提交**，`wip`、`临时`、`调试中`都行——小步提交能让你随时回退，这是安全网
+2. 发现前面某个提交有问题，用 `git commit --fixup=<hash>` 精确标记
+3. 准备提 PR 前，`git rebase -i --autosquash main` 一次性整理干净
+4. `git push`
+
+这套流程让你在"开发时的安全感"和"历史的整洁"之间不用做取舍。
+</Callout>
+
+## 6. 其他实用技巧
+
+### exec：每个提交都跑一遍测试
+
+```text
+pick 77e752d feat: A
+exec npm test
+pick 9e8d6fa feat: B
+exec npm test
+```
+
+或者一次性给所有提交加上：
+
+```bash
+git rebase -i --exec "npm test" HEAD~5
+```
+
+任何一个提交跑测试失败，rebase 会停下来。这是确保"历史上每个提交都是可用状态"（bisect 的前提）的有效手段。
+
+### --root：整理包括第一个提交在内的全部历史
+
+```bash
+git rebase -i --root
+```
+
+### --autostash：有未提交改动时自动 stash
+
+```bash
+git rebase -i --autostash main
+```
+
+Git 会在开始前自动 stash、结束后自动恢复，省得你手工来一遍。可以设为默认：`git config --global rebase.autostash true`。
+
+## 7. 安全边界
+
+交互式 rebase **一定会改写历史**——它重放提交，哈希全部变化。所以第 7 章的黄金法则原样适用：
+
+| 状态 | 能否 rebase -i |
+|---|---|
+| 提交只在本地 | 随便整理 |
+| 已推到个人分支，无人基于它工作 | 可以，之后 `push --force-with-lease` |
+| 已推到 main / develop 等公共分支 | **绝对不行** |
+
+<Callout type="warn" title="整理砸了怎么办">
+`git rebase --abort` 能在过程中放弃。但如果已经完成了 rebase 才发现搞错了，别慌：
+
+```bash
+git reflog                       # 找到 rebase 之前的那个位置
+git reset --hard HEAD@{5}        # 回去
+```
+
+rebase 前的旧提交并没有被删除，只是没有分支指向它们。第 14 章会详细讲这套自救流程。
+</Callout>
+
+## 小结
+
+- `git rebase -i <base>` 打开 todo 清单，**从旧到新**排列，你编辑的是操作计划
+- `squash` 合并且保留两条信息，`fixup` 合并且丢弃本条信息
+- `reword` 改信息、`drop`（或删行）删提交、上下移动行改顺序
+- `edit` 让 rebase 停在某个提交，可用 `--amend` 补内容，或 `reset` 后拆成多个提交
+- 最顺手的工作流：`git commit --fixup=<hash>` + `git rebase -i --autosquash`
+- `--exec "npm test"` 可以校验每个提交都能通过测试
+- 整理只是重写历史的组织方式，**最终文件内容不变**
+- 同样受黄金法则约束：公共分支上的提交不能 rebase
+- 下一章：stash 与 cherry-pick——现场保存与跨分支摘提交 →
+
+<Callout type="exercise" title="练习">
+1. 造 5 个提交，其中 3 个是 `wip` 类噪音。用 `git rebase -i HEAD~5` 把它们 squash 成 2 个语义清晰的提交，用 `git log --oneline` 和文件内容分别验证"历史变了"和"内容没变"。
+2. 用 `drop` 删掉中间一个提交，观察它创建的文件是否随之消失。然后故意让后续提交依赖被删提交的内容，看看会发生什么冲突。
+3. 用 `git commit --fixup=<hash>` 制造两个 fixup 提交（指向不同的目标），再用 `--autosquash` 一次性归位，确认它们各自回到了正确的位置。
+4. 用 `git rebase -i --exec "cat f.txt"` 让每个提交重放后都打印一次文件内容，观察文件是如何一步步演化的。
+</Callout>

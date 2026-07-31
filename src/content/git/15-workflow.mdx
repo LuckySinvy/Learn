@@ -1,0 +1,149 @@
+---
+title: 团队协作工作流：Feature Branch、GitFlow 与 Fork/PR
+order: 15
+description: 从分支模型到 GitFlow、GitHub Flow、Trunk-Based，以及 Fork+PR 协作机制的本地完整模拟
+---
+
+# 团队协作工作流：Feature Branch、GitFlow 与 Fork/PR
+
+Git 本身只提供分支、合并这些原语，**怎么用**是团队约定的事。这一章盘点主流协作工作流，并亲手用本地仓库模拟其中最关键的"功能分支"和"Fork + PR"两种机制。
+
+## 1. 为什么需要工作流
+
+没有约定的团队，所有人往 `main` 直接提交，结果就是：互相覆盖、无法并行、发布时一团乱。工作流的本质是用**分支分工**把"开发""审查""发布"隔离开。
+
+| 工作流 | 核心思想 | 适合 |
+|---|---|---|
+| 集中式 | 所有人都推 main（几乎不用分支） | 个人 / 极简单项目 |
+| 功能分支 Feature Branch | 每个功能一个分支，合并回 main | 绝大多数团队（基础） |
+| GitFlow | main / develop / feature / release / hotfix 多角色分支 | 有固定版本发布的传统软件 |
+| GitHub Flow | 只有 main + 短期功能分支 + PR | SaaS / 持续部署 |
+| Trunk-Based | 极短分支、频繁合 main、靠 CI 保护 | 高成熟度高吞吐团队 |
+| Fork + PR | 贡献者用 fork 而非直接 push | 开源 / 跨组织协作 |
+
+## 2. 功能分支工作流（最该掌握的 baseline）
+
+每个功能从 `main` 切一个 `feature/xxx` 分支，在上面开发、提交，完成后 `--no-ff` 合并回 `main` 再删除分支。好处：main 永远是可发布状态；并行功能互不干扰；合并时的 merge commit 保留"这次合入了一个功能"的痕迹。
+
+<Playground
+  language="git"
+  title="功能分支工作流完整演练"
+  id="git-15-1"
+  code={`echo '===== 功能分支工作流（Feature Branch）====='
+git init -q --bare /tmp/up.git
+git clone -q /tmp/up.git proj && cd proj
+echo 'init' > app.txt && git add . && git commit -q -m "init"
+git push -q -u origin main 2>/dev/null
+echo '开一个功能分支开发新功能：'
+git checkout -q -b feature/login
+echo 'username field' > login.txt && git add . && git commit -q -m "feat: 登录表单"
+echo 'username + password' >> login.txt && git add . && git commit -q -m "feat: 登录校验"
+echo '功能分支历史：'
+git log --oneline
+echo
+echo '回到 main 合并功能分支（--no-ff 保留分支痕迹）：'
+git checkout -q main
+git merge --no-ff -m "merge: 合入登录功能" feature/login
+git log --oneline --graph --all
+echo
+echo '删除已合并的功能分支：'
+git branch -d feature/login
+git push -q origin main 2>/dev/null
+echo 'main 最终历史：'
+git log --oneline
+cd ..`}
+/>
+
+`--no-ff` 在这里很重要：它强制生成一个 merge commit，让"哪些提交属于同一个功能"在历史上清晰可辨。如果允许 fast-forward，功能提交会直接贴到 main 上，丢失分组信息。
+
+## 3. GitFlow：多角色分支模型
+
+GitFlow 用一组**长期 + 短期**分支区分软件的不同状态：
+
+```text
+main        —— 永远对应已发布的生产代码（每个点都打 tag）
+develop     —— 集成分支，下个版本的功能在此汇聚
+feature/*   —— 从 develop 切出，开发完合回 develop（短期）
+release/*   —— 从 develop 切出，只修 bug、打 tag，合回 main + develop
+hotfix/*    —— 从 main 切出，紧急修生产 bug，合回 main + develop
+```
+
+优点：版本边界极其清晰，适合有"季度发布""严格版本号"的传统产品。缺点：分支多、流程重、release/hotfix 的双向合并容易出错，对小团队偏繁琐。
+
+## 4. GitHub Flow / Trunk-Based：轻量现代派
+
+**GitHub Flow** 是 GitFlow 的极简版：只有 `main`（永远可部署）+ 短期功能分支 + **Pull Request**。流程：`main` 切分支 -> 开发 -> 开 PR -> 审查+CI 通过 -> 合回 `main` -> 自动部署。适合持续部署的互联网服务。
+
+**Trunk-Based Development** 更激进：功能分支**存在时间极短**（几小时到一天），频繁合回主干，几乎不用长期分支，靠强大的 CI 和特性开关（feature flag）保证主干随时可发布。Google、Meta 这类高频交付团队采用。
+
+<Callout type="tip" title="怎么选">
+小团队 / 初创 / SaaS：GitHub Flow 或 Trunk-Based。传统版本化软件（客户端、嵌入式）：GitFlow。不确定时，从**功能分支 + PR** 起步，永远不会错——它是一切现代工作流的公共基础。
+</Callout>
+
+## 5. Fork + Pull Request：开源协作机制
+
+开源项目里陌生人不能直接 push 官方仓库。机制是：**贡献者先 fork（复制）官方仓库到自己的空间，在自己的 fork 上开发，然后向官方发一个 Pull Request（请求官方拉取自己的改动）**。官方维护者审查、讨论、合并。下面用两个本地裸仓库完整模拟这一机制。
+
+<Playground
+  language="git"
+  title="Fork + PR 机制的本地完整模拟"
+  id="git-15-2"
+  code={`echo '===== Fork + Pull Request 机制的本地模拟 ====='
+git init -q --bare /tmp/up.git
+git init -q --bare /tmp/fork.git
+git clone -q /tmp/up.git mainline && cd mainline
+echo 'project' > app.txt && git add . && git commit -q -m "init"
+git push -q -u origin main 2>/dev/null
+cd ..
+
+echo '贡献者：克隆「自己的 fork」而不是官方仓库：'
+git clone -q /tmp/fork.git contributor && cd contributor
+git fetch -q /tmp/up.git main && git merge -q FETCH_HEAD 2>/dev/null
+git push -q origin main 2>/dev/null
+git remote add upstream /tmp/up.git
+echo '贡献者的两个 remote（origin=fork, upstream=官方）：'
+git remote -v
+echo
+echo '贡献者在功能分支上开发：'
+git checkout -q -b fix/typo
+echo 'fixed' >> app.txt && git add . && git commit -q -m "fix: 修正拼写"
+echo '推到「自己的 fork」的 fix/typo 分支（这就是开 PR 的前提）：'
+git push -q -u origin fix/typo 2>/dev/null
+echo 'fork 上的分支：'
+git branch -r
+echo
+cd ../mainline
+echo '维护者：把贡献者 fork 里的分支 fetch 下来审查：'
+git remote add contributor /tmp/fork.git
+git fetch -q contributor fix/typo
+echo '审查贡献者的提交：'
+git log --oneline contributor/fix/typo
+echo '没问题，合入官方 main：'
+git merge --no-ff -m "merge PR#1: 修正拼写" contributor/fix/typo
+git push -q origin main 2>/dev/null
+echo '官方最终历史：'
+git log --oneline --graph --all
+cd ..`}
+/>
+
+关键认知：
+
+- 贡献者 `origin` 指向**自己的 fork**，`upstream` 指向官方。日常从 `upstream` 同步，推到 `origin`。
+- 开 PR 的本质 = "请官方 fetch 我 fork 上的某个分支并合并"。GitHub/GitLab 的 PR 按钮只是把这串 fetch+merge 包装成了网页操作。
+- 维护者合并前可以 `git fetch` 贡献者的分支，在本地**先审一遍、甚至跑测试**，再决定合并——这才是 PR 真正的价值（代码审查 + CI）。
+
+## 6. 小结
+
+- 工作流 = 团队对"如何用分支"的约定；功能分支是一切现代流程的基石
+- 功能分支：`feature/*` 开发，`--no-ff` 合回 main，保留功能分组痕迹
+- GitFlow：main/develop/feature/release/hotfix 多角色，适合版本化软件，但偏重
+- GitHub Flow / Trunk-Based：轻量、靠 PR+CI，适合持续部署
+- Fork+PR：贡献者 fork -> 推自己 fork -> 官方 fetch 分支审查合并；PR 按钮背后就是 fetch+merge
+- 下一章：hooks 与自动化 →
+
+<Callout type="exercise" title="练习">
+1. 用本地裸仓库模拟"功能分支工作流"：从 main 切 `feature/pay`，做两个提交，`--no-ff` 合并回 main，对比 `git log --graph` 与不用 `--no-ff`（直接 fast-forward）的差异。
+2. 在 Fork+PR 模拟里，让贡献者的 `fix/typo` 与维护者 main 上**已有冲突**的改动冲突，演示维护者 `git fetch` 后 `git merge` 遇到冲突该如何解决（提示：维护者先合自己 main，再 merge 贡献者分支）。
+3. 解释：`git fetch upstream main` 后，贡献者应该用 `git merge upstream/main` 还是 `git rebase upstream/main` 来同步官方最新？各自对本地提交历史有什么影响？
+4. 你们团队如果要同时维护"线上 v1"和"开发 v2"，用 GitFlow 的话，线上紧急 bug 应该走哪个分支？它最终要合回哪些分支？
+</Callout>

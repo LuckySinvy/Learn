@@ -1,0 +1,152 @@
+---
+title: 软件包管理：apt、yum/dnf 与 apk
+order: 18
+description: 包/仓库/依赖的核心概念，三大包管理器命令对照，以及版本锁定与安全更新惯例
+---
+
+# 软件包管理：apt、yum/dnf 与 apk
+
+在 Linux 上装软件不是"下载 exe 双击"，而是通过**包管理器**从**软件仓库**安装：一条命令完成下载、依赖解析、安装、注册卸载信息。不同发行版工具不同（这正是发行版之间最大的使用差异），但概念完全一致。本章沙箱无外网，无法真装软件，以对照讲解为主。
+
+## 1. 三个核心概念
+
+- **包（package）**：软件的安装单元（.deb / .rpm / .apk 文件），内含程序文件、元数据（版本、依赖清单）和安装脚本；
+- **仓库（repository）**：存放海量包的服务器；包管理器从配置的仓库列表里检索和下载。国内服务器通常把仓库地址换成镜像源（清华、阿里云）加速；
+- **依赖（dependency）**：包 A 运行需要包 B——包管理器最大的价值就是自动解析并安装整棵依赖树，卸载时也能反向清理。
+
+```text
+你：apt install nginx
+      │
+      ▼
+apt 查本地缓存的仓库索引 → 解析依赖（nginx 需要 libpcre、openssl...）
+      │
+      ▼
+从仓库下载全部 .deb → 校验签名 → 按依赖顺序安装 → 记录到本地数据库
+```
+
+## 2. 三大家族命令对照
+
+| 操作 | Debian/Ubuntu (apt) | RHEL/CentOS (yum/dnf) | Alpine (apk) |
+|---|---|---|---|
+| 更新仓库索引 | `apt update` | `dnf check-update` | `apk update` |
+| 安装 | `apt install nginx` | `dnf install nginx` | `apk add nginx` |
+| 卸载 | `apt remove nginx` | `dnf remove nginx` | `apk del nginx` |
+| 升级全部 | `apt upgrade` | `dnf upgrade` | `apk upgrade` |
+| 搜索 | `apt search nginx` | `dnf search nginx` | `apk search nginx` |
+| 查包信息 | `apt show nginx` | `dnf info nginx` | `apk info nginx` |
+| 列出已安装 | `apt list --installed` | `dnf list installed` | `apk info` |
+| 某文件属于哪个包 | `dpkg -S /usr/sbin/nginx` | `rpm -qf ...` | `apk info --who-owns ...` |
+| 清理缓存 | `apt clean` | `dnf clean all` | 默认不留缓存 |
+
+两点辨析：
+
+- **update ≠ upgrade**（apt 语境）：`apt update` 只刷新"仓库里有什么版本"的索引，不动任何已装软件；`apt upgrade` 才是真正升级。所以标准姿势永远是连招：`apt update && apt install xxx`——索引过期会导致 404；
+- **yum 与 dnf**：dnf 是 yum 的下一代实现（依赖解析更快更准），RHEL 8+ 默认 dnf，命令兼容，老文档里的 yum 直接替换成 dnf 即可。
+
+## 3. 每个家族多说两句
+
+### apt（Debian / Ubuntu）
+
+```bash
+sudo apt update                    # 永远先刷索引
+sudo apt install -y nginx=1.24.*   # -y 免确认（脚本用）；= 指定版本
+sudo apt remove nginx              # 卸载但保留配置文件
+sudo apt purge nginx               # 连配置一起删干净
+sudo apt autoremove                # 清理不再被依赖的"孤儿包"
+apt list --upgradable              # 看看有哪些可升级
+```
+
+### dnf（RHEL 系）
+
+```bash
+sudo dnf install -y nginx
+sudo dnf history                   # 事务历史，支持 dnf history undo N 回滚安装
+dnf provides '*/bin/htop'          # 反查"哪个包提供这个文件"——找包神器
+```
+
+### apk（Alpine，容器世界高频）
+
+```bash
+apk add --no-cache curl jq         # --no-cache：不留索引缓存，镜像更小（Dockerfile 标配）
+apk add --virtual .build-deps gcc make    # 打组安装编译依赖
+apk del .build-deps                # 编译完一把删掉，缩小镜像
+```
+
+<Playground
+  language="linux"
+  title="沙箱侦查：识别发行版与已装软件"
+  id="linux-18-1"
+  code={`echo '$ 判断发行版（决定该用哪个包管理器）：'
+cat /etc/os-release | head -n 3
+
+echo ''
+echo '$ 三连探测：机器上装了哪个包管理器？'
+command -v apt && echo '-> Debian 系' || true
+command -v dnf || command -v yum && echo '-> RHEL 系' || true
+command -v apk && echo '-> Alpine' || true
+
+echo ''
+echo '$ apk info 列出已安装的包（前 15 个）：'
+apk info 2>/dev/null | head -n 15 || echo '（本环境 apk 数据库不可用）'`}
+/>
+
+<Playground
+  language="linux"
+  title="查证'命令来自哪个包'"
+  id="linux-18-2"
+  code={`echo '$ which 找到文件路径：'
+which awk sed jq
+
+echo ''
+echo '$ apk info --who-owns 反查所属的包：'
+apk info --who-owns /usr/bin/gawk 2>/dev/null || echo '（沙箱 apk 数据库精简，真机可用）'
+apk info --who-owns /usr/bin/jq 2>/dev/null || true
+
+echo ''
+echo '$ 没有包数据库时的土办法——看二进制里的线索：'
+file /usr/bin/jq 2>/dev/null | head -n 1`}
+/>
+
+## 4. 仓库之外：其他安装途径
+
+不是所有软件都在官方仓库（版本可能老旧或干脆没有）：
+
+- **附加仓库**：Ubuntu 的 PPA、RHEL 的 EPEL，把第三方仓库加进列表后照常 install；
+- **直接下载包文件**：`dpkg -i pkg.deb` / `rpm -ivh pkg.rpm`——注意这两个底层工具**不解析依赖**，缺依赖时 apt/dnf 可以补救（`apt -f install`）；
+- **二进制直接放 PATH**：Go/Rust 生态很多工具发布单文件二进制，下载解压丢进 `/usr/local/bin` 即用；
+- **语言自带的包管理**：pip、npm、cargo 管各自生态，与系统包管理器互不干涉（也因此注意：`pip install` 装的东西 apt 不知道）。
+
+<Callout type="warn" title="生产环境三条纪律">
+1. **不要随手 upgrade 全量升级**：生产机上 `apt upgrade` 可能把内核、glibc 一起升了，引发不可预期的行为，升级要有计划、先在测试环境验证；
+2. **锁定关键版本**：`apt-mark hold nginx`（apt）/ `dnf versionlock`（dnf）防止关键组件被顺手升级；
+3. **只加可信仓库**：第三方仓库拥有 root 级投毒能力，加源前确认其签名与口碑。
+</Callout>
+
+<Callout type="info" title="Dockerfile 里的惯用连招">
+`RUN apt update && apt install -y curl && rm -rf /var/lib/apt/lists/*`——一条 RUN 里完成"刷索引、安装、删索引缓存"，保证镜像层最小且不留过期索引。Alpine 版等价物就是 `apk add --no-cache curl`。理解了本章概念，这些"咒语"都是自然推论。
+</Callout>
+
+## 5. 排错速查
+
+| 症状 | 原因与解法 |
+|---|---|
+| `E: Unable to locate package` | 索引过期或没刷过 → 先 `apt update`；或包名拼错/不在仓库 |
+| 下载奇慢 | 用的境外源 → 换国内镜像源 |
+| `Could not get lock /var/lib/dpkg/lock` | 另一个 apt 进程在跑（如自动更新）→ 等它结束，别急着删锁文件 |
+| 装完命令还是 not found | 二进制不在 PATH，或需要重开 Shell → `hash -r` 或查包安装清单 |
+
+## 小结
+
+- 包管理器 = 下载 + 依赖解析 + 安装记录；仓库是包的来源，可换镜像加速
+- 三大家族：apt（Debian 系）、dnf/yum（RHEL 系）、apk（Alpine）；操作一一对应
+- `apt update` 刷索引、`apt upgrade` 才升级；安装标准连招 `update && install -y`
+- dpkg/rpm 是不解析依赖的底层工具；语言包管理器与系统包管理器各管一摊
+- 生产纪律：不随手全量升级、关键包锁版本、只加可信源
+- 下一章：SSH 与远程操作 →
+
+<Callout type="exercise" title="练习">
+1. 在沙箱运行 `cat /etc/os-release`，根据 ID 字段判断发行版，写出在这台机器上安装 htop 的完整命令（含刷索引）。
+2. 用对照表完成"翻译"：把 `apt update && apt install -y git && apt autoremove` 翻译成 RHEL 系和 Alpine 的等价命令。
+3. 真机作业：在一台 Ubuntu 上执行 `apt show curl`，找出它的版本、依赖列表；再用 `dpkg -S $(which curl)` 验证 curl 命令属于哪个包。
+4. 思考题：Dockerfile 里为什么强调 `apt update` 和 `apt install` 必须写在**同一条** RUN 里？拆成两条会有什么缓存陷阱？（提示：镜像层缓存导致 update 层长期不失效）
+</Callout>

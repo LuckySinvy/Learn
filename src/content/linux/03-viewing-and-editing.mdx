@@ -1,0 +1,197 @@
+---
+title: 查看与编辑文件：cat/less/head/tail 与 vim 生存指南
+order: 3
+description: 四种查看文件的方式与适用场景、tail -f 追日志，以及 vim 最小生存技能
+---
+
+# 查看与编辑文件：cat/less/head/tail 与 vim 生存指南
+
+排查问题的第一步几乎总是"看文件"：看配置、看日志、看代码。不同大小、不同目的的文件要用不同工具——用 cat 打开 2 GB 日志会刷屏到怀疑人生。本章还包含所有人都绕不开的一课：vim 生存指南，至少保证你"进得去、改得动、出得来"。
+
+## 1. cat：小文件一次看完
+
+`cat`（concatenate）把文件内容一次性全部输出：
+
+```bash
+cat app.conf            # 输出整个文件
+cat -n app.conf         # 带行号
+cat a.txt b.txt         # 依次输出多个文件（这才是它名字"拼接"的本义）
+cat a.txt b.txt > merged.txt   # 拼接并保存
+```
+
+适合**一屏能装下**的小文件：配置、脚本、hosts。反过来，大文件用 cat 会瞬间刷过几万行，毫无意义。
+
+<Playground
+  language="linux"
+  title="cat 与它的伙伴们"
+  id="linux-03-1"
+  code={`printf 'server:\n  port: 8080\n  host: 0.0.0.0\n' > app.yaml
+echo '$ cat app.yaml'
+cat app.yaml
+
+echo '$ cat -n app.yaml   # 带行号，讨论配置时好定位'
+cat -n app.yaml
+
+# tac：倒序输出（cat 反过来拼写），看日志"最新在前"时有用
+printf 'line1\nline2\nline3\n' > order.txt
+echo '$ tac order.txt'
+tac order.txt
+
+# nl：另一种加行号的方式，默认跳过空行
+printf 'alpha\n\nbeta\n' > sparse.txt
+echo '$ nl sparse.txt'
+nl sparse.txt`}
+/>
+
+## 2. less：大文件分页翻阅
+
+`less` 是查看大文件的标准答案：**按需读取**，打开 10 GB 文件也是瞬间的，且支持搜索和翻页。它是交互式程序，沙箱里无法演示，常用按键务必记住：
+
+| 按键 | 作用 |
+|---|---|
+| 空格 / `b` | 下翻一屏 / 上翻一屏 |
+| `j` / `k` | 下移一行 / 上移一行 |
+| `g` / `G` | 跳到开头 / 结尾 |
+| `/关键词` | 向下搜索；`n` 下一个匹配，`N` 上一个 |
+| `?关键词` | 向上搜索 |
+| `F` | 追踪模式（类似 `tail -f`，Ctrl+C 退出追踪） |
+| `q` | 退出 |
+
+```bash
+less /var/log/syslog        # 打开日志
+less -N app.log             # 显示行号
+less +G app.log             # 打开后直接跳到末尾（看最新日志）
+```
+
+<Callout type="tip" title="man 手册就是用 less 展示的">
+`man ls` 打开的界面正是 less，所以上面这套按键（搜索、翻页、q 退出）在读手册时同样适用。学会 less 等于同时学会了读文档。
+</Callout>
+
+## 3. head 与 tail：只看两端
+
+```bash
+head app.log            # 前 10 行（默认）
+head -n 3 app.log       # 前 3 行
+head -c 100 app.log     # 前 100 字节
+tail -n 5 app.log       # 最后 5 行
+tail -n +3 app.log      # 从第 3 行开始输出到末尾（注意 + 号）
+tail -f app.log         # 持续追踪新增内容——运维第一命令
+```
+
+<Playground
+  language="linux"
+  title="head / tail 精确取行"
+  id="linux-03-2"
+  code={`# 生成 1..20 行的演示文件
+seq -f 'line %g' 20 > demo.log
+
+echo '$ head -n 3 demo.log'
+head -n 3 demo.log
+
+echo '$ tail -n 3 demo.log'
+tail -n 3 demo.log
+
+echo '$ tail -n +18 demo.log   # 从第 18 行到末尾'
+tail -n +18 demo.log
+
+# 组合技：取第 5 到第 8 行
+echo '$ head -n 8 demo.log | tail -n 4'
+head -n 8 demo.log | tail -n 4
+
+# wc：统计行数/单词数/字节数
+echo '$ wc demo.log'
+wc demo.log
+echo '$ wc -l demo.log   # 只要行数'
+wc -l demo.log`}
+/>
+
+`tail -f`（follow）会保持运行、实时打印文件新追加的内容，是盯日志的标配；`tail -F` 更进一步，在日志被轮转（重命名后新建）时会自动重新打开新文件，生产环境建议用大写 F。
+
+## 4. file：这是个什么文件
+
+Linux 不靠扩展名判断文件类型，`file` 命令通过内容特征识别：
+
+<Playground
+  language="linux"
+  title="file 识别文件类型"
+  id="linux-03-3"
+  code={`echo 'plain text' > a.txt
+printf '#!/bin/bash\necho hi\n' > run.sh
+head -c 100 /bin/busybox > bin.sample 2>/dev/null || head -c 100 /bin/ls > bin.sample
+
+echo '$ file a.txt run.sh bin.sample'
+file a.txt run.sh bin.sample
+
+# 扩展名骗不过 file
+cp bin.sample fake.txt
+echo '$ file fake.txt'
+file fake.txt`}
+/>
+
+## 5. vim 生存指南
+
+服务器上改配置，十有八九只有 vi/vim 可用。vim 是**模态编辑器**：同一个按键在不同模式下含义不同，这是初学者懵掉的根源。生存级理解只需要两个模式：
+
+```text
+        按 i                      按 Esc
+普通模式 ────────→ 插入模式 ────────→ 普通模式
+（移动/删除/命令）  （正常打字输入）
+```
+
+**最小生存流程**，背下来：
+
+1. `vim app.conf` 打开文件，此时处于**普通模式**，打字不会输入；
+2. 按 `i` 进入**插入模式**（左下角显示 INSERT），像普通编辑器一样打字；
+3. 改完按 `Esc` 回到普通模式；
+4. 输入 `:wq` 回车 = 保存并退出；输入 `:q!` 回车 = **不保存**强制退出。
+
+普通模式下的少量高频操作，够用很久：
+
+| 按键 | 作用 |
+|---|---|
+| `i` / `o` | 光标处插入 / 在下方新建一行并插入 |
+| `dd` | 删除当前行 |
+| `yy` 然后 `p` | 复制当前行、粘贴 |
+| `u` | 撤销 |
+| `gg` / `G` | 跳到文件开头 / 结尾 |
+| `/关键词` 回车 | 搜索，`n` 跳下一个 |
+| `:w` / `:q` / `:wq` / `:q!` | 保存 / 退出 / 保存退出 / 不保存强退 |
+
+<Callout type="warn" title="被 vim 困住时的自救">
+全世界每天都有人"被困在 vim 里"。万能自救三步：连按几次 `Esc`（确保回到普通模式）→ 输入 `:q!` → 回车。如果按出了奇怪状态（比如按了 Ctrl+S 导致终端"卡死"），按 Ctrl+Q 恢复。
+</Callout>
+
+<Callout type="info" title="nano：更简单的备选">
+很多发行版还带 nano 编辑器：打开即可直接输入，底部明确标注快捷键（`^O` 保存、`^X` 退出，`^` 代表 Ctrl）。应急时 nano 更友好，但 vim 几乎无处不在，生存技能仍是必修。
+</Callout>
+
+## 6. 不进编辑器的快速写文件
+
+脚本和文档里常见两种不打开编辑器就写内容的方式，后面章节会大量用到：
+
+```bash
+echo 'PORT=8080' > app.env          # 覆盖写入一行
+echo 'DEBUG=true' >> app.env        # 追加一行
+
+cat > app.conf << 'EOF'             # heredoc：一次写入多行
+server {
+  listen 80;
+}
+EOF
+```
+
+## 小结
+
+- 小文件 `cat`（`-n` 带行号），大文件 `less`（`/` 搜索、`q` 退出），两端用 `head`/`tail`
+- `tail -f` 实时追日志，轮转场景用 `tail -F`；`head | tail` 组合可取任意行区间
+- `wc -l` 数行数；`file` 看真实类型，不被扩展名欺骗
+- vim 生存四步：`i` 输入 → `Esc` → `:wq` 保存退出 / `:q!` 强退
+- `echo >` 与 heredoc 可以不进编辑器快速写文件
+- 下一章：文件系统的地图——FHS 布局与 inode →
+
+<Callout type="exercise" title="练习">
+1. 用 `seq -f 'row %g' 100` 生成 100 行文件，只用 head 和 tail 组合取出第 42 到 45 行。
+2. 用 heredoc 创建一个三行的 nginx 风格配置文件，再用 `cat -n` 与 `nl` 分别查看，观察两者对空行编号的差异（记得在内容里留一个空行）。
+3. 在自己的机器上（非沙箱）练习 vim 完整流程：`vim test.txt` → i 输入两行 → Esc → dd 删掉一行 → u 撤销 → :wq 保存退出，最后用 cat 验证内容。
+4. 说出下面三个场景各自最合适的命令：查看 8 GB 的访问日志找一个关键字；实时观察正在写入的错误日志；确认某个没有扩展名的文件是文本还是二进制。
+</Callout>

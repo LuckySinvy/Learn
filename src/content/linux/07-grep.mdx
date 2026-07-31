@@ -1,0 +1,212 @@
+---
+title: 文本三剑客之 grep：搜索与正则过滤
+order: 7
+description: grep 核心选项 -i -n -v -r -o -E、基础正则、上下文参数与日志过滤实战
+---
+
+# 文本三剑客之 grep：搜索与正则过滤
+
+grep、sed、awk 并称"文本三剑客"，是 Linux 文本处理的核心。三者分工明确：**grep 负责找**（过滤出匹配的行）、sed 负责改、awk 负责按列算。本章从 grep 开始——它也是三者中使用频率最高的，排查日志几乎每一步都有它。
+
+## 1. 基本用法
+
+```bash
+grep 模式 文件              # 打印文件中包含"模式"的行
+grep error app.log         # 找出含 error 的行
+grep -i error app.log      # -i 忽略大小写（error/Error/ERROR 通吃）
+grep -n error app.log      # -n 显示行号
+grep -c error app.log      # -c 只输出匹配行数
+grep -v debug app.log      # -v 反选：输出**不**含 debug 的行
+grep -w on app.log         # -w 整词匹配：匹配 on 但不匹配 config
+```
+
+grep 是**按行**工作的：逐行检查，整行输出。它还常出现在管道右侧过滤别的命令的输出：
+
+```bash
+ps | grep nginx            # 从进程列表里找 nginx
+history | grep ssh         # 从历史命令里找 ssh 相关
+```
+
+<Playground
+  language="linux"
+  title="grep 基本选项"
+  id="linux-07-1"
+  code={`cat > app.log << 'EOF'
+2026-07-31 10:00:01 INFO  server started on port 8080
+2026-07-31 10:00:05 DEBUG cache warmed up
+2026-07-31 10:01:12 ERROR db connection refused
+2026-07-31 10:01:13 error retrying db connection
+2026-07-31 10:01:15 INFO  db connected
+2026-07-31 10:02:30 WARN  slow query took 1200ms
+2026-07-31 10:03:00 ERROR timeout calling payment api
+EOF
+
+echo '$ grep ERROR app.log'
+grep ERROR app.log
+
+echo '$ grep -i error app.log   # 大小写都要'
+grep -i error app.log
+
+echo '$ grep -in error app.log  # 加上行号'
+grep -in error app.log
+
+echo '$ grep -c -i error app.log   # 只数个数'
+grep -c -i error app.log
+
+echo '$ grep -v DEBUG app.log   # 排除调试噪音'
+grep -v DEBUG app.log`}
+/>
+
+## 2. 递归搜索目录：-r
+
+在整个项目里找一段代码、一处配置，是 grep 的另一大主场：
+
+```bash
+grep -r 'TODO' src/                  # 递归搜索目录
+grep -rn 'listen 80' /etc/nginx/     # 带行号，定位配置
+grep -rl 'deprecated_api' src/       # -l 只列出含匹配的文件名
+grep -r --include='*.py' 'import requests' .    # 只搜某类文件
+```
+
+<Playground
+  language="linux"
+  title="grep -r 递归搜索代码"
+  id="linux-07-2"
+  code={`mkdir -p src/api src/web
+cat > src/api/user.py << 'EOF'
+# TODO: add rate limit
+def get_user(uid):
+    return db.find(uid)
+EOF
+cat > src/web/views.py << 'EOF'
+def home():
+    # TODO: cache this page
+    return render()
+EOF
+echo 'nothing here' > src/notes.txt
+
+echo '$ grep -rn TODO src/'
+grep -rn TODO src/
+
+echo '$ grep -rl TODO src/   # 只要文件名'
+grep -rl TODO src/
+
+echo '$ grep -rn --include="*.py" def src/   # 只搜 python 文件'
+grep -rn --include='*.py' def src/`}
+/>
+
+## 3. 正则表达式：模式的语言
+
+grep 的"模式"默认就是正则表达式（基础版 BRE）。加 `-E` 启用扩展正则（ERE），元字符更好用，**建议默认写 grep -E**。核心元字符：
+
+| 元字符 | 含义 | 示例 |
+|---|---|---|
+| `.` | 任意单个字符 | `r.d` 匹配 red、rid |
+| `^` / `$` | 行首 / 行尾 | `^ERROR`、`ms$` |
+| `[abc]` `[0-9]` | 字符集合/范围 | `[45][0-9][0-9]` 匹配 4xx/5xx |
+| `[^0-9]` | 集合取反 | 非数字字符 |
+| `*` | 前一项 0 次或多次 | `go*gle` |
+| `+`（ERE） | 前一项 1 次以上 | `[0-9]+` 一串数字 |
+| `?`（ERE） | 前一项 0 或 1 次 | `https?` |
+| `{2,4}`（ERE） | 次数区间 | `[0-9]{4}` 恰好四位数字 |
+| `(a\|b)`（ERE） | 分组与或 | `(GET\|POST)` |
+
+注意区分：正则的 `*` 表示"前一项重复任意次"，与 Shell 通配符里"任意字符串"的 `*` 完全是两码事。
+
+<Playground
+  language="linux"
+  title="grep -E 正则实战"
+  id="linux-07-3"
+  code={`cat > access.log << 'EOF'
+192.168.1.10 GET /index.html 200 12ms
+192.168.1.11 POST /api/login 401 35ms
+10.0.0.3 GET /api/users 200 210ms
+192.168.1.10 GET /favicon.ico 404 2ms
+10.0.0.7 POST /api/orders 500 1520ms
+10.0.0.3 DELETE /api/users/9 204 18ms
+EOF
+
+echo '$ grep -E " (4|5)[0-9][0-9] " access.log   # 4xx 与 5xx'
+grep -E ' (4|5)[0-9][0-9] ' access.log
+
+echo '$ grep -E "^10[.]" access.log   # 10. 开头的内网 IP（[.] 表示字面点号）'
+grep -E '^10[.]' access.log
+
+echo '$ grep -E "(POST|DELETE)" access.log   # 写操作'
+grep -E '(POST|DELETE)' access.log
+
+echo '$ grep -oE "[0-9]+ms" access.log   # -o 只输出匹配片段'
+grep -oE '[0-9]+ms' access.log`}
+/>
+
+`-o`（only-matching）值得单独强调：不输出整行、只输出匹配到的片段，一行多个匹配就输出多行。它是"从文本里**提取**信息"的利器，配合 sort/uniq 能做各种统计（第 20 章大量使用）。
+
+## 4. 上下文：-A -B -C
+
+日志里光看到 ERROR 那一行往往不够，前因后果都在附近几行里：
+
+```bash
+grep -A 3 'ERROR' app.log     # After：匹配行 + 后 3 行
+grep -B 2 'ERROR' app.log     # Before：前 2 行 + 匹配行
+grep -C 2 'ERROR' app.log     # Context：前后各 2 行
+```
+
+<Playground
+  language="linux"
+  title="上下文参数还原事故现场"
+  id="linux-07-4"
+  code={`cat > svc.log << 'EOF'
+10:00:01 INFO  request id=1001 received
+10:00:01 INFO  querying db for user=42
+10:00:04 WARN  db latency high: 3000ms
+10:00:04 ERROR request id=1001 timeout
+10:00:04 INFO  sending 504 to client
+10:00:05 INFO  request id=1002 received
+10:00:05 INFO  request id=1002 done in 8ms
+EOF
+
+echo '$ grep ERROR svc.log   # 只看这行，不知道为什么超时'
+grep ERROR svc.log
+
+echo '$ grep -B 2 -A 1 ERROR svc.log   # 带上前 2 行后 1 行，原因一目了然'
+grep -B 2 -A 1 ERROR svc.log`}
+/>
+
+## 5. 实战套路汇总
+
+日常排查里 grep 常常是管道流水线的第一环：
+
+```bash
+# 统计今天各类错误出现次数（-o 提取 + 排序计数，第 20 章详解）
+grep -oE 'ERROR [a-z_]+' app.log | sort | uniq -c | sort -rn
+
+# 多条件：先粗筛再精筛，逐级缩小范围
+grep 'ERROR' app.log | grep -v 'retrying' | grep '2026-07-31 10:'
+
+# 固定字符串搜索（-F 不解释正则，搜含特殊字符的内容更快更安全）
+grep -F '[cache]' app.conf
+```
+
+<Callout type="tip" title="搜索字面文本用 -F，别让正则背刺你">
+要搜的内容里含 `.` `*` `[` 这类字符时，普通 grep 会把它们当元字符：`grep 1.2.3.4 log` 会把 1a2b3c4 也匹配进来。用 `grep -F`（fixed string）按字面处理，或用 `[.]` 逐个转义。管道里查 IP、版本号、URL 时尤其注意。
+</Callout>
+
+<Callout type="info" title="现代替代品 ripgrep（rg）">
+在代码仓库里搜索，很多工程师用 rg 替代 grep -r：默认递归、自动忽略 .gitignore 里的文件、速度更快。语法与 grep -E 基本一致，grep 学好了 rg 无缝上手；但服务器上未必装有 rg，grep 永远是保底技能。
+</Callout>
+
+## 小结
+
+- grep 按行过滤：`-i` 忽略大小写、`-n` 行号、`-v` 反选、`-c` 计数、`-w` 整词、`-r` 递归
+- 默认写 `grep -E`：`.` `^` `$` `[]` `*` `+` `?` `{n,m}` `(a|b)` 这套元字符要熟
+- `-o` 只输出匹配片段，是提取与统计的基础
+- `-A/-B/-C` 带上下文看日志，还原事故现场
+- 搜索字面字符串（IP、URL）用 `-F` 防正则误伤
+- 下一章：三剑客之 sed——流式编辑与批量替换 →
+
+<Callout type="exercise" title="练习">
+1. 用本章的 access.log 数据，写出三条命令：只输出状态码为 404 的行；输出所有非 GET 请求；统计 200 出现的次数（用 `-c`）。
+2. 用 `grep -oE` 从 access.log 中只提取出所有 IP 地址（提示：`[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+`）。
+3. 构造一个 10 行的日志，让第 6 行是 ERROR，用 `-C` 参数一次性输出第 4 到 8 行。
+4. 解释这两条命令结果为何不同：`grep 'a.c' f.txt` 与 `grep -F 'a.c' f.txt`（先造一个包含 abc 和 a.c 两行的文件验证）。
+</Callout>

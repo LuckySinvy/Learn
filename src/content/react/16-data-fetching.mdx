@@ -1,0 +1,195 @@
+---
+title: 数据请求
+order: 16
+description: 为什么 useEffect + fetch 不够用、竞态与缓存问题，以及 TanStack Query 的缓存/重试/staleTime 思想
+---
+
+# 数据请求
+
+React 本身不管数据从哪来。最早的「标准答案」是把 fetch 写进 useEffect。这能跑，但很快你会遇到一堆 React 特有的麻烦：竞态、重复请求、缓存、重试、加载/错误状态的样板代码。
+
+这一章先看 useEffect + fetch 的真实问题，再介绍 TanStack Query 的思想——它本质上是一个「带缓存的异步状态管理器」。
+
+## 1. useEffect + fetch 够用吗
+
+最朴素的写法：
+
+```tsx
+function UserProfile({ id }: { id: string }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetch("/api/users/" + id)
+      .then((r) => r.json())
+      .then((data) => {
+        if (!cancelled) setUser(data);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  // ...
+}
+```
+
+这已经写了三份状态，外加一个 `cancelled` 标志。真实项目里每个接口都复制一遍，代码会迅速膨胀，而且每个开发者手写的细节都不一样，难以统一。
+
+### 1.1 竞态（race condition）
+
+更严重的是竞态：如果 `id` 从 A 变成 B 又变回 A，三次请求可能以任意顺序返回。第二次先回、第三次后回，最后屏幕显示的是 A 的数据——但用户当前看的是 B。这在慢网络下非常常见。上面的 `cancelled` 标志只解决了「切走就别更新」，没有解决「快速来回切」造成的乱序。
+
+### 1.2 没有缓存，也没有去重
+
+切到另一个页面再切回来，整个 useEffect 重新跑一遍，重新发请求。两个组件同时请求同一份数据，发两次请求。React 对此一无所知，因为它只管渲染，不管「这份数据是否已经在别处加载过」。
+
+### 1.3 这些都不是「渲染」问题
+
+关键点：加载中、错误、数据过期——这些都属于**异步状态管理**，跟 React 的渲染机制无关。把它们塞进 useEffect 是本末倒置：useEffect 是为「同步外部系统」设计的（订阅、事件监听），不是为「管理异步缓存」设计的。
+
+## 2. TanStack Query 的思想
+
+TanStack Query（旧名 React Query）把上面所有问题收进一个库。它的核心概念只有三个：**query key**、**缓存**、**失效**。
+
+### 2.1 query key 即缓存键
+
+```tsx
+import { useQuery } from "@tanstack/react-query";
+
+function UserProfile({ id }: { id: string }) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["user", id],
+    queryFn: () => fetch("/api/users/" + id).then((r) => r.json()),
+  });
+  // ...
+}
+```
+
+`queryKey: ["user", id]` 就是缓存键。相同 key 复用同一份数据——切回来不发新请求，两个组件用同一 key 只发一次请求。竞态也被它内部处理掉了（它只保留「最新一次」请求的结果）。
+
+### 2.2 缓存与时间窗：staleTime 与 gcTime
+
+| 概念 | 含义 | 典型默认 |
+|---|---|---|
+| staleTime | 数据保持「新鲜」的时长，期间不重新请求 | 0（立即过期） |
+| gcTime | 没有组件订阅后，缓存保留多久 | 5 分钟 |
+
+```tsx
+useQuery({
+  queryKey: ["user", id],
+  queryFn: fetchUser,
+  staleTime: 60_000,   // 一分钟内认为新鲜，切换不重拉
+});
+```
+
+`staleTime` 是性能与新鲜度的平衡：列表数据可以长一点，余额、库存这类要短一点甚至设为 0。
+
+### 2.3 重试与退避
+
+网络抖动导致的失败不该直接显示错误。TanStack Query 默认重试 3 次，并带指数退避：
+
+```tsx
+useQuery({
+  queryKey: ["user", id],
+  queryFn: fetchUser,
+  retry: 3,
+  retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
+});
+```
+
+### 2.4 写操作：useMutation
+
+读用 `useQuery`，写用 `useMutation`：
+
+```tsx
+const mutation = useMutation({
+  mutationFn: (payload: UserInput) =>
+    fetch("/api/users", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ["user"] }),
+});
+```
+
+`onSuccess` 里调 `invalidateQueries` 让相关缓存失效、自动重新拉取——这就是「失效」概念。
+
+## 3. 它到底帮你做了什么
+
+把第一节能手写的样板，和 TanStack Query 对照：
+
+| 痛点 | 手写 | TanStack Query |
+|---|---|---|
+| 加载/错误状态 | 自己写三份 state | `isLoading` / `error` 自带 |
+| 竞态 | 手动 cancelled 标志 | 内部处理 |
+| 缓存去重 | 做不到 | queryKey 自动 |
+| 重试 | 手写 | 配置即可 |
+| 过期刷新 | 自己管 | staleTime / invalidate |
+
+## 4. 乐观更新：先假装成功
+
+很多写操作并不需要等服务器确认，比如点赞。乐观更新（optimistic update）的思路是：先立刻更新本地缓存，等服务器结果回来再校正；如果失败就回滚。
+
+```tsx
+useMutation({
+  mutationFn: toggleLike,
+  onMutate: async (id) => {
+    await queryClient.cancelQueries({ queryKey: ["post", id] });
+    const prev = queryClient.getQueryData(["post", id]);
+    queryClient.setQueryData(["post", id], (old: Post) => ({
+      ...old,
+      liked: !old.liked,
+    }));
+    return { prev };                 // 把旧值交给 onError 回滚
+  },
+  onError: (_e, id, ctx) => {
+    queryClient.setQueryData(["post", id], ctx?.prev);
+  },
+});
+```
+
+注意 `onMutate` 在 `mutationFn` 之前同步执行，用户点下去的瞬间界面就变了——这正是「乐观」的含义。
+
+<Callout type="info" title="它不替代你的数据层">
+TanStack Query 管的是「客户端缓存与异步状态」，不是「怎么发请求」。`queryFn` 里你照样写 fetch / axios。它也不管全局状态（用户登录态、UI 开关），那些交给第 15 章的状态库。
+</Callout>
+
+<Callout type="tip" title="服务端组件时代还需要它吗">
+在 Next.js App Router（第 19 章）里，很多读数据可以直接在服务端组件做，不需要客户端请求。但「需要在客户端交互触发的刷新、无限滚动、乐观更新、轮询」这类场景，TanStack Query 依然是最顺手的选择。
+</Callout>
+
+<Callout type="warn" title="别把服务端状态放进 useState">
+服务端数据（来自接口）和客户端状态（输入框、开关、弹窗）是两回事。把接口数据长期存进 Zustand / Redux 是本末倒置：你等于手动重造了一个缓存，还容易和后端失同步。服务端状态用 TanStack Query，客户端状态用状态库。
+</Callout>
+
+<Callout type="exercise" title="练习 1：竞态复现">
+写一个最小的 React 组件：一个按钮在 "a" 和 "b" 之间切换 `id`，useEffect 里用 `setTimeout` 模拟请求（"a" 延迟 1 秒，"b" 延迟 0.2 秒）。快速点两次，观察是否出现「显示 a 的数据但 id 是 b」的竞态，并说明原因。
+</Callout>
+
+<Callout type="exercise" title="练习 2：设计 queryKey">
+你的接口有：用户列表（带分页和关键词）、单个用户、用户的订单列表。为这三种分别设计 `queryKey` 数组，要求「翻页或改关键词时缓存相互独立、互不影响」。
+</Callout>
+
+<Callout type="exercise" title="练习 3：失效策略">
+编辑用户的昵称后，你需要让「用户列表」和「单个用户详情」两处缓存都更新。应该 `invalidateQueries(["users"])` 还是只 invalidate 单个？说明 `queryKey` 前缀匹配的语义。
+</Callout>
+
+## 小结
+
+- useEffect + fetch 能跑，但要手写加载/错误状态、自己处理竞态、没有缓存
+- 竞态本质：异步请求返回顺序不可控，与 React 渲染无关
+- TanStack Query 是「带缓存的异步状态管理器」，核心是 queryKey / 缓存 / 失效
+- `staleTime` 管新鲜度、`gcTime` 管回收、`retry` 管容错、`invalidateQueries` 管刷新
+- 乐观更新先改本地缓存、失败回滚，是提升交互手感的关键手段
+- 服务端状态用 TanStack Query，客户端状态用状态库，二者不要混
+- 下一章讲路由：组件如何根据 URL 切换 →

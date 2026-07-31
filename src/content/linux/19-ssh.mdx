@@ -1,0 +1,197 @@
+---
+title: SSH 与远程操作：密钥、scp/rsync 与隧道
+order: 19
+description: SSH 密钥登录原理与配置、scp/rsync 文件传输、~/.ssh/config 与端口转发隧道
+---
+
+# SSH 与远程操作：密钥、scp/rsync 与隧道
+
+管理云服务器的唯一入口几乎就是 SSH（Secure Shell）：加密的远程登录、远程执行、文件传输，甚至能搭加密隧道。本章内容需要真实的远程主机才能完整实操（沙箱无外网也未装 ssh 客户端），因此以讲解和真机演练清单为主。
+
+## 1. 基本连接与远程执行
+
+```bash
+ssh ada@203.0.113.10             # 用户名@主机，默认 22 端口
+ssh -p 2222 ada@203.0.113.10     # 指定端口
+ssh ada@web-01 'df -h; uptime'   # 不进交互 Shell，执行完命令直接返回
+ssh web-01 'bash -s' < local.sh  # 把本地脚本送到远端执行——批量运维的地基
+exit                             # 或 Ctrl+D 退出登录
+```
+
+首次连接会提示确认主机指纹（防中间人攻击），确认后记入 `~/.ssh/known_hosts`；此后若指纹突变会拒绝连接并大字报警——除非服务器真的重装过，否则要警惕。
+
+## 2. 密钥登录：告别密码
+
+密码登录既麻烦又易被爆破，生产环境标配**密钥对**：私钥留在你机器（严格保密），公钥放到服务器。登录时服务器用公钥出题、你的私钥作答，全程密码不上网。
+
+```bash
+# 1. 本机生成密钥对（ed25519 是当前推荐算法）
+ssh-keygen -t ed25519 -C 'ada@laptop'
+#    生成 ~/.ssh/id_ed25519（私钥）和 id_ed25519.pub（公钥）
+
+# 2. 公钥安装到服务器（追加进对方的 ~/.ssh/authorized_keys）
+ssh-copy-id ada@203.0.113.10
+#    没有 ssh-copy-id 时的手动等价操作：
+cat ~/.ssh/id_ed25519.pub | ssh ada@host 'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys'
+
+# 3. 之后 ssh 直接进，不再要密码
+ssh ada@203.0.113.10
+```
+
+密钥体系对**权限极其苛刻**，权限不对会被 SSH 静默拒绝，这是新手排查密钥登录失败的第一检查点：
+
+<Playground
+  language="linux"
+  title="SSH 目录的权限规范（可在沙箱演练）"
+  id="linux-19-1"
+  code={`# 权限要求：.ssh 目录 700，私钥/authorized_keys 600，公钥 644
+mkdir -p /root/.ssh
+echo 'FAKE-PRIVATE-KEY-FOR-DEMO' > /root/.ssh/id_ed25519
+echo 'ssh-ed25519 AAAA... ada@laptop' > /root/.ssh/id_ed25519.pub
+echo 'ssh-ed25519 AAAA... ada@laptop' > /root/.ssh/authorized_keys
+
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/id_ed25519 /root/.ssh/authorized_keys
+chmod 644 /root/.ssh/id_ed25519.pub
+
+echo '$ 验收：'
+ls -ld /root/.ssh
+ls -l /root/.ssh
+
+echo ''
+echo '$ 权限过宽的私钥，真实 ssh 会报 UNPROTECTED PRIVATE KEY 并拒用'
+stat -c '%a %n' /root/.ssh/id_ed25519`}
+/>
+
+<Callout type="warn" title="私钥 = 服务器钥匙串，三条红线">
+1. 私钥永不离开你的设备：不进 git 仓库、不发聊天工具、不放服务器上"中转"；
+2. 生成时建议设 passphrase（私钥文件本身再加一道密码），配合 ssh-agent 免重复输入；
+3. 服务器加固三件套：`/etc/ssh/sshd_config` 里 `PasswordAuthentication no`（禁密码）、`PermitRootLogin no`（禁 root 直登）、改用非 22 端口减少扫描噪音，改完 `systemctl reload sshd`。
+</Callout>
+
+## 3. ~/.ssh/config：给主机起外号
+
+连接参数写进配置，长命令变短别名：
+
+```text
+# ~/.ssh/config
+Host web
+    HostName 203.0.113.10
+    User ada
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519
+
+Host bastion
+    HostName 198.51.100.1
+    User ops
+
+Host db-internal
+    HostName 10.0.0.5
+    User ops
+    ProxyJump bastion        # 经跳板机自动中转——内网机器一步直达
+```
+
+之后 `ssh web`、`scp app.tgz web:/opt/` 即可；`ProxyJump`（命令行 `-J`）让"先登跳板再登内网"合并成一步，是有堡垒机环境的必备配置。
+
+## 4. 文件传输：scp 与 rsync
+
+```bash
+scp app.tar.gz web:/opt/           # 本地 → 远程
+scp web:/var/log/app.log ./        # 远程 → 本地
+scp -r site/ web:/var/www/         # 目录递归
+
+rsync -avz site/ web:/var/www/site/     # 增量同步：只传变化的部分
+rsync -avz --delete site/ web:/var/www/site/   # 镜像：远端多余文件也删掉
+rsync -avz --exclude 'node_modules' ./ web:/opt/app/
+```
+
+scp 简单粗暴每次全量；rsync 按块比对**只传差异**，大目录、断点续传、重复部署场景全面胜出（`-a` 归档保权限、`-v` 显示过程、`-z` 压缩传输）。
+
+<Callout type="warn" title="rsync 尾部斜杠的语义陷阱">
+`rsync -av site web:/var/www/` 传的是 site **目录本身**（结果 /var/www/site/...）；`rsync -av site/ web:/var/www/` 传的是 site **里面的内容**（直接铺进 /var/www）。一斜杠之差，配合 `--delete` 足以清空错误的目标目录——不确定时先加 `-n`（dry-run）预演。
+</Callout>
+
+无 rsync 可用时的流式打包传输（第 13 章伏笔）：`tar czf - site/ | ssh web 'tar xzf - -C /var/www'`——不落中间文件，一条管道跨越两台机器。
+
+## 5. 隧道：SSH 的隐藏形态
+
+SSH 可以在加密连接里"搬运"任意 TCP 流量，两种方向：
+
+```bash
+# 本地转发 -L：把远端资源拉到本地端口
+ssh -L 13306:10.0.0.5:3306 bastion
+# 之后本地连 127.0.0.1:13306 == 经跳板机连内网数据库 10.0.0.5:3306
+# 典型用途：用本地 GUI 客户端连"只对内网开放"的数据库
+
+# 远程转发 -R：把本地服务暴露到远端
+ssh -R 8080:127.0.0.1:3000 web
+# 远端服务器的 8080 → 你笔记本的 3000（演示本地开发中的服务）
+
+# 常配参数：-N 只建隧道不开 Shell，-f 转后台
+ssh -N -f -L 13306:10.0.0.5:3306 bastion
+```
+
+记忆锚点：`-L` 的 L 是 Local——**监听在本地**；`-R` 的 R 是 Remote——监听在远端。
+
+<Playground
+  language="linux"
+  title="体会'端口转发'的效果（本地模拟）"
+  id="linux-19-2"
+  code={`# 沙箱无 ssh，但可以模拟隧道的"效果"：
+# 假设 9000 是"内网服务"，我们用一个转发进程把它映射到 9100
+mkdir -p www && echo 'internal service data' > www/data.txt
+cd www && python3 -m http.server 9000 --bind 127.0.0.1 > /dev/null 2>&1 &
+sleep 1
+
+# 用 python 写一个极简 TCP 转发（ssh -L 干的就是这件事+加密）
+cat > /tmp/fwd.py << 'EOF'
+import socket, threading
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(4096)
+            if not d: break
+            b.sendall(d)
+    finally:
+        a.close(); b.close()
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', 9100)); srv.listen(1)
+c, _ = srv.accept()
+up = socket.create_connection(('127.0.0.1', 9000))
+threading.Thread(target=pipe, args=(c, up)).start()
+pipe(up, c)
+EOF
+python3 /tmp/fwd.py > /dev/null 2>&1 &
+sleep 1
+
+echo '$ 访问 9100（转发端口），拿到的是 9000（内网服务）的数据：'
+curl -s http://127.0.0.1:9100/data.txt
+echo '(ssh -L 13306:db:3306 的原理与此相同，只是包在加密通道里)'
+kill $(jobs -p) 2>/dev/null || true`}
+/>
+
+## 6. 真机演练清单
+
+按顺序在自己的云服务器上过一遍，SSH 就算毕业：
+
+1. `ssh-keygen -t ed25519` 生成密钥，`ssh-copy-id` 上传公钥，验证免密登录；
+2. 写好 `~/.ssh/config`，实现 `ssh 别名` 直连；
+3. `rsync -avzn`（带 n 预演）同步一个本地目录到服务器，确认清单后去掉 n 实传；
+4. sshd_config 禁用密码登录并 reload（**先确认密钥能登再禁**，否则把自己锁外面）；
+5. `ssh -L` 把服务器上某个只监听 127.0.0.1 的端口拉到本地访问一次。
+
+## 小结
+
+- ssh 用户@主机 登录、`ssh host 'cmd'` 远程执行；首次指纹入 known_hosts，突变要警觉
+- 密钥登录：ssh-keygen 生成、ssh-copy-id 部署；.ssh 700、私钥 600，权限不对直接拒
+- ~/.ssh/config 存主机档案，ProxyJump 穿跳板；scp 简单全量、rsync 增量（注意尾斜杠 + `-n` 预演）
+- 隧道：`-L` 拉远端资源到本地，`-R` 推本地服务到远端，配 -N -f 常驻
+- 服务器加固：禁密码、禁 root 直登、密钥加 passphrase
+- 下一章（最终章）：综合实战——日志分析流水线 →
+
+<Callout type="exercise" title="练习">
+1. 在沙箱把 19-1 的权限练习改造成一个 `fix-ssh-perms.sh` 脚本：接收一个目录参数，把它按 .ssh 规范修正权限并输出修正前后的 `stat -c '%a'` 对比。
+2. 默写 rsync 命令：把本地 `dist/` 的**内容**同步到 `web:/var/www/app/`，排除 `.map` 文件，删除远端多余文件，先预演再实传（两条命令）。
+3. 画出（或用文字描述）`ssh -L 13306:10.0.0.5:3306 bastion` 中数据包的完整路径：本地客户端 → ？ → ？ → 数据库。
+4. 真机作业：完成第 6 节演练清单的 1、2、3 步，并记录 rsync 第二次同步时传输量比第一次小多少。
+</Callout>

@@ -1,0 +1,229 @@
+---
+title: 状态码：服务器的一句话回复
+order: 6
+description: 1xx-5xx 分类详解、301/302/307/308 与 401/403 等易混淆状态码对比
+---
+
+# 状态码：服务器的一句话回复
+
+状态码是响应的第一信息：三位数字，第一位定类别。它决定浏览器是否重定向、缓存是否可用、爬虫如何对待你的页面、监控系统是否报警。用错状态码的 API，会把这些下游系统全部带偏。
+
+## 1. 五大类
+
+| 类别 | 含义 | 记忆口诀 |
+|---|---|---|
+| 1xx | 信息性：收到了，继续 | "等等" |
+| 2xx | 成功 | "成了" |
+| 3xx | 重定向：去别处找 | "挪了" |
+| 4xx | 客户端错误：你的问题 | "你错了" |
+| 5xx | 服务器错误：我的问题 | "我错了" |
+
+4xx 和 5xx 的分界是**责任归属**：请求本身不合法/无权限是 4xx，请求没问题但服务器处理砸了是 5xx。监控告警通常只盯 5xx——4xx 是用户行为，5xx 才是事故。
+
+## 2. 高频状态码逐个说
+
+### 2xx 成功
+
+- **200 OK**：通用成功；
+- **201 Created**：创建成功，应带 `Location` 头指向新资源；
+- **204 No Content**：成功但没有体（如 DELETE 成功），**响应必须无体**；
+- **206 Partial Content**：范围请求成功（断点续传，配合 Range 头）。
+
+### 3xx 重定向
+
+- **301 Moved Permanently**：永久搬家，浏览器/爬虫会记住新地址，**可被缓存**；
+- **302 Found**：临时挪动，下次还来老地址；
+- **303 See Other**：让客户端改用 GET 去取结果（POST-Redirect-GET 模式）；
+- **304 Not Modified**：协商缓存命中，"你手里那份还能用"（第 9 章主角）；
+- **307 / 308**：302 / 301 的严格版——**重定向时不许改方法**（详见下文实验）。
+
+### 4xx 客户端错误
+
+- **400 Bad Request**：报文/参数不合法的兜底；
+- **401 Unauthorized**：**未认证**（不知道你是谁），必须带 `WWW-Authenticate` 头提示如何认证；
+- **403 Forbidden**：**已认证但无权限**（知道你是谁，但你不配）；
+- **404 Not Found**：资源不存在（也常被用来隐藏 403，避免泄露资源存在性）；
+- **405 Method Not Allowed**：路径存在但方法不对，应带 `Allow` 头；
+- **409 Conflict**：状态冲突（重复创建、版本冲突）；
+- **429 Too Many Requests**：限流，配合 `Retry-After`。
+
+### 5xx 服务器错误
+
+- **500 Internal Server Error**：未捕获异常的兜底；
+- **502 Bad Gateway**：网关收到了上游的**无效响应**（上游崩了/返回垃圾）；
+- **503 Service Unavailable**：暂时过载/维护中，可带 `Retry-After`；
+- **504 Gateway Timeout**：网关**等上游超时**。
+
+502 与 504 的区分对排障很关键：502 = 上游挂了或响应非法；504 = 上游太慢。
+
+## 3. 动手：一台"状态码自助餐"服务器
+
+<Playground
+  language="http"
+  title="按路径返回各种状态码"
+  id="http-06-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+ROUTES = {
+    "/ok":        (200, {}),
+    "/created":   (201, {"Location": "/things/9"}),
+    "/nocontent": (204, {}),
+    "/moved":     (301, {"Location": "/ok"}),
+    "/found":     (302, {"Location": "/ok"}),
+    "/unauth":    (401, {"WWW-Authenticate": "Bearer realm=\"api\""}),
+    "/forbidden": (403, {}),
+    "/limited":   (429, {"Retry-After": "30"}),
+    "/boom":      (500, {}),
+    "/slowgw":    (504, {}),
+}
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        code, headers = ROUTES.get(self.path, (404, {}))
+        self.send_response(code)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        if code not in (204, 304):
+            self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+for p in /ok /created /nocontent /moved /unauth /forbidden /limited /boom /slowgw /nope; do
+  curl -s -o /dev/null -w "%{http_code}  $p\n" http://127.0.0.1:8000$p
+done
+echo "---- 401 必须携带 WWW-Authenticate ----"
+curl -sI http://127.0.0.1:8000/unauth | grep -iE "HTTP/|www-auth"
+echo "---- 429 携带 Retry-After ----"
+curl -sI http://127.0.0.1:8000/limited | grep -iE "HTTP/|retry"`}
+/>
+
+## 4. 实验：301/302 会偷偷改掉你的 POST
+
+历史遗留：大量客户端把 301/302 的重定向**从 POST 降级成 GET**（丢掉请求体）。307/308 就是为堵住这个漏洞而生——**禁止改方法**。用实验说话：
+
+<Playground
+  language="http"
+  title="302 vs 307：重定向后方法变了吗"
+  id="http-06-2"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def route(self):
+        if self.path == "/r302":
+            self.send_response(302)
+            self.send_header("Location", "/target")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/r307":
+            self.send_response(307)
+            self.send_header("Location", "/target")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            body = ("到达 /target 的方法是: " + self.command + "\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    do_GET = route
+    do_POST = route
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+# 注意：用 -d 让 curl 隐式 POST（如果写死 -X POST，curl 会强制每一跳都用 POST，
+# 反而掩盖了 302 的降级行为）
+echo "== POST 遇到 302 + curl -L =="
+curl -sL -d "pay=100" http://127.0.0.1:8000/r302
+echo "== POST 遇到 307 + curl -L =="
+curl -sL -d "pay=100" http://127.0.0.1:8000/r307`}
+/>
+
+结果：302 之后 curl 改用 **GET** 去请求新地址（支付数据没了！），307 之后依然是 **POST**。选型口诀：
+
+| 需求 | 用 |
+|---|---|
+| 永久换址，允许换成 GET | 301 |
+| 临时换址，允许换成 GET | 302 |
+| 提交后跳到结果页（强制 GET） | 303 |
+| 临时换址，方法与体必须原样 | 307 |
+| 永久换址，方法与体必须原样 | 308 |
+
+## 5. 易混对比速查
+
+**401 vs 403**：401 是"请先登录"（可以补救——去认证），403 是"登录了也不行"（无权限，重试无用）。判断口径：换个身份能否解决？能 → 401，不能 → 403。
+
+**404 vs 410**：410 Gone 明确表示"曾经有、永久删了"，爬虫会更快移除索引；404 只是"现在没有"。
+
+**200 + 错误体 vs 4xx/5xx**：把所有失败都包装成 `200 {"code": 500}` 是反模式——监控、网关重试、浏览器缓存全部失明。HTTP 状态码表达传输层结果，业务细分码放响应体里，两层各司其职。
+
+<Callout type="info" title="1xx 很少直接见到">
+100 Continue 用于大体积上传前的"预询问"（配合 Expect: 100-continue 请求头，curl 上传大文件时自动使用）；101 Switching Protocols 是 WebSocket 升级握手的应答。它们都是"中间响应"，最终还会跟一个正式状态码。
+</Callout>
+
+<Playground
+  language="http"
+  title="404 也可以有讲究：405 + Allow"
+  id="http-06-3"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/orders":
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"[]")
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+    def do_DELETE(self):
+        if self.path == "/orders":
+            # 路径存在，但不允许 DELETE 整个集合 -> 405 而不是 404
+            self.send_response(405)
+            self.send_header("Allow", "GET, POST")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 路径不存在：404 =="
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/nope
+echo "== 路径存在但方法不允许：405 + Allow =="
+curl -si -X DELETE http://127.0.0.1:8000/orders | grep -iE "HTTP/|allow"`}
+/>
+
+## 小结
+
+- 第一位数字定类别：1 继续、2 成功、3 挪了、4 你错、5 我错；
+- 301/302 可能把 POST 降级为 GET；需要保持方法用 307/308；
+- 401 缺认证（带 WWW-Authenticate），403 缺权限；502 上游坏了，504 上游慢了；
+- 204/304 响应不能有体；201 应带 Location；429/503 宜带 Retry-After；
+- 别用 200 包裹一切错误：状态码是给浏览器、缓存、网关、监控看的公共契约。
+
+<Callout type="exercise" title="练习">
+1. 给 Playground 1 加一条 /teapot 路由返回 418，并用 curl -w 验证；再查一查 418 的来历。
+2. 在 Playground 2 中把 302 换成 303，观察 curl -L 的行为与 302 有何异同。
+3. 用 Playground 1 的 /nocontent 验证：204 响应即使你写了体，curl 也收不到（或服务器报错）——为什么协议这样规定？
+4. 你的 API 遇到"库存不足下单失败"，应该返回 200、400、409 还是 422？给出你的选择和理由。
+</Callout>

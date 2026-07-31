@@ -1,0 +1,200 @@
+---
+title: React Router
+order: 17
+description: 声明式路由、嵌套路由与布局、动态参数、loader 数据加载思想，以及路由匹配背后的模式解析
+---
+
+# React Router
+
+单页应用（SPA）没有「换页面」这回事，URL 变了只是换了一批组件渲染。React Router 是做这件事最流行的库：它把 URL 映射到组件树，让「前进后退」「刷新保持状态」「可分享链接」都自然成立。
+
+这一章讲路由的核心心智，而不是 API 清单。理解了「URL 是一棵树的路径」，嵌套路由、动态参数都会顺理成章。
+
+## 1. 声明式路由
+
+最基础的用法：用组件声明「哪个路径渲染哪个界面」。
+
+```tsx
+import { createBrowserRouter, RouterProvider } from "react-router-dom";
+
+const router = createBrowserRouter([
+  { path: "/", element: <Home /> },
+  { path: "/users/:id", element: <UserProfile /> },
+  { path: "/about", element: <About /> },
+]);
+
+function App() {
+  return <RouterProvider router={router} />;
+}
+```
+
+`/users/:id` 里的 `:id` 是动态段。访问 `/users/42` 时，组件里用 `useParams()` 拿到 `{ id: "42" }`。注意 `id` 永远是字符串——要当数字用记得 `Number(params.id)`。
+
+### 1.1 路由匹配是怎么做的
+
+React Router 把模式编译成正则，`/users/:id` 变成 `^/users/([^/]+)$`，再按参数名把捕获组取出来。亲手实现一个最小版本就很清楚了：
+
+<Playground
+  language="typescript"
+  title="路由模式匹配"
+  id="react-17-1"
+  code={`type Params = Record<string, string>;
+
+// 把 "/users/:id" 这种模式编译成正则 + 参数名列表
+function compile(pattern: string): { regex: RegExp; keys: string[] } {
+  const keys: string[] = [];
+  const source = pattern
+    .split("/")
+    .map(function (seg) {
+      if (seg.startsWith(":")) {
+        keys.push(seg.slice(1));
+        return "([^/]+)";
+      }
+      return seg;
+    })
+    .join("/");
+  return { regex: new RegExp("^" + source + "$"), keys: keys };
+}
+
+function match(pattern: string, path: string): Params | null {
+  const built = compile(pattern);
+  const m = path.match(built.regex);
+  if (!m) return null;
+  const params: Params = {};
+  built.keys.forEach(function (k, i) {
+    params[k] = m[i + 1];
+  });
+  return params;
+}
+
+console.log("匹配 /users/42 与模式 /users/:id");
+console.log(JSON.stringify(match("/users/:id", "/users/42")));
+
+console.log("匹配 /posts/3/comments/7");
+console.log(JSON.stringify(match("/posts/:pid/comments/:cid", "/posts/3/comments/7")));
+
+console.log("不匹配 /users/42 与 /posts/:pid");
+console.log(JSON.stringify(match("/posts/:pid", "/users/42")));`}
+  expectedOutput={`匹配 /users/42 与模式 /users/:id\n{"id":"42"}\n匹配 /posts/3/comments/7\n{"pid":"3","cid":"7"}\n不匹配 /users/42 与 /posts/:pid\nnull`}
+/>
+
+这正是 React Router 在背后做的事：把动态段变成捕获组，再按位置回填参数名。
+
+## 2. 嵌套路由与布局
+
+真实应用里，页面有公共外壳：顶栏、侧边栏、面包屑。与其每个页面重复写一遍，不如把它们抽成布局，让子路由「嵌」进布局的留白处。
+
+```tsx
+const router = createBrowserRouter([
+  {
+    path: "/",
+    element: <Layout />,                // 外壳，里面有 <Outlet />
+    children: [
+      { index: true, element: <Home /> },
+      { path: "users/:id", element: <UserProfile /> },
+      { path: "settings", element: <Settings /> },
+    ],
+  },
+]);
+```
+
+`Layout` 内部用一个 `<Outlet />` 占位，子路由渲染的结果就出现在这里：
+
+```tsx
+function Layout() {
+  return (
+    <div>
+      <Sidebar />
+      <main>
+        <Outlet />          {/* 子路由的组件渲染到这里 */}
+      </main>
+    </div>
+  );
+}
+```
+
+`index: true` 表示「父路径自身」对应的默认子路由（比如 `/` 显示 Home，而不是空白）。
+
+### 2.1 嵌套路由的渲染模型
+
+URL `/users/42` 会同时激活两层路由：外层 `Layout` 常驻，内层 `UserProfile` 填进 `<Outlet />`。所以切换用户时，只有 `UserProfile` 重渲染，`Layout` 不动——这正是「布局复用」的性能好处。
+
+## 3. 导航：声明式与命令式
+
+不要用 `<a href>` 跳转，那会触发整页刷新、丢掉 React 状态。改用：
+
+```tsx
+import { Link, useNavigate } from "react-router-dom";
+
+function Nav() {
+  const go = useNavigate();
+  return (
+    <>
+      <Link to="/about">关于</Link>
+      <button onClick={() => go("/users/42")}>看用户</button>
+    </>
+  );
+}
+```
+
+`Link` 是声明式跳转（渲染成 `<a>` 但拦截点击），`useNavigate()` 是命令式跳转（在事件里调用）。
+
+## 4. loader：把数据加载移到路由层
+
+传统做法是在组件里 `useEffect` 拉数据，会先渲染空壳再闪一下。React Router 的 `loader` 让数据在**渲染组件之前**就准备好：
+
+```tsx
+{
+  path: "users/:id",
+  element: <UserProfile />,
+  loader: async ({ params }) => {
+    const user = await fetchUser(params.id);
+    return user;
+  },
+}
+```
+
+组件里用 `useLoaderData()` 直接拿到结果，没有 loading 闪烁：
+
+```tsx
+function UserProfile() {
+  const user = useLoaderData() as User;   // 数据已经在手
+  return <h1>{user.name}</h1>;
+}
+```
+
+这背后的思想很关键：**数据依赖跟着路由走**，而不是跟着组件走。好处是 URL 一确定，需要哪些数据就确定了，可以在导航时并行预取、做加载态、出错时显示 errorElement。
+
+<Callout type="info" title="loader 不是 React 特性">
+`loader` 是 React Router 的路由层能力，和 React 的渲染循环无关。它本质是「在进入这个路由前跑一个函数」。下一章会看到，Next.js 把这个思想又往前推了一步——直接在服务端拿数据。
+</Callout>
+
+<Callout type="tip" title="URL 是你的全局状态来源">
+把「当前看什么」放进 URL，而不是放进某个 React state。这样刷新、分享链接、前进后退都能复原界面。能用 URL 表达的状态，尽量不要藏在内存里。
+</Callout>
+
+<Callout type="warn" title="动态段永远是字符串">
+`useParams()` 返回的每一段都是 `string`。`/users/42` 拿到的 `id` 是 `"42"`，不是 `42`。直接拿去做数组索引或比较会踩坑，先 `Number()` 转换。
+</Callout>
+
+<Callout type="exercise" title="练习 1：设计路由树">
+一个后台有：登录页（无外壳）、带侧边栏的后台首页、文章列表、文章详情（带评论子路由）。画出 `createBrowserRouter` 的嵌套结构，并标出 `<Outlet />` 出现在哪一层。
+</Callout>
+
+<Callout type="exercise" title="练习 2：扩展匹配器">
+给本章 Playground 的 `compile` 增加「可选段」支持：模式写成 `/files/:path*` 能匹配 `/files` 和 `/files/a/b`。提示：把 `*` 段编译成 `(/.*)?`。
+</Callout>
+
+<Callout type="exercise" title="练习 3：loader 与组件取值">
+把「用户详情」从「组件内 useEffect 拉取」改成「loader 预取 + useLoaderData」。列出改动涉及的三处（路由配置、组件取值、错误边界），并说明为什么没有 loading 闪烁。
+</Callout>
+
+## 小结
+
+- 路由把 URL 映射到组件树；`/users/:id` 中的 `:id` 是动态段，由 `useParams()` 取回（字符串）
+- React Router 在背后把模式编译成正则、按捕获组回填参数名
+- 嵌套路由用 `<Outlet />` 让子路由填进布局，切换子路由时外壳不重渲染
+- 跳转用 `Link`（声明式）或 `useNavigate()`（命令式），不要用 `<a href>` 以免整页刷新
+- `loader` 在渲染前准备好数据，消除 loading 闪烁；数据依赖跟着路由走
+- 能用 URL 表达的状态就放进 URL，刷新和分享都能复原
+- 下一章讲并发特性：useTransition 与自动批处理 →

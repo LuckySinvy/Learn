@@ -1,0 +1,194 @@
+---
+title: HTTP 报文结构：手写一份原始报文
+order: 4
+description: 请求行/状态行、头部、空行与报文体，CRLF 规则，手工构造请求与响应
+---
+
+# HTTP 报文结构：手写一份原始报文
+
+HTTP/1.x 报文就是有固定格式的纯文本。这一章我们把报文拆到字节级：亲手拼一个请求发出去，再亲手拼一个响应让 curl 解析——拼完你就再也不会忘。
+
+## 1. 报文的骨架
+
+请求和响应共用同一个三段式骨架，只有第一行不同：
+
+```text
+请求报文                          响应报文
+┌─────────────────────────┐      ┌─────────────────────────┐
+│ 请求行: 方法 路径 版本      │      │ 状态行: 版本 状态码 原因   │
+│ GET /index.html HTTP/1.1 │      │ HTTP/1.1 200 OK          │
+├─────────────────────────┤      ├─────────────────────────┤
+│ 头部字段（每行一个键值对）  │      │ 头部字段                  │
+│ Host: example.com        │      │ Content-Type: text/html  │
+│ Accept: text/html        │      │ Content-Length: 1024     │
+├─────────────────────────┤      ├─────────────────────────┤
+│ 空行（头部结束的标志）      │      │ 空行                     │
+├─────────────────────────┤      ├─────────────────────────┤
+│ 报文体（可选）             │      │ 报文体                   │
+└─────────────────────────┘      └─────────────────────────┘
+```
+
+三条铁律：
+
+1. **行尾是 CRLF**（`\r\n` 两个字节），不是裸 `\n`；
+2. **一个空行（CRLF）分隔头部和报文体**——解析器就靠它判断"头读完了"；
+3. **头部字段名不区分大小写**（`Host` 与 `host` 等价），值前后的空白会被裁剪。
+
+## 2. 请求行三要素
+
+```text
+GET /list/books?page=2 HTTP/1.1
+ │        │               │
+方法    请求目标         协议版本
+```
+
+- **方法**：GET/POST/PUT/DELETE 等动词，语义详见第 5 章；
+- **请求目标**：通常是"路径 + 查询串"（origin-form）；请求代理时会是完整 URL（absolute-form）；
+- **版本**：HTTP/1.0、HTTP/1.1；HTTP/2 起报文改用二进制帧，不再有文本请求行。
+
+## 3. 用回显服务器透视请求
+
+先起一个"回显服务器"：把收到的请求行和全部头部原样吐回来。这是观察"curl 到底发了什么"的照妖镜：
+
+<Playground
+  language="http"
+  title="回显服务器：看清 curl 发出的每个头"
+  id="http-04-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Echo(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = ("请求行: " + self.requestline + "\n---头部---\n" + str(self.headers)).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), Echo).serve_forever()
+' &
+sleep 0.3
+
+# 一个最普通的 GET，再附加一个自定义头
+curl -s "http://127.0.0.1:8000/books?page=2" -H "X-Debug: 1"`}
+/>
+
+即使我们什么头都没写，curl 也自动带上了 `Host`、`User-Agent`、`Accept`——**Host 是 HTTP/1.1 唯一强制的请求头**，同一 IP 上托管多个网站（虚拟主机）全靠它区分。
+
+## 4. 字节级观察：POST 请求的真身
+
+回显服务器经过了 Python 的解析，我们再降一级——用原生 socket 收下**原始字节**，看 POST 请求在网线上的确切模样：
+
+<Playground
+  language="http"
+  title="字节级抓包：POST 报文的原始字节"
+  id="http-04-2"
+  code={`python3 -c '
+import socket, threading
+
+def server():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 8001)); srv.listen(1)
+    conn, _ = srv.accept()
+    raw = conn.recv(65536)
+    # repr 让 \r\n 显形
+    print("== 收到的原始字节 ==")
+    parts = raw.split(b"\r\n")
+    for i, line in enumerate(parts):
+        if i < len(parts) - 1:
+            tag = "   <-- 空行，头部结束" if line == b"" else ""
+            print(repr(line + b"\r\n") + tag)
+        elif line:
+            print(repr(line) + "   <-- 报文体（无 CRLF 结尾）")
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\n")
+    conn.close()
+
+threading.Thread(target=server, daemon=True).start()
+import time; time.sleep(0.2)
+
+import subprocess
+subprocess.run(["curl", "-s", "-X", "POST", "http://127.0.0.1:8001/login",
+                "-H", "Content-Type: application/json",
+                "-d", "{\"user\":\"ada\"}"], check=False)
+'`}
+/>
+
+注意输出中的几个关键点：
+
+- 每行确实以 `\r\n`（repr 显示为 `\\r\\n`）结尾；
+- 空行之后紧跟着 JSON 报文体，**报文体不带 CRLF 结尾**；
+- curl 自动计算并添加了 `Content-Length: 14`——接收方靠它知道"体有多长、何时读完"。
+
+<Callout type="warn" title="Content-Length 必须精确">
+Content-Length 比实际体短，服务器会截断数据；比实际长，服务器会一直等待剩余字节直到超时。前后端手工拼报文时的悬案，八成出在这里。声明长度的另一种方式是分块传输（第 10 章）。
+</Callout>
+
+## 5. 手工拼一个响应
+
+反过来，我们不用任何 HTTP 库，直接往 socket 里写响应文本，看 curl 能否正常解析：
+
+<Playground
+  language="http"
+  title="手写原始响应报文"
+  id="http-04-3"
+  code={`python3 -c '
+import socket, threading, time
+
+RESP = (b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"X-Handmade: yes\r\n"
+        b"Content-Length: 22\r\n"
+        b"\r\n"
+        b"hand-crafted response\n")
+
+def server():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 8002)); srv.listen(1)
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)          # 读掉请求
+        conn.sendall(RESP)
+        conn.close()
+
+threading.Thread(target=server, daemon=True).start()
+time.sleep(0.2)
+import subprocess
+subprocess.run(["curl", "-v", "http://127.0.0.1:8002/"], check=False)
+'`}
+/>
+
+curl 用 `-v` 展示了它成功解析出的状态行、每个头、以及正好 22 字节的体。一份合法的 HTTP 响应，就是这么几行手打的字节。
+
+## 6. 头部的书写规则
+
+| 规则 | 说明 |
+|---|---|
+| 格式 | `字段名: 值`，冒号后惯例加一个空格 |
+| 大小写 | 字段名不敏感；HTTP/2 中统一强制小写 |
+| 重复字段 | 同名头可出现多次（如 Set-Cookie），语义等价于逗号连接 |
+| 折行 | 历史上允许头部值换行续写（obs-fold），已废弃，收到应拒绝 |
+| 大小限制 | 协议未定，服务器各有上限（Nginx 默认单头 8k），超限返回 431 |
+
+<Callout type="info" title="报文 ≠ 语义">
+报文结构（syntax）与方法/状态码语义（semantics）是两份独立的规范：RFC 9112 定义 HTTP/1.1 报文格式，RFC 9110 定义与版本无关的语义。HTTP/2、HTTP/3 换掉了报文格式，但语义层完全沿用——这就是"学 HTTP 永不过时"的部分。
+</Callout>
+
+## 小结
+
+- 报文 = 起始行 + 头部 + 空行 + 可选体；行尾 CRLF，空行是头部结束的唯一标志；
+- 请求行是"方法 目标 版本"，状态行是"版本 状态码 原因短语"；
+- Host 是 HTTP/1.1 唯一必需的请求头，支撑虚拟主机；
+- 报文体长度由 Content-Length（或分块传输）声明，错一个字节都会出事；
+- HTTP/1.x 报文是文本，用 socket 就能手写手读——这是排查一切疑难杂症的底气。
+
+<Callout type="exercise" title="练习">
+1. 修改 Playground 3 的手工响应：把 Content-Length 改成 10，观察 curl 输出的体被截断成什么样；改成 100，观察 curl 如何等待并超时/报错。
+2. 在 Playground 2 中把 curl 的 -d 参数换成 --data-binary @- 并配合 echo 管道，验证报文体的字节与你输入完全一致。
+3. 用 Playground 1 的回显服务器对比 curl 加与不加 -H "Accept: application/json" 时请求头的差异。
+4. 手工写一个 302 响应（含 Location 头），用 curl -v 观察，再加 -L 让 curl 跟随跳转（可跳到同一服务器的另一路径）。
+</Callout>

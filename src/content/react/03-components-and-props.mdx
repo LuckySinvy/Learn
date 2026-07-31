@@ -1,0 +1,414 @@
+---
+title: 组件与 props
+order: 3
+description: 函数组件的本质、props 的单向传递与只读性、children 与组合模式，以及用 TypeScript 精确描述组件契约
+---
+
+# 组件与 props
+
+组件是 React 唯一的复用单元。这一章讲清楚组件是什么、数据怎么传进去、以及如何用组合而不是继承来搭建界面。
+
+## 1. 函数组件的本质
+
+### 1.1 一个组件就是一个函数
+
+```tsx
+function Welcome(props: { name: string }) {
+  return <h1>你好，{props.name}</h1>;
+}
+```
+
+去掉 JSX 语法糖后：
+
+```js
+function Welcome(props) {
+  return React.createElement("h1", null, "你好，", props.name);
+}
+```
+
+所以组件的定义可以精确表述为：**一个接收 props 对象、返回 element 描述的函数**。它没有任何特殊之处，你可以直接调用它，得到的就是一个普通对象。
+
+### 1.2 使用组件 vs 调用组件
+
+这两种写法看起来等价，实际差别巨大：
+
+```tsx
+<Welcome name="Ada" />        // 写法 A：作为组件使用
+{Welcome({ name: "Ada" })}    // 写法 B：直接调用函数
+```
+
+写法 A 编译成 `createElement(Welcome, { name: "Ada" })`，返回的对象里 type 字段是 `Welcome` 这个**函数本身**。React 在渲染时才去调用它，并为它建立一个独立的节点——这个节点拥有自己的 state、自己的生命周期、自己的位置身份。
+
+写法 B 是你自己把函数执行了，React 拿到的是执行结果，中间那一层组件节点根本不存在。后果是：这个「组件」不能有自己的 state（严格说，它的 Hooks 会被算到父组件头上）、不能被单独优化、在 DevTools 里也看不见。
+
+<Callout type="warn" title="永远用标签语法">
+唯一的例外是「render props」这类刻意的函数调用模式（第 3.5 节会讲）。除此之外，把组件当普通函数调用几乎总是错的，而且报错信息会非常难懂——通常表现为「Hooks 调用顺序变化」的运行时错误。
+</Callout>
+
+### 1.3 组件必须是纯函数
+
+React 要求组件函数在渲染期间是**纯**的：给定相同的 props 和 state，必须返回相同的结果，并且不产生副作用。
+
+```tsx
+// 错误示例
+let renderCount = 0;
+
+function Bad({ items }: { items: Item[] }) {
+  renderCount += 1;            // 修改外部变量
+  items.sort((a, b) => a.n - b.n);  // 修改传入的 props
+  document.title = "列表";      // 直接操作 DOM
+
+  return <List items={items} />;
+}
+```
+
+三行全是副作用。为什么这是问题？因为 React 保留了「随时重新执行组件函数」的权力——开发模式下的严格模式会故意执行两次来帮你发现这类问题，未来的并发特性可能执行后丢弃结果。副作用必须放进 `useEffect` 或事件处理函数里（第 5 章详述）。
+
+排序那行还额外犯了「修改 props」的错——props 是只读的，改它会让父组件的数据莫名其妙变化，这类 bug 极难追踪。正确做法是先复制：`[...items].sort(...)`。
+
+## 2. props：单向数据流
+
+### 2.1 props 是只读的
+
+props 从父组件流向子组件，子组件只能读，不能写。这不是技术限制（JS 对象当然能改），而是**约定**——React 依赖这个约定来推理「什么时候需要重新渲染谁」。
+
+想让子组件影响父组件的数据，唯一的正规途径是父组件传一个回调函数下去：
+
+```tsx
+function Parent() {
+  const [text, setText] = useState("");
+  return <Editor value={text} onChange={setText} />;
+}
+
+function Editor({ value, onChange }: EditorProps) {
+  return <input value={value} onChange={(e) => onChange(e.target.value)} />;
+}
+```
+
+数据向下（`value`），事件向上（`onChange`）。这就是**单向数据流**，第 11 章会展开讲它在大型应用里的实践。
+
+### 2.2 默认值与解构
+
+现代写法直接在参数位置解构并给默认值：
+
+```tsx
+type ButtonProps = {
+  label: string;
+  variant?: "primary" | "ghost";
+  disabled?: boolean;
+  onClick?: () => void;
+};
+
+function Button({
+  label,
+  variant = "primary",
+  disabled = false,
+  onClick,
+}: ButtonProps) {
+  return (
+    <button className={"btn btn-" + variant} disabled={disabled} onClick={onClick}>
+      {label}
+    </button>
+  );
+}
+```
+
+注意默认值只在传入 `undefined` 时生效，传 `null` 不会。这和函数参数默认值的规则一致。
+
+### 2.3 属性展开的取舍
+
+```tsx
+function Input(props: InputProps) {
+  return <input {...props} className="input" />;
+}
+```
+
+展开写起来很爽，但有代价：**你看不出这个组件到底接受什么 props**。而且顺序敏感——上面这段里，即使调用方传了 `className`，也会被后面的硬编码覆盖。
+
+推荐的折中写法是显式列出关心的 props，剩下的透传：
+
+```tsx
+type Props = { label: string } & React.InputHTMLAttributes<HTMLInputElement>;
+
+function Field({ label, className, ...rest }: Props) {
+  return (
+    <label>
+      <span>{label}</span>
+      <input {...rest} className={"input " + (className ?? "")} />
+    </label>
+  );
+}
+```
+
+这样既保留了原生属性的灵活性，又能对特定 props 做处理。
+
+## 3. children 与组合
+
+### 3.1 children 是一个特殊的 prop
+
+写在标签之间的内容，会作为 `children` 传给组件：
+
+```tsx
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="card">
+      <h3>{title}</h3>
+      <div className="card-body">{children}</div>
+    </section>
+  );
+}
+
+// 使用
+<Card title="用户信息">
+  <Avatar src={user.avatar} />
+  <p>{user.bio}</p>
+</Card>
+```
+
+`children` 没有任何魔法，它就是 `createElement` 的第三个及之后的参数被收集成的值。单个子节点时它是那个节点本身，多个时是数组。
+
+### 3.2 组合优于配置
+
+新手容易把组件写成「配置驱动」的：
+
+```tsx
+// 不推荐：用 props 描述所有可能的内容
+<Dialog
+  title="确认删除"
+  content="此操作不可撤销"
+  showIcon
+  iconType="warning"
+  confirmText="删除"
+  cancelText="取消"
+  showFooter
+  footerAlign="right"
+/>
+```
+
+这种组件会不断膨胀，因为需求总有你没想到的变化。用组合重写：
+
+```tsx
+<Dialog>
+  <Dialog.Header>
+    <WarningIcon />
+    确认删除
+  </Dialog.Header>
+  <Dialog.Body>此操作不可撤销</Dialog.Body>
+  <Dialog.Footer align="right">
+    <Button label="取消" variant="ghost" onClick={close} />
+    <Button label="删除" variant="danger" onClick={remove} />
+  </Dialog.Footer>
+</Dialog>
+```
+
+调用方拥有完全的控制权，`Dialog` 只负责结构、定位和遮罩。这就是 React 官方推崇的**组合模式（composition）**——用嵌套代替配置项。
+
+<Callout type="tip" title="什么时候该用配置">
+组合不是万能的。当某个变体在应用里出现几十次、且形态高度一致时（比如「危险操作确认框」），应该在组合的基础上封装一个配置式的便捷组件。原则是：**底层组件用组合保证灵活，上层组件用配置保证一致性**。
+</Callout>
+
+### 3.3 用 props 传 JSX
+
+`children` 只有一个「插槽」。需要多个插槽时，直接用普通 props 传 JSX：
+
+```tsx
+type LayoutProps = {
+  sidebar: React.ReactNode;
+  header: React.ReactNode;
+  children: React.ReactNode;
+};
+
+function Layout({ sidebar, header, children }: LayoutProps) {
+  return (
+    <div className="layout">
+      <aside>{sidebar}</aside>
+      <div className="main">
+        <header>{header}</header>
+        <main>{children}</main>
+      </div>
+    </div>
+  );
+}
+
+<Layout sidebar={<Nav />} header={<TopBar user={user} />}>
+  <Dashboard />
+</Layout>
+```
+
+JSX 是普通的值，可以放在任何 prop 上，这一点在第 2 章已经论证过了。
+
+### 3.4 组合能解决「层层透传」
+
+一个常见的痛点：`App` 有个 `theme`，最深层的 `Button` 需要它，中间隔了五层组件。层层传 props 很难受（这叫 prop drilling）。
+
+Context 是一种解法（第 9 章），但**组合往往是更简单的解法**：
+
+```tsx
+// 与其让 Page 接收 theme 再传给 Toolbar 再传给 Button
+function App() {
+  const theme = useTheme();
+  // 直接在顶层把带好 theme 的元素传下去
+  return <Page toolbar={<Toolbar button={<Button theme={theme} />} />} />;
+}
+```
+
+元素在哪里被创建，就在哪里拿到数据，中间层只负责「放在哪个位置」，不需要知道数据的存在。
+
+### 3.5 render props
+
+如果子内容需要用到父组件的内部数据，可以把 children 传成函数：
+
+```tsx
+type ListProps<T> = {
+  items: T[];
+  children: (item: T, index: number) => React.ReactNode;
+};
+
+function List<T>({ items, children }: ListProps<T>) {
+  return <ul>{items.map((item, i) => <li key={i}>{children(item, i)}</li>)}</ul>;
+}
+
+<List items={users}>
+  {(user) => <UserCard user={user} />}
+</List>
+```
+
+这个模式在 Hooks 出现前是逻辑复用的主力，现在大部分场景被自定义 Hook 取代（第 6 章）。但在「复用渲染结构」而非「复用逻辑」时，它依然是最合适的工具。
+
+## 4. 用 TypeScript 描述组件契约
+
+### 4.1 基本类型化
+
+```tsx
+type Props = {
+  id: string;
+  count: number;
+  tags: string[];
+  user: { name: string; age: number };
+  status: "idle" | "loading" | "done";   // 联合类型代替 string
+  onSelect: (id: string) => void;
+  render?: (n: number) => React.ReactNode;
+  children?: React.ReactNode;
+};
+
+function Widget({ id, count, status, onSelect }: Props) {
+  return <div onClick={() => onSelect(id)}>{status}: {count}</div>;
+}
+```
+
+几个要点：
+
+- 优先用**字面量联合类型**而不是 `string`，编辑器会给出补全，写错立刻报错
+- 回调函数的返回类型写 `void`，这样传入返回任意值的函数也能兼容
+- 可选 props 用问号，不要用 `T | undefined`（后者要求调用方显式传 undefined）
+
+### 4.2 常用的 React 类型
+
+| 类型 | 用途 |
+|---|---|
+| `React.ReactNode` | 任何能被渲染的东西：元素、字符串、数字、数组、null |
+| `React.ReactElement` | 具体的一个元素对象，比 ReactNode 窄 |
+| `React.FC<Props>` | 函数组件类型，现在**不推荐**主动使用 |
+| `React.ComponentProps<typeof X>` | 提取某个组件的 props 类型 |
+| `React.ButtonHTMLAttributes<HTMLButtonElement>` | 原生 button 的所有属性 |
+| `React.CSSProperties` | style 对象 |
+
+<Callout type="info" title="为什么不推荐 React.FC">
+早期 `React.FC` 会隐式给组件加上 `children` prop，导致「不接受子节点的组件也能传子节点」，类型失去了约束力。React 18 的类型定义已经移除了隐式 children，但 `React.FC` 依然有其他问题：不支持泛型组件、给默认导出加了额外的类型噪音。
+
+现在的社区共识是**直接给参数标注类型**，返回类型让 TS 自己推断。
+</Callout>
+
+### 4.3 表达「互斥的 props」
+
+有些组件的 props 之间存在约束，比如「要么传 href 渲染成链接，要么传 onClick 渲染成按钮」。用联合类型表达：
+
+```tsx
+type LinkProps = { href: string; onClick?: never; label: string };
+type BtnProps = { onClick: () => void; href?: never; label: string };
+type Props = LinkProps | BtnProps;
+
+function Action(props: Props) {
+  if ("href" in props) {
+    return <a href={props.href}>{props.label}</a>;
+  }
+  return <button onClick={props.onClick}>{props.label}</button>;
+}
+```
+
+`never` 在这里的作用是**禁止**另一分支的属性出现，同时传两个会报错。判别时用 `in` 操作符收窄类型。
+
+### 4.4 泛型组件
+
+```tsx
+type SelectProps<T> = {
+  options: T[];
+  value: T | null;
+  getLabel: (item: T) => string;
+  onChange: (item: T) => void;
+};
+
+function Select<T>({ options, value, getLabel, onChange }: SelectProps<T>) {
+  return (
+    <ul>
+      {options.map((opt, i) => (
+        <li
+          key={i}
+          className={opt === value ? "active" : ""}
+          onClick={() => onChange(opt)}
+        >
+          {getLabel(opt)}
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+调用时 TS 会自动推断出 T，`onChange` 的参数类型就和 `options` 元素类型对上了。这是类型化组件里投入产出比最高的技巧之一。
+
+## 5. 组件拆分的尺度
+
+「什么时候该拆成新组件」没有标准答案，但有几条经验：
+
+- **有独立的状态** → 拆。状态的存在意味着它有自己的生命
+- **在多处使用** → 拆。这是最明显的信号
+- **函数超过 150 行或 JSX 嵌套超过 4 层** → 考虑拆，但只拆出有语义的部分
+- **纯粹为了「让文件短一点」** → 别拆。拆出一堆只用一次、还要传八个 props 的组件，比一个长函数更难读
+
+拆分的正确方向是**按职责**，不是按行数。一个组件应该能用一句话说清它负责什么。
+
+<Callout type="exercise" title="练习 1：改写成组合">
+下面这个组件用配置项描述了所有内容，把它改写成组合式 API：
+
+`<PageHeader title="订单详情" subtitle="ORD-1024" backUrl="/orders" actions={[{text:"导出",onClick:exp},{text:"删除",onClick:del,danger:true}]} tabs={["概览","物流","发票"]} />`
+
+要求：改写后调用方能自由决定按钮的图标、顺序，也能在标题旁插入一个状态标签。
+</Callout>
+
+<Callout type="exercise" title="练习 2：类型设计">
+设计一个 `Table` 组件的 props 类型，要求：
+
+- 接收 `data: T[]`
+- 接收 `columns`，每列包含 key（必须是 T 的某个键名）、标题、可选的自定义渲染函数
+- 列的 key 写错时能在编译期报错
+
+提示：需要用到泛型和 `keyof`。
+</Callout>
+
+<Callout type="exercise" title="练习 3：找出纯度问题">
+指出下面这个组件里所有违反「渲染纯度」的地方，并说明每一处应该怎么改：
+
+组件接收 `logs` 数组，渲染时先执行 `logs.reverse()` 让最新的在前，用 `Date.now()` 计算每条日志距今多久，用一个模块级变量 `seen` 记录已经渲染过哪些 id，并在发现新 id 时调用 `reportNewLog(id)` 上报。
+</Callout>
+
+## 小结
+
+- 组件是**接收 props 返回 element 的纯函数**；用标签语法使用它，不要直接调用
+- 渲染期间不能有副作用：不改外部变量、不改 props、不碰 DOM
+- props 只读，数据向下、事件向上，构成单向数据流
+- `children` 是普通 prop，多插槽时直接用其他 prop 传 JSX
+- **组合优于配置**：底层组件用组合保证灵活，上层再按需封装配置式便捷组件
+- 组合还能解决大部分 prop drilling，不必一上来就用 Context
+- TS 类型化要点：字面量联合代替 string、不用 `React.FC`、善用泛型组件
+- 下一章开始讲状态：useState 与不可变更新 →

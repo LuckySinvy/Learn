@@ -1,0 +1,339 @@
+---
+title: stash 与 cherry-pick：现场保存与跨分支摘提交
+order: 9
+description: 临时收起工作现场、stash 栈的完整操作，以及把单个提交搬到另一条分支
+---
+
+# stash 与 cherry-pick：现场保存与跨分支摘提交
+
+这一章讲两个救急工具。它们看起来不相干，但都在回答同一类问题：**"我的改动现在在错误的位置上，怎么挪走？"**
+
+- `stash`：改动还没提交，需要临时收起来 → 挪进一个隐藏的储藏区
+- `cherry-pick`：改动已经提交，但提交在错误的分支上 → 复制一份到正确的分支
+
+## 1. stash：把工作现场收进抽屉
+
+经典场景：功能改到一半，测试同学喊线上炸了要你马上修。你的工作区是脏的，切分支会被 Git 拒绝，提交半成品又污染历史。
+
+<Playground
+  language="git"
+  title="stash 救急：收起半成品去修 bug，回来再恢复"
+  id="git-09-1"
+  code={`git init -q
+echo 'stable' > app.py && echo 'cfg' > config.py
+git add . && git commit -q -m "init"
+
+echo '===== 功能改到一半，突然要切分支修线上 bug ====='
+echo 'half-done feature' > app.py
+echo 'new file' > draft.py
+git add draft.py
+git status --short
+echo
+
+echo '===== git stash push -u：连未跟踪文件一起收起来 ====='
+git stash push -u -m "feature 做到一半"
+echo '现在的状态：'
+git status --short
+echo '(干净了)'
+echo '目录里的文件（draft.py 也被收走了）：'
+ls
+echo
+
+echo '===== 安心切分支修 bug ====='
+git switch -qc hotfix
+echo 'cfg + fix' > config.py
+git commit -qam "fix: 线上紧急修复"
+git switch -q main
+git merge -q hotfix
+git log --oneline
+echo
+
+echo '===== 看看抽屉里有什么 ====='
+git stash list
+echo
+git stash show -p
+echo
+
+echo '===== 恢复现场 ====='
+git stash pop
+echo
+echo 'app.py（半成品回来了）:'
+cat app.py
+echo 'stash 列表:'
+git stash list
+echo '(pop 成功后条目自动删除)'`}
+/>
+
+### 1.1 stash 的基本命令
+
+| 命令 | 作用 |
+|---|---|
+| `git stash` | 收起已跟踪文件的改动（工作区 + 暂存区） |
+| `git stash push -m "说明"` | 带说明地收起，强烈推荐 |
+| `git stash push -u` | **同时收起未跟踪文件**（`--include-untracked`） |
+| `git stash push -a` | 连被 ignore 的文件也收（`--all`，谨慎） |
+| `git stash push -- src/a.py` | 只收起指定文件 |
+| `git stash list` | 查看所有条目 |
+| `git stash show` | 看最新条目的统计 |
+| `git stash show -p stash@{1}` | 看指定条目的完整 diff |
+| `git stash pop` | 恢复最新条目**并删除**它 |
+| `git stash apply stash@{2}` | 恢复指定条目，**保留**它 |
+| `git stash drop stash@{0}` | 删除指定条目 |
+| `git stash clear` | 清空全部（不可恢复） |
+| `git stash branch <name>` | 基于 stash 创建时的提交开新分支并恢复 |
+
+<Callout type="warn" title="git stash 默认不收未跟踪文件">
+这是最常见的 stash 事故：你新建了几个文件还没 `git add`，执行 `git stash` 后它们**留在原地**。然后你切到别的分支，看到这些"多出来的文件"，一脸困惑，甚至可能顺手 `git clean` 掉。
+
+**养成习惯：永远用 `git stash push -u -m "说明"`。** 或者干脆配个别名：
+
+```bash
+git config --global alias.save 'stash push -u -m'
+```
+
+之后 `git save "改到一半"` 就完事了。
+</Callout>
+
+### 1.2 stash 是一个栈
+
+多次 stash 会堆叠，最新的永远是 `stash@{0}`：
+
+<Playground
+  language="git"
+  title="stash 栈、apply vs pop、stash branch"
+  id="git-09-2"
+  code={`git init -q
+echo 'v1' > a.txt && git add . && git commit -q -m "init"
+
+echo '===== 连续攒 3 个 stash ====='
+echo 'A' >> a.txt && git stash push -m "改动A"
+echo 'B' >> a.txt && git stash push -m "改动B"
+echo 'C' >> a.txt && git stash push -m "改动C"
+git stash list
+echo '(后进先出：最新的是 stash@{0})'
+echo
+
+echo '===== apply：应用但保留条目 ====='
+git stash apply stash@{2} > /dev/null
+echo 'a.txt 内容:'
+cat a.txt
+echo 'stash 列表（改动A 依然在）:'
+git stash list
+echo
+
+echo '===== 清理掉刚才的应用，再 drop 掉那个条目 ====='
+git restore a.txt
+git stash drop stash@{2}
+git stash list
+echo
+
+echo '===== stash branch：直接从 stash 开一个分支 ====='
+git stash branch feature-from-stash stash@{0} > /dev/null
+echo '当前分支:'
+git branch --show-current
+echo 'a.txt 内容:'
+cat a.txt
+echo 'stash 列表（用掉的条目被删除）:'
+git stash list
+echo
+
+echo '===== clear：清空全部 ====='
+git stash clear
+git stash list
+echo '(空了)'`}
+/>
+
+`pop` 和 `apply` 的取舍：
+
+- **`pop`** = apply + drop。日常首选。
+- **`apply`** 保留条目。适合"我想把这份改动应用到多个分支上"，或者"不确定能不能正常恢复，先留个底"。
+
+<Callout type="tip" title="pop 冲突时会发生什么">
+如果恢复的改动和当前工作区冲突，`git stash pop` 会：
+
+1. 把冲突标记写进文件
+2. **保留 stash 条目不删除**（防止你的改动丢失）
+
+解决冲突后，需要手工 `git stash drop` 清掉那个条目。这个"失败时不删除"的设计是有意的安全网。
+</Callout>
+
+### 1.3 stash 的本质
+
+`git stash` 其实是**偷偷创建了两三个提交**，挂在 `refs/stash` 这个引用下：
+
+```bash
+git log --oneline refs/stash          # stash 也是提交！
+git stash list --format='%h %gd %s'
+```
+
+这解释了几件事：
+
+- stash 的内容是安全的（在对象库里），不像 `git restore` 那样直接消失
+- 即使 `git stash drop` 了，只要没被 gc 回收，还能通过 `git fsck --unreachable` 找回（第 14 章）
+- stash 可以跨分支恢复——它记录的是内容，不绑定分支
+
+<Callout type="warn" title="stash 不适合长期存放">
+stash 是抽屉，不是仓库。它的问题是：
+
+- 没有分支名，只有 `stash@{3}` 这样的编号，编号还会随着新 stash 变化
+- `git stash list` 只有一行说明，攒到 10 个以上你就不记得哪个是哪个了
+- 不会被推送到远程，换台电脑就没了；仓库重新 clone 也没了
+
+**超过一天的工作，请开分支提交，不要放 stash。**
+</Callout>
+
+## 2. cherry-pick：把某个提交摘到当前分支
+
+`git cherry-pick <commit>` 的作用是：**取出目标提交的改动，在当前分支上重新应用，生成一个新提交。**
+
+和 rebase 一样，它产生的是**内容相同但哈希不同**的新提交。
+
+<Playground
+  language="git"
+  title="cherry-pick 单个提交与一段范围"
+  id="git-09-3"
+  code={`git init -q
+echo 'base' > app.py && git add . && git commit -q -m "chore: 初始化"
+BASE=$(git rev-parse HEAD)
+
+git switch -qc dev
+echo 'feature-1' > f1.py && git add . && git commit -q -m "feat: 大功能第一部分"
+echo 'urgent fix' > hotfix.py && git add . && git commit -q -m "fix: 一个紧急 bug 修复"
+echo 'feature-2' > f2.py && git add . && git commit -q -m "feat: 大功能第二部分"
+
+git switch -q main
+echo '===== 现状：紧急修复混在没做完的 dev 分支里 ====='
+git log --oneline --graph --all
+echo 'main 上的文件：'
+ls
+echo
+
+echo '===== 只把那一个修复摘到 main ====='
+FIX=$(git log dev --format=%H --grep='紧急 bug')
+git cherry-pick $FIX
+echo
+git log --oneline --graph --all
+echo 'main 上的文件（只多了 hotfix.py，两个 feat 没跟过来）：'
+ls
+echo
+
+echo '===== 内容相同、哈希不同 ====='
+echo "dev 上的原提交: $(git log dev --format='%h %s' --grep='紧急 bug')"
+echo "main 上的副本:  $(git log main --format='%h %s' --grep='紧急 bug')"
+echo
+
+echo '===== 摘一整段：start^..end ====='
+git switch -qc release $BASE
+FIRST=$(git log $BASE..dev --reverse --format=%H | head -1)
+LAST=$(git log dev --format=%H -1)
+git cherry-pick $FIRST^..$LAST > /dev/null
+git log --oneline
+echo '(dev 的三个提交整段复制到了 release)'`}
+/>
+
+### 2.1 常用参数
+
+| 命令 | 作用 |
+|---|---|
+| `git cherry-pick <c>` | 摘一个提交 |
+| `git cherry-pick <c1> <c2> <c3>` | 摘多个（按给出的顺序） |
+| `git cherry-pick <a>..<b>` | 摘一段，**不含 a**，含 b |
+| `git cherry-pick <a>^..<b>` | 摘一段，**含 a**，含 b |
+| `git cherry-pick -n <c>` | 只改工作区/暂存区，不自动提交 |
+| `git cherry-pick -x <c>` | 在提交信息里追加 "cherry picked from commit xxx" |
+| `git cherry-pick -e <c>` | 摘的同时编辑提交信息 |
+| `git cherry-pick -m 1 <merge>` | 摘一个合并提交，指定主线 |
+| `git cherry-pick --continue` | 解决冲突后继续 |
+| `git cherry-pick --skip` | 跳过当前这个 |
+| `git cherry-pick --abort` | 全部放弃 |
+
+<Callout type="tip" title="-x 参数值得用">
+`-x` 会在提交信息末尾自动加一行：
+
+```text
+(cherry picked from commit 82fbacb1a...)
+```
+
+三个月后有人问"main 上这个修复是从哪来的"，这一行就是答案。**对于跨分支同步修复的场景，建议默认加 `-x`。**（注意：只适合从公开分支摘到公开分支，因为它暴露了原始哈希。）
+</Callout>
+
+### 2.2 典型使用场景
+
+**场景一：修复要同步到多个维护分支**
+
+```bash
+# 在 main 上修好了
+git switch main
+git commit -m "fix(security): 修复 XSS 漏洞"
+FIX=$(git rev-parse HEAD)
+
+# 同步到还在维护的两个老版本
+git switch release/1.x && git cherry-pick -x $FIX
+git switch release/2.x && git cherry-pick -x $FIX
+```
+
+**场景二：提交提到了错误的分支**
+
+```bash
+# 本该提到 feature 上，结果提到了 main
+git switch feature
+git cherry-pick main          # 先摘过来
+git switch main
+git reset --hard HEAD~1       # 再把 main 上的删掉（前提：还没推送）
+```
+
+**场景三：从一个废弃的分支里抢救几个有用的提交**
+
+```bash
+git switch main
+git cherry-pick abandoned-branch~3 abandoned-branch~1
+```
+
+### 2.3 cherry-pick 的代价
+
+<Callout type="warn" title="重复的提交会让后续合并变复杂">
+把 dev 上的提交 cherry-pick 到 main 后，这份改动在两条分支上各有一个副本（哈希不同）。将来把 dev 合并到 main 时：
+
+- 如果 Git 能识别出改动内容相同 → 自动处理，无事发生
+- 如果之后又有人改了这块代码 → **可能产生看起来莫名其妙的冲突**
+
+所以 cherry-pick 应该是**例外手段**，不是常规工作流。如果你发现自己每天都在 cherry-pick，说明分支策略有问题（第 15 章会讨论）。
+</Callout>
+
+`git cherry` 命令可以帮你检查两条分支间哪些提交"内容已经存在"：
+
+```bash
+git cherry -v main feature
+# + abc1234 这个提交 main 上还没有
+# - def5678 这个提交 main 上已有等价内容
+```
+
+## 3. 两个工具的对照
+
+| | stash | cherry-pick |
+|---|---|---|
+| 处理的对象 | 未提交的改动 | 已提交的提交 |
+| 存放位置 | `refs/stash`（本地，不推送） | 正常的提交，会被推送 |
+| 典型用途 | 临时切分支、切换任务 | 跨分支同步修复 |
+| 会不会改历史 | 不会 | 在目标分支上追加新提交 |
+| 冲突可能 | pop 时可能冲突 | 应用时可能冲突 |
+| 适合长期保存 | **不适合** | 是正常提交，当然可以 |
+
+## 小结
+
+- `git stash push -u -m "说明"` 是唯一推荐的收起姿势——默认不带 `-u` 会漏掉未跟踪文件
+- stash 是个栈，`stash@{0}` 永远是最新的；`pop` 用完即删，`apply` 保留条目
+- `pop` 遇冲突时会**保留条目**，解决后需手工 `drop`
+- stash 底层就是提交，内容安全；但没有分支名、不推送远程，**不适合长期存放**
+- `git cherry-pick <c>` 把某个提交的改动复制到当前分支，生成新哈希
+- 范围语法：`a..b` 不含 a，`a^..b` 含 a
+- 加 `-x` 会记录来源哈希，跨分支同步修复时很有用
+- cherry-pick 制造重复提交，是例外手段而非常规工作流
+- 下一章：远程仓库——clone / fetch / pull / push 与跟踪分支 →
+
+<Callout type="exercise" title="练习">
+1. 制造一个包含"已修改的已跟踪文件"和"未跟踪的新文件"的工作区，分别用 `git stash` 和 `git stash -u` 试一次，用 `ls` 确认两者的差别。
+2. 连续做三次 stash，用 `git stash list` 观察编号顺序。然后 `apply stash@{1}`，再 `git stash list`，说明为什么条目还在。
+3. 用 `git log --oneline refs/stash` 证明 stash 条目本身就是提交对象。
+4. 造两条分支，在 dev 上做三个提交（feat / fix / feat），只把 fix 那个 cherry-pick 到 main，用 `git log --graph --all` 观察结果，并对比两个提交的哈希是否相同、内容是否相同。
+</Callout>

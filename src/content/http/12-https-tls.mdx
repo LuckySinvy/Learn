@@ -1,0 +1,180 @@
+---
+title: HTTPS 与 TLS：给 HTTP 穿上盔甲
+order: 12
+description: 对称与非对称加密、Diffie-Hellman、证书链与信任、TLS 1.3 握手
+---
+
+# HTTPS 与 TLS：给 HTTP 穿上盔甲
+
+HTTP 是明文的：路径上的每个路由器、代理、Wi-Fi 热点都能看光并篡改你的报文。HTTPS = HTTP + TLS，解决三件事：**机密性**（别人看不懂）、**完整性**（改了能发现）、**身份认证**（对面真的是银行不是钓鱼站）。
+
+<Callout type="info" title="本章的实验方式">
+沙箱内没有外网和证书环境，无法演示真实 TLS 握手，握手流程用静态图讲解。但 TLS 的三块基石——对称加密、密钥交换、摘要签名——都可以用 python 在容器里亲手实现玩具版，直觉一旦建立，真协议只是工程化的堆料。
+</Callout>
+
+## 1. 对称加密：快，但钥匙怎么给你？
+
+对称加密 = 加密解密用**同一把钥匙**（AES、ChaCha20）。速度极快（有 CPU 硬件指令），适合加密大流量。用异或实现一个玩具版感受本质：
+
+<Playground
+  language="http"
+  title="玩具对称加密：同一把钥匙加解密"
+  id="http-12-1"
+  code={`python3 -c '
+def xor_cipher(data: bytes, key: bytes) -> bytes:
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+key = b"secret-key"
+msg = b"GET /account/balance HTTP/1.1"
+
+ct = xor_cipher(msg, key)
+print("明文:", msg.decode())
+print("密文:", ct.hex())
+print("用同一把钥匙解开:", xor_cipher(ct, key).decode())
+print()
+print("窃听者用错的钥匙解:", xor_cipher(ct, b"wrong-key!")[:20])
+'`}
+/>
+
+问题来了：**你和服务器素未谋面，这把钥匙怎么安全地送过去？** 直接发钥匙会被窃听者抄走——这就是"密钥分发问题"，非对称加密与密钥交换算法就是为它而生。
+
+## 2. 非对称加密与密钥交换
+
+非对称加密有一对钥匙：**公钥加密的只有私钥能解**（RSA、ECC）。公钥可以随便公开——任何人都能给你写加密信，只有你能拆。但它比对称加密慢几个数量级，所以实践是**混合加密**：
+
+```text
+非对称手段  →  安全地商定出一把对称密钥（会话密钥）
+对称加密    →  用会话密钥加密之后的全部 HTTP 流量
+```
+
+现代 TLS 商定密钥用的不是"RSA 加密传钥匙"，而是 **Diffie-Hellman（ECDHE）**：双方各自持有秘密，交换公开值，各自算出**相同的共享密钥**——密钥本身从未上网。亲手跑一遍数学：
+
+<Playground
+  language="http"
+  title="Diffie-Hellman：密钥从未传输，双方却算出同一个"
+  id="http-12-2"
+  code={`python3 -c '
+import secrets
+
+# 公开参数（真实场景是标准化的大素数群或椭圆曲线）
+p = 0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF
+g = 2
+
+# Alice 与 Bob 各自生成私密随机数（从不发送）
+a = secrets.randbits(256)
+b = secrets.randbits(256)
+
+# 各自计算公开值并"发给对方"（窃听者能看到 A 和 B）
+A = pow(g, a, p)
+B = pow(g, b, p)
+
+# 双方各自用"对方的公开值 + 自己的秘密"计算
+key_alice = pow(B, a, p)     # B^a = g^(ba)
+key_bob   = pow(A, b, p)     # A^b = g^(ab)
+
+print("Alice 算出的密钥指纹:", hex(key_alice)[2:18])
+print("Bob   算出的密钥指纹:", hex(key_bob)[2:18])
+print("两边一致?", key_alice == key_bob)
+print("窃听者拿到 g、p、A、B，但从 A 反推 a 是离散对数难题")
+'`}
+/>
+
+ECDHE 的 E 是 **Ephemeral（临时）**：每次连接用全新随机数，即使服务器私钥日后泄露，历史流量也解不开——这叫**前向保密**，TLS 1.3 强制要求。
+
+## 3. 证书：公钥的身份证
+
+DH 防窃听但防不了**中间人**：攻击者两头各做一次密钥交换冒充对方。必须证明"这把公钥真属于 example.com"——这就是证书（X.509）的使命。
+
+```text
+证书内容：域名 + 公钥 + 有效期 + 签发者 + 签发者的数字签名
+
+信任链（Chain of Trust）:
+根 CA 证书（预装在操作系统/浏览器，自签名）
+   └── 签发 → 中间 CA 证书
+                 └── 签发 → example.com 的证书（服务器发给你的）
+
+验证 = 逐级检查签名 + 域名匹配 + 有效期 + 吊销状态
+```
+
+签名的原理是"摘要 + 私钥加密"。用 hashlib 感受摘要如何充当防篡改指纹：
+
+<Playground
+  language="http"
+  title="摘要与签名：一个字节都改不得"
+  id="http-12-3"
+  code={`python3 -c '
+import hashlib
+
+cert_info = b"CN=example.com; pubkey=04a1b2c3...; expires=2027-01-01"
+tampered  = b"CN=exampIe.com; pubkey=04a1b2c3...; expires=2027-01-01"  # l 换成大写 I
+
+print("原始信息摘要:", hashlib.sha256(cert_info).hexdigest()[:32], "...")
+print("篡改一个字母:", hashlib.sha256(tampered).hexdigest()[:32], "...")
+print()
+print("CA 用私钥对摘要签名 -> 附在证书上")
+print("浏览器用 CA 公钥解开签名得到摘要 A，自己重算证书摘要 B")
+print("A == B 则证书未被篡改，且确由该 CA 签发")
+'`}
+/>
+
+摘要天差地别——改一个比特都会雪崩。浏览器地址栏的锁，本质是这条链每一环的签名都验过了。
+
+## 4. TLS 1.3 握手：一趟往返搞定
+
+TLS 1.2 要 2-RTT，TLS 1.3 砍到 **1-RTT**，且把握手中能加密的部分全部加密了：
+
+```text
+客户端                                        服务器
+  │ ClientHello                                 │
+  │   支持的加密套件列表                          │
+  │   key_share: 客户端的 DH 公开值 ◀── 提前猜好曲线，直接带上
+  │   SNI: 我要访问 example.com                  │
+  │ ────────────────────────────────────────────▶
+  │                                  ServerHello │
+  │                    选定套件 + 服务器 DH 公开值 │
+  │        {证书、签名、Finished}←已加密           │
+  │ ◀────────────────────────────────────────────
+  │  [此刻双方已算出会话密钥]                      │
+  │ {Finished} + 立即开始发 HTTP 请求              │
+  │ ────────────────────────────────────────────▶
+```
+
+关键设计：
+
+- **key_share 前置**：客户端赌服务器支持某条椭圆曲线（几乎必中），把 DH 公开值随第一条消息带上，省掉一轮协商；
+- **0-RTT 模式**：复用之前的会话密钥，第一个包就能带 HTTP 请求——代价是这部分数据可被**重放攻击**，只允许携带幂等请求（回忆第 5 章，幂等性又立功了）；
+- **SNI（Server Name Indication）**：一台服务器托管多个 HTTPS 站点时，客户端在 ClientHello 里声明目标域名，服务器才知道递哪张证书——这是 TLS 层的 "Host 头"（ECH 正在推动把它也加密掉）。
+
+## 5. 工程清单
+
+| 事项 | 建议 |
+|---|---|
+| 协议版本 | 只开 TLS 1.2 + 1.3，禁用 SSLv3/TLS 1.0/1.1 |
+| 证书获取 | Let's Encrypt / ACME 自动签发续期，免费 |
+| 全站 HTTPS | HTTP 301 跳 HTTPS + HSTS 头（Strict-Transport-Security）防降级 |
+| 混合内容 | HTTPS 页面里的 HTTP 资源会被浏览器拦截，全部资源都要 HTTPS |
+| 性能 | 会话复用（session ticket）、OCSP stapling、HTTP/2 一起上 |
+
+```text
+Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+含义：一年内，本域及子域强制走 HTTPS，浏览器直接拒绝明文访问
+```
+
+<Callout type="warn" title="自签证书与 curl -k">
+测试环境用自签证书时，curl 要加 -k 跳过验证。但把 -k（或代码里的 verify=False）带上生产，等于亲手拆掉身份认证——中间人攻击畅通无阻。生产环境宁可把自签 CA 加入信任库，也不要禁用验证。
+</Callout>
+
+## 小结
+
+- HTTPS 提供机密性、完整性、身份认证三件套；
+- 混合加密：ECDHE 协商会话密钥（前向保密），AES/ChaCha20 加密流量；
+- DH 的魔法：交换公开值，各自算出相同密钥，密钥本身从未传输；
+- 证书链把"公钥属于谁"锚定到系统预装的根 CA；签名 = 摘要 + CA 私钥；
+- TLS 1.3：1-RTT 握手、0-RTT 复用（仅幂等请求）、SNI 选证书、强制前向保密。
+
+<Callout type="exercise" title="练习">
+1. 修改 Playground 2：让"中间人" Eve 分别与 Alice、Bob 各做一次 DH 交换，演示没有证书时中间人攻击如何成立。
+2. 用 Playground 3 的思路解释：为什么证书过期（仅日期变化）会导致整个签名验证失败？
+3. 在自己电脑上执行 openssl s_client -connect example.com:443 -servername example.com，找出输出中的证书链层级与协商出的 TLS 版本。
+4. 排障题：用户报告"网站提示不安全"。列出证书侧至少四种可能原因（提示：域名、日期、链、算法）。
+</Callout>

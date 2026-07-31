@@ -1,0 +1,435 @@
+---
+title: Hooks 原理与自定义 Hook
+order: 6
+description: 手写迷你 useState 理解 Hooks 的存储机制，弄清「不能条件调用」的真正原因，并掌握自定义 Hook 的抽象方法
+---
+
+# Hooks 原理与自定义 Hook
+
+「不要在条件语句、循环、嵌套函数里调用 Hook」——这条规则你一定见过。大多数教程只是让你记住它。这一章我们把 Hooks 的存储机制实现一遍，你会发现这条规则不是人为规定，而是实现方式的**必然结果**。
+
+## 1. 一个基本问题：state 存在哪里
+
+### 1.1 组件函数是无状态的
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>{count}</button>;
+}
+```
+
+每次渲染，`Counter` 这个函数都被完整执行一遍。函数体内的所有局部变量都会被重新创建。那么 `count` 的值 3 是存在哪里的？
+
+显然不在函数里。它存在 **React 为这个组件实例维护的一块数据结构里**（现在叫 fiber 节点）。`useState` 的工作就是：去那块数据里，把「属于这次调用的那个格子」取出来。
+
+### 1.2 问题来了：怎么知道是哪个格子
+
+```tsx
+function Form() {
+  const [name, setName] = useState("");
+  const [age, setAge] = useState(0);
+  const [email, setEmail] = useState("");
+  // ...
+}
+```
+
+三次 `useState` 调用，函数签名一模一样，React 凭什么区分它们？
+
+它没有名字可依据（`useState` 不接收 key），没有变量名可读（那是编译后就没有的信息）。React 用的是最朴素的办法：**调用顺序**。
+
+第一次调用 `useState` 就用第 0 个格子，第二次用第 1 个，第三次用第 2 个。每次渲染开始前把计数器归零，重新数一遍。
+
+## 2. 手写一个迷你 Hooks 实现
+
+理论说完，直接写代码。下面这段纯 TypeScript 复刻了 `useState` 的核心：一个数组存值、一个游标记位置、每次渲染重置游标。
+
+<Playground
+  language="typescript"
+  title="迷你 useState：游标 + 数组"
+  id="react-06-1"
+  code={`// ——— 迷你 React 运行时 ———
+const hookStates: unknown[] = [];
+let cursor = 0;
+let renderFn: () => void = function () {};
+
+function useStateMini<T>(initial: T): [T, (next: T) => void] {
+  const index = cursor;
+  cursor++;
+
+  if (!(index in hookStates)) {
+    hookStates[index] = initial; // 只有首次渲染用得上初始值
+  }
+
+  function setState(next: T): void {
+    hookStates[index] = next;
+    renderFn(); // 触发重新渲染
+  }
+
+  return [hookStates[index] as T, setState];
+}
+
+function mount(component: () => void): () => void {
+  renderFn = function () {
+    cursor = 0; // 关键：每次渲染前把游标归零
+    component();
+  };
+  renderFn();
+  return renderFn;
+}
+
+// ——— 用它写一个组件 ———
+let showEmail = true;
+
+function Form(): void {
+  const nameSlot = useStateMini("Ada");
+  const ageSlot = useStateMini(36);
+
+  // 危险写法：条件调用 Hook
+  let emailValue = "(未渲染)";
+  if (showEmail) {
+    const emailSlot = useStateMini("ada@example.com");
+    emailValue = emailSlot[0];
+  }
+
+  console.log(
+    "render -> name=" + nameSlot[0] + " age=" + ageSlot[0] + " email=" + emailValue
+  );
+  console.log("        槽位内容: " + JSON.stringify(hookStates));
+}
+
+console.log("第 1 次渲染（三个 Hook 都调用）");
+const rerender = mount(Form);
+
+console.log("第 2 次渲染（条件为 false，只调用了两个 Hook）");
+showEmail = false;
+rerender();
+
+console.log("第 3 次渲染（条件恢复，Hook 数量又变回三个）");
+showEmail = true;
+rerender();
+
+console.log("三次渲染 name 都对，因为它永远是第 0 个");
+console.log("一旦某个条件 Hook 之后还有别的 Hook，错位就会发生");`}
+  expectedOutput={`第 1 次渲染（三个 Hook 都调用）\nrender -> name=Ada age=36 email=ada@example.com\n        槽位内容: ["Ada",36,"ada@example.com"]\n第 2 次渲染（条件为 false，只调用了两个 Hook）\nrender -> name=Ada age=36 email=(未渲染)\n        槽位内容: ["Ada",36,"ada@example.com"]\n第 3 次渲染（条件恢复，Hook 数量又变回三个）\nrender -> name=Ada age=36 email=ada@example.com\n        槽位内容: ["Ada",36,"ada@example.com"]\n三次渲染 name 都对，因为它永远是第 0 个\n一旦某个条件 Hook 之后还有别的 Hook，错位就会发生`}
+/>
+
+这个实现只有二十来行，但它解释了 Hooks 的全部核心行为。
+
+### 2.1 为什么不能条件调用
+
+上面的例子里条件 Hook 恰好在最后，所以没出乱子。把它挪到中间试试：
+
+```text
+渲染 1（条件为真）：
+  useState("Ada")     → 槽位 0
+  useState("email")   → 槽位 1
+  useState(36)        → 槽位 2
+
+渲染 2（条件为假）：
+  useState("Ada")     → 槽位 0   ✓
+  useState(36)        → 槽位 1   ✗ 拿到的是 "email" 的值！
+```
+
+`age` 变成了字符串。类型系统在这里完全帮不上忙，因为错位发生在运行时。真实的 React 会检测到「Hook 数量比上次少了」并抛出明确的错误，但如果数量恰好相同、只是顺序变了，它检测不出来——你会得到一个诡异的、难以定位的 bug。
+
+同理，这些写法也是禁止的：
+
+```tsx
+// 循环中调用（次数可能变化）
+for (const item of items) {
+  const [x] = useState(item);   // 禁止
+}
+
+// 提前 return 之后调用
+if (!user) return null;
+const [name] = useState("");     // 禁止：某些渲染走不到这里
+
+// 嵌套函数中调用
+function handleClick() {
+  const [x] = useState(0);       // 禁止：调用时机不在渲染期
+}
+```
+
+<Callout type="info" title="React 实际用的是链表">
+真实实现里，每个 fiber 节点的 `memoizedState` 字段指向一条 Hook 单链表，每个节点存着这个 Hook 的状态和 `next` 指针。渲染时用一个「当前 Hook 指针」沿链表前进。
+
+链表和游标数组在**语义上完全等价**——都是「按调用顺序一一对应」。用链表是为了配合 fiber 的双缓冲机制（同时存在 current 和 workInProgress 两棵树）。理解到「靠顺序定位」这一层就够了。
+</Callout>
+
+### 2.2 为什么必须以 use 开头
+
+`useXxx` 的命名不只是约定俗成，它是 **lint 规则的识别依据**。`eslint-plugin-react-hooks` 靠函数名判断：
+
+- 名字以 `use` 开头 → 这是一个 Hook，检查它的调用位置是否合法
+- 名字以大写字母开头 → 这是一个组件，里面可以调用 Hook
+- 其他普通函数 → 里面不允许调用 Hook
+
+所以自定义 Hook 必须叫 `useSomething`，否则 lint 无法保护你。
+
+### 2.3 Hook 只能在两个地方调用
+
+- **React 组件函数的顶层**
+- **另一个自定义 Hook 的顶层**
+
+「顶层」的意思是：不在任何条件、循环、嵌套函数、try-catch 里。
+
+## 3. 自定义 Hook
+
+### 3.1 它到底是什么
+
+自定义 Hook 就是一个**调用了其他 Hook 的普通函数**。没有任何特殊语法，没有注册机制，就是函数抽取。
+
+```tsx
+function useToggle(initial = false) {
+  const [on, setOn] = useState(initial);
+  const toggle = useCallback(() => setOn((v) => !v), []);
+  return [on, toggle] as const;
+}
+
+// 使用
+function Panel() {
+  const [open, toggleOpen] = useToggle();
+  return <button onClick={toggleOpen}>{open ? "收起" : "展开"}</button>;
+}
+```
+
+`as const` 让返回值被推断成元组类型 `[boolean, () => void]` 而不是数组联合类型，解构时才有正确的类型。
+
+### 3.2 关键理解：复用的是逻辑，不是状态
+
+```tsx
+function A() {
+  const [open, toggle] = useToggle();   // 一份独立的 state
+}
+
+function B() {
+  const [open, toggle] = useToggle();   // 另一份完全独立的 state
+}
+```
+
+两个组件各自拥有自己的 `open`。自定义 Hook 里的 `useState` 调用，会落在**调用它的那个组件**的 Hook 链上。
+
+这是自定义 Hook 和 Context（第 9 章）的根本区别：Hook 复用的是「怎么管理状态」的逻辑，Context 共享的是「同一份状态」。
+
+### 3.3 几个实用的自定义 Hook
+
+**防抖值**：
+
+```tsx
+function useDebounced<T>(value: T, delay = 300): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(id);
+  }, [value, delay]);
+
+  return debounced;
+}
+
+// 使用：输入停止 300ms 后才触发搜索
+const query = useDebounced(input, 300);
+useEffect(() => {
+  if (query) search(query);
+}, [query]);
+```
+
+注意清理函数在这里的作用：每次 value 变化都会先清掉上一个定时器，这正是防抖的实现方式。
+
+**localStorage 同步**：
+
+```tsx
+function useLocalStorage<T>(key: string, initial: T) {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? (JSON.parse(raw) as T) : initial;
+    } catch {
+      return initial;
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+
+  return [value, setValue] as const;
+}
+```
+
+用了惰性初始化避免每次渲染都读 localStorage（第 4 章）。
+
+**窗口尺寸**：
+
+```tsx
+function useWindowSize() {
+  const [size, setSize] = useState(() => ({
+    w: window.innerWidth,
+    h: window.innerHeight,
+  }));
+
+  useEffect(() => {
+    function onResize() {
+      setSize({ w: window.innerWidth, h: window.innerHeight });
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  return size;
+}
+```
+
+**上一次的值**：
+
+```tsx
+function usePrevious<T>(value: T): T | undefined {
+  const ref = useRef<T | undefined>(undefined);
+  useEffect(() => {
+    ref.current = value;
+  });
+  return ref.current;
+}
+```
+
+这个 Hook 利用了「effect 在渲染之后执行」的时序：渲染期间读到的 `ref.current` 还是上一轮写进去的值。`useRef` 是下一章的主题。
+
+### 3.4 抽取的时机与边界
+
+什么时候该抽自定义 Hook？
+
+- **同样的 Hook 组合在两处以上出现** → 抽
+- **一段逻辑需要 3 个以上的 state/effect 配合，且有清晰的语义名字** → 抽，即使只用一次
+- **组件里混杂了「业务逻辑」和「渲染逻辑」** → 把业务逻辑抽出去，组件只剩 JSX
+
+什么时候不该抽？
+
+- 只是为了「让组件短一点」，抽出一个叫 `useLogic` 的大杂烩
+- 抽出来后需要传五六个参数、返回七八个值——说明边界切错了
+- 只有一个 `useState` 的包装，没带来任何抽象价值
+
+<Callout type="tip" title="好 Hook 的判断标准">
+一个好的自定义 Hook 应该能用一句「它负责 X」说清楚，而且这句话里**不出现具体的组件名**。
+
+`useUserListPageState` 是坏味道——它和某个页面绑死了，不是抽象，只是搬运。`usePagination`、`useFormValidation`、`useIntersectionObserver` 才是抽象。
+</Callout>
+
+### 3.5 组合自定义 Hook
+
+Hook 可以调用 Hook，这让抽象能层层叠加：
+
+```tsx
+function useSearchResults(rawInput: string) {
+  const query = useDebounced(rawInput, 300);       // 复用防抖
+  const [data, setData] = useState<Item[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!query) {
+      setData([]);
+      return;
+    }
+
+    let ignore = false;
+    setLoading(true);
+
+    search(query)
+      .then((res) => {
+        if (!ignore) setData(res);
+      })
+      .finally(() => {
+        if (!ignore) setLoading(false);
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, [query]);
+
+  return { data, loading, isEmpty: !loading && query !== "" && data.length === 0 };
+}
+```
+
+组件里就只剩一行：`const { data, loading, isEmpty } = useSearchResults(input);`
+
+注意返回值用对象而不是数组——超过两个返回值时，对象更清晰，调用方也不用关心顺序。
+
+## 4. Hooks 之前的世界
+
+了解一点历史有助于理解 Hooks 的设计动机。在 Hooks 之前，逻辑复用有两种主流方案：
+
+**高阶组件（HOC）**：一个函数接收组件、返回增强后的组件。
+
+```tsx
+const Enhanced = withRouter(withTheme(withAuth(MyComponent)));
+```
+
+问题：多层嵌套导致「包装地狱」，props 来源不明（这个 prop 是哪一层注入的？），命名冲突。
+
+**render props**：把渲染逻辑作为函数 prop 传入（第 3 章讲过）。
+
+```tsx
+<Mouse render={(pos) => <Theme render={(t) => <Auth render={(u) => ...} />} />} />
+```
+
+问题：嵌套形成「回调地狱」形状的 JSX。
+
+Hooks 用「平铺的函数调用」替代了这两种嵌套：
+
+```tsx
+const router = useRouter();
+const theme = useTheme();
+const user = useAuth();
+```
+
+没有嵌套、没有包装、数据来源一目了然。这是 Hooks 最大的价值——**它不是为了让 class 组件写起来更短，而是为了解决逻辑复用**。
+
+<Callout type="exercise" title="练习 1：推理错位">
+用本章 Playground 的迷你实现，推理下面这段代码第二次渲染时每个变量的值：
+
+第一次渲染时 flag 为 true，依次调用：useState("a")、（flag 为真时）useState("b")、useState("c")。
+第二次渲染时 flag 变成 false，依次调用：useState("a")、useState("c")。
+
+第二次渲染时，第二个变量拿到的是什么？为什么真实 React 可能不报错？
+</Callout>
+
+<Callout type="exercise" title="练习 2：写一个 useInterval">
+实现 `useInterval(callback: () => void, delay: number | null)`：
+
+- delay 为 null 时暂停计时器
+- callback 更新时不重建计时器（这是难点，需要用 ref 保存最新的 callback）
+- 组件卸载时清理
+
+提示：先写一个 effect 把 callback 写进 ref，再写一个 effect 建立计时器，计时器里调用 `ref.current()`。
+</Callout>
+
+<Callout type="exercise" title="练习 3：判断是否该抽 Hook">
+下面几段逻辑，判断该不该抽成自定义 Hook，如果抽，起个名字：
+
+1. 三个页面都需要「监听滚动到底部然后加载下一页」
+2. 一个组件里有 8 个 useState，都是表单字段
+3. 弹窗打开时锁定 body 滚动，关闭时恢复
+4. 某个页面需要同时用到用户信息、权限判断和路由参数
+</Callout>
+
+<Callout type="exercise" title="练习 4：扩展迷你实现">
+在本章 Playground 基础上，给迷你运行时加一个 `useEffectMini`，要求：
+
+- 复用同一个 hookStates 数组和游标（真实 React 就是这样，所有 Hook 共用一条链）
+- 存储 deps 并做浅比较
+- 依赖变化时先执行上次的清理函数
+
+然后在 Form 里同时使用 useStateMini 和 useEffectMini，验证游标依然能正确对应。
+</Callout>
+
+## 小结
+
+- 组件的 state 存在 React 维护的 fiber 数据结构里，不在函数闭包中
+- React 靠**调用顺序**定位每个 Hook 的存储槽位，实现上是一条单链表（等价于游标数组）
+- 「不能条件调用」是这个定位机制的**必然结果**，不是人为规定
+- Hook 只能在组件顶层或另一个自定义 Hook 顶层调用
+- 命名必须以 `use` 开头，这是 lint 规则的识别依据
+- 自定义 Hook 就是「调用了 Hook 的普通函数」，**复用的是逻辑，不是状态**——每个使用者都有独立的 state
+- Hooks 的核心价值是替代 HOC 和 render props，用平铺调用消灭嵌套地狱
+- 下一章讲三个「性能与引用」相关的 Hook：useRef、useMemo、useCallback →

@@ -1,0 +1,226 @@
+---
+title: Shell 脚本入门：变量、引号、条件与退出码
+order: 15
+description: 从一次性命令到可复用脚本：shebang、变量赋值、引号三兄弟、if/test 与退出码
+---
+
+# Shell 脚本入门：变量、引号、条件与退出码
+
+前 14 章的命令都是"敲一次执行一次"。把它们写进文件、加上变量和判断，就成了可复用的**脚本**——部署、备份、巡检的自动化起点。Shell 脚本语法有不少历史包袱（空格敏感、引号玄学），本章把最容易踩的坑一次讲透。
+
+## 1. 第一个脚本
+
+```bash
+#!/bin/bash
+# deploy.sh —— 第一行 shebang 声明用哪个解释器执行
+echo "deploying..."
+```
+
+三步跑起来：
+
+```bash
+chmod +x deploy.sh      # 加执行权限（一次即可）
+./deploy.sh             # 通过 shebang 指定的 bash 执行
+bash deploy.sh          # 或者显式交给 bash（不需要 x 权限）
+```
+
+<Callout type="info" title="为什么是 ./deploy.sh 而不是 deploy.sh">
+直接敲 `deploy.sh`，Shell 只去 PATH 列表里找，不搜当前目录（安全设计：防止进入恶意目录后敲 ls 却执行了假 ls）。`./` 明确表示"就是当前目录这个文件"。
+</Callout>
+
+## 2. 变量：赋值与使用
+
+```bash
+NAME=ada            # 赋值：= 两边绝不能有空格！
+PORT=8080
+echo $NAME          # 使用：加 $ 前缀
+echo "$NAME"        # 更稳妥：加双引号（后面讲为什么）
+```
+
+三条铁律：
+
+- `NAME = ada` 是**错的**——Shell 会把 NAME 当命令、= 当参数；
+- 变量默认是字符串，没有类型；算术要用 `$(( ))`：`NEXT=$((PORT + 1))`；
+- 命令的输出赋给变量用 `$(命令)`（命令替换）：`TODAY=$(date +%F)`。
+
+<Playground
+  language="linux"
+  title="变量、算术与命令替换"
+  id="linux-15-1"
+  code={`NAME=ada
+PORT=8080
+echo "hello, $NAME! port=$PORT"
+
+# 算术：$(( ))
+NEXT=$((PORT + 1))
+echo "next port: $NEXT"
+
+# 命令替换：把命令输出装进变量
+TODAY=$(date +%F)
+FILES=$(ls / | wc -l)
+echo "today is $TODAY, / has $FILES entries"
+
+# 未定义的变量默认是空串，且不报错——这是很多事故的根源
+echo "undefined: [$NOT_SET]"
+
+# 环境变量：export 后子进程才能看到
+export APP_ENV=prod
+bash -c 'echo "child sees: $APP_ENV"'`}
+/>
+
+## 3. 引号三兄弟：脚本可靠性的分水岭
+
+| 写法 | 行为 |
+|---|---|
+| `'单引号'` | 内容**完全原样**，`$` 也不展开 |
+| `"双引号"` | 展开 `$变量` 和 `$(命令)`，但保护空格与通配符 |
+| 不加引号 | 展开一切，且按空格**拆词**、通配符**展开**——事故高发区 |
+
+为什么"变量要用双引号包住"是铁律：
+
+<Playground
+  language="linux"
+  title="不加引号的惨案现场"
+  id="linux-15-2"
+  code={`FILE='my report.txt'
+touch "$FILE"
+
+echo '$ ls -l $FILE   # 不加引号：被拆成 my 和 report.txt 两个参数'
+ls -l $FILE 2>&1 | head -n 2
+
+echo ''
+echo '$ ls -l "$FILE"  # 加引号：一个完整参数'
+ls -l "$FILE"
+
+echo ''
+echo '$ 单引号 vs 双引号：'
+NAME=ada
+echo '单引号: $NAME 原样输出'
+echo "双引号: $NAME 被展开"
+
+echo ''
+echo '$ 通配符也会在不加引号时抢跑：'
+MSG='files: *'
+echo $MSG
+echo "$MSG"`}
+/>
+
+结论先背再理解：**脚本里的变量引用，默认写 `"$VAR"`**，只有明确需要拆词/通配时才裸写。
+
+## 4. 退出码：命令的成败信号
+
+每个命令结束都返回退出码：0 成功、非 0 失败（1-255，各命令自定含义）。`$?` 保存上一条命令的退出码：
+
+```bash
+grep -q root /etc/passwd
+echo $?          # 0：找到了
+grep -q xyz /etc/passwd
+echo $?          # 1：没找到
+ls /nope
+echo $?          # 非 0：出错
+```
+
+退出码驱动着两个短路操作符——它们是脚本和命令行里最常用的"迷你 if"：
+
+```bash
+mkdir -p /data && cd /data      # && ：前面成功才执行后面
+command -v jq || echo '缺 jq'   # || ：前面失败才执行后面
+./backup.sh && echo OK || echo FAILED    # 组合（注意不完全等价 if-else，够日用）
+```
+
+## 5. 条件判断：if 与 test
+
+```bash
+if [ "$PORT" -eq 8080 ]; then
+  echo 'default port'
+elif [ "$PORT" -gt 1024 ]; then
+  echo 'user port'
+else
+  echo 'privileged port'
+fi
+```
+
+`[` 其实是一个命令（test 的别名），所以**方括号内侧必须有空格**、变量必须加引号。常用判断：
+
+| 判断 | 写法 |
+|---|---|
+| 字符串相等 / 非空 | `[ "$A" = "$B" ]` / `[ -n "$A" ]` |
+| 数字比较 | `-eq -ne -gt -lt -ge -le` |
+| 文件存在 / 是目录 | `[ -f path ]` / `[ -d path ]` |
+| 文件可读 / 可执行 | `[ -r path ]` / `[ -x path ]` |
+| 取反 / 与 / 或 | `[ ! -f p ]`、`[ c1 ] && [ c2 ]` |
+
+bash 还提供增强版 `[[ ]]`：内部不拆词（变量可以不加引号）、支持 `==` 通配匹配和 `=~` 正则。写 bash 专用脚本时推荐 `[[ ]]`，但要理解老脚本里满地的 `[ ]`。
+
+<Playground
+  language="linux"
+  title="if / test 实战：一个部署前检查脚本"
+  id="linux-15-3"
+  code={`cat > check.sh << 'EOF'
+#!/bin/bash
+CONF=$1
+
+if [ -z "$CONF" ]; then
+  echo "usage: check.sh <config-file>"
+  exit 1
+fi
+
+if [ ! -f "$CONF" ]; then
+  echo "FAIL: $CONF 不存在"
+  exit 2
+fi
+
+if grep -q 'env = prod' "$CONF"; then
+  echo "OK: 生产配置确认"
+else
+  echo "WARN: 不是生产配置"
+fi
+
+LINES=$(wc -l < "$CONF")
+if [ "$LINES" -gt 100 ]; then
+  echo "WARN: 配置超过 100 行，建议拆分"
+fi
+echo "check passed"
+EOF
+chmod +x check.sh
+
+echo '$ 不带参数运行：'
+./check.sh
+echo "exit code = $?"
+
+echo ''
+echo '$ 指向不存在的文件：'
+./check.sh missing.conf
+echo "exit code = $?"
+
+echo ''
+printf 'env = prod\nport = 80\n' > app.conf
+echo '$ 正常运行：'
+./check.sh app.conf
+echo "exit code = $?"`}
+/>
+
+注意脚本中的几个细节：`$1` 是第一个命令行参数（下一章详讲）；`exit N` 主动结束脚本并设定退出码——**不同错误用不同退出码**，调用方才能区分失败原因；`grep -q` 静默模式不输出只给退出码，专为条件判断而生。
+
+<Callout type="warn" title="新手四大高频报错对照">
+1. `command not found`，而变量名没拼错 → 八成是 `NAME = value` 加了空格；
+2. `unary operator expected` → `[ $VAR = x ]` 里 VAR 为空导致语法残缺，给变量加双引号即愈；
+3. `Permission denied` → 忘了 chmod +x，或分区挂载了 noexec；
+4. `bad interpreter` → 脚本是 Windows 换行符（CRLF），用 `sed -i 's/\r$//' file` 或 dos2unix 修复。
+</Callout>
+
+## 小结
+
+- 脚本三件套：shebang `#!/bin/bash`、`chmod +x`、`./运行`
+- 变量：`=` 两侧无空格、`$(cmd)` 命令替换、`$(( ))` 算术、export 传给子进程
+- 引号铁律：变量引用默认 `"$VAR"`；单引号原样、双引号展开、裸奔拆词
+- 退出码 0 为成功；`$?` 查看；`&&` / `||` 短路串联；`exit N` 区分错误
+- `[ ]` 是命令（内侧留空格），bash 脚本可用更强的 `[[ ]]`；`grep -q` 配 if 是常用素材
+- 下一章：循环、函数与更健壮的脚本 →
+
+<Callout type="exercise" title="练习">
+1. 写脚本 `sysinfo.sh`：用命令替换收集主机名、内核版本（uname -r）、当前负载（/proc/loadavg 第一列），按 `key: value` 格式输出三行。
+2. 写脚本接收一个路径参数：参数为空输出用法并 exit 1；是目录则统计里面文件数；是普通文件则输出行数；都不是则报错 exit 2。用不同输入验证各分支的 `$?`。
+3. 用 && 与 || 写一行命令：目录 /tmp/build 存在就删除重建，不存在就直接创建，最后输出 ready（提示：可以组合 rm -rf 与 mkdir -p，思考更简单的等价写法）。
+4. 复现引号事故：创建带空格的文件名，分别用 `rm $F` 和 `rm "$F"` 删除，观察前者的报错并解释拆词过程。
+</Callout>

@@ -1,0 +1,215 @@
+---
+title: 项目实战 TodoMVC
+order: 20
+description: 用前面所有知识实现一个进阶版 TodoMVC，涵盖状态建模、不可变更新、性能优化与 key 的协调原理
+---
+
+# 项目实战 TodoMVC
+
+学完 19 章，是时候把它们串成一个完整项目。TodoMVC 是经典的练手题：增删改查一个待办列表，外加筛选、计数、清空已完成。进阶版我们加上**本地持久化**和**编辑态**，足以覆盖前面大部分知识点。
+
+这一章的重点不是「抄一份能跑的代码」，而是看每个需求对应哪条 React 原则。
+
+## 1. 状态建模
+
+先把数据形状想清楚。一个 todo：
+
+```ts
+type Todo = {
+  id: string;
+  text: string;
+  done: boolean;
+  editing: boolean;
+};
+```
+
+顶层状态用 `useReducer`（第 10 章）比一堆 useState 更清晰，因为操作很多：
+
+```tsx
+type Action =
+  | { type: "add"; text: string }
+  | { type: "toggle"; id: string }
+  | { type: "remove"; id: string }
+  | { type: "edit"; id: string; text: string }
+  | { type: "clearDone" }
+  | { type: "setFilter"; filter: Filter };
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case "add":
+      return {
+        ...state,
+        todos: [
+          ...state.todos,
+          { id: crypto.randomUUID(), text: action.text, done: false, editing: false },
+        ],
+      };
+    case "toggle":
+      return {
+        ...state,
+        todos: state.todos.map((t) =>
+          t.id === action.id ? { ...t, done: !t.done } : t
+        ),
+      };
+    // ...
+  }
+}
+```
+
+注意全部是**不可变更新**（第 4 章）：`map` 返回新数组，改的那一项也建新对象。这样 `React.memo` 和 `useMemo` 才能正确判断变化。
+
+## 2. 不可变更新为什么重要
+
+第 4 章说过，`setTodos(state.todos.push(...))` 是错的——`push` 改了原数组，`Object.is` 比较相等，React 跳过重渲染，界面不更新。进阶版的每个 reducer 分支都用展开运算符或 `map` 返回新引用。
+
+这正是第 12 章性能优化的地基：没有稳定引用，memo 全部失效。TodoMVC 虽小，却是练习不可变更新的好地方。
+
+## 3. key 与协调
+
+列表渲染必须给每项一个稳定 `key`：
+
+```tsx
+{todos.map((t) => (
+  <TodoItem key={t.id} todo={t} onToggle={toggle} onRemove={remove} />
+))}
+```
+
+为什么不用数组下标？亲手看一个极简协调器就明白了：
+
+<Playground
+  language="typescript"
+  title="极简协调与 key"
+  id="react-20-1"
+  code={`type VNode = {
+  type: string;
+  key?: string;
+  children: VNode[];
+};
+
+function make(type: string, key: string | undefined, children: VNode[]): VNode {
+  return { type: type, key: key, children: children };
+}
+
+// 极简协调：比较新旧子节点，输出复用/新建/删除操作
+function diffChildren(oldList: VNode[], newList: VNode[]): string[] {
+  const log: string[] = [];
+  const oldByKey = new Map<string, VNode>();
+  oldList.forEach(function (n) {
+    oldByKey.set(n.key !== undefined ? n.key : n.type, n);
+  });
+
+  newList.forEach(function (n) {
+    const k = n.key !== undefined ? n.key : n.type;
+    if (oldByKey.has(k)) {
+      log.push("复用 " + n.type + " (key=" + k + ")");
+    } else {
+      log.push("新建 " + n.type + " (key=" + k + ")");
+    }
+  });
+
+  oldList.forEach(function (n) {
+    const k = n.key !== undefined ? n.key : n.type;
+    const stillThere = newList.some(function (m) {
+      return (m.key !== undefined ? m.key : m.type) === k;
+    });
+    if (!stillThere) {
+      log.push("删除 " + n.type + " (key=" + k + ")");
+    }
+  });
+
+  return log;
+}
+
+const oldTree = [make("li", "a", []), make("li", "b", []), make("li", "c", [])];
+const newTree = [make("li", "a", []), make("li", "c", []), make("li", "b", []), make("li", "d", [])];
+
+console.log("旧顺序: a b c，新顺序: a c b d");
+diffChildren(oldTree, newTree).forEach(function (line) { console.log(line); });
+console.log("结论：有稳定 key，节点跨位置也能复用；无 key 只能按位置猜");`}
+  expectedOutput={`旧顺序: a b c，新顺序: a c b d\n复用 li (key=a)\n复用 li (key=c)\n复用 li (key=b)\n新建 li (key=d)\n结论：有稳定 key，节点跨位置也能复用；无 key 只能按位置猜`}
+/>
+
+用下标当 key 时，React 按「位置」匹配：旧的第 0 项是 a，新的第 0 项还是 a 没问题，但如果你删了第一项，后面所有项的下标都前移，React 会误以为「每一项的内容变了」，于是重建整列 DOM——输入框失焦、动画错乱都由此而来。用 `id` 当 key，React 能认出「b 只是挪了位置」，原地复用。
+
+## 4. 性能：memo 与状态下放
+
+`TodoItem` 用 `React.memo` 包裹，这样只改一个 todo 时，其余项不重渲染：
+
+```tsx
+const TodoItem = React.memo(function TodoItem({ todo, onToggle, onRemove }: Props) {
+  return (
+    <li>
+      <input type="checkbox" checked={todo.done} onChange={() => onToggle(todo.id)} />
+      <span>{todo.text}</span>
+      <button onClick={() => onRemove(todo.id)}>x</button>
+    </li>
+  );
+});
+```
+
+但 memo 要生效，`onToggle` / `onRemove` 必须是稳定引用——用 `useCallback`（第 7 章）包起来。否则每次父组件重渲染都新建函数，memo 归零。
+
+## 5. 持久化：useEffect 同步
+
+把状态写进 `localStorage`，刷新不丢：
+
+```tsx
+useEffect(() => {
+  localStorage.setItem("todos", JSON.stringify(state.todos));
+}, [state.todos]);
+
+const initial = useMemo(() => {
+  const raw = localStorage.getItem("todos");
+  return raw ? (JSON.parse(raw) as Todo[]) : [];
+}, []);
+```
+
+注意读放在 `useMemo`（只算一次），写放在 `useEffect`（依赖变化才写）。这正好是第 5 章 useEffect 依赖数组的用武之地。
+
+## 6. 完整结构一览
+
+把整章串起来，组件树大致是：
+
+```
+<TodoApp>                 // useReducer + 持久化
+ ├─ <input />            // 新增（受控，第 8 章）
+ ├─ <ul>
+ │   └─ <TodoItem />     // memo + key=id
+ ├─ <Filter />          // 全部/进行中/已完成
+ └─ <Footer />           // 剩余计数 + 清空已完成
+```
+
+覆盖到的知识点：**状态建模（reducer）、不可变更新、key 协调、memo 引用稳定性、受控表单、useEffect 同步副作用、本地持久化、派生数据（筛选/计数用 `useMemo`）**。
+
+<Callout type="tip" title="先画状态图，再写组件">
+这个项目最易出错的地方不是某个 API，而是状态形状没想清就动手。先确定 `State` 和 `Action` 的类型，再写 reducer，最后才写 UI。类型即文档（第 1 章的精神）。
+</Callout>
+
+<Callout type="info" title="进阶可继续加的">
+想挑战自己，可以加：拖拽排序（涉及 key 与不可变数组）、乐观同步到后端（第 16 章 TanStack Query）、路由到单个 todo 详情（第 17 章）、用 Server Component 做 SSR（第 19 章）。TodoMVC 是检验你 React 综合能力的试金石。
+</Callout>
+
+<Callout type="warn" title="不要用下标当 key">
+这是 TodoMVC 最高频的错误。列表会增删、会重排，下标不稳定。必须用数据自身的 `id`（或能唯一标识的字段）作为 `key`。
+</Callout>
+
+<Callout type="exercise" title="练习 1：补完 reducer">
+补全 `edit`、`remove`、`clearDone`、`setFilter` 四个分支，全部用不可变更新。特别说明 `clearDone` 应该用 `filter` 而不是逐个删。
+</Callout>
+
+<Callout type="exercise" title="练习 2：memo 失效排查">
+你的 `TodoItem` 加了 `React.memo`，但改一个 todo 时其余项仍然全部重渲染。列出至少三个可能原因，并给出对应修复。
+</Callout>
+
+<Callout type="exercise" title="练习 3：派生数据">
+「剩余未完成数量」和「按筛选条件显示的列表」应该用 `useMemo` 计算，依赖分别是什么？如果把 `todos` 写进 `localStorage` 的副作用也误放进同一个 `useMemo`，会发生什么？
+</Callout>
+
+## 小结
+
+- 状态建模先行：`State` + 判别联合 `Action`，用 `useReducer` 管理多操作
+- 每个 reducer 分支都做**不可变更新**，这是 memo / useMemo 正确工作的前提
+- 列表 `key` 必须用稳定 `id`，下标会在增删重排时导致整列 DOM 重建
+- `React.memo` + `useCallback` 稳定引用，让只改一项时不重渲染其余项
+- 持久化：读用 `useMemo`（一次）、写用 `useEffect`（依赖变化）
+- 一个 TodoMVC 串起了建模、不可变、key、memo、受控表单、副作用、派生数据——这就是现代 React 的全貌

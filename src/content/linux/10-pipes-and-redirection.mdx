@@ -1,0 +1,209 @@
+---
+title: 管道与重定向：stdin/stdout/stderr 的流动艺术
+order: 10
+description: 三个标准流、> >> 2>&1 重定向语义与顺序、管道组合、tee 与 xargs
+---
+
+# 管道与重定向：stdin/stdout/stderr 的流动艺术
+
+前几章你已经多次见到 `>` 和 `|` 了，这一章把背后的机制彻底讲清楚。Unix 哲学的精髓——"每个程序只做好一件事，用文本流协作"——正是靠管道和重定向实现的。理解了三个标准流，`2>&1` 这类咒语就不再神秘。
+
+## 1. 三个标准流
+
+每个进程启动时自动带三条数据通道，各有编号（文件描述符，fd）：
+
+| fd | 名称 | 默认连接 | 用途 |
+|---|---|---|---|
+| 0 | stdin（标准输入） | 键盘 | 程序读取的输入 |
+| 1 | stdout（标准输出） | 终端屏幕 | 正常结果 |
+| 2 | stderr（标准错误） | 终端屏幕 | 报错与诊断信息 |
+
+关键设计：**结果和报错走不同通道**。虽然默认都显示在屏幕上看起来一样，但它们可以被分别重定向——这让"把结果存文件、让报错继续显示"成为可能。
+
+## 2. 输出重定向：> 与 >>
+
+```bash
+ls > list.txt            # stdout 写入文件（覆盖！）
+ls >> list.txt           # 追加，不覆盖
+ls /nope 2> err.txt      # 只重定向 stderr（fd 2）
+ls /nope > out.txt 2> err.txt    # 结果与报错分开存
+ls /nope > /dev/null 2>&1        # 全部丢弃（脚本里常见的"静音"写法）
+```
+
+<Playground
+  language="linux"
+  title="stdout 与 stderr 分流"
+  id="linux-10-1"
+  code={`mkdir -p okdir
+# ls 一个存在的和一个不存在的：stdout 和 stderr 同时产生
+echo '$ ls okdir /nope   # 两种输出混在屏幕上'
+ls okdir /nope
+
+echo ''
+echo '$ ls okdir /nope > out.txt   # 只有 stdout 进了文件，报错仍在屏幕'
+ls okdir /nope > out.txt
+echo '--- out.txt 内容 ---'
+cat out.txt
+
+echo ''
+echo '$ ls okdir /nope > out.txt 2> err.txt   # 彻底分流'
+ls okdir /nope > out.txt 2> err.txt
+echo '--- err.txt 内容 ---'
+cat err.txt
+
+echo ''
+echo '$ 追加与覆盖：'
+echo line1 > note.txt
+echo line2 >> note.txt
+echo line3 > note.txt
+cat note.txt
+echo '(line1、line2 被第三条的 > 覆盖掉了)'`}
+/>
+
+<Callout type="warn" title="> 是覆盖，且发生在命令执行之前">
+`>` 会先把目标文件清空再运行命令，所以 `cat a.txt > a.txt` 的结果是 a.txt 变成空文件（cat 还没读，文件已被清空）。想追加务必用 `>>`；想"过滤后写回原文件"要借助临时文件或 sed -i。
+</Callout>
+
+## 3. 2>&1：合并两条流
+
+`2>&1` 读作"把 fd 2 重定向到 fd 1 当前指向的地方"。**顺序至关重要**：
+
+```bash
+cmd > all.log 2>&1    # 正确：先让 1 指向文件，再让 2 跟随 1 → 都进文件
+cmd 2>&1 > all.log    # 错误：2 先跟随了"当时还指向屏幕"的 1 → 报错仍在屏幕
+cmd &> all.log        # bash 简写，等价于第一种（脚本内建议写全 2>&1，兼容性好）
+```
+
+<Playground
+  language="linux"
+  title="2>&1 的顺序陷阱"
+  id="linux-10-2"
+  code={`mkdir -p okdir
+
+echo '$ 正确顺序：> file 2>&1'
+ls okdir /nope > all.log 2>&1
+echo '屏幕上没有任何输出，都进了文件：'
+cat all.log
+
+echo ''
+echo '$ 错误顺序：2>&1 > file （注意报错漏到了屏幕上）'
+ls okdir /nope 2>&1 > only-stdout.log
+echo '--- 文件里只有 stdout ---'
+cat only-stdout.log`}
+/>
+
+## 4. 输入重定向与 heredoc
+
+```bash
+wc -l < app.log          # 用文件作为 stdin（与 wc -l app.log 输出略有差异：没有文件名）
+sort < names.txt > sorted.txt     # 输入输出各自重定向
+
+cat > config.yaml << 'EOF'        # heredoc：多行文本灌入 stdin
+port: 8080
+env: prod
+EOF
+```
+
+heredoc 的结束标记加引号（`'EOF'`）时内容原样保留，不加引号则其中的 `$变量` 会被展开——写配置模板时这个区别很关键。
+
+## 5. 管道：|
+
+管道把左边命令的 stdout 接到右边命令的 stdin，数据在内存中流动，不落磁盘：
+
+```bash
+ps | grep python                 # 进程列表 → 过滤
+cat access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head
+# 日志 → 取IP列 → 排序 → 去重计数 → 按次数排 → 取前10
+```
+
+<Playground
+  language="linux"
+  title="管道流水线：sort、uniq、cut、tr"
+  id="linux-10-3"
+  code={`cat > visits.txt << 'EOF'
+alice /home
+bob /shop
+alice /home
+carol /shop
+alice /cart
+bob /shop
+EOF
+
+echo '$ 谁访问最多？（sort 后 uniq -c 计数，再按数值倒序）'
+cut -d ' ' -f 1 visits.txt | sort | uniq -c | sort -rn
+
+echo ''
+echo '$ 有哪些不同的页面？'
+cut -d ' ' -f 2 visits.txt | sort -u
+
+echo ''
+echo '$ tr 转换字符：把路径里的 / 换成 _'
+cut -d ' ' -f 2 visits.txt | sort -u | tr '/' '_'
+
+echo ''
+echo '$ 管道每一环都可以单独调试——从左往右逐段加'
+cut -d ' ' -f 1 visits.txt | sort | uniq -c`}
+/>
+
+两个高频细节：`uniq` 只合并**相邻**重复行，所以前面必须先 `sort`；管道默认只传 stdout，stderr 会绕过管道直达屏幕（要一起传就先 `2>&1`）。
+
+## 6. tee：既存档又继续流动
+
+`tee` 像三通管：把 stdin 同时写入文件**和** stdout，适合"留档且继续处理"：
+
+```bash
+./deploy.sh 2>&1 | tee deploy.log        # 屏幕实时看，同时落盘
+cat data | process | tee mid.txt | next  # 把中间结果留档，便于调试
+echo '1' | sudo tee /proc/sys/net/ipv4/ip_forward   # 经典：sudo 写系统文件
+```
+
+最后一例值得理解：`sudo echo 1 > file` 不行，因为重定向是**当前 Shell**（无特权）执行的；`| sudo tee file` 则由带特权的 tee 进程来写文件。
+
+## 7. xargs：把流变成命令行参数
+
+管道传的是 stdin 数据，但很多命令（rm、cp、mkdir）只认**命令行参数**不读 stdin。`xargs` 负责转换——把输入的每一项拼到指定命令后面执行：
+
+<Playground
+  language="linux"
+  title="tee 与 xargs"
+  id="linux-10-4"
+  code={`echo '$ tee：一份数据两个去处'
+seq 3 | tee saved.txt | sort -rn
+echo '--- saved.txt 同时留了原始数据 ---'
+cat saved.txt
+
+echo ''
+mkdir -p imgs
+touch imgs/a.tmp imgs/b.tmp imgs/keep.jpg
+
+echo '$ 直接管给 rm 不行（rm 不读 stdin），xargs 来转换：'
+find imgs -name '*.tmp' | xargs rm -v
+
+echo ''
+echo '$ xargs -I 占位符：参数不在末尾时使用'
+echo 'photo.jpg' | xargs -I FILE cp imgs/keep.jpg imgs/FILE
+ls imgs
+
+echo ''
+echo '$ xargs -n 1：每次只带一个参数（对比一次全带）'
+seq 4 | xargs echo all:
+seq 4 | xargs -n 2 echo pair:`}
+/>
+
+处理"文件名可能含空格"的场景，标准姿势是 find 与 xargs 的零字节分隔协议：`find . -name '*.log' -print0 | xargs -0 rm`——用 NUL 字符分隔，空格、换行都不再是陷阱。
+
+## 小结
+
+- 三条流：0 stdin、1 stdout、2 stderr；结果与报错分道而行
+- `>` 覆盖、`>>` 追加、`2>` 管报错、`2>&1` 合流（顺序：先 `>` 后 `2>&1`）、`/dev/null` 黑洞
+- 管道传 stdout 到下家的 stdin；`sort | uniq -c | sort -rn` 是统计铁三角
+- `tee` 分流留档；`sudo tee` 解决特权写文件
+- `xargs` 把流转为参数；含空格文件名用 `-print0 | xargs -0`
+- 下一章：进程管理——ps、kill 与前后台任务 →
+
+<Callout type="exercise" title="练习">
+1. 执行 `ls /etc /nonexist`，分别实现：只把报错存入 err.txt；stdout 和 stderr 存入同一个 all.txt；全部丢弃不显示。
+2. 解释 `cmd 2>&1 > f` 和 `cmd > f 2>&1` 的区别，并用 `ls okdir /nope` 在沙箱验证两者行为。
+3. 造一个 20 行、有重复的单词列表，用管道统计每个单词出现次数并按频次倒序输出前 5。
+4. 用 find + xargs 实现：找出当前目录树里所有 .sh 文件并统一加上可执行权限；思考如果文件名带空格，命令要怎么改。
+</Callout>

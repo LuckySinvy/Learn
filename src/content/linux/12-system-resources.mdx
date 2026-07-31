@@ -1,0 +1,168 @@
+---
+title: 系统资源：内存、磁盘与负载
+order: 12
+description: free 读懂 buff/cache、df/du 排查磁盘、/proc 虚拟文件系统与负载平均的正确理解
+---
+
+# 系统资源：内存、磁盘与负载
+
+"服务器是不是内存不够了？""磁盘怎么满的？""负载 8 算高吗？"——回答这三个问题分别靠 free、df/du 和 uptime/loadavg。这几个命令输出不难打出来，难的是**读懂**：Linux 的内存统计和负载定义都有反直觉之处，本章重点纠偏。
+
+## 1. free：内存到底剩多少
+
+```bash
+free -h        # -h 人类可读单位
+```
+
+```text
+       total   used   free   shared  buff/cache  available
+Mem:    7.6G   2.1G   0.4G     82M       5.1G       5.2G
+Swap:   2.0G     0B   2.0G
+```
+
+新手最常见的误读："free 只剩 0.4G，内存要爆了！"——错。Linux 的哲学是**空闲内存就是浪费的内存**：系统会把暂时没人用的内存拿来做磁盘缓存（buff/cache），一旦应用需要，缓存立刻让位。所以：
+
+- `free` 低是**正常现象**，不代表紧张；
+- 真正该看的是 **available**：应用还能申请到的内存（含可回收的缓存）；
+- available 持续走低、Swap 开始大量使用，才是真的内存压力。
+
+<Playground
+  language="linux"
+  title="free 与 /proc/meminfo"
+  id="linux-12-1"
+  code={`echo '$ free -m   # 以 MB 为单位'
+free -m
+
+echo ''
+echo '$ free 的数据源就是 /proc/meminfo：'
+head -n 5 /proc/meminfo
+
+echo ''
+echo '$ 用 awk 算一下可用内存占比：'
+awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {print "available:", a/t*100 "%"}' /proc/meminfo`}
+/>
+
+## 2. df 与 du：磁盘的两个视角
+
+两个命令一字之差，视角完全不同：
+
+- `df`（disk free）：**文件系统层面**，每个挂载点总量/已用/可用——回答"哪块盘满了"；
+- `du`（disk usage）：**目录层面**，逐个目录累加实际占用——回答"是谁占的"。
+
+```bash
+df -h                         # 各挂载点用量
+df -h /var                    # 某路径所在的文件系统
+df -i                         # inode 用量（小文件挤爆 inode 时磁盘"明明有空间却写不进"）
+
+du -sh /var/log               # -s 汇总 -h 可读：这个目录共占多少
+du -h --max-depth=1 /var | sort -rh | head    # 第一层子目录排行，逐层下钻
+```
+
+<Playground
+  language="linux"
+  title="df 与 du：定位磁盘去哪了"
+  id="linux-12-2"
+  code={`echo '$ df -h   # 容器里挂载点较少'
+df -h
+
+echo ''
+# 造一些"占空间"的目录来练 du 下钻
+mkdir -p appdata/logs appdata/cache appdata/uploads
+truncate -s 3M appdata/logs/app.log
+truncate -s 1M appdata/logs/err.log
+truncate -s 6M appdata/cache/blob.bin
+truncate -s 2M appdata/uploads/pic.jpg
+
+echo '$ du -sh appdata   # 总量'
+du -sh appdata
+
+echo '$ du -h --max-depth=1 appdata | sort -rh   # 谁是大头？'
+du -h --max-depth=1 appdata | sort -rh
+
+echo ''
+echo '$ 配合 find 直接找大文件：'
+find appdata -type f -size +2M -exec ls -lh {} +`}
+/>
+
+磁盘爆满的标准排查路径：`df -h` 确认哪个挂载点满 → 从挂载点开始 `du -h --max-depth=1 | sort -rh` 逐层下钻 → 找到元凶（多半是日志、缓存或核心转储）。
+
+<Callout type="warn" title="删了文件磁盘没变大？">
+第 4 章埋的伏笔：`rm` 掉被进程打开着的文件，只是删了目录项；进程还握着文件描述符，空间不会释放——这时 du 算不到它（没有路径了），df 却显示满。解法：重启对应进程，或用 `truncate -s 0` 清空而非删除正在写的日志。这是"df 和 du 对不上"的头号原因。
+</Callout>
+
+## 3. 负载平均：排队论视角
+
+```bash
+uptime
+# 10:24:01 up 33 days, 2 users, load average: 0.42, 1.10, 2.30
+#                                              1分钟  5分钟  15分钟
+```
+
+**load average 不是 CPU 使用率**。它是"处于可运行状态 + 不可中断 IO 等待状态的进程数"的滑动平均——直观理解为"排队干活的队伍长度"：
+
+- 4 核机器负载 4.0：恰好满负荷，每个核一个任务，不排队；
+- 4 核负载 8.0：一半任务在排队，明显过载；
+- 1 核负载 2.3：严重排队。
+
+所以**负载要除以核数**才有意义。三个数字的走势也有信息量：1 分钟远高于 15 分钟 → 压力刚刚上来；反之 → 高峰正在退去。
+
+<Playground
+  language="linux"
+  title="loadavg 与 CPU 信息"
+  id="linux-12-3"
+  code={`echo '$ cat /proc/loadavg'
+cat /proc/loadavg
+echo '（前三个数：1/5/15 分钟负载；第四个：运行中/总进程；第五个：最近的 PID）'
+
+echo ''
+echo '$ nproc 查核数——负载要除以它来评估：'
+nproc
+
+echo ''
+echo '$ CPU 型号（/proc/cpuinfo 每个逻辑核一段）：'
+grep -m 1 'model name' /proc/cpuinfo || head -n 8 /proc/cpuinfo
+
+echo ''
+echo '$ uptime：开机时长 + 负载一行看全'
+uptime`}
+/>
+
+负载高的两大类原因要区分：**CPU 密集**（top 里 CPU% 高，%us/%sy 占满）和 **IO 等待**（CPU 使用率不高但负载高，top 的 %wa 高、进程多处于 D 状态）——前者加核或优化计算，后者查磁盘/网络存储。
+
+## 4. /proc：内核状态的实时窗口
+
+前面反复出现的 /proc 值得系统性认识——它是内核暴露状态的虚拟文件系统，读它没有磁盘 IO：
+
+| 文件 | 内容 |
+|---|---|
+| `/proc/cpuinfo` | CPU 型号、核数、指令集 |
+| `/proc/meminfo` | 内存明细（free 的数据源） |
+| `/proc/loadavg` | 负载平均 |
+| `/proc/uptime` | 开机秒数 |
+| `/proc/mounts` | 当前挂载表 |
+| `/proc/net/dev` | 各网卡收发字节数 |
+| `/proc/PID/` | 某进程的一切：cmdline、environ、fd/、status |
+
+```bash
+cat /proc/self/status | head    # self 指向"读它的那个进程"自己
+ls /proc/1/fd                   # 看 1 号进程打开了哪些文件描述符
+cat /proc/1/cmdline | tr '\0' ' '   # 启动命令（参数以 NUL 分隔）
+```
+
+监控系统（Prometheus node_exporter 等）的大部分指标，本质就是周期性读取 /proc 并解析。
+
+## 小结
+
+- free 看 **available** 而不是 free；buff/cache 是可让位的缓存，不是被吃掉了
+- df 查"哪个盘满"、du 查"谁占的"；`du --max-depth=1 | sort -rh` 逐层下钻
+- df/du 对不上 → 被删除但仍被进程打开的文件；`df -i` 排查 inode 耗尽
+- 负载是"排队进程数"的均值，除以 `nproc` 才能判断轻重；区分 CPU 型与 IO 型
+- /proc 是一切监控数据的源头，cat 就能读
+- 下一章：tar 与压缩——打包、备份与传输 →
+
+<Callout type="exercise" title="练习">
+1. 用 awk 从 /proc/meminfo 计算 buff/cache 相关项（Buffers + Cached）合计多少 MB，与 `free -m` 输出对照。
+2. 构造三层目录并用 truncate 放入不同大小的文件，仅用 du 与 sort 的组合，三步内定位到最大的那个文件所在目录。
+3. 读取 /proc/uptime 第一个字段（秒），用 awk 换算成"X 天 Y 小时"格式输出。
+4. 思考题：一台 8 核机器 load average 是 6.5 / 7.0 / 7.2，CPU 使用率只有 30%，最可能的瓶颈类型是什么？该看 top 的哪个指标、进程的哪个状态来证实？
+</Callout>

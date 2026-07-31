@@ -1,0 +1,412 @@
+---
+title: 状态管理生态
+order: 15
+description: 区分四类状态、Zustand / Redux Toolkit / Jotai 的设计哲学与代码对比，以及如何为项目选型
+---
+
+# 状态管理生态
+
+「React 项目该用什么状态管理库」是最常见的技术选型问题，也是最容易选错的——因为大多数人在问这个问题时，没有先区分自己要管的是哪种状态。
+
+## 1. 先分清四类状态
+
+### 1.1 分类
+
+| 类型 | 例子 | 特点 | 该用什么 |
+|---|---|---|---|
+| **服务端状态** | 商品列表、用户资料、订单 | 异步、有缓存、会过期、多处共享 | TanStack Query / SWR（第 16 章） |
+| **URL 状态** | 当前页码、筛选条件、tab、搜索词 | 需要可分享、可后退、可刷新保持 | 路由参数（第 17 章） |
+| **全局客户端状态** | 主题、登录态、购物车、通知队列 | 跨页面、纯前端 | Zustand / Jotai / Redux |
+| **局部 UI 状态** | 弹窗开关、输入草稿、hover | 只影响一小块 | `useState` / `useReducer` |
+
+### 1.2 最常见的错误
+
+**把服务端状态当全局状态管**。用 Redux 存接口数据，然后手写 loading、error、缓存失效、重新请求、竞态处理——这些 TanStack Query 都做好了，而且做得比你好。
+
+一个真实的观察：很多项目在引入 React Query 之后，Redux store 里 80% 的内容消失了，剩下的部分小到不需要 Redux。
+
+**把 URL 状态放进 store**。筛选条件存在 store 里，结果用户刷新页面全丢了，也没法把当前视图分享给同事。这些状态应该在 URL 里。
+
+<Callout type="tip" title="选型前先做减法">
+按顺序问自己：
+
+1. 这个状态能不能放 URL？能就放 URL
+2. 是不是服务端数据？是就用数据请求库
+3. 是不是只有一小块用？是就用 useState
+4. 剩下的才需要全局状态库
+
+做完这四步，很多项目会发现根本不需要状态管理库。
+</Callout>
+
+## 2. Zustand
+
+### 2.1 基本用法
+
+```ts
+import { create } from "zustand";
+
+type CartState = {
+  items: CartItem[];
+  add: (item: CartItem) => void;
+  remove: (id: string) => void;
+  clear: () => void;
+};
+
+export const useCart = create<CartState>((set, get) => ({
+  items: [],
+
+  add: (item) =>
+    set((s) => {
+      const existing = s.items.find((i) => i.id === item.id);
+      if (existing) {
+        return {
+          items: s.items.map((i) =>
+            i.id === item.id ? { ...i, qty: i.qty + item.qty } : i
+          ),
+        };
+      }
+      return { items: [...s.items, item] };
+    }),
+
+  remove: (id) => set((s) => ({ items: s.items.filter((i) => i.id !== id) })),
+
+  clear: () => set({ items: [] }),
+}));
+```
+
+组件里使用：
+
+```tsx
+function CartBadge() {
+  // 选择器：只订阅 items.length，其他字段变化不会导致重渲染
+  const count = useCart((s) => s.items.length);
+  return <span>{count}</span>;
+}
+
+function AddButton({ product }: Props) {
+  // 只取 action，引用永远不变，这个组件永远不会因为购物车变化而重渲染
+  const add = useCart((s) => s.add);
+  return <button onClick={() => add(toCartItem(product))}>加入购物车</button>;
+}
+```
+
+### 2.2 它的优点
+
+- **没有 Provider**：store 是模块级单例，任何地方都能 import 使用，包括非组件代码
+- **选择器天然支持**：`useCart((s) => s.xxx)` 只订阅需要的部分，这正是 Context 缺失的能力
+- **样板代码极少**：没有 action type 常量、没有 dispatch、没有 connect
+- **体积小**：约 1KB
+- **可以在 React 之外用**：`useCart.getState()`、`useCart.setState()`、`useCart.subscribe()`
+
+第三点很实用：在一个普通的工具函数、路由守卫、WebSocket 回调里，你都能直接读写 store。
+
+### 2.3 常用中间件
+
+```ts
+import { persist, devtools, subscribeWithSelector } from "zustand/middleware";
+import { immer } from "zustand/middleware/immer";
+
+export const useSettings = create<State>()(
+  devtools(
+    persist(
+      immer((set) => ({
+        theme: "light",
+        // 有了 immer，可以「直接修改」
+        toggleTheme: () =>
+          set((s) => {
+            s.theme = s.theme === "light" ? "dark" : "light";
+          }),
+      })),
+      { name: "settings", partialize: (s) => ({ theme: s.theme }) }
+    )
+  )
+);
+```
+
+`persist` 自动同步 localStorage，`partialize` 控制只持久化哪些字段（不要把 action 和临时状态存进去）。`devtools` 让 Redux DevTools 能调试 Zustand。
+
+### 2.4 注意事项
+
+**选择器返回新对象会导致每次都重渲染**：
+
+```ts
+// 错误：每次都返回新对象，浅比较失败
+const { a, b } = useStore((s) => ({ a: s.a, b: s.b }));
+
+// 正确一：分开取
+const a = useStore((s) => s.a);
+const b = useStore((s) => s.b);
+
+// 正确二：用 useShallow
+import { useShallow } from "zustand/react/shallow";
+const { a, b } = useStore(useShallow((s) => ({ a: s.a, b: s.b })));
+```
+
+这是 Zustand 用户最常踩的坑。
+
+## 3. Redux Toolkit
+
+### 3.1 基本用法
+
+```ts
+import { createSlice, configureStore, type PayloadAction } from "@reduxjs/toolkit";
+
+const cartSlice = createSlice({
+  name: "cart",
+  initialState: { items: [] as CartItem[] },
+  reducers: {
+    // 内置 Immer，可以写成「直接修改」的样子
+    added(state, action: PayloadAction<CartItem>) {
+      const existing = state.items.find((i) => i.id === action.payload.id);
+      if (existing) existing.qty += action.payload.qty;
+      else state.items.push(action.payload);
+    },
+    removed(state, action: PayloadAction<string>) {
+      state.items = state.items.filter((i) => i.id !== action.payload);
+    },
+  },
+});
+
+export const { added, removed } = cartSlice.actions;
+
+export const store = configureStore({
+  reducer: { cart: cartSlice.reducer },
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+```
+
+组件里：
+
+```tsx
+function CartBadge() {
+  const count = useSelector((s: RootState) => s.cart.items.length);
+  return <span>{count}</span>;
+}
+
+function AddButton({ product }: Props) {
+  const dispatch = useDispatch<AppDispatch>();
+  return <button onClick={() => dispatch(added(toCartItem(product)))}>加入</button>;
+}
+```
+
+`createSlice` 已经把老 Redux 的样板代码消掉了大半——不用手写 action type 常量、不用写 switch、不用手动保证不可变。
+
+### 3.2 它的优势
+
+- **DevTools 无可替代**：完整的 action 历史、状态 diff、时间旅行、状态导入导出。调查「这个值怎么变成这样的」时效率极高
+- **中间件生态**：日志、埋点、持久化、离线队列、saga
+- **约定强**：大团队里，强约定意味着所有人写出来的代码长得一样
+- **RTK Query**：内置的数据请求方案，如果已经用了 Redux，可以不用再引入 React Query
+
+### 3.3 它的代价
+
+- 概念多：store、slice、reducer、action、thunk、selector、middleware
+- 文件多：一个功能往往要碰三四个文件
+- 体积大：RTK + react-redux 约 12KB
+- 对小项目来说，仪式感大于价值
+
+## 4. Jotai
+
+### 4.1 原子化模型
+
+Zustand 和 Redux 是「一个大 store，用选择器取一部分」。Jotai 反过来：**状态被拆成很多个独立的小原子（atom），组件订阅具体的原子**。
+
+```ts
+import { atom, useAtom, useAtomValue } from "jotai";
+
+// 基础原子
+const countAtom = atom(0);
+const stepAtom = atom(1);
+
+// 派生原子：自动追踪依赖，依赖变了才重算
+const doubledAtom = atom((get) => get(countAtom) * 2);
+
+// 可写的派生原子
+const incrementAtom = atom(null, (get, set) => {
+  set(countAtom, get(countAtom) + get(stepAtom));
+});
+
+// 异步原子
+const userAtom = atom(async (get) => {
+  const id = get(userIdAtom);
+  const res = await fetch("/api/users/" + id);
+  return res.json();
+});
+```
+
+组件里：
+
+```tsx
+function Counter() {
+  const [count, setCount] = useAtom(countAtom);
+  const doubled = useAtomValue(doubledAtom);   // 只读
+  return <button onClick={() => setCount(count + 1)}>{count} / {doubled}</button>;
+}
+```
+
+### 4.2 它的特点
+
+- **心智模型像 useState**，只是状态住在组件外面
+- **依赖自动追踪**：派生原子只在真正用到的原子变化时重算，不需要手写选择器
+- **天然细粒度**：只有订阅了变化原子的组件会重渲染
+- **异步是一等公民**：原子可以是 Promise，配合 Suspense 使用
+- **体积小**：约 3KB
+
+代价是：状态分散在很多个 atom 里，大型应用中「这个 atom 在哪定义的、谁在改它」可能不好追踪。调试工具也不如 Redux DevTools 成熟。
+
+## 5. 横向对比
+
+### 5.1 同一个功能的三种写法
+
+需求：一个计数器，加上一个「是否为偶数」的派生值。
+
+```ts
+// Zustand
+const useStore = create<S>((set) => ({
+  count: 0,
+  inc: () => set((s) => ({ count: s.count + 1 })),
+}));
+const count = useStore((s) => s.count);
+const isEven = useStore((s) => s.count % 2 === 0);   // 选择器里算
+
+// Redux Toolkit
+const slice = createSlice({
+  name: "counter",
+  initialState: { count: 0 },
+  reducers: { inc: (s) => { s.count += 1; } },
+});
+const count = useSelector((s: RootState) => s.counter.count);
+const isEven = useSelector((s: RootState) => s.counter.count % 2 === 0);
+
+// Jotai
+const countAtom = atom(0);
+const isEvenAtom = atom((get) => get(countAtom) % 2 === 0);   // 派生原子
+const [count, setCount] = useAtom(countAtom);
+const isEven = useAtomValue(isEvenAtom);
+```
+
+### 5.2 对比表
+
+| 维度 | Zustand | Redux Toolkit | Jotai | Context + useReducer |
+|---|---|---|---|---|
+| 体积 | ~1KB | ~12KB | ~3KB | 0 |
+| 需要 Provider | 否 | 是 | 可选 | 是 |
+| 选择性订阅 | 是（手写选择器） | 是（useSelector） | 是（自动） | **否** |
+| 样板代码 | 少 | 中 | 极少 | 中 |
+| DevTools | 借用 Redux 的 | **最强** | 一般 | 无 |
+| 异步支持 | 手写 | thunk / RTK Query | 原生支持 | 手写 |
+| 学习曲线 | 平缓 | 陡 | 平缓 | 平缓 |
+| 适合规模 | 中小到中大 | 大型 | 中小 | 小 |
+
+### 5.3 选型建议
+
+- **小项目 / 状态很少** → `useState` + Context，不引入库
+- **中型项目 / 想要简单** → **Zustand**（现在的默认推荐）
+- **大团队 / 需要强约定 / 复杂调试需求 / 已有 Redux 代码** → **Redux Toolkit**
+- **状态之间派生关系复杂 / 喜欢原子化** → **Jotai**（或 Recoil 的继任者们）
+- **主要问题是服务端数据** → 先上 **TanStack Query**，然后重新评估还需不需要状态库
+
+<Callout type="warn" title="不要在一个项目里混用两个状态库">
+「用户模块用 Redux，购物车用 Zustand」看起来灵活，实际会让新人无所适从：这个状态在哪？该怎么改？两套 DevTools 都要看。
+
+统一是有价值的，即使某个库在某个场景下不是最优。
+</Callout>
+
+## 6. 迁移与实践建议
+
+### 6.1 store 的组织
+
+不管用哪个库，都建议**按领域切分**：
+
+```text
+src/stores/
+├── cart.ts          购物车
+├── auth.ts          登录态
+├── ui.ts            全局 UI（侧边栏折叠、主题）
+└── notifications.ts 通知队列
+```
+
+不要建一个包含所有东西的 `store.ts`。
+
+### 6.2 action 放在 store 里
+
+```ts
+// 好：逻辑内聚在 store，组件只调用
+const useCart = create<S>((set, get) => ({
+  items: [],
+  addWithStock: async (id: string) => {
+    const stock = await api.checkStock(id);
+    if (stock <= 0) throw new Error("库存不足");
+    set((s) => ({ items: [...s.items, { id, qty: 1 }] }));
+  },
+}));
+
+// 不好：组件里拼装逻辑
+const items = useCart((s) => s.items);
+const setItems = useCart((s) => s.setItems);
+// 然后在组件里写一堆业务判断
+```
+
+store 暴露的应该是**业务操作**，不是裸的 setter。这和第 10 章「action 描述发生了什么」是同一个原则。
+
+### 6.3 不要把所有东西塞进全局
+
+一个常见的退化路径：引入了状态库之后，什么状态都往里放，包括「这个弹窗开没开」。
+
+结果是：store 变成了一个巨大的全局变量表，组件失去独立性，测试要 mock 整个 store。
+
+**保持局部状态局部化**。全局 store 里应该只有真正需要跨组件、跨页面共享的东西。
+
+<Callout type="exercise" title="练习 1：状态分类">
+一个协作文档应用有这些状态，把它们归入四类（服务端 / URL / 全局客户端 / 局部 UI），并说明该用什么方案：
+
+1. 文档内容
+2. 当前打开的文档 id
+3. 当前用户的昵称和头像
+4. 侧边栏是否折叠
+5. 评论面板的筛选条件（全部/未解决）
+6. 正在编辑的评论草稿
+7. 其他在线协作者的光标位置
+8. 是否显示「已保存」提示
+</Callout>
+
+<Callout type="exercise" title="练习 2：用三种库实现同一个 store">
+实现一个通知队列：`notifications` 数组，支持 `push(msg, type)`、`dismiss(id)`、`clearAll()`，每条通知 3 秒后自动移除。
+
+分别用 Zustand、Redux Toolkit、Jotai 实现，对比代码量和「自动移除」这个副作用各自放在哪里最自然。
+</Callout>
+
+<Callout type="exercise" title="练习 3：修复选择器问题">
+```ts
+function Header() {
+  const { user, cartCount, theme } = useStore((s) => ({
+    user: s.user,
+    cartCount: s.cart.items.length,
+    theme: s.theme,
+  }));
+}
+```
+这段 Zustand 代码有性能问题。指出原因，给出两种修复方案，并说明各自适用什么情况。
+</Callout>
+
+<Callout type="exercise" title="练习 4：做一次选型">
+为下面三个项目分别选型，写出理由和可能的风险：
+
+1. 一个内部工具，5 个页面，主要是表格和表单，2 人开发
+2. 一个 SaaS 后台，40+ 页面，12 人团队，需要严格的代码规范和完整的问题排查能力
+3. 一个在线白板协作应用，大量高频局部更新（拖拽、缩放、多人光标）
+</Callout>
+
+## 小结
+
+- 选型前先**区分四类状态**：服务端、URL、全局客户端、局部 UI
+- 最常见的错误是**用状态库管服务端数据**——那是 TanStack Query 的职责
+- 第二常见的错误是**把 URL 状态放进 store**——会失去分享和刷新保持能力
+- **Zustand**：无 Provider、有选择器、样板少、1KB，中小项目的默认推荐
+- **Redux Toolkit**：DevTools 和生态最强、约定最严，适合大团队和复杂调试需求
+- **Jotai**：原子化、依赖自动追踪、异步原生支持，适合派生关系复杂的场景
+- Context + useReducer 的唯一硬伤是**没有选择性订阅**
+- 实践：按领域切分 store、把业务操作放进 store、保持局部状态局部化、不混用两个库
+- 下一章讲服务端状态：数据请求与缓存 →

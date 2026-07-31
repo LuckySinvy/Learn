@@ -1,0 +1,258 @@
+---
+title: 版本控制与 Git：从"文件名后缀"到分布式仓库
+order: 1
+description: 为什么需要版本控制、集中式与分布式的本质区别、Git 的设计哲学与首次配置
+---
+
+# 版本控制与 Git：从"文件名后缀"到分布式仓库
+
+几乎每个写过代码或论文的人都干过这件事：`report.docx`、`report_v2.docx`、`report_final.docx`、`report_final_真的最终版.docx`。这套"文件名版本控制系统"能撑过一个人一周，撑不过三个人一个月。Git 要解决的，正是这个问题——而且解决得比你想象的彻底得多。
+
+## 1. 版本控制到底在管什么
+
+一个版本控制系统（VCS，Version Control System）本质上回答四个问题：
+
+| 问题 | 没有 VCS 时 | 有 VCS 时 |
+|---|---|---|
+| 这行代码为什么这么写？ | 问同事，同事已离职 | `git blame` 找到提交，读提交说明 |
+| 昨天还能跑，今天挂了，改了啥？ | 逐个文件肉眼比对 | `git diff` 精确到行 |
+| 能退回上周五的状态吗？ | 翻备份盘，祈祷 | `git checkout` 一条命令 |
+| 三个人同时改一个文件怎么办？ | 微信喊"别动 utils.py" | 各自分支，合并时才协调 |
+
+注意最后一条。版本控制真正的价值不在"存历史"，而在**让多人并行修改同一份代码成为可能**。前三条是个人生产力，第四条是团队生产力，量级完全不同。
+
+## 2. 三代版本控制系统
+
+### 2.1 本地版本控制（RCS 时代）
+
+最早的方案是在本地磁盘上维护一个补丁数据库：每次修改只记录与上一版的差异（delta），要恢复到某个版本就把补丁按顺序打一遍。
+
+```text
+本地磁盘
+  file.c        <- 当前工作副本
+  file.c,v      <- 版本数据库：v1 全文 + v2 补丁 + v3 补丁 ...
+```
+
+问题很明显：只在本机可用，磁盘坏了全没了，更别提协作。
+
+### 2.2 集中式版本控制（CVS / SVN / Perforce）
+
+把版本数据库搬到一台服务器上，所有人从服务器上取文件、往服务器上提交。
+
+```text
+        +------------------+
+        |  中央服务器      |
+        |  版本库（全部    |
+        |  历史都在这里）  |
+        +------------------+
+           ^     ^     ^
+           |     |     |
+      +----+   +-+-+   +----+
+      | A  |   | B |   | C  |
+      |工作|   |工作|  |工作|
+      |副本|   |副本|  |副本|
+      +----+   +---+   +----+
+```
+
+优点是管理简单、权限好控制。缺点也很致命：
+
+- **服务器是单点**。服务器宕机，全公司无法提交；服务器硬盘损坏且无备份，全部历史蒸发。
+- **每个操作都要联网**。查看历史、比对差异、创建分支，全部要走网络往返。断网就只能记事本编程。
+- **分支很贵**。SVN 的分支是"服务器上复制一份目录"，创建慢、合并痛苦，导致团队本能地回避分支，最后所有人挤在 trunk 上互相踩脚。
+
+### 2.3 分布式版本控制（Git / Mercurial）
+
+分布式的核心变化只有一句话：**每个人克隆下来的，是完整的仓库，而不是某个版本的快照。**
+
+```text
+        +------------------+
+        |  远程仓库        |   <- 只是"约定俗成的中心"，
+        |  （完整历史）    |      技术上和其他节点平等
+        +------------------+
+           ^     ^     ^
+           |     |     |   （网络只在同步时用到）
+      +----+   +-+-+   +----+
+      | A  |   | B |   | C  |
+      |完整|   |完整|  |完整|
+      |仓库|   |仓库|  |仓库|
+      +----+   +---+   +----+
+```
+
+这带来了几个连锁效果：
+
+1. **绝大多数操作是本地的**。提交、查历史、diff、切分支、回退，全部读写本地磁盘，毫秒级完成，断网照用。
+2. **天然备份**。每个克隆都是一份完整备份，中心仓库炸了，随便找个同事的仓库推回去就行。
+3. **分支变得极其廉价**。Git 的分支只是一个指向提交的 41 字节文件，创建和切换几乎零成本。这一点从根本上改变了工作方式——第 5 章会详细展开。
+
+<Callout type="info" title="Git 的出身">
+2005 年，Linux 内核团队与当时使用的商业 VCS（BitKeeper）闹翻，失去了免费授权。Linus Torvalds 花了大约两周时间写出了 Git 的第一个版本。他的设计目标非常明确：速度快、设计简单、强力支持非线性开发（成千上万的并行分支）、完全分布式、能高效处理 Linux 内核级别的大项目。这些目标解释了 Git 后来几乎所有的设计取舍。
+</Callout>
+
+## 3. Git 与其他 VCS 最大的思维差异：快照，而非差异
+
+这是理解 Git 的关键，也是初学者最容易卡住的地方。
+
+SVN 等系统把数据看作**一组文件和每个文件随时间的增量变化**：
+
+```text
+版本1      版本2      版本3
+fileA  -> Δ1     ->  Δ2
+fileB  -> (无变化) -> Δ1
+fileC  -> Δ1     ->  (无变化)
+```
+
+Git 把数据看作**一系列微型文件系统的快照**。每次提交，Git 记录当前所有文件的状态；如果某个文件没变，Git 不会重复存储，只保留一个指向已有文件的链接：
+
+```text
+提交1          提交2          提交3
+fileA(v1)  ->  fileA(v2)  ->  fileA(v3)
+fileB(v1)  ->  链接到v1   ->  fileB(v2)
+fileC(v1)  ->  fileC(v2)  ->  链接到v2
+```
+
+"快照流"这个模型直接解释了后面很多现象：为什么 Git 切分支这么快（只是切换 HEAD 指针 + 更新工作区）、为什么每个提交都能独立还原、为什么 Git 能轻松做出各种历史重写操作。第 13 章会拆开 `.git` 目录，亲眼看看快照是怎么存的。
+
+另一个重要特性：**Git 中所有数据在存储前都会计算 SHA-1 校验和**，并以校验和作为索引。你看到的 `e83c516` 这样的短字符串，就是某个 40 位十六进制哈希的前缀。这意味着任何内容的改动——哪怕一个字节——都会导致哈希变化，Git 立刻就能发现。**不可能在 Git 不知情的情况下修改任何文件内容或历史。**
+
+## 4. 安装与首次配置
+
+### 4.1 安装
+
+| 平台 | 命令 |
+|---|---|
+| macOS | `brew install git`（或安装 Xcode Command Line Tools） |
+| Debian/Ubuntu | `sudo apt install git` |
+| CentOS/RHEL | `sudo yum install git` |
+| Alpine | `apk add git` |
+| Windows | 下载 Git for Windows 安装包，自带 Git Bash |
+
+装完验证：
+
+<Playground
+  language="git"
+  title="验证安装与查看当前身份配置"
+  id="git-01-1"
+  code={`echo '$ git --version'
+git --version
+echo
+
+echo '$ git config user.name / user.email'
+git config user.name
+git config user.email
+echo
+
+echo '$ git config --list (节选)'
+git config --list | grep -E 'user.|init.'`}
+/>
+
+### 4.2 三级配置
+
+Git 的配置分三层，**范围越小优先级越高**：
+
+| 级别 | 文件位置 | 命令参数 | 作用范围 |
+|---|---|---|---|
+| 系统级 | `/etc/gitconfig` | `--system` | 本机所有用户 |
+| 用户级 | `~/.gitconfig` | `--global` | 当前用户所有仓库 |
+| 仓库级 | `.git/config` | `--local`（默认） | 当前仓库 |
+
+必须配置的两项是身份信息，它会写进你的每一个提交：
+
+```bash
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+```
+
+<Callout type="warn" title="邮箱决定了提交归属">
+GitHub、GitLab 等平台是通过提交里的 email 把提交关联到账号的。如果 `user.email` 配错了，你的提交在网页上会显示成一个没有头像的陌生人。公司项目和个人项目用不同邮箱时，建议在仓库级单独配置：进入项目目录执行 `git config user.email "work@company.com"`。
+</Callout>
+
+### 4.3 其他常用配置
+
+```bash
+# 默认分支名（Git 2.28+），把 master 改成 main
+git config --global init.defaultBranch main
+
+# 默认编辑器（写提交信息、交互式 rebase 时用）
+git config --global core.editor "vim"
+
+# 中文文件名不转义成八进制
+git config --global core.quotepath false
+
+# 命令别名，高频命令值得配
+git config --global alias.st status
+git config --global alias.co checkout
+git config --global alias.br branch
+git config --global alias.lg "log --oneline --graph --decorate --all"
+
+# 查看某项配置来自哪个文件
+git config --list --show-origin
+```
+
+配好 `alias.lg` 后，`git lg` 就能画出彩色的提交拓扑图，这是日常最常用的命令之一。
+
+## 5. 第一个仓库：最小闭环
+
+理论讲够了，跑一遍完整流程。下面这段脚本从零建仓库、写文件、提交、看历史，就是你今后每天要重复几十次的动作：
+
+<Playground
+  language="git"
+  title="从零到第一个提交"
+  id="git-01-2"
+  code={`echo '===== 1. 初始化仓库 ====='
+git init -q demo
+cd demo
+echo '仓库目录内容：'
+ls -a
+echo
+
+echo '===== 2. 创建文件 ====='
+echo 'print("hello git")' > hello.py
+echo '$ git status --short'
+git status --short
+echo
+
+echo '===== 3. 加入暂存区并提交 ====='
+git add hello.py
+git commit -m "feat: 第一个提交"
+echo
+
+echo '===== 4. 再改一次并提交 ====='
+echo 'print("hello again")' >> hello.py
+git add hello.py
+git commit -q -m "feat: 增加一行输出"
+echo
+
+echo '===== 5. 查看历史 ====='
+git log --oneline`}
+/>
+
+几个值得注意的细节：
+
+- `git init` 只做一件事——创建 `.git` 目录。你的项目文件一根汗毛都没动，`.git` 就是整个版本库，删掉它，目录立刻退化成普通文件夹。
+- `?? hello.py` 中的 `??` 表示"未跟踪"（untracked）。Git 不会自动管理新文件，必须显式 `git add`。
+- 提交输出里的 `(root-commit)` 表示这是仓库的第一个提交——它没有父提交。
+- `git log --oneline` 里的 `HEAD -> main` 表示：当前分支是 `main`，而你正处在这个分支上。
+
+## 6. Git 不适合什么
+
+诚实地说清边界，比吹嘘更有用：
+
+- **大二进制文件**。Git 存全量快照，改十次 100MB 的设计稿，仓库就膨胀 1GB，且无法压缩。这类场景要用 Git LFS 或专门的资产管理系统。
+- **超大单仓库**。虽然 Git 能处理 Linux 内核，但当仓库达到数十 GB、百万文件量级时，`git status` 都会变慢。Google、微软为此做了大量定制（第 17 章会提到 sparse-checkout 等缓解手段）。
+- **需要文件锁的协作**。有些二进制格式（如 Photoshop 文件）根本无法合并，团队需要"我在改这个文件，你别动"的独占锁，这是集中式系统的强项。
+
+## 小结
+
+- 版本控制的核心价值不是"存历史"，而是让多人并行修改成为可能
+- 集中式（SVN）把历史放在服务器，单点故障、操作依赖网络、分支昂贵
+- 分布式（Git）让每个克隆都是完整仓库，操作本地化、天然备份、分支极廉价
+- Git 存的是**快照**不是差异，且所有内容用 SHA-1 校验和寻址，历史不可悄悄篡改
+- 配置分 system / global / local 三级，`user.name` 和 `user.email` 必须先配
+- 下一章：工作区、暂存区、仓库——Git 的三区模型 →
+
+<Callout type="exercise" title="练习">
+1. 在 Playground 里创建一个仓库，连续做三次提交（每次修改同一个文件），然后用 `git log --oneline` 确认历史里有三条记录，观察 `HEAD -> main` 指向哪一条。
+2. 试试给自己配一个别名：`git config alias.hist "log --oneline --graph"`，然后在有多条提交的仓库里执行 `git hist`，看输出和 `git log` 有什么不同。
+3. 用一句话向没接触过 Git 的同事解释："为什么 Git 断网也能提交，SVN 不行？"
+4. 思考题：如果 Git 用的是"记录差异"而不是"记录快照"，切换到一个 500 个提交之前的版本会发生什么？这解释了 Git 为什么选择快照模型。
+</Callout>

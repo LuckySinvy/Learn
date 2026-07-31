@@ -1,0 +1,214 @@
+---
+title: 缓存机制：强缓存与协商缓存
+order: 9
+description: Cache-Control 指令、Expires、ETag 与 Last-Modified、完整缓存决策树
+---
+
+# 缓存机制：强缓存与协商缓存
+
+缓存是 Web 性能的第一杠杆：命中一次强缓存，请求根本不出门。但缓存也是"改了代码用户看不到"这类灵异事件的头号嫌犯。这一章把两级缓存机制和决策树彻底理清，并用 curl 亲手打出 304。
+
+## 1. 两级缓存模型
+
+浏览器拿到一个资源后再次需要它时，按顺序问两个问题：
+
+1. **强缓存**：本地副本还在保质期内吗？在 → 直接用，**不发请求**（DevTools 显示 200 from disk/memory cache）；
+2. **协商缓存**：过期了？带上"凭据"问服务器——**没变**回 304（不传体，省流量），**变了**回 200 + 新内容。
+
+```text
+                ┌── 命中 ──▶ 直接用本地副本（不发请求）
+需要资源 ─ 强缓存 ┤
+                └── 过期 ──▶ 发条件请求 ─ 协商缓存 ┬─ 304 ─▶ 继续用本地副本
+                                                └─ 200 ─▶ 用新内容并更新缓存
+```
+
+## 2. 强缓存：Cache-Control 与 Expires
+
+### 2.1 Cache-Control 常用指令
+
+| 指令 | 含义 |
+|---|---|
+| max-age=3600 | 从响应产生起 3600 秒内为"新鲜" |
+| s-maxage=600 | 仅对共享缓存（CDN/代理）生效的 max-age |
+| public | 允许任何缓存存储（包括 CDN） |
+| private | 只允许浏览器私有缓存（含个人数据的页面） |
+| no-cache | **可以存，但每次使用前必须协商验证**（名字有误导性！） |
+| no-store | 完全不许存储（敏感数据） |
+| must-revalidate | 过期后必须成功验证才能用，不许"宽限" |
+| immutable | 保质期内绝不验证（配合文件名带 hash） |
+
+两个最容易记反的指令：**no-cache 不是不缓存**（是"用前必验"），**不缓存是 no-store**。
+
+`Expires: Wed, 21 Oct 2026 07:28:00 GMT` 是 HTTP/1.0 的绝对时间方案，受客户端时钟影响；与 Cache-Control 同时存在时 **max-age 优先**。现代项目写 Cache-Control 即可。
+
+<Playground
+  language="http"
+  title="观察各种 Cache-Control 响应头"
+  id="http-09-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+POLICIES = {
+    "/app.8f3a2c.js": "public, max-age=31536000, immutable",
+    "/index.html":    "no-cache",
+    "/api/profile":   "private, max-age=0, must-revalidate",
+    "/api/token":     "no-store",
+    "/logo.png":      "public, max-age=86400, s-maxage=604800",
+}
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        cc = POLICIES.get(self.path, "no-store")
+        self.send_response(200)
+        self.send_header("Cache-Control", cc)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+for p in /app.8f3a2c.js /index.html /api/profile /api/token /logo.png; do
+  echo "== $p =="
+  curl -sI http://127.0.0.1:8000$p | grep -i cache-control
+done`}
+/>
+
+这五条正是经典的**工程缓存策略**：带 hash 的静态资源缓存一年 + immutable；HTML 入口 no-cache（保证发版即生效——hash 变了 HTML 里引用也变了）；个人数据 private；凭证类 no-store；图片走 CDN 用 s-maxage 加长边缘缓存。
+
+## 3. 协商缓存：两对头字段
+
+| 服务器下发（响应头） | 客户端回传（请求头） | 比较内容 |
+|---|---|---|
+| Last-Modified: 时间 | If-Modified-Since: 时间 | 修改时间（秒级精度） |
+| ETag: "指纹" | If-None-Match: "指纹" | 内容指纹（精确） |
+
+### 3.1 亲手打出一个 304
+
+python3 内置的文件服务器就支持 If-Modified-Since，先用它体验最原始的协商缓存：
+
+<Playground
+  language="http"
+  title="Last-Modified 与 If-Modified-Since"
+  id="http-09-2"
+  code={`echo "cached content v1" > page.html
+python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+sleep 0.3
+
+echo "== 第一次请求：200，记下 Last-Modified =="
+curl -sI http://127.0.0.1:8000/page.html | grep -E "HTTP/|Last-Modified"
+
+LM=$(curl -sI http://127.0.0.1:8000/page.html | grep -i last-modified | cut -d" " -f2-)
+
+echo "== 带 If-Modified-Since 再问：304，没有响应体 =="
+curl -s -o /dev/null -w "%{http_code} 下载了 %{size_download} 字节\n" \
+  -H "If-Modified-Since: $LM" http://127.0.0.1:8000/page.html
+
+echo "== 修改文件后再问：文件变新了，回 200 =="
+sleep 1
+echo "cached content v2" > page.html
+curl -s -o /dev/null -w "%{http_code} 下载了 %{size_download} 字节\n" \
+  -H "If-Modified-Since: $LM" http://127.0.0.1:8000/page.html`}
+/>
+
+### 3.2 ETag：更精确的指纹
+
+Last-Modified 有两个弱点：秒级精度（一秒内改两次分辨不出）、"时间变了内容没变"会误判（比如重新部署 touch 了文件）。ETag 直接对**内容**取指纹，彻底解决：
+
+<Playground
+  language="http"
+  title="ETag 与 If-None-Match"
+  id="http-09-3"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import hashlib
+
+content = {"data": b"article body version 1"}
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/bump":
+            content["data"] = b"article body version 2 (edited)"
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = content["data"]
+        etag = "\"" + hashlib.md5(body).hexdigest()[:12] + "\""
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)     # 304 禁止携带响应体
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 第一次：200，拿到 ETag =="
+curl -si http://127.0.0.1:8000/article | grep -E "HTTP/|ETag"
+ET=$(curl -si http://127.0.0.1:8000/article | grep -i "^etag" | cut -d" " -f2 | tr -d "\r")
+
+echo "== 带 If-None-Match 再问：304 =="
+curl -s -o /dev/null -w "%{http_code} 下载 %{size_download} 字节\n" \
+  -H "If-None-Match: $ET" http://127.0.0.1:8000/article
+
+echo "== 内容更新后：指纹不符，回 200 新内容 =="
+curl -s http://127.0.0.1:8000/bump >/dev/null
+curl -s -o /dev/null -w "%{http_code} 下载 %{size_download} 字节\n" \
+  -H "If-None-Match: $ET" http://127.0.0.1:8000/article`}
+/>
+
+两者同时存在时，**If-None-Match 优先**（服务器应先比 ETag）。ETag 还分强弱：`W/"abc"` 弱 ETag 表示"语义相同即可"（如 gzip 前后），字节级校验（断点续传）必须用强 ETag。
+
+<Callout type="warn" title="集群环境的 ETag 陷阱">
+Nginx/Apache 默认用 inode + mtime + size 生成文件 ETag。多台服务器上同一文件的 inode 不同，ETag 就不同——负载均衡轮换后 304 永远打不中，缓存形同虚设。解法：去掉 inode 因子、统一按内容 hash 生成，或干脆只用 Last-Modified。
+</Callout>
+
+## 4. 完整决策树
+
+服务器视角，给一个资源定缓存策略的思考顺序：
+
+```text
+是敏感数据（token、个人隐私）？
+├─ 是 → Cache-Control: no-store                     [到此为止]
+└─ 否 → 内容会变吗？
+    ├─ 文件名带内容 hash（app.8f3a2c.js）
+    │      → public, max-age=31536000, immutable
+    ├─ 会变，但必须立即生效（HTML 入口、API）
+    │      → no-cache（或 max-age=0）+ ETag/Last-Modified
+    └─ 会变，可容忍 N 秒延迟（列表页、头像）
+           → max-age=N（+ ETag 兜底）
+              是否允许 CDN 缓存？ public/s-maxage : private
+```
+
+浏览器视角（简化）：有强缓存且新鲜 → 直接用；否则带 If-None-Match / If-Modified-Since 发请求 → 304 续命 / 200 换新。
+
+<Callout type="tip" title="用户按下 Ctrl+F5 时发生了什么">
+普通刷新：浏览器给主文档加 Cache-Control: max-age=0（跳过强缓存、仍协商）。强制刷新（Ctrl+F5）：加 Cache-Control: no-cache 且不带条件头——强缓存协商缓存全部跳过，逼服务器返回完整 200。
+</Callout>
+
+## 小结
+
+- 两级模型：强缓存（不发请求）→ 协商缓存（304 免传体）；
+- no-cache = 用前必验，no-store = 不许存，max-age 以秒计新鲜期，s-maxage 管 CDN；
+- 协商两对：ETag / If-None-Match（内容指纹，优先）与 Last-Modified / If-Modified-Since（秒级时间）；
+- 黄金策略：静态资源文件名带 hash + 缓存一年 + immutable，HTML 入口 no-cache；
+- 集群下注意 ETag 一致性，否则 304 全落空。
+
+<Callout type="exercise" title="练习">
+1. 在 Playground 3 中同时下发 ETag 和 Last-Modified，请求时两个条件头都带上但故意让时间对、指纹不对，验证服务器应返回 200（ETag 优先）。
+2. 修改 Playground 3：把 ETag 改成弱 ETag（W/ 前缀），验证比较逻辑需要怎么调整。
+3. 用 Playground 1 的策略表回答：一个每小时更新的 sitemap.xml 应该用什么 Cache-Control？
+4. 排障题：发版后用户反馈页面还是旧的。按"HTML 入口 → JS 文件名 → CDN s-maxage"的顺序列出你的检查清单。
+</Callout>

@@ -1,0 +1,189 @@
+---
+title: 文本三剑客之 sed：流编辑器与批量替换
+order: 8
+description: s 替换命令、地址范围、删除与打印行、-i 原地编辑及 GNU/BSD 差异
+---
+
+# 文本三剑客之 sed：流编辑器与批量替换
+
+sed（Stream EDitor，流编辑器）解决"改"的问题：批量替换配置里的域名、删掉文件的某些行、给每行加前缀——不打开编辑器，一条命令完成。它的工作模型很简单：**逐行读入 → 按脚本处理 → 打印结果**，原文件默认不动（除非 `-i`）。
+
+## 1. s 命令：替换
+
+sed 使用率 90% 以上的功能就是 `s`（substitute）：
+
+```bash
+sed 's/旧/新/' file        # 每行替换第一处匹配
+sed 's/旧/新/g' file       # g 标志：每行替换全部匹配
+sed 's/旧/新/2' file       # 只替换每行的第 2 处
+sed 's/旧/新/gi' file      # i 标志：忽略大小写
+```
+
+<Playground
+  language="linux"
+  title="s 命令与 g 标志"
+  id="linux-08-1"
+  code={`cat > greet.txt << 'EOF'
+hello world, hello linux
+HELLO again
+goodbye world
+EOF
+
+echo '$ sed "s/hello/hi/" greet.txt   # 每行只换第一处'
+sed 's/hello/hi/' greet.txt
+
+echo '$ sed "s/hello/hi/g" greet.txt   # 全部换'
+sed 's/hello/hi/g' greet.txt
+
+echo '$ sed "s/hello/hi/gi" greet.txt   # 大小写通吃'
+sed 's/hello/hi/gi' greet.txt
+
+echo '$ cat greet.txt   # 原文件没有变！sed 默认只改输出流'
+cat greet.txt`}
+/>
+
+模式部分是正则表达式（加 `-E` 用扩展正则，与 grep -E 同一套）。分隔符不是必须用 `/`——处理路径、URL 时换个分隔符可读性天差地别：
+
+```bash
+sed 's/\/var\/www\/old/\/var\/www\/new/' cfg     # 斜杠地狱，别这么写
+sed 's#/var/www/old#/var/www/new#' cfg           # 用 # 做分隔符，清爽
+sed 's|http://old.com|https://new.com|g' cfg     # 用 | 也行
+```
+
+## 2. 地址：只处理某些行
+
+sed 命令前可以加"地址"限定作用范围，形式是行号或正则：
+
+```bash
+sed '3s/a/b/' file          # 只在第 3 行替换
+sed '2,5s/a/b/g' file       # 第 2 到 5 行
+sed '/^#/s/a/b/' file       # 只在注释行（# 开头）里替换
+sed '/BEGIN/,/END/s/a/b/'   # 从匹配 BEGIN 的行到匹配 END 的行
+sed '$s/a/b/' file          # $ 表示最后一行
+```
+
+## 3. d 删除与 p 打印
+
+```bash
+sed '/^#/d' app.conf        # 删除所有注释行
+sed '/^$/d' app.conf        # 删除所有空行
+sed '1d' file               # 删除第一行（如去掉 CSV 表头）
+sed -n '5,8p' file          # -n 关闭默认输出，p 打印：只输出 5~8 行
+sed -n '/ERROR/p' file      # 等价于 grep ERROR
+```
+
+`-n` 加 `p` 的组合要理解：sed 默认把每行处理完都打印一遍，`-n` 关掉这个默认行为，只有被 `p` 命令点名的行才输出——这就变成了"精确取行"工具，比 head+tail 组合更直接。
+
+<Playground
+  language="linux"
+  title="清洗配置：删注释、删空行、取区间"
+  id="linux-08-2"
+  code={`cat > app.conf << 'EOF'
+# main config
+port = 8080
+
+# database settings
+db_host = localhost
+db_port = 5432
+
+# cache
+cache_ttl = 300
+EOF
+
+echo '$ sed "/^#/d" app.conf   # 去注释行'
+sed '/^#/d' app.conf
+
+echo '$ sed "/^#/d; /^$/d" app.conf   # 分号串联多个命令：再去空行'
+sed '/^#/d; /^$/d' app.conf
+
+echo '$ sed -n "4,6p" app.conf   # 只看 4 到 6 行'
+sed -n '4,6p' app.conf
+
+echo '$ sed -n "/^db_/p" app.conf   # 只看 db 开头的配置项'
+sed -n '/^db_/p' app.conf`}
+/>
+
+## 4. -i：原地编辑
+
+前面所有例子都只改输出、不动原文件。加 `-i`（in-place）直接写回：
+
+```bash
+sed -i 's/8080/9090/' app.conf           # 直接修改文件
+sed -i.bak 's/8080/9090/' app.conf       # 修改前先留一份 app.conf.bak（推荐）
+sed -i '/^debug/d' /etc/app/*.conf       # 批量修改多个文件
+```
+
+<Playground
+  language="linux"
+  title="sed -i 原地修改（带备份）"
+  id="linux-08-3"
+  code={`printf 'env = dev\nport = 8080\nhost = dev.example.com\n' > app.conf
+
+echo '$ sed -i.bak "s/dev/prod/g" app.conf'
+sed -i.bak 's/dev/prod/g' app.conf
+
+echo '--- 修改后的 app.conf ---'
+cat app.conf
+echo '--- 自动备份 app.conf.bak ---'
+cat app.conf.bak
+
+# 经典组合：find + sed 批量改整个项目
+mkdir -p srcs
+echo 'api = http://old-api' > srcs/a.cfg
+echo 'cdn = http://old-cdn' > srcs/b.cfg
+find srcs -name '*.cfg' -exec sed -i 's|http://old|https://new|' {} +
+echo '--- 批量替换后 ---'
+cat srcs/a.cfg srcs/b.cfg`}
+/>
+
+<Callout type="warn" title="GNU sed 与 BSD/macOS sed 的 -i 不兼容">
+Linux（GNU sed）：`sed -i 's/a/b/' f` 直接可用，`-i.bak` 表示留备份。macOS（BSD sed）：`-i` 后面**必须**跟备份后缀参数，不留备份要写 `sed -i '' 's/a/b/' f`（注意空字符串）。跨平台脚本要么统一装 gsed，要么用 `sed 's/a/b/' f > tmp && mv tmp f` 的通用写法。本课沙箱是 GNU sed。
+</Callout>
+
+## 5. 进阶一瞥：分组回引与 &
+
+替换部分可以引用模式里捕获的内容：`&` 代表整个匹配，`\1` `\2` 代表 `-E` 模式下第 1、2 个括号分组：
+
+```bash
+# & ：给每个数字加上方括号
+echo 'port 8080 and 9090' | sed -E 's/[0-9]+/[&]/g'
+# 输出：port [8080] and [9090]
+
+# \1 \2 ：调换 "key = value" 为 "value = key"
+echo 'name = ada' | sed -E 's/(\w+) = (\w+)/\2 = \1/'
+# 输出：ada = name
+
+# 实战：从 nginx 日志行提取 IP（把整行替换成第一个字段）
+echo '10.2.3.4 - - [31/Jul/2026] "GET /"' | sed -E 's/^([0-9.]+) .*/\1/'
+# 输出：10.2.3.4
+```
+
+sed 还有追加（a）、插入（i）、行内换行处理等更多命令，但工作中"替换 + 删除 + 取行"三板斧覆盖了绝大多数需求；更复杂的字段级逻辑，下一章的 awk 更合适。
+
+## 6. sed 与 grep 的配合分工
+
+| 需求 | 工具 |
+|---|---|
+| 找出包含 X 的行 | grep |
+| 把 X 换成 Y | sed s |
+| 删掉某些行 / 取某区间 | sed d / sed -n p |
+| 按列取值、算数、统计 | awk（下一章） |
+
+管道里三者常串着用：`grep 先缩小范围 → sed 清洗格式 → awk 统计`，第 20 章会看到完整流水线。
+
+## 小结
+
+- 模型：逐行读入、处理、输出；默认**不修改原文件**
+- `s/旧/新/g` 是绝对主力；分隔符可换成 `#` `|` 避免斜杠地狱；`-E` 用扩展正则
+- 地址限定范围：行号、`2,5`、`/正则/`、`$`（末行）
+- `/^#/d` 删注释、`/^$/d` 删空行、`-n '5,8p'` 精确取行
+- `-i` 原地改，建议 `-i.bak` 留备份；注意 macOS 的 BSD sed 语法差异
+- `&` 与 `\1` 分组回引，能做"提取重排"类改写
+- 下一章：三剑客之 awk——按列处理与统计报表 →
+
+<Callout type="exercise" title="练习">
+1. 造一个含注释、空行的配置文件，用一条 sed 同时删掉注释行和空行，并把 `localhost` 替换为 `127.0.0.1`（提示：分号串联三个命令）。
+2. 用 `seq 10` 生成 10 行数字，分别用 `sed -n '3,6p'` 和 `head -n 6 | tail -n 4` 取第 3~6 行，确认结果一致。
+3. 用 `sed -i.bak` 把某文件里所有 `http://` 改为 `https://`（用 `|` 做分隔符），再 diff 修改后文件与 .bak 备份查看变化。
+4. 挑战：`echo 'user=ada id=42'`，用 `sed -E` 加分组回引改写成 `id=42 user=ada`。
+</Callout>

@@ -1,0 +1,467 @@
+---
+title: 性能优化
+order: 12
+description: 重渲染的真正原因、React.memo 的浅比较规则、什么时候优化才有意义，以及用 Profiler 定位瓶颈
+---
+
+# 性能优化
+
+React 应用变慢有三种可能：渲染的组件太多、单个组件渲染太慢、更新太频繁。绝大多数「优化」文章只讲第一种，而且往往在解决一个根本不存在的问题。
+
+这一章的顺序是：先搞清楚重渲染的规则，再学会测量，最后才谈优化手段。
+
+## 1. 什么导致重渲染
+
+### 1.1 三个原因
+
+一个组件会重新渲染，只可能因为：
+
+1. **它自己的 state 变了**（调用了 setState 且新值和旧值不同）
+2. **它订阅的 Context 变了**
+3. **它的父组件重新渲染了**
+
+第三条是最重要也最反直觉的：**父组件重渲染，所有子组件默认都会重渲染，无论 props 有没有变。**
+
+```tsx
+function Parent() {
+  const [count, setCount] = useState(0);
+  return (
+    <div>
+      <button onClick={() => setCount(count + 1)}>{count}</button>
+      <Child />          {/* 没有任何 props，照样重渲染 */}
+    </div>
+  );
+}
+```
+
+### 1.2 「重渲染」不等于「操作 DOM」
+
+这是最需要澄清的一点。React 的更新分两个阶段：
+
+| 阶段 | 做什么 | 成本 |
+|---|---|---|
+| render | 执行组件函数，生成新的 element 树，和旧树 diff | 低（纯 JS 计算） |
+| commit | 把 diff 出的差异应用到真实 DOM | 高 |
+
+`Child` 重渲染，只是它的函数被执行了一遍、结果被比较了一遍。如果输出和上次一样，**commit 阶段什么都不会做，DOM 一动不动**。
+
+所以「组件重渲染了」本身不是问题。只有当重渲染的次数 × 单次成本大到影响帧率时，才是问题。
+
+<Callout type="warn" title="不要为了减少重渲染而减少重渲染">
+我见过团队花两周给全项目加 memo，最后性能没有任何变化，代码可读性大幅下降。
+
+一个返回十几个 DOM 节点的普通组件，渲染一次大约耗时几十微秒。一帧有 16 毫秒。你需要同时渲染几百个这样的组件才会掉帧。
+</Callout>
+
+### 1.3 state 更新但值没变
+
+React 有一个内置优化叫 bailout：如果新 state 和旧 state `Object.is` 相等，会跳过重渲染。
+
+```tsx
+const [n, setN] = useState(0);
+setN(0);    // 值没变，不会重渲染
+```
+
+注意这个优化对对象无效——`setUser({...user})` 即使内容相同，引用变了就会重渲染。这也是为什么第 4 章强调「只在真的变化时才创建新对象」。
+
+## 2. React.memo
+
+### 2.1 它做什么
+
+`React.memo` 包裹一个组件后，React 会在重渲染前先比较新旧 props：**浅比较相等就跳过这次渲染**（连同它的整棵子树）。
+
+```tsx
+const Row = React.memo(function Row({ item, onSelect }: RowProps) {
+  return <li onClick={() => onSelect(item.id)}>{item.name}</li>;
+});
+```
+
+它切断的正是上一节的第三条原因：父组件重渲染不再自动导致它重渲染。但另外两条（自己的 state、订阅的 Context）依然会触发它。
+
+### 2.2 浅比较的规则
+
+亲手实现一遍就完全清楚了：
+
+<Playground
+  language="typescript"
+  title="React.memo 的浅比较"
+  id="react-12-1"
+  code={`type Props = Record<string, unknown>;
+
+// React.memo 内部用的比较函数（简化版，真实实现在 shallowEqual.js）
+function shallowEqual(a: Props, b: Props): boolean {
+  if (Object.is(a, b)) return true;
+
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+    // 注意：只比一层，属性值本身是对象时只比引用
+    if (!Object.is(a[key], b[key])) return false;
+  }
+  return true;
+}
+
+let renderCount = 0;
+let lastProps: Props | null = null;
+
+// 模拟一个被 React.memo 包裹的组件
+function memoComponent(label: string, props: Props): void {
+  if (lastProps !== null && shallowEqual(lastProps, props)) {
+    console.log(label + " -> 跳过渲染");
+    return;
+  }
+  lastProps = props;
+  renderCount++;
+  console.log(label + " -> 重新渲染（第 " + renderCount + " 次）");
+}
+
+const stableUser = { id: 1, name: "Ada" };
+const stableHandler = function (): void {};
+
+console.log("场景 A：所有 props 引用稳定");
+memoComponent("A1", { user: stableUser, onClick: stableHandler, count: 1 });
+memoComponent("A2", { user: stableUser, onClick: stableHandler, count: 1 });
+
+console.log("场景 B：内联对象字面量（父组件每次渲染新建）");
+memoComponent("B1", { user: { id: 1, name: "Ada" }, count: 1 });
+memoComponent("B2", { user: { id: 1, name: "Ada" }, count: 1 });
+
+console.log("场景 C：内联箭头函数");
+memoComponent("C1", { onClick: function () {}, count: 1 });
+memoComponent("C2", { onClick: function () {}, count: 1 });
+
+console.log("场景 D：只是原始值变了");
+memoComponent("D1", { user: stableUser, count: 1 });
+memoComponent("D2", { user: stableUser, count: 2 });
+
+console.log("场景 E：props 数量变了");
+memoComponent("E1", { user: stableUser });
+memoComponent("E2", { user: stableUser, extra: true });
+
+console.log("总渲染次数: " + renderCount);
+console.log("结论：内联对象与内联函数会让 memo 完全失效");`}
+  expectedOutput={`场景 A：所有 props 引用稳定\nA1 -> 重新渲染（第 1 次）\nA2 -> 跳过渲染\n场景 B：内联对象字面量（父组件每次渲染新建）\nB1 -> 重新渲染（第 2 次）\nB2 -> 重新渲染（第 3 次）\n场景 C：内联箭头函数\nC1 -> 重新渲染（第 4 次）\nC2 -> 重新渲染（第 5 次）\n场景 D：只是原始值变了\nD1 -> 重新渲染（第 6 次）\nD2 -> 重新渲染（第 7 次）\n场景 E：props 数量变了\nE1 -> 重新渲染（第 8 次）\nE2 -> 重新渲染（第 9 次）\n总渲染次数: 9\n结论：内联对象与内联函数会让 memo 完全失效`}
+/>
+
+### 2.3 memo 失效的常见原因
+
+场景 B 和 C 是真实项目里最常见的：
+
+```tsx
+// 这四种写法都会让 MemoChild 的 memo 完全失效
+<MemoChild style={{ color: "red" }} />               {/* 内联对象 */}
+<MemoChild items={data.filter((d) => d.ok)} />       {/* 每次新数组 */}
+<MemoChild onClick={() => doSomething(id)} />        {/* 内联函数 */}
+<MemoChild render={() => <span>hi</span>} />         {/* 内联 JSX */}
+```
+
+修复方式就是第 7 章的 `useMemo` / `useCallback`：
+
+```tsx
+const style = useMemo(() => ({ color: "red" }), []);
+const items = useMemo(() => data.filter((d) => d.ok), [data]);
+const onClick = useCallback(() => doSomething(id), [id]);
+```
+
+**注意这是一条链**：只要链上有一环断了，整个优化就是零收益还有额外成本。所以 memo 要么完整地做，要么就别做。
+
+### 2.4 自定义比较函数
+
+第二个参数可以自定义比较逻辑：
+
+```tsx
+const Chart = React.memo(
+  function Chart({ data, config }: Props) { /* ... */ },
+  (prev, next) => prev.data.version === next.data.version
+);
+```
+
+返回 `true` 表示「相等，跳过渲染」——注意这个语义和 `shouldComponentUpdate` 是**反的**，很容易写错。
+
+慎用深比较：对一个大数组做深比较可能比重新渲染还慢。
+
+### 2.5 什么时候值得用 memo
+
+- 组件渲染开销确实大（复杂图表、大表格、富文本）
+- 组件在长列表里被渲染很多次
+- 组件的 props 大部分时候真的不变
+- 你已经用 Profiler **测量过**，确认这里是瓶颈
+
+反过来，这些情况不要用：
+
+- 组件很简单（几个 DOM 节点）
+- props 每次都变（memo 只会增加一次无用的比较）
+- 组件本来就很少重渲染
+
+## 3. 更有效的优化：改变结构
+
+比加 memo 更根本的做法，是让不必要的渲染压根不发生。
+
+### 3.1 状态下沉
+
+```tsx
+// 不好：输入框的 state 在顶层，每打一个字整棵树都重渲染
+function Page() {
+  const [query, setQuery] = useState("");
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      <HugeStaticTree />
+      <Results query={query} />
+    </>
+  );
+}
+
+// 好：把 state 和用到它的部分一起下沉
+function Page() {
+  return (
+    <>
+      <SearchArea />         {/* query 状态在这里面 */}
+      <HugeStaticTree />     {/* 完全不受影响 */}
+    </>
+  );
+}
+```
+
+这是第 11 章「不要过早提升状态」的性能侧论证。
+
+### 3.2 children 传递
+
+```tsx
+// 不好：Counter 每次渲染，HugeTree 都跟着渲染
+function Counter() {
+  const [n, setN] = useState(0);
+  return (
+    <div onClick={() => setN(n + 1)}>
+      {n}
+      <HugeTree />
+    </div>
+  );
+}
+
+// 好：HugeTree 的元素在外面创建，Counter 重渲染时它的引用没变
+function Counter({ children }: { children: React.ReactNode }) {
+  const [n, setN] = useState(0);
+  return (
+    <div onClick={() => setN(n + 1)}>
+      {n}
+      {children}
+    </div>
+  );
+}
+
+// 使用
+<Counter>
+  <HugeTree />
+</Counter>
+```
+
+原理：`children` 是一个 prop，它的值（element 对象）是在**父组件**里创建的。`Counter` 自己重渲染不会重新创建这个元素，React 看到引用相同就直接复用了整棵子树。
+
+**这个技巧不需要任何 memo，效果却比 memo 更彻底。**
+
+### 3.3 拆分组件
+
+```tsx
+// 不好：一个大组件，任何一个 state 变化都要重算全部
+function Dashboard() {
+  const [filter, setFilter] = useState("");
+  const [selected, setSelected] = useState(null);
+  const [expanded, setExpanded] = useState(false);
+  // 300 行 JSX
+}
+```
+
+按 state 的影响范围拆成几个组件，每个 state 的变化只影响一小块。
+
+## 4. 测量：React DevTools Profiler
+
+### 4.1 基本用法
+
+1. 安装 React DevTools 浏览器扩展，切到 Profiler 面板
+2. 点录制按钮，执行一次让你觉得卡的操作，停止录制
+3. 看火焰图
+
+火焰图里每个条形是一个组件，**宽度代表渲染耗时**，灰色表示这次没有渲染。
+
+### 4.2 关键功能
+
+- **Ranked 视图**：按耗时排序，直接看到最慢的组件
+- **点击某个组件**：右侧显示「为什么这次会渲染」（需要在设置里开启 Record why each component rendered）
+- **Highlight updates**：在设置里开启后，页面上重渲染的组件会闪蓝框，能直观发现无谓渲染
+
+「为什么会渲染」这个功能是定位问题的关键，它会告诉你是 props 变了（具体哪个）、state 变了、还是 hook 变了。
+
+### 4.3 用 Profiler 组件做程序化测量
+
+```tsx
+import { Profiler } from "react";
+
+<Profiler
+  id="TodoList"
+  onRender={(id, phase, actualDuration, baseDuration) => {
+    // actualDuration: 本次渲染实际耗时
+    // baseDuration: 不用任何 memo 的话理论耗时
+    if (actualDuration > 16) {
+      console.warn(id + " 渲染耗时 " + actualDuration.toFixed(1) + "ms");
+    }
+  }}
+>
+  <TodoList />
+</Profiler>
+```
+
+对比 `actualDuration` 和 `baseDuration` 能看出 memo 到底省了多少——如果两者接近，说明你的 memo 没起作用。
+
+### 4.4 优化的正确顺序
+
+1. **先测量**，找到真正的瓶颈（往往和你的猜测不一样）
+2. **看是不是算法问题**：O(n²) 的循环、每次渲染都新建的大对象、正则重复编译
+3. **看是不是渲染了不该渲染的东西**：一次性渲染 1000 行（该虚拟化，第 13 章）
+4. **看结构能不能改**：状态下沉、children 传递
+5. **最后才是 memo / useMemo / useCallback**
+6. **改完再测量**，确认真的变快了
+
+<Callout type="tip" title="生产构建才有意义">
+开发构建包含大量额外检查，比生产构建慢 2-5 倍，而且 StrictMode 会让组件渲染两次。
+
+性能测量必须在生产构建下做（`next build && next start` 或 `vite build && vite preview`），否则你测的数字没有参考价值。
+</Callout>
+
+## 5. 常见的真实瓶颈
+
+按我的经验，实际项目里的性能问题排序大致是：
+
+**第一名：一次渲染太多 DOM 节点。** 一个 5000 行的表格，任何优化都救不了，只能虚拟化（第 13 章）。
+
+**第二名：包体积太大导致首屏慢。** 这不是渲染性能问题，是加载问题，用代码分割解决（第 13 章）。
+
+**第三名：高频事件没有节流。** scroll、mousemove、resize 每秒触发上百次，每次都 setState。
+
+```tsx
+useEffect(() => {
+  let ticking = false;
+  function onScroll() {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(() => {
+      setScrollY(window.scrollY);
+      ticking = false;
+    });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  return () => window.removeEventListener("scroll", onScroll);
+}, []);
+```
+
+**第四名：渲染期间做重复的昂贵计算。** 每次渲染都重新排序一个大数组、重新解析日期、重新编译正则。
+
+**第五名：Context 导致大范围重渲染。** 第 9 章讲的问题。
+
+**最后才是：缺少 memo 导致的重渲染。** 真的排在最后。
+
+## 6. 一个优化的完整案例
+
+假设有个消息列表，每次收到新消息整个列表都卡一下。
+
+**测量**：Profiler 显示每次更新耗时 180ms，其中 `MessageItem` 出现 500 次，每次 0.3ms。
+
+**分析**：500 × 0.3 = 150ms。问题是「渲染了 500 个组件」，而不是「单个组件慢」。
+
+**方案对比**：
+
+| 方案 | 效果 | 代价 |
+|---|---|---|
+| 给 MessageItem 加 memo | 新消息到来时旧消息不再重渲染，180ms → 5ms | 需要保证 props 引用稳定 |
+| 虚拟化只渲染可视区 20 条 | 首次渲染也快，180ms → 8ms | 引入依赖，滚动条行为要处理 |
+| 两者都做 | 最优 | 复杂度最高 |
+
+这里 memo 是对的选择，因为「历史消息不会变」这个前提天然成立。实施时要检查：
+
+```tsx
+const MessageItem = React.memo(function MessageItem({ msg, onReply }: Props) {
+  /* ... */
+});
+
+function MessageList({ messages }: { messages: Msg[] }) {
+  // 必须稳定，否则上面的 memo 全废
+  const onReply = useCallback((id: string) => { /* ... */ }, []);
+
+  return (
+    <ul>
+      {messages.map((m) => (
+        <MessageItem key={m.id} msg={m} onReply={onReply} />
+      ))}
+    </ul>
+  );
+}
+```
+
+还要确认 `messages` 数组里的每个 `msg` 对象在没变化时保持同一引用——如果每次从服务端拿到数据都重新构造整个数组，memo 依然会失效。这就是第 4 章「不可变更新只复制变化路径」的实际价值。
+
+<Callout type="info" title="React Compiler">
+React 19 配套的编译器会自动做记忆化：它分析你的代码，在编译期插入等价于 `useMemo`/`useCallback`/`memo` 的逻辑。
+
+启用后，本章讲的大部分手动优化都可以删掉。但**理解规则依然必要**——编译器只对「符合 React 规则」的代码生效，如果你的组件不纯、有隐藏的副作用，编译器会跳过它（或者更糟，产生你没预期的行为）。
+</Callout>
+
+<Callout type="exercise" title="练习 1：判断重渲染">
+```tsx
+function App() {
+  const [n, setN] = useState(0);
+  const [text, setText] = useState("");
+  return (
+    <>
+      <button onClick={() => setN(n + 1)}>{n}</button>
+      <Memoized value={text} />
+      <Plain value={text} />
+      <Wrapper><Heavy /></Wrapper>
+    </>
+  );
+}
+```
+其中 Memoized 用了 React.memo，Wrapper 内部有自己的 state 但只渲染 children。
+
+点击按钮后，Memoized、Plain、Wrapper、Heavy 分别会不会重渲染？逐个说明理由。
+</Callout>
+
+<Callout type="exercise" title="练习 2：修复失效的 memo">
+```tsx
+const Item = React.memo(function Item({ data, config, onPick }) { /* ... */ });
+
+function List({ rows }) {
+  const config = { dense: true };
+  const sorted = rows.sort((a, b) => a.n - b.n);
+  return sorted.map((r) => (
+    <Item key={r.id} data={r} config={config} onPick={() => pick(r.id)} />
+  ));
+}
+```
+这段代码里 memo 完全没有生效，而且还有一个不属于性能范畴的 bug。找出全部问题并修复。
+</Callout>
+
+<Callout type="exercise" title="练习 3：用结构代替 memo">
+一个页面顶部有个每秒更新的时钟，下面是一棵渲染很慢的树。目前时钟的 state 在页面组件里，导致整棵树每秒重渲染一次。
+
+给出两种不加 memo 的解法（提示：一种是状态下沉，一种是 children 传递），并说明各自适用什么情况。
+</Callout>
+
+<Callout type="exercise" title="练习 4：扩展浅比较">
+给本章 Playground 的 `shallowEqual` 加一个「变化原因」输出：当返回 false 时，打印出是哪个 key 变了、变化前后的值分别是什么。
+
+然后模拟一个真实场景：连续 5 次渲染，其中 style 是内联对象、data 引用稳定、count 递增，观察输出能否准确定位到「style 每次都变」这个问题。
+</Callout>
+
+## 小结
+
+- 重渲染只有三个原因：自己的 state 变、订阅的 Context 变、**父组件重渲染**
+- **重渲染 ≠ 操作 DOM**：render 阶段很便宜，commit 阶段才贵；输出没变就不碰 DOM
+- `React.memo` 用**浅比较**（逐个 key 的 `Object.is`）判断是否跳过
+- 内联对象、内联数组、内联函数、内联 JSX 会让 memo 完全失效——优化是一条链，断一环就归零
+- 比 memo 更有效的手段：**状态下沉**、**children 传递**、拆分组件
+- 先用 **Profiler 测量**（生产构建下），找到真正的瓶颈再动手
+- 真实瓶颈排序：DOM 节点太多 > 包体积 > 高频事件 > 重复昂贵计算 > Context > 缺 memo
+- 下一章讲虚拟化与代码分割，正面解决前两名 →

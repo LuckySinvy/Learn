@@ -1,0 +1,192 @@
+---
+title: 文本三剑客之 awk：列处理与统计报表
+order: 9
+description: 按列取值、内置变量 NR/NF、模式过滤、BEGIN/END 与关联数组做分组统计
+---
+
+# 文本三剑客之 awk：列处理与统计报表
+
+grep 面向"行"，awk 面向"列"。日志、CSV、命令输出大多是列状数据——"取第 3 列""统计平均耗时""按状态码分组计数"，这些都是 awk 的主场。awk 其实是门小型编程语言，但日常够用的子集很小，本章全部覆盖。
+
+## 1. 工作模型：模式 + 动作
+
+```bash
+awk '模式 { 动作 }' 文件
+```
+
+awk 逐行读入，把每行按分隔符（默认连续空白）切成字段：`$1` 是第 1 列，`$2` 是第 2 列……`$0` 是整行。对每一行：模式成立就执行动作；模式省略则每行都执行；动作省略则默认打印整行。
+
+<Playground
+  language="linux"
+  title="按列取值：$1 $2 与 $NF"
+  id="linux-09-1"
+  code={`cat > access.log << 'EOF'
+10.0.0.1 GET /index.html 200 12
+10.0.0.2 POST /api/login 401 35
+10.0.0.1 GET /api/users 200 210
+10.0.0.3 GET /favicon.ico 404 2
+10.0.0.2 POST /api/orders 500 1520
+EOF
+
+echo '$ awk "{print $1}" access.log   # 第 1 列：IP'
+awk '{print $1}' access.log
+
+echo '$ awk "{print $2, $4}" access.log   # 逗号分隔多列，输出以空格连接'
+awk '{print $2, $4}' access.log
+
+echo '$ awk "{print $NF}" access.log   # NF=列数，$NF 即最后一列（耗时）'
+awk '{print $NF}' access.log
+
+echo '$ awk "{print $4, $3}" access.log   # 重排列序，瞬间完成'
+awk '{print $4, $3}' access.log`}
+/>
+
+## 2. 内置变量与自定义分隔符
+
+| 变量 | 含义 |
+|---|---|
+| `$0` / `$1`... | 整行 / 第 n 个字段 |
+| `NF` | 当前行的字段数（`$NF` 是最后一列） |
+| `NR` | 当前行号（累计所有输入） |
+| `FS` / `OFS` | 输入 / 输出字段分隔符 |
+
+处理 CSV、/etc/passwd 这类非空白分隔的数据，用 `-F` 指定分隔符：
+
+<Playground
+  language="linux"
+  title="-F 分隔符与 NR/NF"
+  id="linux-09-2"
+  code={`echo '$ 处理冒号分隔的 /etc/passwd：'
+head -n 4 /etc/passwd
+echo '$ awk -F: "{print NR, $1, $3}" —— 行号、用户名、UID'
+head -n 4 /etc/passwd | awk -F: '{print NR, $1, $3}'
+
+cat > users.csv << 'EOF'
+name,dept,salary
+ada,eng,32000
+bob,ops,21000
+carol,eng,28000
+dave,sales,18000
+EOF
+
+echo '$ awk -F, "NR > 1 {print $1, $3}" users.csv   # NR>1 跳过表头'
+awk -F, 'NR > 1 {print $1, $3}' users.csv
+
+echo '$ 修改输出分隔符 OFS 生成 TSV：'
+awk -F, 'BEGIN{OFS="|"} NR > 1 {print $1, $2, $3}' users.csv
+
+echo '$ awk "{print NF}" 检查每行列数是否一致（数据质量检查）：'
+awk -F, '{print NR": "NF" cols"}' users.csv`}
+/>
+
+## 3. 模式：只处理感兴趣的行
+
+模式可以是正则、比较表达式或其组合，写在动作前面：
+
+```bash
+awk '$4 == 200 {print $3}' access.log       # 状态码 200 的 URL
+awk '$5 > 1000' access.log                  # 耗时超 1 秒的行（动作省略=打印整行）
+awk '/POST/ {print $1}' access.log          # 含 POST 的行（正则模式）
+awk '$2 == "GET" && $4 != 200' access.log   # 逻辑与：GET 且非 200
+awk 'NR >= 2 && NR <= 4' file               # 用行号取区间，替代 head+tail
+```
+
+注意 awk 的比较是真数值比较：`$5 > 1000` 是数字大小，不是字符串排序——这是它比 grep/sed 强的根本原因之一。
+
+## 4. BEGIN / END 与统计三板斧
+
+`BEGIN` 块在读第一行前执行（初始化、打表头），`END` 块在全部行读完后执行（输出汇总）。配合变量累加，就是统计报表的标准结构：
+
+<Playground
+  language="linux"
+  title="求和、平均、最大值"
+  id="linux-09-3"
+  code={`cat > access.log << 'EOF'
+10.0.0.1 GET /index.html 200 12
+10.0.0.2 POST /api/login 401 35
+10.0.0.1 GET /api/users 200 210
+10.0.0.3 GET /favicon.ico 404 2
+10.0.0.2 POST /api/orders 500 1520
+10.0.0.1 GET /api/users 200 180
+EOF
+
+echo '$ 总耗时与平均耗时：'
+awk '{sum += $5} END {print "total:", sum, "avg:", sum/NR}' access.log
+
+echo '$ 最慢的一次请求：'
+awk '$5 > max {max = $5; line = $0} END {print max "ms:", line}' access.log
+
+echo '$ 只统计 200 请求的平均耗时（模式过滤 + 自己计数）：'
+awk '$4 == 200 {sum += $5; n++} END {print "200 avg:", sum/n, "ms (", n, "reqs )"}' access.log`}
+/>
+
+三个细节：awk 变量不用声明，未赋值的数值变量自动是 0，所以 `sum += $5` 可以直接写；`NR` 在 END 块里就是总行数；条件过滤后求平均要自己维护计数器 `n`，不能用 NR。
+
+## 5. 关联数组：分组统计的杀手锏
+
+awk 的数组下标可以是任意字符串（类似字典/哈希表），`arr[key]++` 一行就完成"按 key 分组计数"——这是 awk 最有生产力的特性：
+
+<Playground
+  language="linux"
+  title="按字段分组计数与分组求和"
+  id="linux-09-4"
+  code={`cat > access.log << 'EOF'
+10.0.0.1 GET /index.html 200 12
+10.0.0.2 POST /api/login 401 35
+10.0.0.1 GET /api/users 200 210
+10.0.0.3 GET /favicon.ico 404 2
+10.0.0.2 POST /api/orders 500 1520
+10.0.0.1 GET /api/users 200 180
+10.0.0.3 GET /index.html 200 9
+EOF
+
+echo '$ 每个 IP 的请求数：'
+awk '{cnt[$1]++} END {for (ip in cnt) print cnt[ip], ip}' access.log
+
+echo '$ 每种状态码出现次数：'
+awk '{code[$4]++} END {for (c in code) print c, code[c]}' access.log
+
+echo '$ 每个 IP 的总耗时（分组求和）：'
+awk '{ms[$1] += $5} END {for (ip in ms) print ip, ms[ip] "ms"}' access.log
+
+echo '$ 配合 sort 按次数倒序（awk 输出天然接管道）：'
+awk '{cnt[$1]++} END {for (ip in cnt) print cnt[ip], ip}' access.log | sort -rn`}
+/>
+
+`for (key in 数组)` 遍历所有出现过的 key，遍历顺序不保证——需要排序就交给管道后面的 `sort`，各司其职。
+
+## 6. printf 与格式化输出
+
+`print` 自动换行、字段用 OFS 连接；需要对齐和精度控制时用 `printf`（与 C 语言同款格式）：
+
+```bash
+awk '{printf "%-15s %6d ms\n", $1, $5}' access.log
+# %-15s 左对齐占 15 格；%6d 右对齐占 6 格；\n 需自己写
+
+awk '{sum+=$5} END {printf "avg = %.2f ms\n", sum/NR}' access.log
+# %.2f 保留两位小数
+```
+
+<Callout type="tip" title="grep、sed、awk 怎么选">
+只是"找行"用 grep（最快最直白）；"改文本"用 sed；一旦涉及**列**、**数值比较**、**分组统计**，直接上 awk。也别教条：`awk '/ERROR/'` 完全可以当 grep 用，管道里少一个进程有时更清爽。
+</Callout>
+
+<Callout type="info" title="awk 的方言">
+本课沙箱装的是 gawk（GNU awk），功能最全；很多容器里是 busybox/mawk 的精简实现，本章用到的特性（-F、NR/NF、BEGIN/END、关联数组、printf）属于 POSIX 核心子集，任何实现都支持，可放心通用。
+</Callout>
+
+## 小结
+
+- 模型：`awk '模式 {动作}'`，逐行切列，`$1..$NF` 取字段，`$0` 整行
+- `-F` 定分隔符处理 CSV/passwd；`NR` 行号、`NF` 列数
+- 模式支持正则与数值比较：`$4 == 200`、`$5 > 1000`、`&&` 组合
+- 统计三板斧：变量累加 + `END` 汇总；分组用关联数组 `arr[$1]++`
+- `for (k in arr)` 遍历输出，排序交给管道下游的 sort
+- 下一章：管道与重定向——把这些工具串成流水线 →
+
+<Callout type="exercise" title="练习">
+1. 用本章 users.csv：输出所有 eng 部门的成员名；计算全公司平均工资；找出工资最高的人。
+2. 对 access.log 统计"每个 URL 的访问次数"，并用 sort 按次数从高到低输出前 3 名。
+3. 用 `awk -F:` 处理 /etc/passwd：输出 UID 大于等于 100 的用户名和登录 Shell，并统计每种 Shell 各有几个用户。
+4. 挑战：一条 awk 命令同时输出——总请求数、错误数（状态码大于等于 400）、错误率百分比（printf 保留 1 位小数）。
+</Callout>

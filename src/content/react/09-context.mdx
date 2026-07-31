@@ -1,0 +1,469 @@
+---
+title: Context 与跨层级传递
+order: 9
+description: createContext 的用法、Provider 的性能陷阱与拆分技巧、自定义 Hook 封装模式，以及 Context 不适合做什么
+---
+
+# Context 与跨层级传递
+
+第 3 章说过，大部分「层层透传」问题可以用组合解决。但有些数据确实需要被树中任意深度的组件访问——主题、当前登录用户、语言设置、路由信息。Context 就是为这类数据设计的。
+
+它也是最容易被误用成「全局状态管理器」的 API。这一章讲清楚它的能力边界。
+
+## 1. 基本用法
+
+### 1.1 三步走
+
+```tsx
+// 1. 创建 —— 参数是「没有 Provider 时的默认值」
+const ThemeContext = createContext<Theme>("light");
+
+// 2. 提供
+function App() {
+  const [theme, setTheme] = useState<Theme>("light");
+  return (
+    <ThemeContext.Provider value={theme}>
+      <Layout />
+    </ThemeContext.Provider>
+  );
+}
+
+// 3. 消费 —— 任意深度的后代都能读到
+function DeepButton() {
+  const theme = useContext(ThemeContext);
+  return <button className={"btn-" + theme}>点击</button>;
+}
+```
+
+React 19 起，`Context` 本身可以直接当 Provider 用：`<ThemeContext value={theme}>`，不再需要 `.Provider`。
+
+### 1.2 查找规则
+
+`useContext` 会从当前组件**向上**查找最近的一个对应 Provider，用它的 value。找不到任何 Provider 时，才使用 `createContext` 的默认值。
+
+这意味着 Context 可以嵌套覆盖：
+
+```tsx
+<ThemeContext.Provider value="dark">
+  <Sidebar />                      {/* 读到 dark */}
+  <ThemeContext.Provider value="light">
+    <Modal />                      {/* 读到 light */}
+  </ThemeContext.Provider>
+</ThemeContext.Provider>
+```
+
+这个特性在「局部反色区域」「表单嵌套」这类场景很有用。
+
+### 1.3 默认值的正确用法
+
+很多人给默认值传一个假数据，导致「忘记包 Provider」时组件不报错，只是行为诡异。更好的做法是让默认值明确表示「没有 Provider」：
+
+```tsx
+type AuthValue = {
+  user: User | null;
+  login: (c: Credentials) => Promise<void>;
+  logout: () => void;
+};
+
+// 默认值为 null，配合下面的自定义 Hook 强制报错
+const AuthContext = createContext<AuthValue | null>(null);
+
+export function useAuth(): AuthValue {
+  const ctx = useContext(AuthContext);
+  if (ctx === null) {
+    throw new Error("useAuth 必须在 AuthProvider 内部使用");
+  }
+  return ctx;
+}
+```
+
+这个模式有三个好处：**类型收窄**（消费方拿到的不再是可能为 null 的类型）、**错误明确**（忘记包 Provider 时报错信息一目了然）、**封装**（外部只导出 Hook，不导出 Context 本身，实现可以随时替换）。
+
+## 2. Provider 的组织
+
+### 2.1 把 Provider 封装成组件
+
+不要让 App 里堆满 state 和 Provider，把每个 Context 的逻辑封装在自己的文件里：
+
+```tsx
+// theme-context.tsx
+type ThemeValue = {
+  theme: Theme;
+  toggle: () => void;
+};
+
+const ThemeContext = createContext<ThemeValue | null>(null);
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setTheme] = useState<Theme>(() => readStoredTheme());
+
+  const toggle = useCallback(() => {
+    setTheme((t) => (t === "light" ? "dark" : "light"));
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("theme", theme);
+  }, [theme]);
+
+  const value = useMemo(() => ({ theme, toggle }), [theme, toggle]);
+
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
+}
+
+export function useTheme() {
+  const ctx = useContext(ThemeContext);
+  if (!ctx) throw new Error("useTheme 必须在 ThemeProvider 内");
+  return ctx;
+}
+```
+
+App 里就只剩下嵌套：
+
+```tsx
+<ThemeProvider>
+  <AuthProvider>
+    <RouterProvider router={router} />
+  </AuthProvider>
+</ThemeProvider>
+```
+
+### 2.2 Provider 嵌套过深的处理
+
+五六个 Provider 叠起来会形成金字塔。可以写一个组合工具：
+
+```tsx
+function compose(providers: React.ComponentType<{ children: React.ReactNode }>[]) {
+  return function Composed({ children }: { children: React.ReactNode }) {
+    return providers.reduceRight(
+      (acc, Provider) => <Provider>{acc}</Provider>,
+      children as React.ReactElement
+    );
+  };
+}
+
+const AppProviders = compose([ThemeProvider, AuthProvider, I18nProvider, ToastProvider]);
+```
+
+不过说实话，直接嵌套的可读性更好——你能一眼看出顺序（内层能用外层的东西，反之不行）。只有 Provider 数量真的失控时才值得抽象。
+
+## 3. 性能陷阱
+
+这是 Context 最需要小心的部分。
+
+### 3.1 value 是新对象导致全员重渲染
+
+```tsx
+// 有问题的写法
+function AuthProvider({ children }: Props) {
+  const [user, setUser] = useState<User | null>(null);
+
+  // 每次 AuthProvider 渲染，这个对象都是新的
+  return (
+    <AuthContext.Provider value={{ user, login, logout }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+```
+
+**所有 `useContext(AuthContext)` 的组件都会重新渲染**，哪怕 user 根本没变。因为 Context 的变化检测也是 `Object.is` 比较，新对象永远不等于旧对象。
+
+修复：用 `useMemo` 稳定 value，用 `useCallback` 稳定里面的函数。
+
+```tsx
+const login = useCallback(async (c: Credentials) => { /* ... */ }, []);
+const logout = useCallback(() => setUser(null), []);
+const value = useMemo(() => ({ user, login, logout }), [user, login, logout]);
+```
+
+### 3.2 消费方无法「只订阅一部分」
+
+即使 value 被 memo 了，只要 value 变了，**所有消费者都会重渲染**，不管它们实际用到了哪个字段。
+
+```tsx
+const value = useMemo(() => ({ user, theme, locale }), [user, theme, locale]);
+// theme 一变，只用 user 的组件也会重渲染
+```
+
+React 没有提供「只订阅 value 的某个字段」的 API（社区提案 `useContextSelector` 至今未进入正式版）。
+
+### 3.3 解法：按变化频率拆分 Context
+
+这是最有效也最简单的方案：
+
+```tsx
+// 拆成两个：状态（会变）和操作（永远不变）
+const TodoStateContext = createContext<Todo[] | null>(null);
+const TodoActionsContext = createContext<Actions | null>(null);
+
+function TodoProvider({ children }: Props) {
+  const [todos, setTodos] = useState<Todo[]>([]);
+
+  // actions 用 useMemo + 函数式更新，依赖为空 —— 引用永远不变
+  const actions = useMemo(
+    () => ({
+      add: (title: string) =>
+        setTodos((prev) => [...prev, { id: uid(), title, done: false }]),
+      toggle: (id: string) =>
+        setTodos((prev) =>
+          prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t))
+        ),
+    }),
+    []
+  );
+
+  return (
+    <TodoActionsContext.Provider value={actions}>
+      <TodoStateContext.Provider value={todos}>
+        {children}
+      </TodoStateContext.Provider>
+    </TodoActionsContext.Provider>
+  );
+}
+```
+
+现在「只需要派发操作」的组件（比如一个添加按钮）订阅 `TodoActionsContext`，它的 value 永远不变，**这个按钮永远不会因为列表变化而重渲染**。
+
+这个「state / dispatch 分离」模式配合 `useReducer` 尤其自然，第 10 章会再提到。
+
+### 3.4 解法：把消费下沉
+
+另一个思路是缩小受影响的范围：
+
+```tsx
+// 不好：在顶层读，导致整棵树重渲染
+function Page() {
+  const { theme } = useTheme();
+  return (
+    <div className={theme}>
+      <HugeTree />
+    </div>
+  );
+}
+
+// 好：只让真正用到的叶子组件读
+function Page() {
+  return (
+    <ThemedWrapper>
+      <HugeTree />
+    </ThemedWrapper>
+  );
+}
+
+function ThemedWrapper({ children }: { children: React.ReactNode }) {
+  const { theme } = useTheme();
+  return <div className={theme}>{children}</div>;
+}
+```
+
+关键在于 `children` 是从上层传进来的元素，`ThemedWrapper` 重渲染时 `children` 的引用没变，React 会跳过整棵子树的重渲染。这个技巧值得记住。
+
+<Callout type="tip" title="先测量再优化">
+上面这些优化不要预防性地全部套用。Context 重渲染的实际成本取决于消费者的数量和渲染开销。
+
+先用 React DevTools Profiler 打开「Highlight updates」，看看到底哪些组件在无谓地重渲染，再针对性处理。第 12 章会讲怎么用 Profiler。
+</Callout>
+
+## 4. Context 适合放什么
+
+### 4.1 合适的场景
+
+| 数据 | 特点 |
+|---|---|
+| 主题 / 暗色模式 | 全局、变化极少 |
+| 当前用户与权限 | 全局、变化极少 |
+| 语言与本地化 | 全局、变化极少 |
+| 路由信息 | 全局、由路由库提供 |
+| 组件族内部通信（Tabs、Accordion） | 局部、避免透传 |
+| 依赖注入（把 service 传下去） | 全局、引用不变 |
+
+共同特征：**读多写少，或者作用域明确**。
+
+### 4.2 组件族内部通信
+
+这是被低估的用法。实现 `Tabs` 这类复合组件时，Context 让子组件之间不需要显式传参：
+
+```tsx
+const TabsContext = createContext<TabsValue | null>(null);
+
+function Tabs({ defaultValue, children }: TabsProps) {
+  const [active, setActive] = useState(defaultValue);
+  const value = useMemo(() => ({ active, setActive }), [active]);
+  return <TabsContext.Provider value={value}>{children}</TabsContext.Provider>;
+}
+
+function Tab({ value, children }: TabProps) {
+  const ctx = useContext(TabsContext)!;
+  return (
+    <button
+      className={ctx.active === value ? "active" : ""}
+      onClick={() => ctx.setActive(value)}
+    >
+      {children}
+    </button>
+  );
+}
+
+function TabPanel({ value, children }: TabProps) {
+  const ctx = useContext(TabsContext)!;
+  return ctx.active === value ? <div>{children}</div> : null;
+}
+
+// 使用方完全不需要管状态
+<Tabs defaultValue="a">
+  <Tab value="a">概览</Tab>
+  <Tab value="b">明细</Tab>
+  <TabPanel value="a">…</TabPanel>
+  <TabPanel value="b">…</TabPanel>
+</Tabs>
+```
+
+这个 Context 的作用域被限制在一组 Tabs 内，多个 Tabs 实例互不干扰——因为每个 `Tabs` 都是独立的 Provider。
+
+### 4.3 不合适的场景
+
+**高频变化的数据。** 鼠标位置、滚动位置、输入框内容、动画进度放进 Context，会让所有消费者以极高频率重渲染。
+
+**大型可变应用状态。** 一个包含几十个字段、被上百个组件读写的对象。Context 没有选择性订阅，也没有中间件、时间旅行调试、持久化这些能力。这是 Zustand / Redux 的领域（第 15 章）。
+
+**服务端数据缓存。** 用 Context 存接口数据，你就得自己实现缓存失效、重新请求、竞态处理、乐观更新。这是 TanStack Query 的领域（第 16 章）。
+
+<Callout type="warn" title="Context 不是状态管理库">
+Context 只做一件事：**把一个值广播给子树**。它不管理状态（状态是 `useState`/`useReducer` 管的），不做选择性订阅，不提供任何优化手段。
+
+「用 Context 替代 Redux」这个说法只在很小的应用里成立。数据量和更新频率上去以后，你会一步步把状态管理库的功能全部手写一遍——这时候不如直接用库。
+</Callout>
+
+## 5. 完整示例：带持久化的认证 Context
+
+```tsx
+type AuthState =
+  | { status: "loading" }
+  | { status: "anonymous" }
+  | { status: "authed"; user: User };
+
+type AuthValue = AuthState & {
+  login: (c: Credentials) => Promise<void>;
+  logout: () => void;
+};
+
+const AuthContext = createContext<AuthValue | null>(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [state, setState] = useState<AuthState>({ status: "loading" });
+
+  // 启动时用本地 token 恢复会话
+  useEffect(() => {
+    let ignore = false;
+    const token = localStorage.getItem("token");
+
+    if (!token) {
+      setState({ status: "anonymous" });
+      return;
+    }
+
+    api
+      .me(token)
+      .then((user) => {
+        if (!ignore) setState({ status: "authed", user });
+      })
+      .catch(() => {
+        if (!ignore) setState({ status: "anonymous" });
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  const login = useCallback(async (c: Credentials) => {
+    const { token, user } = await api.login(c);
+    localStorage.setItem("token", token);
+    setState({ status: "authed", user });
+  }, []);
+
+  const logout = useCallback(() => {
+    localStorage.removeItem("token");
+    setState({ status: "anonymous" });
+  }, []);
+
+  const value = useMemo(
+    () => ({ ...state, login, logout }),
+    [state, login, logout]
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth 必须在 AuthProvider 内");
+  return ctx;
+}
+```
+
+用**可辨识联合**表示三种状态，消费方就不可能出现「已登录但 user 是 null」这种非法组合：
+
+```tsx
+function Header() {
+  const auth = useAuth();
+
+  if (auth.status === "loading") return <Skeleton />;
+  if (auth.status === "anonymous") return <LoginButton onClick={...} />;
+
+  // 这里 TS 知道 auth.user 一定存在
+  return <Avatar user={auth.user} onLogout={auth.logout} />;
+}
+```
+
+<Callout type="exercise" title="练习 1：判断该不该用 Context">
+下面几种数据，判断该用 props、组合、Context 还是状态管理库：
+
+1. 一个弹窗的开关状态，只有父子两层
+2. 全站的「是否折叠侧边栏」
+3. 一个 Table 组件内部的「选中行 id 集合」，需要被表头全选框和每一行读取
+4. 购物车内容，被导航栏角标、购物车页、商品页三处使用
+5. 一个画布应用中鼠标的实时坐标
+</Callout>
+
+<Callout type="exercise" title="练习 2：修复性能问题">
+```tsx
+function AppProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [cart, setCart] = useState([]);
+  const [toast, setToast] = useState(null);
+
+  return (
+    <AppContext.Provider value={{ user, setUser, cart, setCart, toast, setToast }}>
+      {children}
+    </AppContext.Provider>
+  );
+}
+```
+这个 Provider 有两类问题。指出它们，并给出重构方案（提示：既要 memo，也要拆分）。重构后说明「显示 toast」时会有哪些组件重渲染。
+</Callout>
+
+<Callout type="exercise" title="练习 3：实现 Accordion">
+用 Context 实现一个手风琴组件族：`Accordion`（可配置是否允许同时展开多项）、`AccordionItem`、`AccordionHeader`、`AccordionPanel`。
+
+要求：`AccordionItem` 通过 Context 把自己的 id 传给内部的 Header 和 Panel（提示：需要两层 Context，一层给整个 Accordion，一层给每个 Item）。
+</Callout>
+
+<Callout type="exercise" title="练习 4：children 优化验证">
+写两个版本的组件：A 版本在顶层组件里 useContext 然后渲染一棵大树；B 版本把 useContext 下沉到一个包裹组件，大树通过 children 传入。
+
+在两个版本的子树组件里加 `console.log`，触发 Context 更新，对比打印次数。解释为什么 B 版本的子树不重渲染。
+</Callout>
+
+## 小结
+
+- Context 解决的是**跨层级广播一个值**，不是状态管理
+- 默认值设为 `null` + 自定义 Hook 抛错，能同时获得类型收窄和明确的错误提示
+- 把 Provider 封装成独立组件，只对外导出 Hook，不导出 Context 本身
+- **性能陷阱一**：value 是新对象 → 用 `useMemo` 稳定
+- **性能陷阱二**：所有消费者一起重渲染，无法只订阅一部分 → 按变化频率**拆分 Context**（state 与 actions 分离）
+- 把 `useContext` 下沉到叶子，或用 `children` 传递不变的子树，能大幅缩小重渲染范围
+- 适合：主题、用户、语言、路由、组件族内部通信
+- 不适合：高频变化的值、大型可变状态、服务端数据缓存
+- 下一章讲 useReducer，它和 Context 是天生一对 →

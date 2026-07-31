@@ -1,0 +1,209 @@
+---
+title: HTTP/3 与 QUIC：在 UDP 上重建世界
+order: 14
+description: 为什么抛弃 TCP、QUIC 用户态可靠传输、0-RTT、连接 ID 与连接迁移
+---
+
+# HTTP/3 与 QUIC：在 UDP 上重建世界
+
+第 13 章的结尾判了 TCP 死刑缓期执行：队头阻塞长在内核协议栈里，改不动（全球中间设备只认 TCP/UDP，新传输协议根本过不了防火墙——"协议僵化"）。Google 的解法脑洞大开：**在 UDP 上，用用户态代码重建一套更好的 TCP + TLS**。这就是 QUIC，而 HTTP/3 = HTTP over QUIC（RFC 9114）。
+
+<Callout type="info" title="本章实验说明">
+沙箱内无 HTTP/3 客户端与外网，无法发起真实 h3 请求。但 QUIC 的地基——UDP——python 完全可以操作。我们将在 UDP 上亲手实现"确认与重传"玩具版，体会 QUIC 做了什么；真实握手与帧格式用静态图讲解。
+</Callout>
+
+## 1. 地基：UDP 有多"裸"
+
+UDP 只做一件事：把数据报从一个端口扔到另一个端口。不握手、不确认、不重传、不排序：
+
+<Playground
+  language="http"
+  title="UDP：不握手，发了就走"
+  id="http-14-1"
+  code={`python3 -c '
+import socket, threading, time
+
+def server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 9000))
+    while True:
+        data, addr = s.recvfrom(2048)
+        # 原样回显，并报告对方地址（注意端口）
+        s.sendto(b"echo: " + data + b" (from " + str(addr[1]).encode() + b")", addr)
+
+threading.Thread(target=server, daemon=True).start()
+time.sleep(0.2)
+
+cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+t0 = time.time()
+cli.sendto(b"hello-udp", ("127.0.0.1", 9000))   # 没有任何握手，直接发
+print(cli.recvfrom(2048)[0].decode())
+print("首包往返耗时:", round((time.time() - t0) * 1000, 2), "ms —— 0 次握手")
+
+# 对无人监听的端口发 UDP：不报错，数据静默消失
+cli.sendto(b"into the void", ("127.0.0.1", 9999))
+print("发往无人端口: sendto 正常返回，包丢了也没人告诉你")
+'`}
+/>
+
+对比第 3 章：TCP 发第一个字节前要 1-RTT 握手；UDP 第一个包就是数据。但代价是丢包、乱序、重复全都要**应用自己处理**——QUIC 接下了这全部脏活。
+
+## 2. 在 UDP 上重建可靠传输
+
+QUIC 在用户态实现了 TCP 的全套本领：包编号、ACK 确认、超时重传、拥塞控制、流量控制。写一个最小玩具版，直观感受"可靠性是怎么用不可靠的砖头砌出来的"：
+
+<Playground
+  language="http"
+  title="玩具版 QUIC：编号 + ACK + 重传"
+  id="http-14-2"
+  code={`python3 -c '
+import socket, threading, time, random
+
+random.seed(7)
+received = {}
+
+def server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 9001))
+    while True:
+        data, addr = s.recvfrom(2048)
+        seq, payload = data.split(b"|", 1)
+        # 模拟 30% 丢包：假装没收到，不回 ACK
+        if random.random() < 0.3:
+            print("  [网络] 丢弃了包", seq.decode())
+            continue
+        received[int(seq)] = payload
+        s.sendto(b"ACK|" + seq, addr)     # 收到就确认
+
+threading.Thread(target=server, daemon=True).start()
+time.sleep(0.2)
+
+cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+cli.settimeout(0.3)                        # 超时时间（真实协议动态估算 RTT）
+
+chunks = [b"GET /index", b".html HTTP", b"/3-style!"]
+for seq, chunk in enumerate(chunks):
+    attempt = 0
+    while True:
+        attempt += 1
+        cli.sendto(str(seq).encode() + b"|" + chunk, ("127.0.0.1", 9001))
+        try:
+            ack = cli.recvfrom(2048)[0]
+            print("包", seq, "第", attempt, "次发送后收到", ack.decode())
+            break
+        except socket.timeout:
+            print("包", seq, "超时，重传...")
+
+time.sleep(0.2)
+print("服务端按序重组:", b"".join(received[i] for i in sorted(received)).decode())
+'`}
+/>
+
+丢包被超时检测出来并重传，最终按序重组——TCP 内核里发生的事，就这样搬到了用户态。**搬到用户态的巨大意义：迭代速度**。TCP 改进要等全球操作系统内核升级（十年计），QUIC 改进只需应用/浏览器发个版（几周计）。
+
+## 3. QUIC 的四大王牌
+
+### 3.1 流级独立：真正告别队头阻塞
+
+QUIC 原生支持多流，且**每条流独立编号、独立重传**：
+
+```text
+HTTP/2 over TCP:  流A包丢 → TCP 卡住整条字节流 → 流B流C全部罚站
+HTTP/3 over QUIC: 流A包丢 → 只有流A等重传   → 流B流C照常交付
+```
+
+### 3.2 握手合并：1-RTT 与 0-RTT
+
+TCP + TLS 1.3 首次连接要 2-RTT（握手 1 + TLS 1）。QUIC 把**传输握手和 TLS 1.3 握手合并成同一趟往返**：
+
+```text
+首次连接:  1-RTT 后即可发 HTTP 请求（内置 TLS 1.3，加密不可选）
+再次连接:  0-RTT —— 第一个 UDP 包里就带着加密的 HTTP 请求
+           （与 TLS 1.3 0-RTT 同款重放风险，只许幂等请求）
+```
+
+### 3.3 连接 ID：换网络不断线
+
+TCP 连接由四元组（源 IP、源端口、目的 IP、目的端口）定义——手机从 Wi-Fi 切到 5G，IP 变了，所有 TCP 连接尸骨无存，页面里的请求全部重来。
+
+QUIC 用**连接 ID**（一串随机字节）标识连接，与 IP/端口解耦。换网络后，客户端用新地址继续发同一个连接 ID 的包，服务器验证后无缝续传——**连接迁移**。用实验演示"标识连接的两种方式"：
+
+<Playground
+  language="http"
+  title="四元组标识 vs 连接 ID 标识"
+  id="http-14-3"
+  code={`python3 -c '
+import socket, threading, time
+
+# 服务器：按"连接ID"（载荷前8字节）识别会话，而不是按来源地址
+sessions = {}
+
+def server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 9002))
+    while True:
+        data, addr = s.recvfrom(2048)
+        cid, msg = data[:8], data[8:]
+        if cid not in sessions:
+            sessions[cid] = {"count": 0}
+        sessions[cid]["count"] += 1
+        reply = ("会话 " + cid.decode() + " 第 " + str(sessions[cid]["count"]) +
+                 " 个包，来自端口 " + str(addr[1])).encode()
+        s.sendto(reply, addr)
+
+threading.Thread(target=server, daemon=True).start()
+time.sleep(0.2)
+
+CID = b"cid-7f3a"
+
+# 客户端用第一个 socket（端口A）发两个包
+c1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+c1.sendto(CID + b"hello", ("127.0.0.1", 9002))
+print(c1.recvfrom(2048)[0].decode())
+c1.sendto(CID + b"again", ("127.0.0.1", 9002))
+print(c1.recvfrom(2048)[0].decode())
+
+# 模拟切换网络：换一个全新 socket（源端口变了 = 四元组变了）
+c2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+c2.sendto(CID + b"after-network-switch", ("127.0.0.1", 9002))
+print(c2.recvfrom(2048)[0].decode(), "<- 端口变了，会话计数却连续！")
+'`}
+/>
+
+第三个包来自全新的源端口（模拟切网），但服务器凭连接 ID 认出"还是那个会话"，计数连续——这就是刷着视频从家走到地铁不卡顿的原理。
+
+### 3.4 全加密
+
+QUIC 把包头中除必要路由字段外的一切都加密了（连包编号都加密）。中间设备看不见摸不着，从根上杜绝了"运营商中间盒子篡改/优化 TCP 导致的诡异故障"，也保住了协议未来的演进自由。
+
+## 4. HTTP/3 概览与落地
+
+HTTP/3 = HTTP 语义映射到 QUIC 流：每个请求-响应占一条 QUIC 流；头部压缩换成 **QPACK**（HPACK 的改造版，解决动态表更新与乱序交付的冲突）。
+
+发现机制：服务器在 HTTP/1.1 或 h2 的响应里加 `Alt-Svc: h3=":443"` 头，浏览器下次尝试 h3，失败则回落——**h3 部署必须保留 TCP 回落**（约 3-5% 网络封 UDP 443）。
+
+| 关注点 | 现状 |
+|---|---|
+| 浏览器支持 | Chrome/Firefox/Safari 全支持 |
+| 服务器 | Nginx 1.25+（quic 监听）、Caddy 默认开启、各大 CDN 均支持 |
+| CPU 开销 | 用户态收发 UDP 比内核 TCP 更耗 CPU（内核 offload 生态还在补课） |
+| 收益场景 | 弱网/高丢包、移动网络切换、长肥管道首包时间 |
+
+<Callout type="tip" title="三代协议一句话总结">
+HTTP/1.1：一条连接一次一个请求（队头阻塞在应用层）；HTTP/2：一条 TCP 多路复用（队头阻塞退到 TCP 层）；HTTP/3：QUIC 流级独立（队头阻塞被消灭），外加 0/1-RTT 握手与连接迁移。
+</Callout>
+
+## 小结
+
+- TCP 无法演进（内核 + 中间设备僵化），QUIC 在 UDP 上用用户态代码重建可靠传输；
+- 可靠性三件套：包编号、ACK、超时重传——本章玩具版亲手实现了一遍；
+- QUIC 流级独立重传，彻底消灭队头阻塞；握手与 TLS 1.3 合并，首连 1-RTT、复连 0-RTT；
+- 连接 ID 取代四元组标识连接，换网络不断线（连接迁移）；
+- HTTP/3 经 Alt-Svc 发现、QPACK 压头，部署必须保留 TCP 回落。
+
+<Callout type="exercise" title="练习">
+1. 修改 Playground 2：把丢包率调到 60%，观察重传次数变化；再把超时从 0.3s 改成 0.05s，会出现什么新现象（提示：ACK 还在路上就重传了）？
+2. 给 Playground 2 增加"乱序到达"处理：服务端收到 seq=2 而 0、1 未到时，如何缓存与等待？
+3. 在 Playground 3 中再加一个不同的连接 ID，验证服务器能同时维护两个独立会话。
+4. 排障题：公司防火墙封了 UDP 443，用户访问启用 h3 的站点会发生什么？浏览器靠什么机制保证可用性？
+</Callout>

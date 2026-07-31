@@ -1,0 +1,316 @@
+---
+title: 提交历史：log、show、blame 与提交信息规范
+order: 3
+description: git log 的各种姿势、定位一行代码的来历、写出可被检索的提交信息
+---
+
+# 提交历史：log、show、blame 与提交信息规范
+
+提交历史是团队最重要的技术文档之一——前提是它写得像文档。这一章分两半：前半是**怎么读**历史，后半是**怎么写**才值得被读。
+
+## 1. git log 的各种姿势
+
+裸的 `git log` 输出很啰嗦，每个提交占五六行。真正日常用的是各种参数组合：
+
+<Playground
+  language="git"
+  title="log 的常用格式"
+  id="git-03-1"
+  code={`git init -q
+for m in "feat: 初始化项目骨架" "feat(auth): 增加登录接口" "fix(auth): 修复 token 过期判断" "docs: 补充 README" "refactor: 抽取公共校验函数"; do
+  echo "$m" >> log.txt
+  git add . && git commit -q -m "$m"
+done
+
+echo '===== git log --oneline：一行一个提交 ====='
+git log --oneline
+echo
+
+echo '===== 加上 --graph --decorate：拓扑图 + 分支标签 ====='
+git log --oneline --graph --decorate
+echo
+
+echo '===== --pretty=format 自定义输出 ====='
+git log -3 --pretty=format:'%h | %an | %ar | %s'
+echo
+echo
+
+echo '===== --stat：附带文件改动统计 ====='
+git log --stat -1`}
+/>
+
+### 1.1 输出格式参数
+
+| 参数 | 作用 |
+|---|---|
+| `--oneline` | 每个提交压缩成一行（短哈希 + 标题） |
+| `--graph` | 用 ASCII 字符画出分支拓扑 |
+| `--decorate` | 显示分支名、tag 等引用（新版 Git 默认开启） |
+| `--all` | 显示所有分支，而不只是当前分支 |
+| `--stat` | 附带每个提交改了哪些文件、增删多少行 |
+| `-p` / `--patch` | 显示每个提交的完整 diff |
+| `-n` / `-3` | 只看最近 n 条 |
+| `--reverse` | 从旧到新排列 |
+
+最值得配成别名的组合：
+
+```bash
+git config --global alias.lg "log --oneline --graph --decorate --all"
+```
+
+### 1.2 --pretty=format 的占位符
+
+| 占位符 | 含义 | 占位符 | 含义 |
+|---|---|---|---|
+| `%H` | 完整哈希 | `%h` | 短哈希 |
+| `%an` | 作者名 | `%ae` | 作者邮箱 |
+| `%ad` | 作者日期 | `%ar` | 相对日期（3 days ago） |
+| `%cn` | 提交者名 | `%cr` | 提交者相对日期 |
+| `%s` | 提交标题（首行） | `%b` | 提交正文 |
+| `%d` | 引用装饰（分支/tag） | `%p` | 父提交短哈希 |
+
+<Callout type="info" title="作者 vs 提交者">
+Git 区分 **author**（写代码的人）和 **committer**（把提交放进历史的人）。正常提交两者相同；但当你 `rebase`、`cherry-pick` 或应用别人的补丁时，author 保持原作者，committer 变成你。这是为什么 `git log` 默认只显示 Author，而在 rebase 之后 `%cr` 会全部变成"刚刚"。
+</Callout>
+
+### 1.3 筛选历史
+
+真实项目有几万个提交，能筛选才有意义：
+
+<Playground
+  language="git"
+  title="按文件、信息、代码内容筛选历史"
+  id="git-03-2"
+  code={`git init -q
+echo 'def login(): pass' > auth.py
+git add . && git commit -q -m "feat(auth): 增加登录函数"
+echo 'MAX_RETRY = 3' > config.py
+git add . && git commit -q -m "feat: 增加配置文件"
+echo 'def login(): return True' > auth.py
+git add . && git commit -q -m "fix(auth): 登录返回值修正"
+echo 'MAX_RETRY = 5' > config.py
+git add . && git commit -q -m "chore: 调整重试次数"
+
+echo '===== 只看某个文件的历史（注意 -- 分隔符）====='
+git log --oneline -- auth.py
+echo
+
+echo '===== 按提交信息搜索：--grep ====='
+git log --oneline --grep='auth'
+echo
+
+echo '===== 按代码内容搜索：-S 找出增删了 MAX_RETRY 的提交 ====='
+git log --oneline -S 'MAX_RETRY'
+echo
+
+echo '===== git show：看某个提交的详情 ====='
+git show --stat HEAD
+echo
+
+echo '===== 相对引用：HEAD~n ====='
+echo "HEAD    -> $(git log -1 --format=%s HEAD)"
+echo "HEAD~1  -> $(git log -1 --format=%s HEAD~1)"
+echo "HEAD~3  -> $(git log -1 --format=%s HEAD~3)"`}
+/>
+
+| 筛选方式 | 命令 |
+|---|---|
+| 某个文件/目录 | `git log -- src/auth.py` |
+| 提交信息含关键字 | `git log --grep='fix'` |
+| 某人的提交 | `git log --author='Alice'` |
+| 时间范围 | `git log --since='2 weeks ago' --until='2026-07-01'` |
+| **代码内容变化** | `git log -S 'MAX_RETRY'` |
+| 代码内容正则 | `git log -G 'MAX_RETRY\s*='` |
+| 排除合并提交 | `git log --no-merges` |
+| 两个分支的差集 | `git log main..feature` |
+
+<Callout type="tip" title="-S 是排查问题的核武器">
+`git log -S 'someFunction'` 会找出**所有增加或删除了这个字符串的提交**（术语叫 pickaxe search）。当你面对"这个配置项什么时候被谁删掉的"这类问题时，`-S` 比翻遍所有提交快一万倍。加上 `-p` 还能直接看到当时的 diff：`git log -S 'someFunction' -p`。
+</Callout>
+
+### 1.4 提交的多种指定方式
+
+| 写法 | 含义 |
+|---|---|
+| `41a4d7e` | 短哈希（前 7 位通常就够唯一） |
+| `HEAD` | 当前所在的提交 |
+| `HEAD~1` / `HEAD~` | 上一个提交 |
+| `HEAD~3` | 往上数 3 个提交 |
+| `HEAD^` | 第一个父提交（等价于 `HEAD~1`） |
+| `HEAD^2` | **第二个**父提交（只有合并提交才有） |
+| `main` | 分支 main 指向的提交 |
+| `v1.0` | tag 指向的提交 |
+| `main..feature` | 在 feature 上但不在 main 上的提交 |
+
+`~` 和 `^` 的区别在合并提交处才显现：`~` 是"沿第一父线往上走 n 步"，`^n` 是"选第 n 个父亲"。日常 99% 的场景用 `~` 就够。
+
+## 2. git show：看单个提交
+
+```bash
+git show               # 最新提交的完整 diff
+git show HEAD~2        # 往前第 2 个提交
+git show abc1234       # 指定哈希
+git show --stat HEAD   # 只看文件统计
+git show HEAD:src/a.py # 看某个提交时刻的文件全文（不是 diff！）
+```
+
+最后一条很实用：`git show <commit>:<path>` 直接打印那个时间点的文件内容，不用切分支、不用改工作区。
+
+## 3. git blame：定位一行代码的来历
+
+`git blame` 逐行标注：这行是谁、在哪个提交、什么时候写的。
+
+<Playground
+  language="git"
+  title="blame 定位每一行的出处"
+  id="git-03-3"
+  code={`git init -q
+echo 'a = 1' > calc.py
+echo 'b = 2' >> calc.py
+git add . && git commit -q -m "feat: 初始变量"
+
+echo 'a = 1' > calc.py
+echo 'b = 20' >> calc.py
+echo 'c = a + b' >> calc.py
+git add . && git commit -q -m "fix: 修正 b 的值并增加求和"
+
+echo '===== git blame：每一行的提交 / 作者 / 时间 ====='
+git blame calc.py
+echo
+
+echo '===== -L 2,3 只看第 2-3 行 ====='
+git blame -L 2,3 calc.py
+echo
+
+echo '===== 拿到提交号后用 git show 追完整上下文 ====='
+SHA=$(git blame -L 2,2 --porcelain calc.py | head -1 | cut -d' ' -f1)
+echo "第 2 行来自提交 $SHA"
+git show --oneline --stat $SHA | head -5`}
+/>
+
+输出格式：`^31662b4 (learner 2026-07-31 10:55:07 +0800 1) a = 1`。开头的 `^` 表示这行来自仓库的**初始提交**（边界提交）。
+
+`blame` 的常用参数：
+
+| 参数 | 作用 |
+|---|---|
+| `-L 10,20` | 只看第 10-20 行 |
+| `-L :funcName` | 只看某个函数（需语言支持） |
+| `-w` | 忽略空白字符改动（避免格式化提交污染结果） |
+| `-C` | 追踪从其他文件复制过来的代码 |
+| `<commit>` | 从某个历史时点往回 blame |
+
+<Callout type="warn" title="blame 会被格式化提交污染">
+如果有人做过一次全项目 Prettier 格式化，`git blame` 会把所有行都归到那次提交上，完全失去意义。解决办法：把格式化提交的哈希写进 `.git-blame-ignore-revs` 文件，然后配置 `git config blame.ignoreRevsFile .git-blame-ignore-revs`。GitHub 也支持这个文件。
+</Callout>
+
+真实排查流程通常是三级跳：
+
+```text
+git blame file.py -L 42,42     -> 拿到提交哈希
+git show <hash>                -> 看这次改动的完整上下文
+git log -1 <hash>              -> 读提交信息，找到关联的 issue / PR 号
+```
+
+## 4. 写出值得被读的提交信息
+
+上面所有工具的威力，都建立在**提交信息本身有信息量**的前提上。`git log --grep='auth'` 能起作用，是因为有人在提交信息里写了 auth。
+
+### 4.1 基本格式
+
+```text
+<type>(<scope>): <subject>
+                              <- 空行
+<body>：为什么这么改，而不是改了什么
+                              <- 空行
+<footer>：Closes #123 / BREAKING CHANGE: ...
+```
+
+**标题行（subject）的规则：**
+
+- 不超过 50 个字符（GitHub 超过 72 会截断）
+- 用祈使句现在时："add feature" 而非 "added feature"，中文用"增加"而非"增加了"
+- 首字母小写，结尾不加句号
+- 说清"做了什么"，而不是"改了哪个文件"
+
+**正文（body）的重点是「为什么」。** 代码本身已经说明了"改了什么"，diff 里看得一清二楚。提交信息真正不可替代的价值是记录**动机和权衡**：为什么选这个方案、放弃了哪个方案、有什么已知限制。
+
+### 4.2 Conventional Commits 规范
+
+业界事实标准，也是能自动生成 CHANGELOG 的基础：
+
+| type | 用于 | 示例 |
+|---|---|---|
+| `feat` | 新功能 | `feat(auth): 支持手机号登录` |
+| `fix` | 修 bug | `fix(order): 修复金额精度丢失` |
+| `docs` | 只改文档 | `docs: 补充部署说明` |
+| `style` | 格式（不影响逻辑） | `style: 统一缩进为 2 空格` |
+| `refactor` | 重构（既不加功能也不修 bug） | `refactor: 抽取校验工具函数` |
+| `perf` | 性能优化 | `perf: 用索引替代全表扫描` |
+| `test` | 测试相关 | `test: 补充登录边界用例` |
+| `build` | 构建系统 / 依赖 | `build: 升级 webpack 到 5` |
+| `ci` | CI 配置 | `ci: 增加单测卡点` |
+| `chore` | 杂项 | `chore: 更新 .gitignore` |
+| `revert` | 回滚 | `revert: 撤销 feat(auth) 手机号登录` |
+
+一个完整例子：
+
+```text
+fix(order): 修复并发下单导致库存超卖
+
+原实现先查库存再扣减，两步之间存在竞态窗口，
+压测 200 并发时出现库存为负。
+
+改为使用 UPDATE ... WHERE stock >= n 的原子扣减，
+依赖数据库行锁保证正确性。代价是高并发下同一 SKU
+的写入会串行，实测 QPS 从 3200 降到 2800，可接受。
+
+Closes #482
+```
+
+### 4.3 反面教材
+
+| 差的提交信息 | 问题 |
+|---|---|
+| `update` | 等于没写 |
+| `fix bug` | 修的哪个 bug？ |
+| `修改了 user.py 和 order.py` | diff 已经说了，重复劳动 |
+| `临时提交，明天再改` | 这类提交应该在推送前用 rebase 整理掉（第 8 章） |
+| `.` | 见过，真的 |
+
+<Callout type="tip" title="提交模板">
+把常用格式写进模板文件，`git commit` 时自动带出来：
+
+```bash
+git config --global commit.template ~/.gitmessage
+```
+
+`~/.gitmessage` 内容可以是带注释的骨架，注释行（以 `#` 开头）在提交时会被自动剔除。
+</Callout>
+
+## 5. 一次提交应该多大
+
+经验法则：**一个提交对应一个可以用一句话说清的逻辑变更**。
+
+- 太大：`feat: 重构整个用户模块`，改了 60 个文件——出问题无法二分定位，review 也没人看得动。
+- 太小：`fix: 少了个分号`，紧接着 `fix: 再补一个分号`——历史噪音，应该合并（第 8 章的 squash）。
+- 刚好：改动集中，能独立通过测试，能独立回退。
+
+判断标准很简单：**如果这个提交需要被单独 revert，它会不会带走无关的东西，或者留下半截功能？** 如果会，说明拆分粒度不对。
+
+## 小结
+
+- `git log --oneline --graph --decorate --all` 是日常主力，值得配成别名 `git lg`
+- 筛选历史：`-- <path>` 按文件、`--grep` 按信息、`--author` 按人、`-S` 按代码内容（排查神器）
+- `git show <commit>` 看单个提交，`git show <commit>:<path>` 看某时刻的文件全文
+- `git blame -L` 定位一行代码的来历，`-w` 忽略空白改动，配合 `.git-blame-ignore-revs` 屏蔽格式化提交
+- 提交信息用 `type(scope): subject` 格式，正文写**为什么**而不是改了什么
+- 一个提交 = 一个能用一句话说清、能独立回退的逻辑变更
+- 下一章：改错了怎么办——restore / reset / revert →
+
+<Callout type="exercise" title="练习">
+1. 造一个有 5 个提交的仓库，其中两个提交的信息里含 `fix`。分别用 `--grep='fix'` 和 `--oneline -2` 查询，比较输出。
+2. 在某个提交里加入字符串 `TIMEOUT = 30`，在后面的提交里把它删掉。用 `git log -S 'TIMEOUT'` 找出这两个提交，并解释为什么中间那些提交没有被列出来。
+3. 用 `--pretty=format` 自定义一个输出：`短哈希 | 相对时间 | 标题`，并加上 `--graph`。
+4. 把下面这条差劲的提交信息改写成符合 Conventional Commits 的形式，正文要补上"为什么"：`更新了缓存代码`（背景：原来缓存永不过期导致用户改了昵称后一天都不生效，现在改成 10 分钟过期）。
+</Callout>

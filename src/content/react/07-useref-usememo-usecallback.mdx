@@ -1,0 +1,417 @@
+---
+title: useRef、useMemo 与 useCallback
+order: 7
+description: 可变引用容器、缓存计算结果与稳定函数引用，以及大多数时候你其实不需要它们
+---
+
+# useRef、useMemo 与 useCallback
+
+这三个 Hook 经常被一起讲，因为它们都和「跨渲染保持某个东西不变」有关。它们也是被滥用最多的三个 Hook——很多项目里，`useCallback` 包了一切，却没带来任何性能提升，只增加了噪音。这一章讲清楚它们各自解决什么问题，以及**什么时候不该用**。
+
+## 1. useRef：一个可变的盒子
+
+### 1.1 它是什么
+
+```tsx
+const ref = useRef(0);
+console.log(ref.current);   // 读
+ref.current = 5;            // 写
+```
+
+`useRef` 返回一个对象，这个对象在组件的整个生命周期内**始终是同一个**。你可以随意修改它的 `current` 属性，**修改不会触发重新渲染**。
+
+和 state 的对比：
+
+| | useState | useRef |
+|---|---|---|
+| 跨渲染保持 | 是 | 是 |
+| 修改触发重渲染 | 是 | 否 |
+| 渲染期间可否修改 | 否 | 否（约定上不应该） |
+| 修改后立刻可读到新值 | 否（下次渲染才更新） | 是 |
+| 适合存放 | 会影响界面的数据 | 不影响界面的数据 |
+
+判断标准很简单：**这个值变了，界面需要跟着变吗？** 需要就用 state，不需要就用 ref。
+
+### 1.2 用途一：访问 DOM 节点
+
+这是最常见的用途。把 ref 挂到 JSX 元素上，React 会在挂载后把 DOM 节点写入 `ref.current`：
+
+```tsx
+function SearchBox() {
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  function scrollToTop() {
+    inputRef.current?.scrollIntoView({ behavior: "smooth" });
+  }
+
+  return <input ref={inputRef} />;
+}
+```
+
+类型标注 `useRef<HTMLInputElement>(null)` 会得到只读的 `RefObject`，正好符合「交给 React 管理」的语义。注意 `current` 可能是 null（挂载前、卸载后），所以要用可选链。
+
+<Callout type="warn" title="不要用 ref 做本该用 state 做的事">
+用 ref 拿到 DOM 然后手动改 `textContent`、`style`、`classList`，会让 React 和你「抢着改同一个节点」。React 下次重渲染时会用它认为正确的值覆盖你的修改，产生极难排查的闪烁问题。
+
+ref 操作 DOM 的合法场景只有：聚焦、滚动、测量尺寸、播放媒体、集成第三方命令式库。**凡是能通过 state 表达的，就不要用 ref 改 DOM。**
+</Callout>
+
+### 1.3 用途二：存放不影响渲染的可变值
+
+```tsx
+function Stopwatch() {
+  const [elapsed, setElapsed] = useState(0);
+  const timerRef = useRef<number | null>(null);
+  const startAtRef = useRef(0);
+
+  function start() {
+    if (timerRef.current !== null) return;
+    startAtRef.current = Date.now() - elapsed;
+    timerRef.current = window.setInterval(() => {
+      setElapsed(Date.now() - startAtRef.current);
+    }, 100);
+  }
+
+  function stop() {
+    if (timerRef.current === null) return;
+    clearInterval(timerRef.current);
+    timerRef.current = null;
+  }
+
+  useEffect(() => stop, []);   // 卸载时清理
+
+  return (
+    <div>
+      <span>{(elapsed / 1000).toFixed(1)}s</span>
+      <button onClick={start}>开始</button>
+      <button onClick={stop}>暂停</button>
+    </div>
+  );
+}
+```
+
+`timerRef` 和 `startAtRef` 都不影响界面显示，用 ref 存放正好。如果用 state 存 timer id，每次开始/暂停都会多一次无意义的渲染。
+
+### 1.4 用途三：保存「最新值」破解闭包陷阱
+
+第 5 章的闭包陷阱，还有一种解法：
+
+```tsx
+function useLatest<T>(value: T) {
+  const ref = useRef(value);
+  ref.current = value;    // 每次渲染都更新
+  return ref;
+}
+
+function Chat({ onMessage }: { onMessage: (m: string) => void }) {
+  const latestHandler = useLatest(onMessage);
+
+  useEffect(() => {
+    const socket = connect();
+    // 用 ref 读，所以永远调用最新的 onMessage，
+    // 但 effect 的依赖数组里不需要 onMessage，连接不会被反复重建
+    socket.on("msg", (m) => latestHandler.current(m));
+    return () => socket.close();
+  }, [latestHandler]);
+
+  return null;
+}
+```
+
+这个模式（React 团队称之为 Effect Event 的雏形）能把「需要最新值」和「不想重新执行 effect」这对矛盾解开。
+
+## 2. useMemo：缓存计算结果
+
+### 2.1 基本用法
+
+```tsx
+const sorted = useMemo(() => {
+  return [...items].sort((a, b) => a.price - b.price);
+}, [items]);
+```
+
+依赖没变时直接返回上次的结果，不重新执行工厂函数。依赖比较规则和 `useEffect` 完全一样：逐位 `Object.is`。
+
+### 2.2 亲手实现一遍
+
+<Playground
+  language="typescript"
+  title="迷你 useMemo 与 useCallback"
+  id="react-07-1"
+  code={`type Deps = readonly unknown[];
+
+interface MemoSlot {
+  deps: Deps;
+  value: unknown;
+}
+
+const slots: MemoSlot[] = [];
+let cursor = 0;
+let computeCount = 0;
+
+function sameDeps(a: Deps, b: Deps): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!Object.is(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+function useMemoMini<T>(factory: () => T, deps: Deps): T {
+  const index = cursor;
+  cursor++;
+
+  const slot: MemoSlot | undefined = slots[index];
+  if (slot !== undefined && sameDeps(slot.deps, deps)) {
+    return slot.value as T;
+  }
+
+  const value = factory();
+  slots[index] = { deps: deps, value: value };
+  return value;
+}
+
+// useCallback(fn, deps) 完全等价于 useMemo(() => fn, deps)
+function useCallbackMini<T>(fn: T, deps: Deps): T {
+  return useMemoMini(function () {
+    return fn;
+  }, deps);
+}
+
+interface Item {
+  name: string;
+  price: number;
+}
+
+function expensiveSort(items: Item[]): Item[] {
+  computeCount++;
+  const copy = items.slice();
+  copy.sort(function (a, b) {
+    return a.price - b.price;
+  });
+  return copy;
+}
+
+const listA: Item[] = [
+  { name: "键盘", price: 399 },
+  { name: "鼠标", price: 129 },
+  { name: "屏幕", price: 1899 },
+];
+const listB: Item[] = [{ name: "音箱", price: 259 }];
+
+function render(items: Item[], label: string): void {
+  cursor = 0;
+
+  const sorted = useMemoMini(function () {
+    return expensiveSort(items);
+  }, [items]);
+
+  const onClick = useCallbackMini(function () {
+    return "clicked";
+  }, []);
+
+  console.log(label);
+  console.log("  排序结果首项: " + sorted[0].name);
+  console.log("  累计计算次数: " + computeCount);
+  console.log("  回调引用是否稳定: " + Object.is(onClick, lastCallback));
+  lastCallback = onClick;
+}
+
+let lastCallback: unknown = null;
+
+render(listA, "渲染 1（首次）");
+render(listA, "渲染 2（items 引用未变）");
+render(listA.slice(), "渲染 3（内容相同但是新数组）");
+render(listB, "渲染 4（真的换了数据）");
+
+console.log("结论：useMemo 只认引用，不认内容");`}
+  expectedOutput={`渲染 1（首次）\n  排序结果首项: 鼠标\n  累计计算次数: 1\n  回调引用是否稳定: false\n渲染 2（items 引用未变）\n  排序结果首项: 鼠标\n  累计计算次数: 1\n  回调引用是否稳定: true\n渲染 3（内容相同但是新数组）\n  排序结果首项: 鼠标\n  累计计算次数: 2\n  回调引用是否稳定: true\n渲染 4（真的换了数据）\n  排序结果首项: 音箱\n  累计计算次数: 3\n  回调引用是否稳定: true\n结论：useMemo 只认引用，不认内容`}
+/>
+
+渲染 3 是重点：数组内容一模一样，但引用变了，缓存直接失效。这解释了为什么「父组件每次渲染都新建一个数组传下来」会让所有 memo 优化归零。
+
+### 2.3 useMemo 的两种用途
+
+**用途一：跳过昂贵计算。**
+
+```tsx
+const stats = useMemo(() => computeStatistics(rows), [rows]);
+```
+
+前提是这个计算真的昂贵。对一个 20 项的数组做 filter，耗时是微秒级，而 `useMemo` 本身也有开销（存储依赖、比较、额外的内存）。**给便宜的计算加缓存是净亏损。**
+
+**用途二：稳定引用，让下游的 memo 生效。**
+
+```tsx
+// 不加 useMemo：每次渲染 config 都是新对象
+const config = useMemo(() => ({ theme, locale }), [theme, locale]);
+
+return <ExpensiveChart config={config} />;   // ExpensiveChart 用 React.memo 包了
+```
+
+这种用途和「计算是否昂贵」无关，纯粹是为了让 `React.memo` 或依赖数组的比较能命中。第 12 章会详细讲。
+
+## 3. useCallback：稳定的函数引用
+
+### 3.1 它就是 useMemo 的特例
+
+```tsx
+const handler = useCallback(fn, deps);
+// 完全等价于
+const handler = useMemo(() => fn, deps);
+```
+
+存在的唯一理由是语法方便——避免写「返回函数的函数」这种绕的写法。
+
+### 3.2 什么时候需要它
+
+只有两种情况：
+
+**情况一：函数被传给了用 `React.memo` 包裹的子组件。**
+
+```tsx
+const Row = React.memo(function Row({ item, onSelect }: RowProps) {
+  return <li onClick={() => onSelect(item.id)}>{item.name}</li>;
+});
+
+function List({ items }: { items: Item[] }) {
+  // 不加 useCallback，每次渲染 onSelect 都是新函数，
+  // Row 的 memo 会因为 props 变化而全部失效
+  const onSelect = useCallback((id: string) => {
+    console.log("selected", id);
+  }, []);
+
+  return <ul>{items.map((i) => <Row key={i.id} item={i} onSelect={onSelect} />)}</ul>;
+}
+```
+
+**情况二：函数出现在某个 Hook 的依赖数组里。**
+
+```tsx
+const load = useCallback(() => fetch("/api/" + id), [id]);
+
+useEffect(() => {
+  load();
+}, [load]);    // load 不稳定的话，effect 会每次渲染都跑
+```
+
+### 3.3 什么时候不需要
+
+```tsx
+// 完全没必要
+const onClick = useCallback(() => setOpen(true), []);
+return <button onClick={onClick}>打开</button>;
+```
+
+原生 DOM 元素的事件处理函数**不需要**稳定引用。React 内部对 DOM 事件用的是委托机制，重新赋值一个函数属性的开销可以忽略不计。加 `useCallback` 反而多了一次数组分配和依赖比较。
+
+<Callout type="warn" title="无脑加 useCallback 是负优化">
+每个 `useCallback` 都有成本：一个 Hook 槽位、一个依赖数组、每次渲染的比较开销，还有代码可读性的下降。
+
+如果它没有让任何 memo 生效、没有稳定任何依赖数组，那它就是**纯粹的浪费**。
+
+真实项目里我见过整个文件所有函数都被 useCallback 包裹，但没有一个子组件用了 React.memo——所有这些包装都毫无意义。
+</Callout>
+
+## 4. useLayoutEffect：需要同步的那个 effect
+
+顺便说说这个和 ref 经常配合使用的 Hook。
+
+```tsx
+useEffect(() => { /* 浏览器绘制之后异步执行 */ });
+useLayoutEffect(() => { /* DOM 更新后、浏览器绘制之前同步执行 */ });
+```
+
+区别只有时机。`useLayoutEffect` 会阻塞绘制，所以只在一种情况下用：**你需要在用户看到画面之前读取布局并调整它**。
+
+```tsx
+function Tooltip({ targetRect }: Props) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [top, setTop] = useState(0);
+
+  useLayoutEffect(() => {
+    const h = ref.current!.getBoundingClientRect().height;
+    // 空间不够就翻到下面 —— 必须在绘制前算完，否则用户会看到跳动
+    setTop(targetRect.top - h < 0 ? targetRect.bottom : targetRect.top - h);
+  }, [targetRect]);
+
+  return <div ref={ref} style={{ top }} />;
+}
+```
+
+用 `useEffect` 写这段代码，用户会先看到 tooltip 在错误位置闪一下再跳过去。
+
+代价是它阻塞绘制，所以里面不能有耗时逻辑。服务端渲染时它也不会执行（且会打印警告，因为服务端没有布局）。
+
+## 5. 三者的选择流程
+
+面对「要不要用」的问题，按这个顺序问自己：
+
+1. **这个值变了界面要不要变？** 要 → state；不要 → 可能是 ref
+2. **这是不是一个 DOM 节点或第三方实例？** 是 → ref
+3. **这个计算是不是真的很慢（毫秒级以上）？** 是 → useMemo
+4. **这个值/函数是不是被传给了 memo 组件，或者出现在依赖数组里？** 是 → useMemo / useCallback
+5. **以上都不是** → 什么都不用加
+
+<Callout type="tip" title="React Compiler 正在让这一切自动化">
+React 19 起，官方的编译器（原 React Forget）能在编译期自动插入记忆化，理论上让手写 `useMemo`/`useCallback` 成为历史。
+
+但即使编译器普及了，理解「为什么需要稳定引用」依然重要——因为你还是要判断哪些代码是纯的、哪些依赖是正确的。编译器能替你写代码，不能替你理解代码。
+</Callout>
+
+<Callout type="exercise" title="练习 1：state 还是 ref">
+下面这些数据，各自该用 state 还是 ref？说明理由：
+
+1. 输入框当前的值
+2. 防抖用的 setTimeout id
+3. 「是否已经上报过埋点」的标记
+4. 列表的滚动位置（用于显示「回到顶部」按钮）
+5. 列表的滚动位置（仅用于路由返回时恢复）
+6. 拖拽过程中鼠标按下时的初始坐标
+</Callout>
+
+<Callout type="exercise" title="练习 2：找出无效的 useMemo">
+```tsx
+const total = useMemo(() => a + b, [a, b]);
+const upper = useMemo(() => name.toUpperCase(), [name]);
+const style = useMemo(() => ({ color: theme.fg }), [theme.fg]);
+const rows = useMemo(() => data.filter((d) => d.active), [data]);
+```
+假设这四个值分别传给：一个普通的 span、一个普通的 div、一个 React.memo 包裹的图表组件、一个普通的 ul（内部 map）。
+
+判断哪几个 useMemo 是有价值的，哪几个应该删掉。
+</Callout>
+
+<Callout type="exercise" title="练习 3：实现 useEventCallback">
+实现一个 Hook，它返回的函数引用**永远不变**，但每次调用时执行的是最新一次渲染时传入的逻辑。
+
+```tsx
+const stable = useEventCallback((id: string) => {
+  console.log(count, id);   // count 永远是最新的
+});
+```
+
+提示：需要一个 ref 存最新函数，加一个 useCallback 返回稳定的包装函数。想一想为什么这个 Hook 不能在渲染期间调用。
+</Callout>
+
+<Callout type="exercise" title="练习 4：扩展 Playground">
+给本章 Playground 的 `useMemoMini` 加一个「命中率统计」：记录总调用次数和缓存命中次数，最后打印命中率。
+
+然后新增一个场景：连续 5 次渲染，其中第 3 次换了新的 items 引用（但内容相同），验证命中率的计算结果符合预期。
+</Callout>
+
+## 小结
+
+- `useRef` 返回一个跨渲染稳定的可变盒子，**改它不触发渲染**
+- ref 的三大用途：访问 DOM、存放不影响渲染的可变值、保存最新值破解闭包陷阱
+- 不要用 ref 手动改 DOM 内容——那会和 React 抢控制权
+- `useMemo` 缓存计算结果，依赖比较是**逐位 Object.is**，只认引用不认内容
+- `useMemo` 的两种正当用途：跳过真正昂贵的计算、稳定引用让下游 memo 生效
+- `useCallback(fn, deps)` 就是 `useMemo(() => fn, deps)`；只在「传给 memo 组件」或「进入依赖数组」时才需要
+- 给原生 DOM 事件加 `useCallback` 通常是负优化
+- `useLayoutEffect` 在绘制前同步执行，只用于「读布局并立刻调整」的场景
+- 下一章讲表单处理 →

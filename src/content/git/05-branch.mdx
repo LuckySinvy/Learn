@@ -1,0 +1,329 @@
+---
+title: 分支基础：branch、switch 与两种合并
+order: 5
+description: 分支为什么这么便宜、HEAD 的作用、fast-forward 与三方合并的区别
+---
+
+# 分支基础：branch、switch 与两种合并
+
+分支是 Git 的杀手锏。在 SVN 里创建分支意味着服务器上复制一整份目录，慢且贵，所以团队本能地回避；在 Git 里创建分支就是**写一个 41 字节的文件**，快到你根本不会犹豫。这个成本差异彻底改变了工作方式——"随手开个分支试试"从奢侈变成了常态。
+
+## 1. 分支到底是什么
+
+一句话：**分支是一个指向某个提交的可移动指针。**
+
+Git 的提交构成一条（或一张）链：每个提交记录着自己的父提交。分支名只是一个文件，里面存着 40 位哈希；`HEAD` 则是一个指向"当前分支"的指针。
+
+```text
+.git/refs/heads/main          内容: 15081dba7c2dc497df71c6b3f4f845188adbdb78
+.git/refs/heads/feature       内容: 5cd08eab...
+.git/HEAD                     内容: ref: refs/heads/main   <- 我现在在 main 上
+```
+
+```text
+        A <--- B <--- C  (main)
+                      ^
+                      |
+                     HEAD
+```
+
+提交一次，发生的事情是：创建新提交 D（父提交是 C）→ 把 `main` 文件的内容改成 D 的哈希。就这么简单。
+
+<Playground
+  language="git"
+  title="拆开看：分支就是一个文件"
+  id="git-05-1"
+  code={`git init -q
+echo 'main-1' > app.txt && git add . && git commit -q -m "feat: 主线提交1"
+echo 'main-2' >> app.txt && git add . && git commit -q -m "feat: 主线提交2"
+
+echo '===== 分支列表 ====='
+git branch
+echo
+echo '.git/refs/heads/main 的内容：'
+cat .git/refs/heads/main
+echo '.git/HEAD 的内容：'
+cat .git/HEAD
+echo
+
+echo '===== 创建并切换到新分支 ====='
+git switch -c feature/login
+git branch
+echo '新分支文件的内容：'
+cat .git/refs/heads/feature/login
+echo '(和 main 完全一样 —— 创建分支只是复制了一个哈希)'
+echo
+
+echo '===== 在新分支上提交两次 ====='
+echo 'login page' > login.txt && git add . && git commit -q -m "feat: 登录页"
+echo 'login api' >> login.txt && git add . && git commit -q -m "feat: 登录接口"
+git log --oneline --graph --decorate --all
+echo
+
+echo '===== 切回 main：工作区立刻变回去 ====='
+git switch main
+echo '目录内容：' && ls
+echo '(login.txt 不见了 —— 它只存在于 feature/login 分支)'`}
+/>
+
+<Callout type="info" title="切分支为什么这么快">
+`git switch` 做两件事：改写 `.git/HEAD` 的一行文本，然后把工作区更新成目标提交的快照。第二步只需要处理**两个提交之间有差异的文件**，其余文件一个字节都不动。所以哪怕仓库有 10 万个文件，切换一个只改了 3 个文件的分支，也是瞬间完成的。
+</Callout>
+
+## 2. 分支的基本操作
+
+```bash
+# 查看
+git branch                  # 本地分支，* 标记当前分支
+git branch -v               # 带最后一次提交信息
+git branch -a               # 包括远程分支
+git branch --merged main    # 已并入 main 的分支（可以安全删）
+git branch --no-merged main # 还没并入的分支（删了会丢代码）
+
+# 创建 / 切换（新命令）
+git switch -c feature/login       # 创建并切换
+git switch -c hotfix main         # 基于 main 创建
+git switch feature/login          # 切换
+git switch -                      # 切回上一个分支
+
+# 创建 / 切换（老命令，等价）
+git checkout -b feature/login
+git checkout feature/login
+
+# 只创建不切换
+git branch feature/login
+
+# 重命名 / 删除
+git branch -m old-name new-name
+git branch -d feature/login       # 安全删：未合并会拒绝
+git branch -D feature/login       # 强制删
+```
+
+<Playground
+  language="git"
+  title="分支管理：merged 检查、安全删除、重命名"
+  id="git-05-2"
+  code={`git init -q
+echo 'base' > app.txt && git add . && git commit -q -m "init"
+git switch -qc done-work && echo x > x.txt && git add . && git commit -q -m "feat: 已完成的活"
+git switch -q main && git merge -q done-work
+git switch -qc wip-work && echo y > y.txt && git add . && git commit -q -m "wip: 没做完的活"
+git switch -q main
+
+echo '===== 所有分支及各自最新提交 ====='
+git branch -v
+echo
+
+echo '===== 哪些分支已并入 main（可以删了）====='
+git branch --merged main
+echo
+echo '===== 哪些还没并入（删了会丢代码）====='
+git branch --no-merged main
+echo
+
+echo '===== -d 删除已合并分支：放行 ====='
+git branch -d done-work
+echo
+
+echo '===== -d 删除未合并分支：拒绝 ====='
+git branch -d wip-work
+echo '(Git 在保护你，确实要删得用 -D)'
+echo
+
+echo '===== 重命名 ====='
+git branch -m wip-work feature/wip
+git branch`}
+/>
+
+<Callout type="tip" title="分支命名约定">
+团队里常见的命名规范：
+
+- `feature/user-login` 或 `feat/user-login` —— 新功能
+- `fix/order-amount` 或 `bugfix/xxx` —— 修 bug
+- `hotfix/critical-crash` —— 线上紧急修复
+- `release/v1.2.0` —— 发版分支
+- `chore/upgrade-deps` —— 杂项
+
+用 `/` 分层，Git 会在 `.git/refs/heads/` 下建立对应的目录结构，`git branch` 输出时也更整齐。避免用空格和中文，避免以 `-` 开头（会被当成命令参数）。
+</Callout>
+
+## 3. 两种合并
+
+`git merge <branch>` 把另一个分支的工作并入当前分支。Git 会根据历史形态自动选择两种策略之一。
+
+### 3.1 Fast-forward：直接快进
+
+如果当前分支自分叉后**没有任何新提交**，目标分支只是"往前走了几步"，Git 不需要做任何合并计算——**直接把当前分支的指针往前挪**。
+
+```text
+合并前：
+        A --- B --- C  (hotfix)
+        ^
+        |
+      main
+
+git merge hotfix →  指针直接挪过去
+
+合并后：
+        A --- B --- C  (main, hotfix)
+```
+
+### 3.2 三方合并：产生合并提交
+
+如果两个分支**都有新提交**（历史真的分叉了），Git 需要做一次三方合并（three-way merge）：找到两条线的**共同祖先**，然后把"祖先→我"和"祖先→你"两组改动都应用上去，生成一个有**两个父提交**的合并提交。
+
+```text
+合并前：
+              D --- E  (feature)
+             /
+        A --- B --- C  (main)
+
+git merge feature
+
+合并后：
+              D --- E  (feature)
+             /         \
+        A --- B --- C --- M  (main)      M 有两个父提交：C 和 E
+```
+
+跑一遍看差别：
+
+<Playground
+  language="git"
+  title="Fast-forward vs 三方合并"
+  id="git-05-3"
+  code={`echo '################ A. Fast-forward ################'
+git init -q ff && cd ff
+echo 'base' > app.txt && git add . && git commit -q -m "init"
+git switch -qc hotfix
+echo 'fix' > fix.txt && git add . && git commit -q -m "fix: 紧急修复"
+git switch -q main
+echo '合并前（main 自分叉后没有新提交，是一条直线）：'
+git log --oneline --graph --all
+echo '-- git merge hotfix --'
+git merge hotfix
+echo '合并后：'
+git log --oneline --graph --all
+echo '(没有新的合并提交，main 指针直接快进到 hotfix)'
+cd ..
+echo
+
+echo '################ B. 三方合并 ################'
+git init -q tw && cd tw
+echo 'base' > app.txt && git add . && git commit -q -m "init"
+git switch -qc feature
+echo 'feature work' > feat.txt && git add . && git commit -q -m "feat: 新功能"
+git switch -q main
+echo 'main work' > other.txt && git add . && git commit -q -m "feat: 主线也在动"
+echo '合并前（两边都有新提交，历史分叉）：'
+git log --oneline --graph --all
+echo '-- git merge feature --'
+git merge feature --no-edit
+echo '合并后：'
+git log --oneline --graph --all
+echo '合并提交的两个父提交：'
+git log -1 --format='%h 的父提交是: %p'
+cd ..`}
+/>
+
+注意 B 段输出里的 `Merge made by the 'ort' strategy`。ort 是 Git 2.34 起的默认合并策略（Ostensibly Recursive's Twin），比老的 recursive 更快、对重命名的处理更准。
+
+### 3.3 --no-ff：强制留下分支痕迹
+
+Fast-forward 很干净，但也**抹掉了"这里曾经有一个分支"的信息**。如果团队希望在历史里看得出每个功能是从哪个分支合进来的，用 `--no-ff` 强制生成合并提交：
+
+```bash
+git merge --no-ff feature/login
+```
+
+```text
+默认（可以 ff 时）:        --no-ff:
+   A --- B --- C            A --------- M   (main)
+                                 \     /
+                                  B---C  (feature)
+```
+
+| | 默认（允许 ff） | `--no-ff` |
+|---|---|---|
+| 历史形状 | 线性、干净 | 有分叉气泡 |
+| 能否看出功能边界 | 不能 | 能 |
+| 回滚整个功能 | 要逐个 revert | `revert -m 1 <merge>` 一次搞定 |
+| 常见于 | trunk-based、个人项目 | Git Flow、需要审计的团队 |
+
+很多团队会把 `--no-ff` 设成默认：`git config --global merge.ff false`，或者只对 main 分支强制（GitHub 的 "Create a merge commit" 选项就是 `--no-ff`）。
+
+## 4. 合并相关的其他操作
+
+```bash
+# 合并但不自动提交，给你机会检查/调整
+git merge --no-commit feature
+
+# 只在能 fast-forward 时才合并，否则报错（保证线性历史）
+git merge --ff-only feature
+
+# 合并出冲突了，放弃回到合并前
+git merge --abort
+
+# 查看某个分支相比 main 多了哪些提交
+git log main..feature --oneline
+
+# 查看两个分支的差异
+git diff main..feature
+```
+
+<Callout type="warn" title="有未提交改动时切分支">
+如果工作区有未提交的改动，`git switch` 有两种结果：
+
+- 改动的文件在两个分支上内容相同 → Git 允许切换，改动跟着你走
+- 改动的文件会被目标分支覆盖 → Git 拒绝切换，报 "Your local changes would be overwritten"
+
+第二种情况的正确处理是先 `git stash`（第 9 章），或者先提交。**不要**用 `git switch -f` 强制切换，那会直接丢弃你的改动。
+</Callout>
+
+## 5. 一个典型的分支工作日
+
+```bash
+# 1. 从最新的 main 开新分支
+git switch main
+git pull
+git switch -c feature/coupon
+
+# 2. 干活，小步提交
+#    ...编辑...
+git add -p && git commit -m "feat(coupon): 优惠券数据模型"
+#    ...编辑...
+git commit -am "feat(coupon): 领券接口"
+
+# 3. 期间 main 有更新，同步过来（避免最后一次性解决一堆冲突）
+git switch main && git pull
+git switch feature/coupon
+git merge main            # 或 git rebase main，见第 7 章
+
+# 4. 完成，合回 main
+git switch main
+git merge --no-ff feature/coupon
+
+# 5. 清理
+git branch -d feature/coupon
+```
+
+第 3 步值得强调：**长期分支要定期同步主线**。一个开了三周没同步的分支，合并时的冲突量往往是每天同步一次的十倍以上。
+
+## 小结
+
+- 分支是一个存着提交哈希的文件；`HEAD` 指向当前分支。创建分支 = 写一个 41 字节文件
+- 切分支只更新有差异的文件，所以再大的仓库也是瞬间完成
+- `git switch -c <name>` 创建并切换，`git switch -` 切回上一个分支
+- `git branch --merged` / `--no-merged` 判断分支能否安全删除；`-d` 安全删，`-D` 强删
+- **Fast-forward**：当前分支无新提交时直接挪指针，历史线性
+- **三方合并**：两边都有新提交时，基于共同祖先合并，产生有两个父提交的合并提交
+- `--no-ff` 强制留下合并提交，保住"这是一个功能分支"的信息
+- 长期分支要定期把主线合进来，别攒到最后
+- 下一章：合并冲突了怎么办 →
+
+<Callout type="exercise" title="练习">
+1. 建一个仓库提交两次，然后 `cat .git/refs/heads/main` 和 `git log -1 --format=%H`，验证两者一致。创建一个新分支后再 cat 一次，说明"创建分支"到底发生了什么。
+2. 分别构造出 fast-forward 和三方合并两种场景，用 `git log --oneline --graph --all` 对比合并后的历史形状。
+3. 在能 fast-forward 的场景下用 `git merge --no-ff`，观察多出来的那个提交，并用 `git log -1 --format=%p` 查看它有几个父提交。
+4. 创建一个有独立提交的分支，尝试 `git branch -d` 删除它，读懂报错信息。然后把它合并到 main，再删一次，观察这次为什么放行了。
+</Callout>

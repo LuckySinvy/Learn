@@ -1,0 +1,205 @@
+---
+title: 查找文件：find 的常用姿势与 which/locate
+order: 6
+description: find 按名字/类型/大小/时间查找、-exec 批量处理，以及 which/whereis/locate 的分工
+---
+
+# 查找文件：find 的常用姿势与 which/locate
+
+"那个配置文件在哪来着？""哪些日志超过 100 MB？""三天内改过哪些代码？"——这类问题都归 `find` 管。它是功能最强也是参数最多的命令之一，好在日常高频用法就那么几种姿势，本章逐一过一遍。
+
+## 1. find 的基本形态
+
+```bash
+find 起点目录 [条件...] [动作...]
+find /var/log -name '*.log'      # 从 /var/log 开始递归找所有 .log
+find . -name 'config*'          # 从当前目录找 config 开头的
+```
+
+`find` 默认**递归遍历**起点下的整棵子树，把每个匹配的路径打印一行。条件不写则匹配一切（相当于递归版 ls）。
+
+<Callout type="tip" title="模式一定要加引号">
+`find . -name *.log` 不加引号时，通配符会先被 Shell 展开（第 2 章讲过）：若当前目录恰好有 a.log，命令就变成了 `find . -name a.log`，结果莫名其妙。写成 `-name '*.log'`，把模式原样交给 find 自己去匹配。
+</Callout>
+
+## 2. 按名字与类型
+
+```bash
+find . -name '*.conf'        # 按名字（区分大小写）
+find . -iname 'readme*'      # -i 忽略大小写
+find . -type f               # 只要文件
+find . -type d               # 只要目录
+find . -type l               # 只要软链接
+find . -maxdepth 2 -name '*.py'   # 限制递归深度（放在其它条件前面）
+```
+
+<Playground
+  language="linux"
+  title="find 按名字与类型"
+  id="linux-06-1"
+  code={`# 搭一棵演示目录树
+mkdir -p proj/src/utils proj/docs proj/build
+touch proj/src/main.py proj/src/utils/helper.py
+touch proj/docs/README.md proj/docs/readme.txt
+touch proj/build/app.o proj/.env
+ln -s src/main.py proj/entry.py
+
+echo '$ find proj -name "*.py"'
+find proj -name '*.py'
+
+echo '$ find proj -iname "readme*"   # 忽略大小写'
+find proj -iname 'readme*'
+
+echo '$ find proj -type d'
+find proj -type d
+
+echo '$ find proj -type l   # 软链接'
+find proj -type l
+
+echo '$ find proj -maxdepth 1 -type f   # 只看第一层的文件'
+find proj -maxdepth 1 -type f`}
+/>
+
+## 3. 按大小与时间
+
+```bash
+find . -size +100M           # 大于 100 MB（k/M/G 单位）
+find . -size -1k             # 小于 1 KB
+find . -mtime -3             # 3 天内修改过（内容修改时间）
+find . -mtime +30            # 超过 30 天没改过
+find . -mmin -60             # 60 分钟内修改过（分钟粒度）
+find . -newer base.txt       # 比 base.txt 更新的文件
+```
+
+`+` 表示大于、`-` 表示小于、不带符号表示恰好——时间单位下"恰好"很少用，记住加减号语义即可。
+
+<Playground
+  language="linux"
+  title="find 按大小与时间"
+  id="linux-06-2"
+  code={`mkdir data
+# 制造不同大小：truncate 直接指定文件长度
+truncate -s 2K  data/small.bin
+truncate -s 5M  data/medium.bin
+truncate -s 12M data/big.bin
+# 制造不同时间：touch -d 指定修改时间（GNU touch）
+touch -d '10 days ago' data/old.log
+touch data/fresh.log
+
+echo '$ find data -size +1M'
+find data -size +1M
+
+echo '$ find data -size +1M -size -10M   # 条件默认 AND：1M 到 10M 之间'
+find data -size +1M -size -10M
+
+echo '$ find data -mtime +7   # 超过 7 天没动过'
+find data -mtime +7
+
+echo '$ find data -mmin -5 -type f   # 5 分钟内新改动的'
+find data -mmin -5 -type f`}
+/>
+
+多个条件并列默认是 **AND**；`-o` 表示 OR（通常要配合转义括号分组）；`!` 取反：
+
+```bash
+find . \( -name '*.log' -o -name '*.tmp' \) -mtime +7    # 7 天前的 log 或 tmp
+find . -type f ! -name '*.md'                            # 所有非 markdown 文件
+```
+
+## 4. 找到之后做什么：-exec 与配合 xargs
+
+打印路径往往只是第一步，真正的需求是"找到并处理"：
+
+```bash
+find . -name '*.tmp' -delete                  # 内置删除动作（先确认再用！）
+find . -name '*.sh' -exec chmod +x {} \;      # 对每个结果执行一次命令，{} 是占位符
+find . -name '*.log' -exec ls -lh {} +        # + 结尾：尽量合并成一次调用，效率高
+find . -name '*.py' | xargs wc -l             # 交给 xargs 批量处理（第 10 章详讲）
+```
+
+`{}` 会被替换成找到的路径；`\;` 表示"每个文件调用一次命令"，`+` 表示"把一批文件拼进同一次命令"（类似 xargs，快得多）。
+
+<Playground
+  language="linux"
+  title="find -exec 批量处理"
+  id="linux-06-3"
+  code={`mkdir -p app/scripts app/cache
+printf '#!/bin/bash\necho task-a\n' > app/scripts/a.sh
+printf '#!/bin/bash\necho task-b\n' > app/scripts/b.sh
+touch app/cache/x.tmp app/cache/y.tmp app/keep.txt
+
+echo '$ 给所有 .sh 加执行权限并验证：'
+find app -name '*.sh' -exec chmod +x {} +
+find app -name '*.sh' -exec ls -l {} +
+
+echo '$ 统计每个 .sh 的行数（-exec wc -l）：'
+find app -name '*.sh' -exec wc -l {} +
+
+echo '$ 删除所有 .tmp 前先列出确认：'
+find app -name '*.tmp'
+find app -name '*.tmp' -delete
+echo '$ 删除后 cache 目录：'
+ls -A app/cache || true
+echo '(空)'`}
+/>
+
+<Callout type="warn" title="find -delete 之前，先跑一遍不带 -delete 的版本">
+`-delete` 与 `rm -rf` 同级危险。标准流程：先执行 `find ... -print` 检查匹配列表，确认无误后再追加 `-delete`。另外 `-delete` 必须放在条件**之后**——放在前面会直接删掉起点目录下的一切（find 参数顺序即求值顺序）。
+</Callout>
+
+## 5. 找命令本身：which、whereis、type
+
+找的不是普通文件而是"某个命令的可执行文件在哪"时，用更轻量的工具：
+
+```bash
+which python3        # 按 PATH 顺序找到将被执行的那个可执行文件
+whereis python3      # 额外列出手册页、源码位置
+type cd              # 判别：内建命令 / 外部程序 / 别名 / 函数
+command -v jq        # 脚本里判断命令是否存在的标准写法
+```
+
+<Playground
+  language="linux"
+  title="which 与 type"
+  id="linux-06-4"
+  code={`echo '$ which bash python3 jq'
+which bash python3 jq
+
+echo '$ type cd echo ls   # cd 是内建命令，不存在对应的程序文件'
+type cd
+type echo
+type ls
+
+echo '$ command -v nginx || echo nginx 未安装'
+command -v nginx || echo 'nginx 未安装'
+
+echo '$ echo $PATH   # which 就是按这个列表从左到右找的'
+echo $PATH`}
+/>
+
+## 6. locate：用索引换速度
+
+`find` 每次都实时遍历磁盘，大目录会慢；`locate` 查的是预先建好的文件名索引数据库，毫秒级返回：
+
+```bash
+locate nginx.conf        # 从索引中秒查
+sudo updatedb            # 手动重建索引（通常由 cron 每天自动跑）
+```
+
+代价是**时效性**：新建的文件要等下一次 updatedb 才能被查到。另外很多精简环境（包括本沙箱）没有预装 locate。分工总结：精确条件、实时结果用 find；只按名字、要快、允许略旧用 locate。
+
+## 小结
+
+- `find 起点 条件 动作`，默认递归、条件 AND；模式记得加引号
+- 名字 `-name/-iname`、类型 `-type f/d/l`、大小 `-size +100M`、时间 `-mtime -3`、深度 `-maxdepth`
+- 处理结果：`-exec cmd {} \;`（逐个）、`-exec cmd {} +`（批量）、`-delete`（先预演）
+- 命令位置用 `which`/`type`，脚本判存在用 `command -v`
+- locate 靠索引快但可能滞后；沙箱与精简容器常无此工具
+- 下一章：文本三剑客第一位——grep →
+
+<Callout type="exercise" title="练习">
+1. 构造一棵目录树，包含 .py、.md、.tmp 三类文件各若干，用一条 find 命令列出"所有 .py 或 .md 文件"（提示：转义括号加 `-o`）。
+2. 用 `truncate -s` 制造 500K、2M、20M 三个文件，写出找出"大于 1M 且小于 10M"文件的 find 命令并验证。
+3. 用 `touch -d '40 days ago'` 制造旧文件，实现运维经典需求："找出 30 天以前的 .log 并删除"——要求先打印确认列表，再执行删除，最后验证结果。
+4. 分别运行 `type cd`、`type ls`、`which cd`，解释为什么 which 找不到 cd。
+</Callout>

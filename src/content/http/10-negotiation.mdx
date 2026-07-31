@@ -1,0 +1,207 @@
+---
+title: 内容协商与压缩：同一资源的多副面孔
+order: 10
+description: Accept 系列头与 q 值、Vary、gzip/br 压缩、分块传输编码
+---
+
+# 内容协商与压缩：同一资源的多副面孔
+
+同一个 URL，可以返回中文或英文、JSON 或 XML、压缩或原文——客户端说出偏好，服务器挑一个最合适的版本。这就是**内容协商**。压缩与分块传输则解决"怎么把体传得又小又快"的问题。
+
+## 1. 协商的语法：Accept 系列 + q 值
+
+| 请求头 | 协商维度 | 对应响应头 |
+|---|---|---|
+| Accept | 媒体类型 | Content-Type |
+| Accept-Language | 语言 | Content-Language |
+| Accept-Encoding | 压缩算法 | Content-Encoding |
+| Accept-Charset | 字符集（已基本弃用） | - |
+
+偏好强度用 **q 值**（0~1，默认 1）表达：
+
+```text
+Accept-Language: zh-CN, zh;q=0.9, en;q=0.5
+含义：最想要 zh-CN（q=1），其次任何中文（0.9），实在不行英文（0.5）
+```
+
+<Playground
+  language="http"
+  title="按 Accept-Language 协商语言版本"
+  id="http-10-1"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PAGES = {"zh": "你好，世界", "en": "Hello, World", "ja": "こんにちは"}
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        al = self.headers.get("Accept-Language", "")
+        # 极简协商：取第一个命中的语言标签
+        chosen = "en"
+        for token in al.split(","):
+            lang = token.split(";")[0].strip().split("-")[0].lower()
+            if lang in PAGES:
+                chosen = lang
+                break
+        body = (PAGES[chosen] + "\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Language", chosen)
+        self.send_header("Vary", "Accept-Language")   # 关键！告诉缓存按语言分开存
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+curl -s http://127.0.0.1:8000/ -H "Accept-Language: zh-CN, en;q=0.5"
+curl -s http://127.0.0.1:8000/ -H "Accept-Language: ja, en;q=0.8"
+curl -s http://127.0.0.1:8000/ -H "Accept-Language: fr"
+echo "--- 响应头里的协商结果与 Vary ---"
+curl -sI http://127.0.0.1:8000/ -H "Accept-Language: zh" | grep -iE "content-language|vary"`}
+/>
+
+### 1.1 Vary：协商资源的缓存钥匙
+
+同一 URL 有多个版本时，缓存（CDN、代理）**必须知道按什么维度区分**，否则中文用户会拿到缓存里的英文页。`Vary: Accept-Language` 的意思是"缓存键 = URL + Accept-Language 的值"。**凡是参与协商的请求头都要写进 Vary**——漏写 Vary 是 CDN 串页事故的经典根因（尤其是 `Vary: Accept-Encoding`，漏了会把 gzip 内容发给不支持 gzip 的老客户端）。
+
+## 2. 压缩：Content-Encoding
+
+文本类资源压缩率惊人（HTML/JS/JSON 通常压到 20%-30%）。流程：
+
+```text
+客户端: Accept-Encoding: gzip, deflate, br     "我会解这些"
+服务器: Content-Encoding: gzip                 "那我用 gzip 压了"
+        （Content-Length 是压缩后的字节数）
+```
+
+| 算法 | 说明 |
+|---|---|
+| gzip | 老牌通用，兼容性最好 |
+| br（Brotli） | 压缩率比 gzip 高约 15-25%，现代浏览器全支持，仅限 HTTPS |
+| zstd | 新秀，压缩速度快，支持面还在扩大 |
+| identity | 不压缩 |
+
+<Playground
+  language="http"
+  title="gzip 压缩：体积对比实验"
+  id="http-10-2"
+  code={`python3 -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import gzip, json
+
+# 造一份 高冗余 JSON，模拟真实 API 响应
+DATA = json.dumps([{"id": i, "status": "active", "role": "member"} for i in range(200)]).encode()
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        accepts_gzip = "gzip" in self.headers.get("Accept-Encoding", "")
+        body = gzip.compress(DATA) if accepts_gzip else DATA
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        if accepts_gzip:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+' &
+sleep 0.3
+
+echo "== 不接受压缩 =="
+curl -s -o /dev/null -w "传输 %{size_download} 字节\n" \
+  -H "Accept-Encoding: identity" http://127.0.0.1:8000/api
+
+echo "== 接受 gzip（--compressed 让 curl 声明并自动解压）=="
+curl -s --compressed -o /dev/null -w "传输 %{size_download} 字节\n" \
+  http://127.0.0.1:8000/api
+
+echo "== 看响应头确认 =="
+curl -sI --compressed http://127.0.0.1:8000/api | grep -iE "content-encoding|content-length|vary"`}
+/>
+
+一份 9KB 的 JSON 压到几百字节——这就是所有网关默认开启 gzip 的原因。两个注意点：**已压缩格式（jpg/png/mp4/woff2）别再压**，白耗 CPU 还可能变大；**Content-Encoding 与 Transfer-Encoding 是两层**，前者描述"体本身是压缩格式"，后者描述"传输方式"（见下节）。
+
+## 3. 分块传输：Transfer-Encoding: chunked
+
+Content-Length 要求**发之前就知道总长度**。但动态生成的内容（大报表、AI 流式回答）边算边发，长度未知怎么办？HTTP/1.1 的答案是分块传输：
+
+```text
+Transfer-Encoding: chunked
+
+响应体格式：
+1a\r\n                    <- 块长度（十六进制）
+abcdefghijklmnopqrstuvwxyz\r\n
+10\r\n
+0123456789abcdef\r\n
+0\r\n                     <- 长度为 0 的块 = 结束
+\r\n
+```
+
+<Playground
+  language="http"
+  title="手写 chunked 响应，观察流式到达"
+  id="http-10-3"
+  code={`python3 -c '
+import socket, threading, time
+
+def server():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 8000)); srv.listen(1)
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                     b"Content-Type: text/plain\r\n"
+                     b"Transfer-Encoding: chunked\r\n\r\n")
+        for i in range(1, 4):
+            piece = ("第 " + str(i) + " 块数据\n").encode()
+            # 块 = 十六进制长度 + CRLF + 数据 + CRLF
+            conn.sendall(format(len(piece), "x").encode() + b"\r\n" + piece + b"\r\n")
+            time.sleep(0.5)          # 模拟"边生成边发"
+        conn.sendall(b"0\r\n\r\n")   # 结束块
+        conn.close()
+
+threading.Thread(target=server, daemon=True).start()
+time.sleep(0.2)
+
+import subprocess
+# -N 关闭缓冲，配合 -w 展示总时间：三块分三次到达，总耗时约 1.5 秒
+subprocess.run(["curl", "-sN", "-w", "总耗时 %{time_total}s\n",
+                "http://127.0.0.1:8000/stream"], check=False)
+'`}
+/>
+
+curl 收完全程约 1.5 秒，但**第一块 0.5 秒内就到了**——客户端不必等全部生成完。ChatGPT 式的打字机效果（SSE）底层正是 chunked 流：`Content-Type: text/event-stream` + 一块一块地推 `data: ...` 行。
+
+<Callout type="info" title="HTTP/2 之后没有 chunked">
+分块传输是 HTTP/1.1 专属语法。HTTP/2、HTTP/3 的 DATA 帧天然就是"分块"的，流式能力内建于帧结构，不再需要（也不允许）Transfer-Encoding: chunked。
+</Callout>
+
+<Callout type="warn" title="协商失败的正确姿势">
+服务器无法满足 Accept 要求时，可以返回 406 Not Acceptable，但实践中更常见的是"尽力而为"——返回默认版本并如实标注 Content-Type/Content-Language。浏览器对 406 的处理很不友好，API 场景才建议严格 406。
+</Callout>
+
+## 小结
+
+- 内容协商：Accept 系列请求头 + q 值表达偏好，响应用 Content-* 头标注实际选择；
+- **Vary 必须列出所有参与协商的头**，否则共享缓存会串版本；
+- 文本资源务必压缩（gzip 保底、br 更优），已压缩的二进制格式不要二次压缩；
+- Content-Length 需要预知总长；未知长度用 chunked 分块，流式输出的基石；
+- Content-Encoding 描述"体是什么格式"，Transfer-Encoding 描述"怎么传"——两层独立。
+
+<Callout type="exercise" title="练习">
+1. 修改 Playground 1：实现真正的 q 值解析（按权重排序选择），用 "zh;q=0.3, ja;q=0.9" 验证选中日文。
+2. 在 Playground 2 中增加一个 /logo.png 路由返回随机字节（模拟已压缩图片），对比它 gzip 前后的体积，验证"压不动"。
+3. 修改 Playground 3：把三块数据改成 SSE 格式（Content-Type: text/event-stream，每块形如 data: hello 加两个换行），观察输出。
+4. 排障题：某老旧客户端收到乱码，抓包发现响应是 gzip 的但请求没带 Accept-Encoding。缓存层的哪个头没配对？
+</Callout>

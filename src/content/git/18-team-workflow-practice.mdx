@@ -1,0 +1,181 @@
+---
+title: 实战演练：串起全课的一次完整协作
+order: 18
+description: 从 0 演练一次完整协作流程——建仓、feature 分支、并行冲突、rebase 解决、交互式整理、打 tag 发布、reflog 自救
+---
+
+# 实战演练：串起全课的一次完整协作
+
+前面十七章把 Git 的每个零件都拆开讲过。这一章把它们**组装成一次真实的团队协作**：你（Alice）和同事（Bob）共同开发一个项目，从建仓库到发版，途中遇到并行冲突、用 rebase 化解、用交互式 rebase 整理提交、打 tag 发布，最后演示一次误操作如何靠 reflog 自救。请把下面两段 Playground 跟着跑一遍——它们就是一份可执行的"标准协作剧本"。
+
+## 1. 剧本设定
+
+- **origin**：用一个本地裸仓库模拟 GitHub（沙箱无外网，但本地路径当远程完全等价）。
+- **Alice**：主开发者，开 `feature/login` 分支做登录功能。
+- **Bob**：同事，在 `main` 上补充文档，制造与 Alice 的冲突。
+- 全程只动过"登录表单"和"README"两个文件，便于看清每次变更落在哪。
+
+## 2. 完整协作流程（上）：建仓、开发、冲突、rebase、合并、发版
+
+<Playground
+  language="git"
+  title="一次完整协作：建仓到发版"
+  id="git-18-1"
+  code={`echo '########## 实战：一次完整协作流程 ##########'
+export GIT_EDITOR=true
+rm -rf /tmp/origin.git
+git init -q --bare /tmp/origin.git
+
+git clone -q /tmp/origin.git alice && cd alice
+echo 'project v0' > README.md
+git add . && git commit -q -m "chore: 初始化项目"
+git push -q -u origin main 2>/dev/null
+cd ..
+
+git clone -q /tmp/origin.git alice2 && cd alice2
+git checkout -q -b feature/login
+echo 'login form' > login.txt && git add . && git commit -q -m "feat: 登录表单初版"
+echo 'login form (typo fixed)' > login.txt && git add . && git commit -q -m "fix: 修正登录表单拼写"
+echo 'login form (typo fixed) + validate' >> login.txt && git add . && git commit -q -m "feat: 登录校验"
+echo 'login docs' >> README.md && git add . && git commit -q -m "docs: 登录模块说明"
+echo 'feature 分支提交历史：'
+git log --oneline
+cd ..
+
+git clone -q /tmp/origin.git bob && cd bob
+echo 'documented by bob' >> README.md && git add . && git commit -q -m "docs: bob 补充 README"
+git push -q origin main 2>/dev/null
+cd ..
+
+cd alice2
+git fetch -q origin
+echo '===== 变基时发生冲突（README）====='
+git rebase origin/main 2>&1 | head -4
+echo '冲突内容片段：'
+grep -n '<<<<<<<\\|=======\\|>>>>>>>' README.md
+echo '===== 手动解决冲突 ====='
+cat > README.md <<'EOF'
+project v0
+documented by bob
+login docs
+EOF
+git add README.md
+git rebase --continue
+echo '变基后 feature 历史（已排在 bob 的提交之后）：'
+git log --oneline
+cd ..
+
+cd alice2
+git checkout -q main
+git merge --no-ff -m "merge: 合入登录功能" feature/login
+git push -q origin main 2>/dev/null
+git tag -a v1.0 -m "Release 1.0：登录功能上线"
+git push -q origin v1.0 2>/dev/null
+echo '最终 main 历史：'
+git log --oneline --graph | head -12
+echo '已发布标签：'
+git tag
+cd ..`}
+/>
+
+这段脚本把全课的关键动作串成一条线：
+
+1. **建仓 + 关联远程**（第 1、10 章）：`git init --bare` 造 origin，`clone` 下来开发，`push -u` 建立跟踪。
+2. **feature 分支开发**（第 5 章）：从 `main` 切 `feature/login`，在上面连续提交，保持 `main` 始终可发布。
+3. **并行推进制造冲突**（第 6 章）：Bob 在 `main` 改了 README 并推上 origin；Alice 的 feature 也改了 README——两边分叉。
+4. **fetch + rebase 化解**（第 7 章）：Alice 先 `fetch` 看一眼，再 `git rebase origin/main` 把 feature 重放到 Bob 之后；冲突只在 README 一处，手工合并后 `rebase --continue`。冲突解决时 Bob 的改动在 `HEAD` 侧、Alice 的在另一侧，合并成"先 Bob 后 Alice"的顺序。
+5. **合并回 main + 发布**（第 5、11 章）：`git merge --no-ff` 保留功能分组痕迹，推上 origin，打附注标签 `v1.0` 并推送——一次正式发版完成。
+
+<Callout type="tip" title="为什么这里用 rebase 而不是 merge 来追平 main">
+Alice 在**自己还没推送**的 feature 分支上 rebase，把"和 Bob 的冲突"消化成一条直线，符合第 7 章黄金法则（绝不 rebase 已公开的分支）。等到 feature 合回 main 时，main 的历史依旧清爽、无多余 merge 气泡。
+</Callout>
+
+## 3. 完整协作流程（下）：交互式 rebase 整理 + reflog 自救
+
+功能合进去之前，feature 分支上那个 `fix: 修正登录表单拼写` 是提交后又补的小修，单独留着很零碎。用**交互式 rebase** 把它并回前一个提交；再演示一次"手滑 `reset --hard` 丢提交"如何用 reflog 救回。
+
+<Playground
+  language="git"
+  title="整理提交与误操作自救"
+  id="git-18-2"
+  code={`echo '########## 实战（续）：整理提交 + 误操作自救 ##########'
+export GIT_EDITOR=true
+git init -q -b main tidy && cd tidy
+echo 'init' > app.txt && git add . && git commit -q -m "chore: 初始化"
+git checkout -q -b feature/profile
+echo 'name field' > profile.txt && git add . && git commit -q -m "feat: 个人资料表单"
+echo 'name field (typo fixed)' > profile.txt && git add . && git commit -q -m "fix: 修正表单拼写"
+echo 'name field (typo fixed) + avatar' >> profile.txt && git add . && git commit -q -m "feat: 头像上传"
+echo '--- 整理前的历史（中间有个零散的 fix 提交）---'
+git log --oneline
+
+echo '--- 交互式 rebase：把 fix 提交 fixup 进前一个 ---'
+cat > /tmp/sqedit.sh <<'SCRIPT'
+#!/bin/sh
+sed -i.bak '/修正表单拼写/s/^pick /fixup /' "$1"
+SCRIPT
+chmod +x /tmp/sqedit.sh
+GIT_SEQUENCE_EDITOR=/tmp/sqedit.sh git rebase -i HEAD~3
+echo '整理后的历史（fix 提交已合并进前一个）：'
+git log --oneline
+cd ..
+
+echo
+echo '########## 误操作自救：reset 丢掉提交后用 reflog 找回 ##########'
+cd tidy
+echo '再做一个提交：'
+echo 'extra' >> profile.txt && git add . && git commit -q -m "feat: 额外完善"
+echo "误操作前 HEAD = $(git rev-parse --short HEAD)"
+echo '手滑执行 git reset --hard HEAD~2，把刚做的提交弄丢了：'
+git reset -q --hard HEAD~2
+echo "reset 后 HEAD = $(git rev-parse --short HEAD)"
+echo '但 reflog 还记着：'
+git reflog | head -3
+echo '从 reflog 找回被丢的提交并恢复：'
+RECOVER=$(git reflog --format='%H %gs' | grep '额外完善' | head -1 | awk '{print $1}')
+git reset -q --hard $RECOVER
+echo "恢复后 HEAD = $(git rev-parse --short HEAD)"
+echo "profile.txt 末尾一行（应恢复为 extra）：$(tail -1 profile.txt)"
+cd ..`}
+/>
+
+两段要点：
+
+- **交互式 rebase 整理**（第 8 章）：`rebase -i HEAD~3` 打开待办清单，把那个零散 `fix` 行的 `pick` 改成 `fixup`，它就被并回前一个提交、消息也一并丢弃，历史从"表单 / fix / 头像"三连变成干净的"表单 / 头像"两段。脚本用 `GIT_SEQUENCE_EDITOR` 非交互地改清单，等价于你在编辑器里手动改——真实开发里你就是在编辑器里改的。
+- **reflog 自救**（第 14 章）：`git reset --hard HEAD~2` 只是把分支指针挪走，原提交还在对象库里。从 `git reflog` 找到它的哈希，`git reset --hard <哈希>` 一步还原。这正是"几乎什么都能救回来"的实战版。
+
+<Callout type="warn" title="整理已推送的提交要三思">
+本节的 `rebase -i` 整理的是**尚未推送**的 feature 分支，安全。如果你已经把 feature 推到 origin 并被人拉取过，再 rebase 改写历史就会制造"历史分叉"，队友得强行同步——那种情况要么用 `rebase --onto` + `--force-with-lease` 谨慎处理，要么干脆保留原样、用新提交补齐。
+</Callout>
+
+## 4. 把这套剧本变成你的习惯
+
+一次标准的"功能开发"循环，推荐长这样：
+
+```text
+git fetch origin                 # 先看远程有什么新东西
+git checkout -b feature/xxx     # 开功能分支
+# ... 开发、本地小步提交 ...
+git fetch origin && git rebase origin/main   # 追上 main，解决冲突
+git rebase -i HEAD~N            # 合并零散提交，写好 Conventional 信息
+git push -u origin feature/xxx  # 开 PR / MR
+# 审查通过、CI 绿 -> 合并、打 tag、删除分支
+```
+
+把第 1 章的"三个区"、第 4 章的"撤销"、第 7 章的"rebase 黄金法则"、第 11 章的"发版"、第 14 章的"reflog 兜底"全串起来，你会发现 Git 不再是一堆命令，而是一条顺滑的工作流。
+
+## 5. 小结
+
+- 完整协作剧本：建仓/关联远程 -> feature 分支开发 -> fetch+rebase 追平 main -> 解冲突 -> --no-ff 合回 main -> 打 tag 发布
+- 并行冲突时用 rebase 把未推送的 feature 重放到 main 之后，历史保持直线
+- 交互式 rebase（fixup/squash）把零散提交并成干净的一组，再开 PR
+- 手滑 `reset --hard` 别慌：reflog 记录了一切，找回哈希即可还原
+- 记牢边界：rebase 只改**未公开**的历史；已推送的分支要改需谨慎或用新提交
+- 恭喜走完 18 章——你已经具备独立、规范地使用 Git 协作的能力
+
+<Callout type="exercise" title="练习">
+1. 照着 git-18-1 的脚本，自己从零搭一套"origin + Alice + Bob"的协作环境，故意让两个人在**同一个文件的不同行**各改一处，观察 rebase 时是否还会冲突（提示：不同行通常不冲突，Git 能自动合并）。
+2. 在 feature 分支上制造 3 个提交，用交互式 rebase 把其中 2 个 `squash` 成 1 个，对比整理前后的 `git log --oneline`。
+3. 在任意仓库里 `git commit` 一个新文件后立刻 `git reset --hard HEAD~1`，然后用 `git reflog` 找到那个提交哈希并 `git cherry-pick` 它回来（复习第 9 章），体会"找回"的另一种方式。
+4. 反思：为什么团队约定"main 永远可发布、所有改动走 feature 分支 + PR"能显著降低协作风险？结合你踩过的（或设想的）坑说明。
+</Callout>

@@ -1,0 +1,203 @@
+---
+title: .gitignore 与文件管理：忽略规则、git rm/mv、clean 与 skip-worktree
+order: 12
+description: 如何写 .gitignore 规则与例外、git rm/git mv 的正确姿势、git clean 清理与 skip-worktree 本地覆盖
+---
+
+# .gitignore 与文件管理：忽略规则、git rm/mv、clean 与 skip-worktree
+
+不是仓库里的每个文件都该进版本库。依赖目录、构建产物、本地配置、日志——这些要么体积大、要么因人而异、要么含密钥。这一章讲怎么用 `.gitignore` 把它们挡在门外，以及 Git 里增删改文件的"正确姿势"。
+
+## 1. .gitignore 的匹配规则
+
+`.gitignore` 是一个放在仓库根目录（也能放子目录）的文本文件，每行一条规则。核心语法：
+
+| 写法 | 含义 |
+|---|---|
+| `node_modules/` | 忽略名为 node_modules 的**目录**（结尾斜杠） |
+| `*.log` | 忽略任意层级的 `.log` 文件 |
+| `/build` | 只忽略**根目录**下的 build，不碰子目录的 |
+| `!important.log` | **例外**：不忽略 important.log（取消防上面的 `*.log`） |
+| `# 注释` | 注释行，空行被忽略 |
+
+几个关键特性：
+
+- 子目录里的 `.gitignore` 只对该目录及其下层生效。
+- 忽略规则是**叠加**的，后面可以"翻案"前面——`!` 例外必须写在更具体的忽略规则**之后**。
+- 已经被跟踪的文件，加进 `.gitignore` **不会**自动取消跟踪，需要 `git rm --cached`。
+- Windows 用户注意：Git 默认忽略 `.gitignore` 里行尾的 `\r`，但最好统一用 LF 换行。
+
+<Playground
+  language="git"
+  title=".gitignore 规则与例外"
+  id="git-12-1"
+  code={`echo '===== .gitignore 规则与匹配 ====='
+git init -q -b main ig1 && cd ig1
+mkdir -p node_modules dist
+echo 'x' > node_modules/a.js
+echo 'x' > dist/app.js
+echo 'x' > logs.log
+echo 'secret' > config.secret
+echo 'keep' > important.log
+cat > .gitignore <<'EOF'
+# 忽略依赖与构建产物
+node_modules/
+dist/
+# 忽略所有日志
+*.log
+# 例外：不忽略重要日志
+!important.log
+# 忽略敏感配置
+*.secret
+EOF
+echo 'git check-ignore -v 显示每个文件命中的规则（无输出=会被跟踪）：'
+for f in node_modules/a.js dist/app.js logs.log config.secret important.log .gitignore; do
+  line=$(git check-ignore -v "$f" 2>/dev/null)
+  if [ -z "$line" ]; then echo "  TRACK   $f"; continue; fi
+  rule=$(echo "$line" | cut -d: -f3)
+  if echo "$rule" | grep -q '^!'; then echo "  TRACK*  $f  <- 例外规则 $rule 解除忽略"; else echo "  IGNORE  $f  <- $rule"; fi
+done
+echo
+echo '验证 important.log 真的会被跟踪（git add -n 预览）：'
+git add -n important.log
+echo '如果上面显示 "add important.log" 说明例外规则生效'
+cd ..`}
+/>
+
+<Callout type="tip" title="拿不准某文件会不会被忽略？用 check-ignore">
+```bash
+git check-ignore -v path/to/file     # 打印命中的规则及其所在 .gitignore 行号
+git check-ignore path/to/file        # 简洁版，被忽略才输出
+```
+排查"为什么这个文件没被忽略"时，`-v` 会告诉你它命中了哪一条、在文件的第几行，比肉眼读规则快得多。
+</Callout>
+
+### 已经跟踪的文件怎么忽略
+
+如果 `secret.conf` 已经提交过，再写进 `.gitignore` 不会让 Git 放手。必须显式把它从索引里移除（保留工作区文件）：
+
+```bash
+echo 'secret.conf' >> .gitignore
+git rm --cached secret.conf        # 只删索引，不删磁盘文件
+git commit -m "chore: 停止跟踪 secret.conf"
+```
+
+## 2. git rm / git mv：别直接用 shell 命令删
+
+删除和重命名文件时，用 Git 自带的命令而不是 `rm` / `mv`，因为它们会**顺手维护暂存区**。
+
+| 命令 | 等价于 | 区别 |
+|---|---|---|
+| `git rm file` | `rm file` + `git add file` | 同时删工作区和索引 |
+| `git rm --cached file` | 只 `git add` 删除 | 删索引、留工作区（常用于转忽略） |
+| `git mv a b` | `mv a b` + `git rm a` + `git add b` | 一次完成改名，Git 能识别为 rename |
+
+<Playground
+  language="git"
+  title="git rm 与 git mv"
+  id="git-12-2"
+  code={`echo '===== git rm / git mv ====='
+git init -q -b main ig2 && cd ig2
+echo '占位' > keep.txt && git add keep.txt && git commit -q -m "docs: 占位 keep"
+echo 'old content' > oldname.txt && git add oldname.txt && git commit -q -m "docs: 占位 old"
+echo '用 git rm 删除（同时删工作区+暂存）：'
+git rm -q keep.txt
+echo 'git status 显示 deleted:'
+git status --short
+echo '撤销刚才的删除（恢复工作区+暂存）：'
+git restore --staged keep.txt && git restore keep.txt
+echo '恢复后文件是否还在：'
+ls keep.txt
+echo
+echo '现在用 git mv 改名（等于 mv + git add + git rm）：'
+git mv oldname.txt newname.txt
+echo 'status 显示 renamed:'
+git status --short
+cd ..`}
+/>
+
+`git mv` 的好处：Git 会把它识别为 **rename** 而不是"删一个、加一个"，`git log --follow newname.txt` 能顺着改名追溯历史。用普通 `mv` 再分别 `add`/`rm`，Git 有时也能靠内容相似度猜出是 rename，但 `git mv` 最稳。
+
+## 3. git clean 与 skip-worktree
+
+### git clean：清掉未跟踪文件
+
+工作区里常堆积临时文件、编译缓存。手动 `rm` 容易误删，用 `git clean` 更安全——它只删**未跟踪**且**未被忽略**的文件，绝不动已跟踪的文件。
+
+```bash
+git clean -n           # 预览（dry-run），列出会删什么，不真删
+git clean -f           # 真正删除未跟踪文件
+git clean -fd          # 连未跟踪的目录一起删
+git clean -fdx         # 连 .gitignore 里忽略的文件也一起删（慎用）
+```
+
+<Playground
+  language="git"
+  title="git clean 与跳过工作区跟踪"
+  id="git-12-3"
+  code={`echo '===== git clean 与跳过工作区跟踪 ====='
+git init -q -b main ig3 && cd ig3
+echo 'tracked' > app.txt && git add app.txt && git commit -q -m "init"
+echo '临时文件' > temp.tmp
+echo '本地开发覆盖' > app.txt
+echo 'git clean -n 先预览（不真删，只列未跟踪文件）：'
+git clean -n
+echo 'git clean -f 真正删除未跟踪文件：'
+git clean -f
+echo 'temp.tmp 是否还在：'
+ls temp.tmp 2>/dev/null && echo '还在' || echo '已删除'
+echo '(注意：被跟踪的 app.txt 不会被 clean 删掉)'
+echo
+echo 'skip-worktree：让 Git 假装没改过某个已跟踪文件：'
+git update-index --skip-worktree app.txt
+echo 'status 不显示 app.txt 的本地改动：'
+git status --short
+echo '查看 skip-worktree 标记（小写 s 表示已标记）：'
+git ls-files -v app.txt
+echo '取消标记：'
+git update-index --no-skip-worktree app.txt
+git ls-files -v app.txt
+cd ..`}
+/>
+
+### skip-worktree / assume-unchanged：本地覆盖已跟踪文件
+
+有时一个文件必须进版本库（比如 `config.sample.js`），但你本地要改成自己的值，又不想每次 `git status` 都看到它被改、每次 `git stash` 都带它。两种"假装没改"的标记：
+
+| 命令 | 适用 | 语义 |
+|---|---|---|
+| `git update-index --skip-worktree <file>` | **本地修改不想提交**（如本地配置） | 告诉 Git 永不看这个文件的工作区改动 |
+| `git update-index --assume-unchanged <file>` | **性能优化**（大文件确认不变） | 假设它没变，跳过 stat 检查以提速 |
+
+区别：`--skip-worktree` 是"我故意改了、你别管"；`--assume-unchanged` 是"它保证没变、你别查了"。推荐用 `skip-worktree` 处理本地配置覆盖。查看标记：`git ls-files -v`，小写 `s` 表示 skip-worktree，小写 `h` 表示 assume-unchanged。
+
+<Callout type="warn" title="这两种标记不是保险箱">
+`git checkout`、`git reset --hard`、`git pull` 仍可能覆盖带标记的文件。它只是让 `git status` 和日常提交"看不见"改动，不能替代真正的配置分离（应为不同环境准备不同配置文件，本地那份放进 `.gitignore`）。
+</Callout>
+
+## 4. 常见文件管理问题速查
+
+| 问题 | 原因 | 解决 |
+|---|---|---|
+| 加了 `.gitignore` 文件仍被跟踪 | 已提交过 | `git rm --cached <file>` |
+| `*.log` 把重要日志也忽略了 | 规则太宽 | 加 `!important.log` 例外（写在后面） |
+| `git clean` 删不掉 | 文件被 `.gitignore` 忽略 | 加 `-x` 参数 |
+| `git status` 总显示本地配置改动 | 直接改了已跟踪文件 | `skip-worktree` 或改配置分离 |
+| 后悔 `git clean -f` | 直接删了 | 文件未跟踪，只能靠编辑器/磁盘恢复 |
+
+## 小结
+
+- `.gitignore` 用模式匹配挡住不该进库的文件；`!` 例外必须写在更具体的忽略规则之后
+- `git check-ignore -v` 是排查忽略规则的利器
+- 已跟踪文件要忽略：先写规则，再 `git rm --cached` 移出索引
+- 删除用 `git rm`、改名用 `git mv`，Git 才会正确识别 rename
+- `git clean -n` 预览、`-f` 执行，只删**未跟踪**文件，绝不动已跟踪文件
+- 本地覆盖配置用 `skip-worktree`（语义是"我故意改的"），不是 `assume-unchanged`
+- 下一章：Git 对象模型（.git 里到底存了什么）→
+
+<Callout type="exercise" title="练习">
+1. 写一个 `.gitignore`，让它能忽略 `build/`、`*.tmp`，但**不**忽略 `build/keep.txt`（提示：用 `!build/keep.txt`）。用 `git check-ignore -v` 验证两个文件的判定结果。
+2. 故意 `git add` 一个本该忽略的 `a.log` 并提交，再用 `git rm --cached a.log` 把它移出索引，观察 `git status` 的变化（它应该变成未跟踪且被忽略）。
+3. 在一个已跟踪文件上执行 `git update-index --skip-worktree app.txt`，修改它后看 `git status` 是否忽略改动；再执行 `--no-skip-worktree` 恢复。
+4. 用 `git mv` 重命名一个文件，然后 `git log --follow 新名字` 看能否追溯到改名前的历史。
+</Callout>

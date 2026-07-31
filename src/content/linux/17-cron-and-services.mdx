@@ -1,0 +1,203 @@
+---
+title: 定时任务与服务：cron 与 systemd
+order: 17
+description: cron 五段语法与运维惯例、systemd 单元/常用 systemctl 命令与 journalctl 日志
+---
+
+# 定时任务与服务：cron 与 systemd
+
+"每天凌晨备份数据库""服务挂了自动拉起""开机自动启动应用"——前者靠 **cron**（定时任务），后两者靠 **systemd**（服务管理）。这两套设施都依赖常驻的系统守护进程，沙箱容器无法完整演示，本章以展示讲解为主，配少量可跑的辅助练习；命令请在真机/云服务器上实操。
+
+## 1. cron：按时间表执行命令
+
+cron 守护进程（crond）每分钟醒来一次，检查所有用户的时间表（crontab），到点的任务就执行。管理自己的时间表：
+
+```bash
+crontab -e      # 编辑（首次会让你选编辑器）
+crontab -l      # 查看当前任务表
+crontab -r      # 删除全部（危险，几乎不用）
+```
+
+### 1.1 五段语法
+
+每行一个任务：五个时间字段 + 命令。
+
+```text
+┌───────── 分钟 (0-59)
+│ ┌───────── 小时 (0-23)
+│ │ ┌───────── 日 (1-31)
+│ │ │ ┌───────── 月 (1-12)
+│ │ │ │ ┌───────── 星期 (0-7，0 和 7 都是周日)
+│ │ │ │ │
+*  *  *  *  *  /opt/scripts/backup.sh
+```
+
+特殊符号：`*` 任意值、`*/5` 每 5 个单位、`1,15` 列表、`9-18` 区间。经典示例：
+
+| 表达式 | 含义 |
+|---|---|
+| `0 3 * * *` | 每天 03:00 |
+| `*/10 * * * *` | 每 10 分钟 |
+| `0 9 * * 1-5` | 工作日每天 09:00 |
+| `30 2 1 * *` | 每月 1 号 02:30 |
+| `0 */6 * * *` | 每 6 小时整点 |
+| `0 0 * * 0` | 每周日零点 |
+
+<Playground
+  language="linux"
+  title="练习读 cron 表达式（用脚本自查）"
+  id="linux-17-1"
+  code={`# 写一个迷你解读器，练习五段语法（仅处理常见形态）
+cat > explain.sh << 'EOF'
+#!/bin/bash
+explain_field() {
+  local VAL=$1
+  local UNIT=$2
+  case $VAL in
+    '*') echo "每$UNIT" ;;
+    */*) echo "每 $(echo $VAL | cut -d/ -f2) $UNIT" ;;
+    *-*) echo "$UNIT $VAL 范围内" ;;
+    *)   echo "$UNIT=$VAL" ;;
+  esac
+}
+echo "表达式: $1 $2 $3 $4 $5"
+echo " 分钟: $(explain_field $1 分钟)"
+echo " 小时: $(explain_field $2 小时)"
+echo " 日:   $(explain_field $3 日)"
+echo " 月:   $(explain_field $4 月)"
+echo " 周:   $(explain_field $5 周)"
+EOF
+chmod +x explain.sh
+
+./explain.sh 0 3 '*' '*' '*'
+echo '---'
+./explain.sh '*/10' '*' '*' '*' '*'
+echo '---'
+./explain.sh 0 9 '*' '*' 1-5`}
+/>
+
+### 1.2 运维惯例：cron 任务的标准写法
+
+生产 crontab 里的任务几乎都长这样，每一处都有原因：
+
+```bash
+0 3 * * * /opt/scripts/backup.sh >> /var/log/backup.log 2>&1
+```
+
+- **绝对路径**：cron 环境的 PATH 极简（往往只有 /usr/bin:/bin），脚本和其中的命令都用绝对路径，或在脚本开头自设 PATH；
+- **重定向输出落盘**：cron 默认把输出尝试发邮件（多数服务器没配邮件，等于丢失），`>> log 2>&1` 才留得下现场；
+- **脚本自带锁**：任务耗时可能超过间隔导致重叠执行，用 flock 防止：`flock -n /tmp/backup.lock /opt/scripts/backup.sh`。
+
+<Callout type="warn" title="cron 排障三板斧">
+任务没执行，按序检查：1) `crontab -l` 确认任务在、语法对；2) 看 cron 自身日志（Debian 系 `grep CRON /var/log/syslog`，RHEL 系 `/var/log/cron`）确认有没有被触发；3) 手动以同样命令行执行一次脚本——九成问题是 PATH/环境变量与交互 Shell 不同导致的。
+</Callout>
+
+<Playground
+  language="linux"
+  title="模拟 cron 惯例：日志追加 + flock 防重叠"
+  id="linux-17-2"
+  code={`# 沙箱没有 crond 常驻，但任务脚本的"惯例"可以完整演练
+cat > job.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+echo "[$(date '+%F %T')] job start"
+sleep 1
+echo "[$(date '+%F %T')] job done"
+EOF
+chmod +x job.sh
+
+echo '$ 模拟 cron 的两次触发（输出追加进日志）：'
+./job.sh >> /tmp/job.log 2>&1
+./job.sh >> /tmp/job.log 2>&1
+cat /tmp/job.log
+
+echo ''
+echo '$ flock 防重叠：第二个实例拿不到锁直接放弃（-n 不等待）'
+flock -n /tmp/job.lock sleep 3 &
+sleep 0.3
+flock -n /tmp/job.lock echo '我抢到了锁' || echo '锁被占用，本轮跳过（这就是防重叠）'
+wait`}
+/>
+
+## 2. systemd：现代 Linux 的服务管家
+
+systemd 是主流发行版的 1 号进程（PID 1），负责开机引导、服务生命周期、日志收集。核心概念是**单元（unit）**，最常打交道的是服务单元（`.service` 文件）。
+
+### 2.1 一个典型的服务单元
+
+```ini
+# /etc/systemd/system/myapp.service
+[Unit]
+Description=My Web App
+After=network.target          ; 在网络就绪后再启动
+
+[Service]
+User=appuser                  ; 以低权限用户运行
+WorkingDirectory=/opt/myapp
+ExecStart=/opt/myapp/bin/server --port 8080
+Restart=on-failure            ; 崩溃自动拉起——nohup 给不了的能力
+RestartSec=3
+Environment=APP_ENV=prod
+
+[Install]
+WantedBy=multi-user.target    ; enable 时挂到哪个启动目标
+```
+
+### 2.2 systemctl 命令速查
+
+```bash
+sudo systemctl start myapp        # 启动
+sudo systemctl stop myapp         # 停止
+sudo systemctl restart myapp      # 重启
+sudo systemctl reload nginx       # 不中断服务重载配置（服务需支持）
+systemctl status myapp            # 状态：active? 主 PID？最近日志摘要
+sudo systemctl enable myapp       # 开机自启（创建软链接，不等于现在启动）
+sudo systemctl enable --now myapp # 自启 + 立即启动，一步到位
+sudo systemctl daemon-reload      # 改了 .service 文件后必须先执行这个
+systemctl list-units --type=service --state=running    # 在跑的服务清单
+```
+
+新手最高频的两个坑：改完 unit 文件忘了 `daemon-reload`（改动不生效）；以为 `enable` 会顺便启动服务（它只管开机自启，当下启动要 start 或用 `--now`）。
+
+### 2.3 journalctl：统一日志
+
+systemd 把所有服务的 stdout/stderr 收进 journal，不用再满盘找日志文件：
+
+```bash
+journalctl -u myapp               # 某服务的全部日志
+journalctl -u myapp -f            # 实时追踪（tail -f 的服务版）
+journalctl -u myapp --since '1 hour ago'      # 时间过滤
+journalctl -u myapp -p err        # 只看 error 及以上级别
+journalctl --disk-usage           # journal 占了多少磁盘
+```
+
+<Callout type="info" title="容器时代的对照">
+Docker/K8s 里通常**不用** systemd 和 cron：容器的 1 号进程就是应用本身，"崩溃拉起"交给编排器（restartPolicy），定时任务交给 K8s CronJob。但云主机上直接部署时，systemd + cron 仍是标准答案——两套都要会，按环境选用。
+</Callout>
+
+## 3. 该用哪个：决策表
+
+| 需求 | 方案 |
+|---|---|
+| 每天/每小时跑一次脚本 | cron（或 systemd timer） |
+| 常驻服务、崩溃自动拉起、开机自启 | systemd service |
+| 临时长任务，跑完就完 | nohup / tmux（第 11 章） |
+| 容器内定时/常驻 | K8s CronJob / restartPolicy |
+
+systemd 其实也有自己的定时器（timer 单元），比 cron 多了错过补跑（Persistent）、依赖管理和统一日志的优势，新项目值得考虑；cron 的优势是简单和无处不在。
+
+## 小结
+
+- cron 五段：分 时 日 月 周；`*/n` 每 n 个单位，`1-5` 区间，`crontab -e/-l` 管理
+- cron 任务三惯例：绝对路径、输出重定向落盘、flock 防重叠；排障先手动跑一遍
+- systemd 单元文件声明服务：ExecStart、Restart=on-failure、WantedBy
+- systemctl：start/stop/restart/status/enable --now；改文件后 daemon-reload
+- journalctl -u 服务名 -f 看日志；容器环境用编排器替代这两套
+- 下一章：apt/yum/apk——软件包管理 →
+
+<Callout type="exercise" title="练习">
+1. 写出 cron 表达式：每周六 23:30；每月 1 号和 15 号的 04:00；工作日 9 点到 18 点之间每半小时。
+2. 在沙箱用 flock 复现"防重叠"：后台先占锁 5 秒，期间循环三次尝试 `flock -n` 执行任务，观察哪几次被跳过。
+3. 阅读 2.1 的 unit 文件，回答：服务崩溃后多久重启？以哪个用户运行？如何让改动后的配置生效并重启服务（写出完整命令序列）？
+4. 真机作业：在一台云服务器上创建一个每分钟往 /tmp/heartbeat.log 追加时间戳的 cron 任务，验证生效后删除它（`crontab -e` 增删行）。
+</Callout>
