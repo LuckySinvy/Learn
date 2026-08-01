@@ -180,4 +180,83 @@ cat task.log`}
 2. 验证退出码规律：分别用 kill -15 和 kill -9 终止后台 sleep，用 `wait $PID; echo $?` 记录两次退出码，解释 143 和 137 的由来。
 3. 用 nohup 启动一个循环写日志的脚本并记录 PID 到文件，然后通过 `kill $(cat xxx.pid)` 停止它——这正是很多服务 stop 脚本的原理。
 4. 思考题：SSH 里直接 `./server &` 后断开连接，进程为什么消失了？加 nohup 后为什么还建议同时重定向输出？
+
+<Answer>
+**参考答案：**
+
+**第 1 题：启动 3 个后台 sleep 并全部杀掉**
+
+```bash
+sleep 300 &
+sleep 300 &
+sleep 300 &
+
+ps            # 确认 3 个 sleep 都在
+pkill sleep   # 方式一：按名字杀，一条命令解决
+# 方式二：ps | grep | awk | xargs 管道
+# ps | grep sleep | grep -v grep | awk '{print $1}' | xargs kill
+```
+
+验证：`ps` 后再看，sleep 进程应全部消失。注意 `pkill sleep` 的匹配规则是进程名，确认没有其它同名关键进程时再使用。
+
+**第 2 题：143 与 137 的由来**
+
+```bash
+sleep 300 &
+PID1=$!
+kill -15 $PID1      # 发 SIGTERM
+wait $PID1
+echo "TERM exit = $?"    # 143
+
+sleep 300 &
+PID2=$!
+kill -9 $PID2       # 发 SIGKILL
+wait $PID2
+echo "KILL exit = $?"    # 137
+```
+
+规律：被信号终止的进程，退出码 = **128 + 信号编号**。
+
+- `kill -15` 发 SIGTERM（编号 15）→ 128 + 15 = **143**；
+- `kill -9` 发 SIGKILL（编号 9）→ 128 + 9 = **137**。
+
+137 在容器场景极常见：容器内存超限被 OOM Killer 强杀，看到的退出码就是 137。
+
+**第 3 题：nohup + PID 文件的启停**
+
+```bash
+# 造一个循环写日志的脚本
+cat > logger.sh << 'EOF'
+#!/bin/bash
+i=0
+while true; do
+  echo "tick $i"
+  i=$((i+1))
+  sleep 1
+done
+EOF
+chmod +x logger.sh
+
+# 启动并记录 PID
+nohup ./logger.sh > logger.log 2>&1 &
+echo $! > logger.pid
+cat logger.pid
+
+# 按 PID 文件停止
+kill $(cat logger.pid)
+```
+
+`kill $(cat logger.pid)` 就是很多服务 stop 脚本的核心：先读 PID 文件拿到进程号，再对它发信号（默认 SIGTERM，留给进程优雅退出的机会）。
+
+**第 4 题：为什么断开 SSH 后后台进程会消失**
+
+SSH 会话结束时，Shell 退出前会向它的所有子进程发送 **SIGHUP**（挂断信号）。默认情况下进程收到 SIGHUP 就退出，所以 `./server &` 启动的后台进程也会跟着被 SIGHUP 杀死。
+
+`nohup` 的作用就是让进程**忽略 SIGHUP**，SSH 断开后依然存活。但还要配合输出重定向 `> log 2>&1`，因为：
+
+- 进程的 stdout/stderr 原本连着终端的伪终端（pty），会话关闭后这些通道就断了，进程再往 stdout 写内容会收到错误甚至触发异常退出；
+- 重定向到文件后，进程的输出有稳定的去处，日志还能留档排查。
+
+所以标准姿势是 `nohup cmd > log 2>&1 &`——nohup 保命，重定向保输出通道。
+</Answer>
 </Callout>

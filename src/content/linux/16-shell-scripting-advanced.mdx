@@ -266,4 +266,120 @@ trap cleanup EXIT        # 无论正常结束、报错还是被信号打断，�
 2. 写函数 `check_port`，参数是端口号：小于 1024 输出 privileged 并 return 1，否则输出 ok return 0；用 80、8080 两个输入验证 `$?`。
 3. 写一个 `svc.sh`，用 case 实现 start/stop/status 三个子命令（用 touch/rm/检查一个 .pid 文件模拟），无参数时打印 usage 并 exit 1。
 4. 把第 1 题脚本加上 `set -euo pipefail`，故意在循环里引用一个拼错的变量名，观察脚本在哪一步停下、退出码是什么。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：批量生成文件 + 偶数序号改名**
+
+```bash
+cat > gen.sh << 'EOF'
+#!/bin/bash
+# 生成 log-01.txt 到 log-10.txt
+for i in $(seq 1 10); do
+  touch "$(printf 'log-%02d.txt' "$i")"
+done
+ls log-*.txt
+
+# 把序号为偶数的改成 .bak 后缀
+for f in log-*.txt; do
+  N=${f#log-}          # 去掉 log- 前缀
+  N=${N%.txt}          # 去掉 .txt 后缀
+  if [ $((N % 2)) -eq 0 ]; then
+    mv "$f" "$f.bak"
+  fi
+done
+ls log-*
+EOF
+chmod +x gen.sh
+./gen.sh
+```
+
+`printf '%02d'` 把数字补成两位（01、02…10）；从文件名提取序号用参数展开 `${f#log-}`（去最短前缀）和 `${N%.txt}`（去最短后缀）；`$((N % 2))` 判断奇偶。
+
+**第 2 题：check_port 函数**
+
+```bash
+cat > port.sh << 'EOF'
+#!/bin/bash
+check_port() {
+  local P=$1
+  if [ "$P" -lt 1024 ]; then
+    echo "privileged"
+    return 1
+  fi
+  echo "ok"
+  return 0
+}
+
+check_port 80
+echo "80 -> $?"
+check_port 8080
+echo "8080 -> $?"
+EOF
+chmod +x port.sh
+./port.sh
+```
+
+注意 `$?` 取的是**上一条命令**的退出码，所以要先调用函数、再单独 `echo $?`；`local P=$1` 里 `$1` 是函数的第一个参数，与脚本参数无关。
+
+**第 3 题：svc.sh 用 case 模拟服务管理**
+
+```bash
+cat > svc.sh << 'EOF'
+#!/bin/bash
+case $1 in
+  start)
+    touch /tmp/svc.pid
+    echo "started (pid file created)"
+    ;;
+  stop)
+    rm -f /tmp/svc.pid
+    echo "stopped (pid file removed)"
+    ;;
+  status)
+    if [ -f /tmp/svc.pid ]; then
+      echo "running"
+    else
+      echo "not running"
+    fi
+    ;;
+  *)
+    echo "usage: $0 {start|stop|status}"
+    exit 1
+    ;;
+esac
+EOF
+chmod +x svc.sh
+
+./svc.sh start     # started
+./svc.sh status    # running
+./svc.sh stop      # stopped
+./svc.sh status    # not running
+./svc.sh           # 打印 usage，echo $? 为 1
+```
+
+用 `.pid` 文件的存在性模拟服务状态，`case` 的 `*)` 分支兜底处理未知参数并 `exit 1`。
+
+**第 4 题：set -u 抓拼错变量**
+
+```bash
+cat > buggy.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+for i in $(seq 1 10); do
+  touch "$(printf 'log-%02d.txt' "$i")"
+  echo "created $LOOG"   # 拼错的变量名：LOOG 应为 LOG
+done
+echo '脚本结束'
+EOF
+chmod +x buggy.sh
+./buggy.sh
+# 第一次循环就停下，输出类似：
+# buggy.sh: line 5: LOOG: unbound variable
+echo "exit code = $?"    # 1
+```
+
+`set -u` 让脚本在第一次引用未定义变量 `$LOOG` 时**当场报错并终止**，而不是把空串当值继续跑。脚本只生成了第一个文件 `log-01.txt` 就停在第一轮循环（也可能一个文件都没生成，取决于 touch 与 echo 的顺序），退出码为 1（shell 语法/变量错误常用 1）。这就是 `set -u` 的价值——拼写错误立刻现形，而不是静默出错带偏后续逻辑。
+</Answer>
 </Callout>

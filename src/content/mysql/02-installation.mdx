@@ -229,4 +229,100 @@ SELECT DATABASE();   -- 确认已切到 shop
 1. 用 Docker 启动一个 MySQL 8.0 实例，字符集 utf8mb4、时区东八区。
 2. 创建 `shop` 库和一个只对 `shop` 库有 CRUD 权限的账号 `app`，用它登录并确认 `SHOW DATABASES` 只能看到 `shop` 和 information_schema。
 3. 执行 `SELECT NOW();` 验证时间是否为北京时间；故意把会话时区改成 `+00:00` 再看 NOW() 的变化。
+
+<Answer>
+**参考答案：**
+
+**1. 启动 utf8mb4 + 东八区的实例**
+
+```bash
+docker run -d \
+  --name mysql8 \
+  -p 3306:3306 \
+  -e MYSQL_ROOT_PASSWORD=root123 \
+  -e TZ=Asia/Shanghai \
+  -v mysql8-data:/var/lib/mysql \
+  mysql:8.0 \
+  --character-set-server=utf8mb4 \
+  --collation-server=utf8mb4_0900_ai_ci \
+  --default-time-zone=+08:00
+```
+
+关键点：`TZ` 环境变量只改容器操作系统的时区，**mysqld 不一定跟随**，所以必须再加 `--default-time-zone=+08:00` 才稳妥。验证：
+
+```bash
+docker exec -it mysql8 mysql -uroot -proot123 \
+  -e "SELECT VERSION(); SHOW VARIABLES LIKE 'character_set_server'; SELECT @@global.time_zone, NOW();"
+```
+
+**2. 建库 + 建最小权限账号**
+
+```sql
+CREATE DATABASE shop
+  DEFAULT CHARACTER SET utf8mb4
+  DEFAULT COLLATE utf8mb4_0900_ai_ci;
+
+-- '%' 表示任意来源；生产应收窄到内网网段，如 '10.0.%'
+CREATE USER 'app'@'%' IDENTIFIED BY 'S3cure#Pass';
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'app'@'%';
+
+FLUSH PRIVILEGES;
+
+SHOW GRANTS FOR 'app'@'%';
+```
+
+`SHOW GRANTS` 应该输出两行：一行 `GRANT USAGE ON *.*`（只代表「能登录」，没有任何实际权限），一行 `GRANT SELECT, INSERT, UPDATE, DELETE ON shop.*`。
+
+用 app 登录验证：
+
+```bash
+docker exec -it mysql8 mysql -uapp -p'S3cure#Pass' -e "SHOW DATABASES;"
+```
+
+```text
++--------------------+
+| Database           |
++--------------------+
+| information_schema |
+| shop               |
++--------------------+
+```
+
+**为什么 `information_schema` 一定看得见**：它是虚拟的元数据库，对所有账号可见，但内容会**按权限过滤**——app 在里面也只能查到 shop 库的表。另外，如果账号有全局 `SHOW DATABASES` 权限（或误给了 `ON *.*`），就会看到所有库，这正是要检查的点。
+
+再验证 DDL 确实被拒绝：
+
+```sql
+CREATE TABLE shop.t(id INT);
+-- ERROR 1142 (42000): CREATE command denied to user 'app'@'...' for table 't'
+```
+
+**3. 时区实验**
+
+```sql
+SELECT @@global.time_zone, @@session.time_zone, NOW(), UTC_TIMESTAMP();
+-- +08:00 | +08:00 | 2026-08-01 15:30:00 | 2026-08-01 07:30:00
+
+SET time_zone = '+00:00';
+SELECT @@session.time_zone, NOW();
+-- +00:00 | 2026-08-01 07:30:00     ← 整整差了 8 小时
+```
+
+结论与延伸：
+
+- `NOW()` / `CURRENT_TIMESTAMP` 返回的是**会话时区**下的挂钟时间，改会话时区会立刻改变它的输出；`UTC_TIMESTAMP()` 永远返回 UTC，不受影响。
+- 更能说明问题的是 `TIMESTAMP` 列：它按 UTC 存储、按会话时区渲染，所以同一行数据在不同时区的会话里读出来的字符串不同；而 `DATETIME` 存的是字面值，不管会话时区怎么改，读出来都一样。
+
+```sql
+CREATE TABLE t_tz (ts TIMESTAMP, dt DATETIME);
+SET time_zone = '+08:00';
+INSERT INTO t_tz VALUES (NOW(), NOW());
+SELECT * FROM t_tz;      -- 两列相同
+SET time_zone = '+00:00';
+SELECT * FROM t_tz;      -- ts 变了（早 8 小时），dt 没变
+```
+
+这就是「数据库时间比北京时间慢 8 小时」这类线上问题的根源：应用、连接串、MySQL 三处时区必须对齐。
+</Answer>
 </Callout>

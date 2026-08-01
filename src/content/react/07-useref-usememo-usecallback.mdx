@@ -372,6 +372,106 @@ React 19 起，官方的编译器（原 React Forget）能在编译期自动插�
 4. 列表的滚动位置（用于显示「回到顶部」按钮）
 5. 列表的滚动位置（仅用于路由返回时恢复）
 6. 拖拽过程中鼠标按下时的初始坐标
+
+<Answer>
+**参考答案：**
+
+判断标准只有一句：**这个值变了，界面需要跟着变吗？**
+
+| # | 数据 | 选择 | 理由 |
+|---|---|---|---|
+| 1 | 输入框当前值 | **state** | 受控组件的值直接决定界面显示 |
+| 2 | 防抖的 timeout id | **ref** | 纯内部记账，界面上看不到它 |
+| 3 | 是否已上报埋点 | **ref** | 只是个开关，不影响任何渲染输出 |
+| 4 | 滚动位置（控制「回到顶部」按钮） | **state**（但要处理好） | 按钮的显示与否依赖它 |
+| 5 | 滚动位置（仅路由返回时恢复） | **ref** | 只在离开/返回的瞬间读一次 |
+| 6 | 拖拽起始坐标 | **ref** | 只是计算增量的中间量 |
+
+**逐条说明：**
+
+**1. 输入框当前的值 → state**
+
+受控组件的定义就是「值由 state 决定」。用 ref 存的话，改了值不会重渲染，输入框永远显示不出来。
+
+唯一的例外是**非受控输入框**——那时你根本不「存」值，而是用 `useRef<HTMLInputElement>` 拿到 DOM，提交时读 `inputRef.current.value`。注意这两种情况下 ref 的角色完全不同：前者是「存值的盒子」（错误用法），后者是「DOM 句柄」（正确用法）。
+
+**2. 防抖的 timeout id → ref**
+
+界面上不存在「当前 timer id 是 172」这种显示。用 state 存的话，每次 `setTimeout`/`clearTimeout` 都会多触发一次渲染，而这次渲染的输出和上次一模一样——纯浪费。这和本章 `Stopwatch` 例子里的 `timerRef` 是同一个道理。
+
+**3. 「是否已上报埋点」的标记 → ref**
+
+同样不影响渲染。它的典型用途正是应对第 5 章说的 StrictMode 双执行：
+
+```tsx
+const reportedRef = useRef(false);
+useEffect(() => {
+  if (reportedRef.current) return;
+  reportedRef.current = true;
+  reportView(productId);
+}, [productId]);
+```
+
+用 state 存这个标记还会引发一个更糟的问题：`setState` → 重渲染 → effect 依赖变化 → 又跑一遍，容易写出死循环。
+
+**4. 滚动位置（用于显示「回到顶部」按钮）→ state，但不要存原始滚动值**
+
+按钮的显示与否确实依赖滚动位置，所以必须是 state。但**直接把 `scrollTop` 存成 state 是性能灾难**——滚动时每一像素都会触发一次重渲染。
+
+正确做法是**只存派生出来的布尔值**：
+
+```tsx
+const [showTop, setShowTop] = useState(false);
+
+useEffect(() => {
+  function onScroll() {
+    const next = window.scrollY > 300;
+    setShowTop((prev) => (prev === next ? prev : next));   // 值没变就不更新
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  return () => window.removeEventListener("scroll", onScroll);
+}, []);
+```
+
+这样整个滚动过程中最多只重渲染 2 次（越过阈值上去、越过阈值下来）。传给 `setState` 相同的值时 React 会跳过重渲染，所以这里其实连手动比较都可以省掉——但显式写出来意图更清楚。
+
+**5. 滚动位置（仅用于路由返回时恢复）→ ref**
+
+这个值在渲染期间完全用不到，只在两个时刻被碰：离开页面时写、回来时读。用 state 会导致滚动时疯狂重渲染，而且毫无收益。
+
+```tsx
+const scrollRef = useRef(0);
+
+useEffect(() => {
+  const onScroll = () => { scrollRef.current = window.scrollY; };
+  window.addEventListener("scroll", onScroll, { passive: true });
+  return () => {
+    window.removeEventListener("scroll", onScroll);
+    sessionStorage.setItem("list-scroll", String(scrollRef.current));  // 卸载时落盘
+  };
+}, []);
+```
+
+**注意第 4 题和第 5 题是同一个数据，答案却不同**——这恰好证明了「用 state 还是 ref」取决于**用途**，而不是数据本身的性质。
+
+**6. 拖拽起始坐标 → ref**
+
+`mousedown` 时记下起点，`mousemove` 时用「当前坐标 − 起点」算出位移。起点本身从不显示在界面上，是个纯中间量。
+
+```tsx
+const startRef = useRef({ x: 0, y: 0 });
+const [offset, setOffset] = useState({ x: 0, y: 0 });   // 这个才影响界面
+
+function onMouseDown(e: React.MouseEvent) {
+  startRef.current = { x: e.clientX - offset.x, y: e.clientY - offset.y };
+}
+function onMouseMove(e: React.MouseEvent) {
+  setOffset({ x: e.clientX - startRef.current.x, y: e.clientY - startRef.current.y });
+}
+```
+
+而且它必须是 ref 而不是普通变量——普通变量在 `mousedown` 的那次渲染结束后就没了，`mousemove` 那次渲染读不到。**「跨渲染保持 + 不影响界面」这两个条件同时成立，就是 ref 的标准使用场景。**
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：找出无效的 useMemo">
@@ -384,6 +484,74 @@ const rows = useMemo(() => data.filter((d) => d.active), [data]);
 假设这四个值分别传给：一个普通的 span、一个普通的 div、一个 React.memo 包裹的图表组件、一个普通的 ul（内部 map）。
 
 判断哪几个 useMemo 是有价值的，哪几个应该删掉。
+
+<Answer>
+**参考答案：只有第 3 个值得保留，其余三个都该删掉。**
+
+| # | 计算 | 消费方 | 判断 |
+|---|---|---|---|
+| 1 | `a + b` | 普通 span | ❌ 删 |
+| 2 | `name.toUpperCase()` | 普通 div | ❌ 删 |
+| 3 | 对象字面量 | `React.memo` 图表 | ✅ **保留** |
+| 4 | `data.filter(...)` | 普通 ul | ❌ 删（除非数据量极大） |
+
+---
+
+**1. `useMemo(() => a + b, [a, b])` → 删**
+
+一次加法是**纳秒**级。而 `useMemo` 要做的事有：占一个 Hook 槽位、创建 `[a, b]` 这个数组、和上次的数组逐位 `Object.is` 比较、把结果存进链表节点。**缓存的开销比被缓存的计算大了好几个数量级**，这是纯亏损。
+
+而且消费方是普通 span，`total` 是不是新引用它根本不关心（数字本来也是原始值，谈不上引用）。
+
+```tsx
+const total = a + b;   // 就这样
+```
+
+**2. `useMemo(() => name.toUpperCase(), [name])` → 删**
+
+同理。字符串的 `toUpperCase` 对正常长度的名字来说也是纳秒级，而且结果是原始值，不存在「稳定引用」的需求。
+
+**3. `useMemo(() => ({ color: theme.fg }), [theme.fg])` → 保留 ✅**
+
+注意它有价值的原因**不是**「创建对象很贵」——创建一个只有一个字段的对象比 `useMemo` 本身还便宜。
+
+它的价值在于**稳定引用**：消费方是 `React.memo` 包裹的图表组件，`React.memo` 用浅比较判断 props 是否变化。如果不加 `useMemo`：
+
+```tsx
+const style = { color: theme.fg };        // 每次渲染都是新对象
+return <ExpensiveChart style={style} />;  // Object.is(旧, 新) === false
+```
+
+→ 父组件每次重渲染，图表都跟着重渲染，`React.memo` **完全白加**。
+
+这正是本章 2.3 节说的「用途二：稳定引用，让下游的 memo 生效」。判断依据是**下游有没有 memo**，与计算本身的开销无关。
+
+依赖写 `[theme.fg]` 而不是 `[theme]` 也是对的——只有真正用到的那个字段变化时才需要新对象。
+
+**4. `useMemo(() => data.filter((d) => d.active), [data])` → 删（有条件）**
+
+消费方是普通 ul，内部直接 map。`rows` 是不是新数组引用，普通 ul 完全不在乎——它每次都会重新渲染所有子元素。
+
+- 几十到几千条数据：`filter` 是微秒级，删掉 `useMemo`，直接现算。
+- **上万条 + 复杂过滤逻辑**：这时缓存才开始有意义，用 Profiler 实测确认后再加。
+
+**还有一种情况会让它变得有价值：** 如果 ul 里的子项换成了 `React.memo(Row)`，或者 `rows` 被传给了另一个 memo 组件、或者出现在某个 `useEffect` 的依赖数组里——那 `rows` 的引用稳定性就重要了，理由和第 3 个完全相同。
+
+---
+
+**归纳成一条决策规则：**
+
+```text
+加 useMemo 的理由只有两个，二者有其一才加：
+  ① 这个计算真的很慢（毫秒级以上，用 Profiler 量过）
+  ② 这个结果是对象/数组/函数，且下游有 memo 或依赖数组要吃它
+
+原始值（number / string / boolean）几乎永远不需要 ②，
+因为它们按值比较，不存在「引用不稳定」的问题。
+```
+
+本题里第 1、2 个是原始值且计算便宜——两个理由都不占；第 4 个占了「是数组」但下游不在乎——理由 ② 不成立；只有第 3 个实打实地命中了理由 ②。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：实现 useEventCallback">
@@ -396,12 +564,265 @@ const stable = useEventCallback((id: string) => {
 ```
 
 提示：需要一个 ref 存最新函数，加一个 useCallback 返回稳定的包装函数。想一想为什么这个 Hook 不能在渲染期间调用。
+
+<Answer>
+**参考答案：**
+
+```tsx
+function useEventCallback<A extends unknown[], R>(
+  fn: (...args: A) => R
+): (...args: A) => R {
+  const ref = useRef(fn);
+
+  // ① 每次渲染提交后，把最新的 fn 写进 ref
+  //    用 useLayoutEffect 而不是 useEffect：确保在任何 useEffect 之前完成更新，
+  //    这样别的 effect 里调用这个函数时读到的一定是本轮最新的
+  useLayoutEffect(() => {
+    ref.current = fn;
+  });
+
+  // ② 返回一个引用永不改变的包装函数
+  //    注意 .current 是在「被调用的那一刻」才读取的
+  return useCallback((...args: A) => ref.current(...args), []);
+}
+```
+
+**使用效果：**
+
+```tsx
+function Chat({ roomId }: { roomId: string }) {
+  const [count, setCount] = useState(0);
+
+  const onMessage = useEventCallback((msg: string) => {
+    console.log(count, roomId, msg);   // count 和 roomId 永远是最新的
+  });
+
+  useEffect(() => {
+    const socket = connect(roomId);
+    socket.on("msg", onMessage);
+    return () => socket.close();
+  }, [roomId]);   // ← onMessage 不需要进依赖，因为它永远不变
+
+  return <button onClick={() => setCount((c) => c + 1)}>{count}</button>;
+}
+```
+
+它同时解决了两个互相矛盾的需求：
+
+- **引用稳定** → 放进依赖数组不会导致 effect 反复重建，传给 `React.memo` 子组件也不会击穿缓存
+- **逻辑最新** → 每次调用执行的都是最近一次渲染时定义的那个闭包，读到的 state 是最新的
+
+对比一下普通的 `useCallback`：它要么依赖写全（引用不稳），要么依赖写空（逻辑过期），**没法两全**。`useEventCallback` 靠「把读取推迟到调用时刻」绕开了这个矛盾。
+
+---
+
+**为什么这个 Hook 不能在渲染期间调用**
+
+有三层原因，一层比一层根本：
+
+**① 时序上，渲染期读到的 `ref.current` 是过期的**
+
+`ref.current = fn` 写在 effect 里，而 effect 在**提交之后**才执行。所以在本轮渲染进行到一半时，`ref.current` 里装的还是**上一轮**的函数：
+
+```tsx
+const stable = useEventCallback(() => count);
+const wrong = stable();   // ❌ 拿到的是上一次渲染的 count
+```
+
+首次渲染更糟——`ref.current` 是初始值 `fn` 本身（因为 `useRef(fn)`），侥幸是对的；但从第二次渲染起就全错了。这种「第一次对、后面错」的 bug 极难排查。
+
+**② 语义上，它破坏了渲染的纯粹性**
+
+`stable()` 的返回值取决于「effect 跑到哪一步了」，而不只取决于 props 和 state。同样的输入可能得到不同的输出——这直接违反了第 3 章的渲染纯度要求。
+
+**③ 根本上，它和并发渲染不兼容**
+
+React 18 的并发特性允许「渲染一半丢弃重来」。被丢弃的那次渲染**不会提交**，也就不会跑 effect，`ref.current` 不会更新。如果渲染期间就读它，你读到的是一个「来自某次可能已经被丢弃的渲染」的函数——这个值在语义上根本不存在于当前的渲染树里。
+
+**React 官方的 `useEffectEvent`（实验特性）就是这个 Hook 的标准化版本，它在开发模式下会直接抛错**：
+
+```text
+A function wrapped in useEffectEvent can't be called during rendering.
+```
+
+---
+
+**它该在哪里被调用：**
+
+- ✅ 事件处理函数里（`onClick`、`onChange`）
+- ✅ `useEffect` 内部，包括订阅回调、定时器回调
+- ✅ 传给第三方库作为回调
+- ❌ 组件函数体内直接调用
+- ❌ `useMemo` 的工厂函数里（那也是渲染期）
+
+一句话概括：**它是给「渲染之后的世界」用的函数。**
+
+---
+
+**一个实现细节：为什么用 `useLayoutEffect` 而不是 `useEffect`**
+
+考虑这个顺序：
+
+```tsx
+const handler = useEventCallback(() => count);
+
+useEffect(() => {
+  handler();   // 如果 ref 也是在 useEffect 里更新的，谁先跑？
+}, [something]);
+```
+
+`useEffect` 之间按声明顺序执行，`useEventCallback` 内部的 effect 声明在前，所以这个例子里恰好没问题。但只要调用方把 `useEventCallback` 写在后面，顺序就反了。用 `useLayoutEffect` 能保证它**总是**先于所有 `useEffect` 完成——因为布局副作用整体在被动副作用之前执行。React 内部实现用的是更早的 `useInsertionEffect`，动机是一样的。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：扩展 Playground">
 给本章 Playground 的 `useMemoMini` 加一个「命中率统计」：记录总调用次数和缓存命中次数，最后打印命中率。
 
 然后新增一个场景：连续 5 次渲染，其中第 3 次换了新的 items 引用（但内容相同），验证命中率的计算结果符合预期。
+
+<Answer>
+**参考答案：**
+
+```ts
+type Deps = readonly unknown[];
+
+interface MemoSlot {
+  deps: Deps;
+  value: unknown;
+}
+
+const slots: MemoSlot[] = [];
+let cursor = 0;
+
+// —— 新增：命中率统计 ——
+let memoCalls = 0;
+let memoHits = 0;
+
+function sameDeps(a: Deps, b: Deps): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!Object.is(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+function useMemoMini<T>(factory: () => T, deps: Deps): T {
+  memoCalls++;                 // ← 每次调用都计数
+  const index = cursor;
+  cursor++;
+
+  const slot: MemoSlot | undefined = slots[index];
+  if (slot !== undefined && sameDeps(slot.deps, deps)) {
+    memoHits++;                // ← 命中缓存
+    return slot.value as T;
+  }
+
+  const value = factory();
+  slots[index] = { deps: deps, value: value };
+  return value;
+}
+
+function hitRate(): string {
+  if (memoCalls === 0) return "0.0%";
+  return ((memoHits / memoCalls) * 100).toFixed(1) + "%";
+}
+
+interface Item {
+  name: string;
+  price: number;
+}
+
+let computeCount = 0;
+
+function expensiveSort(items: Item[]): Item[] {
+  computeCount++;
+  const copy = items.slice();
+  copy.sort(function (a, b) {
+    return a.price - b.price;
+  });
+  return copy;
+}
+
+const listA: Item[] = [
+  { name: "键盘", price: 399 },
+  { name: "鼠标", price: 129 },
+  { name: "屏幕", price: 1899 },
+];
+
+function render(items: Item[], label: string): void {
+  cursor = 0;
+
+  const sorted = useMemoMini(function () {
+    return expensiveSort(items);
+  }, [items]);
+
+  console.log(
+    label +
+      " 首项:" + sorted[0].name +
+      "  调用:" + memoCalls +
+      "  命中:" + memoHits +
+      "  实际计算:" + computeCount
+  );
+}
+
+// 内容与 listA 完全相同，但是一个全新的数组对象
+const listACopy = listA.slice();
+
+render(listA, "渲染1 listA 首次      ");
+render(listA, "渲染2 listA 同一引用  ");
+render(listACopy, "渲染3 新数组内容相同  ");
+render(listACopy, "渲染4 listACopy 同引用");
+render(listACopy, "渲染5 listACopy 同引用");
+
+console.log("---");
+console.log("总调用 " + memoCalls + " 次，命中 " + memoHits + " 次，命中率 " + hitRate());
+console.log("工厂函数实际执行 " + computeCount + " 次");
+```
+
+**预期输出：**
+
+```text
+渲染1 listA 首次       首项:鼠标  调用:1  命中:0  实际计算:1
+渲染2 listA 同一引用   首项:鼠标  调用:2  命中:1  实际计算:1
+渲染3 新数组内容相同   首项:鼠标  调用:3  命中:1  实际计算:2
+渲染4 listACopy 同引用 首项:鼠标  调用:4  命中:2  实际计算:2
+渲染5 listACopy 同引用 首项:鼠标  调用:5  命中:3  实际计算:2
+---
+总调用 5 次，命中 3 次，命中率 60.0%
+工厂函数实际执行 2 次
+```
+
+**逐次分析：**
+
+| 渲染 | 传入 | `Object.is(上次deps[0], 本次deps[0])` | 结果 |
+|---|---|---|---|
+| 1 | `listA` | 槽位为空 | miss，计算 |
+| 2 | `listA` | `true` | **hit** |
+| 3 | `listACopy` | `false` ← 新对象 | miss，计算 |
+| 4 | `listACopy` | `true` | **hit** |
+| 5 | `listACopy` | `true` | **hit** |
+
+**命中率 3/5 = 60.0%，工厂函数只跑了 2 次**（而不是 5 次）——缓存省下了 3 次排序。
+
+**关键观察：渲染 3 那一次「白算」了**
+
+`listACopy` 和 `listA` 的内容一模一样，排序结果也一模一样，但缓存还是失效了。因为 `useMemo` 用的是 `Object.is` **引用比较**，它根本不看内容。
+
+这就是为什么下面这种父组件写法会让所有 memo 优化归零：
+
+```tsx
+function Parent() {
+  // ❌ 每次渲染都是新数组，子组件里的 useMemo / React.memo 全部失效
+  return <Child items={data.filter((d) => d.active)} />;
+}
+```
+
+只要父组件因为任何原因重渲染（哪怕改的是完全无关的 state），`items` 就是新引用，子组件的缓存全线崩塌。修法是把 `filter` 也用 `useMemo` 包起来，让引用能稳定传递下去。
+
+**为什么不做深比较？** 因为深比较是 `O(n)`，而缓存要解决的往往就是 `O(n)` 的计算——为了省一次 `O(n)` 先做一次 `O(n)`，得不偿失。React 选择 `O(1)` 的引用比较，代价就是**把「保持引用稳定」的责任交给了开发者**。这条约定贯穿 `useMemo`、`useCallback`、`useEffect` 依赖数组和 `React.memo`，是整个 React 性能模型的基石。
+
+**命中率这个指标怎么用：** 如果你给某个 `useMemo` 加了统计，发现命中率长期是 0%，那说明它的依赖从来没稳定过——这时该做的不是加更多 memo，而是回头去查那个依赖是从哪来的、为什么每次都是新引用。
+</Answer>
 </Callout>
 
 ## 小结

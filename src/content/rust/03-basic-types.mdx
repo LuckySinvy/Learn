@@ -98,6 +98,60 @@ let emoji = '😊';         // char 可存任意 Unicode 字符
 
 <Callout type="exercise" title="练习">
 定义一个元组 `(String, i32, bool)` 存放「姓名、年龄、是否会员」，解构后打印；再定义一个长度为 4 的数组存放四个季度销售额，用循环求和。
+
+<Answer>
+**参考答案：**
+
+```rust
+fn main() {
+    // 1. 元组：异类型组合
+    let person: (String, i32, bool) = (String::from("小明"), 28, true);
+
+    // 解构（注意：String 不是 Copy 类型，这里用引用解构避免所有权转移）
+    let (name, age, is_member) = &person;
+    println!("姓名：{}，年龄：{}，会员：{}", name, age, is_member);
+
+    // 也可以用 .索引 访问
+    println!("直接访问姓名：{}", person.0);
+
+    // 2. 数组：同类型固定长度
+    let sales: [f64; 4] = [12000.5, 15800.0, 9600.25, 21000.75];
+
+    let mut total = 0.0;
+    for s in sales {
+        total += s;
+    }
+
+    println!("四个季度总销售额 = {:.2}", total);
+    println!("平均每季度 = {:.2}", total / sales.len() as f64);
+}
+```
+
+**输出：**
+
+```text
+姓名：小明，年龄：28，会员：true
+直接访问姓名：小明
+四个季度总销售额 = 58401.50
+平均每季度 = 14600.38
+```
+
+**几个关键点：**
+
+- **`String` vs `&str`**：元组里声明的是 `String`，所以要用 `String::from("小明")` 或 `"小明".to_string()` 构造，不能直接塞 `"小明"`（那是 `&str`）
+- **解构时的所有权**：如果写 `let (name, age, is_member) = person;`（不加 `&`），`String` 会被**移动**出来，之后 `person.0` 就不能再用了。加 `&` 做引用解构，`name` 的类型是 `&String`，原元组仍然完整可用
+- **数组长度是类型的一部分**：`[f64; 4]` 和 `[f64; 5]` 是两种不同的类型，长度必须在编译期已知
+- **`sales.len() as f64`**：`len()` 返回 `usize`，Rust 不做隐式类型转换，必须用 `as` 显式转成 `f64` 才能参与浮点除法
+- **`{:.2}`** 是格式化占位符，表示保留 2 位小数
+
+**用迭代器的更地道写法：**
+
+```rust
+let total: f64 = sales.iter().sum();
+```
+
+一行就能求和，`sum()` 会根据目标类型标注推断出结果类型。
+</Answer>
 </Callout>
 
 ## 小结

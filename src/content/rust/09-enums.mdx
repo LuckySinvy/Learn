@@ -140,6 +140,141 @@ enum Expr {
 
 <Callout type="exercise" title="练习">
 定义一个 `enum Shape { Circle(f64), Rectangle(f64, f64) }`，写一个 `fn area(s: &Shape) -> f64` 用 `match` 计算面积（圆用 π·r²）。再补一个 `Triangle` 变体，体会穷尽性要求你同步更新 match。
+
+<Answer>
+**参考答案：**
+
+**第一步：两个变体的版本**
+
+```rust
+#[derive(Debug)]
+enum Shape {
+    Circle(f64),           // 半径
+    Rectangle(f64, f64),   // 宽、高
+}
+
+fn area(s: &Shape) -> f64 {
+    match s {
+        Shape::Circle(r) => std::f64::consts::PI * r * r,
+        Shape::Rectangle(w, h) => w * h,
+    }
+}
+
+fn main() {
+    let shapes = vec![
+        Shape::Circle(2.0),
+        Shape::Rectangle(3.0, 4.0),
+    ];
+
+    for s in &shapes {
+        println!("{:?} 面积 = {:.2}", s, area(s));
+    }
+}
+```
+
+**输出：**
+
+```text
+Circle(2.0) 面积 = 12.57
+Rectangle(3.0, 4.0) 面积 = 12.00
+```
+
+**第二步：加上 Triangle，观察穷尽性检查**
+
+只在枚举里加变体、**不改** `match`：
+
+```rust
+enum Shape {
+    Circle(f64),
+    Rectangle(f64, f64),
+    Triangle(f64, f64),    // 底、高
+}
+```
+
+编译立刻失败：
+
+```text
+error[E0004]: non-exhaustive patterns: `&Shape::Triangle(_, _)` not covered
+ --> src/main.rs:9:11
+  |
+9 |     match s {
+  |           ^ pattern `&Shape::Triangle(_, _)` not covered
+  |
+note: `Shape` defined here
+  |
+2 | enum Shape {
+  |      -----
+5 |     Triangle(f64, f64),
+  |     -------- not covered
+  = note: the matched value is of type `&Shape`
+help: ensure the match is exhaustive by adding a match arm
+```
+
+**这就是穷尽性检查的价值：** 你在一处（枚举定义）新增了一种情况，编译器会把**所有**需要同步更新的 `match` 全部找出来。在大型项目里，这意味着「加了新状态却忘了在某个分支处理」这类 bug 根本无法编译通过。
+
+**第三步：补全后的完整版本**
+
+```rust
+use std::f64::consts::PI;
+
+#[derive(Debug)]
+enum Shape {
+    Circle(f64),
+    Rectangle(f64, f64),
+    Triangle(f64, f64),
+}
+
+impl Shape {
+    // 枚举同样可以有方法，这样写更地道
+    fn area(&self) -> f64 {
+        match self {
+            Shape::Circle(r) => PI * r * r,
+            Shape::Rectangle(w, h) => w * h,
+            Shape::Triangle(base, height) => 0.5 * base * height,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Shape::Circle(_) => "圆形",
+            Shape::Rectangle(..) => "矩形",
+            Shape::Triangle(..) => "三角形",
+        }
+    }
+}
+
+fn main() {
+    let shapes = vec![
+        Shape::Circle(2.0),
+        Shape::Rectangle(3.0, 4.0),
+        Shape::Triangle(6.0, 5.0),
+    ];
+
+    let mut total = 0.0;
+    for s in &shapes {
+        println!("{} 面积 = {:.2}", s.name(), s.area());
+        total += s.area();
+    }
+    println!("总面积 = {:.2}", total);
+}
+```
+
+**输出：**
+
+```text
+圆形 面积 = 12.57
+矩形 面积 = 12.00
+三角形 面积 = 15.00
+总面积 = 39.57
+```
+
+**几个细节：**
+
+- **`match s` 中 `r` 的类型**：因为 `s` 是 `&Shape`，按理说 `r` 应该是 `&f64`。得益于**匹配人体工程学（match ergonomics）**，Rust 会自动解引用，`r` 直接就是 `f64`，可以参与算术运算而不用写 `*r`
+- **`Shape::Rectangle(..)`**：两个点表示「忽略所有字段」，比写 `Shape::Rectangle(_, _)` 更省事
+- **不要用 `_ => ` 兜底**：如果 `area` 里写了 `_ => 0.0`，加 `Triangle` 时就**不会报错**了，而是静默返回 0——穷尽性检查的保护作用就此失效。对于自己定义的枚举，宁可把每个变体都列出来
+- **`std::f64::consts::PI`** 是标准库提供的圆周率常量，不要自己写 `3.14`
+</Answer>
 </Callout>
 
 ## 小结

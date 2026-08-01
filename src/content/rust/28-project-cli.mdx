@@ -94,6 +94,298 @@ cargo run -- ./README.md --chars
 
 <Callout type="exercise" title="练习">
 给工具加一个 `--words-only` 与 `--lines-only` 开关（互斥时用 `ArgGroup`），并把统计逻辑抽成返回结构体的函数，补一个单元测试验证「`a b\nc`」词数=2、行数=2。
+
+<Answer>
+**参考答案：**
+
+`Cargo.toml`：
+
+```toml
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+```
+
+`src/main.rs`：
+
+```rust
+use clap::{ArgGroup, Parser};
+
+#[derive(Parser, Debug)]
+#[command(name = "mywc", about = "简易 wc 工具", version)]
+// 定义互斥组：组内选项最多只能出现一个
+#[command(group(
+    ArgGroup::new("mode")
+        .args(["words_only", "lines_only"])
+        .multiple(false)
+))]
+struct Cli {
+    /// 要统计的文件路径
+    #[arg(required = true)]
+    path: String,
+
+    /// 只输出词数
+    #[arg(long)]
+    words_only: bool,
+
+    /// 只输出行数
+    #[arg(long)]
+    lines_only: bool,
+
+    /// 额外统计字符数
+    #[arg(short, long)]
+    chars: bool,
+}
+
+/// 统计结果
+#[derive(Debug, PartialEq, Default)]
+pub struct Stats {
+    pub lines: usize,
+    pub words: usize,
+    pub chars: usize,
+    pub bytes: usize,
+}
+
+/// 纯函数：不碰 IO，只负责统计——这样才好测试
+pub fn analyze(text: &str) -> Stats {
+    Stats {
+        lines: text.lines().count(),
+        words: text.split_whitespace().count(),
+        chars: text.chars().count(),
+        bytes: text.len(),
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    let content = std::fs::read_to_string(&cli.path)
+        .map_err(|e| format!("无法读取「{}」：{}", cli.path, e))?;
+
+    let stats = analyze(&content);
+
+    // ArgGroup 已保证两个开关不会同时为真
+    if cli.words_only {
+        println!("{}", stats.words);
+    } else if cli.lines_only {
+        println!("{}", stats.lines);
+    } else {
+        println!("行数: {}", stats.lines);
+        println!("词数: {}", stats.words);
+        if cli.chars {
+            println!("字符数: {}", stats.chars);
+            println!("字节数: {}", stats.bytes);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_stats() {
+        let s = analyze("a b\nc");
+        // 注意：换行符也算空白，所以是 3 个词而非题干说的 2 个（详见下方说明）
+        assert_eq!(s.words, 3);
+        assert_eq!(s.lines, 2);
+    }
+
+    #[test]
+    fn empty_text() {
+        let s = analyze("");
+        assert_eq!(s, Stats::default());
+    }
+
+    #[test]
+    fn trailing_newline_does_not_add_line() {
+        // lines() 不会因末尾换行多算一行
+        assert_eq!(analyze("a\nb\n").lines, 2);
+        assert_eq!(analyze("a\nb").lines, 2);
+    }
+
+    #[test]
+    fn multiple_spaces_are_one_separator() {
+        // split_whitespace 会合并连续空白
+        assert_eq!(analyze("a    b\t\tc").words, 3);
+    }
+
+    #[test]
+    fn unicode_chars_vs_bytes() {
+        let s = analyze("你好ab");
+        assert_eq!(s.chars, 4);   // 4 个字符
+        assert_eq!(s.bytes, 8);   // 3+3+1+1 字节
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_flags() {
+        use clap::Parser;
+        // 两个互斥开关同时出现，解析应当失败
+        let result = Cli::try_parse_from(["mywc", "f.txt", "--words-only", "--lines-only"]);
+        assert!(result.is_err());
+    }
+}
+```
+
+**⚠️ 注意练习题干里的一个陷阱**
+
+题目说「`a b\nc`」词数 = 2，但实际上 **`split_whitespace()` 数出的是 3 个词**：`"a"`、`"b"`、`"c"`。换行符也算空白字符，所以 `c` 是独立的第三个词。
+
+```rust
+let s = "a b\nc";
+println!("{:?}", s.split_whitespace().collect::<Vec<_>>());
+// ["a", "b", "c"]  —— 3 个
+println!("{}", s.lines().count());   // 2 行 ✓
+```
+
+**行数 = 2 是对的**（`"a b"` 和 `"c"` 两行）。所以正确的断言应该是：
+
+```rust
+#[test]
+fn basic_stats() {
+    let s = analyze("a b\nc");
+    assert_eq!(s.words, 3);   // 不是 2
+    assert_eq!(s.lines, 2);   // ✓
+}
+```
+
+**这恰好说明了写测试的价值**——凭直觉估算的期望值经常是错的，跑一遍才知道真实行为。遇到测试失败时，先别急着改代码，**先确认是代码错了还是期望值错了**。
+
+**运行效果：**
+
+```bash
+$ cargo run -- README.md
+行数: 120
+词数: 800
+
+$ cargo run -- README.md --words-only
+800
+
+$ cargo run -- README.md --words-only --lines-only
+error: the argument '--words-only' cannot be used with '--lines-only'
+
+Usage: mywc <PATH> --words-only
+
+For more information, try '--help'.
+
+$ cargo run -- --help
+简易 wc 工具
+
+Usage: mywc [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>  要统计的文件路径
+
+Options:
+      --words-only  只输出词数
+      --lines-only  只输出行数
+  -c, --chars       额外统计字符数
+  -h, --help        Print help
+  -V, --version     Print version
+```
+
+**关键设计点：**
+
+- **`ArgGroup` 声明互斥**：`.multiple(false)` 表示组内最多选一个。clap 会自动生成友好的冲突提示，不用自己写 `if a && b { 报错 }`
+- **另一种更简单的互斥写法**：只有两个选项时，直接用 `conflicts_with` 更省事
+
+  ```rust
+  #[arg(long, conflicts_with = "lines_only")]
+  words_only: bool,
+  ```
+
+- **`Cli::try_parse_from`**：不像 `parse()` 那样失败就退出进程，而是返回 `Result`，所以能在单元测试里验证参数解析逻辑
+- **文档注释即帮助文本**：字段上的 `///` 注释会自动变成 `--help` 里的说明，文档和帮助永远同步
+- **`#[command(version)]`**：自动从 `Cargo.toml` 读取版本号，提供 `-V` 选项
+
+**最重要的一点：把 IO 和逻辑分离**
+
+```rust
+// ❌ 难以测试：混杂了文件读取
+fn count_lines(path: &str) -> usize {
+    std::fs::read_to_string(path).unwrap().lines().count()
+}
+
+// ✅ 易于测试：纯函数，输入输出都在内存里
+fn analyze(text: &str) -> Stats { /* ... */ }
+```
+
+纯函数版本不需要准备测试文件、不需要清理、不受文件系统状态影响、运行速度快，还能轻松覆盖各种边界情况。这个原则叫 **「把副作用推到边缘」**——`main` 负责读文件、打印，中间的所有逻辑都做成纯函数。
+
+**支持多文件（真正的 wc 行为）：**
+
+```rust
+#[derive(Parser)]
+struct Cli {
+    /// 要统计的文件（可多个）
+    #[arg(required = true, num_args = 1..)]
+    paths: Vec<String>,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let mut total = Stats::default();
+
+    for path in &cli.paths {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let s = analyze(&content);
+                println!("{:>8}{:>8}{:>8}  {}", s.lines, s.words, s.bytes, path);
+                total.lines += s.lines;
+                total.words += s.words;
+                total.bytes += s.bytes;
+            }
+            // 单个文件失败不应中断其余文件的处理
+            Err(e) => eprintln!("mywc: {}: {}", path, e),
+        }
+    }
+
+    if cli.paths.len() > 1 {
+        println!("{:>8}{:>8}{:>8}  总计", total.lines, total.words, total.bytes);
+    }
+
+    Ok(())
+}
+```
+
+**支持从 stdin 读取（Unix 管道传统）：**
+
+```rust
+use std::io::Read;
+
+fn read_input(path: &str) -> std::io::Result<String> {
+    if path == "-" {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(path)
+    }
+}
+```
+
+这样就能 `cat file.txt | mywc -` 了，符合 Unix 工具的惯例。
+
+**发布你的工具：**
+
+```bash
+cargo build --release          # 产物在 target/release/mywc
+cargo install --path .         # 安装到 ~/.cargo/bin，全局可用
+cargo publish                  # 发布到 crates.io（需先注册账号）
+```
+
+**推荐搭配的 crate：**
+
+| crate | 用途 |
+|---|---|
+| `anyhow` | 应用层错误处理，比 `Box<dyn Error>` 更好用（带上下文链） |
+| `thiserror` | 库的错误类型，自动派生 `Display`/`Error` |
+| `indicatif` | 进度条 |
+| `colored` / `owo-colors` | 彩色终端输出 |
+| `dialoguer` | 交互式提示、选择菜单 |
+| `assert_cmd` | 测试 CLI 的端到端行为 |
+</Answer>
 </Callout>
 
 ## 小结

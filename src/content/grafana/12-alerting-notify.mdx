@@ -123,6 +123,71 @@ Root (email-ops)
 
 <Callout type="exercise" title="练习">
 配一个 Slack Contact point 和一个钉钉 Webhook 中转，再用 Notification policy 把 `severity=critical` 同时发到两者，`warning` 只发 Slack。给支付团队单独一条路由。
+
+<Answer>
+**参考答案：**
+
+**① 配置 Slack Contact point**
+
+Alerting → Contact points → **New contact point**：
+
+- **Name**：`slack-alerts`
+- **Integration**：`Slack`
+- **Webhook URL**：`https://hooks.slack.com/services/XXX/YYY/ZZZ`（在 Slack 的 Incoming Webhooks 应用里创建）
+- **Recipient**：`#alerts`
+
+**② 配置钉钉 Webhook 中转**
+
+钉钉机器人需要把 Grafana 的 JSON 转成钉钉 Markdown 格式，所以先起一个中转服务（示例）：
+
+```python
+import json, requests
+
+DING_URL = "https://oapi.dingtalk.com/robot/send?access_token=xxx"
+
+def on_grafana(payload):
+    text = f"### {payload['title']}\n"
+    for a in payload["alerts"]:
+        text += f"- {a['labels'].get('severity')} {a['annotations'].get('summary', '')}\n"
+    requests.post(DING_URL, json={
+        "msgtype": "markdown",
+        "markdown": {"title": "告警", "text": text}
+    })
+```
+
+再建一个 Contact point：
+
+- **Name**：`dingding-alerts`
+- **Integration**：`Webhook`
+- **URL**：`http://<中转服务地址>:5000/grafana`（中转服务需公网可达，见上文警告）
+
+**③ 关键点：critical 同时发到两者**
+
+Notification policy 里**一个策略只能指向一个 Contact point**，但一个 Contact point 可以挂**多个 Integration**。所以再建一个组合 Contact point：
+
+- **Name**：`critical-ops`
+- **Integration 1**：Slack（Webhook 同 `slack-alerts`）
+- **Integration 2**：Webhook（钉钉中转地址）
+
+这样一封 critical 告警会同时走 Slack 和钉钉两条渠道。
+
+**④ Notification policy 路由树**
+
+```text
+Root (email-ops)                ← 默认兜底
+ ├─ severity=critical → critical-ops     （Slack + 钉钉双发）
+ ├─ severity=warning  → slack-alerts      （只发 Slack）
+ └─ team=payment      → dingding-payment （支付团队专属钉钉群）
+```
+
+配置时注意：`team=payment` 是独立的子策略，指向为支付团队单独建的 Contact point（钉钉支付群）。规则里 `team` 标签打对，路由才正确。
+
+**⑤ 验证**
+
+- 触发一条 `severity=critical` 的告警 → Slack 和钉钉各收到一条
+- 触发 `severity=warning` → 只有 Slack 收到
+- 触发一条带 `team=payment` 标签的告警 → 支付群收到
+</Answer>
 </Callout>
 
 ## 小结

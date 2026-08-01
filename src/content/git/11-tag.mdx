@@ -161,4 +161,61 @@ git push origin --tags        # 推所有本地有、远程没有的标签
 2. 故意把 `v1.0` 打在第二个提交上，然后给第一个提交补打 `v0.5`，用 `git tag -l --sort=v:refname` 验证排序正确。
 3. 本地克隆一个仓库，在克隆里 `git tag -a v9.9.9 -m test` 然后推到远程，再删除远程标签，原仓库 `git fetch` 后观察 `git tag` 是否还残留。
 4. 查阅语义化版本规范：版本号 `2.3.4`、`2.4.0`、`3.0.0` 分别代表什么性质的变更？（用一句话分别说明）
+
+<Answer>
+**参考答案：**
+
+**1. 两种标签的对象类型**
+
+```bash
+git init -q -b main repo && cd repo
+echo v1 > app.txt && git add . && git commit -q -m "feat: 1.0"
+echo v2 > app.txt && git add . && git commit -q -m "feat: 2.0"
+git tag v1.0                 # 轻量标签
+git tag -a v2.0 -m "发布"    # 附注标签
+git cat-file -t v1.0
+git cat-file -t v2.0
+```
+
+输出分别是 `commit` 和 `tag`。`git cat-file -t` 打印对象类型：**轻量标签 v1.0 就是直接指向 commit 的指针**，类型是 `commit`；**附注标签 v2.0 是一个独立的 tag 对象**，类型是 `tag`，它再指向目标 commit，并额外携带打标人、日期、说明信息（可签名）。这也解释了为什么 `git show v2.0` 能显示作者和信息，而 `git show v1.0` 只显示提交本身。
+
+**2. 给旧提交补标签 + 版本排序**
+
+```bash
+echo v3 > app.txt && git add . && git commit -q -m "feat: 3.0"
+git tag v1.0 HEAD~2          # 故意把 v1.0 打在第二个提交上
+FIRST=$(git rev-list --max-parents=0 HEAD)
+git tag -a v0.5 -m "早期预览版" $FIRST   # 给第一个提交补打 v0.5
+git tag -l --sort=v:refname
+```
+
+输出 `v0.5`、`v1.0`——按版本号而非字符串排序。若用默认字符串排序，`v1.0` 会排在 `v0.5` 前面；`--sort=v:refname` 会把 `v` 后的部分当版本号解析，保证 `v1.10 > v1.9` 这种语义正确。
+
+**3. 标签的推送/删除与残留**
+
+```bash
+git init -q --bare /tmp/origin.git
+git clone -q /tmp/origin.git alice
+cd alice && echo x > x.txt && git add . && git commit -q -m "init" && git push -q -u origin main 2>/dev/null && cd ..
+git clone -q /tmp/origin.git bob
+
+# bob 打标签并推到远程
+cd bob && git tag -a v9.9.9 -m test && git push -q origin v9.9.9 && cd ..
+# 删除远程标签
+git push origin :refs/tags/v9.9.9
+
+# alice 拉取
+cd alice && git fetch && git tag
+```
+
+`git tag` 仍然显示 `v9.9.9`——因为 `fetch` 只会**新增**远程带下来的 tag，不会删除本地已有的（远程删除不会自动传播）。要同步清理需要 `git fetch --prune --prune-tags`（或 `git tag -d v9.9.9` 手工删）。
+
+**4. SemVer 三档版本的含义**
+
+- `2.3.4`：MAJOR=2、MINOR=3、PATCH=4，即当前 2.x 主版本下，只做了**向下兼容的 bug 修复**。
+- `2.4.0`：MINOR 加 1、PATCH 归零，表示在 2.x 系列内**新增了向下兼容的新功能**。
+- `3.0.0`：MAJOR 加 1，表示有**不兼容的 API/行为变更**，升级到 3.x 需要用户改造代码。
+
+一句话记忆：**修 bug 加 PATCH，加功能加 MINOR，破坏兼容加 MAJOR。**
+</Answer>
 </Callout>

@@ -251,4 +251,113 @@ s.close()
 2. 给服务器加一个静态文件路由：读取 /work 下的文件返回，并用第 7 章的知识按扩展名设置正确的 Content-Type；务必阻止路径中出现 .. 的穿越攻击。
 3. 给客户端加上 302 跟随：检测 3xx 状态码与 Location 头，最多跟随 5 次防止循环重定向。
 4. 综合题：给服务器加上 ETag 支持（对响应体取 md5），客户端第二次请求带 If-None-Match，验证收到 304 且无体——把第 9 章的协商缓存完整复刻一遍。
+
+<Answer>
+**参考答案：**
+
+**1. 给服务器加 keep-alive**
+
+参考 Playground 3：把 `handle` 改成循环，非 `Connection: close` 就继续读下一个请求：
+
+```python
+def handle(conn):
+    keep = True
+    while keep:
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                conn.close(); return
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        lines = head.decode("iso-8859-1").split("\r\n")
+        method, path, version = lines[0].split(" ", 2)
+        headers = {}
+        for line in lines[1:]:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+        # 读取请求体（POST 时需要）
+        need = int(headers.get("content-length", 0))
+        body = rest
+        while len(body) < need:
+            body += conn.recv(4096)
+        # 路由生成响应（略，同原代码）...
+        keep = headers.get("connection", "").lower() != "close"
+        resp += (b"" if keep else b"Connection: close\r\n")
+        conn.sendall(resp)
+    conn.close()
+```
+
+要点：响应必须带 `Content-Length`（长连接没有"关闭"作为结束信号，靠长度定界）；客户端发 `Connection: close` 才跳出循环关闭连接。这是第 11 章"keep-alive = 循环再读"的亲手落地。
+
+**2. 静态文件路由 + 防路径穿越**
+
+```python
+import os, mimetypes
+
+def do_static(conn, path):
+    # 1. 防穿越：规范化后必须仍在 /work 内
+    full = os.path.realpath(os.path.join("/work", path.lstrip("/")))
+    if not full.startswith(os.path.realpath("/work") + os.sep):
+        return (b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+    # 2. 读文件，不存在则 404
+    if not os.path.isfile(full):
+        return (b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+    data = open(full, "rb").read()
+    ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+    resp = ("HTTP/1.1 200 OK\r\nContent-Type: " + ctype +
+            "\r\nContent-Length: " + str(len(data)) + "\r\n\r\n").encode()
+    return resp + data
+```
+
+两道防线：**先用 `os.path.realpath` 把 `../../etc/passwd` 之类的路径规范化**，再校验结果必须落在 `/work` 前缀内（`/work` 本身除外），否则 403；Content-Type 按扩展名用 `mimetypes.guess_type`（第 7 章的知识）映射，如 `.html`→`text/html`、`.png`→`image/png`、未知→`application/octet-stream`。
+
+**3. 客户端 302 跟随**
+
+```python
+def http_get(host, port, path, headers=None, max_redirects=5):
+    for _ in range(max_redirects + 1):
+        code, reason, hdrs, body = raw_request(host, port, path, headers or {})
+        if code in (301, 302, 303, 307, 308) and "location" in hdrs:
+            loc = hdrs["location"]
+            path = loc if loc.startswith("/") else "/" + loc   # 简化：同主机相对/绝对路径
+            continue                                          # 最多跟随 5 次
+        return code, reason, hdrs, body
+    raise RuntimeError("重定向次数超过 5 次（可能循环）")
+```
+
+要点：3xx + `Location` 头 → 重新构造请求；每跳计数，**超过 5 次直接报错**，防止 `/a → /b → /a` 无限循环。真实场景还要处理 `Location` 为完整 URL（跨主机）的情况并带上 Cookie（第 8 章）。
+
+**4. ETag + If-None-Match 完整复刻**
+
+服务器端：对响应体取 md5 作 ETag，命中 `If-None-Match` 则回 304 无体：
+
+```python
+import hashlib
+# 服务器：路由生成 out(字节) 后：
+etag = '"' + hashlib.md5(out).hexdigest() + '"'
+if headers.get("if-none-match") == etag:
+    conn.sendall(b"HTTP/1.1 304 Not Modified\r\n"
+                 b"ETag: " + etag.encode() + b"\r\n"
+                 b"Content-Length: 0\r\n\r\n")     # 304 禁止带体
+else:
+    resp = (b"HTTP/1.1 200 OK\r\n"
+            b"ETag: " + etag.encode() + b"\r\n"
+            b"Content-Length: " + str(len(out)).encode() + b"\r\n\r\n") + out
+    conn.sendall(resp)
+```
+
+客户端：第一次请求拿 ETag 存下来，第二次请求带上 `If-None-Match`：
+
+```python
+etag = None
+code, reason, hdrs, body = http_get("127.0.0.1", 8000, "/article")
+etag = hdrs.get("etag")                          # 保存指纹
+code2, reason2, hdrs2, body2 = http_get("127.0.0.1", 8000, "/article",
+                                        {"If-None-Match": etag})
+print(code2, reason2, "体字节数:", len(body2))    # -> 304 Not Modified, 0 字节
+```
+
+验证：第二次收到 `304 Not Modified` 且 `Content-Length: 0`、体为空——协商缓存全链路（ETag 下发 → If-None-Match 回传 → 304 免传体）从零复刻完成。
+</Answer>
 </Callout>

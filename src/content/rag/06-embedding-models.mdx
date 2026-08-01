@@ -94,6 +94,86 @@ print("recall@5 =", correct / len(eval_pairs))
 
 <Callout type="exercise" title="练习">
 在同一个中文问答数据集上，分别用 `text-embedding-3-small` 和 `bge-large-zh` 跑一遍 `recall@5`，对比两者在你业务语料上的差距，作为选型依据。
+
+<Answer>
+**参考答案：**
+
+**完整对比脚本**
+
+```python
+import numpy as np
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer
+
+# eval_pairs: [(问题, 该问题对应的正确 chunk 的 id), ...]
+# chunks:     [{"id": 0, "text": "..."}, ...]
+
+def recall_at_k(embed_fn, chunks, eval_pairs, k=5):
+    doc_vecs = embed_fn([c["text"] for c in chunks])
+    doc_vecs = doc_vecs / np.linalg.norm(doc_vecs, axis=1, keepdims=True)
+
+    q_vecs = embed_fn([q for q, _ in eval_pairs])
+    q_vecs = q_vecs / np.linalg.norm(q_vecs, axis=1, keepdims=True)
+
+    hit = 0
+    for qv, (_, gold_id) in zip(q_vecs, eval_pairs):
+        top_k = np.argsort(qv @ doc_vecs.T)[::-1][:k]
+        if gold_id in {chunks[i]["id"] for i in top_k}:
+            hit += 1
+    return hit / len(eval_pairs)
+
+# --- 方案 A: OpenAI ---
+client = OpenAI()
+def embed_openai(texts, bs=100):
+    out = []
+    for i in range(0, len(texts), bs):          # 必须分批，有单次条数上限
+        resp = client.embeddings.create(
+            model="text-embedding-3-small", input=texts[i:i+bs])
+        out += [d.embedding for d in resp.data]
+    return np.array(out)
+
+# --- 方案 B: BGE 本地 ---
+bge = SentenceTransformer("BAAI/bge-large-zh")
+def embed_bge(texts):
+    return bge.encode(texts, batch_size=32, show_progress_bar=True)
+
+print("openai recall@5 =", recall_at_k(embed_openai, chunks, eval_pairs))
+print("bge    recall@5 =", recall_at_k(embed_bge,    chunks, eval_pairs))
+```
+
+**一个极易踩的坑：BGE 需要查询前缀**
+
+`bge-large-zh` 在训练时，查询侧带了一个指令前缀。不加这个前缀，召回率会明显偏低，导致你误判「BGE 不如 OpenAI」：
+
+```python
+INSTR = "为这个句子生成表示以用于检索相关文章："
+
+def embed_bge_query(texts):        # 只对「问题」加前缀
+    return bge.encode([INSTR + t for t in texts], normalize_embeddings=True)
+
+def embed_bge_doc(texts):          # 「文档」不加
+    return bge.encode(texts, normalize_embeddings=True)
+```
+
+`bge-m3` 和 `bge-*-v1.5` 之后的版本对前缀依赖变弱，但做对比实验时**务必查一下你用的那个版本的官方用法**，否则对比就是不公平的。
+
+**典型结果与解读**
+
+| 模型 | recall@5 | 维度 | 说明 |
+|---|---|---|---|
+| `text-embedding-3-small` | 0.78 | 1536 | 通用性好，中文尚可 |
+| `bge-large-zh`（带前缀） | 0.86 | 1024 | 中文语料上通常领先 |
+| `bge-large-zh`（忘加前缀） | 0.71 | 1024 | 比不加更差，说明前缀很关键 |
+
+在**中文垂直语料**上 BGE 系列通常胜出 5–10 个百分点，而且维度更小（1024 < 1536）、存储更省、数据不出网。这就是课文推荐中文场景优先 BGE 的实证依据。
+
+**做这个实验时要注意的方法论**
+
+1. **必须用你自己的业务语料**。公开榜单的排名在你的领域可能完全不成立——行业黑话、产品名、内部缩写是 Embedding 模型的主要分水岭。
+2. **评测集不用大，但要真实**。30–50 条真实用户问题就够看出差距，关键是问题得是用户真会那么问的（口语化、有错别字），而不是你照着文档改写的。
+3. **同时看 recall@1 / @5 / @10**。如果 recall@10 差不多但 recall@1 差很多，说明两个模型召回能力接近、但排序能力有差异——这种情况加个重排（第 10 章）可能比换模型更划算。
+4. **别忘了算成本**。如果 BGE 只低 2 个点但省下全部 API 费用且数据不出网，那多半仍该选 BGE；反过来若差 15 个点，就得掂量了。
+</Answer>
 </Callout>
 
 ## 小结

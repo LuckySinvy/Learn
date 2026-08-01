@@ -126,6 +126,95 @@ kubectl delete -f web-app.yaml
 
 <Callout type="exercise" title="练习">
 把副本数改为 5 再 apply，观察滚动过程；然后给 Deployment 加一个 livenessProbe（探 `/`），再次删除 Pod，确认自愈且不会因探针误判被反复重启。
+
+<Answer>
+**参考答案：**
+
+沿用本章的 `web-app.yaml`，先在 Deployment 段把 `replicas: 3` 改成 `replicas: 5`，并在容器里加上 livenessProbe：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 5                        # 3 → 5
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:             # 新增：探 / 判断进程是否存活
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10  # 给应用足够启动时间，避免误杀
+            periodSeconds: 10
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: NodePort
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+按顺序执行：
+
+```bash
+# 1. 应用新配置：从 3 副本扩到 5 副本
+kubectl apply -f web-app.yaml
+
+# 2. 观察滚动/扩容过程：新 Pod 逐个起，最终 5 个全部 Running
+kubectl get pods -l app=web -w
+kubectl rollout status deployment/web
+# deployment "web" successfully rolled out
+
+# 3. 验证自愈：删掉一个 Pod，应立刻有新的补上，数量仍为 5
+kubectl delete pod -l app=web
+kubectl get pods -l app=web
+# 仍显示 5 个 Running，且删除的 Pod 被一个新 Pod 替代
+
+# 4. 确认 livenessProbe 生效：nginx 对 / 一直返回 200，
+#    所以 RESTARTS 应保持 0，不会出现误判反复重启
+kubectl get pods -l app=web
+# NAME                   READY   STATUS    RESTARTS
+# web-xxxxx-aaaaa        1/1     Running   0
+
+# 5. 主动验证探针会重启：临时改一下探针路径制造失败（仅演示，完事改回）
+#    或直接模拟：让容器无法响应 /（生产不要这样改，这里只是观察 RESTARTS 变化）
+# kubectl set ... # 演示 liveness 失败时 Events 会报 Unhealthy → Killing → 重启
+
+# 清理
+kubectl delete -f web-app.yaml
+```
+
+**要点回顾：** 改 `replicas` 再 `apply` 是声明式扩缩容，Deployment 自动把副本收敛到 5；livenessProbe 探 `/` 在 nginx 正常时永不失败（RESTARTS 保持 0），删 Pod 后 ReplicaSet 立即补齐——"自愈"来自副本数保障，"不误杀"来自探针只探测自身存活。
+</Answer>
 </Callout>
 
 ## 小结

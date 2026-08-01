@@ -96,6 +96,375 @@ curl localhost:3000/todos
 
 <Callout type="exercise" title="练习">
 为服务加一个 `DELETE /todos/:id` 路由，用 `axum::extract::Path` 取 id，从 `Vec` 中删除对应项。再写一个集成测试（用 `tower::ServiceExt::oneshot`）验证删除后列表为空。
+
+<Answer>
+**参考答案：**
+
+`Cargo.toml`：
+
+```toml
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+```
+
+`src/main.rs`：
+
+```rust
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Todo {
+    pub id: u32,
+    pub title: String,
+    pub done: bool,
+}
+
+pub type Db = Arc<Mutex<Vec<Todo>>>;
+
+async fn list(State(db): State<Db>) -> Json<Vec<Todo>> {
+    let items = db.lock().unwrap().clone();
+    Json(items)
+}
+
+async fn create(State(db): State<Db>, Json(todo): Json<Todo>) -> (StatusCode, Json<Todo>) {
+    db.lock().unwrap().push(todo.clone());
+    (StatusCode::CREATED, Json(todo))
+}
+
+/// DELETE /todos/:id
+async fn delete(State(db): State<Db>, Path(id): Path<u32>) -> StatusCode {
+    let mut items = db.lock().unwrap();
+    let before = items.len();
+
+    items.retain(|t| t.id != id);
+
+    if items.len() < before {
+        StatusCode::NO_CONTENT      // 204：删除成功
+    } else {
+        StatusCode::NOT_FOUND       // 404：没有这个 id
+    }
+}
+
+/// 抽出来便于测试复用
+pub fn app(db: Db) -> Router {
+    Router::new()
+        .route("/todos", get(list).post(create))
+        .route("/todos/:id", axum::routing::delete(delete))
+        .with_state(db)
+}
+
+#[tokio::main]
+async fn main() {
+    let db: Db = Arc::new(Mutex::new(Vec::new()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
+    println!("监听 http://127.0.0.1:3000");
+
+    axum::serve(listener, app(db)).await.unwrap();
+}
+```
+
+**集成测试：**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;   // 提供 oneshot
+
+    fn make_db(items: Vec<Todo>) -> Db {
+        Arc::new(Mutex::new(items))
+    }
+
+    async fn body_to_json<T: serde::de::DeserializeOwned>(
+        response: axum::response::Response,
+    ) -> T {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_todo() {
+        let db = make_db(vec![Todo {
+            id: 1,
+            title: "学 Rust".into(),
+            done: false,
+        }]);
+
+        // 1. 删除 id=1
+        let response = app(db.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/todos/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // 2. 再查列表，应为空
+        let response = app(db.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/todos")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let todos: Vec<Todo> = body_to_json(response).await;
+        assert!(todos.is_empty(), "删除后列表应为空，实际：{:?}", todos);
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_returns_404() {
+        let db = make_db(vec![]);
+
+        let response = app(db)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/todos/999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_only_removes_matching_id() {
+        let db = make_db(vec![
+            Todo { id: 1, title: "A".into(), done: false },
+            Todo { id: 2, title: "B".into(), done: false },
+            Todo { id: 3, title: "C".into(), done: false },
+        ]);
+
+        let response = app(db.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/todos/2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let remaining = db.lock().unwrap().clone();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn create_then_list() {
+        let db = make_db(vec![]);
+
+        let new_todo = Todo { id: 7, title: "写测试".into(), done: false };
+
+        let response = app(db.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/todos")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&new_todo).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let todos = db.lock().unwrap().clone();
+        assert_eq!(todos, vec![new_todo]);
+    }
+}
+```
+
+运行 `cargo test`，四个测试全绿。
+
+**关键点解析：**
+
+- **`Path(id): Path<u32>`**：从 URL 路径提取参数并**自动解析成 `u32`**。访问 `/todos/abc` 时 axum 会自动返回 400 Bad Request，不用自己校验。路由里的 `:id` 是占位符，名字要和提取顺序对应
+- **`Vec::retain`**：原地保留满足条件的元素，比「先 `position` 找下标再 `remove`」更简洁，而且能一次删除所有匹配项
+- **返回正确的 HTTP 状态码**：删除成功用 `204 No Content`（表示成功但无响应体），资源不存在用 `404`。`StatusCode` 本身实现了 `IntoResponse`，可以直接作为 handler 的返回类型
+- **`(StatusCode, Json<T>)` 元组**：axum 允许返回元组来同时指定状态码和响应体，这是它的一个很方便的设计
+- **把 `Router` 构造抽成 `app()` 函数**：这是可测试性的关键。测试不需要真正监听端口，直接把 `Router` 当作 `Service` 使用即可
+
+**`oneshot` 为什么这么好用？**
+
+`tower::ServiceExt::oneshot` 直接把一个 `Request` 喂给 `Router` 并拿到 `Response`，**完全不经过网络栈**：
+
+| | 真实 HTTP 测试 | `oneshot` |
+|---|---|---|
+| 需要绑定端口 | 是（可能冲突） | 否 |
+| 速度 | 毫秒级 | 微秒级 |
+| 并行运行测试 | 端口易冲突 | 完全隔离 |
+| 覆盖范围 | 含网络层 | 路由 + handler |
+
+对绝大多数业务逻辑测试来说，`oneshot` 是更好的选择。只有要验证 TLS、超时、连接池这类网络层行为时才需要真起服务。
+
+**注意：每次 `oneshot` 都要重建 `Router`**
+
+`oneshot` 会**消耗**掉 service（拿走所有权），所以测试里连续发两个请求时要调用两次 `app(db.clone())`。但因为共享的是同一个 `db`，状态是连续的——这正好模拟了「同一个服务处理多个请求」。
+
+**关于 `Mutex` 的选择：`std` 还是 `tokio`？**
+
+本例用的是 `std::sync::Mutex`，在**这里是正确的**，因为临界区里没有 `.await`。判断标准很简单：
+
+```rust
+// ✅ std::sync::Mutex 完全够用：锁在语句结束就释放，中间没有 await
+async fn ok(State(db): State<Db>) -> Json<Vec<Todo>> {
+    let items = db.lock().unwrap().clone();
+    Json(items)
+}
+
+// ❌ 危险：持锁期间 await，会阻塞整个执行器线程
+async fn bad(State(db): State<Db>) {
+    let mut items = db.lock().unwrap();
+    some_async_io().await;        // 编译器可能直接报错：MutexGuard 不是 Send
+    items.push(todo);
+}
+
+// ✅ 需要跨 await 持锁时，用 tokio::sync::Mutex
+use tokio::sync::Mutex as AsyncMutex;
+async fn good(State(db): State<Arc<AsyncMutex<Vec<Todo>>>>) {
+    let mut items = db.lock().await;   // 注意是 .await 而非 .unwrap()
+    some_async_io().await;
+    items.push(todo);
+}
+```
+
+**经验法则：能不跨 `await` 持锁就别跨；不跨的话 `std::sync::Mutex` 更快**（`tokio::sync::Mutex` 有额外的调度开销）。
+
+**改进方向一：自动生成 ID**
+
+现在的 API 要求客户端自己指定 `id`，容易冲突。更合理的做法是服务端分配：
+
+```rust
+#[derive(Deserialize)]
+struct CreateTodo {
+    title: String,
+}
+
+async fn create(
+    State(db): State<Db>,
+    Json(input): Json<CreateTodo>,
+) -> (StatusCode, Json<Todo>) {
+    let mut items = db.lock().unwrap();
+    let id = items.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+    let todo = Todo { id, title: input.title, done: false };
+    items.push(todo.clone());
+    (StatusCode::CREATED, Json(todo))
+}
+```
+
+注意这里用了独立的 `CreateTodo` 输入类型——**请求体的结构不必等于存储的结构**，这是 REST API 设计的常见做法。
+
+**改进方向二：用 `HashMap` 替代 `Vec`**
+
+按 id 查找/删除时，`Vec` 是 O(n)，`HashMap` 是 O(1)：
+
+```rust
+use std::collections::HashMap;
+pub type Db = Arc<Mutex<HashMap<u32, Todo>>>;
+
+async fn delete(State(db): State<Db>, Path(id): Path<u32>) -> StatusCode {
+    match db.lock().unwrap().remove(&id) {
+        Some(_) => StatusCode::NO_CONTENT,
+        None => StatusCode::NOT_FOUND,
+    }
+}
+```
+
+`remove` 返回 `Option`，正好用来判断资源是否存在，代码反而更简洁了。
+
+**改进方向三：统一的错误响应**
+
+生产 API 应该返回结构化的错误 JSON，而不是光秃秃一个状态码：
+
+```rust
+use axum::response::{IntoResponse, Response};
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+enum AppError {
+    NotFound(u32),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            AppError::NotFound(id) => (
+                StatusCode::NOT_FOUND,
+                format!("找不到 id 为 {} 的待办", id),
+            ),
+        };
+        (status, Json(ErrorBody { error: msg })).into_response()
+    }
+}
+
+async fn delete(State(db): State<Db>, Path(id): Path<u32>) -> Result<StatusCode, AppError> {
+    let mut items = db.lock().unwrap();
+    let before = items.len();
+    items.retain(|t| t.id != id);
+
+    if items.len() < before {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(id))
+    }
+}
+```
+
+自己实现 `IntoResponse` 后，handler 就能返回 `Result`，用 `?` 传播错误——错误处理终于和普通 Rust 代码一样自然了。
+
+**其他常用中间件：**
+
+```rust
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+
+let app = Router::new()
+    .route("/todos", get(list).post(create))
+    .layer(TraceLayer::new_for_http())   // 请求日志
+    .layer(CorsLayer::permissive())       // CORS
+    .with_state(db);
+```
+
+`tower-http` 提供了压缩、超时、限流、静态文件服务等一整套中间件，都是一行 `.layer()` 的事。
+</Answer>
 </Callout>
 
 ## 小结

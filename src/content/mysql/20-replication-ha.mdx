@@ -173,4 +173,96 @@ MGR 简述：3 或 5 个节点组成复制组，事务提交需**多数派认证
 1. 用两个 Docker 容器搭一套 GTID 主从，`SHOW REPLICA STATUS\G` 确认三项健康指标。
 2. 在主库执行一个 50 万行的大事务 UPDATE，观察从库 Seconds_Behind_Source 的变化过程，然后改成分批更新对比。
 3. 手动停掉主库容器，练习把从库提升为新主（`STOP REPLICA; RESET REPLICA ALL;` + 开写），并说明生产上这个过程该由什么组件自动完成。
+
+<Answer>
+
+**参考答案：**
+
+**1. 用两个 Docker 容器搭建 GTID 主从**
+
+准备主从两个不同的 `my.cnf`（关键是 `server-id` 不同、都开 `log-bin`、GTID 开启），再起两个容器：
+
+```bash
+# 主库
+docker run -d --name mysql-master -p 3307:3306 \
+  -e MYSQL_ROOT_PASSWORD=root123 \
+  -v $PWD/master.cnf:/etc/mysql/conf.d/my.cnf mysql:8.0
+
+# 从库
+docker run -d --name mysql-replica -p 3308:3306 \
+  -e MYSQL_ROOT_PASSWORD=root123 \
+  -v $PWD/replica.cnf:/etc/mysql/conf.d/my.cnf mysql:8.0
+```
+
+主库建复制账号，从库指向主库并启动：
+
+```sql
+-- 主库
+CREATE USER 'repl'@'%' IDENTIFIED BY 'Repl#Pass1';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+
+-- 从库（用 docker inspect 拿到主库容器 IP）
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '<master_ip>',
+  SOURCE_USER = 'repl',
+  SOURCE_PASSWORD = 'Repl#Pass1',
+  SOURCE_AUTO_POSITION = 1;     -- GTID 自动对齐位点
+START REPLICA;
+```
+
+三项健康指标（都应满足）：
+
+```sql
+SHOW REPLICA STATUS\G
+-- Replica_IO_Running: Yes        -- IO 线程正常拉 binlog
+-- Replica_SQL_Running: Yes       -- SQL 线程正常重放
+-- Seconds_Behind_Source: 0       -- 无延迟
+```
+
+**2. 大事务 vs 分批更新对延迟的影响**
+
+```sql
+-- 一次 50 万行的大事务：从库会"一次性"落后一大截
+UPDATE orders SET status = 1 WHERE id BETWEEN 1 AND 500000;
+```
+
+现象：大事务在主库上提交很快，但从库 SQL 线程必须**逐行重放**这 50 万行，期间 `Seconds_Behind_Source` 会突然飙升、稳定在一个高值，重放完才回落到 0。这期间读写分离架构下会读到"旧数据"。
+
+改用分批后，延迟被切成小段、几乎无感：
+
+```sql
+-- 分批更新（每批 5000 行，批间让从库追上）
+SET autocommit = 0;
+WHILE 存在未更新行 DO
+  UPDATE orders SET status = 1 WHERE status != 1 LIMIT 5000;
+  COMMIT;
+  -- 可选：短暂 SLEEP(0.2) 让从库追平
+END WHILE;
+```
+
+对比结论：**大事务造成延迟"尖峰"，分批把延迟摊平**，对线上读写分离更友好。这也是第 5 章批量写入要分批 `LIMIT` 的原因。
+
+**3. 手动提升从库 + 生产该由谁自动做**
+
+```bash
+# 1) 停掉主库容器（模拟主库宕机）
+docker stop mysql-master
+
+# 2) 在从库提升为新主
+mysql -uroot -p -e "STOP REPLICA; RESET REPLICA ALL;"
+# 必要：确认从库已重放完所有 relay log（SHOW REPLICA STATUS 看 SQL 线程已追平）
+mysql -uroot -p -e "SET GLOBAL read_only = OFF; SET GLOBAL super_read_only = OFF;"
+```
+
+此时原从库已变成可写的新主。原主库恢复后**不能直接重新上线为主**，否则数据分叉；应把它作为新主的从库重新接入（或丢弃重建）。
+
+生产环境绝不靠人工敲命令，而是由**高可用组件自动完成 failover**：
+
+- **Orchestrator**（GitHub 出品）：自动探测主库故障、选最优从库提升、重接拓扑，Web 可视化；
+- **MGR（组复制）/ InnoDB Cluster**：基于 Paxos 多数派，组内自动选新主，配合 MySQL Router 对应用透明；
+- **云 RDS 高可用版**：主备双机 + VIP/连接地址自动切换，免运维。
+
+这些组件会同时处理"选主、切换连接路由、原主恢复后防脑裂"等人工极易出错的细节。
+
+</Answer>
 </Callout>

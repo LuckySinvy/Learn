@@ -149,6 +149,117 @@ let val = some_option.ok_or("缺少值")?;
 
 <Callout type="exercise" title="练习">
 写一个 `fn read_first_line(path: &str) -> Result<String, Box<dyn std::error::Error>>`，用 `?` 打开文件并读取第一行返回。在 `main` 里调用，用 `match` 打印成功内容或错误。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::error::Error;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+
+fn read_first_line(path: &str) -> Result<String, Box<dyn Error>> {
+    let file = File::open(path)?;            // io::Error 自动转成 Box<dyn Error>
+    let reader = BufReader::new(file);
+
+    // lines() 返回 Iterator<Item = Result<String, io::Error>>
+    // next() 返回 Option<Result<String, io::Error>>
+    match reader.lines().next() {
+        Some(line) => Ok(line?),             // 读行本身也可能失败（如非 UTF-8）
+        None => Err("文件为空".into()),      // &str 可以直接 .into() 成 Box<dyn Error>
+    }
+}
+
+fn main() {
+    for path in ["Cargo.toml", "不存在的文件.txt"] {
+        match read_first_line(path) {
+            Ok(line) => println!("[{}] 第一行：{}", path, line),
+            Err(e) => println!("[{}] 出错：{}", path, e),
+        }
+    }
+}
+```
+
+**输出：**
+
+```text
+[Cargo.toml] 第一行：[package]
+[不存在的文件.txt] 出错：No such file or directory (os error 2)
+```
+
+**关键点解析：**
+
+- **`?` 做了两件事**：遇到 `Err` 就提前 `return`；同时通过 `From` trait 把错误类型转换成函数签名声明的类型。这里 `io::Error` 被自动装箱成 `Box<dyn Error>`，完全不用手写转换代码
+- **为什么用 `Box<dyn Error>`**：函数里可能冒出 `io::Error`、`Utf8Error`、自定义错误等多种类型。`Box<dyn Error>` 是一个 trait 对象，能装下任何实现了 `Error` 的类型，写应用层代码时最省事
+- **`"文件为空".into()`**：标准库为 `&str` 实现了 `Into<Box<dyn Error>>`，所以能直接把字符串当错误用。适合快速原型，正式项目建议用具名错误类型
+- **为什么用 `BufReader`**：直接用 `File` 逐字节读会有大量系统调用。`BufReader` 加了缓冲，并提供 `lines()` 这类按行读取的便捷方法。**不要用 `read_to_string` 再 `split`**——那会把整个文件读进内存，处理大文件时很浪费
+- **`Ok(line?)` 的双层拆包**：`lines()` 的每一项本身就是 `Result`，因为读取过程随时可能出 I/O 错误
+
+**更简洁的写法（用 Option 组合子）：**
+
+```rust
+fn read_first_line(path: &str) -> Result<String, Box<dyn Error>> {
+    let reader = BufReader::new(File::open(path)?);
+    let line = reader.lines().next().ok_or("文件为空")??;
+    Ok(line)
+}
+```
+
+`ok_or` 把 `Option` 转成 `Result`，然后两个 `?` 依次拆开两层——虽然紧凑，但可读性略差。
+
+**进阶：定义自己的错误枚举**
+
+库代码通常不用 `Box<dyn Error>`（它会丢失类型信息，调用方无法针对不同错误做不同处理），而是定义专用枚举：
+
+```rust
+use std::fmt;
+
+#[derive(Debug)]
+enum ReadError {
+    Io(std::io::Error),
+    Empty,
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ReadError::Io(e) => write!(f, "读取失败：{}", e),
+            ReadError::Empty => write!(f, "文件为空"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+// 实现 From，? 就能自动转换
+impl From<std::io::Error> for ReadError {
+    fn from(e: std::io::Error) -> Self {
+        ReadError::Io(e)
+    }
+}
+
+fn read_first_line(path: &str) -> Result<String, ReadError> {
+    let reader = BufReader::new(File::open(path)?);   // 自动走 From
+    reader.lines().next().ok_or(ReadError::Empty)?.map_err(ReadError::Io)
+}
+```
+
+这样调用方可以 `match` 区分「文件打不开」和「文件是空的」，分别采取不同的恢复策略。
+
+**实践建议：** 二进制程序（应用层）用 `Box<dyn Error>` 或 `anyhow` crate；库要用具名错误类型或 `thiserror` crate 来自动生成上面这些样板代码。
+
+**顺带一提：** `main` 函数本身也能返回 `Result`，这样就能在顶层直接用 `?`：
+
+```rust
+fn main() -> Result<(), Box<dyn Error>> {
+    let line = read_first_line("Cargo.toml")?;
+    println!("{}", line);
+    Ok(())
+}
+```
+
+出错时进程会以非零状态码退出，并把错误的 `Debug` 表示打印到 stderr。
+</Answer>
 </Callout>
 
 ## 小结

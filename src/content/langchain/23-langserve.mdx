@@ -63,6 +63,56 @@ LangServe 默认不鉴权。生产务必：①放在反向代理后加 API Key/�
 
 <Callout type="exercise" title="练习">
 把第 16 章的流式问答链用 `addRoute` 挂载，并用 `RemoteRunnable` 从另一个 Node 脚本远程调用 `/invoke`。
+
+<Answer>
+**参考答案：**
+
+Python 侧用 FastAPI 挂载（JS 侧才是 `addRoute`），两者能力等价，都自动生成 `/invoke`、`/batch`、`/stream`、`/playground`：
+
+```python
+# server.py
+from fastapi import FastAPI
+from langserve import add_routes
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+app = FastAPI()
+
+# 第 16 章的流式问答链
+chain = (
+    ChatPromptTemplate.from_template("用中文回答：{question}")
+    | ChatOpenAI(model="gpt-4o-mini")
+    | StrOutputParser()
+)
+
+add_routes(app, "/chat", chain, playground=True)
+
+# 启动：uvicorn server:app --port 8000
+```
+
+远程调用端（另一个脚本）：
+
+```python
+# client.py
+from langserve import RemoteRunnable
+
+remote = RemoteRunnable("http://localhost:8000/chat")
+
+# 单次调用 /invoke
+res = await remote.ainvoke({"question": "什么是 RAG？"})
+
+# 流式消费 /stream
+async for chunk in remote.astream({"question": "什么是 RAG？"}):
+    print(chunk, end="")
+```
+
+关键点：
+
+- 流式链（`StrOutputParser` 结尾）天然支持 `/stream`，`RemoteRunnable.astream` 逐个 token 返回；
+- 中文问题必须用键 `question`，与 `from_template` 里的 `{question}` 对应，否则 schema 校验失败；
+- JS/Node 侧等价写法：`addRoute(app, '/chat', chain)` 挂载，`RemoteRunnable` 从 `@langchain/core/runnables` 导入，`await remote.invoke({ question: '...' })` 调用 `/invoke`。
+</Answer>
 </Callout>
 
 ## 小结

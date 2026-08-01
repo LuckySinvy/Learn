@@ -254,4 +254,31 @@ EXACTLY_ONCE_V2 底层就是第 6 章的事务：消费 offset、状态 changelo
 1. 完整搭建本章流水线（可用 Docker Compose 单机三 broker），实现生产者、库存消费组（含 DLQ）、Streams 聚合三个程序。
 2. 故障演练：处理中 kill -9 库存消费者再重启，验证扣减不重复；kill 一个 broker，验证事件不丢。
 3. 写一个 DLQ 回放工具：读取死信消息，修复后带上原 headers 回灌主 topic，并保证回放本身也是幂等的。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：三件套骨架**
+
+- **生产者（Outbox）**：业务库订单表与 outbox 表同事务写入；独立投递线程/CDC 把 outbox 行发到 `orders` topic，`acks=all` + 幂等（`enable.idempotence=true`）。key 取 `orderId` 保证同一订单事件有序。
+- **库存消费组（含 DLQ）**：`at-least-once` 消费，扣减逻辑与「已处理 orderId 唯一键」同事务——重复事件因唯一键冲突被忽略，实现幂等。处理失败（如库存不足、格式错）写入 `orders-dlq` topic，主流程照常提交 offset 不卡死。
+- **Streams 聚合**：`orders` 流按 `orderId`/`userId` 窗口聚合（如每分钟 GMV），用 `EXACTLY_ONCE_V2` 保证聚合结果精确一次。下游数仓消费聚合结果 topic。
+
+Docker Compose 起 3 broker + 各程序容器即可联调。
+
+**第 2 题：故障演练**
+
+- **kill -9 库存消费者再重启**：消费组 rebalance，新实例从已提交 offset 继续。由于扣减靠「唯一键幂等」，重启期间重复投递的事件（at-least-once 正常行为）落库时唯一键冲突被跳过 → 库存**不重复扣减**。证据：库存最终值与无故障场景一致。
+- **kill 一个 broker**：`acks=all` + 副本数≥2 + min.insync.replicas≥2，只要存活 broker 数 ≥ min.insync.replicas，生产者写入仍成功；副本从 leader 追平。事件不丢。若存活数 < min.insync.replicas，生产者会收到 `NotEnoughReplicasException` 而**拒绝写入**（宁可失败也不写单副本），此时需恢复 broker——这是「可用性换一致性」的刻意设计，避免丢数据。
+
+**第 3 题：DLQ 回放工具（幂等）**
+
+工具逻辑：
+1. 用 `seekToBeginning` 从 `orders-dlq` 全量读死信消息。
+2. 对消息做修复（如补全缺失字段、修正金额），得到新 value。
+3. **原样带上 `record.headers()`**（保留原始 traceId、重试次数等），以原 key 发回主 topic `orders`。
+4. 保证回放幂等：主流程消费回灌消息时，同样走「唯一键幂等」去重；回放工具自身也记录「已回放消息的 offset/key 指纹」，避免工具重复运行导致二次回灌。可给 headers 加 `replay=true` 标记，便于审计与去重。
+
+注意回灌后下游（库存、Streams 聚合）会再次处理这些事件，因此它们的幂等设计必须覆盖「原始事件 + 回放事件」两种来源——这正是全链路幂等的价值。
+</Answer>
 </Callout>

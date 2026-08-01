@@ -79,6 +79,62 @@ Rust 是** ahead-of-time 编译**语言：先 `cargo build` 生成机器码，�
 
 <Callout type="exercise" title="练习">
 用 `cargo new hello --bin` 创建项目，把输出改成你的名字（例如 `Hello, 小明!`），再 `cargo run` 确认成功。然后试试故意写错一个字母让编译失败，观察编译器的友好报错。
+
+<Answer>
+**参考答案：**
+
+**第 1 步：创建并运行项目**
+
+```bash
+cargo new hello --bin
+cd hello
+cargo run
+# 输出：
+#    Compiling hello v0.1.0 (/path/to/hello)
+#     Finished dev [unoptimized + debuginfo] target(s) in 0.35s
+#      Running `target/debug/hello`
+# Hello, world!
+```
+
+**第 2 步：修改 `src/main.rs`**
+
+```rust
+fn main() {
+    println!("Hello, 小明!");
+}
+```
+
+再次 `cargo run`，输出变为 `Hello, 小明!`。
+
+**第 3 步：故意制造编译错误**
+
+把 `println!` 写成 `printl!`：
+
+```rust
+fn main() {
+    printl!("Hello, 小明!");
+}
+```
+
+编译器会给出类似这样的报错：
+
+```text
+error: cannot find macro `printl` in this scope
+ --> src/main.rs:2:5
+  |
+2 |     printl!("Hello, 小明!");
+  |     ^^^^^^ help: a macro with a similar name exists: `println`
+```
+
+**观察要点：**
+
+- 报错里有**错误码/描述**、**出错文件与行列号**、用 `^^^` 标出的**精确位置**
+- 最有价值的是 `help:` 那一行——Rust 编译器会主动猜测你的意图并给出修复建议
+- 另一个常见错误是漏掉分号，报错会提示 `` help: add `;` here ``
+- 这种「编译器即导师」的体验是 Rust 的一大特色：遇到红色报错先完整读一遍，通常答案就写在里面
+
+**小提示：** `cargo run` 会自动先 build 再执行；只想检查语法而不生成可执行文件时，用 `cargo check` 更快。
+</Answer>
 </Callout>
 
 ## 小结

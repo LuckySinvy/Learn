@@ -200,4 +200,73 @@ systemd 其实也有自己的定时器（timer 单元），比 cron 多了错过
 2. 在沙箱用 flock 复现"防重叠"：后台先占锁 5 秒，期间循环三次尝试 `flock -n` 执行任务，观察哪几次被跳过。
 3. 阅读 2.1 的 unit 文件，回答：服务崩溃后多久重启？以哪个用户运行？如何让改动后的配置生效并重启服务（写出完整命令序列）？
 4. 真机作业：在一台云服务器上创建一个每分钟往 /tmp/heartbeat.log 追加时间戳的 cron 任务，验证生效后删除它（`crontab -e` 增删行）。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：三个 cron 表达式**
+
+```text
+# 每周六 23:30：分钟 30、小时 23、周 6（周六）
+30 23 * * 6
+
+# 每月 1 号和 15 号的 04:00：用列表符号
+0 4 1,15 * *
+
+# 工作日 9 点到 18 点之间每半小时
+# 9-18 点的整点：0,30 分钟 × 小时 9-17（18 点整不算"之间"）；若包含 18 点整则为 9-18
+0,30 9-17 * * 1-5
+```
+
+说明：星期 `6` 是周六（`0` 和 `7` 都是周日）；"每半小时"要写分钟列表 `0,30`；`1-5` 表示工作日周一到周五；小时区间 `9-17` 覆盖 09:00 到 17:30，若想含 18:00 整点改成 `9-18`。
+
+**第 2 题：flock 防重叠复现**
+
+```bash
+# 后台先占锁 5 秒
+flock -n /tmp/job.lock sleep 5 &
+
+# 立即循环三次尝试拿锁（每次不等待，-n）
+for i in 1 2 3; do
+  flock -n /tmp/job.lock echo "尝试 $i 拿到了锁" || echo "尝试 $i 锁被占用，跳过"
+  sleep 2
+done
+wait
+```
+
+第一次尝试（约 0.2 秒后）锁仍被占用 → 跳过；前 5 秒内的尝试都会失败；等第一次的 sleep 5 释放锁后，若还有尝试就能成功。这就是定时任务防止"上一轮没跑完、下一轮又启动"重叠执行的机制——错过就跳过，不排队堆积。
+
+**第 3 题：读懂 unit 文件**
+
+```bash
+# 服务崩溃后多久重启？→ RestartSec=3，即崩溃拉起后等 3 秒再重启
+# 以哪个用户运行？   → User=appuser
+# 让改动生效并重启：先 daemon-reload 再 restart
+sudo systemctl daemon-reload
+sudo systemctl restart myapp
+```
+
+完整回答：`Restart=on-failure` 表示非正常退出时自动拉起，`RestartSec=3` 是重启前等待 3 秒；服务以 `appuser` 这个低权限用户运行（`User=appuser`）。修改 `.service` 文件后必须**先** `daemon-reload` 让 systemd 重新读取单元定义，**再** `restart`（或 `stop` + `start`）使新配置生效。注意 `reload` 只对支持热重载的服务有意义，改 ExecStart 这类核心字段时用 `restart` 更稳妥。
+
+**第 4 题：真机 cron 心跳任务**
+
+```bash
+# 1. 编辑 crontab
+crontab -e
+# 加入一行（命令建议绝对路径，用 date 绝对路径或依赖 PATH）：
+# * * * * * /bin/date '+%F %T' >> /tmp/heartbeat.log 2>&1
+
+# 2. 查看任务是否在
+crontab -l
+
+# 3. 等约 2 分钟，验证
+cat /tmp/heartbeat.log
+# 应看到每分钟追加一行时间戳
+
+# 4. 删除任务
+crontab -e    # 删掉那一行保存；或 crontab -r 清空全部（慎用）
+```
+
+验证要点：cron 的最小粒度是分钟，创建后约 1 分钟内第一次触发，等两分钟确认有两行追加即可。删除时用 `crontab -e` 删行，不要轻易 `crontab -r`（会清空所有任务）。
+</Answer>
 </Callout>

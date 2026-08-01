@@ -280,4 +280,112 @@ GLOBAL IN：协调节点算一次结果集 → 广播给分片1/2/3 ...        �
 1. 用 2 个 Docker 容器（或 `clickhouse-server` 多实例）搭一个 `2 分片 × 1 副本`的 `my_cluster`，用 `config.d/cluster.xml` 声明，并 `SELECT * FROM system.clusters` 验证。
 2. 建 `events_local`（`MergeTree`）和 `events`（`Distributed(my_cluster, default, events_local, rand())`），插入 100 万行，分别 `SELECT count()` 和按 `country` 聚合，观察结果是否等于各分片之和。
 3. 构造一个跨分片的 `IN (SELECT ...)` 与 `GLOBAL IN (SELECT ...)`，用 `system.query_log` 的 `read_rows` 字段对比两者的扫描量差异（提示：开两个会话分别跑，再用 `SELECT query, read_rows FROM system.query_log ORDER BY event_time DESC LIMIT 4`）。
+
+<Answer>
+**参考答案：**
+
+1. 搭 2 分片 × 1 副本集群：
+
+```bash
+docker network create chnet
+
+docker run -d --name ch1 --network chnet --ulimit nofile=262144:262144 -p 8123:8123 -p 9000:9000 clickhouse/clickhouse-server:24.8
+docker run -d --name ch2 --network chnet --ulimit nofile=262144:262144 -p 8124:8123 -p 9001:9000 clickhouse/clickhouse-server:24.8
+```
+
+在两台容器里分别写同一个 `cluster.xml`（用各自的 host 名，容器网络内可互 ping）：
+
+```xml
+<!-- /etc/clickhouse-server/config.d/cluster.xml（ch1、ch2 内容相同） -->
+<clickhouse>
+    <remote_servers>
+        <my_cluster>
+            <shard>
+                <replica><host>ch1</host><port>9000</port></replica>
+            </shard>
+            <shard>
+                <replica><host>ch2</host><port>9000</port></replica>
+            </shard>
+        </my_cluster>
+    </remote_servers>
+</clickhouse>
+```
+
+```bash
+docker restart ch1 ch2
+```
+
+验证（任一节点执行）：
+
+```sql
+SELECT cluster, shard_num, replica_num, host_name
+FROM system.clusters
+WHERE cluster = 'my_cluster';
+-- 期望两行：shard 1 / ch1，shard 2 / ch2
+```
+
+2. 本地表 + 分布式表：
+
+```sql
+-- 在任意节点执行 ON CLUSTER，DDL 广播到所有节点
+CREATE TABLE events_local ON CLUSTER my_cluster
+(
+    event_time DateTime,
+    user_id    UInt64,
+    event_type LowCardinality(String),
+    page       String,
+    country    LowCardinality(String),
+    device     LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+
+CREATE TABLE events ON CLUSTER my_cluster
+AS events_local
+ENGINE = Distributed(my_cluster, default, events_local, rand());
+
+-- 向分布式表插 100 万行，自动按 rand() 路由到两个分片
+INSERT INTO events
+SELECT now() - number, number, 'view', '/p/1',
+       ['CN','US','JP','DE','IN'][1 + number % 5], 'web', 100
+FROM numbers(1000000);
+```
+
+验证：
+
+```sql
+-- 分布式表看到的总数
+SELECT count() FROM events;
+-- 各分片本地之和
+SELECT count() FROM events_local;
+SELECT hostName() AS node, count() AS rows FROM events_local GROUP BY node;
+```
+
+分布式表的总数 = 两个分片之和；按 `country` 聚合也一样，协调节点会合并各分片的部分结果。
+
+3. IN vs GLOBAL IN：
+
+```sql
+-- 会话 A：普通 IN（危险写法，子查询在每个分片各自重跑）
+SELECT count() FROM events
+WHERE user_id IN (SELECT user_id FROM events WHERE event_type = 'purchase');
+
+-- 会话 B：GLOBAL IN（协调节点先算出结果集再广播）
+SELECT count() FROM events
+WHERE user_id GLOBAL IN (SELECT user_id FROM events WHERE event_type = 'purchase');
+```
+
+分别跑完后用 `query_log` 对比：
+
+```sql
+SELECT query, read_rows
+FROM system.query_log
+WHERE type = 'QueryFinish' AND query_kind = 'Select'
+ORDER BY event_time DESC LIMIT 4;
+```
+
+普通 `IN` 的 `read_rows` 会大得多（每个分片都对分布式表重复发起子查询，N×N 扫描）；`GLOBAL IN` 只算一次结果集再广播，`read_rows` 小一个量级。这就是分布式环境下必须用 GLOBAL 的原因。
+</Answer>
 </Callout>

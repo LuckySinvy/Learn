@@ -218,4 +218,232 @@ SHOW EVENTS FROM shop;
 1. 写一个存储过程给 orders 造 10 万行测试数据（分批提交），完成后用它验证第 7 章的深分页优化效果。
 2. 给 users 表建一个 BEFORE INSERT 触发器：email 统一转小写存储；插入大写邮箱验证效果。
 3. 列出你当前库中所有触发器和事件，然后全部 DROP 掉，体会「摸清遗留逻辑」的排查过程。
+
+<Answer>
+**参考答案：**
+
+**1. 存储过程造 10 万行测试数据**
+
+```sql
+DROP PROCEDURE IF EXISTS gen_test_orders;
+
+DELIMITER //
+
+CREATE PROCEDURE gen_test_orders(IN p_count INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+
+  SET autocommit = 0;
+
+  WHILE i < p_count DO
+    INSERT INTO orders (order_no, user_id, status, total_amount, created_at)
+    VALUES (CONCAT('T', LPAD(i, 10, '0')),
+            FLOOR(1 + RAND() * 5),
+            FLOOR(RAND() * 5),
+            ROUND(RAND() * 10000, 2),
+            NOW() - INTERVAL FLOOR(RAND() * 365) DAY);
+
+    SET i = i + 1;
+
+    IF i % 1000 = 0 THEN
+      COMMIT;              -- 每 1000 行提交一次
+    END IF;
+  END WHILE;
+
+  COMMIT;                  -- 提交尾巴上不足 1000 行的部分
+  SET autocommit = 1;
+END //
+
+DELIMITER ;
+
+CALL gen_test_orders(100000);
+ANALYZE TABLE orders;      -- 重新收集统计信息，否则优化器还按老数据估算
+SELECT COUNT(*) FROM orders;
+```
+
+**为什么必须分批提交**：10 万行放一个事务里会产生巨大的 undo log（MVCC 要保留所有旧版本无法清理）、长时间持有大量行锁、redo log 暴涨可能触发强制刷脏页卡顿，主从架构下还会造成明显延迟。分批提交把它拆成 100 个小事务。
+
+`SET autocommit = 0` 是必须的：否则每条 INSERT 自己就是一个事务并立即 fsync，10 万次刷盘会慢到无法接受，`COMMIT` 也形同虚设。
+
+**更快的替代方案**（存储过程逐行 INSERT 其实很慢，10 万行可能要几十秒）：用「自我复制倍增法」，17 次翻倍即可从 1 行到 13 万行，通常只要几秒：
+
+```sql
+INSERT INTO orders (order_no, user_id, status, total_amount, created_at)
+SELECT CONCAT('X', LPAD(FLOOR(RAND()*1000000000), 10, '0')),
+       user_id, status, total_amount, created_at
+FROM orders;
+-- 反复执行这一条即可
+```
+
+**验证第 7 章的深分页优化**：
+
+```sql
+-- 慢：扫描并丢弃前 9 万行
+SELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 90000;
+-- 约 0.2 ~ 0.8 sec
+
+-- 延迟关联：子查询只在主键索引上翻页，不回表
+SELECT o.* FROM orders o
+JOIN (SELECT id FROM orders ORDER BY id LIMIT 20 OFFSET 90000) t
+  ON o.id = t.id;
+-- 明显更快
+
+-- 游标分页：直接定位起点，与页码无关
+SELECT * FROM orders WHERE id > 90000 ORDER BY id LIMIT 20;
+-- 约 0.00 sec，和第一页一样快
+```
+
+用 EXPLAIN 看根因：第一条的 `rows` 是 90020，第三条只有 20。
+
+**2. BEFORE INSERT 触发器：email 转小写**
+
+```sql
+DROP TRIGGER IF EXISTS trg_users_email_lower;
+
+DELIMITER //
+
+CREATE TRIGGER trg_users_email_lower
+BEFORE INSERT ON users
+FOR EACH ROW
+BEGIN
+  SET NEW.email = LOWER(TRIM(NEW.email));
+END //
+
+DELIMITER ;
+```
+
+验证：
+
+```sql
+INSERT INTO users (username, email, phone)
+  VALUES ('Tom', '  ToM@DEMO.COM  ', '13900001111');
+
+SELECT id, username, email FROM users WHERE username = 'Tom';
+```
+
+```text
++----+----------+---------------+
+| id | username | email         |
++----+----------+---------------+
+| 10 | Tom      | tom@demo.com  |
++----+----------+---------------+
+```
+
+要点：
+
+- **只有 BEFORE 触发器能修改 `NEW.列`**。AFTER 触发器里改 NEW 无效（行已经写入了），MySQL 会直接报错 `Updating of NEW row is not allowed in after trigger`。
+- `OLD` 在 INSERT 触发器里不可用，`NEW` 在 DELETE 触发器里不可用。
+- 只覆盖 INSERT 是不够的——`UPDATE users SET email = 'ABC@X.COM'` 会绕过它。要完整覆盖得再建一个 BEFORE UPDATE 触发器：
+
+```sql
+DELIMITER //
+CREATE TRIGGER trg_users_email_lower_upd
+BEFORE UPDATE ON users
+FOR EACH ROW
+BEGIN
+  SET NEW.email = LOWER(TRIM(NEW.email));
+END //
+DELIMITER ;
+```
+
+**这个需求其实不该用触发器**。更好的三种方案：
+
+1. **依赖排序规则**：默认的 `utf8mb4_0900_ai_ci` 本身就不区分大小写，`WHERE email = 'ABC@X.COM'` 能匹配到 `abc@x.com`，唯一索引 `uk_email` 也会把两者判为重复——**大多数情况下根本不需要转小写**。
+2. **生成列**（声明式，比触发器透明得多）：
+
+```sql
+ALTER TABLE users
+  ADD COLUMN email_lower VARCHAR(100)
+    GENERATED ALWAYS AS (LOWER(email)) STORED,
+  ADD UNIQUE KEY uk_email_lower (email_lower);
+```
+
+3. **应用层规范化**：注册时就把邮箱转小写再入库，逻辑显式可见、可单测、可追踪。
+
+触发器的问题正如本章所说：**不可观测**。「我明明插入的是大写，查出来怎么是小写」会让不知情的同事排查半天——逻辑藏在数据库里，应用日志和 APM 全部失明。
+
+**3. 摸清并清理遗留触发器与事件**
+
+**第一步：全量盘点（接手任何遗留系统的必做动作）**
+
+```sql
+-- 所有触发器：在哪张表、什么时机、什么事件
+SELECT trigger_name,
+       event_object_table AS on_table,
+       action_timing,
+       event_manipulation AS on_event,
+       definer,
+       created
+FROM information_schema.triggers
+WHERE trigger_schema = 'shop'
+ORDER BY event_object_table, action_timing;
+```
+
+```sql
+-- 所有事件（库内定时任务）
+SELECT event_name, status, event_type, interval_value, interval_field,
+       starts, last_executed, definer
+FROM information_schema.events
+WHERE event_schema = 'shop';
+
+-- 别忘了存储过程和函数
+SELECT routine_name, routine_type, definer, created, last_altered
+FROM information_schema.routines
+WHERE routine_schema = 'shop';
+```
+
+**第二步：备份定义（关键！DROP 之前必须做）**
+
+```bash
+# 单独导出所有例程、触发器、事件的定义，不含数据
+mysqldump -uroot -p --no-data --no-create-info \
+  --routines --triggers --events --skip-opt \
+  --databases shop > shop_logic_backup.sql
+```
+
+也可以逐个查看：
+
+```sql
+SHOW CREATE TRIGGER trg_product_price_audit\G
+SHOW CREATE EVENT ev_purge_price_log\G
+SHOW CREATE PROCEDURE gen_test_orders\G
+```
+
+**第三步：清理**
+
+```sql
+DROP TRIGGER IF EXISTS trg_product_price_audit;
+DROP TRIGGER IF EXISTS trg_users_email_lower;
+DROP TRIGGER IF EXISTS trg_users_email_lower_upd;
+
+DROP EVENT IF EXISTS ev_purge_price_log;
+
+DROP PROCEDURE IF EXISTS gen_test_orders;
+DROP PROCEDURE IF EXISTS get_user_orders;
+DROP FUNCTION  IF EXISTS order_status_text;
+```
+
+批量生成 DROP 语句（表多时用）：
+
+```sql
+SELECT CONCAT('DROP TRIGGER IF EXISTS `', trigger_name, '`;') AS stmt
+FROM information_schema.triggers WHERE trigger_schema = 'shop';
+```
+
+确认清理干净：
+
+```sql
+SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = 'shop';
+SELECT COUNT(*) FROM information_schema.events   WHERE event_schema   = 'shop';
+```
+
+**这个排查过程要体会到什么：**
+
+1. **触发器是隐形炸弹**。「我只 UPDATE 了 products 一行，为什么 product_price_log 多了记录」——不盘点根本想不到。批量导数据前尤其要检查：触发器会被**逐行触发**，导 100 万行就执行 100 万次，性能直接雪崩。
+2. **`definer` 字段是个大坑**。触发器/过程默认以创建者权限执行。如果那个账号被删了或迁库时不存在，运行时会报 `The user specified as a definer does not exist`——迁移前必须检查这一列。
+3. **`mysqldump` 默认不导出这些**。必须显式加 `--routines --triggers --events`，否则「备份恢复完发现触发器全没了」（第 19 章会再强调）。
+4. **生产环境不能这样直接 DROP**。正确流程是：盘点 → 备份定义 → 分析每个对象是否还被依赖（查代码、查调用方）→ 逐个下线并观察 → 确认无影响后删除。这里为了练习才一次性清空。
+
+替代方案上，新系统需要审计留痕应该用 **binlog 订阅**（Canal / Debezium）——逻辑在应用侧，可观测、可版本管理、不占数据库 CPU、也不影响分库分表。
+</Answer>
 </Callout>

@@ -232,6 +232,196 @@ console.log(greet.call({ who: "TS" }, "!"));`}
 1. 在本地新建一个空项目，运行 `npx tsc --init --strict`，逐条阅读生成的注释，挑出五个你以前没注意的选项。
 2. 打开 `noUncheckedIndexedAccess`，修一遍现有代码，统计有多少处数组访问其实是不安全的。
 3. 把一个小项目拆成 `src` 与 `tests` 两个 tsconfig，用 `references` 关联，体验 `tsc -b` 的增量构建。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：五个容易被忽略的选项**
+
+`npx tsc --init --strict` 生成的文件里注释掉的选项有七八十个。下面五个是实践中价值高、却最常被忽略的：
+
+| 选项 | 作用 | 为什么值得注意 |
+|---|---|---|
+| `forceConsistentCasingInFileNames` | 禁止同一文件用不同大小写引用 | macOS/Windows 文件系统不区分大小写，Linux 区分。本地一切正常、CI 上「找不到模块」，十有八九是它 |
+| `allowUnreachableCode: false` | 不可达代码报错而非警告 | `return` 之后的语句、恒假条件分支，往往是重构没删干净的残留 |
+| `noImplicitReturns` | 函数有的分支返回值、有的不返回时报错 | 漏写一个 `return` 导致隐式返回 `undefined`，是很隐蔽的逻辑 bug |
+| `noUnusedLocals` / `noUnusedParameters` | 未使用的局部变量与参数报错 | 建议交给 ESLint 管，因为 lint 能提供自动修复且不阻断编译 |
+| `resolveJsonModule` | 允许 `import data from "./x.json"` 并推断出精确类型 | 配置文件、mock 数据直接当模块用，还能拿到字面量类型 |
+
+再补充三个「知道了会少踩坑」的：
+
+- **`skipLibCheck`** 默认是关的，但 `--init` 生成的模板里通常帮你开了。别随手关掉，编译时间会翻倍。
+- **`exactOptionalPropertyTypes`** 区分「没有这个键」与「键存在但值是 `undefined`」。语义上更正确，但会和很多第三方库的类型定义打架，老项目慎开。
+- **`lib` 不写时的默认值跟随 `target`**。前端项目忘了加 `"DOM"`，就会出现 `document is not defined` 这种类型错误。
+
+**第 2 题：noUncheckedIndexedAccess 的典型修法**
+
+```json
+{
+  "compilerOptions": {
+    "noUncheckedIndexedAccess": true
+  }
+}
+```
+
+开启后所有索引访问的类型都会带上 `undefined`。常见的四类报错与对应修法：
+
+```ts
+const arr = [1, 2, 3];
+
+// ── 情况 1：直接使用首元素 ──────────────────────
+// const first: number = arr[0];   // 错误：number | undefined 不能赋给 number
+
+// 修法 A：显式判空（最推荐，逻辑最诚实）
+const first = arr[0];
+if (first !== undefined) {
+  console.log(first * 2);
+}
+
+// 修法 B：给一个兜底值
+const firstOrZero = arr[0] ?? 0;
+
+// 修法 C：确实能保证非空时用非空断言，但要留个注释说明理由
+const head = arr[0]!;   // 上游已保证 arr.length > 0
+
+
+// ── 情况 2：for 循环里的索引访问 ────────────────
+for (let i = 0; i < arr.length; i++) {
+  // const v: number = arr[i];   // 错误：编译器不做「i < length 所以一定有值」的推理
+}
+
+// 修法：改用 for...of，元素类型不带 undefined
+for (const v of arr) {
+  console.log(v * 2);   // v 是 number
+}
+
+// 需要下标时用 entries()
+for (const [i, v] of arr.entries()) {
+  console.log(i + ": " + v);
+}
+
+
+// ── 情况 3：对象字典查表 ────────────────────────
+const scores: Record<string, number> = { math: 90 };
+// const s: number = scores["english"];   // 错误：可能不存在
+
+const s = scores["english"] ?? 0;
+console.log(s);   // 0
+
+
+// ── 情况 4：解构 ────────────────────────────────
+const [a, b] = arr;      // a、b 的类型都是 number | undefined
+console.log((a ?? 0) + (b ?? 0));
+```
+
+**统计不安全访问的实操办法：**
+
+```bash
+# 只做类型检查，把报错按错误码分组统计
+npx tsc --noEmit 2>&1 | grep -c "TS2532\|TS18048\|TS2322"
+```
+
+真实项目里第一次打开这个选项，通常会冒出几十到上百个错误。**绝大多数确实是潜在 bug**——尤其是「用了 `find()` 的结果却没判空」「假设 `split()` 一定有第二段」这两类。
+
+一个重要认知：修的时候要**优先选修法 A（显式判空）**，而不是无脑加 `!`。如果全靠 `!` 消错，等于把选项开了个寂寞——`!` 只是让编译器闭嘴，运行时该崩还是崩。`!` 应该只用在「有明确不变量保证」的地方，并且写注释说明这个保证是什么。
+
+**第 3 题：src / tests 拆分与项目引用**
+
+目录结构：
+
+```text
+my-project/
+├── tsconfig.json           ← 聚合根，本身不编译任何文件
+├── tsconfig.base.json      ← 共享的 compilerOptions
+├── src/
+│   ├── tsconfig.json
+│   └── index.ts
+└── tests/
+    ├── tsconfig.json
+    └── index.test.ts
+```
+
+`tsconfig.base.json`（共享配置）：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  }
+}
+```
+
+`src/tsconfig.json`：
+
+```json
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "../dist/src"
+  },
+  "include": ["**/*.ts"]
+}
+```
+
+`tests/tsconfig.json`（依赖 src）：
+
+```json
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "../dist/tests",
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["**/*.ts"],
+  "references": [{ "path": "../src" }]
+}
+```
+
+根 `tsconfig.json`（纯聚合，不含任何文件）：
+
+```json
+{
+  "files": [],
+  "references": [{ "path": "./src" }, { "path": "./tests" }]
+}
+```
+
+构建命令：
+
+```bash
+npx tsc -b              # 按依赖顺序构建全部
+npx tsc -b --verbose    # 打印每个项目是「已是最新」还是「需要重建」
+npx tsc -b --watch      # 监听模式，同样是增量的
+npx tsc -b --clean      # 删除所有产物与 .tsbuildinfo
+```
+
+**能观察到的效果：**
+
+1. 第一次 `tsc -b` 会依次构建 `src` 和 `tests`。
+2. **只改 `tests` 下的文件**再次构建，`--verbose` 会输出「Project 'src' is up to date」，直接跳过——这就是增量的收益。
+3. **只改 `src` 下的文件**，两个项目都会重建，但 `tests` 读的是 `src` 产出的 `.d.ts`，不会重新检查 `src` 的全部源码。
+4. 更妙的是：如果改动只影响 `src` 的函数体而不改变任何签名，生成的 `.d.ts` 内容不变，TypeScript 会判定下游无需重建。
+
+**几个容易撞墙的点**（对应本章的 Callout）：
+
+- 被引用的项目**必须**开 `composite: true`。它会强制要求 `rootDir` 明确、`include` 不为空。
+- 根 tsconfig 用 `"files": []` 表示「我自己不编译任何文件，只负责聚合」。漏写这行会导致根项目试图编译整个仓库。
+- 必须用 `tsc -b` 而不是 `tsc`。普通的 `tsc` 完全无视 `references`。
+- `.tsbuildinfo` 文件要加进 `.gitignore`。
+- 编辑器（VS Code）能自动理解 references，跳转定义时若配了 `declarationMap: true`，会直接跳到 `.ts` 源码而不是 `.d.ts`——这一条体验提升很大，别漏配。
+
+**这样拆分的实际收益：** 测试文件不会被打包进生产产物，`tests` 可以单独声明 `types: ["vitest/globals"]` 这类只有测试才需要的全局类型，而 `src` 保持干净——不会出现「生产代码里误用了 `describe`」还能通过类型检查的情况。
+</Answer>
 </Callout>
 
 ## 小结

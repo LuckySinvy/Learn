@@ -87,6 +87,90 @@ kubectl get pod app
 
 <Callout type="exercise" title="练习">
 给一个 Web 应用加上 `/healthz`（liveness）和 `/ready`（readiness）两个端点，并配置对应探针；故意让 `/ready` 返回 500，观察 READY 状态变为 0/1、Pod 从 Service endpoints 中消失。
+
+<Answer>
+**参考答案：**
+
+用一个带两个端点的测试镜像来演示（这里用支持环境变量开关 `/ready` 的镜像，比如 `joshgav/healthz` 或自建；若手头没有，可用下面 YAML 里任意能对 `/healthz`、`/ready` 返回 200 的应用代替）：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: app
+          image: joshgav/healthz:latest   # 提供 /healthz 与 /ready 端点
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+按顺序执行：
+
+```bash
+kubectl apply -f probe-demo.yaml
+
+# 健康时：READY 为 1/1，endpoints 非空
+kubectl get pod -l app=web
+kubectl get endpoints web
+
+# 模拟 /ready 返回 500（此镜像支持通过文件/环境变量切换就绪状态；
+# 真实应用可直接让 /ready 逻辑返回 500 即可）
+kubectl exec -it deploy/web -- touch /tmp/unhealthy    # 以镜像自身机制为准
+
+# 观察：READY 变 0/1，Pod 仍 Running（liveness 没失败，容器不被重启）
+kubectl get pod -l app=web
+# NAME                   READY   STATUS    RESTARTS
+# web-xxxxx-yyyy         0/1     Running   0
+
+# endpoints 变为空：流量被摘掉
+kubectl get endpoints web
+# NAME   ENDPOINTS   AGE
+# web               10s
+
+# 恢复 /ready 后，READY 回到 1/1，endpoints 重新出现
+kubectl exec -it deploy/web -- rm -f /tmp/unhealthy
+kubectl get pod -l app=web
+
+# 清理
+kubectl delete -f probe-demo.yaml
+```
+
+**要点回顾：** readiness 失败只会把 Pod 从 Service 后端摘掉（endpoints 变空），Pod 本身不重启；liveness 失败才会杀掉重启容器。因此"READY 0/1 + 无 RESTARTS"正是 readiness 失败的典型表现。
+</Answer>
 </Callout>
 
 ## 小结

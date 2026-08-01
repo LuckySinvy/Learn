@@ -80,6 +80,109 @@ const webDocs = await webLoader.load();
 
 <Callout type="exercise" title="练习">
 把你电脑里一份 PDF 手册加载进来，打印第一页的 `pageContent` 前 200 字，确认结构正确。
+
+<Answer>
+**参考答案：**
+
+**准备依赖**
+
+```bash
+npm install @langchain/community @langchain/core pdf-parse
+```
+
+**基础版**
+
+```ts
+// load-pdf.ts
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+
+const loader = new PDFLoader("./docs/manual.pdf");
+const pages = await loader.load();
+
+console.log("总页数：", pages.length);
+
+const first = pages[0];
+console.log("元数据：", first.metadata);
+console.log("页码：", first.metadata.loc?.pageNumber);
+console.log("前 200 字：\n" + first.pageContent.slice(0, 200));
+```
+
+**加上体检的完整版（推荐这样验证）**
+
+只看前 200 字容易被「看起来有内容」骗过去。真正要确认的是**文本是否被正确抽取**：
+
+```ts
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+
+const loader = new PDFLoader("./docs/manual.pdf");
+const pages = await loader.load();
+
+if (pages.length === 0) {
+  throw new Error("没有解析出任何内容，检查文件路径是否正确");
+}
+
+const first = pages[0];
+
+console.log("=== 结构检查 ===");
+console.log("Document 的键：", Object.keys(first));       // [ 'pageContent', 'metadata' ]
+console.log("来源：", first.metadata.source);
+console.log("页码：", first.metadata.loc?.pageNumber);
+console.log("本页字符数：", first.pageContent.length);
+
+console.log("\n=== 前 200 字 ===");
+console.log(first.pageContent.slice(0, 200));
+
+// 体检：扫描式 PDF 常常解析出一堆空白
+const empty = pages.filter((p) => p.pageContent.trim().length < 20).length;
+if (empty > pages.length / 2) {
+  console.warn(
+    `⚠️ ${empty}/${pages.length} 页几乎没有文字，` +
+    "这份 PDF 很可能是扫描件（图片），需要 OCR 才能提取内容"
+  );
+}
+```
+
+**两种加载粒度**
+
+`PDFLoader` 默认**一页一个 Document**。如果你想整份文档合成一个 Document，传 `splitPages: false`：
+
+```ts
+// 一页一个 Document（默认），metadata.loc.pageNumber 可用于溯源
+const byPage = await new PDFLoader("./docs/manual.pdf").load();
+
+// 整份合成一个 Document，适合后续统一交给 splitter 切分
+const whole = await new PDFLoader("./docs/manual.pdf", {
+  splitPages: false,
+}).load();
+
+console.log(byPage.length, whole.length);   // 例如 42  1
+```
+
+做 RAG 时**建议保留默认的分页模式**——`pageNumber` 会跟着切分后的块一路传下去，将来答案就能标注「出自第 12 页」。
+
+**常见问题排查**
+
+| 现象 | 原因与解法 |
+|---|---|
+| `Cannot find module 'pdf-parse'` | 忘了 `npm i pdf-parse`，它是 `PDFLoader` 的 peer 依赖 |
+| `ENOENT: no such file` | 路径是相对**运行目录**而非文件所在目录，用 `path.resolve()` 或绝对路径更稳 |
+| `pageContent` 全是空白 | 扫描件/纯图片 PDF，`pdf-parse` 抽不出文字，需要 OCR（可换第 25 章的 `UnstructuredLoader` 配 `hi_res` 策略） |
+| 文字顺序错乱、夹杂大量空格 | 多栏排版或复杂版式，`pdf-parse` 按坐标流式读取会串行。同样建议换 `UnstructuredLoader` |
+| 中文变成乱码 | PDF 内嵌字体未提供 ToUnicode 映射，属于源文件问题，只能走 OCR |
+
+**下一步**
+
+确认 `Document` 结构正确后，这些 `pages` 就可以直接喂给第 9 章的切分器：
+
+```ts
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+
+const splits = await new RecursiveCharacterTextSplitter({
+  chunkSize: 500,
+  chunkOverlap: 50,
+}).splitDocuments(pages);   // metadata 会自动继承到每个小块上
+```
+</Answer>
 </Callout>
 
 ## 小结

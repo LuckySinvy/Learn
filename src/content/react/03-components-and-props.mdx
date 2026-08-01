@@ -384,6 +384,89 @@ function Select<T>({ options, value, getLabel, onChange }: SelectProps<T>) {
 `<PageHeader title="订单详情" subtitle="ORD-1024" backUrl="/orders" actions={[{text:"导出",onClick:exp},{text:"删除",onClick:del,danger:true}]} tabs={["概览","物流","发票"]} />`
 
 要求：改写后调用方能自由决定按钮的图标、顺序，也能在标题旁插入一个状态标签。
+
+<Answer>
+**参考答案：**
+
+**改写后的调用方式：**
+
+```tsx
+<PageHeader>
+  <PageHeader.Back to="/orders" />
+
+  <PageHeader.Title>
+    订单详情
+    <StatusTag status="paid" />   {/* 状态标签想插哪就插哪 */}
+  </PageHeader.Title>
+
+  <PageHeader.Subtitle>ORD-1024</PageHeader.Subtitle>
+
+  <PageHeader.Actions>
+    {/* 图标、顺序、变体全由调用方决定 */}
+    <Button icon={<ExportIcon />} label="导出" onClick={exp} />
+    <Button icon={<TrashIcon />} label="删除" variant="danger" onClick={del} />
+  </PageHeader.Actions>
+
+  <PageHeader.Tabs value={tab} onChange={setTab}>
+    <PageHeader.Tab value="overview">概览</PageHeader.Tab>
+    <PageHeader.Tab value="logistics">物流</PageHeader.Tab>
+    <PageHeader.Tab value="invoice">发票</PageHeader.Tab>
+  </PageHeader.Tabs>
+</PageHeader>
+```
+
+**实现（用「命名空间组件」把子组件挂在主组件上）：**
+
+```tsx
+type SlotProps = { children: React.ReactNode };
+
+function PageHeader({ children }: SlotProps) {
+  // 主组件只负责容器：布局、边框、间距
+  return <header className="page-header">{children}</header>;
+}
+
+PageHeader.Back = function Back({ to }: { to: string }) {
+  return <a className="ph-back" href={to}>返回</a>;
+};
+
+PageHeader.Title = function Title({ children }: SlotProps) {
+  return <h1 className="ph-title">{children}</h1>;
+};
+
+PageHeader.Subtitle = function Subtitle({ children }: SlotProps) {
+  return <p className="ph-subtitle">{children}</p>;
+};
+
+PageHeader.Actions = function Actions({ children }: SlotProps) {
+  return <div className="ph-actions">{children}</div>;
+};
+
+PageHeader.Tabs = function Tabs({
+  value,
+  onChange,
+  children,
+}: { value: string; onChange: (v: string) => void } & SlotProps) {
+  return <nav className="ph-tabs">{children}</nav>;
+};
+```
+
+**为什么这样更好：**
+
+| 需求变化 | 配置式 | 组合式 |
+|---|---|---|
+| 按钮要加图标 | 改 `actions` 类型，加 `icon` 字段 | 不用改，调用方自己传 |
+| 标题旁加状态标签 | 加 `titleExtra` prop | 不用改，写进 children |
+| 某个 tab 要带红点 | 加 `tabBadges` prop | 不用改 |
+| 删除按钮换成下拉菜单 | 加 `actionType` 联合类型 | 不用改 |
+
+配置式 API 的每一次需求变化都要**修改组件本身**，props 会持续膨胀；组合式把「渲染什么」的决定权交还给调用方，组件只保留「放在哪里、长什么间距」这一件事。
+
+**几点补充：**
+
+1. **`Tabs` 的联动状态适合用 Context。** 如果 `PageHeader.Tab` 需要知道当前选中的是谁，让 `Tabs` 提供一个 Context，`Tab` 内部消费它判断自己是否高亮——这样调用方不必给每个 `Tab` 重复传 `value` 和 `onChange`（第 9 章）。
+2. **不要用 `React.Children` 去「检查」子节点类型。** 那会让组件变脆（包一层 `<div>` 就失效了）。约束应该靠类型和文档，而不是运行时校验。
+3. **上层可以再封一个配置式的便捷组件。** 比如订单模块里 `PageHeader` 的用法高度一致，就封一个 `OrderPageHeader`，内部用组合式实现。这就是本章 `<Callout type="tip">` 说的「底层组合保灵活，上层配置保一致」。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：类型设计">
@@ -394,12 +477,230 @@ function Select<T>({ options, value, getLabel, onChange }: SelectProps<T>) {
 - 列的 key 写错时能在编译期报错
 
 提示：需要用到泛型和 `keyof`。
+
+<Answer>
+**参考答案：**
+
+**第一版（能用，但不够精确）：**
+
+```ts
+type Column<T> = {
+  key: keyof T;
+  title: string;
+  render?: (value: T[keyof T], row: T) => React.ReactNode;
+};
+
+type TableProps<T> = {
+  data: T[];
+  columns: Column<T>[];
+};
+```
+
+这一版已经满足了「key 写错编译期报错」——因为 `keyof T` 只允许 T 真实存在的键名。但 `render` 的第一个参数类型是 `T[keyof T]`，也就是**所有字段类型的联合**。如果 `T` 是 `{ id: number; name: string }`，那 `value` 的类型就是 `string | number`，即使这一列的 key 明明是 `name`，你也拿不到确切的 `string`。
+
+**第二版（推荐：用分布式映射类型把 key 和 value 绑定起来）：**
+
+```ts
+// 对 T 的每一个键 K 生成一个对象类型，再用 [keyof T] 取出它们的联合
+type Column<T> = {
+  [K in keyof T]: {
+    key: K;
+    title: string;
+    render?: (value: T[K], row: T, index: number) => React.ReactNode;
+  };
+}[keyof T];
+
+type TableProps<T> = {
+  data: T[];
+  columns: Column<T>[];
+  rowKey: keyof T;              // 顺带解决第 2 章讲的 key 问题
+  onRowClick?: (row: T) => void;
+};
+```
+
+现在 `Column<{ id: number; name: string }>` 展开成：
+
+```ts
+  | { key: "id";   title: string; render?: (v: number, row: T, i: number) => ReactNode }
+  | { key: "name"; title: string; render?: (v: string, row: T, i: number) => ReactNode }
+```
+
+**验证效果：**
+
+```ts
+type User = { id: number; name: string; age: number };
+
+const columns: Column<User>[] = [
+  { key: "id", title: "ID" },
+  { key: "name", title: "姓名", render: (v) => v.toUpperCase() },  // v 推断为 string ✅
+  { key: "age", title: "年龄", render: (v) => v + " 岁" },          // v 推断为 number ✅
+
+  { key: "email", title: "邮箱" },                                  // ❌ 编译错误：不存在的键
+  { key: "age", title: "年龄", render: (v) => v.toUpperCase() },    // ❌ number 上没有 toUpperCase
+];
+```
+
+**组件实现：**
+
+```tsx
+function Table<T>({ data, columns, rowKey }: TableProps<T>) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          {columns.map((col) => (
+            <th key={String(col.key)}>{col.title}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {data.map((row, i) => (
+          <tr key={String(row[rowKey])}>
+            {columns.map((col) => (
+              <td key={String(col.key)}>
+                {col.render
+                  ? (col.render as (v: unknown, r: T, i: number) => React.ReactNode)(
+                      row[col.key], row, i
+                    )
+                  : String(row[col.key])}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+**几点说明：**
+
+1. **组件内部那一处断言是必要的妥协。** 对使用者来说 `col.key` 和 `col.render` 的类型是完美关联的，但在组件**内部**，`col` 是一个联合类型，TS 无法证明「取出的 `col.key` 和取出的 `col.render` 来自同一个联合分支」（这叫相关联合，correlated union）。类型安全的收益在调用方，内部断言一次是标准做法。
+2. **`String(col.key)` 是必需的。** `keyof T` 可能是 `string | number | symbol`，而 `key` 属性不接受 symbol。
+3. **加 `rowKey` 而不是用数组下标。** 理由见第 2 章——下标 key 在排序、删除时会导致行内状态错位。
+4. 如果还想支持「不对应任何字段的列」（比如「操作」列放编辑/删除按钮），可以再并上一个分支：`| { key: string; title: string; render: (v: undefined, row: T, i: number) => React.ReactNode }`。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：找出纯度问题">
 指出下面这个组件里所有违反「渲染纯度」的地方，并说明每一处应该怎么改：
 
 组件接收 `logs` 数组，渲染时先执行 `logs.reverse()` 让最新的在前，用 `Date.now()` 计算每条日志距今多久，用一个模块级变量 `seen` 记录已经渲染过哪些 id，并在发现新 id 时调用 `reportNewLog(id)` 上报。
+
+<Answer>
+**参考答案：**
+
+先把有问题的版本写出来：
+
+```tsx
+const seen = new Set<string>();               // ❌ 问题 3
+
+function LogList({ logs }: { logs: Log[] }) {
+  logs.reverse();                             // ❌ 问题 1
+  const now = Date.now();                     // ❌ 问题 2
+
+  return (
+    <ul>
+      {logs.map((log) => {
+        if (!seen.has(log.id)) {              // ❌ 问题 3
+          seen.add(log.id);
+          reportNewLog(log.id);               // ❌ 问题 4
+        }
+        return <li key={log.id}>{log.text}（{now - log.time} 毫秒前）</li>;
+      })}
+    </ul>
+  );
+}
+```
+
+**问题 1：`logs.reverse()` 原地修改了 props**
+
+`reverse` 是原地方法，它改的是父组件那个数组本身。后果有两个：父组件持有的数据被子组件悄悄改掉了（极难追踪）；而且组件重渲染一次就翻转一次，**渲染两次就变回原顺序**——严格模式下你会直接看到顺序在乱跳。
+
+改法：先复制再排序，并且用 `useMemo` 避免每次渲染都重算。
+
+```tsx
+const ordered = useMemo(() => [...logs].reverse(), [logs]);
+// 或者 logs.slice().reverse()
+// 更稳妥：不依赖入参顺序，显式按时间排 [...logs].sort((a, b) => b.time - a.time)
+```
+
+**问题 2：渲染期读 `Date.now()`**
+
+它违反了「相同输入 → 相同输出」：同一份 `logs` 连续渲染两次，结果不一样。具体危害有三个：
+
+- 服务端渲染和客户端 hydration 的时间不同，React 会报 hydration 不匹配
+- 「3 分钟前」这个文案**不会自己变成 4 分钟前**，因为没有任何东西触发重渲染
+- 组件无法被可靠地快照测试
+
+改法要看意图：
+
+```tsx
+// 方案 A：把「现在」变成状态，由定时器驱动更新（相对时间会自己走）
+function useNow(intervalMs = 60_000) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
+// 方案 B：渲染绝对时间，把相对时间的计算交给外部或 effect
+// 方案 C：由父组件把 now 作为 prop 传进来，组件保持纯粹（最好测试）
+```
+
+注意方案 A 里 `useState(() => Date.now())` 用的是**惰性初始化**——初始值只在首次挂载时求值一次，不算渲染期的副作用。
+
+**问题 3：读写模块级可变变量 `seen`**
+
+模块级的 `Set` 是所有组件实例**共享**的，而且渲染期对它做写入意味着「渲染这个动作本身改变了程序状态」。后果：
+
+- 严格模式故意双调用组件函数时，第二次执行看到的 `seen` 已经被第一次污染了，行为不一致
+- 页面上同时挂两个 `LogList` 时，第二个的日志会被第一个「吃掉」，永远不上报
+- 并发渲染中 React 可能渲染一半就丢弃结果，但 `seen` 已经被改了，回不去
+
+改法：跨渲染保存、又不需要触发重渲染的可变值，用 `useRef`（第 7 章）；而且这段逻辑本来就不该在渲染期跑。
+
+**问题 4：渲染期调用 `reportNewLog(id)` 发起副作用**
+
+上报是网络请求，是典型副作用。放在渲染里会导致：严格模式下发两次、渲染被丢弃时发出「其实没渲染出来」的假上报、`logs` 引用变化引起的无谓重渲染也会触发一轮检查。
+
+**综合改写：**
+
+```tsx
+function LogList({ logs, now }: { logs: Log[]; now: number }) {
+  // 纯计算：复制后排序，不碰入参
+  const ordered = useMemo(
+    () => [...logs].sort((a, b) => b.time - a.time),
+    [logs]
+  );
+
+  // 每个实例独立的记忆，且不参与渲染
+  const seenRef = useRef<Set<string>>(new Set());
+
+  // 副作用统一放进 effect：提交之后才执行
+  useEffect(() => {
+    for (const log of ordered) {
+      if (!seenRef.current.has(log.id)) {
+        seenRef.current.add(log.id);
+        reportNewLog(log.id);
+      }
+    }
+  }, [ordered]);
+
+  return (
+    <ul>
+      {ordered.map((log) => (
+        <li key={log.id}>{log.text}（{formatAgo(now - log.time)}）</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+**一条通用的判断标准：** 如果一段代码「执行两次和执行一次的效果不同」，或者「它的结果依赖渲染时刻的外部世界」，那它就不属于渲染期，应该搬到 `useEffect` 或事件处理函数里。
+</Answer>
 </Callout>
 
 ## 小结

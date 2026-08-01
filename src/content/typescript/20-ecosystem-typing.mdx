@@ -394,6 +394,129 @@ const createUser: RequestHandler<Record<string, never>, CreateUserResp, CreateUs
 1. 给 `loadConfig` 加一个 `required: true` 选项：缺失时不使用默认值而是抛出「缺少必需环境变量」的错误，并让类型层区分「必填」与「有默认值」两种字段。
 2. 用品牌类型区分 `Email` 与普通 `string`，写出配套的类型守卫 `isEmail`，并让它同时服务于运行时校验和类型收窄。
 3. 把第 3 节的 `Routes` 扩展成支持路径参数（如 `"GET /users/:id"`），用模板字面量类型从 key 里提取出参数名。
+
+<Answer>
+**参考答案：**
+
+**第 1 题**——给 `EnvVar` 加一个 `required` 标记，并在 `loadConfig` 里区分「缺失」时的行为：
+
+```ts
+type EnvVar<T, R extends boolean = false> = {
+  parse: (raw: string) => T;
+  fallback: T;
+  required: R;
+};
+
+function envVar<T>(parse: (raw: string) => T, fallback: T): EnvVar<T, false>;
+function envVar<T>(parse: (raw: string) => T, fallback: T, required: true): EnvVar<T, true>;
+function envVar<T>(parse: (raw: string) => T, fallback: T, required = false) {
+  return { parse, fallback, required };
+}
+
+// 类型层区分「必填」与「有默认值」：required 被编码进了类型参数 R
+type Config<S extends Record<string, EnvVar<unknown, boolean>>> = {
+  [K in keyof S]: S[K] extends EnvVar<infer T, true>
+    ? T
+    : S[K] extends EnvVar<infer T, false>
+      ? T
+      : never;
+};
+
+function loadConfig<S extends Record<string, EnvVar<unknown, boolean>>>(
+  schema: S,
+  source: Record<string, string | undefined>,
+): Config<S> {
+  const table: Record<string, EnvVar<unknown, boolean>> = schema;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(table)) {
+    const spec = table[key];
+    const raw = source[key];
+    if (raw === undefined || raw === "") {
+      if (spec.required) throw new Error("缺少必需环境变量: " + key);
+      out[key] = spec.fallback;
+    } else {
+      out[key] = spec.parse(raw);
+    }
+  }
+  return out as unknown as Config<S>;
+}
+
+const schema = {
+  PORT: envVar(asNumber, 3000),
+  DATABASE_URL: envVar(asString, "", true), // 必填，缺失即抛错
+};
+```
+
+`required` 走的是重载，返回 `EnvVar<..., true>`，`Config` 映射里能把它和 `EnvVar<..., false>` 区分开。真实项目里常把「非必填」的结果类型写成 `T | undefined`，从而让调用方在类型层也必须判空。
+
+**第 2 题**——品牌类型 + 类型守卫：
+
+```ts
+declare const emailBrand: unique symbol;
+type Email = string & { readonly [emailBrand]: "Email" };
+
+// 守卫同时服务于「运行时校验」和「类型收窄」
+function isEmail(v: unknown): v is Email {
+  return (
+    typeof v === "string" &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)
+  );
+}
+
+// 带运行时校验的唯一构造入口
+function toEmail(raw: string): Email {
+  if (!isEmail(raw)) throw new Error("非法邮箱: " + raw);
+  return raw as Email;
+}
+
+// 函数签名精确描述「只接受邮箱」
+function sendWelcomeEmail(addr: Email): string {
+  return "已发送欢迎邮件给 " + addr;
+}
+
+const input = "ada@example.com";
+if (isEmail(input)) {
+  // input 被收窄成 Email，可直接传入
+  console.log(sendWelcomeEmail(input));
+}
+// sendWelcomeEmail("plain-string"); // 编译错误：裸字符串不行
+```
+
+`isEmail` 返回 `v is Email`，所以 `if (isEmail(input))` 之后 `input` 自动收窄成 `Email`；`toEmail` 是带校验的构造入口，二者配合才能既保证类型又保证值合法（否则到处 `as Email` 会让品牌保护名存实亡）。
+
+**第 3 题**——路径参数 + 模板字面量提取参数名：
+
+```ts
+type Routes = {
+  "GET /users": { params: { page: number }; result: { id: number; name: string }[] };
+  "GET /users/:id": { params: { id: number }; result: { id: number; name: string } };
+};
+
+// 从 "GET /users/:id" 这样的 key 里递归提取参数名
+type ParamNames<K extends string> =
+  K extends `${string}/:${infer P}/${infer Rest}`
+    ? P | ParamNames<`/${Rest}`>
+    : K extends `${string}/:${infer P}`
+      ? P
+      : never;
+
+// 把参数名映射成 params 类型（这里统一为 string，真实项目可另行做类型映射）
+type PathParams<K extends string> = {
+  [P in ParamNames<K>]: string;
+};
+
+type RouteKey = keyof Routes;
+type Params<K extends RouteKey> = Routes[K]["params"] | PathParams<K>;
+type Result<K extends RouteKey> = Routes[K]["result"];
+
+function request<K extends RouteKey>(key: K, params: Params<K>): Result<K> {
+  // 真实实现：从 key 解析出路径、用 params 替换 :id，再 fetch
+  throw new Error("见正文思路");
+}
+```
+
+`ParamNames` 用递归模板字面量把每段 `:xxx` 拆出来：遇到 `字符串/:P/Rest` 就取出 `P` 并继续处理 `Rest`。这样 `"GET /users/:id"` 会被解析出 `"id"`，`PathParams` 再把它映射成 `{ id: string }`，请求函数就能按 key 推导出路径参数了。
+</Answer>
 </Callout>
 
 ## 小结

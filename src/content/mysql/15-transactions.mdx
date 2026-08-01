@@ -166,4 +166,170 @@ InnoDB 用**两阶段提交（2PC）**解决：
 1. 开两个会话演练：会话 A BEGIN 后 UPDATE 一行不提交，会话 B 查询该行（看到旧值）并尝试 UPDATE 同一行（被阻塞），A COMMIT 后观察 B 的变化。
 2. 用 SAVEPOINT 写一个事务：插入 3 笔订单，回滚掉第 2 笔，验证最终只有 1、3 生效。
 3. 口述：`innodb_flush_log_at_trx_commit` 三个取值分别在「MySQL 进程崩溃」和「主机断电」两种故障下各丢多少数据？
+
+<Answer>
+**参考答案：**
+
+**1. 两会话演练：读不阻塞、写要排队**
+
+```sql
+-- 会话 A
+BEGIN;
+UPDATE products SET stock = 999 WHERE id = 1;
+SELECT stock FROM products WHERE id = 1;   -- A 自己看到 999
+-- 先不提交
+```
+
+```sql
+-- 会话 B
+SELECT stock FROM products WHERE id = 1;
+-- 立即返回！而且看到的是【旧值】，不是 999
+```
+
+```sql
+-- 会话 B 继续
+UPDATE products SET stock = stock - 1 WHERE id = 1;
+-- 挂起，一直等待……
+```
+
+```sql
+-- 会话 A
+COMMIT;
+-- 此刻 B 的 UPDATE 立即完成，且是基于 A 提交后的新值 999 计算的 → 998
+```
+
+```sql
+-- 会话 B
+SELECT stock FROM products WHERE id = 1;   -- 998
+COMMIT;
+```
+
+**两个关键现象要解释清楚：**
+
+**（1）B 的 SELECT 为什么不阻塞、还看到旧值？**
+
+普通 `SELECT` 是**快照读（一致性非锁定读）**，它不加任何锁，而是通过 **MVCC** 顺着 undo log 的版本链找到「对本事务可见的历史版本」。A 未提交的修改对 B 不可见，所以 B 读到旧值。这就是 InnoDB 的核心优势——**读写不互相阻塞**（第 17 章展开）。
+
+**（2）B 的 UPDATE 为什么阻塞？**
+
+`UPDATE` 是**当前读**，必须读最新版本并加 **X 行锁**。A 已经持有 `id = 1` 这行的 X 锁，X 锁互斥，所以 B 只能等。等待上限由 `innodb_lock_wait_timeout` 控制（默认 50 秒），超时报：
+
+```text
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+```
+
+在第三个会话里可以看到等待现场：
+
+```sql
+SELECT * FROM sys.innodb_lock_waits\G
+-- 谁在等谁、等的是哪个索引上的哪条记录
+
+SELECT trx_id, trx_state, trx_started, trx_rows_locked, trx_query
+FROM information_schema.innodb_trx;
+-- A 是 RUNNING，B 是 LOCK WAIT
+```
+
+**（3）还有一个必须注意的细节**：A 提交后，B 的 `stock = stock - 1` 是基于 **999** 算的，不是基于它事务开始时看到的旧值。因为当前读总是读最新已提交版本——这正是「先 SELECT 检查再 UPDATE」不安全、而 `UPDATE ... WHERE stock >= 1` 安全的原因。
+
+**2. SAVEPOINT 部分回滚**
+
+```sql
+BEGIN;
+
+INSERT INTO orders (order_no, user_id, status, total_amount)
+  VALUES ('SP-001', 1, 0, 100.00);
+SAVEPOINT sp1;
+
+INSERT INTO orders (order_no, user_id, status, total_amount)
+  VALUES ('SP-002', 2, 0, 200.00);
+SAVEPOINT sp2;
+
+INSERT INTO orders (order_no, user_id, status, total_amount)
+  VALUES ('SP-003', 3, 0, 300.00);
+
+-- 目标：撤销第 2 笔，保留第 1、3 笔
+```
+
+**这里有个陷阱**：`ROLLBACK TO sp1` 会把 sp1 **之后的所有操作**都撤销掉——包括第 3 笔。SAVEPOINT 只能回退到某个时间点，**不能"挖掉中间一笔"**。
+
+正确做法是调整顺序，把要回滚的那笔放在最后再撤销：
+
+```sql
+BEGIN;
+
+INSERT INTO orders (order_no, user_id, status, total_amount)
+  VALUES ('SP-001', 1, 0, 100.00);
+
+SAVEPOINT sp_before_2;
+INSERT INTO orders (order_no, user_id, status, total_amount)
+  VALUES ('SP-002', 2, 0, 200.00);
+ROLLBACK TO sp_before_2;      -- 只撤销第 2 笔
+
+INSERT INTO orders (order_no, user_id, status, total_amount)
+  VALUES ('SP-003', 3, 0, 300.00);
+
+COMMIT;
+
+SELECT order_no FROM orders WHERE order_no LIKE 'SP-%' ORDER BY order_no;
+```
+
+```text
++----------+
+| order_no |
++----------+
+| SP-001   |
+| SP-003   |
++----------+
+```
+
+其他要点：
+
+- `ROLLBACK TO sp1` **不结束事务**，事务仍在进行，锁也**不会释放**（这点常被误解）；只有 `COMMIT` / `ROLLBACK` 才结束事务。
+- 回滚到某个 savepoint 后，它**之后**创建的 savepoint 全部失效。
+- `RELEASE SAVEPOINT sp1` 可以手动释放一个保存点。
+- 自增值不会回退：即使第 2 笔被撤销，它消耗掉的 AUTO_INCREMENT 值也不会还回来，`SP-003` 的 id 会跳号。这是设计使然（自增值分配不参与事务，否则会成为并发瓶颈）。
+
+**适用场景**：批量处理中「单条失败跳过、其余继续」。但逻辑一复杂就很容易出错，**更推荐拆成多个小事务** + 应用层记录失败项。
+
+**3. `innodb_flush_log_at_trx_commit` 三个取值的丢数据分析**
+
+先理解数据要落盘经过的两道关：
+
+```text
+redo log buffer（MySQL 进程内存）
+        │  ① write：写入 OS Page Cache
+        ▼
+OS Page Cache（操作系统内存）
+        │  ② fsync：真正落到磁盘
+        ▼
+磁盘上的 redo log 文件
+```
+
+- **MySQL 进程崩溃**（kill -9、OOM、bug）：进程内存丢失，但 **OS Page Cache 由操作系统持有，仍然存在**，操作系统会继续把它写到磁盘。
+- **主机断电 / 内核崩溃**：进程内存和 OS Page Cache **全部丢失**，只有已经 fsync 到磁盘的才算数。
+
+| 取值 | 行为 | MySQL 进程崩溃 | 主机断电 |
+|---|---|---|---|
+| **1**（默认） | 每次事务提交都 write + **fsync** | **不丢** | **不丢** |
+| **2** | 每次提交只 write 到 OS Cache，后台每秒 fsync | **不丢** | 丢**约 1 秒**的已提交事务 |
+| **0** | 提交时什么都不做，后台每秒 write + fsync | 丢**约 1 秒** | 丢**约 1 秒** |
+
+逐个解释：
+
+- **`= 1`**：提交时同步刷盘，返回成功就意味着数据已在磁盘上。**这是唯一真正满足 ACID 中 D（持久性）的取值，也是生产环境的安全底线。** 代价是每次提交一次 fsync，高并发写入时是主要瓶颈（可用 `sync_binlog = 1` 配套，见第 19 章）。
+- **`= 2`**：数据交给了操作系统。MySQL 进程怎么死都不丢（OS Cache 还在），但主机层面的故障会丢最后约 1 秒。适合「允许丢一点、要吞吐」的场景。
+- **`= 0`**：提交时连 write 都不做，全靠后台线程每秒一次。MySQL 进程崩溃就会丢——因为数据还在进程自己的 redo log buffer 里。性能最好，只适合可以随时重灌的数据（如爬虫中间结果、可重算的统计表）。
+
+**要点提炼**：`0` 和 `2` 的区别，本质就是「**数据有没有交出进程边界**」。交给了 OS（= 2），MySQL 自己死了不要紧；没交出去（= 0），MySQL 一死就没了。
+
+配套的还有 binlog 的 `sync_binlog`，含义完全平行：
+
+```sql
+SET GLOBAL innodb_flush_log_at_trx_commit = 1;
+SET GLOBAL sync_binlog = 1;
+-- 这组「双 1」配置是金融级不丢数据的标配，代价是每次提交两次 fsync
+```
+
+真正的高可用不能只靠单机刷盘策略——即使配了「双 1」，磁盘物理损坏照样丢数据。生产上应配合**半同步复制 / MGR**（第 20 章），让数据至少落到两台机器上。
+</Answer>
 </Callout>

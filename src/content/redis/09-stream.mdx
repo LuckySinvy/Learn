@@ -190,4 +190,313 @@ Stream 有消费组与 ACK，但没有分区（单 key 单线程处理，吞吐�
 1. 创建一个 Stream 和消费组，用两个 redis-cli 窗口模拟两个消费者，验证消息被分摊而不是都收到。
 2. 一个消费者领取消息后不 ACK，用 XPENDING 观察其挂起状态，再用 XAUTOCLAIM 从另一个消费者身份认领它。
 3. 对比实验：Pub/Sub 的订阅者断开期间发布消息，重连后收不到；Stream 消费组的消费者离线期间的消息重连后仍能领取。
+
+<Answer>
+**参考答案：**
+
+**1. 两个消费者分摊消息**
+
+```bash
+# ---- 准备：创建 Stream 和消费组 ----
+127.0.0.1:6379> XADD orders '*' order_id 1001 amount 99
+"1785000000000-0"
+127.0.0.1:6379> XGROUP CREATE orders g1 0
+OK
+# 说明：0 表示从头开始消费；$ 表示只消费新消息
+# 如果 Stream 还不存在，加 MKSTREAM 参数：XGROUP CREATE orders g1 0 MKSTREAM
+
+# ---- 再生产 5 条消息 ----
+127.0.0.1:6379> XADD orders '*' order_id 1002 amount 150
+"1785000001000-0"
+127.0.0.1:6379> XADD orders '*' order_id 1003 amount 200
+"1785000002000-0"
+127.0.0.1:6379> XADD orders '*' order_id 1004 amount 88
+"1785000003000-0"
+127.0.0.1:6379> XADD orders '*' order_id 1005 amount 320
+"1785000004000-0"
+127.0.0.1:6379> XLEN orders
+(integer) 5
+
+# ---- 窗口 A：消费者 c1 领取 2 条 ----
+127.0.0.1:6379> XREADGROUP GROUP g1 c1 COUNT 2 STREAMS orders >
+1) 1) "orders"
+   2) 1) 1) "1785000000000-0"
+         2) 1) "order_id"
+            2) "1001"
+            3) "amount"
+            4) "99"
+      2) 1) "1785000001000-0"
+         2) 1) "order_id"
+            2) "1002"
+
+# ---- 窗口 B：消费者 c2 领取 2 条 ----
+127.0.0.1:6379> XREADGROUP GROUP g1 c2 COUNT 2 STREAMS orders >
+1) 1) "orders"
+   2) 1) 1) "1785000002000-0"      # 拿到的是 1003、1004
+         2) 1) "order_id"
+            2) "1003"
+      2) 1) "1785000003000-0"
+         2) 1) "order_id"
+            2) "1004"
+
+# 关键：c2 拿到的是 c1 没拿过的消息，不是同一批 —— 这就是"分摊"
+```
+
+`>` 这个特殊 ID 是分摊的关键：
+
+| ID 参数 | 含义 |
+|---|---|
+| `>` | 只取**从未被本组任何消费者领取过**的新消息 |
+| `0` 或具体 ID | 取**本消费者自己**已领取但未 ACK 的历史消息（读 PEL） |
+
+```bash
+# ---- 验证：c1 用 0 只能看到自己的 PEL，看不到 c2 的 ----
+127.0.0.1:6379> XREADGROUP GROUP g1 c1 COUNT 10 STREAMS orders 0
+1) 1) "orders"
+   2) 1) 1) "1785000000000-0"      # 只有 1001、1002，是 c1 自己领的
+      ...
+
+# ---- 查看组状态 ----
+127.0.0.1:6379> XINFO GROUPS orders
+1)  1) "name"
+    2) "g1"
+    3) "consumers"
+    4) (integer) 2                  # 2 个消费者
+    5) "pending"
+    6) (integer) 4                  # 4 条已领取未 ACK
+    7) "last-delivered-id"
+    8) "1785000003000-0"
+
+127.0.0.1:6379> XINFO CONSUMERS orders g1
+1) 1) "name"
+   2) "c1"
+   3) "pending"
+   4) (integer) 2
+   ...
+2) 1) "name"
+   2) "c2"
+   3) "pending"
+   4) (integer) 2
+
+# ---- ACK 后 PEL 减少 ----
+127.0.0.1:6379> XACK orders g1 1785000000000-0 1785000001000-0
+(integer) 2
+```
+
+**对比广播**：如果要让两个消费者都收到全部消息，就建**两个消费组**——组间广播、组内分摊。这是 Stream 比 List 强的核心能力。
+
+```bash
+127.0.0.1:6379> XGROUP CREATE orders g2 0
+OK
+127.0.0.1:6379> XREADGROUP GROUP g2 c1 COUNT 5 STREAMS orders >
+# g2 的 c1 能拿到全部 5 条，因为 g2 的进度是独立的
+```
+
+**2. 不 ACK 的消息用 XPENDING 观察，再用 XAUTOCLAIM 认领**
+
+```bash
+# ---- c1 领取一条但故意不 ACK ----
+127.0.0.1:6379> XADD orders '*' order_id 2001 amount 500
+"1785000010000-0"
+127.0.0.1:6379> XREADGROUP GROUP g1 c1 COUNT 1 STREAMS orders >
+1) 1) "orders"
+   2) 1) 1) "1785000010000-0"
+         2) 1) "order_id"
+            2) "2001"
+# 这里模拟消费者崩溃：不执行 XACK
+
+# ---- XPENDING 摘要模式：快速看整体挂起情况 ----
+127.0.0.1:6379> XPENDING orders g1
+1) (integer) 3                      # 总挂起数
+2) "1785000002000-0"                # 最小挂起 ID
+3) "1785000010000-0"                # 最大挂起 ID
+4) 1) 1) "c1"
+      2) "1"                        # c1 挂起 1 条
+   2) 1) "c2"
+      2) "2"                        # c2 挂起 2 条
+
+# ---- XPENDING 明细模式：看每条消息的详情 ----
+127.0.0.1:6379> XPENDING orders g1 - + 10
+1) 1) "1785000002000-0"
+   2) "c2"                          # 归属消费者
+   3) (integer) 125300              # 空闲时间（毫秒），即多久没被处理
+   4) (integer) 1                   # 投递次数
+2) 1) "1785000010000-0"
+   2) "c1"
+   3) (integer) 45120
+   4) (integer) 1
+
+# 只看某个消费者的挂起消息
+127.0.0.1:6379> XPENDING orders g1 - + 10 c1
+1) 1) "1785000010000-0"
+   2) "c1"
+   3) (integer) 46200
+   4) (integer) 1
+
+# 只看空闲超过 30 秒的（IDLE 过滤，Redis 6.2+）
+127.0.0.1:6379> XPENDING orders g1 IDLE 30000 - + 10
+
+# ---- XAUTOCLAIM：以 c3 的身份认领 c1 的僵尸消息 ----
+# 语法：XAUTOCLAIM key group 新消费者 最小空闲毫秒 起始ID [COUNT n]
+127.0.0.1:6379> XAUTOCLAIM orders g1 c3 30000 0 COUNT 10
+1) "0-0"                            # 下次扫描的起始游标，0-0 表示扫完了
+2) 1) 1) "1785000002000-0"
+      2) 1) "order_id"
+         2) "1003"
+   2) 1) "1785000010000-0"
+      2) 1) "order_id"
+         2) "2001"
+3) (empty array)                    # 已被删除的消息 ID 列表
+
+# ---- 验证归属已转移 ----
+127.0.0.1:6379> XPENDING orders g1 - + 10
+1) 1) "1785000002000-0"
+   2) "c3"                          # 归属变成 c3
+   3) (integer) 156                 # 空闲时间被重置
+   4) (integer) 2                   # 投递次数 +1
+
+# ---- c3 处理完后 ACK ----
+127.0.0.1:6379> XACK orders g1 1785000002000-0 1785000010000-0
+(integer) 2
+```
+
+**三个关键机制**：
+
+- **PEL（Pending Entries List）**：每个消费组维护一份"已投递未确认"的清单。这是 Stream 实现"至少一次投递"的基础——只要没 ACK，消息就一直在 PEL 里，不会丢
+- **`min-idle-time` 是安全阀**：只认领空闲超过阈值的消息。设成 30000 意味着"30 秒没动静才认为消费者挂了"，避免把正在被正常处理的消息抢走。这个值应该设为**正常处理耗时的几倍**
+- **投递次数（delivery count）**：每次被认领都 +1。这是识别"毒消息"的依据
+
+**毒消息处理**（生产必备）：
+
+```bash
+# XAUTOCLAIM 不返回投递次数，需要配合 XPENDING 明细判断
+# 投递超过 3 次的消息转入死信 Stream，然后 ACK 掉原消息
+127.0.0.1:6379> XADD orders:dlq '*' original_id "1785000010000-0" reason "retry_exceeded"
+"1785000099000-0"
+127.0.0.1:6379> XACK orders g1 1785000010000-0
+(integer) 1
+```
+
+不做这一步的后果：一条永远处理失败的消息会被无限认领、无限重试，占满消费者的处理能力。
+
+`XCLAIM` 是 `XAUTOCLAIM` 的手动版本，需要自己指定消息 ID；`XAUTOCLAIM`（Redis 6.2+）能自动扫描，是推荐做法。另外 `XCLAIM` 支持 `JUSTID` 选项，只转移归属不返回内容，适合只想重置计数的场景。
+
+**3. Pub/Sub 与 Stream 的可靠性对比实验**
+
+```bash
+# ========== 实验一：Pub/Sub 会丢消息 ==========
+
+# ---- 窗口 A：订阅 ----
+127.0.0.1:6379> SUBSCRIBE news
+Reading messages... (press Ctrl-C to quit)
+1) "subscribe"
+2) "news"
+3) (integer) 1
+
+# ---- 窗口 B：发布 ----
+127.0.0.1:6379> PUBLISH news "msg-1"
+(integer) 1                         # 返回 1 = 有 1 个订阅者收到
+
+# ---- 窗口 A 立刻收到 ----
+1) "message"
+2) "news"
+3) "msg-1"
+
+# ---- 窗口 A 按 Ctrl-C 断开订阅 ----
+
+# ---- 窗口 B 在 A 离线期间继续发布 ----
+127.0.0.1:6379> PUBLISH news "msg-2"
+(integer) 0                         # 返回 0 = 没有任何订阅者，消息直接丢弃
+127.0.0.1:6379> PUBLISH news "msg-3"
+(integer) 0
+
+# ---- 窗口 A 重新订阅 ----
+127.0.0.1:6379> SUBSCRIBE news
+1) "subscribe"
+2) "news"
+3) (integer) 1
+# 等待... 什么都收不到，msg-2 和 msg-3 永久丢失
+```
+
+`PUBLISH` 的返回值就是最好的证据：**它返回的是"收到消息的订阅者数量"，返回 0 意味着这条消息被直接丢弃了**。Pub/Sub 是纯粹的"广播即焚"，服务端不保存任何消息。
+
+```bash
+# ========== 实验二：Stream 消费组不丢消息 ==========
+
+127.0.0.1:6379> XADD news:stream '*' content "msg-1"
+"1785001000000-0"
+127.0.0.1:6379> XGROUP CREATE news:stream g1 0
+OK
+
+# ---- 消费者 c1 上线，消费 msg-1 ----
+127.0.0.1:6379> XREADGROUP GROUP g1 c1 COUNT 10 STREAMS news:stream >
+1) 1) "news:stream"
+   2) 1) 1) "1785001000000-0"
+         2) 1) "content"
+            2) "msg-1"
+127.0.0.1:6379> XACK news:stream g1 1785001000000-0
+(integer) 1
+
+# ---- c1 "下线"（在 CLI 里就是什么都不做）----
+
+# ---- 离线期间继续生产 ----
+127.0.0.1:6379> XADD news:stream '*' content "msg-2"
+"1785001001000-0"
+127.0.0.1:6379> XADD news:stream '*' content "msg-3"
+"1785001002000-0"
+
+# ---- c1 "重连"后再次读取 ----
+127.0.0.1:6379> XREADGROUP GROUP g1 c1 COUNT 10 STREAMS news:stream >
+1) 1) "news:stream"
+   2) 1) 1) "1785001001000-0"
+         2) 1) "content"
+            2) "msg-2"              # 离线期间的消息一条不少
+      2) 1) "1785001002000-0"
+         2) 1) "content"
+            2) "msg-3"
+
+# ---- 甚至可以回溯任意历史消息 ----
+127.0.0.1:6379> XRANGE news:stream - +
+1) 1) "1785001000000-0"
+   2) 1) "content"
+      2) "msg-1"                    # 已 ACK 的消息依然在 Stream 里
+...
+```
+
+**为什么 Stream 能做到？** 因为消息**持久化存储在 Stream 这个数据结构里**，消费组只记录一个"已投递到哪"的游标（`last-delivered-id`）。消费者离线只是暂时不来取，游标停在原地，消息一直在那儿等着。
+
+**核心对比表**：
+
+| 维度 | Pub/Sub | Stream 消费组 |
+|---|---|---|
+| 消息存储 | 不存储，转发即焚 | 持久化在 Stream 中 |
+| 离线消息 | **永久丢失** | 重连后可继续领取 |
+| 消息确认 | 无 | XACK |
+| 崩溃恢复 | 无 | PEL + XAUTOCLAIM |
+| 历史回溯 | 不可能 | XRANGE 任意回溯 |
+| 投递语义 | 至多一次 | 至少一次 |
+| 多消费者 | 全部广播 | 组内分摊、组间广播 |
+| 内存占用 | 极小 | 随消息累积增长，需 XTRIM |
+| 适用场景 | 实时通知、配置推送、缓存失效广播 | 业务队列、任务分发、事件溯源 |
+
+**选型结论**：**能丢的用 Pub/Sub，不能丢的用 Stream。** 判断标准很简单——如果这条消息丢了会造成业务损失（订单未处理、扣款未记账），就必须用 Stream。
+
+**Stream 的两个必做运维项**：
+
+```bash
+# 1. 控制长度，否则内存无限增长（ACK 不等于删除！）
+127.0.0.1:6379> XADD news:stream MAXLEN '~' 10000 '*' content "msg"
+# ~ 表示近似裁剪，性能好得多，会保留略多于 10000 条
+
+# 或者定期裁剪
+127.0.0.1:6379> XTRIM news:stream MAXLEN '~' 10000
+127.0.0.1:6379> XTRIM news:stream MINID '~' 1785000000000   # 按时间裁剪
+
+# 2. 清理不再使用的消费者，避免 XINFO 里堆积僵尸条目
+127.0.0.1:6379> XGROUP DELCONSUMER news:stream g1 c_old
+(integer) 0     # 返回该消费者 PEL 中被删除的消息数，非 0 说明有消息丢失风险
+```
+
+最后提醒 `XTRIM` 的陷阱：**裁剪会直接删除消息，即使它还在某个消费组的 PEL 里**。如果消费严重滞后，激进的裁剪会导致消息永久丢失。所以 MAXLEN 的值要留足余量，并对消费延迟做监控。
+</Answer>
 </Callout>

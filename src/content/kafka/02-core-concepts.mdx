@@ -172,4 +172,84 @@ Topic: orders  PartitionCount: 3  ReplicationFactor: 2
 1. 一个 topic 有 6 个分区，消费组 A 有 4 个消费者，画出一种可能的分区分配结果。
 2. 如果要求"同一用户的事件必须按序处理"，应该把什么作为消息的 key？为什么这能保证顺序？
 3. 3 个 Broker 的集群里，能创建 replication-factor=4 的 topic 吗？动手试一下会得到什么报错。
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · 6 分区分给 4 个消费者**
+
+默认的 RangeAssignor / RoundRobinAssignor 都会尽量均分，6 ÷ 4 = 1 余 2，所以是**两个消费者拿 2 个分区，两个消费者拿 1 个分区**：
+
+```text
+Topic: events (6 partitions)  ×  Consumer Group A (4 consumers)
+
+  C1  <-- p0, p1
+  C2  <-- p2, p3
+  C3  <-- p4
+  C4  <-- p5
+```
+
+要点：
+
+- **一个分区在同一时刻只能被组内一个消费者消费**，这是 Kafka 的核心约束。
+- 反过来一个消费者可以拿多个分区，所以消费者数 ≤ 分区数时不会有人闲着。
+- 如果再加两个消费者变成 6 个，就是一人一个；加到第 7 个，那一个**永远空转**（拿不到任何分区）。
+
+用 CLI 可以直接看到分配结果：
+
+```bash
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group A
+# CONSUMER-ID 列会显示每个分区归属哪个成员
+```
+
+**第 2 题 · 用什么做 key 才能保证用户内有序**
+
+用 **`userId`（用户 ID）做消息的 key**。
+
+推理链条是这样的：
+
+1. Kafka 只保证**分区内有序**，跨分区无序。
+2. 默认分区器对 key 做哈希再取模：`partition = hash(key) % numPartitions`。
+3. 同一个 `userId` 哈希值固定 → 永远落到同一个分区。
+4. 同一分区内消息按写入顺序追加，消费者也按 offset 顺序读取。
+5. 所以同一用户的事件天然按序处理，而不同用户之间仍然可以并行——既有序又不牺牲整体吞吐。
+
+```bash
+# 验证：同 key 一定落同一分区
+printf 'u1:login\nu2:login\nu1:pay\nu1:logout\n' | \
+  bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic user-events --property parse.key=true --property key.separator=:
+
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic user-events --from-beginning --max-messages 4 \
+  --property print.key=true --property print.partition=true
+```
+
+三个容易踩的坑：
+
+- **不要选粒度太粗的 key**（比如固定字符串或城市名），会造成分区数据倾斜，热点分区拖慢整体。
+- **不要中途给 topic 加分区**：分区数变了，`hash(key) % n` 的结果也变，同一用户的新老消息会落到不同分区，历史顺序保证被打破。
+- 生产端还要开启幂等（`enable.idempotence=true`），否则失败重试可能让同分区内的消息乱序。
+
+**第 3 题 · 3 个 Broker 能不能建 replication-factor=4**
+
+**不能。** 副本因子不能超过集群中可用 broker 的数量，因为同一个分区的多个副本必须分布在**不同的 broker** 上——放两份到同一台机器，那台机器挂了副本一起没，容错就失去意义了。
+
+```bash
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic bad-topic --partitions 3 --replication-factor 4
+```
+
+会得到类似这样的报错：
+
+```text
+Error while executing topic command : Replication factor: 4 larger than
+available brokers: 3.
+org.apache.kafka.common.errors.InvalidReplicationFactorException:
+Replication factor: 4 larger than available brokers: 3.
+```
+
+异常类型是 `InvalidReplicationFactorException`。顺带记住生产上的经验值：**副本因子 3 + `min.insync.replicas=2`**，既能容忍一台宕机仍可写入，又不至于浪费太多磁盘和网络带宽。
+</Answer>
 </Callout>

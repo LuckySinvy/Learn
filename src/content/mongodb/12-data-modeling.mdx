@@ -525,6 +525,155 @@ db.comments.find({ ancestors: ObjectId("...301") })
 
 <Callout type="exercise" title="练习">
 一、为「电商订单」设计文档结构，明确哪些字段是快照、哪些是引用，并说明理由；二、把本章的 `follows` 方案改成「双向内嵌数组」，估算一个百万粉丝账号会遇到什么问题；三、给「用户浏览记录」设计桶模式，每桶 500 条，写出插入语句和「查某用户最近 1000 条浏览」的查询；四、用属性模式重构一个「商品规格」集合，并设计只需要一个索引就能支持任意规格查询的方案；五、用「父引用 + 祖先数组」实现评论树，写出「查某条评论的全部子孙」和「查某条评论的完整祖先链」两个查询；六、列出你当前项目里三个「冗余了但其实不该冗余」或「该冗余却没冗余」的字段。
+
+<Answer>
+**参考答案：**
+
+**一、电商订单的文档结构（快照 vs 引用）**
+
+```js
+// orders 集合
+{
+  _id: ObjectId("...501"),
+  orderNo: "2024060412345678",
+  userId: ObjectId("...101"),                       // 引用：用户会频繁改资料，且订单常要按用户查
+  status: "paid",
+  // —— 以下都是快照 ——
+  receiver: { name: "张三", phone: "138...", address: "北京市海淀区..." },   // 快照
+  items: [                                          // 快照数组
+    { skuId: "1001", name: "无线鼠标", spec: "黑色", price: 99.00, qty: 1 },  // 快照
+    { skuId: "1002", name: "机械键盘", spec: "87键", price: 100.00, qty: 1 }
+  ],
+  totalAmount: 199.00,                              // 快照
+  coupon: { code: "SAVE20", amount: 20.00 },        // 快照
+  createdAt: ISODate()
+}
+```
+
+**快照字段**：`items` 里的名称/规格/成交价、`receiver`、`totalAmount`、`coupon`。理由：订单是**历史事实**，商品后续改价、改规格、用户改地址都不该影响历史订单——这不是冗余，而是快照，**不应同步**。
+
+**引用字段**：`userId`（用户资料与订单生命周期无关，需要独立查询）、`skuId`（商品详情仍以 `products` 集合为准，订单里只保留展示所需的最小快照）。
+
+**二、`follows` 改成双向内嵌数组的问题**
+
+```js
+// 方案 B：双向内嵌数组
+{
+  _id: ObjectId("...101"),
+  username: "alice",
+  following: [ObjectId("...102"), ...],
+  followers: [ObjectId("...104"), ...]    // 百万粉丝 → 数组百万级
+}
+```
+
+一个百万粉丝账号会遇到：
+
+1. **16MB 限制**：每个 ObjectId 约 12 字节，加上 BSON 数组元素开销，百万级数组轻松超过 16MB，文档写不进去。
+2. **写放大**：每次有人关注都要重写整个大文档，MongoDB 为文档预留空间不足时还会迁移文档，性能断崖。
+3. **写热点**：大 V 的关注操作集中在同一个文档上，成为单点写瓶颈。
+4. **无法建索引**：虽然可以建多键索引，但数组巨大时索引体积也巨大，且反向查询（谁关注了我）依然困难。
+5. **一致性**：关注/取关要同时改两边数组，跨文档操作需要事务或应用层兜底，容易不一致。
+
+结论：社交关注必须用中间集合（方案 A），粉丝数用计数器字段单独维护。
+
+**三、用户浏览记录的桶模式（每桶 500 条）**
+
+```js
+// readEvents 集合，桶键 = 用户 + 桶号
+db.readEvents.updateOne(
+  { userId: ObjectId("...101"), bucket: { $lt: 3 }, count: { $lt: 500 } },   // 探测未满桶
+  {
+    $push: { events: { postId: 11, at: new Date() } },
+    $inc: { count: 1 },
+    $setOnInsert: { userId: ObjectId("...101"), bucket: 0, createdAt: new Date() }
+  },
+  { upsert: true }
+)
+```
+
+更稳的写法是**确定性桶号**：先用 `counters` 或读现有最大桶号算出 `bucket = Math.floor(n / 500)`，再 upsert 到该桶，配 `{ userId: 1, bucket: 1 }` 唯一索引防并发：
+
+```js
+const n = db.counters.findOneAndUpdate(
+  { _id: "read:101" }, { $inc: { v: 1 } }, { upsert: true, returnDocument: "after" }
+).v
+const bucket = Math.floor((n - 1) / 500)
+db.readEvents.updateOne(
+  { userId: ObjectId("...101"), bucket },
+  { $push: { events: { postId: 11, at: new Date() } }, $inc: { count: 1 } },
+  { upsert: true }
+)
+```
+
+**查某用户最近 1000 条浏览：**
+
+```js
+db.readEvents.find({ userId: ObjectId("...101") })
+  .sort({ bucket: -1 })
+  .limit(2)                    // 最多跨 2 个桶（1000 / 500）
+  .toArray()
+  .flatMap(b => b.events.reverse())   // 合并并倒序
+```
+
+（若 events 里按 `at` 存了时间，也可以在拿到桶后按时间过滤取最近 1000 条。）
+
+**四、属性模式重构商品规格，一个索引支持任意规格**
+
+```js
+// 重构前：字段名不固定，无法索引
+{ _id: 1, name: "手机", spec_cpu: "A17", spec_ram: "8GB", spec_screen: "6.1寸" }
+
+// 属性模式
+{
+  _id: 1, name: "手机",
+  attrs: [
+    { k: "cpu", v: "A17" },
+    { k: "ram", v: "8GB" },
+    { k: "screen", v: "6.1寸" }
+  ]
+}
+```
+
+```js
+// 一个多键复合索引，任意规格组合都能命中
+db.products.createIndex({ "attrs.k": 1, "attrs.v": 1 })
+
+// 查「ram = 8GB」的商品
+db.products.find({ attrs: { $elemMatch: { k: "ram", v: "8GB" } } })
+// 查「cpu = A17 且 ram = 8GB」
+db.products.find({
+  $and: [
+    { attrs: { $elemMatch: { k: "cpu", v: "A17" } } },
+    { attrs: { $elemMatch: { k: "ram", v: "8GB" } } }
+  ]
+})
+```
+
+`{ "attrs.k": 1, "attrs.v": 1 }` 是多键复合索引，`$elemMatch` 保证同一元素内的 k/v 匹配，因此任意规格的「键值对」查询都能走同一个索引。
+
+**五、父引用 + 祖先数组的评论树**
+
+```js
+// 查某条评论的全部子孙
+db.comments.find({ ancestors: ObjectId("...301") })
+// 祖先数组里包含根评论 id 的，都是它的后代，一次索引查询搞定
+
+// 查某条评论的完整祖先链
+const c = db.comments.findOne({ _id: ObjectId("...304") })
+db.comments.find({ _id: { $in: c.ancestors } }).sort({ depth: 1 })
+// 或直接用祖先数组本身 + 详情补全
+```
+
+「全部子孙」用 `ancestors` 数组 + 多键索引一次命中；「祖先链」直接读文档里的 `ancestors` 数组即可（必要时再批量补全文档内容）。
+
+**六、三个「冗余误用」示例（思路，请对照你自己的项目）**
+
+1. **该冗余却没冗余**：文章列表接口每次都要 `$lookup` users 拿作者名/头像——应改用扩展引用，在 posts 里冗余 `author: { _id, username, avatar }`。
+2. **冗余了但改起来扇出爆炸**：把用户「在线状态」或「粉丝数」直接内嵌复制到每篇帖子——这类字段高频变化、要求近乎实时一致，应该用预聚合计数器集中维护，而不是冗余。
+3. **把快照当冗余删掉了**：订单只存 `skuId`、每次展示实时去查商品——一旦商品改名/下架，历史订单展示就错乱；这属于「历史快照」，应该冗余商品名称与成交价。
+
+（请结合你实际项目中的字段自查，重点看：列表页有没有可以消灭的 `$lookup`、有没有被反复同步的高频字段、有没有丢失的历史事实。）
+</Answer>
 </Callout>
 
 ## 小结

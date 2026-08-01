@@ -90,6 +90,261 @@ println!("名字是 {}", v["name"]);
 
 <Callout type="exercise" title="练习">
 定义 `struct Config { host: String, port: u16 }` 派生 serde，把一段 JSON 反序列化成 `Config`，再把它序列化回紧凑 JSON（`to_string`）打印。给 `port` 加 `#[serde(default)]` 并测试缺省端口时的行为。
+
+<Answer>
+**参考答案：**
+
+`Cargo.toml`：
+
+```toml
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+`src/main.rs`：
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct Config {
+    host: String,
+
+    // 缺少该字段时使用 u16::default()，即 0
+    #[serde(default)]
+    port: u16,
+}
+
+// 更实用的版本：自定义默认值
+#[derive(Serialize, Deserialize, Debug)]
+struct BetterConfig {
+    #[serde(default = "default_host")]
+    host: String,
+
+    #[serde(default = "default_port")]
+    port: u16,
+}
+
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_port() -> u16 {
+    8080
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ===== 1. 完整 JSON 反序列化 =====
+    let json = r#"{"host": "example.com", "port": 443}"#;
+    let config: Config = serde_json::from_str(json)?;
+    println!("反序列化：{:?}", config);
+
+    // ===== 2. 序列化回紧凑 JSON =====
+    let compact = serde_json::to_string(&config)?;
+    println!("紧凑 JSON：{}", compact);
+
+    // 漂亮打印
+    let pretty = serde_json::to_string_pretty(&config)?;
+    println!("格式化 JSON：\n{}", pretty);
+
+    // ===== 3. 缺少 port 字段 =====
+    let json_no_port = r#"{"host": "localhost"}"#;
+    let config2: Config = serde_json::from_str(json_no_port)?;
+    println!("\n缺省 port：{:?}", config2);   // port = 0
+
+    // ===== 4. 自定义默认值 =====
+    let empty = r#"{}"#;
+    let config3: BetterConfig = serde_json::from_str(empty)?;
+    println!("全部缺省：{:?}", config3);      // host=127.0.0.1, port=8080
+
+    // ===== 5. 缺少必填字段会报错 =====
+    let bad = r#"{"port": 3000}"#;
+    match serde_json::from_str::<Config>(bad) {
+        Ok(c) => println!("意外成功：{:?}", c),
+        Err(e) => println!("\n预期的错误：{}", e),
+    }
+
+    // ===== 6. 类型不匹配也会报错 =====
+    let wrong_type = r#"{"host": "localhost", "port": "not a number"}"#;
+    match serde_json::from_str::<Config>(wrong_type) {
+        Ok(c) => println!("意外成功：{:?}", c),
+        Err(e) => println!("类型错误：{}", e),
+    }
+
+    Ok(())
+}
+```
+
+**输出：**
+
+```text
+反序列化：Config { host: "example.com", port: 443 }
+紧凑 JSON：{"host":"example.com","port":443}
+格式化 JSON：
+{
+  "host": "example.com",
+  "port": 443
+}
+
+缺省 port：Config { host: "localhost", port: 0 }
+全部缺省：BetterConfig { host: "127.0.0.1", port: 8080 }
+
+预期的错误：missing field `host` at line 1 column 15
+类型错误：invalid type: string "not a number", expected u16 at line 1 column 45
+```
+
+**关键点解析：**
+
+- **`#[serde(default)]` 用的是 `Default::default()`**：对 `u16` 来说是 `0`。端口 0 在实践中是个糟糕的默认值（虽然它在 socket 编程里表示「让系统随机分配」），所以真实项目应该用 `#[serde(default = "函数名")]` 指定合理默认值
+- **默认值函数的签名**：无参数，返回字段类型。注意属性里写的是**字符串形式的函数名**，这是过程宏的常见写法
+- **`r#"..."#` 原始字符串**：里面的引号不用转义，写 JSON 时极其方便。如果内容本身包含 `"#`，可以加更多井号：`r##"..."##`
+- **`to_string` vs `to_string_pretty`**：前者紧凑无空格（适合网络传输、节省带宽），后者带缩进（适合配置文件、日志、人工阅读）
+- **错误信息包含位置**：serde 的报错会指出出错的行列，调试大 JSON 时很有用
+
+**常用 serde 属性：**
+
+```rust
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]        // 整体改用驼峰命名
+struct ServerConfig {
+    // JSON 里叫 "serverHost"（受 rename_all 影响）
+    server_host: String,
+
+    // 单独指定 JSON 字段名，优先级高于 rename_all
+    #[serde(rename = "PORT")]
+    port: u16,
+
+    // 序列化时跳过，反序列化时用默认值
+    #[serde(skip)]
+    internal_cache: Vec<String>,
+
+    // 值为 None 时不出现在输出 JSON 里
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+
+    // 缺失时用 Default
+    #[serde(default)]
+    verbose: bool,
+
+    // 接受多种字段名（兼容旧版配置）
+    #[serde(alias = "timeout_ms", alias = "timeoutMs")]
+    timeout: u64,
+}
+```
+
+**处理嵌套结构：**
+
+```rust
+#[derive(Serialize, Deserialize, Debug)]
+struct App {
+    name: String,
+    database: Database,        // 嵌套结构体
+    features: Vec<String>,     // 数组
+    limits: HashMap<String, u32>,   // 映射
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Database {
+    url: String,
+    #[serde(default = "default_pool")]
+    pool_size: u32,
+}
+
+fn default_pool() -> u32 { 10 }
+```
+
+对应的 JSON：
+
+```json
+{
+  "name": "myapp",
+  "database": { "url": "postgres://localhost/db" },
+  "features": ["auth", "cache"],
+  "limits": { "requests": 1000, "connections": 50 }
+}
+```
+
+只要每层结构体都派生了 serde，嵌套多深都能自动处理。
+
+**枚举的序列化**
+
+serde 对枚举有多种表示方式，其中 `tag` 形式在 API 设计中最常见：
+
+```rust
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+enum Event {
+    Click { x: i32, y: i32 },
+    KeyPress { key: String },
+}
+// 序列化结果：{"type":"Click","x":10,"y":20}
+```
+
+**结构未知时用 `Value`：**
+
+```rust
+use serde_json::Value;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let data = r#"{"name": "小明", "tags": ["a", "b"], "meta": {"age": 18}}"#;
+    let v: Value = serde_json::from_str(data)?;
+
+    // 索引访问（不存在返回 Value::Null，不会 panic）
+    println!("{}", v["name"]);                  // "小明"（带引号）
+    println!("{:?}", v["name"].as_str());       // Some("小明")（去引号）
+    println!("{:?}", v["meta"]["age"].as_u64()); // Some(18)
+    println!("{:?}", v["不存在"]);               // Null
+
+    // 动态构造 JSON
+    let obj = serde_json::json!({
+        "status": "ok",
+        "data": { "count": 42 },
+        "items": [1, 2, 3]
+    });
+    println!("{}", obj);
+
+    Ok(())
+}
+```
+
+**`Value` 灵活但失去了编译期类型检查**，字段名写错要到运行时才发现。**结构已知时永远优先用具体结构体。**
+
+**读写配置文件的完整实践：**
+
+```rust
+use std::fs;
+
+fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let config = serde_json::from_str(&content)?;
+    Ok(config)
+}
+
+fn save_config(path: &str, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(config)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+```
+
+注意这里 `?` 同时处理了 `io::Error` 和 `serde_json::Error` 两种错误——因为它们都能转成 `Box<dyn Error>`，这正是第 12 章讲的 `From` 自动转换在发挥作用。
+
+**serde 不只支持 JSON**
+
+同一套 `#[derive(Serialize, Deserialize)]` 可以对接几十种格式，换个 crate 即可：
+
+| 格式 | crate |
+|---|---|
+| JSON | `serde_json` |
+| YAML | `serde_yaml` |
+| TOML | `toml` |
+| MessagePack | `rmp-serde` |
+| CSV | `csv` |
+| Bincode（二进制） | `bincode` |
+
+这就是 serde 被称为「序列化框架」而非「JSON 库」的原因——**数据结构定义一次，所有格式通吃**。
+</Answer>
 </Callout>
 
 ## 小结

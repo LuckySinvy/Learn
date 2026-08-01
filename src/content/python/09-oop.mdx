@@ -345,6 +345,53 @@ print("a == BankAccount('Alice', 150):", a == BankAccount("Alice", 150))`}
 
 <Callout type="exercise" title="参考实现思路">
 提示：内部存 `_balance`，对外暴露 `balance` property 不带 setter。`from_dict` 中用 `cls(...)` 而不是 `BankAccount(...)`，这样子类化时也能正常工作。
+
+<Answer>
+
+**参考答案：**
+
+```python
+class BankAccount:
+    def __init__(self, owner, balance=0):
+        self.owner = owner
+        self._balance = balance
+
+    @property
+    def balance(self):              # 只读：没有 setter
+        return self._balance
+
+    def deposit(self, amount):
+        if amount < 0:
+            raise ValueError("存款金额不能为负")
+        self._balance += amount
+
+    def withdraw(self, amount):
+        if amount < 0:
+            raise ValueError("取款金额不能为负")
+        if amount > self._balance:
+            raise ValueError("余额不足")
+        self._balance -= amount
+
+    def __str__(self):
+        return f"账户({self.owner}): {self._balance}"
+
+    def __eq__(self, other):
+        if not isinstance(other, BankAccount):
+            return NotImplemented
+        return self.owner == other.owner and self._balance == other._balance
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["owner"], data.get("balance", 0))
+```
+
+要点：
+
+- 内部用 `_balance` 存钱，`balance` 只挂 `@property`、不写 setter，外部只能读不能改。
+- `withdraw` 先检查余额不足再扣款，抛 `ValueError`；`deposit` 顺手拒绝了负数金额。
+- `__eq__` 先 `isinstance` 判型（返回 `NotImplemented` 让 Python 尝试反向比较），再比 owner 和 balance 两个字段。
+- `from_dict` 用 `cls(...)` 而非 `BankAccount(...)`，子类继承后工厂方法也能正确构造子类实例。
+</Answer>
 </Callout>
 
 ## 小结

@@ -261,6 +261,39 @@ print(latest([]))`}
 
 <Callout type="exercise" title="提示">
 `max(books, key=lambda b: b.year, default=None)` 一行搞定。
+
+<Answer>
+
+**参考答案：**
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Book:
+    title: str
+    author: str
+    year: int = 2024
+
+def latest(books):
+    # 空列表时 default=None 保证不抛 ValueError
+    return max(books, key=lambda b: b.year, default=None)
+```
+
+运行结果：
+
+```
+Book(title='三体', author='刘慈欣', year=2008)
+None
+```
+
+要点：
+
+- `key=lambda b: b.year`：按 `year` 字段比较大小，所以返回 `year` 最大的那本（2008 年的《三体》）。
+- `default=None`：列表为空时返回 `None`；不写的话，`max` 对空序列会抛 `ValueError`。
+- `@dataclass` 自动生成了 `__repr__`，所以 `print(latest([b1, b2, b3]))` 直接输出 `Book(title='三体', ...)`。
+- 想更贴合"泛型函数"的写法，可以加 `TypeVar`：`T = TypeVar("T")`、`def latest(books: list[T]) -> T | None`，运行行为完全一致。
+</Answer>
 </Callout>
 
 ## 小结

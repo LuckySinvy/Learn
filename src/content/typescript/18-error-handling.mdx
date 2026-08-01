@@ -323,6 +323,250 @@ console.log("解析失败:", worse.ok ? "?" : worse.error.name);`}
 1. 给 `AppError` 加一个 `toJSON()` 方法，输出 `name`、`code`、`message` 与递归展开的 `cause`，用于结构化日志。
 2. 实现异步版 `attemptAsync<T>(fn: () => Promise<T>): Promise<Result<T, Error>>`，并用它改写一段 `try/catch` 代码。
 3. 给 `Result` 补上 `unwrapOr(r, fallback)` 与 `mapErr(r, fn)` 两个组合子，并思考什么时候不该用 `unwrap`。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：AppError.toJSON()**
+
+```ts
+interface SerializedError {
+  name: string;
+  code?: string;
+  message: string;
+  cause?: SerializedError;
+}
+
+function serializeError(e: unknown, depth = 0): SerializedError {
+  // 防御无限递归：错误链可能成环（A.cause = B, B.cause = A）
+  if (depth > 5) {
+    return { name: "Truncated", message: "错误链过深，已截断" };
+  }
+  if (!(e instanceof Error)) {
+    return { name: "NonError", message: String(e) };
+  }
+  const out: SerializedError = {
+    name: e.name,
+    message: e.message,
+  };
+  if (e instanceof AppError) {
+    out.code = e.code;
+  }
+  if (e.cause !== undefined) {
+    out.cause = serializeError(e.cause, depth + 1);
+  }
+  return out;
+}
+
+class AppError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+
+  constructor(
+    message: string,
+    code: string,
+    options?: { retryable?: boolean; cause?: unknown },
+  ) {
+    super(message, { cause: options?.cause });
+    this.name = "AppError";
+    this.code = code;
+    this.retryable = options?.retryable ?? false;
+  }
+
+  toJSON(): SerializedError {
+    return serializeError(this);
+  }
+}
+```
+
+验证：
+
+```ts
+const root = new Error("socket hang up");
+const mid = new AppError("请求上游失败", "UPSTREAM_ERROR", { cause: root });
+const top = new AppError("加载用户配置失败", "CONFIG_LOAD_FAILED", {
+  retryable: true,
+  cause: mid,
+});
+
+console.log(JSON.stringify(top, null, 2));
+```
+
+输出：
+
+```text
+{
+  "name": "AppError",
+  "code": "CONFIG_LOAD_FAILED",
+  "message": "加载用户配置失败",
+  "cause": {
+    "name": "AppError",
+    "code": "UPSTREAM_ERROR",
+    "message": "请求上游失败",
+    "cause": {
+      "name": "Error",
+      "message": "socket hang up"
+    }
+  }
+}
+```
+
+要点：
+
+- **`toJSON` 是 `JSON.stringify` 的约定钩子。** 定义了它之后，直接 `JSON.stringify(err)` 就会调用它。这一点很关键——因为原生 `Error` 的 `name` / `message` / `stack` 都是**不可枚举**属性，不加 `toJSON` 的话 `JSON.stringify(new Error("x"))` 得到的是 `{}`。这是结构化日志里最经典的坑。
+- **深度限制不是过度设计。** 错误链成环在包装层数多的系统里真的会发生（比如重试逻辑把捕获的错误又设成新错误的 cause）。没有这道防线，一次日志打印就能让进程栈溢出。
+- `cause` 用 `!== undefined` 判断而不是真值判断——虽然罕见，但 `cause` 理论上可以是 `0` 或 `""`。
+- 生产环境通常还要按环境决定是否包含 `stack`：开发环境带上便于定位，生产环境省略以免日志膨胀和泄露路径信息。
+
+**第 2 题：attemptAsync**
+
+```ts
+type Ok<T> = { readonly ok: true; readonly value: T };
+type Err<E> = { readonly ok: false; readonly error: E };
+type Result<T, E> = Ok<T> | Err<E>;
+
+function ok<T>(value: T): Ok<T> {
+  return { ok: true, value };
+}
+function err<E>(error: E): Err<E> {
+  return { ok: false, error };
+}
+
+function toError(e: unknown): Error {
+  if (e instanceof Error) return e;
+  if (typeof e === "string") return new Error(e);
+  return new Error("非 Error 抛出物: " + JSON.stringify(e));
+}
+
+async function attemptAsync<T>(fn: () => Promise<T>): Promise<Result<T, Error>> {
+  try {
+    return ok(await fn());     // await 必须在 try 内部
+  } catch (e) {
+    return err(toError(e));
+  }
+}
+```
+
+改写前（传统 try/catch）：
+
+```ts
+async function loadUserProfile(id: string): Promise<string> {
+  let user: User;
+  try {
+    user = await fetchUser(id);
+  } catch (e) {
+    console.error("拉取用户失败", e);
+    return "匿名用户";
+  }
+
+  let avatar: string;
+  try {
+    avatar = await fetchAvatar(user.avatarId);
+  } catch {
+    avatar = "/default.png";
+  }
+
+  return user.name + " " + avatar;
+}
+```
+
+改写后：
+
+```ts
+async function loadUserProfile(id: string): Promise<string> {
+  const userResult = await attemptAsync(() => fetchUser(id));
+  if (!userResult.ok) {
+    console.error("拉取用户失败", userResult.error.message);
+    return "匿名用户";
+  }
+  const user = userResult.value;      // 收窄后类型是 User，不再需要 let
+
+  const avatarResult = await attemptAsync(() => fetchAvatar(user.avatarId));
+  const avatar = avatarResult.ok ? avatarResult.value : "/default.png";
+
+  return user.name + " " + avatar;
+}
+```
+
+改写带来的三个实际收益：
+
+1. **`let` 变成了 `const`。** try/catch 版本里，变量必须先 `let` 声明再在 try 内赋值（因为 `const` 的作用域出不了 try 块），这会丢掉类型收窄并留下「可能未赋值」的隐患。
+2. **失败处理紧贴调用点。** 不再需要「跳读」到几行之外的 catch 块。
+3. **控制流是显式的。** 没有隐藏的异常跳转，每一步的成功/失败都体现在类型里，编译器强制你处理。
+
+一个关键细节：**`return ok(await fn())` 里的 `await` 必须写在 `try` 内部**。如果写成 `return fn().then(ok)`，Promise 的 rejection 会逃出 `try/catch`——这正是本章第 17 章「常见坑」里提到的第 2 条。
+
+**第 3 题：unwrapOr、mapErr 与何时不该用 unwrap**
+
+```ts
+// 取值，失败时返回兜底值
+function unwrapOr<T, E>(r: Result<T, E>, fallback: T): T {
+  return r.ok ? r.value : fallback;
+}
+
+// 惰性版本：兜底值计算昂贵时用它，避免无谓计算
+function unwrapOrElse<T, E>(r: Result<T, E>, fn: (e: E) => T): T {
+  return r.ok ? r.value : fn(r.error);
+}
+
+// 只转换错误分支，成功分支原样透传
+function mapErr<T, E, F>(r: Result<T, E>, fn: (e: E) => F): Result<T, F> {
+  return r.ok ? r : err(fn(r.error));
+}
+
+// 危险的那个：失败直接抛
+function unwrap<T, E>(r: Result<T, E>): T {
+  if (r.ok) return r.value;
+  throw r.error instanceof Error ? r.error : new Error(String(r.error));
+}
+```
+
+用法：
+
+```ts
+const r1 = parseAge("30");
+const r2 = parseAge("abc");
+
+console.log(unwrapOr(r1, 0));    // 30
+console.log(unwrapOr(r2, 0));    // 0
+
+// mapErr 的典型用途：把底层错误翻译成面向用户的信息
+const friendly = mapErr(r2, (f) => {
+  switch (f.kind) {
+    case "empty":
+      return "请填写年龄";
+    case "not_a_number":
+      return "年龄必须是数字";
+    case "out_of_range":
+      return "年龄不能超过 " + f.max + " 岁";
+  }
+});
+console.log(friendly.ok ? friendly.value : friendly.error);
+// 年龄必须是数字
+```
+
+`mapErr` 最大的价值是**在分层架构中做错误翻译**：数据层返回 `DbError`，服务层用 `mapErr` 转成 `DomainError`，接口层再转成 HTTP 响应。每一层只认识自己那套错误类型，`Result` 的成功分支在整个过程中完全不受影响。
+
+**什么时候不该用 unwrap：**
+
+`unwrap` 会把「编译器强制你处理错误」这个 Result 模式的**唯一好处**给扔掉——它等于在说「我赌这里不会失败」。以下场景明确不该用：
+
+| 场景 | 为什么不该用 | 该用什么 |
+|---|---|---|
+| 处理用户输入 | 失败是**预期内**的正常路径 | `if (!r.ok)` 分支或 `unwrapOr` |
+| 网络、文件 IO | 失败是常态，不是异常 | 显式分支处理 + 重试 |
+| 库/框架的公共 API 内部 | 你替调用方决定了「崩溃」，剥夺了他的选择权 | 把 `Result` 原样返回给调用方 |
+| 只是「懒得写 if」 | 把编译期保障换成了运行时崩溃 | 老老实实写分支 |
+
+**可以用的场景**只有两类：
+
+1. **不变量场景**——失败意味着程序有 bug，本来就该崩。这时更推荐用语义明确的 `invariant`，而不是 `unwrap`。
+2. **测试代码**——测试里失败就该让用例红掉，`unwrap` 反而让代码简洁。
+
+一个判断标准：**问自己「这里失败了，是外部世界的问题还是我的代码写错了？」** 前者用分支处理，后者才可以崩。这正是本章第 5 节「可恢复错误 vs 不变量违背」的区分在 Result 模式下的具体应用。
+
+最后提一句：`unwrapOr` 和 `unwrapOrElse` 的区别在于**兜底值是否惰性求值**。`unwrapOr(r, expensiveDefault())` 无论成功与否都会执行 `expensiveDefault()`，而 `unwrapOrElse(r, () => expensiveDefault())` 只在失败时才执行。兜底值涉及 IO 或复杂计算时，一定要用后者。
+</Answer>
 </Callout>
 
 ## 小结

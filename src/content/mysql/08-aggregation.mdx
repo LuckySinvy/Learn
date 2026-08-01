@@ -192,4 +192,148 @@ GROUP BY user_id, status WITH ROLLUP;
 1. 统计每个商品分类的商品数、平均价、最高价，只保留商品数大于等于 2 的分类。
 2. 用条件聚合写一条 SQL：输出每天的订单总数、已完成数、取消数、取消率。
 3. 故意写一条违反 ONLY_FULL_GROUP_BY 的查询触发 1055 报错，然后分别用聚合函数和 ANY_VALUE 两种方式修正，并说明两者语义差异。
+
+<Answer>
+**参考答案：**
+
+**1. 分类维度统计 + HAVING 过滤**
+
+```sql
+SELECT c.id,
+       c.name                    AS category_name,
+       COUNT(*)                  AS product_count,
+       ROUND(AVG(p.price), 2)    AS avg_price,
+       MAX(p.price)              AS max_price
+FROM products p
+JOIN categories c ON c.id = p.category_id
+GROUP BY c.id, c.name
+HAVING COUNT(*) >= 2
+ORDER BY product_count DESC, avg_price DESC;
+```
+
+只用 products 表（不带分类名）的简化版：
+
+```sql
+SELECT category_id,
+       COUNT(*)               AS product_count,
+       ROUND(AVG(price), 2)   AS avg_price,
+       MAX(price)             AS max_price
+FROM products
+GROUP BY category_id
+HAVING COUNT(*) >= 2;
+```
+
+要点：
+
+- 过滤条件 `COUNT(*) >= 2` **依赖聚合结果，只能放 HAVING**，写进 WHERE 会报 `Invalid use of group function`——因为逻辑执行顺序是 `FROM → WHERE → GROUP BY → 聚合 → HAVING`，WHERE 执行时聚合值还不存在。
+- 反过来，像「只统计在售商品」这种不依赖聚合的条件**必须前置到 WHERE**，让它先减少参与分组的行数并利用索引：
+
+```sql
+WHERE p.status = 1
+GROUP BY c.id, c.name
+HAVING COUNT(*) >= 2
+```
+
+- `GROUP BY c.id, c.name` 把 `c.name` 也带上是为了满足 ONLY_FULL_GROUP_BY。严格说 `c.id` 是主键、`c.name` 函数依赖于它，MySQL 8.0 能识别这种函数依赖并允许只写 `GROUP BY c.id`，但显式列全更通用、跨数据库也安全。
+- `AVG` 返回的小数位很长，用 `ROUND(x, 2)` 修饰。
+
+**2. 条件聚合出多指标**
+
+```sql
+SELECT DATE(created_at)                              AS d,
+       COUNT(*)                                      AS total_orders,
+       SUM(status = 3)                               AS completed,
+       SUM(status = 4)                               AS cancelled,
+       ROUND(SUM(status = 4) / COUNT(*) * 100, 2)    AS cancel_rate_pct
+FROM orders
+GROUP BY DATE(created_at)
+ORDER BY d;
+```
+
+等价的标准 CASE 写法（可移植到其他数据库）：
+
+```sql
+SELECT DATE(created_at) AS d,
+       COUNT(*)                                          AS total_orders,
+       SUM(CASE WHEN status = 3 THEN 1 ELSE 0 END)       AS completed,
+       SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END)       AS cancelled,
+       ROUND(
+         SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END) / COUNT(*) * 100,
+       2)                                                AS cancel_rate_pct
+FROM orders
+GROUP BY DATE(created_at)
+ORDER BY d;
+```
+
+要点：
+
+- `SUM(status = 4)` 利用了 MySQL 布尔表达式返回 0/1 的特性，是 `SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END)` 的简写，也等价于 `COUNT(IF(status = 4, 1, NULL))`。
+- **不能写成 `COUNT(status = 4)`**：`status = 4` 无论真假都是非 NULL 值（1 或 0），COUNT 会把所有行都数进去，结果恒等于总行数。
+- `COUNT(*)` 作为分母永远不为 0（能进分组说明至少有 1 行），所以这里不需要防除零。但如果分母是 `SUM(某条件)`，就要用 `NULLIF(x, 0)` 保护。
+- 条件聚合的核心价值：**一次扫表出全部指标**。如果拆成四条 SQL 分别统计，就要扫四遍表。
+
+**3. 触发并修正 ONLY_FULL_GROUP_BY**
+
+```sql
+-- 触发 1055
+SELECT user_id, order_no, COUNT(*) AS cnt
+FROM orders
+GROUP BY user_id;
+```
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause
+and contains nonaggregated column 'shop.orders.order_no' which is not
+functionally dependent on columns in GROUP BY clause; this is incompatible
+with sql_mode=only_full_group_by
+```
+
+**修法 A：用聚合函数——语义明确**
+
+```sql
+SELECT user_id, MAX(order_no) AS max_order_no, COUNT(*) AS cnt
+FROM orders
+GROUP BY user_id;
+```
+
+**修法 B：用 ANY_VALUE——语义是「随便给一个」**
+
+```sql
+SELECT user_id, ANY_VALUE(order_no) AS some_order_no, COUNT(*) AS cnt
+FROM orders
+GROUP BY user_id;
+```
+
+**两者语义差异（这是本题的重点）：**
+
+| | `MAX(order_no)` | `ANY_VALUE(order_no)` |
+|---|---|---|
+| 返回什么 | 组内 order_no 的**字典序最大值**，确定且可复现 | 组内**任意一行**的值，由执行计划决定 |
+| 多次执行 | 结果稳定 | 结果**可能不同**（换索引、改并行度都会变） |
+| 本质 | 真正的聚合计算 | 告诉优化器「我知道这不确定，别报错」 |
+| 适用 | 你确实要最大/最小值 | 该列在组内**本来就唯一**（如按 user_id 分组取 username） |
+
+`ANY_VALUE` 只是**抑制检查**，不做任何计算，所以它是一个「承诺」：你向 MySQL 保证这个列在组内取哪个都无所谓。合理场景是列与分组键一一对应：
+
+```sql
+-- username 与 user_id 一一对应，取哪行都一样
+SELECT u.id, ANY_VALUE(u.username) AS username, COUNT(o.id) AS order_cnt
+FROM users u LEFT JOIN orders o ON o.user_id = u.id
+GROUP BY u.id;
+```
+
+**如果真正想要的是「每组最新的一条完整订单」**，上面两种都不对——`MAX(order_no)` 和其他列不保证来自同一行（这是「聚合错行」经典陷阱）。这属于 Top-N per group 问题，要用窗口函数（第 11 章）：
+
+```sql
+SELECT user_id, order_no, total_amount, created_at
+FROM (
+  SELECT user_id, order_no, total_amount, created_at,
+         ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+  FROM orders
+) t
+WHERE rn = 1;
+```
+
+最后再强调：**绝不要通过关闭 `ONLY_FULL_GROUP_BY` 来消除 1055**。那只是把「明确的报错」换成「静默的错误结果」，5.7 升 8.0 时暴露出的这批 SQL，恰恰是过去一直在返回不确定数据的隐患。
+</Answer>
 </Callout>

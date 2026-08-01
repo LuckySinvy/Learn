@@ -85,6 +85,120 @@ page_vectors = {
 
 <Callout type="exercise" title="练习">
 找一份含表格的 PDF，分别用「OCR 文本向量」和「整页 CLIP 图像向量」检索同一个关于表格的问题，对比哪种能命中正确页面。
+
+<Answer>
+**参考答案：**
+
+**对比实验代码**
+
+```python
+import fitz                      # PyMuPDF
+import numpy as np
+from PIL import Image
+from sentence_transformers import SentenceTransformer
+from transformers import CLIPProcessor, CLIPModel
+import torch
+
+PDF = "财报.pdf"
+question = "2025 年第三季度的营业收入是多少？"
+
+# ---------- 路线 A：抽文本 + 文本向量 ----------
+doc = fitz.open(PDF)
+page_texts = [p.get_text() for p in doc]
+
+text_model = SentenceTransformer("BAAI/bge-large-zh")
+tv = text_model.encode(page_texts, normalize_embeddings=True)
+qv = text_model.encode([question], normalize_embeddings=True)[0]
+text_rank = np.argsort(tv @ qv)[::-1]
+
+# ---------- 路线 B：整页渲染成图 + CLIP 向量 ----------
+images = []
+for p in doc:
+    pix = p.get_pixmap(dpi=150)          # 150 dpi 足够，太高只是变慢
+    images.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+
+clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+with torch.no_grad():
+    iv = clip.get_image_features(**proc(images=images, return_tensors="pt"))
+    tq = clip.get_text_features(
+        **proc(text=[question], return_tensors="pt",
+               padding=True, truncation=True, max_length=77))   # CLIP 硬上限 77
+iv = torch.nn.functional.normalize(iv, dim=-1).numpy()
+tq = torch.nn.functional.normalize(tq, dim=-1).numpy()[0]
+clip_rank = np.argsort(iv @ tq)[::-1]
+
+print("文本向量 Top3 页:", [int(i) + 1 for i in text_rank[:3]])
+print("CLIP     Top3 页:", [int(i) + 1 for i in clip_rank[:3]])
+print("正确答案在第 12 页")
+```
+
+**典型结果**
+
+```text
+文本向量 Top3 页: [12, 7, 3]
+CLIP     Top3 页: [5, 12, 18]
+正确答案在第 12 页
+```
+
+**这个结果可能和直觉相反：文本向量赢了。** 理解为什么，比记住某个技术名词重要得多。
+
+**结论一：如果 PDF 有文本层，先老老实实用文本 RAG。**
+
+很多人一看到「表格」就想上多模态，但如果 PDF 是电子版（有文本层），`get_text()` 能把「2025年第三季度 营业收入 1,234万元」这些字完整抽出来，虽然行列结构乱了，但**关键词和数字都在**，向量检索足以定位到正确页面。这时上 CLIP 纯属自找麻烦。
+
+先跑一行代码判断该走哪条路：
+
+```python
+text_ratio = sum(1 for p in doc if len(p.get_text().strip()) > 50) / len(doc)
+print(f"有文本层的页面占比: {text_ratio:.0%}")
+# > 80%  → 走文本 RAG
+# < 20%  → 扫描件，必须 OCR 或视觉方案
+# 20-80% → 混合，按页分流
+```
+
+**结论二：CLIP 在这个任务上表现平庸，是有硬原因的。**
+
+1. **CLIP 的文本编码器只支持 77 token**，长一点的问题直接被截断。
+2. **CLIP 训练目标是「图片 ↔ 图片描述」的匹配**（比如「一只猫坐在沙发上」），它擅长识别**图像整体是什么**，而不是**读出图里的具体数字**。问它「哪一页是表格」它答得不错，问它「哪一页的营收是 1234 万」就无能为力了。
+3. 所以 CLIP 适合的场景是：「找出产品结构示意图」「找到含流程图的那一页」这类**视觉概念检索**，而不是精确数值查找。
+
+**结论三：真正打赢表格问答的是「结构化抽取」这第三条路。**
+
+```python
+import pdfplumber
+
+with pdfplumber.open(PDF) as pdf:
+    for pno, page in enumerate(pdf.pages, 1):
+        for tno, table in enumerate(page.extract_tables()):
+            header, *rows = table
+            md = "| " + " | ".join(str(c or "") for c in header) + " |\n"
+            md += "|" + "---|" * len(header) + "\n"
+            for r in rows:
+                md += "| " + " | ".join(str(c or "") for c in r) + " |\n"
+            # 关键：给表格加一句自然语言描述，大幅提升可检索性
+            caption = f"下表来自《财报》第 {pno} 页，包含各季度财务数据：\n"
+            store.add(embed(caption + md),
+                      payload={"text": caption + md, "page": pno, "type": "table"})
+```
+
+把表格抽成 Markdown 后再向量化，效果通常显著优于前两种路线——因为**行列对应关系被保住了**，LLM 读到 `| 2025Q3 | 1,234万 |` 能准确对上号，而不是面对一堆顺序错乱的数字。
+
+**决策路径总结**
+
+```text
+PDF 有文本层吗？
+├─ 有 ──► 页面里有表格吗？
+│         ├─ 有 ──► pdfplumber 抽表格转 Markdown + 加描述（最佳）
+│         └─ 无 ──► 普通文本 RAG（够用）
+└─ 无（扫描件）──► 版面复杂吗？
+          ├─ 简单 ──► OCR（PaddleOCR / tesseract）+ 文本 RAG
+          └─ 复杂 ──► ColPali 类视觉多向量方案（最后手段）
+```
+
+**最后一句实践建议**：这条路径是按「成本从低到高」排列的，务必**从上往下逐级尝试，每级都用第 13 章的指标验证是否够用**。ColPali 效果确实强，但要 GPU、多向量存储膨胀好几倍，只在「大量扫描件 + 复杂版面」时才值得付出这个代价。
+</Answer>
 </Callout>
 
 ## 小结

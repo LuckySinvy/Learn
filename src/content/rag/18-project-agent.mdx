@@ -92,6 +92,146 @@ Agent 可能多轮调用 RAG。注意：
 
 <Callout type="exercise" title="练习">
 在上面的客服 Agent 里再加一个 `create_ticket(user_id, reason)` 工具，让 Agent 在确认无法自助解决时自动建工单，并验证它不会在能直接回答时误建单。
+
+<Answer>
+**参考答案：**
+
+这道题的难点不在「加一个工具」，而在**「让 Agent 学会克制」**。`create_ticket` 是本课第一个**写操作**工具——前面的检索、查单都是只读的，调错了最多浪费点 token；建工单调错了会真的在客服系统里产生垃圾数据、占用人力。
+
+**第一步：定义工具，把约束写进 docstring**
+
+```python
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+
+class TicketInput(BaseModel):
+    user_id: str = Field(description="用户 ID")
+    reason: str  = Field(description="建单原因，需说明为何无法自助解决")
+    category: str = Field(description="工单分类：退款/物流/质量/其他")
+
+@tool(args_schema=TicketInput)
+def create_ticket(user_id: str, reason: str, category: str) -> dict:
+    """创建人工工单。这是最后手段，会占用人工客服资源。
+
+    仅在同时满足以下全部条件时才可调用：
+    1. 已调用 search_knowledge 检索过知识库，且未找到可用政策依据；
+    2. 或已检索到政策，但用户情况属于政策明确的例外/需人工审批的情形；
+    3. 或用户明确要求转人工。
+
+    禁止调用的情形：
+    - 知识库已能回答用户问题（此时应直接作答）；
+    - 尚未做任何检索就想建单；
+    - 仅仅因为问题看起来复杂。
+    """
+    ticket_id = ticket_system.create(user_id, reason, category)
+    return {"ticket_id": ticket_id, "status": "created"}
+```
+
+**要点：工具的 docstring 就是给 LLM 看的说明书。** 把「什么时候该用、什么时候禁止用」写清楚，比在系统提示里泛泛地说「谨慎建单」有效得多——因为 docstring 是随工具定义一起进入 function calling schema 的，模型每次决策时都会看到。
+
+**第二步：光靠 Prompt 不够，加代码层守门**
+
+模型终究是概率性的，写操作必须有确定性的兜底。用一个装饰器强制「建单前必须先检索」：
+
+```python
+class SessionState:
+    def __init__(self):
+        self.searched = False
+        self.search_had_answer = False
+        self.tickets_created = 0
+
+state = SessionState()
+
+def guard_create_ticket(func):
+    def wrapper(user_id, reason, category, **kw):
+        # 守门 1：没检索过，不许建单
+        if not state.searched:
+            return {"error": "请先调用 search_knowledge 确认知识库无法解决该问题。"}
+        # 守门 2：知识库明明有答案，不许建单
+        if state.search_had_answer:
+            return {"error": "知识库已有相关政策，请直接依据政策回答用户，不要建单。"}
+        # 守门 3：一次会话只能建一单，防循环
+        if state.tickets_created >= 1:
+            return {"error": "本次会话已创建过工单，不可重复创建。"}
+        state.tickets_created += 1
+        return func(user_id, reason, category, **kw)
+    return wrapper
+```
+
+同时让 `search_knowledge` 回写状态：
+
+```python
+@tool
+def search_knowledge(query: str) -> str:
+    """检索企业知识库，返回相关政策原文片段。"""
+    hits = rag_retrieve(query, k=5)
+    state.searched = True
+    # 用重排分数判断「是否真的检索到了」，而不是看有没有返回结果
+    state.search_had_answer = bool(hits and hits[0]["rerank_score"] > 0.5)
+    if not hits:
+        return "知识库中未找到相关政策。"
+    return "\n".join(f"[{i+1}] {h['text']}" for i, h in enumerate(hits))
+```
+
+**注意这里的关键判断**：不能用「有没有返回结果」来判断检索是否成功——向量检索**永远**会返回 k 条，哪怕全都不相关。必须用**重排分数阈值**来判断「这些结果是不是真的相关」。这是第 10 章提到的「重排分可以当阈值用」的实际应用。
+
+**第三步：双向验证**
+
+必须同时测「该建的建了」和「不该建的没建」，只测一边等于没测。
+
+```python
+cases = [
+    # (输入, 期望是否建单, 说明)
+    ("用户 U1 问：退货运费谁承担？", False, "知识库有明确政策，应直接答"),
+    ("用户 U2 问：我买的耳机能退吗？订单 O456", False, "查单+查政策即可判断"),
+    ("用户 U3 问：我要投诉快递员态度，要求赔偿精神损失",
+     True, "知识库无此政策，需人工"),
+    ("用户 U4 说：别废话了，直接转人工", True, "用户明确要求"),
+    ("用户 U5 问：你们几点下班？", False, "简单问题，不该建单"),
+]
+
+for text, should_create, note in cases:
+    state.__init__()                       # 每个用例重置状态
+    result = executor.invoke({"input": text})
+    created = state.tickets_created > 0
+    mark = "PASS" if created == should_create else "FAIL"
+    print(f"[{mark}] 建单={created} 期望={should_create} | {note}")
+```
+
+**误建单的三个典型原因与修法**
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| 简单问题也建单 | 系统提示没强调「优先自助」 | 提示词加：「必须先尝试自助解决，建单是最后手段」 |
+| 检索到了但仍建单 | 模型觉得「答案不够完整」 | 靠 `search_had_answer` 状态位在代码层拦截 |
+| 反复建多个单 | 建单失败后模型重试 | `max_iterations` + 一次会话限一单 |
+
+**加固系统提示**
+
+```python
+SYSTEM = """你是客服助手。处理顺序必须是：
+1. 先用 search_knowledge 查政策；需要订单信息时用 get_order
+2. 能依据政策回答的，直接回答，并说明依据
+3. 只有在政策确实未覆盖、或用户明确要求转人工时，才用 create_ticket
+4. 建单前，先向用户说明原因并征得同意
+
+记住：建单会占用人工资源，能自助解决就不要建单。"""
+
+executor = AgentExecutor(
+    agent=agent, tools=tools,
+    max_iterations=5,              # 防死循环
+    early_stopping_method="generate",
+    verbose=True,
+)
+```
+
+**从这道题该带走的通用原则**
+
+1. **只读工具和写操作工具要区别对待。** 只读工具可以放心让 Agent 随便调（大不了多花点钱），写操作工具必须有代码层守门 + 幂等设计 + 审计日志。
+2. **Prompt 约束是「建议」，代码约束才是「保证」。** 两者都要有：Prompt 让模型大部分时候做对，代码守门保证它错的时候造不成后果。
+3. **「不该做某事」比「该做某事」更难教。** 测试用例里**否定用例应该占多数**——上面 5 条里有 3 条是「不该建单」。这个比例在真实系统里还应该更高。
+4. **写操作要求人工确认更稳妥。** 生产环境里，更保险的做法是让 Agent 只**提议**建单，返回一个确认卡片给用户点「确定」，而不是直接执行。这与本课程一贯强调的「不可逆操作需确认」是一致的。
+</Answer>
 </Callout>
 
 ## 小结

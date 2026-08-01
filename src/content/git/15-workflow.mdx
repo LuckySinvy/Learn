@@ -146,4 +146,91 @@ cd ..`}
 2. 在 Fork+PR 模拟里，让贡献者的 `fix/typo` 与维护者 main 上**已有冲突**的改动冲突，演示维护者 `git fetch` 后 `git merge` 遇到冲突该如何解决（提示：维护者先合自己 main，再 merge 贡献者分支）。
 3. 解释：`git fetch upstream main` 后，贡献者应该用 `git merge upstream/main` 还是 `git rebase upstream/main` 来同步官方最新？各自对本地提交历史有什么影响？
 4. 你们团队如果要同时维护"线上 v1"和"开发 v2"，用 GitFlow 的话，线上紧急 bug 应该走哪个分支？它最终要合回哪些分支？
+
+<Answer>
+**参考答案：**
+
+**1. 功能分支 + `--no-ff` vs fast-forward**
+
+```bash
+git init -q --bare /tmp/up.git
+git clone -q /tmp/up.git proj && cd proj
+echo init > app.txt && git add . && git commit -q -m "init"
+git push -q -u origin main 2>/dev/null
+
+# 开功能分支做两个提交
+git switch -qc feature/pay
+echo pay1 > pay.txt && git add . && git commit -q -m "feat: 支付表单"
+echo pay2 >> pay.txt && git add . && git commit -q -m "feat: 支付接口"
+git switch -q main
+
+# 方式 A：默认（能 fast-forward）
+git merge feature/pay
+git log --oneline --graph
+```
+
+`--graph` 里是一条直线，功能提交直接贴到 main 上，**看不出"这是一个功能"的分组**。
+
+```bash
+# 方式 B：--no-ff（先 reset 回未合并状态再试）
+git reset --hard HEAD~1
+git merge --no-ff -m "merge: 合入支付功能" feature/pay
+git log --oneline --graph
+```
+
+`--graph` 里多了一个合并提交（气泡），功能提交在一条侧线上，main 通过 merge commit 接入——**"哪些提交属于支付功能"一目了然**。这就是功能分支工作流用 `--no-ff` 的原因。
+
+**2. Fork+PR 中冲突的处理**
+
+构造冲突：维护者 main 上先改了 `app.txt` 的最后一行，贡献者的 `fix/typo` 也改同一行。
+
+```bash
+# 维护者：fetch 贡献者分支后 merge 冲突
+git remote add contributor /tmp/fork.git
+git fetch contributor fix/typo
+git merge contributor/fix/typo
+# CONFLICT (content): Merge conflict in app.txt
+```
+
+解决流程（和第 6 章一致）：
+
+```bash
+cat app.txt                 # 看冲突标记，手工融合两个版本
+git add app.txt             # 标记已解决
+git commit --no-edit        # 完成合并（信息已预填）
+git push origin main
+```
+
+这里的"提示"其实准确描述了冲突的实质：维护者**先有自己的 main 改动**（合入前应先把本地 main 与远程 main 同步），再 merge 贡献者分支时，Git 以共同祖先为基准发现两边都改了同一行，所以需要人决定取舍。冲突只发生在这次 merge 里，贡献者自己的 fork 不受影响。
+
+**3. merge 还是 rebase 同步官方？**
+
+```bash
+git fetch upstream main
+# 方案一：git merge upstream/main
+# 方案二：git rebase upstream/main
+```
+
+- **merge**：把官方最新提交合并进本地分支，产生一个合并提交，历史保留分叉。优点：不改写历史、冲突只需解决一次；缺点：多了 "Merge branch 'upstream/main'" 噪音提交。
+- **rebase**：把本地**未推送的提交**重放到官方最新之上，历史变直线。优点：干净；缺点：改写本地提交哈希，若本地已 push 到自己的 fork，需要 `--force-with-lease`。
+
+实践建议：如果本地分支**还没推送到自己 fork**（或只有自己用），用 `rebase` 保持线性；如果已经通过 PR 共享给维护者审阅中，用 `merge` 更安全（维护者已经看过你的提交哈希/内容）。核心判断标准仍是第 7 章黄金法则：这些提交有没有被别人基于它工作。
+
+**4. GitFlow 里线上紧急 bug 的路径**
+
+线上紧急 bug 应该走 **`hotfix/*` 分支**：
+
+```bash
+git checkout -b hotfix/v1.0.1 main   # 从 main（线上版）切出
+# 修复并提交
+git checkout main
+git merge --no-ff hotfix/v1.0.1      # 合回 main（线上发布）
+git tag -a v1.0.1 -m "修复紧急 bug"  # 打新版本 tag
+git checkout develop
+git merge --no-ff hotfix/v1.0.1      # 也必须合回 develop，否则修复会丢失
+git branch -d hotfix/v1.0.1
+```
+
+原因：GitFlow 里 `main` 永远是已发布的生产代码，紧急修复必须**从 main 切出**（而不是 develop，因为 develop 上带着 v2 未发布的功能）；而它要**同时合回 main 和 develop**——合回 main 是发布修复，合回 develop 是保证 v2 开发线也带上这个修复，避免"修复只存在于旧版本、下个版本又复现"。
+</Answer>
 </Callout>

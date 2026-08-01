@@ -517,6 +517,129 @@ db.posts.aggregate([
 
 <Callout type="exercise" title="练习">
 一、用 `$lookup` 子管道，查询 alice 的资料并附带她最近 5 篇已发布帖子的标题；二、用 `$facet` 实现一个分页接口，一次返回当前页 20 条数据、总条数、以及按标签分组的计数；三、用 `$bucketAuto` 画出 `posts.stats.views` 的 10 桶直方图；四、用 `$graphLookup` 查出某条根评论下的完整回复树，限制 3 层；五、用 `$setWindowFields` 找出每个作者浏览量最高的前 2 篇帖子；六、写一个 `$merge` 管道，把每日作者统计增量写入 `authorDailyStats`，要求重复执行不会导致重复累加（提示：`whenMatched` 用 replace 而不是自定义累加管道）。
+
+<Answer>
+**参考答案：**
+
+**一、`$lookup` 子管道查询 alice 的资料 + 最近 5 篇已发布帖子**
+
+```js
+db.users.aggregate([
+  { $match: { username: "alice" } },
+  { $lookup: {
+      from: "posts",
+      let: { uid: "$_id" },
+      pipeline: [
+        { $match: { $expr: { $eq: ["$authorId", "$$uid"] }, status: "published" } },
+        { $sort: { createdAt: -1 } },
+        { $limit: 5 },
+        { $project: { title: 1, createdAt: 1, _id: 0 } }
+      ],
+      as: "recentPosts"
+  } }
+])
+```
+
+子管道把过滤、排序、限制全部在关联阶段内完成，只拉回 5 篇帖子的标题和日期，`recentPosts` 是一个数组。
+
+**二、`$facet` 分页接口（当前页 + 总数 + 按标签计数）**
+
+```js
+db.posts.aggregate([
+  { $match: { status: "published" } },      // 先把数据压到几千条以内
+  { $facet: {
+      data: [
+        { $sort: { createdAt: -1 } },
+        { $skip: 20 },                      // 第 2 页，跳过 20
+        { $limit: 20 },
+        { $project: { title: 1, authorId: 1, createdAt: 1 } }
+      ],
+      total: [ { $count: "value" } ],
+      byTag: [
+        { $unwind: "$tags" },
+        { $group: { _id: "$tags", count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]
+  } }
+])
+```
+
+一次聚合返回 `data`（本页 20 条）、`total`（总数）、`byTag`（标签计数），省掉三次独立查询。注意 `$facet` 子管道内部不走索引，前面的 `$match` 务必把数据量压小。
+
+**三、`posts.stats.views` 的 10 桶直方图**
+
+```js
+db.posts.aggregate([
+  { $bucketAuto: {
+      groupBy: "$stats.views",
+      buckets: 10
+  } }
+])
+```
+
+输出形如 10 个 `{ "_id": { "min": 0, "max": 45 }, "count": 20112 }` 的桶，`$bucketAuto` 会尽量让每个桶的文档数接近，适合先看分布；业务分档明确时用 `$bucket` 指定边界。
+
+**四、`$graphLookup` 查询根评论的完整回复树（3 层）**
+
+```js
+db.comments.aggregate([
+  { $match: { _id: ObjectId("665f1a2b3c4d5e6f70819301") } },
+  { $graphLookup: {
+      from: "comments",
+      startWith: "$_id",
+      connectFromField: "_id",
+      connectToField: "parentId",
+      as: "replies",
+      maxDepth: 3,
+      depthField: "level"
+  } },
+  { $project: { body: 1, replies: { $filter: {
+      input: "$replies", as: "r", cond: { $ne: ["$$r._id", "$_id"] }
+  } } } }
+])
+```
+
+`startWith` 用根评论自己的 `_id` 递归去找所有 `parentId` 指向它的评论，`maxDepth: 3` 限制层数（防止递归爆炸）。注意 `$graphLookup` 默认会把起点本身也放进结果数组，可加 `$filter` 排除。
+
+**五、`$setWindowFields` 找每个作者浏览量前 2 的帖子**
+
+```js
+db.posts.aggregate([
+  { $match: { status: "published" } },
+  { $setWindowFields: {
+      partitionBy: "$authorId",
+      sortBy: { "stats.views": -1 },
+      output: { rankInAuthor: { $rank: {} } }
+  } },
+  { $match: { rankInAuthor: { $lte: 2 } } },
+  { $sort: { authorId: 1, rankInAuthor: 1 } },
+  { $project: { title: 1, authorId: 1, "stats.views": 1, rankInAuthor: 1 } }
+])
+```
+
+`$setWindowFields` 不减少文档数，只给每篇帖子附加一个「该作者内按浏览量排的名次」，再用 `$match` 筛出前 2 名。这就是「分组取 Top N」。
+
+**六、可重复执行的 `$merge` 增量写入（用 replace 防重复累加）**
+
+```js
+db.posts.aggregate([
+  { $match: { createdAt: { $gte: new Date("2024-06-04") } } },
+  { $group: {
+      _id: { author: "$authorId", day: { $dateToString: { date: "$createdAt", format: "%Y-%m-%d" } } },
+      posts: { $sum: 1 },
+      views: { $sum: "$stats.views" }
+  } },
+  { $merge: {
+      into: "authorDailyStats",
+      on: "_id",
+      whenMatched: "replace",       // 用本次结果整体替换已有文档
+      whenNotMatched: "insert"
+  } }
+])
+```
+
+**为什么不会重复累加？** 每次执行都按「作者 + 日期」重新分组，算出的是该窗口内的**绝对**统计值。`whenMatched: "replace"` 用新算出的值直接覆盖旧文档，而不是用自定义累加管道 `$set` + `$add` 把新旧相加——后者如果重复执行同一天的统计，就会把同一批数据累加两次。注意：如果增量窗口只取「当天新增」的数据，那么自定义累加管道其实更合适；这里的关键是**统计窗口与合并语义要匹配**，`replace` 是最稳、天然幂等的选择。建议给 `authorDailyStats` 的 `_id` 建唯一索引，确保 `on: "_id"` 匹配可靠。
+</Answer>
 </Callout>
 
 ## 小结

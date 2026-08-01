@@ -262,4 +262,81 @@ def seckill_api(user_id, sku_id):
 1. 部署完整秒杀脚本：库存 10 件，用 shell 循环模拟 30 个不同用户各请求 2 次，验证最终库存为 0、成功用户恰好 10 人、无人成功两次。
 2. 给排行榜加一个"用户购买战绩榜"，并实现"查询我的排名及前后各 2 名"（提示：ZREVRANK 得到名次 n，再 ZRANGE REV 取 n-2 到 n+2）。
 3. 思考题：如果秒杀活动有 100 万人参与、库存 10 万件，seckill:users 这个 Set 会有多大？它是大 key 吗？给出你的优化方案（提示：分片、或改用 Bitmap/布隆过滤器做资格判断）。
+
+<Answer>
+**参考答案：**
+
+**1. 完整秒杀脚本 + 30 用户 × 2 次请求验证**
+
+```bash
+# ---- 预热: 库存 10 件, 已购集合清空 ----
+redis-cli SET seckill:stock:{2001} 10
+redis-cli DEL seckill:users:{2001}
+
+# ---- 加载 Lua 脚本, 拿到 SHA1 ----
+SHA=$(redis-cli SCRIPT LOAD "if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return -1 end local stock = tonumber(redis.call('GET', KEYS[1]) or '0') if stock <= 0 then return 0 end redis.call('DECR', KEYS[1]) redis.call('SADD', KEYS[2], ARGV[1]) return 1")
+
+# ---- 30 个用户各请求 2 次（共 60 次） ----
+for u in $(seq 1 30); do
+  for i in 1 2; do
+    redis-cli EVALSHA "$SHA" 2 seckill:stock:{2001} seckill:users:{2001} "u$u"
+  done
+done >/dev/null
+
+# ---- 验证 ----
+redis-cli GET seckill:stock:{2001}       # 期望 (integer) 0: 库存精确扣光
+redis-cli SCARD seckill:users:{2001}     # 期望 (integer) 10: 恰好 10 人成功
+redis-cli SMEMBERS seckill:users:{2001}  # 10 个互不相同的用户 → 无人成功两次
+```
+
+返回值语义：前 10 个用户首次请求返回 1（成功）；剩下 20 人首次请求返回 0（售罄）；已成功用户的第二次请求返回 -1（重复购买）。最终 `SCARD` = 10 且库存 = 0，正好满足"不超卖、每人限购 1 件"两个约束。
+
+**2. 用户购买战绩榜 + 查询排名前后各 2 名**
+
+在销量榜之外再加一个"用户战绩榜"，每成功一单给用户 +1：
+
+```bash
+# 战绩榜: member=用户ID, score=累计成功次数
+127.0.0.1:6379> ZINCRBY rank:buyers:20260730 1 u1001
+(integer) 1
+127.0.0.1:6379> ZINCRBY rank:buyers:20260730 1 u1002
+(integer) 1
+127.0.0.1:6379> ZINCRBY rank:buyers:20260730 3 u1001     # u1001 又成功 3 单
+(integer) 4
+127.0.0.1:6379> ZINCRBY rank:buyers:20260730 2 u1005
+(integer) 2
+```
+
+查询"我的排名及前后各 2 名"（名次从 0 起，展示时 +1）：
+
+```bash
+# 1) 取我的名次 n（0 起）
+127.0.0.1:6379> ZREVRANK rank:buyers:20260730 u1001
+(integer) 1
+
+# 2) 名次 n=1, 取 0 ~ 3, 即 n-2 到 n+2（下界要夹到 ≥0）
+127.0.0.1:6379> ZRANGE rank:buyers:20260730 0 3 REV WITHSCORES
+1) "u1002"      # 前 1 名
+2) "5"
+3) "u1001"      # 我
+4) "4"
+5) "u1005"      # 后 1 名
+6) "2"
+7) "u1008"      # 后 2 名
+8) "1"
+```
+
+封装成函数：先 `ZREVRANK` 拿到 n，再执行 `ZRANGE rank:buyers:20260730 max(0, n-2) n+2 REV WITHSCORES`。榜尾/榜首都要夹紧下界，避免负数下标报错。
+
+**3. 100 万人参与、10 万件库存，users 集合有多大？**
+
+**结论：是大 key，且会一直增长到 10 万成员。** 只有成功者（上限 10 万人）会被 `SADD` 进集合，每个 Set 成员约占 60~100 字节（member 字符串 + 哈希表指针 + 元数据），10 万成员约 6~10 MB，远超本章"集合类超 5000 元素或总体积超 1 MB"的经验阈值。
+
+**优化方案（可组合）：**
+
+- **分片**：按 userId 哈希拆片，如 `seckill:users:{skuId}:{userId % 16}`，每片约 6000 成员，读写先取模定位；分片还能把压力散到多个节点，缓解热 key；
+- **Bitmap**：把 userId 当 bit 偏移，成功置 1，10 万 bit 仅约 12.5 KB，体积骤降；但要求 userId 是稠密数字（如自增 ID），且只适合"是否已购"判断；
+- **布隆过滤器**：空间极小（100 万容量、1% 误判率约 1 MB），但有**误判**——可能把"没抢到"误判为"已购买"。能接受少量误拒就可用，或误判时再走 Set/数据库二次确认；
+- **别忘了**：活动结束给 key 加 TTL 清理，数据库唯一索引仍是最终兜底。
+</Answer>
 </Callout>

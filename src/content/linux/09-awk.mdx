@@ -189,4 +189,83 @@ awk '{sum+=$5} END {printf "avg = %.2f ms\n", sum/NR}' access.log
 2. 对 access.log 统计"每个 URL 的访问次数"，并用 sort 按次数从高到低输出前 3 名。
 3. 用 `awk -F:` 处理 /etc/passwd：输出 UID 大于等于 100 的用户名和登录 Shell，并统计每种 Shell 各有几个用户。
 4. 挑战：一条 awk 命令同时输出——总请求数、错误数（状态码大于等于 400）、错误率百分比（printf 保留 1 位小数）。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：users.csv 三个统计**
+
+```bash
+cat > users.csv << 'EOF'
+name,dept,salary
+ada,eng,32000
+bob,ops,21000
+carol,eng,28000
+dave,sales,18000
+EOF
+
+# 输出所有 eng 部门成员
+awk -F, '$2 == "eng" {print $1}' users.csv
+# ada / carol
+
+# 计算全公司平均工资
+awk -F, 'NR > 1 {sum += $3} END {print "avg:", sum/NR}' users.csv
+# 注意：跳过表头后 NR 会少 1，但表头也算一行输入……
+# 更稳妥的写法：单独计数
+awk -F, 'NR > 1 {sum += $3; n++} END {print "avg:", sum/n}' users.csv
+# avg: 24750
+
+# 找出工资最高的人
+awk -F, 'NR > 1 && $3 > max {max = $3; name = $1} END {print name, max}' users.csv
+# ada 32000
+```
+
+**第 2 题：每个 URL 的访问次数，前 3 名**
+
+```bash
+cat > access.log << 'EOF'
+10.0.0.1 GET /index.html 200 12
+10.0.0.2 POST /api/login 401 35
+10.0.0.1 GET /api/users 200 210
+10.0.0.3 GET /favicon.ico 404 2
+10.0.0.2 POST /api/orders 500 1520
+10.0.0.1 GET /api/users 200 180
+EOF
+
+awk '{cnt[$3]++} END {for (u in cnt) print cnt[u], u}' access.log | sort -rn | head -n 3
+# 2 /api/users
+# 1 /index.html
+# 1 /api/login
+```
+
+关联数组 `cnt[$3]++` 按第 3 列（URL）计数，END 里遍历输出，再用 `sort -rn` 数字倒序，`head -n 3` 取前三。
+
+**第 3 题：处理 /etc/passwd**
+
+```bash
+# UID 大于等于 100 的用户名和登录 Shell
+awk -F: '$3 >= 100 {print $1, $7}' /etc/passwd
+
+# 每种 Shell 各有几个用户
+awk -F: '{sh[$7]++} END {for (s in sh) print sh[s], s}' /etc/passwd
+```
+
+`-F:` 把冒号当分隔符：`$3` 是 UID、`$7` 是登录 Shell；按 Shell 分组计数同样用关联数组。
+
+**第 4 题：一条 awk 输出总请求数、错误数、错误率**
+
+```bash
+awk '$4 >= 400 {err++} {total++}
+     END {printf "total=%d errors=%d rate=%.1f%%\n", total, err, err/total*100}' access.log
+# 示例输出：total=6 errors=2 rate=33.3%
+```
+
+要点：
+
+- 模式 `$4 >= 400 {err++}` 只在错误行累加，无模式块 `{total++}` 每行都执行；
+- `printf` 的 `%d` 输出整数、`%.1f` 保留 1 位小数、`%%` 输出字面百分号；
+- `err/total*100` 把比例换算成百分比。
+
+若用 `users.csv` 一样要先跳过表头，可在两个动作块里都加上 `NR > 1` 条件。
+</Answer>
 </Callout>

@@ -131,6 +131,153 @@ fn make_counter() -> impl FnMut() -> i32 {
 
 <Callout type="exercise" title="练习">
 定义一个 `trait Draw { fn draw(&self); }`，为 `Circle` 和 `Square` 实现它。写一个函数 `fn render(shapes: &[&dyn Draw])` 遍历绘制。再给 trait 加一个默认方法 `fn name(&self) -> &str { "unknown" }`。
+
+<Answer>
+**参考答案：**
+
+```rust
+trait Draw {
+    // 必须实现的方法
+    fn draw(&self);
+
+    // 默认方法：不实现就用这个
+    fn name(&self) -> &str {
+        "unknown"
+    }
+
+    // 默认方法可以调用其他方法（包括必须实现的）
+    fn render_with_label(&self) {
+        println!("--- {} ---", self.name());
+        self.draw();
+    }
+}
+
+struct Circle {
+    radius: f64,
+}
+
+struct Square {
+    side: f64,
+}
+
+struct Triangle {
+    base: f64,
+    height: f64,
+}
+
+impl Draw for Circle {
+    fn draw(&self) {
+        println!("画一个半径 {} 的圆", self.radius);
+    }
+
+    fn name(&self) -> &str {
+        "圆形"   // 覆盖默认实现
+    }
+}
+
+impl Draw for Square {
+    fn draw(&self) {
+        println!("画一个边长 {} 的正方形", self.side);
+    }
+
+    fn name(&self) -> &str {
+        "正方形"
+    }
+}
+
+impl Draw for Triangle {
+    fn draw(&self) {
+        println!("画一个 {}x{} 的三角形", self.base, self.height);
+    }
+    // 不实现 name()，会用到默认的 "unknown"
+}
+
+// 接收 trait 对象切片：运行时多态
+fn render(shapes: &[&dyn Draw]) {
+    for s in shapes {
+        s.render_with_label();
+    }
+}
+
+fn main() {
+    let c = Circle { radius: 2.0 };
+    let s = Square { side: 3.0 };
+    let t = Triangle { base: 4.0, height: 5.0 };
+
+    let shapes: Vec<&dyn Draw> = vec![&c, &s, &t];
+    render(&shapes);
+}
+```
+
+**输出：**
+
+```text
+--- 圆形 ---
+画一个半径 2 的圆
+--- 正方形 ---
+画一个边长 3 的正方形
+--- unknown ---
+画一个 4x5 的三角形
+```
+
+`Triangle` 没有实现 `name()`，所以自动使用了 trait 里的默认实现。这就是默认方法的价值：**给 trait 添加新方法时，已有的实现者不会被破坏**。
+
+**关键点解析：**
+
+- **`&[&dyn Draw]` 的含义**：一个切片，每个元素是指向「某个实现了 `Draw` 的类型」的引用。具体是 `Circle` 还是 `Square`，编译期不知道，运行时通过 **vtable（虚函数表）** 查找该调哪个 `draw`
+- **默认方法可以调用抽象方法**：`render_with_label` 里调用了 `self.name()` 和 `self.draw()`，实际执行的是各类型自己的版本。这就是**模板方法模式**——在 trait 里固化流程骨架，把可变部分交给实现者
+- **为什么 `Vec` 需要显式标注 `Vec<&dyn Draw>`**：不标注的话，编译器会从第一个元素推断成 `Vec<&Circle>`，后面塞 `&Square` 就类型不匹配了。标注后会自动把 `&Circle` **强转（unsize coercion）** 成 `&dyn Draw`
+
+**如果需要拥有所有权：用 `Box<dyn Draw>`**
+
+上面的 `&dyn Draw` 要求原对象在别处存活。想让容器自己持有对象，就用 `Box`：
+
+```rust
+fn render_owned(shapes: &[Box<dyn Draw>]) {
+    for s in shapes {
+        s.render_with_label();
+    }
+}
+
+fn main() {
+    let shapes: Vec<Box<dyn Draw>> = vec![
+        Box::new(Circle { radius: 2.0 }),
+        Box::new(Square { side: 3.0 }),
+        Box::new(Triangle { base: 4.0, height: 5.0 }),
+    ];
+    render_owned(&shapes);
+}
+```
+
+这是构建「异构集合」最常见的方式——GUI 组件树、插件系统都是这个模式。
+
+**静态分发 vs 动态分发**
+
+如果每次调用的类型在编译期就确定，用泛型更高效：
+
+```rust
+// 静态分发：编译期单态化，可内联，零开销
+fn render_one<T: Draw>(shape: &T) {
+    shape.render_with_label();
+}
+
+// 等价的简写
+fn render_one2(shape: &impl Draw) {
+    shape.render_with_label();
+}
+```
+
+**如何选择：**
+
+| 场景 | 选择 |
+|---|---|
+| 集合里要放**多种**不同类型 | `dyn Trait`（动态分发） |
+| 每处调用类型**单一**确定 | 泛型 bound（静态分发） |
+| 追求极致性能、允许二进制变大 | 泛型 |
+| 需要在运行时决定类型、控制代码体积 | `dyn Trait` |
+
+**对象安全的注意事项：** 不是所有 trait 都能做成 `dyn Trait`。如果 trait 里有泛型方法、返回 `Self`、或有不带 `self` 的关联函数，它就**不是对象安全的**，无法用作 trait 对象。比如 `Clone` 就不能写成 `Box<dyn Clone>`，因为 `clone()` 返回 `Self`，编译器无法确定返回值的大小。
+</Answer>
 </Callout>
 
 ## 小结

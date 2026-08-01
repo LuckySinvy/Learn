@@ -316,4 +316,145 @@ FROM system.kafka_consumers;
 3. 在 `pv_uv_1m` 之上建 `pv_uv_1h` 级联 MV，验证小时级聚合结果等于分钟级之和（`sumMerge(pv)` 对比）。
 4. 用 `system.kafka_consumers` 确认消费无滞后；故意停掉灌数据脚本，观察 MV 是否停止更新（验证 MV 是 INSERT 触发器语义，9 章）。
 5.  bonus：用本章漏斗 MV 思路，算出「page_view → add_cart → order → pay」的整体转化率，定位流失最大的环节。
+
+<Answer>
+**参考答案：**
+
+1. 起 Kafka 并持续灌数据：
+
+```bash
+docker run -d --name kafka -p 9092:9092 \
+  -e KAFKA_CFG_NODE_ID=0 \
+  -e KAFKA_CFG_PROCESS_ROLES=controller,broker \
+  -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093 \
+  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  bitnami/kafka:3.6
+```
+
+持续灌数据的脚本（示例，Python + kafka-python 或直接用 shell 循环）：
+
+```bash
+#!/bin/bash
+# 每秒灌 100 条混合事件，随机 user_id（1~10000）
+while true; do
+  for i in $(seq 1 100); do
+    uid=$((RANDOM % 10000 + 1))
+    ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+    types=(page_view add_cart order pay)
+    t=${types[$((RANDOM % 4))]}
+    echo "{\"event_time\":\"$ts\",\"user_id\":$uid,\"event_type\":\"$t\",\"page\":\"/p/$((RANDOM % 200))\",\"country\":\"CN\",\"device\":\"web\",\"duration_ms\":$((RANDOM % 5000))}"
+  done | docker exec -i kafka kafka-console-producer.sh --bootstrap-server localhost:9092 --topic user_events
+  sleep 1
+done
+```
+
+2. 建管道并验证：
+
+```sql
+CREATE TABLE events_raw (...) ENGINE = Kafka
+SETTINGS kafka_broker_list = 'kafka:9092', kafka_topic_list = 'user_events',
+         kafka_group_name = 'ch-consumer', kafka_format = 'JSONEachRow',
+         kafka_num_consumers = 4;
+
+CREATE TABLE events (...) ENGINE = MergeTree ...;          -- 见本章第 2 节
+CREATE TABLE pv_uv_1m (...) ENGINE = AggregatingMergeTree ...;   -- 见本章 3.1
+CREATE MATERIALIZED VIEW mv_pv_uv TO pv_uv_1m AS ...;            -- 见本章 3.1
+```
+
+跑 5 分钟后查：
+
+```sql
+SELECT minute, page, country, sumMerge(pv) AS pv, uniqMerge(uv) AS uv
+FROM pv_uv_1m
+WHERE minute >= now() - INTERVAL 5 MINUTE
+GROUP BY minute, page, country
+ORDER BY minute DESC;
+```
+
+有数据说明 Kafka → MV → 聚合表整条链路通了。
+
+3. 级联 MV 验证小时 = 分钟之和：
+
+```sql
+CREATE TABLE pv_uv_1h (...) ENGINE = AggregatingMergeTree ...;   -- 见本章第 4 节
+CREATE MATERIALIZED VIEW mv_pv_uv_hour TO pv_uv_1h AS
+SELECT toStartOfHour(minute) AS hour, page, country, device, pv, uv
+FROM pv_uv_1m;
+
+SELECT
+    (SELECT sumMerge(pv) FROM pv_uv_1h) AS hourly_total,
+    (SELECT sumMerge(pv) FROM pv_uv_1m) AS minute_total;
+-- 两者应相等（UV 用 uniqMerge 同理）
+```
+
+小时表把分钟级聚合状态透传后由引擎自动 `-Merge` 成小时状态，最终 `sumMerge(pv)` 与分钟级之和一致——这就是聚合状态「可组合」的体现。
+
+4. 消费滞后与 MV 触发器语义：
+
+```sql
+SELECT topic, consumer_group, num_consumed, num_messages, num_messages - num_consumed AS lag
+FROM system.kafka_consumers;
+```
+
+`lag` 稳定或为 0 表示消费跟得上。然后**停掉灌数据脚本**，等几秒再查 `pv_uv_1m` 的最大 `minute` 是否停止前进——MV 只在源表 `INSERT`（即 Kafka 消费写入）时触发，源数据停了它自然就停。这直观验证了「物化视图是 INSERT 触发器，不是定时刷新」。
+
+5. bonus：四步漏斗转化率：
+
+```sql
+CREATE TABLE funnel_daily
+(
+    day       Date,
+    steps     AggregateFunction(countIf, UInt8)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY day;
+
+CREATE MATERIALIZED VIEW mv_funnel TO funnel_daily AS
+SELECT
+    toDate(event_time) AS day,
+    countIfState(windowFunnel(86400)(event_time,
+        event_type = 'page_view',
+        event_type = 'add_cart',
+        event_type = 'order',
+        event_type = 'pay'
+    ) = 4) AS steps
+FROM events_raw
+GROUP BY day, user_id;   -- 漏斗必须按 user_id 分组
+
+-- 查询各步骤人数（把 =4 改成 >=1 / >=2 / >=3）
+SELECT
+    countMerge(ifState4)  AS pay_complete,
+    ...
+FROM funnel_daily;
+```
+
+更直接的做法是不落预聚合，直接对明细跑（小数据量时够用）：
+
+```sql
+SELECT
+    countIf(level >= 1) AS page_view,
+    countIf(level >= 2) AS add_cart,
+    countIf(level >= 3) AS order_cnt,
+    countIf(level >= 4) AS pay,
+    round(countIf(level >= 2) / countIf(level >= 1) * 100, 2) AS view_to_cart,
+    round(countIf(level >= 3) / countIf(level >= 2) * 100, 2) AS cart_to_order,
+    round(countIf(level >= 4) / countIf(level >= 3) * 100, 2) AS order_to_pay
+FROM (
+    SELECT user_id,
+           windowFunnel(86400)(event_time,
+               event_type = 'page_view',
+               event_type = 'add_cart',
+               event_type = 'order',
+               event_type = 'pay') AS level
+    FROM events
+    GROUP BY user_id
+);
+```
+
+各步骤转换率中最低的那一级就是流失最大的环节——如果 `cart_to_order` 只有 30%，优化重点就放在购物车到下单这段（比如流程简化、优惠引导），而不是盯着首屏 PV。
+</Answer>
 </Callout>

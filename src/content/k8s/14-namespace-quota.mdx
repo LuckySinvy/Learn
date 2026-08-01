@@ -93,6 +93,94 @@ spec:
 
 <Callout type="exercise" title="练习">
 新建命名空间 `demo`，为其创建一份 ResourceQuota（最多 5 个 Pod、2 核 CPU）和一个 LimitRange（默认内存 128Mi）。然后尝试创建超过配额的 Pod，观察被拒的报错信息。
+
+<Answer>
+**参考答案：**
+
+```bash
+# 1. 新建命名空间
+kubectl create namespace demo
+```
+
+创建 ResourceQuota（保存为 `quota.yaml`）：
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: demo-quota
+  namespace: demo
+spec:
+  hard:
+    pods: "5"
+    requests.cpu: "2"
+```
+
+> CPU 配额用的是 `requests.cpu`（调度占用）。若只限制 Pod 数量，还需要每个 Pod 设 requests 才会被 quota 计数——严格说 `pods: "5"` 本身已限制 Pod 数，CPU 配额是叠加约束。
+
+创建 LimitRange（保存为 `limits.yaml`）：
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: demo-limits
+  namespace: demo
+spec:
+  limits:
+    - type: Container
+      default:                 # 未写 limit 时默认给
+        memory: "128Mi"
+      defaultRequest:          # 未写 request 时默认给
+        memory: "128Mi"
+```
+
+```bash
+kubectl apply -f quota.yaml
+kubectl apply -f limits.yaml
+
+# 查看配额
+kubectl describe resourcequota demo-quota -n demo
+```
+
+创建超过配额的 Pod（比如一次性创建 6 个，或 1 个超过 2 核 requests 的 Pod），观察被拒：
+
+```bash
+# 一次性起 6 个 Pod，第 6 个会被拒绝
+for i in 1 2 3 4 5 6; do
+  kubectl run busy-$i --image=busybox --restart=Never \
+    --namespace=demo -- sleep 3600
+done
+# 前 5 个成功；第 6 个报错形如：
+# Error from server (Forbidden): pods "busy-6" is forbidden:
+# exceeded quota: demo-quota, requested: pods=1, used: pods=5, limited: pods=5
+
+# 或创建一个 requests.cpu=3 的 Pod，超过 2 核配额也会被拒
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: big
+  namespace: demo
+spec:
+  containers:
+    - name: busybox
+      image: busybox
+      command: ["sleep", "3600"]
+      resources:
+        requests: { cpu: "3" }
+EOF
+# Error from server (Forbidden): ... requested: requests.cpu=3, used: requests.cpu=0, limited: requests.cpu=2
+
+# 查看当前用量（used 列会显示已用配额）
+kubectl get resourcequota -n demo
+
+# 清理
+kubectl delete namespace demo
+```
+
+**要点回顾：** ResourceQuota 是命名空间级的"总量上限"，超限时 API Server 直接拒绝创建并返回 `Forbidden / exceeded quota` 错误；LimitRange 则给漏写 `resources` 的容器补默认值。两者的区别正是"总量约束" vs "单容器默认值"。
+</Answer>
 </Callout>
 
 ## 小结

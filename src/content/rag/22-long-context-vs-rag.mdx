@@ -61,6 +61,124 @@ RAG 负责「缩小范围、降成本」，长上下文负责「在相关片段�
 
 <Callout type="exercise" title="练习">
 取一份 5 万字文档，分别用「全文直喂」和「RAG 召回前 10 段」两种方式回答同一个细节问题，对比两者答案准确率与耗时。
+
+<Answer>
+**参考答案：**
+
+**对比脚本**
+
+```python
+import time, tiktoken
+
+enc = tiktoken.encoding_for_model("gpt-4o-mini")
+full_text = open("长文档.txt", encoding="utf-8").read()   # 约 5 万字
+question = "文档中提到的第三阶段验收标准的具体量化指标是什么？"
+
+def timed(fn):
+    t0 = time.perf_counter()
+    out = fn()
+    return out, time.perf_counter() - t0
+
+# ---------- 方式 A：全文直喂 ----------
+def full_context():
+    prompt = f"基于以下资料回答问题：\n{full_text}\n\n问题：{question}"
+    return llm(prompt), len(enc.encode(prompt))
+
+# ---------- 方式 B：RAG 召回 Top-10 ----------
+def rag():
+    chunks = rerank(question, retrieve(embed(question), top_k=30))[:10]
+    ctx = "\n\n".join(f"[{i+1}] {c['text']}" for i, c in enumerate(chunks))
+    prompt = f"仅依据以下资料回答，未提及则说不知道，句末标 [n]：\n{ctx}\n\n问题：{question}"
+    return llm(prompt), len(enc.encode(prompt))
+
+(a_out, a_tok), a_t = timed(full_context)
+(b_out, b_tok), b_t = timed(rag)
+
+price = 0.15 / 1_000_000        # 每 token 输入单价（示例）
+for name, out, tok, t in [("全文直喂", a_out, a_tok, a_t), ("RAG", b_out, b_tok, b_t)]:
+    print(f"\n=== {name} ===")
+    print(f"输入 {tok:,} tokens | 耗时 {t:.2f}s | 单次成本 ${tok * price:.5f}")
+    print(out[:200])
+```
+
+**典型结果**
+
+```text
+=== 全文直喂 ===
+输入 78,400 tokens | 耗时 22.4s | 单次成本 $0.01176
+第三阶段的验收标准要求系统稳定运行并达到预期性能指标……（含糊，没给出具体数字）
+
+=== RAG ===
+输入 3,150 tokens | 耗时 3.1s | 单次成本 $0.00047
+第三阶段验收需满足：P99 延迟 < 200ms、可用性 ≥ 99.9%、并发承载 ≥ 5000 QPS [3]。
+```
+
+| 维度 | 全文直喂 | RAG Top-10 | 差距 |
+|---|---|---|---|
+| 输入 token | 78,400 | 3,150 | **25 倍** |
+| 耗时 | 22.4s | 3.1s | **7 倍** |
+| 单次成本 | $0.01176 | $0.00047 | **25 倍** |
+| 答案准确性 | 含糊，漏掉具体指标 | 准确，且有引用 | — |
+| 可溯源 | 无法定位 | 精确到片段 | — |
+
+**最反直觉的一点：全文直喂不仅更贵更慢，答得还更差。**
+
+模型明明「看到」了那段文字，为什么答不出来？这就是「Lost in the Middle」现象——模型对超长输入的注意力分布是**U 形**的：开头和结尾记得清楚，中间大段内容的利用率显著下降。而细节答案恰恰常常就埋在中间。
+
+**做一个位置验证实验，把这个现象亲眼看清楚**
+
+这是本练习最值得做的一步：把同一段「答案原文」插到文档的不同位置，看准确率怎么变。
+
+```python
+answer_snippet = "第三阶段验收需满足：P99 延迟 < 200ms、可用性 ≥ 99.9%、并发 ≥ 5000 QPS。"
+base = full_text.replace(answer_snippet, "")      # 先移除原位置
+
+for label, pos in [("开头", 0.0), ("四分之一", 0.25),
+                   ("正中间", 0.5), ("四分之三", 0.75), ("结尾", 1.0)]:
+    idx = int(len(base) * pos)
+    doc = base[:idx] + "\n" + answer_snippet + "\n" + base[idx:]
+    out = llm(f"基于以下资料回答：\n{doc}\n\n问题：{question}")
+    hit = "200ms" in out and "99.9" in out
+    print(f"答案位于{label:6s}: {'命中' if hit else '未命中'}")
+```
+
+典型结果：
+
+```text
+答案位于开头    : 命中
+答案位于四分之一: 命中
+答案位于正中间  : 未命中     ← U 形曲线的谷底
+答案位于四分之三: 未命中
+答案位于结尾    : 命中
+```
+
+**结论：「能装下」确实不等于「读得准」。** 窗口标称 100 万 token，不代表第 50 万个 token 处的信息能被可靠使用。
+
+**那什么时候可以直接用长上下文？**
+
+不要因为上面的结果就全盘否定长上下文，它在这些场景下反而更好：
+
+| 场景 | 推荐 | 原因 |
+|---|---|---|
+| 一次性分析单份合同/论文 | **长上下文** | 建索引的成本还不如直接读；且需要全局理解 |
+| 需要「通读全文才能答」的问题（总结、找矛盾） | **长上下文** | RAG 只召回片段，天然看不到全局 |
+| 高频问答、库大、要溯源 | **RAG** | 成本和延迟差 25 倍，且能给出处 |
+| 细节精确查找 | **RAG** | 避开 U 形注意力谷底 |
+
+注意第二行——**RAG 有个结构性短板：它永远只看到片段**。问「这份 50 页报告里有没有前后矛盾的地方」，RAG 召回的 10 段里可能恰好只包含矛盾的一边，根本发现不了。这类问题要么用长上下文，要么用第 19 章的 GraphRAG 社区摘要。
+
+**最优解仍是组合**
+
+```python
+def hybrid(question, k=20):
+    chunks = rerank(question, retrieve(embed(question), top_k=50))[:k]
+    # 召回数可以放宽到 20，因为长上下文模型吃得下
+    ctx = "\n\n".join(f"[{i+1}] {c['text']}" for i, c in enumerate(chunks))
+    return llm_long(f"仅依据资料回答，句末标 [n]：\n{ctx}\n\n问题：{question}")
+```
+
+长上下文模型的真正价值，不是让你能「全库直喂」，而是**让 RAG 的 `top_k` 可以放得更宽**——从 5 段放到 20 段，召回率大幅提升，同时仍然远远避开注意力稀释的临界点。这是两者协同的正确姿势：**RAG 负责把范围从 8 万 token 缩到 5 千，长上下文负责在这 5 千里做深度推理。**
+</Answer>
 </Callout>
 
 ## 小结

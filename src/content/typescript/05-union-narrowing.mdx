@@ -367,6 +367,116 @@ if (isString) {
 <Callout type="exercise" title="练习">
 1. 定义 `type Json = string | number | boolean | null | Json[] | { [k: string]: Json }`，写一个 `stringify(v: Json): string` 手动序列化（不用 `JSON.stringify`），练习对递归联合的收窄。
 2. 把一个「支付方式」建模成可辨识联合：现金（金额）、银行卡（卡号后四位、金额）、优惠券（券码）。写 `describe` 函数用 switch 处理，并加上 `never` 穷尽性检查；然后新增一种方式，观察编译器报错的位置。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：递归 Json 类型与手写序列化**
+
+```ts
+type Json = string | number | boolean | null | Json[] | { [k: string]: Json };
+
+function quote(s: string): string {
+  return '"' + s.replace(/[\\"]/g, (m) => "\\" + m).replace(/\n/g, "\\n") + '"';
+}
+
+function stringify(v: Json): string {
+  // 顺序很重要：null 必须放在最前面，因为 typeof null === "object"
+  if (v === null) return "null";
+  if (typeof v === "string") return quote(v);
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : "null";
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (Array.isArray(v)) {
+    return "[" + v.map(stringify).join(",") + "]";
+  }
+  // 走到这里，联合里只剩下索引签名对象了，编译器已自动收窄
+  const body = Object.entries(v)
+    .map(([k, val]) => quote(k) + ":" + stringify(val))
+    .join(",");
+  return "{" + body + "}";
+}
+
+const data: Json = {
+  name: "Ada",
+  age: 36,
+  active: true,
+  spouse: null,
+  tags: ["math", "code"],
+  address: { city: "London", zip: "N1" },
+};
+
+console.log(stringify(data));
+// {"name":"Ada","age":36,"active":true,"spouse":null,"tags":["math","code"],"address":{"city":"London","zip":"N1"}}
+console.log(stringify([1, "two", false, null]));
+// [1,"two",false,null]
+```
+
+这道题的核心是**收窄的顺序**：
+
+1. `v === null` 必须第一个判断。若先写 `typeof v === "object"`，`null` 会被误判成对象，随后 `Object.entries(null)` 直接抛异常。
+2. `Array.isArray(v)` 是编译器认识的类型守卫，它把 `Json[]` 从联合中摘掉。
+3. 前面五个分支逐一排除后，剩余类型自动收窄为索引签名对象，**不需要任何 `as` 断言**就能调用 `Object.entries`。这就是「联合类型 + 逐步收窄」的威力。
+4. 递归类型是合法的：`Json` 在自己的定义里引用自己，因为引用出现在数组元素和属性值这类「延迟求值」的位置。
+5. `Number.isFinite` 用来处理 `NaN` / `Infinity` —— 标准 JSON 不支持它们，原生 `JSON.stringify` 同样输出 `null`。
+
+**第 2 题：支付方式可辨识联合**
+
+```ts
+type Payment =
+  | { method: "cash"; amount: number }
+  | { method: "card"; last4: string; amount: number }
+  | { method: "coupon"; code: string };
+
+function assertNever(x: never): never {
+  throw new Error("未处理的支付方式: " + JSON.stringify(x));
+}
+
+function describe(p: Payment): string {
+  switch (p.method) {
+    case "cash":
+      return "现金支付 " + p.amount.toFixed(2) + " 元";
+    case "card":
+      return "银行卡（尾号 " + p.last4 + "）支付 " + p.amount.toFixed(2) + " 元";
+    case "coupon":
+      return "优惠券支付，券码 " + p.code;
+    default:
+      return assertNever(p);
+  }
+}
+
+const list: Payment[] = [
+  { method: "cash", amount: 99.5 },
+  { method: "card", last4: "6688", amount: 240 },
+  { method: "coupon", code: "SPRING24" },
+];
+
+for (const p of list) console.log(describe(p));
+// 现金支付 99.50 元
+// 银行卡（尾号 6688）支付 240.00 元
+// 优惠券支付，券码 SPRING24
+```
+
+注意每个 case 里能访问的属性都不一样：`p.last4` 只在 `"card"` 分支存在，在 `"cash"` 分支写 `p.last4` 会直接报错。这正是可辨识联合优于「一堆可选属性」的地方——**券码支付没有金额字段这件事，被类型系统强制表达了出来**，你不可能不小心去读一个不存在的 `amount`。
+
+**新增一种方式后：**
+
+```ts
+type Payment =
+  | { method: "cash"; amount: number }
+  | { method: "card"; last4: string; amount: number }
+  | { method: "coupon"; code: string }
+  | { method: "wallet"; provider: "alipay" | "wechat"; amount: number };  // 新增
+```
+
+编译器会在 **`describe` 的 `default` 分支、`assertNever(p)` 这一行**报错：
+
+```text
+TS2345: 类型“{ method: "wallet"; provider: "alipay" | "wechat"; amount: number; }”
+的参数不能赋给类型“never”的参数。
+```
+
+因为三个 case 处理完后，`p` 的剩余类型不再是空集，而是新增的 wallet 分支。项目里如果有十处 switch 消费 `Payment`，编译器会一次性把十处全列出来——这就是「可辨识联合 + 穷尽性检查」组合的真正价值：**类型定义成为唯一事实来源，改一处，编译器负责找齐所有需要同步的地方。**
+</Answer>
 </Callout>
 
 ## 小结

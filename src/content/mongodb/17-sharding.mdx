@@ -472,6 +472,140 @@ Totals
 
 <Callout type="exercise" title="练习">
 一、用 Docker 搭一个 2 分片的集群（每片单成员复制集 + 1 个 config 复制集 + 1 个 mongos）；二、对 `posts` 用 `{ _id: 1 }` 分片，插入 10 万条数据，用 `getShardDistribution()` 观察分布，解释为什么不均；三、改用 `{ authorId: "hashed" }` 重做，对比分布；四、分别执行带分片键和不带分片键的查询，用 `explain` 对比 `SINGLE_SHARD` 与 `SHARD_MERGE`；五、尝试在非分片键字段上建唯一索引，复现报错，然后设计一个「注册表集合」方案绕过它；六、为内容社区的 `comments` 集合设计分片键，说明为什么必须加 `_id` 后缀。
+
+<Answer>
+**参考答案：**
+
+**一、Docker 搭 2 分片集群**
+
+`docker-compose.yml` 示意（每片单成员复制集，端口各不同）：
+
+```yaml
+services:
+  # config server（复制集 csrs，单成员）
+  cfg1:
+    image: mongo:7.0
+    command: mongod --configsvr --replSet cfgrs --port 27019 --bind_ip_all
+    ports: ["27019:27019"]
+  # 分片 rs-a（单成员）
+  shard_a1:
+    image: mongo:7.0
+    command: mongod --shardsvr --replSet rs-a --port 27018 --bind_ip_all
+    ports: ["27018:27018"]
+  # 分片 rs-b（单成员）
+  shard_b1:
+    image: mongo:7.0
+    command: mongod --shardsvr --replSet rs-b --port 27018 --bind_ip_all
+    ports: ["27020:27018"]
+  # mongos 路由
+  mongos:
+    image: mongo:7.0
+    command: mongos --configdb cfgrs/cfg1:27019 --port 27017 --bind_ip_all
+    ports: ["27017:27017"]
+    depends_on: [cfg1, shard_a1, shard_b1]
+```
+
+初始化：
+
+```bash
+docker compose up -d
+# 初始化 config 复制集
+docker exec -it cfg1 mongosh --port 27019 --eval 'rs.initiate({ _id: "cfgrs", configsvr: true, members: [{ _id: 0, host: "cfg1:27019" }] })'
+# 初始化两个分片复制集
+docker exec -it shard_a1 mongosh --port 27018 --eval 'rs.initiate({ _id: "rs-a", members: [{ _id: 0, host: "shard_a1:27018" }] })'
+docker exec -it shard_b1 mongosh --port 27018 --eval 'rs.initiate({ _id: "rs-b", members: [{ _id: 0, host: "shard_b1:27018" }] })'
+
+# 连 mongos，加入分片并启用
+docker exec -it mongos mongosh --eval '
+  sh.addShard("rs-a/shard_a1:27018")
+  sh.addShard("rs-b/shard_b1:27018")
+'
+```
+
+**二、`{ _id: 1 }` 分片后分布不均**
+
+```js
+sh.enableSharding("community")
+sh.shardCollection("community.posts", { _id: 1 })
+
+// 插入 10 万条（ObjectId 由驱动生成，随时间递增）
+db.posts.insertMany(Array.from({ length: 100000 }, (_, i) => ({ v: i })))
+
+db.posts.getShardDistribution()
+```
+
+结果会显示**绝大多数数据落在同一个分片**。原因：ObjectId 高位是时间戳，**单调递增**。写入时所有新文档的 `_id` 都落在当前最大的 chunk 里，chunk 不断在右侧分裂，新数据永远进「最新」的那个 chunk 所在分片——写热点 + 数据倾斜同时出现，另一个分片几乎闲置。
+
+**三、改用 `{ authorId: "hashed" }` 对比**
+
+```js
+// 重建集合
+db.posts.drop()
+db.posts.createIndex({ authorId: "hashed" })
+sh.shardCollection("community.posts", { authorId: "hashed" })
+
+// authorId 随机分布在 0~9999 之间
+db.posts.insertMany(
+  Array.from({ length: 100000 }, (_, i) => ({ authorId: "user-" + (i % 10000), v: i }))
+)
+db.posts.getShardDistribution()
+```
+
+哈希分片把 `authorId` 哈希后均匀映射到整个取值空间，两个分片的数据量和 chunk 数会非常接近（各约 50%）。代价是范围查询要广播（见第四题）。
+
+**四、`SINGLE_SHARD` vs `SHARD_MERGE`**
+
+```js
+// 带分片键：定向查询
+db.posts.find({ authorId: "user-123" }).explain()
+// winningPlan.stage = SINGLE_SHARD，只查一个分片
+
+// 不带分片键：广播查询
+db.posts.find({ v: 42 }).explain()
+// winningPlan.stage = SHARD_MERGE，三个分片都要查再合并
+```
+
+`SINGLE_SHARD` 一次网络往返、延迟稳定；`SHARD_MERGE` 延迟取决于最慢的分片，分片越多越慢。所以高频查询条件里一定要带分片键。
+
+**五、非分片键唯一索引报错 + 注册表方案**
+
+```js
+// 复现报错
+sh.shardCollection("community.users", { _id: "hashed" })
+db.users.createIndex({ email: 1 }, { unique: true })
+// MongoServerError: Cannot create unique index over { email: 1 }
+// with shard key pattern { _id: "hashed" }
+```
+
+原因：唯一性检查需要看到全部数据，而分片集群里每个分片只有一部分，无法在分布式下保证全局唯一。
+
+**注册表集合方案**：
+
+```js
+// 新建 email_registry 集合，用 email 做 _id（天然唯一），并作为分片键
+sh.enableSharding("community")
+db.email_registry.createIndex({ _id: "hashed" })
+sh.shardCollection("community.email_registry", { _id: "hashed" })
+
+// 注册邮箱：占位成功说明没被占用
+const r = db.email_registry.updateOne(
+  { _id: "alice@example.com" },
+  { $setOnInsert: { userId: ObjectId("...101"), createdAt: new Date() } },
+  { upsert: true }
+)
+if (r.upsertedCount === 0) throw new Error("EMAIL_TAKEN")
+```
+
+以 `email` 为 `_id` 的集合天然保证全局唯一（`_id` 唯一性由分片内部机制保证），注册成功再写用户文档，即可绕过分片下唯一索引的限制。
+
+**六、`comments` 的分片键设计**
+
+```js
+sh.shardCollection("community.comments", { postId: 1, _id: 1 })
+```
+
+**为什么必须加 `_id` 后缀？** 只用 `{ postId: 1 }` 时，同一篇爆款帖子的所有评论 `postId` 相同，全部落在同一个 chunk；这个 chunk 因为取值无法再分裂而变成 **jumbo chunk**，持续增长直到拖垮所在分片。加上 `_id` 后缀后，chunk 边界是 `(postId, _id)`，同一个 `postId` 的评论会按 `_id` 继续分裂到多个分片，既保留了「按帖子查评论」的定向路由，又消除了 jumbo 风险。这与第 4.4 节的结论一致。
+</Answer>
 </Callout>
 
 ## 小结

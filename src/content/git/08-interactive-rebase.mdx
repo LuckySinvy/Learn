@@ -311,4 +311,64 @@ rebase 前的旧提交并没有被删除，只是没有分支指向它们。第 
 2. 用 `drop` 删掉中间一个提交，观察它创建的文件是否随之消失。然后故意让后续提交依赖被删提交的内容，看看会发生什么冲突。
 3. 用 `git commit --fixup=<hash>` 制造两个 fixup 提交（指向不同的目标），再用 `--autosquash` 一次性归位，确认它们各自回到了正确的位置。
 4. 用 `git rebase -i --exec "cat f.txt"` 让每个提交重放后都打印一次文件内容，观察文件是如何一步步演化的。
+
+<Answer>
+**参考答案：**
+
+**1. squash 整理 + 验证"内容没变"**
+
+```bash
+git init -q
+echo base > base.txt && git add . && git commit -q -m "chore: 初始化"
+echo a > f.txt && git add . && git commit -q -m "feat: 核心功能"
+echo b >> f.txt && git add . && git commit -q -m "wip"
+echo c >> f.txt && git add . && git commit -q -m "临时改动"
+echo d >> f.txt && git add . && git commit -q -m "fix typo"
+cp f.txt /tmp/before.txt      # 记录整理前的内容
+```
+
+执行 `git rebase -i HEAD~5`，在 todo 清单里把后 3 行的 `pick` 改成 `squash`，第一行保留 `pick`，最后编辑合并后的提交信息。结果 `git log --oneline` 只显示 2 个提交（`feat: 核心功能` + `chore: 初始化`），而 `diff /tmp/before.txt f.txt` 无差异——**历史从 5 条变成 2 条，但最终文件内容一字未变**。squash 只改历史的组织方式，不改内容。
+
+**2. drop 删提交 + 制造连锁冲突**
+
+```bash
+git init -q
+echo base > base.txt && git add . && git commit -q -m "init"
+echo 'GREETING = "hello"' > config.py && git add . && git commit -q -m "feat: 定义问候语"
+echo 'print(GREETING)' > main.py && git add . && git commit -q -m "feat: 使用问候语"
+```
+
+`git rebase -i HEAD~3` 后把含 `config.py` 的那行改成 `drop`（或直接删掉该行），退出。结果：`ls` 里 `config.py` **随之消失**，因为 drop 掉提交等于撤销它的改动。
+
+更糟的是 `main.py` 依赖 `GREETING`——如果 `main.py` 的改动来自后续提交，重放时它引用的名字已不存在，但 Git 并不理解"引用"语义，所以不一定会报错（它只是文本比对）。想让 Git 报冲突，可以让后续提交修改 `config.py` 的同一行，比如后面有 `sed -i 's/hello/hi/' config.py` 的提交——它要改的行被 drop 没了，重放时找不到 `hello` 所在的行，就会报冲突。遇到连锁冲突就 `git rebase --abort`，拆成小步整理。
+
+**3. 两个 fixup 各自归位**
+
+```bash
+git init -q
+echo base > base.txt && git add . && git commit -q -m "init"
+echo 'login v1' > login.py && git add . && git commit -q -m "feat: 登录"
+echo 'order v1' > order.py && git add . && git commit -q -m "feat: 订单"
+LOGIN=$(git log --format=%H --grep=登录)
+ORDER=$(git log --format=%H --grep=订单)
+echo 'login fix' > login.py && git add . && git commit -q --fixup=$LOGIN
+echo 'order fix' > order.py && git add . && git commit -q --fixup=$ORDER
+git rebase -i --autosquash HEAD~4
+git log --oneline
+```
+
+`--fixup=<目标>` 会生成标题为 `fixup! 登录` / `fixup! 订单` 的提交；`--autosquash` 自动把它们排到各自目标提交的**后面一行**并设成 `fixup`。整理后 `git log` 只剩 3 个提交，两个修补分别并进了"登录"和"订单"里，**各自回到了正确的位置**，不会串位。
+
+**4. `--exec` 观察文件逐步演化**
+
+```bash
+git init -q
+echo a > f.txt && git add . && git commit -q -m "step1"
+echo b >> f.txt && git add . && git commit -q -m "step2"
+echo c >> f.txt && git add . && git commit -q -m "step3"
+git rebase -i --exec "cat f.txt" HEAD~3
+```
+
+rebase 在每次重放一个提交后执行 `cat f.txt`，输出会依次显示 `a`、`a b`、`a b c`——文件内容一步步累积演化，同时印证"重放是按顺序逐提交进行的"。`--exec` 的真实价值是把 `cat` 换成 `npm test` 之类的校验命令，确保历史上每个提交都能独立通过测试。
+</Answer>
 </Callout>

@@ -194,4 +194,104 @@ kill $(jobs -p) 2>/dev/null || true`}
 2. 默写 rsync 命令：把本地 `dist/` 的**内容**同步到 `web:/var/www/app/`，排除 `.map` 文件，删除远端多余文件，先预演再实传（两条命令）。
 3. 画出（或用文字描述）`ssh -L 13306:10.0.0.5:3306 bastion` 中数据包的完整路径：本地客户端 → ？ → ？ → 数据库。
 4. 真机作业：完成第 6 节演练清单的 1、2、3 步，并记录 rsync 第二次同步时传输量比第一次小多少。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：fix-ssh-perms.sh**
+
+```bash
+cat > fix-ssh-perms.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+TARGET=$1
+
+if [ -z "$TARGET" ]; then
+  echo "usage: fix-ssh-perms.sh <directory>"
+  exit 1
+fi
+if [ ! -d "$TARGET" ]; then
+  echo "错误：$TARGET 不是目录"
+  exit 2
+fi
+
+echo "=== 修正前 ==="
+stat -c '%a %n' "$TARGET" "$TARGET/id_ed25519" "$TARGET/authorized_keys" "$TARGET/id_ed25519.pub" 2>/dev/null || true
+
+chmod 700 "$TARGET"                                    # .ssh 目录 700
+chmod 600 "$TARGET"/id_ed25519 "$TARGET"/authorized_keys   # 私钥与授权文件 600
+chmod 644 "$TARGET"/id_ed25519.pub                     # 公钥 644
+
+echo "=== 修正后 ==="
+stat -c '%a %n' "$TARGET" "$TARGET/id_ed25519" "$TARGET/authorized_keys" "$TARGET/id_ed25519.pub" 2>/dev/null || true
+EOF
+chmod +x fix-ssh-perms.sh
+
+# 造一个权限错乱的演示目录再运行
+mkdir -p bad && chmod 777 bad
+echo 'key' > bad/id_ed25519 && echo 'pub' > bad/id_ed25519.pub && echo 'auth' > bad/authorized_keys
+./fix-ssh-perms.sh bad
+```
+
+核心就是三条 chmod：目录 700、私钥与 authorized_keys 600、公钥 644，前后各打一次 `stat -c '%a'` 形成对比。
+
+**第 2 题：rsync 预演 + 实传**
+
+```bash
+# 预演（-n dry-run）：只打印将执行的动作，不改任何东西
+rsync -avzn --delete --exclude '*.map' dist/ web:/var/www/app/
+
+# 确认清单无误后实传
+rsync -avz --delete --exclude '*.map' dist/ web:/var/www/app/
+```
+
+要点：
+
+- 源 `dist/` 带**尾部斜杠** → 同步的是内容本身，直接铺进目标目录；
+- `--delete` 删除远端多余文件（镜像模式），所以必须先预演确认目标没错；
+- `--exclude '*.map'` 排除源码映射文件；
+- 首次建议只跑预演，配合 `--delete` 尤其不能跳过这一步（尾斜杠加 `--delete` 出错会清空目标）。
+
+**第 3 题：`-L` 隧道的数据路径**
+
+```text
+本地客户端(127.0.0.1:13306)
+      │
+      ▼ ① 本地 SSH 客户端监听 13306，把流量打包加密
+SSH 加密隧道（经 bastion 中转，走 22 端口）
+      ▼ ② bastion 上的 sshd 在隧道另一端解包
+      ▼ ③ 由 bastion 主动发起到 10.0.0.5:3306 的连接
+内网数据库 10.0.0.5:3306
+```
+
+即：**本地客户端 → 本机 13306（SSH 客户端加密）→ bastion（SSH 服务端解密并转发）→ 数据库 10.0.0.5:3306**。整条链路在本地与 bastion 之间是加密的，`-L` 的 L 表示"Local，监听在本地"。有了这个隧道，本地 GUI 工具连 `127.0.0.1:13306` 就等于直连内网数据库。
+
+**第 4 题：真机 rsync 增量观察**
+
+```bash
+# 第 1 步：生成密钥
+ssh-keygen -t ed25519 -C 'ada@laptop'
+# 第 2 步：部署公钥
+ssh-copy-id ada@203.0.113.10
+# 之后 ssh ada@203.0.113.10 免密直连
+
+# 第 2.5 步：写好 ~/.ssh/config 后 ssh web 直连
+# Host web
+#     HostName 203.0.113.10
+#     User ada
+
+# 第 3 步：第一次同步（先 -n 预演）
+rsync -avzn site/ web:/var/www/site/
+rsync -avz site/ web:/var/www/site/      # 第一次：全量传输
+
+# 第二次同步（内容几乎没变）
+rsync -avz site/ web:/var/www/site/      # 输出速度极快，传输量接近 0
+
+# 记录对比
+# 第一次同步：传输了几 MB（文件字节总数）
+# 第二次同步：sent 只有几十字节（只是校验信息），没传任何文件内容
+```
+
+第二次同步时 rsync 按块比对发现没有变化，传输量比第一次小到几乎为零（只剩目录项校验信息），这正是它"增量同步"的价值。记录方式：把两次输出的 `sent X bytes / received Y bytes` 记下来对比即可。
+</Answer>
 </Callout>

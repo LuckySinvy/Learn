@@ -83,6 +83,124 @@ def verify(answer, chunks, threshold=0.6):
 
 <Callout type="exercise" title="练习">
 构造一个会让模型「引用不存在编号」的问题，观察输出，然后实现边界校验逻辑，把非法编号过滤掉，再让模型在尾部补一句「部分依据无法定位」。
+
+<Answer>
+**参考答案：**
+
+**第一步：怎么诱发非法引用**
+
+模型编造编号最常见的两个诱因：
+
+1. **只给少量片段，却问一个需要多方面信息的问题**——模型觉得「这么复杂的问题应该有更多依据」，就凭空造出 `[4]`、`[5]`。
+2. **问题问的内容资料里根本没有**——模型不愿说「不知道」，于是编个答案再随手贴个编号充门面。
+
+```python
+chunks = [
+    {"text": "年假：满一年享 5 天。", "meta": {"source": "手册.pdf", "page": 3}},
+    {"text": "病假需提供医院证明。", "meta": {"source": "手册.pdf", "page": 5}},
+]   # 只有 2 段
+
+question = "请详细说明年假、病假、婚假、产假、陪产假的天数与申请流程，并分别注明依据。"
+answer = llm(build_prompt(question, chunks))
+print(answer)
+```
+
+**典型的翻车输出**
+
+```text
+年假满一年可享 5 天 [1]。病假需提供二级以上医院证明 [2]。
+婚假为 3 天 [3]，产假为 158 天 [4]，陪产假为 15 天 [5]。
+申请均需提前 3 个工作日在 OA 提交 [6]。
+```
+
+`[3]`–`[6]` 全是编的，而且天数看起来很合理（是模型从训练数据里记住的通用法规），这种**「格式正确、编号越界、内容似是而非」的输出最危险**——用户看到方括号会下意识以为有据可查。
+
+**第二步：边界校验与清洗**
+
+```python
+import re
+
+CITE_RE = re.compile(r"\[(\d+)\]")
+
+def sanitize_citations(answer: str, n_chunks: int):
+    """过滤越界引用编号，返回 (清洗后答案, 合法编号集合, 非法编号集合)"""
+    valid, invalid = set(), set()
+
+    def _repl(m):
+        idx = int(m.group(1))
+        if 1 <= idx <= n_chunks:
+            valid.add(idx)
+            return m.group(0)          # 合法，原样保留
+        invalid.add(idx)
+        return ""                      # 非法，直接抹掉
+
+    cleaned = CITE_RE.sub(_repl, answer)
+    cleaned = re.sub(r"\s+([。，、；）])", r"\1", cleaned)   # 清理残留空格
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+
+    if invalid:
+        cleaned += (f"\n\n> 注意：本回答中有 {len(invalid)} 处依据无法定位到已检索的资料"
+                    f"（涉及编号 {sorted(invalid)}），相关内容未经核实，请谨慎采信。")
+    return cleaned, valid, invalid
+
+
+cleaned, valid, invalid = sanitize_citations(answer, len(chunks))
+print(cleaned)
+print(f"\n合法引用: {sorted(valid)}  非法引用: {sorted(invalid)}")
+```
+
+**清洗后输出**
+
+```text
+年假满一年可享 5 天 [1]。病假需提供二级以上医院证明 [2]。
+婚假为 3 天，产假为 158 天，陪产假为 15 天。
+申请均需提前 3 个工作日在 OA 提交。
+
+> 注意：本回答中有 4 处依据无法定位到已检索的资料（涉及编号 [3, 4, 5, 6]），
+> 相关内容未经核实，请谨慎采信。
+
+合法引用: [1, 2]  非法引用: [3, 4, 5, 6]
+```
+
+**第三步：更进一步的三层防御**
+
+只做正则过滤是**最低要求**，因为它只删掉了编号，那句编造的内容还留在答案里。生产系统建议叠加三层：
+
+```python
+def answer_with_guard(question, chunks, max_retry=1):
+    n = len(chunks)
+
+    for attempt in range(max_retry + 1):
+        raw = llm(build_prompt(question, chunks))
+        cleaned, valid, invalid = sanitize_citations(raw, n)
+
+        # 第 1 层：无非法引用，直接通过
+        if not invalid:
+            break
+        # 第 2 层：有非法引用则回炉重造一次，把错误明确告诉模型
+        if attempt < max_retry:
+            feedback = (f"你上次的回答引用了不存在的编号 {sorted(invalid)}。"
+                        f"资料只有 [1] 到 [{n}]。请重写：只陈述资料中确实存在的内容，"
+                        f"资料未覆盖的部分明确说明「资料中未提及」，不要编造。")
+            question = f"{question}\n\n{feedback}"
+
+    # 第 3 层：无句子级引用的论断，标记为待核实
+    unsupported = [s for s in re.split(r"(?<=[。！？])", cleaned)
+                   if s.strip() and not CITE_RE.search(s)
+                   and not s.startswith(">")]
+    return cleaned, sorted(valid), sorted(invalid), unsupported
+```
+
+**四条实践经验**
+
+1. **校验必须在服务端做，不能只在前端隐藏。** 前端不渲染非法角标，但答案文本本身仍会被复制、被下游系统消费。清洗要发生在数据出口，而不是显示层。
+
+2. **重试时要把错误明确回传给模型。** 只说「重写一次」效果很差；把「你引用了不存在的 `[4]`，资料只有 1–2 段」直白告诉它，纠正成功率高得多。这本质上是第 20 章 Self-RAG 反思机制的一个轻量版本。
+
+3. **让 LLM 输出结构化 JSON 比解析纯文本更稳。** 用 `{"answer": ..., "citations": [1,2]}` 的结构，配合 JSON Schema / function calling 强制约束，能直接在 schema 层面限制取值范围，比事后正则可靠得多。
+
+4. **根本解法在检索侧。** 模型编引用，很多时候是因为**检索确实没给够资料**。与其在生成后打补丁，不如：召回不足时（比如重排分数普遍偏低）直接回复「知识库中未找到相关资料」；或者把「资料只有 N 段，不要引用超过 N 的编号」写进系统指令，从源头降低发生率。
+</Answer>
 </Callout>
 
 ## 小结

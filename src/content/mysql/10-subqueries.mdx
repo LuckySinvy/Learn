@@ -222,4 +222,168 @@ SELECT d FROM dates;
 1. 分别用 NOT EXISTS 和 LEFT JOIN 两种写法找出「从没被买过的商品」，用 EXPLAIN 对比执行计划。
 2. 用 CTE 分两步计算：每个分类的销售额（明细价 × 数量汇总），再筛出销售额最高的分类。
 3. 给 categories 加一层数据（如「手机」下加「旗舰机」「千元机」），用递归 CTE 打印从根到叶的完整路径。
+
+<Answer>
+**参考答案：**
+
+**1. 「从没被买过的商品」的两种写法**
+
+```sql
+-- 写法 A：NOT EXISTS（对 NULL 免疫，语义最直白）
+SELECT p.id, p.name, p.price
+FROM products p
+WHERE NOT EXISTS (
+  SELECT 1 FROM order_items oi WHERE oi.product_id = p.id
+);
+```
+
+```sql
+-- 写法 B：LEFT JOIN ... IS NULL（反连接）
+SELECT p.id, p.name, p.price
+FROM products p
+LEFT JOIN order_items oi ON oi.product_id = p.id
+WHERE oi.id IS NULL;
+```
+
+**为什么不推荐第三种写法 `NOT IN`**：
+
+```sql
+SELECT * FROM products
+WHERE id NOT IN (SELECT product_id FROM order_items);
+```
+
+只要 `order_items.product_id` 里出现**任何一个 NULL**，整个查询就返回**空集**。原因是三值逻辑：`x NOT IN (1, 2, NULL)` 展开为 `x != 1 AND x != 2 AND x != NULL`，最后一项恒为 UNKNOWN，整个 AND 表达式永远无法为 TRUE。本例中 `product_id` 是 NOT NULL 所以侥幸能跑对，但一旦哪天列约束放开就会静默出错——**「找没有」一律用 NOT EXISTS 或 LEFT JOIN IS NULL**。
+
+对比执行计划：
+
+```sql
+EXPLAIN FORMAT=TREE SELECT p.id FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.product_id = p.id);
+
+EXPLAIN FORMAT=TREE SELECT p.id FROM products p
+LEFT JOIN order_items oi ON oi.product_id = p.id WHERE oi.id IS NULL;
+```
+
+结论：**8.0 优化器通常把两者改写成同一个计划**——都会看到 `Nested loop antijoin`（反半连接）字样。这是 8.0 的 semijoin/antijoin 优化，会自动把 NOT EXISTS 转成 antijoin，所以「NOT EXISTS 一定比 JOIN 慢」是过时的老经验。
+
+关键前提是 `order_items.product_id` 上要有索引（示例库里的 `idx_product`），否则内层每次探测都要全表扫描。EXPLAIN 里应能看到 `oi` 表 `key = idx_product`、`type = ref`。
+
+**2. CTE 分两步算分类销售额**
+
+```sql
+WITH category_sales AS (
+  SELECT p.category_id,
+         SUM(oi.quantity * oi.price) AS sales_amount,
+         SUM(oi.quantity)            AS sales_qty
+  FROM order_items oi
+  JOIN products p ON p.id = oi.product_id
+  JOIN orders   o ON o.id = oi.order_id
+  WHERE o.status IN (1, 2, 3)        -- 只算真实成交，排除待支付和已取消
+  GROUP BY p.category_id
+)
+SELECT c.id, c.name, s.sales_qty, s.sales_amount
+FROM category_sales s
+JOIN categories c ON c.id = s.category_id
+ORDER BY s.sales_amount DESC
+LIMIT 1;
+```
+
+要点：
+
+- 金额必须用 `oi.quantity * oi.price`（明细里的**价格快照**），不能用 `products.price`——商品现价会变，历史订单金额不能跟着变。
+- `ORDER BY ... LIMIT 1` 在**并列最高**时只返回一条。想把并列的都取出来，用 CTE 再套一层：
+
+```sql
+WITH category_sales AS (
+  SELECT p.category_id, SUM(oi.quantity * oi.price) AS sales_amount
+  FROM order_items oi
+  JOIN products p ON p.id = oi.product_id
+  JOIN orders   o ON o.id = oi.order_id
+  WHERE o.status IN (1, 2, 3)
+  GROUP BY p.category_id
+)
+SELECT c.name, s.sales_amount
+FROM category_sales s
+JOIN categories c ON c.id = s.category_id
+WHERE s.sales_amount = (SELECT MAX(sales_amount) FROM category_sales);
+```
+
+这里正好体现了 CTE 相对派生表的优势：**`category_sales` 被引用了两次**（主查询 + 标量子查询），写成派生表就要把整段逻辑复制两遍。
+
+**3. 递归 CTE 打印完整路径**
+
+先加一层数据：
+
+```sql
+INSERT INTO categories (id, name, parent_id) VALUES
+  (6, '旗舰机', 2),
+  (7, '千元机', 2),
+  (8, '游戏本', 3);
+```
+
+从根节点向下遍历，累积路径：
+
+```sql
+WITH RECURSIVE category_tree AS (
+  -- 锚点：所有顶级分类（parent_id = 0）
+  SELECT id, name, parent_id,
+         1 AS depth,
+         CAST(name AS CHAR(500)) AS path
+  FROM categories
+  WHERE parent_id = 0
+
+  UNION ALL
+
+  -- 递归：用上一轮的结果去找子节点，路径不断拼接
+  SELECT c.id, c.name, c.parent_id,
+         t.depth + 1,
+         CONCAT(t.path, ' > ', c.name)
+  FROM categories c
+  JOIN category_tree t ON c.parent_id = t.id
+  WHERE t.depth < 10                  -- 防环兜底
+)
+SELECT id, depth, path
+FROM category_tree
+ORDER BY path;
+```
+
+输出：
+
+```text
++----+-------+------------------------------+
+| id | depth | path                         |
++----+-------+------------------------------+
+|  1 |     1 | 电子产品                      |
+|  3 |     2 | 电子产品 > 笔记本              |
+|  8 |     3 | 电子产品 > 笔记本 > 游戏本      |
+|  2 |     2 | 电子产品 > 手机                |
+|  6 |     3 | 电子产品 > 手机 > 旗舰机        |
+|  7 |     3 | 电子产品 > 手机 > 千元机        |
+|  4 |     1 | 图书                          |
+|  5 |     2 | 图书 > 技术书                  |
++----+-------+------------------------------+
+```
+
+只要叶子节点（没有任何子分类的）：
+
+```sql
+WITH RECURSIVE category_tree AS (
+  SELECT id, name, parent_id, 1 AS depth, CAST(name AS CHAR(500)) AS path
+  FROM categories WHERE parent_id = 0
+  UNION ALL
+  SELECT c.id, c.name, c.parent_id, t.depth + 1, CONCAT(t.path, ' > ', c.name)
+  FROM categories c JOIN category_tree t ON c.parent_id = t.id
+)
+SELECT t.path
+FROM category_tree t
+WHERE NOT EXISTS (SELECT 1 FROM categories c WHERE c.parent_id = t.id)
+ORDER BY t.path;
+```
+
+三个易错点：
+
+- **锚点里必须 `CAST(name AS CHAR(500))`**。递归 CTE 的列类型由锚点那一行决定，如果直接写 `name`（VARCHAR(50)），递归时 CONCAT 出的长路径会被**静默截断**或报 `Data too long`。给足长度是必须的。
+- 必须用 `UNION ALL` 而不是 `UNION`；后者每轮都要去重排序，性能差且在某些递归场景下语义不对。
+- 防环：数据里若存在 A→B→A 的环，递归永远停不下来。MySQL 有 `cte_max_recursion_depth`（默认 1000）兜底报错，但显式加 `WHERE t.depth < N` 更可控。
+</Answer>
 </Callout>

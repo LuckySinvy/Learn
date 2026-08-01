@@ -326,4 +326,87 @@ git branch -d feature/coupon
 2. 分别构造出 fast-forward 和三方合并两种场景，用 `git log --oneline --graph --all` 对比合并后的历史形状。
 3. 在能 fast-forward 的场景下用 `git merge --no-ff`，观察多出来的那个提交，并用 `git log -1 --format=%p` 查看它有几个父提交。
 4. 创建一个有独立提交的分支，尝试 `git branch -d` 删除它，读懂报错信息。然后把它合并到 main，再删一次，观察这次为什么放行了。
+
+<Answer>
+**参考答案：**
+
+**1. 分支文件 = 提交哈希**
+
+```bash
+git init -q
+echo a > app.txt && git add . && git commit -q -m "提交1"
+echo b >> app.txt && git add . && git commit -q -m "提交2"
+cat .git/refs/heads/main
+git log -1 --format=%H
+git switch -c feature/x
+cat .git/refs/heads/feature/x
+```
+
+`cat .git/refs/heads/main` 和 `git log -1 --format=%H` 输出的是同一个 40 位哈希——分支文件里存的就是它指向的提交哈希。"创建分支"实际发生的事情是：**在 `.git/refs/heads/` 下新建一个文件，把当前 HEAD 指向的提交哈希写进去**（和 main 一开始一模一样）。分支不复制文件、不复制历史，只是多了一个指向同一个提交的名字。
+
+**2. 两种合并的历史形状**
+
+Fast-forward（main 自分叉后没有新提交）：
+
+```bash
+git init -q
+echo base > a.txt && git add . && git commit -q -m "init"
+git switch -qc hotfix && echo f > fix.txt && git add . && git commit -q -m "fix"
+git switch -q main && git merge hotfix
+git log --oneline --graph --all
+```
+
+合并后是一条直线 `init → fix`，**没有新的合并提交**，main 指针直接快进。
+
+三方合并（两边都有新提交）：
+
+```bash
+git init -q
+echo base > a.txt && git add . && git commit -q -m "init"
+git switch -qc feature && echo f > feat.txt && git add . && git commit -q -m "feat"
+git switch -q main && echo m > main.txt && git add . && git commit -q -m "main work"
+git merge feature --no-edit
+git log --oneline --graph --all
+```
+
+历史出现分叉和合拢，`--graph` 里能看到 `*` 分叉线，**多了一个有两个父提交的合并提交 M**。
+
+**3. `--no-ff` 强制生成合并提交**
+
+```bash
+git init -q
+echo base > a.txt && git add . && git commit -q -m "init"
+git switch -qc feature && echo f > feat.txt && git add . && git commit -q -m "feat"
+git switch -q main
+git merge --no-ff feature --no-edit
+git log --oneline --graph --all
+git log -1 --format=%p
+```
+
+本来能快进，但 `--no-ff` 强制生成一个合并提交，图形上出现 `M` 气泡。`git log -1 --format=%p` 输出两个父提交的哈希（一个是 main 原本的提交，一个是 feature 的提交），证明它是一个真正的合并提交，而 feature 分支的历史也被保留在图上。
+
+**4. `-d` 的安全机制**
+
+```bash
+git switch -qc my-branch && echo x > x.txt && git add . && git commit -q -m "独立提交"
+git switch -q main
+git branch -d my-branch
+```
+
+第一次删除会报错，类似：
+
+```text
+error: The branch 'my-branch' is not fully merged.
+If you are sure you want to delete it, run 'git branch -D my-branch'.
+```
+
+含义是：`my-branch` 上有 main **没有包含**的提交（`git branch --no-merged main` 会列出它），直接删会丢掉这些提交，所以 `-d` 拒绝执行——这是保护机制。然后：
+
+```bash
+git merge --no-edit my-branch
+git branch -d my-branch
+```
+
+合并后 main 已包含该分支的全部提交（`git branch --merged main` 能列出它），`-d` 放行，干净删除。只有当分支上的提交已全部被当前分支包含时 `-d` 才会成功；确实想丢代码才用 `-D`。
+</Answer>
 </Callout>

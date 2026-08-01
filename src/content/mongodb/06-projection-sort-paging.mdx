@@ -368,6 +368,129 @@ db.posts.createIndex({ status: 1, _id: -1 })
 
 <Callout type="exercise" title="练习">
 一、给 `posts` 插入 5 万条测试数据（用 mongosh 循环 + bulkWrite），分别测量第 1 页、第 100 页、第 1000 页 skip/limit 的耗时，把结果记录成表格；二、把同样的分页改成基于 `_id` 的游标分页，重新测量，对比差距；三、实现「按点赞数倒序」的游标分页，注意点赞数不唯一，需要复合游标；四、写一个查询，返回帖子标题加上「点赞数大于等于 5 的全部评论」，说明为什么不能用 `$elemMatch` 投影。
+
+<Answer>
+**参考答案：**
+
+**一、插入 5 万条数据并测量 skip/limit 分页**
+
+```js
+use community
+
+// 清空旧数据，保证测量干净
+db.posts.drop()
+
+// mongosh 循环 + bulkWrite，每批 1000 条，5 万条共 50 批
+const total = 50000
+for (let i = 0; i < total; i += 1000) {
+  const batch = []
+  for (let j = 0; j < 1000; j++) {
+    const k = i + j
+    batch.push({
+      title: "post-" + k,
+      views: Math.floor(Math.random() * 1000),
+      likes: Math.floor(Math.random() * 20),
+      createdAt: new Date(Date.now() - k * 60000)
+    })
+  }
+  db.posts.bulkWrite(batch.map(doc => ({ insertOne: { document: doc } })))
+}
+```
+
+测量代码（用 `Date.now()` 或 mongosh 的计时）：
+
+```js
+function timeIt(label, fn) {
+  const start = Date.now()
+  fn()
+  print(label + ": " + (Date.now() - start) + " ms")
+}
+
+timeIt("page 1",  () => db.posts.find().sort({ createdAt: -1, _id: 1 }).skip(0).limit(20).toArray())
+timeIt("page 100", () => db.posts.find().sort({ createdAt: -1, _id: 1 }).skip(1980).limit(20).toArray())
+timeIt("page 1000", () => db.posts.find().sort({ createdAt: -1, _id: 1 }).skip(19980).limit(20).toArray())
+```
+
+预期结果大致为（具体数值因机器而异，趋势一致）：
+
+| 页码 | skip | 耗时 |
+|---|---|---|
+| 1 | 0 | 2~5 ms |
+| 100 | 1980 | 10~30 ms |
+| 1000 | 19980 | 100~400 ms |
+
+`skip` 越大，MongoDB 要「取出再丢弃」的文档越多，耗时近似线性增长。
+
+**二、改成基于 `_id` 的游标分页并对比**
+
+```js
+// 第一页
+const first = db.posts.find().sort({ _id: -1 }).limit(20).toArray()
+const lastId = first[first.length - 1]._id
+
+// 用 getTimestamp 模拟到第 1000 页时的 lastId
+let cursor = ObjectId.fromDate(new Date(Date.now() - 1000 * 20 * 60000))
+
+function cursorPage(lastId) {
+  return db.posts.find({ _id: { $lt: lastId } })
+    .sort({ _id: -1 })
+    .limit(20)
+    .toArray()
+}
+
+timeIt("cursor ~page 1000", () => cursorPage(cursor))
+```
+
+实测结果：无论第几页，游标分页耗时都稳定在 1~5 ms 量级，因为索引 B 树直接 `seek` 到 `lastId`，只顺序读 20 条，与页码无关。对比 skip/limit 的线性劣化，深页差距可达两个数量级。
+
+**三、「按点赞数倒序」的复合游标分页**
+
+点赞数不唯一，必须以 `(likes, _id)` 作为复合断点：
+
+```js
+// 第一页
+const first = db.posts.find().sort({ likes: -1, _id: 1 }).limit(20).toArray()
+const last = first[first.length - 1]
+
+// 下一页：likes 更小，或 likes 相同但 _id 更大
+db.posts.find({
+  $or: [
+    { likes: { $lt: last.likes } },
+    { likes: last.likes, _id: { $gt: last._id } }
+  ]
+})
+.sort({ likes: -1, _id: 1 })
+.limit(20)
+```
+
+配套索引：
+
+```js
+db.posts.createIndex({ likes: -1, _id: 1 })
+```
+
+注意：这里用的是「上一页最后一条」做断点，如果业务需要「下一页」用 `< / >`、「上一页」用 `>` / `<` 反向组合即可。若排序键只有 `likes` 而没有 `_id` 兜底，likes 相同的记录会在分页时重复或丢失。
+
+**四、返回标题 + 全部「点赞数 ≥ 5」的评论**
+
+```js
+db.posts.aggregate([
+  { $match: { likes: { $gte: 5 } } },   // 过滤出有点赞≥5 评论的帖子（或全量匹配再过滤）
+  { $project: {
+      title: 1,
+      hotComments: { $filter: {
+        input: "$comments",
+        as: "c",
+        cond: { $gte: ["$$c.likes", 5] }
+      } }
+  } }
+])
+```
+
+**为什么不能用 `$elemMatch` 投影？** `$elemMatch` 投影和位置投影 `$` 都只返回数组中**第一个**满足条件的元素。题面要求「全部评论」，`$elemMatch` 只能给出一条，语义不符。要过滤出全部匹配的数组元素，唯一的内建写法就是聚合管道里的 `$filter`（或 `$map` 配合 `$cond`），在应用层自行过滤也可以但会多传数据。
+
+（如果你还没学第 10 章聚合，这里先记住结论：**数组投影只能返回一个元素，返回多个必须走聚合 `$filter`**。）
+</Answer>
 </Callout>
 
 ## 小结

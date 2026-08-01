@@ -341,6 +341,51 @@ diff 算法在比较新旧两个列表时，需要回答一个问题：新列表
 一个 section 元素，class 为 box，里面有一个 h3 标题「用户」，和一个 ul，ul 里用 map 渲染了 users 数组，每项是一个带 key 的 li 显示用户名。
 
 重点思考：map 返回的数组作为 children 传入时，是一个参数还是多个参数？
+
+<Answer>
+**参考答案：**
+
+原 JSX 是这样：
+
+```tsx
+<section className="box">
+  <h3>用户</h3>
+  <ul>
+    {users.map((u) => (
+      <li key={u.id}>{u.name}</li>
+    ))}
+  </ul>
+</section>
+```
+
+编译后：
+
+```js
+React.createElement(
+  "section",
+  { className: "box" },
+  React.createElement("h3", null, "用户"),
+  React.createElement(
+    "ul",
+    null,
+    users.map((u) =>
+      React.createElement("li", { key: u.id }, u.name)
+    )
+  )
+);
+```
+
+**回答重点思考的问题：是「一个参数」。**
+
+`ul` 只收到了 **1 个 child 参数**，这个参数的值是一个**数组**。对比一下 `section`——它收到的是 2 个独立的 child 参数（`h3` 和 `ul`）。
+
+由此可以推出两个重要结论：
+
+1. **children 可以是嵌套数组，React 渲染时会自动展开。** 所以 `[<li/>, <li/>]` 和写两个并列的 `li` 渲染结果一样。
+2. **这正是数组项必须带 key 的原因。** 静态写出来的 children，位置在编译期就固定了，React 能靠「第几个参数」认出它；而数组的长度和顺序是运行时才确定的，React 没有任何静态信息可依赖，只能靠 key 来判断「新数组里的这一项，是旧数组里的哪一项」。
+
+另外注意 `key` 是写在 props 对象里传进去的，但 React 会把它**提取出来**作为元素的身份标识，不会真正出现在组件的 `props` 里——这就是「key 不是 prop」的由来。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：修复条件渲染">
@@ -349,18 +394,187 @@ diff 算法在比较新旧两个列表时，需要回答一个问题：新列表
 1. `{cart.length && <Badge count={cart.length} />}`
 2. `{user.name || <Anonymous />}`（当 name 为空字符串时的行为是否符合预期）
 3. `{isVip ? <VipTag /> : ""}`（有没有更好的写法）
+
+<Answer>
+**参考答案：**
+
+**第 1 行：购物车为空时会渲染出一个字符 `0`**
+
+`cart.length` 为 `0` 时，`0 && x` 的结果就是 `0`，而数字 `0` 是**会被渲染**的（只有 `null`、`undefined`、布尔值不渲染）。页面上会莫名多出一个「0」。
+
+```tsx
+// ❌ 空数组时渲染出 0
+{cart.length && <Badge count={cart.length} />}
+
+// ✅ 把左侧显式转成布尔值
+{cart.length > 0 && <Badge count={cart.length} />}
+
+// ✅ 或者用三元，右侧给 null
+{cart.length ? <Badge count={cart.length} /> : null}
+```
+
+这个 bug 的隐蔽性在于：开发时购物车里通常有东西，只有真实用户清空后才会暴露。
+
+**第 2 行：空字符串会走到「匿名」分支**
+
+`||` 判断的是**假值**，而 `""` 是假值，所以 `user.name` 为空字符串时会渲染 `<Anonymous />`。
+
+这**符不符合预期取决于你的意图**：
+
+- 如果意图是「名字没填就显示匿名」，那空字符串走匿名分支正好，`||` 没问题；
+- 如果意图是「只有字段缺失（`null` / `undefined`）才显示匿名，空字符串应原样显示」，那 `||` 就错了，应该用 `??`：
+
+```tsx
+// 只兜住 null / undefined，空字符串照常显示
+{user.name ?? <Anonymous />}
+```
+
+顺带一提，同样的坑还有数字 `0` 和布尔 `false`——用 `||` 兜底时它们都会被误判成「没值」。**默认值兜底优先用 `??`，只有在明确想把所有假值都当空处理时才用 `||`。**
+
+**第 3 行：能工作，但空字符串是不恰当的「什么都不渲染」**
+
+`""` 确实不会渲染出可见内容，但它语义不对——它表达的是「渲染一个空文本」，而不是「不渲染」。表示「无」应该用 `null`。
+
+```tsx
+// ⚠️ 能跑，但语义不清晰
+{isVip ? <VipTag /> : ""}
+
+// ✅ 单向显示直接用 &&，最简洁
+{isVip && <VipTag />}
+
+// ✅ 如果偏好三元，右侧写 null
+{isVip ? <VipTag /> : null}
+```
+
+这里用 `&&` 是安全的，因为 `isVip` 已经是布尔值，不存在第 1 行那种数字陷阱。**判断能否放心用 `&&` 的唯一标准就是：左侧是不是真正的布尔值。**
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：key 推理">
 列表初始为 `[{id:1,t:"A"},{id:2,t:"B"},{id:3,t:"C"}]`，每一项渲染成一个带独立输入框的组件。
 
 现在删除中间那项，变成 A、C 两项。请分别推理：用 `key={index}` 和用 `key={item.id}` 两种情况下，原来在 C 行输入框里的文字会显示在哪一行？为什么？
+
+<Answer>
+**参考答案：**
+
+先约定一下：假设用户在三个输入框里分别输入了 `"aa"`、`"bb"`、`"cc"`。这些文字保存在**组件实例的内部状态**里（或未受控输入框对应的真实 DOM 节点里），而不在 `items` 数组里——这是理解本题的关键。
+
+**情况一：`key={index}`**
+
+React 按 key（也就是位置下标）匹配：
+
+| key | 旧 | 新 | React 的判断 | 该实例里的输入内容 |
+|---|---|---|---|---|
+| 0 | A | A | 复用实例，props 不变 | `"aa"` 保留 |
+| 1 | B | C | **复用实例**，props 从 B 变成 C | `"bb"` 保留 |
+| 2 | C | 无 | **卸载** | `"cc"` 随实例销毁 |
+
+结果：
+
+- 原来 C 行输入框里的 `"cc"` **不会出现在任何地方，直接丢了**——因为承载它的是 key=2 的实例，而那个实例被卸载了。
+- 现在标题显示为 C 的那一行（key=1），输入框里是 `"bb"`——**原本属于 B 的内容跑到 C 行去了**。
+
+这就是典型的「文本对了，状态错位了」：React 认为 key=1 的元素一直存在，只是它的 `title` prop 从 B 变成了 C，所以只更新了文本，内部 state 原封不动地留下了。
+
+**情况二：`key={item.id}`**
+
+React 按 id 匹配，跟位置无关：
+
+| key | 旧 | 新 | React 的判断 | 该实例里的输入内容 |
+|---|---|---|---|---|
+| 1 | A | A | 复用 | `"aa"` |
+| 2 | B | 无 | 卸载 | `"bb"` 销毁 |
+| 3 | C | C | 复用，仅位置上移 | `"cc"` |
+
+结果：**`"cc"` 仍然显示在 C 那一行**，完全正确。被销毁的是 B 的实例，这也正是我们期望的——用户删掉的就是 B。
+
+**结论：**
+
+索引 key 表达的是「第几个」，稳定 id 表达的是「哪一个」。列表一旦发生增、删、排序，「第几个」就不再等于「哪一个」，所有跟实例绑定的东西（组件 state、未受控输入框内容、焦点、CSS 过渡、滚动位置）都会错位。
+
+只有当列表**永不排序、永不增删**（纯静态渲染）时，索引 key 才是安全的。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：扩展 Playground">
 在本章的 Playground 基础上，给 `render` 函数增加对布尔值和 null 的处理：当 child 是 `false` 或 `null` 时不输出任何内容。
 
 提示：需要扩展 `VChild` 的类型定义，并在 `render` 开头加上判断。改完后构造一棵包含条件子节点的树，验证输出正确。
+
+<Answer>
+**参考答案：**
+
+只要改两处：类型定义放宽，`render` 开头加两行提前返回。
+
+```ts
+// ① 类型放宽：条件渲染会产生 boolean / null
+type VChild = VNode | string | number | boolean | null;
+
+interface VNode {
+  type: string;
+  props: Record<string, string>;
+  children: VChild[];
+}
+
+function h(
+  type: string,
+  props: Record<string, string> | null,
+  ...children: VChild[]
+): VNode {
+  return { type: type, props: props === null ? {} : props, children: children };
+}
+
+function render(node: VChild): string {
+  // ② 这两类值不产生任何输出 —— 对应 React 的渲染规则
+  if (node === null) return "";
+  if (typeof node === "boolean") return "";
+
+  if (typeof node === "string") return node;
+  if (typeof node === "number") return String(node);
+
+  let attrs = "";
+  for (const key of Object.keys(node.props)) {
+    attrs += " " + key + '="' + node.props[key] + '"';
+  }
+
+  let inner = "";
+  for (const child of node.children) {
+    inner += render(child);
+  }
+
+  return "<" + node.type + attrs + ">" + inner + "</" + node.type + ">";
+}
+
+// ③ 构造一棵含条件子节点的树来验证
+const isVip = false;
+const cartCount = 0;
+
+const tree = h(
+  "div",
+  { class: "user" },
+  h("span", null, "张三"),
+  isVip ? h("b", null, "VIP") : null,      // null   -> 不输出
+  isVip && h("i", null, "尊享标记"),        // false  -> 不输出
+  cartCount > 0 ? h("em", null, cartCount) : null
+);
+
+console.log(render(tree));
+// <div class="user"><span>张三</span></div>
+
+// ④ 对照实验：故意踩一次「数字 0」的坑
+const bad = h("div", null, cartCount && h("em", null, "有商品"));
+console.log(render(bad));
+// <div>0</div>   <- 数字 0 被渲染出来了
+```
+
+**几点说明：**
+
+1. 顺序很重要。`typeof null` 的结果是 `"object"`，所以必须**先**单独判断 `node === null`，否则会掉进最后处理 `VNode` 的分支，访问 `node.props` 时直接抛错。
+2. `typeof node === "boolean"` 同时挡掉了 `true` 和 `false`。React 的行为也是如此——`true` 一样什么都不渲染。
+3. 最后那个对照实验复刻了本章 `<Callout type="warn">` 里讲的陷阱：`cartCount && ...` 在 `cartCount` 为 `0` 时返回数字 `0`，而 `0` **不在**我们的忽略名单里，于是被 `String(0)` 渲染成了字符 `"0"`。这几行代码就是那个 bug 的最小复现。
+4. 真实 React 还会忽略 `undefined`，并且会把**数组**类型的 child 递归展开（对应 `map` 的返回值）。想更完整的话，可以再加一句 `if (Array.isArray(node)) return node.map(render).join("")`，并把数组加进 `VChild` 的联合类型里。
+</Answer>
 </Callout>
 
 ## 小结

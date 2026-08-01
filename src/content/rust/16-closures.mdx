@@ -102,6 +102,129 @@ fn make_adder(n: i32) -> impl Fn(i32) -> i32 {
 
 <Callout type="exercise" title="练习">
 写一个 `fn apply_to_vec(v: Vec<i32>, f: impl Fn(i32) -> i32) -> Vec<i32>`，把 `f` 应用到每个元素（用迭代器）。用闭包 `|x| x * x` 与 `|x| x + 1` 各调一次。
+
+<Answer>
+**参考答案：**
+
+```rust
+fn apply_to_vec(v: Vec<i32>, f: impl Fn(i32) -> i32) -> Vec<i32> {
+    v.into_iter().map(f).collect()
+}
+
+fn main() {
+    let nums = vec![1, 2, 3, 4, 5];
+
+    let squared = apply_to_vec(nums.clone(), |x| x * x);
+    println!("平方：{:?}", squared);
+
+    let incremented = apply_to_vec(nums.clone(), |x| x + 1);
+    println!("加一：{:?}", incremented);
+
+    // 闭包可以捕获环境变量
+    let factor = 10;
+    let scaled = apply_to_vec(nums, move |x| x * factor);
+    println!("放大 {} 倍：{:?}", factor, scaled);
+}
+```
+
+**输出：**
+
+```text
+平方：[1, 4, 9, 16, 25]
+加一：[2, 3, 4, 5, 6]
+放大 10 倍：[10, 20, 30, 40, 50]
+```
+
+**关键点解析：**
+
+- **`into_iter()` vs `iter()`**：参数 `v: Vec<i32>` 已经取得了所有权，用 `into_iter()` 产出 `i32` 值（正好匹配 `Fn(i32) -> i32` 的签名）。如果用 `iter()`，产出的是 `&i32`，得写成 `.map(|x| f(*x))` 多一层解引用
+- **`.map(f)` 直接传函数**：不必写成 `.map(|x| f(x))`，因为 `f` 本身就是个可调用对象，签名恰好吻合
+- **`collect()` 靠返回类型推断**：它能收集成 `Vec`、`HashSet`、`String` 等多种类型，这里由函数返回类型 `Vec<i32>` 确定。若上下文不明确，需要写 `collect::<Vec<i32>>()`
+- **为什么要 `nums.clone()`**：`apply_to_vec` 取得 `Vec` 的所有权，第一次调用后 `nums` 就失效了。最后一次调用不需要 clone，因为之后不再使用
+
+**三种闭包 trait 该选哪个？**
+
+| trait | 捕获方式 | 能调用几次 | 何时使用 |
+|---|---|---|---|
+| `Fn` | 不可变借用 | 多次 | 只读环境，最常用 |
+| `FnMut` | 可变借用 | 多次 | 需要修改捕获的变量 |
+| `FnOnce` | 取得所有权 | 仅一次 | 会消耗捕获的值 |
+
+它们是**包含关系**：`Fn ⊂ FnMut ⊂ FnOnce`。所以参数约束**要选最宽松的那个**——写 `impl Fn` 的地方，`FnMut` 闭包传不进来。这里每个元素都要调一次 `f`，所以必须是 `Fn`（或 `FnMut`），`FnOnce` 不行。
+
+**需要 `FnMut` 的版本（闭包内部有状态）：**
+
+```rust
+fn apply_to_vec_mut(v: Vec<i32>, mut f: impl FnMut(i32) -> i32) -> Vec<i32> {
+    v.into_iter().map(|x| f(x)).collect()
+}
+
+fn main() {
+    let mut call_count = 0;
+    let result = apply_to_vec_mut(vec![1, 2, 3], |x| {
+        call_count += 1;      // 修改了捕获的变量 → 这是 FnMut
+        x * 2
+    });
+    println!("{:?}，共调用 {} 次", result, call_count);
+    // [2, 4, 6]，共调用 3 次
+}
+```
+
+注意参数要写 `mut f`，因为调用 `FnMut` 闭包需要可变借用它自己。
+
+**更通用的泛型版本：**
+
+限死 `i32` 有点浪费，用泛型可以支持任意类型转换：
+
+```rust
+fn apply_to_vec<T, U, F>(v: Vec<T>, f: F) -> Vec<U>
+where
+    F: Fn(T) -> U,
+{
+    v.into_iter().map(f).collect()
+}
+
+fn main() {
+    let nums = vec![1, 2, 3];
+
+    // i32 -> i32
+    println!("{:?}", apply_to_vec(nums.clone(), |x| x * x));
+
+    // i32 -> String（类型都变了）
+    println!("{:?}", apply_to_vec(nums.clone(), |x| format!("#{}", x)));
+
+    // i32 -> bool
+    println!("{:?}", apply_to_vec(nums, |x| x % 2 == 0));
+}
+```
+
+**输出：**
+
+```text
+[1, 4, 9]
+["#1", "#2", "#3"]
+[false, true, false]
+```
+
+这基本上就是标准库 `Iterator::map` 的签名了——直接用 `.map()` 通常比自己造轮子更好。
+
+**`move` 关键字什么时候必须加？**
+
+上面例子里 `move |x| x * factor` 其实可以省略 `move`，因为 `factor` 是 `i32`（实现了 `Copy`），借用也够用。但下面两种情况**必须**加：
+
+```rust
+// 1. 闭包要活得比捕获的变量久（如返回闭包）
+fn make_multiplier(n: i32) -> impl Fn(i32) -> i32 {
+    move |x| x * n      // 不加 move：n 是局部变量，函数返回后就没了
+}
+
+// 2. 跨线程传递（第 19 章会详讲）
+let data = vec![1, 2, 3];
+std::thread::spawn(move || {
+    println!("{:?}", data);   // 必须把所有权移进新线程
+});
+```
+</Answer>
 </Callout>
 
 ## 小结

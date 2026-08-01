@@ -94,6 +94,146 @@ fn main() {
 
 <Callout type="exercise" title="练习">
 用 `Rc<RefCell<Vec<i32>>>` 模拟共享可变列表：创建两个 `Rc` 克隆，从一个里 `borrow_mut().push` 添加元素，验证另一个也能看到变化。观察强引用计数。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::cell::RefCell;
+use std::rc::Rc;
+
+fn main() {
+    // 创建共享的可变列表
+    let shared: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(vec![1, 2, 3]));
+    println!("初始计数 = {}", Rc::strong_count(&shared));   // 1
+
+    // 创建两个克隆——只增加引用计数，不复制数据
+    let owner_a = Rc::clone(&shared);
+    let owner_b = Rc::clone(&shared);
+    println!("克隆后计数 = {}", Rc::strong_count(&shared)); // 3
+
+    println!("初始内容：{:?}", shared.borrow());
+
+    // 从 owner_a 修改
+    owner_a.borrow_mut().push(4);
+    println!("a 添加 4 后，b 看到：{:?}", owner_b.borrow());
+
+    // 从 owner_b 修改
+    owner_b.borrow_mut().push(5);
+    println!("b 添加 5 后，a 看到：{:?}", owner_a.borrow());
+
+    // 三个变量指向的是同一块数据
+    println!("shared 看到：{:?}", shared.borrow());
+
+    // 验证是同一个地址
+    println!("a 与 b 指向同一数据：{}", Rc::ptr_eq(&owner_a, &owner_b));
+
+    // 作用域结束时计数自动递减
+    {
+        let temp = Rc::clone(&shared);
+        println!("进入作用域后计数 = {}", Rc::strong_count(&shared));   // 4
+        temp.borrow_mut().push(6);
+    }   // temp 被 drop，计数 -1
+    println!("离开作用域后计数 = {}", Rc::strong_count(&shared));       // 3
+
+    println!("最终内容：{:?}", shared.borrow());
+}
+```
+
+**输出：**
+
+```text
+初始计数 = 1
+克隆后计数 = 3
+初始内容：[1, 2, 3]
+a 添加 4 后，b 看到：[1, 2, 3, 4]
+b 添加 5 后，a 看到：[1, 2, 3, 4, 5]
+shared 看到：[1, 2, 3, 4, 5]
+a 与 b 指向同一数据：true
+进入作用域后计数 = 4
+离开作用域后计数 = 3
+最终内容：[1, 2, 3, 4, 5, 6]
+```
+
+**为什么需要这个组合？**
+
+- **`Rc<T>` 解决「多个所有者」**：Rust 默认单一所有权，`Rc` 通过引用计数让多处共享同一份数据。但 `Rc` 只给出**不可变**访问
+- **`RefCell<T>` 解决「共享后还要能改」**：它把借用检查从编译期挪到运行时，于是即便你只持有 `&RefCell<T>`，也能拿到内部的 `&mut T`。这个能力叫**内部可变性（interior mutability）**
+
+两者叠加，`Rc<RefCell<T>>` 就得到了「多所有者 + 可变」。注意**顺序不能反**：`RefCell<Rc<T>>` 的含义是「可以换掉指向哪个 Rc」，完全是另一回事。
+
+**`Rc::clone(&x)` 而不是 `x.clone()`**
+
+功能上二者等价，但社区强烈推荐前者。因为 `x.clone()` 看起来像是深拷贝，而 `Rc::clone` 一眼就能看出「这只是计数 +1，开销极小」。这是一个纯粹为了**可读性**的约定。
+
+**运行时 panic 的陷阱**
+
+`RefCell` 的借用规则和编译期完全一样（多个不可变 XOR 一个可变），只是**违反时不是编译错误，而是运行时 panic**：
+
+```rust
+let cell = RefCell::new(vec![1, 2, 3]);
+
+let b1 = cell.borrow_mut();
+let b2 = cell.borrow_mut();   // 💥 panicked at 'already mutably borrowed: BorrowError'
+```
+
+一个更隐蔽的例子：
+
+```rust
+let shared = Rc::new(RefCell::new(vec![1, 2, 3]));
+
+// ❌ 危险：borrow() 的临时值在整个 for 语句期间都存活
+for x in shared.borrow().iter() {
+    shared.borrow_mut().push(*x);   // 💥 运行时 panic
+}
+```
+
+**正确做法** —— 让不可变借用尽早结束：
+
+```rust
+let items: Vec<i32> = shared.borrow().clone();   // 先复制出来，borrow 立刻释放
+for x in items {
+    shared.borrow_mut().push(x);
+}
+```
+
+**想避免 panic？用 `try_borrow`：**
+
+```rust
+match shared.try_borrow_mut() {
+    Ok(mut v) => v.push(7),
+    Err(_) => println!("当前已被借用，稍后再试"),
+}
+```
+
+**循环引用会导致内存泄漏**
+
+`Rc` 的计数永远归不了零，就不会释放：
+
+```rust
+use std::rc::{Rc, Weak};
+
+struct Node {
+    value: i32,
+    children: RefCell<Vec<Rc<Node>>>,
+    parent: RefCell<Weak<Node>>,   // 用 Weak 而非 Rc，打破循环
+}
+```
+
+`Weak<T>` 是**弱引用**，不增加强引用计数，通过 `upgrade()` 获取 `Option<Rc<T>>`（数据已释放时返回 `None`）。父子、双向链表这类结构，一个方向用 `Rc`、另一个方向用 `Weak`，就能避免泄漏。
+
+**多线程场景要换成 `Arc<Mutex<T>>`**
+
+`Rc` 和 `RefCell` **都不是线程安全的**——`Rc` 的计数不是原子操作，`RefCell` 的借用标记也没有同步保护。编译器会直接拒绝跨线程传递它们：
+
+| 单线程 | 多线程 | 说明 |
+|---|---|---|
+| `Rc<T>` | `Arc<T>` | 原子引用计数 |
+| `RefCell<T>` | `Mutex<T>` / `RwLock<T>` | 加锁而非运行时标记 |
+| `Rc<RefCell<T>>` | `Arc<Mutex<T>>` | 共享可变状态 |
+
+好在你不会写错——编译器通过 `Send`/`Sync` trait 在编译期就把这类错误拦下来了。第 20 章会详细展开。
+</Answer>
 </Callout>
 
 ## 小结

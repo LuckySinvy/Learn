@@ -89,6 +89,94 @@ await chain.invoke({ question: "..." });
 
 <Callout type="exercise" title="练习">
 为「中英术语互译」场景写一个 PromptTemplate，用 `partial` 固定目标语言，再串到模型上跑通。
+
+<Answer>
+**参考答案：**
+
+**完整实现**
+
+```ts
+import "dotenv/config";
+import { PromptTemplate } from "@langchain/core/prompts";
+import { ChatOpenAI } from "@langchain/openai";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+// 1) 基础模板：三个变量 domain / language / term
+const termTpl = PromptTemplate.fromTemplate(
+  `你是一名{domain}领域的术语翻译专家。
+请把下面的术语翻译成{language}，只输出译文本身，不要解释、不要加引号。
+如果该术语在业界有公认的固定译法，必须使用公认译法。
+
+术语：{term}`
+);
+
+// 2) 用 partial 固定「领域」和「目标语言」，得到两个专用模板
+const zh2en = await termTpl.partial({ domain: "计算机", language: "英语" });
+const en2zh = await termTpl.partial({ domain: "计算机", language: "简体中文" });
+
+// 3) 串上模型和解析器
+const model = new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 });
+const parser = new StringOutputParser();
+
+const zh2enChain = zh2en.pipe(model).pipe(parser);
+const en2zhChain = en2zh.pipe(model).pipe(parser);
+
+// 4) 跑通：调用时只需要传 term
+console.log(await zh2enChain.invoke({ term: "向量数据库" }));  // vector database
+console.log(await en2zhChain.invoke({ term: "embedding" }));   // 嵌入
+
+// 5) batch 批量翻译，并发执行
+const terms = ["检索增强生成", "提示词工程", "上下文窗口"];
+const results = await zh2enChain.batch(terms.map((term) => ({ term })));
+terms.forEach((t, i) => console.log(t + " → " + results[i]));
+```
+
+**要点解析**
+
+- **`partial` 返回新模板，不修改原模板**。`termTpl` 本身仍然需要三个变量，`zh2en` 只剩 `term` 一个。这正是「一个基础模板派生出多个专用模板」的用法，避免为每个语言方向复制一份 Prompt 文本。
+- **`partial` 是异步的**，必须 `await`。这是初学者最容易忘的一点——漏了 `await` 会拿到一个 Promise，接着 `.pipe()` 就会报「pipe is not a function」。
+- **`temperature: 0`**：术语翻译要求确定性，同一个词每次都该给同一个译法，不能让模型发挥。
+- **提示词里明确「只输出译文本身」**，否则模型常会画蛇添足地回「'向量数据库' 翻译成英文是 vector database」，给下游解析制造麻烦。
+
+**变体一：`partial` 支持传函数，做动态值**
+
+```ts
+const withDate = await termTpl.partial({
+  domain: "计算机",
+  language: "英语",
+  // 传函数则每次 format 时求值，适合时间戳等动态内容
+  term: () => new Date().toISOString(),
+});
+```
+
+**变体二：用 `ChatPromptTemplate` 分离系统提示与用户输入（更推荐）**
+
+把「角色与规则」放 system、「待翻译内容」放 human，语义更清晰，也更不容易被用户输入里的指令带偏：
+
+```ts
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+const chatTpl = ChatPromptTemplate.fromMessages([
+  ["system", "你是{domain}领域的术语翻译专家。把用户给出的术语翻译成{language}，只输出译文。"],
+  ["human", "{term}"],
+]);
+
+const enChain = (await chatTpl.partial({ domain: "计算机", language: "英语" }))
+  .pipe(model)
+  .pipe(parser);
+```
+
+**变体三：让目标语言在调用时动态决定**
+
+如果语言方向要运行时才知道，就**不要**用 `partial`，直接把 `language` 留作调用参数即可：
+
+```ts
+const dynamicChain = termTpl.pipe(model).pipe(parser);
+await dynamicChain.invoke({ domain: "医学", language: "日语", term: "免疫应答" });
+```
+
+`partial` 的适用判断标准很简单：**这个值在这条链的整个生命周期里是否恒定**。恒定就 `partial` 固定住，会变就留给 `invoke`。
+</Answer>
 </Callout>
 
 ## 小结

@@ -325,6 +325,146 @@ TypeScript 的泛型建立在结构化类型之上，所以 `Box<string>` 和 `{
 1. 写一个 `zip` 函数：接收两个数组，返回配对元组数组，签名为 `zip<A, B>(a: A[], b: B[]): [A, B][]`，长度取较短的那个。
 2. 实现泛型类 `Queue<T>`，包含 `enqueue`、`dequeue`、`isEmpty`，内部数组用 `#` 私有字段保护。
 3. 写一个 `groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]>`，返回分组后的元素数组，并用一组对象验证。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：zip**
+
+```ts
+function zip<A, B>(a: A[], b: B[]): [A, B][] {
+  const len = Math.min(a.length, b.length);
+  const out: [A, B][] = [];
+  for (let i = 0; i < len; i++) {
+    out.push([a[i], b[i]]);
+  }
+  return out;
+}
+
+const names = ["Ada", "Alan", "Grace"];
+const ages = [36, 41, 45, 99];          // 多出来的一项被丢弃
+
+const pairs = zip(names, ages);          // 推断为 [string, number][]
+for (const [name, age] of pairs) {
+  console.log(name + " " + age + " 岁");
+}
+// Ada 36 岁
+// Alan 41 岁
+// Grace 45 岁
+
+console.log(pairs.length);               // 3，取较短的长度
+```
+
+两个类型参数 `A`、`B` 把「输入数组元素类型」和「输出元组各位类型」关联了起来，所以解构出来的 `name` 直接就是 `string`、`age` 直接就是 `number`，不需要任何断言。这正是本章说的「泛型的价值在于建立多个位置之间的类型关联」。
+
+也可以用 `map` 写得更短：
+
+```ts
+function zip<A, B>(a: A[], b: B[]): [A, B][] {
+  return a.slice(0, Math.min(a.length, b.length)).map((v, i) => [v, b[i]]);
+}
+```
+
+注意 `.map((v, i) => [v, b[i]])` 默认会被推断成 `(A | B)[][]` 而不是元组，靠函数的返回类型注解 `[A, B][]` 才把它「拉」回元组类型。
+
+**第 2 题：泛型类 Queue**
+
+```ts
+class Queue<T> {
+  #items: T[] = [];
+
+  enqueue(item: T): void {
+    this.#items.push(item);      // 队尾入
+  }
+
+  dequeue(): T | undefined {
+    return this.#items.shift();  // 队首出
+  }
+
+  isEmpty(): boolean {
+    return this.#items.length === 0;
+  }
+
+  get size(): number {
+    return this.#items.length;
+  }
+}
+
+const q = new Queue<string>();
+console.log("初始为空? " + q.isEmpty());   // true
+
+q.enqueue("任务A");
+q.enqueue("任务B");
+q.enqueue("任务C");
+
+console.log("出队 = " + String(q.dequeue()));  // 任务A（先进先出）
+console.log("出队 = " + String(q.dequeue()));  // 任务B
+console.log("剩余 = " + q.size);                // 1
+console.log("为空? " + q.isEmpty());            // false
+
+// q.enqueue(123);   // 编译错误：类型 number 不能赋给 string
+```
+
+要点：
+
+- `dequeue` 返回 `T | undefined` 而不是 `T`：空队列时确实没有值可返回，类型必须诚实地反映这一点，调用方才会被迫处理空的情况。
+- 类型参数 `T` 贯穿 `#items`、`enqueue` 的参数、`dequeue` 的返回值三处，实例化成 `Queue<string>` 后这三处同时被锁定为 `string`。
+- 队列与栈的唯一区别是取元素的一端：栈用 `pop`（后进先出），队列用 `shift`（先进先出）。
+- 提醒一个本章的规则：**静态成员不能使用类的类型参数**，例如 `static empty: T[]` 会报错，因为静态成员属于类本身，而 `T` 要到实例化时才确定。
+
+**第 3 题：groupBy**
+
+```ts
+function groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]> {
+  const result = new Map<string, T[]>();
+  for (const item of items) {
+    const k = key(item);
+    const bucket = result.get(k);
+    if (bucket === undefined) {
+      result.set(k, [item]);
+    } else {
+      bucket.push(item);
+    }
+  }
+  return result;
+}
+
+interface Student {
+  name: string;
+  grade: number;
+  score: number;
+}
+
+const students: Student[] = [
+  { name: "Ada", grade: 1, score: 95 },
+  { name: "Alan", grade: 2, score: 88 },
+  { name: "Grace", grade: 1, score: 91 },
+  { name: "Linus", grade: 2, score: 76 },
+];
+
+// 按年级分组
+const byGrade = groupBy(students, (s) => "年级" + s.grade);
+for (const [k, group] of byGrade) {
+  console.log(k + ": " + group.map((s) => s.name).join("、"));
+}
+// 年级1: Ada、Grace
+// 年级2: Alan、Linus
+
+// 按成绩档位分组，同一个函数复用
+const byLevel = groupBy(students, (s) => (s.score >= 90 ? "优秀" : "合格"));
+for (const [k, group] of byLevel) {
+  console.log(k + " " + group.length + " 人");
+}
+// 优秀 2 人
+// 合格 2 人
+```
+
+要点：
+
+- `T` 出现在参数数组、回调参数、返回值的 `Map` 值类型里，四处关联。所以 `group.map((s) => s.name)` 里的 `s` 自动就是 `Student`，编辑器能正常补全 `.name`。
+- 用 `bucket === undefined` 判断而不是 `result.get(k) || []`：后者虽然也能工作，但每次都会新建数组再 `set` 一次，多一步无谓开销。
+- `key` 回调的返回类型固定为 `string`。想支持数字键或联合键，可以再加一个类型参数：`groupBy<T, K>(items: T[], key: (item: T) => K): Map<K, T[]>`，这是下一章「泛型约束」会自然延伸到的写法。
+</Answer>
 </Callout>
 
 ## 小结

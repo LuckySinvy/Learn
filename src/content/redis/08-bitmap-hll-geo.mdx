@@ -167,4 +167,226 @@ GeoHash 的原理是经纬度二分交替编码：把地球反复对半切，落
 1. 用 Bitmap 实现本月签到：签到 5 天，统计总签到数、查询某天是否签到、找出首次签到日。
 2. 向 HyperLogLog 写入 1 万个不同元素（脚本循环 PFADD），对比 PFCOUNT 估算值与真实值的误差百分比。
 3. GEOADD 写入 5 个门店坐标，实现"查找我 2 公里内最近的 3 家门店，返回距离"。
+
+<Answer>
+**参考答案：**
+
+**1. Bitmap 实现本月签到**
+
+约定：offset 用"日期 − 1"，即 8 月 1 日对应 bit 0，8 月 16 日对应 bit 15。
+
+```bash
+# ---- 用户 u1001 在 2026 年 8 月签到 5 天：1、3、4、10、16 号 ----
+127.0.0.1:6379> SETBIT signin:u1001:202608 0 1      # 8月1日
+(integer) 0                                          # 返回值是该位的"旧值"
+127.0.0.1:6379> SETBIT signin:u1001:202608 2 1      # 8月3日
+(integer) 0
+127.0.0.1:6379> SETBIT signin:u1001:202608 3 1      # 8月4日
+(integer) 0
+127.0.0.1:6379> SETBIT signin:u1001:202608 9 1      # 8月10日
+(integer) 0
+127.0.0.1:6379> SETBIT signin:u1001:202608 15 1     # 8月16日
+(integer) 0
+
+# 重复签到：返回 1 说明今天已经签过了
+127.0.0.1:6379> SETBIT signin:u1001:202608 0 1
+(integer) 1               # 用返回值判断"是否重复签到"，一条命令搞定
+
+# ---- 统计本月总签到天数 ----
+127.0.0.1:6379> BITCOUNT signin:u1001:202608
+(integer) 5
+
+# ---- 查询某天是否签到 ----
+127.0.0.1:6379> GETBIT signin:u1001:202608 2       # 8月3日
+(integer) 1               # 1 = 已签到
+127.0.0.1:6379> GETBIT signin:u1001:202608 4       # 8月5日
+(integer) 0               # 0 = 未签到
+
+# ---- 找出首次签到日：BITPOS 找第一个值为 1 的位 ----
+127.0.0.1:6379> BITPOS signin:u1001:202608 1
+(integer) 0               # offset 0 → 8月1日
+
+# 没有任何签到时返回 -1
+127.0.0.1:6379> BITPOS signin:u9999:202608 1
+(integer) -1
+
+# ---- 查看整月的 bit 串（占用字节数）----
+127.0.0.1:6379> STRLEN signin:u1001:202608
+(integer) 2               # 只要 2 字节就存下了 16 天的状态
+
+# ---- 设置过期，保留 1 年 ----
+127.0.0.1:6379> EXPIRE signin:u1001:202608 31536000
+(integer) 1
+```
+
+**扩展玩法**：
+
+```bash
+# 统计前 10 天签到几次（BITCOUNT 的 BIT 索引，Redis 7.0+）
+127.0.0.1:6379> BITCOUNT signin:u1001:202608 0 9 BIT
+(integer) 4
+
+# 找出第一个"未签到"的日子（断签日）
+127.0.0.1:6379> BITPOS signin:u1001:202608 0
+(integer) 1               # offset 1 → 8月2日没签
+
+# 连续两个月都签到的用户（BITOP AND 求交集）
+127.0.0.1:6379> BITOP AND result signin:u1001:202607 signin:u1001:202608
+(integer) 4
+```
+
+**为什么 Bitmap 这么省？** 一个月 31 天只需要 31 bit = 4 字节。存 1000 万用户一个月的签到数据，总共约 40 MB。如果用 Set 存每天的签到用户，每个用户 ID 至少几十字节，一个月下来是几 GB 量级——差了两个数量级。
+
+**使用注意**：
+
+- **offset 决定内存**：`SETBIT key 100000000 1` 会立刻分配 12.5 MB 内存（Redis 会把中间所有位补 0）。所以 offset 一定要是"从 0 开始的紧凑序号"，绝对不能直接拿用户 ID 当 offset——用户 ID 是 20 位数的话，一个 key 就能吃掉你所有内存
+- **按月分 key**：key 里带上年月，配合 TTL 自动清理，也避免单 key 无限增长
+- **Bitmap 本质是 String**：所以 `STRLEN`、`GETRANGE`、`SETRANGE` 都能用，`OBJECT ENCODING` 返回 `raw`
+
+**2. HyperLogLog 的误差验证**
+
+```bash
+127.0.0.1:6379> DEL hll:test
+(integer) 1
+
+# ---- 写入 1 万个不同元素 ----
+# 用 pipe 模式批量写入，比循环调用快几十倍
+for i in $(seq 1 10000); do echo "pfadd hll:test elem$i"; done | redis-cli --pipe
+All data transferred. Waiting for the last reply...
+Last reply received from server.
+errors: 0, replies: 10000
+
+# ---- 对比估算值与真实值 ----
+127.0.0.1:6379> PFCOUNT hll:test
+(integer) 10023           # 真实值 10000，估算值 10023
+
+# 误差 = |10023 - 10000| / 10000 = 0.23%
+
+# ---- 对照：用 Set 存同样的数据，看内存差距 ----
+for i in $(seq 1 10000); do echo "sadd set:test elem$i"; done | redis-cli --pipe
+127.0.0.1:6379> SCARD set:test
+(integer) 10000           # Set 是精确值
+
+127.0.0.1:6379> MEMORY USAGE hll:test
+(integer) 12304           # 约 12 KB，固定不变
+127.0.0.1:6379> MEMORY USAGE set:test
+(integer) 622160          # 约 608 KB，是 HLL 的 50 倍
+```
+
+不同数据量下的误差表现（实测值会略有波动）：
+
+| 真实基数 | PFCOUNT 估算 | 误差 | HLL 内存 | Set 内存 |
+|---|---|---|---|---|
+| 100 | 100 | 0% | ~200 B（稀疏编码） | ~7 KB |
+| 1,000 | 1,000 | 0% | ~1.5 KB | ~60 KB |
+| 10,000 | ~10,023 | ~0.2% | 12 KB | ~600 KB |
+| 1,000,000 | ~997,240 | ~0.28% | 12 KB | ~60 MB |
+| 100,000,000 | ~99,5xx,xxx | `<1%` | 12 KB | ~6 GB |
+
+关键观察：
+
+- **小基数时通常完全精确**：HLL 有稀疏（sparse）和稠密（dense）两种编码。元素少时用稀疏编码，实际是精确记录，内存也远小于 12 KB。超过 `hll-sparse-max-bytes`（默认 3000 字节）才转成稠密编码开始估算
+- **12 KB 是上限不是固定值**：稠密编码固定 12 KB（16384 个寄存器 × 6 bit），此后无论存 1 万还是 1 亿都不再增长
+- **标准误差 0.81%**：这是统计意义上的标准差，单次测量可能更准也可能更差，多做几次实验会看到误差在 0 到 2% 之间波动
+
+**合并多个 HLL（PFMERGE）**：
+
+```bash
+# 每天一个 HLL，合并出周 UV —— 这是 HLL 最有价值的能力
+127.0.0.1:6379> PFADD uv:20260801 u1 u2 u3
+(integer) 1
+127.0.0.1:6379> PFADD uv:20260802 u2 u3 u4
+(integer) 1
+127.0.0.1:6379> PFMERGE uv:week uv:20260801 uv:20260802
+OK
+127.0.0.1:6379> PFCOUNT uv:week
+(integer) 4               # 自动去重，u2/u3 只算一次
+
+# 也可以直接对多个 key 求并集基数，不落地中间结果
+127.0.0.1:6379> PFCOUNT uv:20260801 uv:20260802
+(integer) 4
+```
+
+用 Set 做同样的事需要 `SUNIONSTORE` 一个巨大的集合，内存和 CPU 都扛不住；HLL 合并永远只是 12 KB 对 12 KB 的位运算。
+
+**HLL 的硬限制**：**只能得到数量，无法列出成员，也无法判断某个元素是否存在**。如果业务上哪天需要"把昨天的 UV 用户捞出来发券"，HLL 就完全无能为力了。选型前一定要确认这个需求永远不会出现，否则要么用 Set，要么 HLL 和明细数据（如 Hive/ClickHouse）配合使用。
+
+**3. GEO 门店查询**
+
+```bash
+# ---- 写入 5 个门店坐标（经度 纬度 名称，注意经度在前）----
+127.0.0.1:6379> GEOADD shops:sh 121.4737 31.2304 "人民广场店" \
+                                121.5054 31.2453 "陆家嘴店" \
+                                121.4581 31.2222 "静安寺店" \
+                                121.4869 31.2397 "外滩店" \
+                                121.4214 31.1937 "徐家汇店"
+(integer) 5
+
+# ---- 查找我 2 公里内最近的 3 家门店，返回距离 ----
+# 假设我在 121.4700 31.2300（人民广场附近）
+127.0.0.1:6379> GEOSEARCH shops:sh FROMLONLAT 121.4700 31.2300 \
+                BYRADIUS 2 km ASC COUNT 3 WITHDIST
+1) 1) "人民广场店"
+   2) "0.3546"            # 距离，单位与 BYRADIUS 一致（km）
+2) 1) "外滩店"
+   2) "1.8123"
+3) 1) "静安寺店"
+   2) "1.9876"
+
+# 同时返回坐标
+127.0.0.1:6379> GEOSEARCH shops:sh FROMLONLAT 121.4700 31.2300 \
+                BYRADIUS 2 km ASC COUNT 3 WITHDIST WITHCOORD
+1) 1) "人民广场店"
+   2) "0.3546"
+   3) 1) "121.47370100021362"
+      2) "31.23040001"
+
+# ---- 以某个已有成员为中心搜索（比如"陆家嘴店附近还有哪些店"）----
+127.0.0.1:6379> GEOSEARCH shops:sh FROMMEMBER "陆家嘴店" BYRADIUS 3 km ASC WITHDIST
+1) 1) "陆家嘴店"
+   2) "0.0000"            # 自己也会被返回，业务侧要过滤掉
+2) 1) "外滩店"
+   2) "1.8654"
+
+# ---- 矩形范围搜索（适合地图视口内的门店）----
+127.0.0.1:6379> GEOSEARCH shops:sh FROMLONLAT 121.4700 31.2300 \
+                BYBOX 4 4 km ASC WITHDIST
+
+# ---- 其他常用命令 ----
+127.0.0.1:6379> GEODIST shops:sh "人民广场店" "陆家嘴店" km
+"3.2145"                  # 两点直线距离
+
+127.0.0.1:6379> GEOPOS shops:sh "外滩店"
+1) 1) "121.48690104484558"
+   2) "31.23970002"
+
+127.0.0.1:6379> GEOHASH shops:sh "外滩店"
+1) "wtw3sm0y0k0"          # 标准 GeoHash 字符串，可用于外部系统对接
+```
+
+关键参数说明：
+
+| 参数 | 作用 |
+|---|---|
+| `FROMLONLAT lon lat` | 以指定经纬度为中心 |
+| `FROMMEMBER m` | 以集合中某个成员为中心 |
+| `BYRADIUS r unit` | 圆形范围，unit 可为 `m`/`km`/`mi`/`ft` |
+| `BYBOX w h unit` | 矩形范围 |
+| `ASC` / `DESC` | 按距离由近到远 / 由远到近 |
+| `COUNT n` | 只返回前 n 个 |
+| `WITHDIST` | 返回距离 |
+| `WITHCOORD` | 返回经纬度 |
+| `WITHHASH` | 返回 52 位整数形式的 GeoHash |
+
+**必须注意的几点**：
+
+- **经度在前、纬度在后**：这是最容易搞错的地方。经度范围 ±180，纬度范围 ±85.05（墨卡托投影限制）。写反了会报 `invalid longitude,latitude pair` 或者查出完全错误的结果
+- **`ASC` + `COUNT` 才等于"最近的 N 个"**：只写 `COUNT 3` 不加 `ASC`，Redis 为了性能会在找到 3 个后就提前返回，这 3 个**不保证是最近的**。加了 `ASC` 后 Redis 会完整搜索再排序
+- **中心点自己会被返回**：用 `FROMMEMBER` 时距离为 0 的那条就是中心点本身，业务代码要过滤
+- **GEO 底层就是 ZSet**：`ZRANGE shops:sh 0 -1` 能看到所有成员，`ZREM` 可以删除门店（GEO 没有专门的删除命令）。`OBJECT ENCODING` 返回 `skiplist` 或 `listpack`
+- **`GEORADIUS` 已废弃**：Redis 6.2 起用 `GEOSEARCH` 替代，新代码不要再用旧命令
+- **精度约 0.5 米**：GeoHash 编码有损，对精度要求极高的场景（如高精地图）不适用
+
+**大 key 与分片问题**：全城几十万骑手放一个 GEO key 是典型大 key，且 Cluster 下无法拆分。实践中按城市或网格分 key（如 `riders:sh:grid:105`），查询时根据用户位置算出所在网格及相邻网格，并发查几个 key 再合并结果。同时避免大半径搜索——半径越大候选点越多，`GEOSEARCH` 在主线程做的计算量就越大。
+</Answer>
 </Callout>

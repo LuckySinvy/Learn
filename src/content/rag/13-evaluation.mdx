@@ -85,6 +85,84 @@ assert new["faithfulness"] >= baseline["faithfulness"] - 0.02
 
 <Callout type="exercise" title="练习">
 用你手头已有问答对，搭一个 10 条的最小 Ragas 数据集，跑一遍三个核心指标。挑分数最低的一项，它就是下一步优化重点。
+
+<Answer>
+**参考答案：**
+
+**完整脚本**
+
+```python
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy, context_precision
+
+questions = [
+    "试用期员工可以休年假吗？",
+    "年假最多能攒几年？",
+    # ... 共 10 条真实用户问题
+]
+references = [
+    "试用期不计入年假工龄，转正后方可申请。",
+    "当年年假最多跨年顺延 1 年，逾期作废。",
+    # ...
+]
+
+# 关键：answers 和 contexts 必须来自你真实的 RAG 管线，不能手写
+answers, contexts = [], []
+for q in questions:
+    chunks = my_rag.retrieve(q, k=5)
+    answers.append(my_rag.generate(q, chunks))
+    contexts.append([c["text"] for c in chunks])   # 注意是 list of list
+
+data = Dataset.from_dict({
+    "question":  questions,
+    "answer":    answers,
+    "contexts":  contexts,
+    "reference": references,
+})
+
+result = evaluate(
+    data,
+    metrics=[faithfulness, answer_relevancy, context_precision],
+)
+print(result)
+result.to_pandas().to_csv("eval_baseline.csv", index=False)
+```
+
+两个容易出错的地方：`contexts` 必须是**嵌套列表**（每条样本对应一个片段列表）；`answers` 必须是**管线真实产出**，手写理想答案就失去评估意义了。另外新版 Ragas 里 `context_relevancy` 已废弃，用 `context_precision` / `context_recall` 替代，实际以你安装的版本文档为准。
+
+**典型输出与诊断**
+
+```text
+{'faithfulness': 0.87, 'answer_relevancy': 0.91, 'context_precision': 0.54}
+```
+
+`context_precision` 明显最低 → **瓶颈在检索环节，而不是生成环节**。
+
+**这就是本练习最核心的方法论：先定位环节，再谈优化。**
+
+| 最低分指标 | 说明问题出在 | 优先尝试的手段 |
+|---|---|---|
+| **context_precision / recall 低** | 检索：召回了噪声，或该召回的没召回 | 调 `chunk_size`、加混合检索（第 9 章）、加重排（第 10 章）、换 Embedding（第 6 章） |
+| **faithfulness 低** | 生成：模型脱离资料自由发挥 | 强化 Prompt 约束「仅依据资料」、加引用要求（第 12 章）、降 temperature、上 Self-RAG（第 20 章） |
+| **answer_relevancy 低** | 生成：答非所问、绕圈子 | 明确输出格式要求、检查是否被无关上下文带偏、考虑查询改写（第 14 章） |
+
+**为什么必须先分环节？** 因为**检索差的时候，优化生成几乎没有意义**。如果召回的 5 段里只有 1 段相关，那再怎么调 Prompt，模型也变不出没给它的信息。反过来，如果 `context_precision` 有 0.9 而 `faithfulness` 只有 0.6，说明资料给对了但模型没好好用，这时去调 `chunk_size` 就是白费功夫。
+
+上面这个例子里，正确的下一步是**加重排**（第 10 章）——它是提升 `context_precision` 最直接、见效最快的手段。
+
+**几条实践建议**
+
+1. **10 条只够定位方向，不够做决策。** 单条样本的权重是 10%，一条异常就能让均值跳动，很容易把噪声当成改进。要做 A/B 判断至少 30–50 条。所以这个练习的产出是「知道该往哪个方向使劲」，而不是「确定某个参数最优」。
+
+2. **一定要看单条明细，不能只看均值。** `result.to_pandas()` 导出后按分数升序排，人工读最差的那 3 条——往往能立刻发现共性问题（比如「所有涉及时间的问题都答错」），这比盯着一个平均分有用得多。
+
+3. **把这次结果存成 baseline 文件。** 评估的价值在于**对比**，不在于绝对值。0.54 这个数字本身没有意义，「改了重排后从 0.54 涨到 0.78」才有意义。
+
+4. **裁判模型要固定。** 换了裁判 LLM（甚至同一模型换了版本）分数就不可比了，记得把裁判模型名和版本一起记录进 baseline。同时给裁判设 `temperature=0`，减少评分抖动。
+
+5. **别把 0.87 当成「87 分及格了」。** 这些是 LLM 打的相对分，不同语料之间横向比较毫无意义。只跟自己的历史版本比。
+</Answer>
 </Callout>
 
 ## 小结

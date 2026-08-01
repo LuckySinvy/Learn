@@ -443,16 +443,213 @@ const Dashboard = lazy(() => import("./pages/Dashboard"));
 
 <Callout type="exercise" title="练习 1：设计路由树">
 一个后台系统有：登录页（无外壳）、带侧边栏的首页、文章列表、文章详情（详情页内还有"评论"和"版本历史"两个 tab 子路由）。写出 `createBrowserRouter` 的嵌套配置，标出每层 `<Outlet />` 的位置，并说明访问 `/posts/9/comments` 时组件链是什么。
+
+<Answer>
+**参考答案：**
+
+登录页「无外壳」所以要和带外壳的后台路由平级、不嵌套在外壳内。外壳 `AdminLayout` 用 `<Outlet />` 把侧边栏之外的区域留给子路由；`PostDetail` 内部还有 tab 子路由，所以它自己也要一个 `<Outlet />` 放 tab 内容。
+
+```tsx
+const router = createBrowserRouter([
+  // 登录页：无外壳，独立顶层
+  { path: "/login", element: <Login /> },
+
+  // 后台外壳：侧边栏 + Outlet
+  {
+    path: "/",
+    element: <AdminLayout />,          // <-- Outlet 在这里（侧边栏旁边）
+    children: [
+      { index: true, element: <Home /> },
+      { path: "posts", element: <PostList /> },
+      {
+        path: "posts/:id",
+        element: <PostDetail />,        // <-- PostDetail 内部也有一个 Outlet（tab 内容区）
+        children: [
+          { index: true, element: <PostOverview /> }, // 默认 tab
+          { path: "comments", element: <Comments /> },
+          { path: "history", element: <VersionHistory /> },
+        ],
+      },
+    ],
+  },
+]);
+
+// AdminLayout
+function AdminLayout() {
+  return (
+    <div className="admin">
+      <Sidebar />
+      <main><Outlet /></main>      {/* 子路由渲染在这里 */}
+    </div>
+  );
+}
+
+// PostDetail
+function PostDetail() {
+  const { id } = useParams();
+  return (
+    <div>
+      <h1>文章 {id}</h1>
+      <TabBar tabs={["", "comments", "history"]} />
+      <Outlet />                    {/* tab 子路由渲染在这里 */}
+    </div>
+  );
+}
+```
+
+**访问 `/posts/9/comments` 时的组件链**（一条路径，不是单个组件）：
+
+```text
+AdminLayout > PostDetail > Comments
+```
+
+- `AdminLayout` 匹配 `/`，`PostDetail` 匹配 `posts/:id`（`id === "9"`，注意是字符串 `"9"`），`Comments` 匹配 `posts/:id` 下的 `comments` 子路由。
+- 因为是嵌套路由，`AdminLayout` 和 `PostDetail` 被复用，只有最里层的 `Comments` 是新挂的——侧边栏滚动位置、`PostDetail` 内的状态都保留，符合第 2 节「外层复用」的特性；若希望切不同 `id` 时 `PostDetail` 彻底重置，给它加 `key={id}`。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：扩展匹配器">
 给 Playground 1 的 `compile` 增加**可选段**支持：模式 `/files/:name?` 既能匹配 `/files` 也能匹配 `/files/a.txt`。再给 `score` 函数加上可选段的打分规则，说明它应该排在静态段和动态段的什么位置。
+
+<Answer>
+**参考答案：**
+
+**思路：** 可选段 `:name?` 的关键是「该段连同它前面的斜杠，整个可省略」。所以把它编译成 `(/([^/]+))?`——可选捕获组，匹配「空」或「/某段」；key 仍是 `name`，取值时去掉前导斜杠。
+
+```ts
+type Params = Record<string, string>;
+
+function compile(pattern: string): { regex: RegExp; keys: string[] } {
+  const keys: string[] = [];
+  const segments = pattern.split("/").filter((s) => s !== "");
+
+  const parts = segments.map((seg) => {
+    if (seg.startsWith(":")) {
+      const optional = seg.endsWith("?");
+      const name = optional ? seg.slice(1, -1) : seg.slice(1);
+      keys.push(name);
+      // 可选段：把 "/value" 整体设为可省；非可选段：必须有 1 段
+      return optional ? "(/([^/]+))?" : "([^/]+)";
+    }
+    return seg;
+  });
+
+  const source = "^" + parts.join("/") + "$";
+  return { regex: new RegExp(source), keys };
+}
+
+function match(pattern: string, path: string): Params | null {
+  const built = compile(pattern);
+  const m = path.match(built.regex);
+  if (m === null) return null;
+  const params: Params = {};
+  // 每个动态 key 对应的捕获组：可选段是 「(/xxx)」整体 + 内部「xxx」，取内部那组
+  let gi = 1;
+  built.keys.forEach((k) => {
+    const raw = m[gi];
+    gi += 1;
+    params[k] = raw === undefined ? "" : raw.replace(/^\//, "");   // 去掉前导斜杠
+  });
+  return params;
+}
+
+console.log(JSON.stringify(match("/files/:name?", "/files")));        // {}
+console.log(JSON.stringify(match("/files/:name?", "/files/a.txt"))); // {"name":"a.txt"}
+```
+
+（注意：真实场景多个可选段、可选段后还有普通段时，正则需要更小心地管理捕获组编号；上面的演示版对单个尾随可选段是正确的。）
+
+**`score` 打分规则：** 可选段比「必须存在一段」的动态段更宽松（它能匹配「少一段」的 URL），因此优先级应**低于动态段、高于通配段**：
+
+```ts
+function score(pattern: string): number {
+  return pattern.split("/").filter((s) => s !== "").reduce((sum, seg) => {
+    if (seg === "*") return sum + 1;                       // 通配：最宽松
+    if (seg.startsWith(":")) {
+      if (seg.endsWith("?")) return sum + 2;               // 可选段：比动态段松
+      return sum + 3;                                      // 动态段
+    }
+    return sum + 10;                                       // 静态段：最具体
+  }, 0);
+}
+```
+
+排序（从最具体到最宽松）：**静态段 (10) > 动态段 (3) > 可选段 (2) > 通配段 (1)**。
+
+这样 `/files/:name`（动态，score 3）和 `/files/:name?`（可选，score 2）都能匹配 `/files/a.txt` 时，动态段胜出拿到 `name="a.txt"`；而 `/files`（无尾段）只有可选段能匹配。这正符合直觉：能精确匹配 1 段的，不该被「允许省略」的版本抢走。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：判断 push 还是 replace">
 以下六个场景各该用 push 还是 replace，说明理由：点击导航菜单、搜索框输入联想、切换列表筛选、表单提交成功后跳详情、未登录被重定向到登录页、分页翻页。
+
+<Answer>
+**参考答案：**
+
+| 场景 | 用哪个 | 理由 |
+|---|---|---|
+| 点击导航菜单 | push | 每次进入一个页面都是有意义的步骤，用户期望后退能回到上一个菜单页 |
+| 搜索框输入联想 | replace | 输入是高频逐字符事件，push 会在历史里塞几十条记录、后退键被毁；replace 让当前条目原地更新（对应第 4 节「实时搜索用 replace」） |
+| 切换列表筛选 | push | 筛选是离散的、有意义的 URL 状态，用户期望能后退到上一个筛选结果（可分享、可后退） |
+| 表单提交成功后跳详情 | replace | 表单页已完成使命；若 push，后退会回到已提交的表单（可能重复提交、看到过期数据），replace 让后退直接回到表单之前的页面 |
+| 未登录被重定向到登录页 | replace | 与第 3 节例子同理：若 push，用户登录后按后退会回到「刚被踢走的受保护页」，又被踢回登录页，陷入循环 |
+| 分页翻页 | push | 每一页都是可后退的状态（Playground 3 里翻页用的就是 push），翻到第 3 页后按后退应回到第 2 页 |
+
+**判断口诀：** 问自己「这次导航是否对应一个用户想去/想回的独立页面状态」。有 → push；只是「原地刷新的过程量」（打字联想、被强制重定向、已完成的表单结果）→ replace。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：消除瀑布">
 现有代码：`Layout` 里 useEffect 拉取当前用户，`UserProfile` 里 useEffect 拉取用户详情，`PostList` 里再拉他的文章。画出三个请求的时间线，然后改写成 loader 方案，说明新时间线快在哪、快多少个 RTT。
+
+<Answer>
+**参考答案：**
+
+**当前 useEffect 瀑布（三个请求必须串行）：**
+
+```text
+时间 →
+
+Layout      [请求 A 当前用户 ────── 返回] → 渲染子组件
+UserProfile                 [请求 B 详情 ────── 返回] → 渲染子组件
+PostList                            [请求 C 文章 ────── 返回]
+            └─ 总耗时 ≈ 3 × RTT + 3 轮「渲染 → 发请求 → 渲染」的空转
+```
+
+原因：`Layout` 没拿到用户之前不知道渲染什么，`UserProfile` 不完成渲染它的 useEffect 不会运行，`PostList` 同理——请求被组件树的渲染顺序强制排成了一条链（第 16 章讲的瀑布缺陷）。
+
+**改写为 loader 方案：**
+
+```tsx
+{
+  path: "users/:id",
+  element: (
+    <Layout>
+      <UserProfile />
+      <PostList />
+    </Layout>
+  ),
+  loader: async ({ params }) => {
+    // 三个请求在导航阶段同时发出，完全并行
+    const [user, detail, posts] = await Promise.all([
+      fetch(`/api/me`).then((r) => r.json()),
+      fetch(`/api/users/${params.id}`).then((r) => r.json()),
+      fetch(`/api/users/${params.id}/posts`).then((r) => r.json()),
+    ]);
+    return { user, detail, posts };
+  },
+}
+```
+
+```text
+时间 →
+
+Layout      loader A ──────── 返回 ┐
+UserProfile loader B ──── 返回     ├─ 导航阶段同时发出
+PostList    loader C ──── 返回     ┘
+            └─ 总耗时 ≈ 1 个 RTT（取三者中最长那一个）
+```
+
+**快在哪：** 三个请求从「串行 3 个 RTT」变成「并行 1 个 RTT」，省下约 **2 个 RTT**；同时消除了组件「先渲染、再发请求、再渲染」的中间空转，数据没到之前停留在旧页面，也没有 loading 闪烁（可用 `useNavigation()` 显示顶部进度条）。组件里直接 `useLoaderData()` 取数据，不再有 loading 分支。
+</Answer>
 </Callout>

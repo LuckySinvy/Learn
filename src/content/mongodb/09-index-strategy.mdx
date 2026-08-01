@@ -398,6 +398,107 @@ db.posts.createIndex({ slug: 1 }, { unique: true })
 
 <Callout type="exercise" title="练习">
 一、给 `posts` 造 100 万条数据（status 三种值，authorId 随机 1000 个，createdAt 随机分布，views 随机）；二、先建 `{ status: 1, views: 1, createdAt: -1 }`，跑本章 3.1 的查询并记录 `totalKeysExamined` 与是否有 SORT 阶段；三、改成 ESR 顺序 `{ status: 1, createdAt: -1, views: 1 }`，重跑对比；四、设计一个覆盖索引让「列表页只返回 title 和 createdAt」的查询达到 `totalDocsExamined: 0`；五、用 `$indexStats` 找出使用次数为 0 的索引；六、把 `status` 从索引键改成部分索引条件，用 `db.posts.stats().indexSizes` 对比索引体积变化。
+
+<Answer>
+**参考答案：**
+
+**一、造 100 万条测试数据**
+
+```js
+use community
+db.posts.drop()
+
+const statuses = ["published", "draft", "deleted"]
+const N = 1000000
+
+// 每批 5000 条，用 bulkWrite 提速
+for (let i = 0; i < N; i += 5000) {
+  const batch = []
+  for (let j = 0; j < 5000; j++) {
+    const k = i + j
+    batch.push({
+      title: "post-" + k,
+      status: statuses[Math.floor(Math.random() * statuses.length)],
+      authorId: "user-" + Math.floor(Math.random() * 1000),
+      views: Math.floor(Math.random() * 10000),
+      createdAt: new Date(Date.now() - Math.random() * 365 * 24 * 3600 * 1000)
+    })
+  }
+  db.posts.bulkWrite(batch.map(doc => ({ insertOne: { document: doc } })))
+}
+```
+
+（如果嫌慢可以减小 N，关键是让数据量足以看出差距。）
+
+**二、先建 ERS 顺序索引并测量**
+
+```js
+db.posts.createIndex({ status: 1, views: 1, createdAt: -1 })
+
+db.posts.find({ status: "published", views: { $gt: 100 } })
+  .sort({ createdAt: -1 })
+  .limit(20)
+  .explain("executionStats")
+```
+
+记录到的结果特征：执行计划**带有 `SORT` 阶段**（在内存里给所有命中 views > 100 的文档排序），`totalKeysExamined` 通常达到几万到几十万。因为 views 是范围条件，区间内 createdAt 不连续有序，无法免排序。
+
+**三、改成 ESR 顺序并对比**
+
+```js
+db.posts.dropIndex({ status: 1, views: 1, createdAt: -1 })
+db.posts.createIndex({ status: 1, createdAt: -1, views: 1 })
+
+db.posts.find({ status: "published", views: { $gt: 100 } })
+  .sort({ createdAt: -1 })
+  .limit(20)
+  .explain("executionStats")
+```
+
+对比结果：**执行计划里 SORT 阶段消失**，变成 LIMIT → FETCH → IXSCAN；`totalKeysExamined` 大幅下降（如本章示例从 4.2 万降到 63）。因为 `status` 等值锁区间、`createdAt` 排序在前保证区间有序，views 范围放最后边扫边过滤。
+
+**四、覆盖索引让列表页 `totalDocsExamined: 0`**
+
+```js
+db.posts.createIndex({ status: 1, createdAt: -1, title: 1 })
+
+db.posts.find(
+  { status: "published" },
+  { title: 1, createdAt: 1, _id: 0 }   // 必须排除 _id
+).sort({ createdAt: -1 }).explain("executionStats")
+```
+
+`explain` 里应看到 `"stage": "PROJECTION_COVERED"`（或 `totalDocsExamined: 0`）——条件字段（status、createdAt）和投影字段（title、createdAt）全部在索引里，MongoDB 直接从索引返回，不读文档。注意：查询条件里如果没有 status 等值，需要 `{ createdAt: -1, title: 1 }` 这种更短的前缀索引来服务，且 **`_id` 必须显式排除**，否则覆盖失效。
+
+**五、用 `$indexStats` 找零使用索引**
+
+```js
+db.posts.aggregate([
+  { $indexStats: {} },
+  { $match: { accesses: { $ops: 0 } } },
+  { $project: { name: 1, accesses: 1 } }
+])
+```
+
+`$indexStats` 返回每个索引的访问次数，`accesses.ops` 为 0 说明上线以来从未被用过。结合业务判断：如果集合上线已久、该索引又非新建，基本可以 `dropIndex` 删除。
+
+**六、把 status 改成部分索引条件并对比体积**
+
+```js
+// 改造前：{ status: 1, createdAt: -1, title: 1 }
+db.posts.stats().indexSizes["status_1_createdAt_-1_title_1"]
+
+db.posts.dropIndex("status_1_createdAt_-1_title_1")
+db.posts.createIndex(
+  { createdAt: -1, title: 1 },
+  { partialFilterExpression: { status: "published" } }
+)
+
+db.posts.stats().indexSizes["createdAt_-1_title_1"]
+```
+
+对比前后 `indexSizes`：部分索引只给 published 的文档建条目（约 92% 的文档），键里也省掉了 status 字段，体积通常缩小 10% 上下；并且 draft/deleted 文档的更新不再维护该索引。注意配套查询必须带上 `status: "published"` 才能命中该部分索引（见第 8 章 5.1 节）。
+</Answer>
 </Callout>
 
 ## 小结

@@ -106,6 +106,58 @@ kubectl exec -it tmp -- sh
 
 <Callout type="exercise" title="练习">
 写一个 Pod YAML：镜像用 `nginx:1.27`，限制内存 128Mi、CPU 100m，容器端口 80。用 `kubectl apply -f` 创建，再用 `kubectl describe pod` 确认资源限制已生效，最后删除。
+
+<Answer>
+**参考答案：**
+
+保存为 `web-pod.yaml`：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27          # 固定版本，避免 latest 的不确定性
+      ports:
+        - containerPort: 80       # 声明容器监听端口
+      resources:
+        requests:                 # 调度保证
+          cpu: "100m"
+          memory: "128Mi"
+        limits:                   # 硬上限
+          cpu: "100m"
+          memory: "128Mi"
+```
+
+> 题面只要求"限制内存 128Mi、CPU 100m"，把 requests 和 limits 设为相同值是学习阶段最简单、也最不容易踩坑的写法。生产上通常 limits 会略高于 requests。
+
+然后依次执行：
+
+```bash
+# 创建
+kubectl apply -f web-pod.yaml
+
+# 确认资源限制已生效：看 Containers 段下的 Limits / Requests
+kubectl describe pod web
+# Limits:
+#   cpu:     100m
+#   memory:  128Mi
+# Requests:
+#   cpu:     100m
+#   memory:  128Mi
+
+# 查看 Pod 状态（Running 即成功）
+kubectl get pod web
+
+# 最后删除
+kubectl delete -f web-pod.yaml
+```
+
+**要点回顾：** `requests` 决定调度（Scheduler 据此找节点），`limits` 是硬上限（内存超出会被 OOMKill）；用 `describe` 看资源段即可确认配置生效。
+</Answer>
 </Callout>
 
 ## 小结

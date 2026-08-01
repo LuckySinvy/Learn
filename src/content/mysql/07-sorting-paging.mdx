@@ -181,4 +181,142 @@ LIMIT 20;
 1. 写出订单表「第 2 页、每页 2 条、按创建时间倒序」的三种实现：LIMIT OFFSET、延迟关联、游标分页。
 2. 造一张 100 万行的测试表（可用存储过程或 INSERT ... SELECT 自我复制），分别测试 OFFSET 0 与 OFFSET 900000 的耗时差异，再用游标分页对比。
 3. 用 `COUNT(DISTINCT user_id)` 统计 7 月份下过单的用户数。
+
+<Answer>
+**参考答案：**
+
+**1. 第 2 页、每页 2 条、按创建时间倒序的三种实现**
+
+```sql
+-- 方案一：LIMIT OFFSET（最直观）
+SELECT id, order_no, total_amount, created_at
+FROM orders
+ORDER BY created_at DESC, id DESC
+LIMIT 2 OFFSET 2;
+```
+
+```sql
+-- 方案二：延迟关联（子查询只在索引上翻页，定位到主键后再回表）
+SELECT o.id, o.order_no, o.total_amount, o.created_at
+FROM orders o
+JOIN (
+  SELECT id FROM orders
+  ORDER BY created_at DESC, id DESC
+  LIMIT 2 OFFSET 2
+) t ON o.id = t.id
+ORDER BY o.created_at DESC, o.id DESC;
+```
+
+```sql
+-- 方案三：游标分页
+-- 先取第 1 页，记下最后一行的 (created_at, id)
+SELECT id, order_no, total_amount, created_at
+FROM orders
+ORDER BY created_at DESC, id DESC
+LIMIT 2;
+-- 假设最后一行是 created_at = '2026-07-02 10:00:00', id = 2
+
+-- 第 2 页：用复合游标定位起点
+SELECT id, order_no, total_amount, created_at
+FROM orders
+WHERE created_at < '2026-07-02 10:00:00'
+   OR (created_at = '2026-07-02 10:00:00' AND id < 2)
+ORDER BY created_at DESC, id DESC
+LIMIT 2;
+```
+
+三点说明：
+
+- **排序键必须唯一**。`created_at` 可能重复，所以三种方案都补了 `, id DESC` 作为 tie-breaker。否则同一时间戳的行在翻页时顺序不稳定，会出现**某行重复出现在两页**或**被跳过**的经典 bug。
+- 方案二的外层 JOIN 之后**必须重新 ORDER BY**：JOIN 不保证保留子查询的顺序。
+- 方案三的复合游标条件也可以用行值比较简写（MySQL 支持，但优化器对索引的利用不如展开写法稳定）：
+
+```sql
+WHERE (created_at, id) < ('2026-07-02 10:00:00', 2)
+```
+
+**2. 百万行造数与深分页耗时对比**
+
+用「自我复制」倍增法造数最快，20 次翻倍即可从 1 行到 100 万行：
+
+```sql
+CREATE TABLE t_page (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_no   VARCHAR(32)     NOT NULL,
+  amount     DECIMAL(12,2)   NOT NULL DEFAULT 0,
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB;
+
+INSERT INTO t_page (order_no, amount) VALUES ('SEED', 1.00);
+
+-- 反复执行下面这条约 20 次，行数每次翻倍：1→2→4→…→1048576
+INSERT INTO t_page (order_no, amount, created_at)
+SELECT CONCAT('NO', LPAD(FLOOR(RAND()*100000000), 10, '0')),
+       ROUND(RAND() * 10000, 2),
+       DATE_ADD('2025-01-01', INTERVAL FLOOR(RAND() * 500) DAY)
+FROM t_page;
+```
+
+或者用存储过程（第 18 章语法）循环插入。造完后开启计时并对比：
+
+```sql
+SET profiling = 1;   -- 或直接看客户端输出的 (x.xx sec)
+
+SELECT * FROM t_page ORDER BY id LIMIT 20 OFFSET 0;
+-- 约 0.00 sec
+
+SELECT * FROM t_page ORDER BY id LIMIT 20 OFFSET 900000;
+-- 约 0.3 ~ 1.5 sec，慢了两三个数量级
+
+-- 延迟关联
+SELECT p.* FROM t_page p
+JOIN (SELECT id FROM t_page ORDER BY id LIMIT 20 OFFSET 900000) t
+  ON p.id = t.id;
+-- 明显快于直接 OFFSET（子查询走主键覆盖扫描，无回表）
+
+-- 游标分页
+SELECT * FROM t_page WHERE id > 900000 ORDER BY id LIMIT 20;
+-- 约 0.00 sec —— 和第一页一样快
+```
+
+**结论解读**：
+
+- `OFFSET 900000` 的真实动作是「**读出 900020 行、丢弃前 900000 行**」，OFFSET 不是「跳转」而是「读了再扔」，所以耗时随页码**线性恶化**。
+- 延迟关联把扫描的每一行从「整行」变成「只有主键的索引行」，扫描行数不变但单行成本大幅降低，通常快数倍。
+- 游标分页用 `WHERE id > ?` 直接在 B+ 树上**定位起点**，只读需要的 20 行，成本与页码**完全无关**。代价是无法随机跳页，因此产品形态要配合「下拉加载更多」。
+
+用 EXPLAIN 可以看到差异的根源：
+
+```sql
+EXPLAIN SELECT * FROM t_page ORDER BY id LIMIT 20 OFFSET 900000;
+-- rows: 900020   ← 预估要扫这么多行
+
+EXPLAIN SELECT * FROM t_page WHERE id > 900000 ORDER BY id LIMIT 20;
+-- rows: 20       ← 只扫 20 行
+```
+
+**3. 统计 7 月下单用户数**
+
+```sql
+SELECT COUNT(DISTINCT user_id) AS buyer_count
+FROM orders
+WHERE created_at >= '2026-07-01'
+  AND created_at <  '2026-08-01';
+```
+
+必须用**左闭右开**而不是 `BETWEEN '2026-07-01' AND '2026-07-31'`：后者的右端点被解析为 `2026-07-31 00:00:00`，会**丢掉 7 月 31 日全天**的订单。
+
+也别写成 `WHERE DATE_FORMAT(created_at, '%Y-%m') = '2026-07'` 或 `MONTH(created_at) = 7`——函数作用在列上会让 `created_at` 上的索引**彻底失效**，退化成全表扫描（第 13 章会详述）。
+
+如果只想统计真实付款用户，再叠加状态条件：
+
+```sql
+SELECT COUNT(DISTINCT user_id) AS paid_buyer_count
+FROM orders
+WHERE created_at >= '2026-07-01'
+  AND created_at <  '2026-08-01'
+  AND status IN (1, 2, 3);
+```
+</Answer>
 </Callout>

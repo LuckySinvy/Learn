@@ -110,6 +110,178 @@ io::stdout().write_all(b"hi\n")?;
 
 <Callout type="exercise" title="练习">
 写一个程序：读 `input.txt`（逐行用 `BufReader`），把每行加行号后写入 `output.txt`（用 `BufWriter`），统计总行数并打印。文件不存在时给出友好错误。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+
+fn number_lines(input_path: &str, output_path: &str) -> io::Result<usize> {
+    let input = File::open(input_path)?;
+    let reader = BufReader::new(input);
+
+    let output = File::create(output_path)?;
+    let mut writer = BufWriter::new(output);
+
+    let mut count = 0;
+
+    for (i, line) in reader.lines().enumerate() {
+        let line = line?;                            // 每行读取也可能失败
+        writeln!(writer, "{:>4} | {}", i + 1, line)?;
+        count += 1;
+    }
+
+    writer.flush()?;   // 确保缓冲区落盘
+    Ok(count)
+}
+
+fn main() {
+    // 先造一个测试文件
+    if let Err(e) = std::fs::write("input.txt", "第一行\n第二行\n第三行\n") {
+        eprintln!("创建测试文件失败：{}", e);
+        return;
+    }
+
+    match number_lines("input.txt", "output.txt") {
+        Ok(n) => {
+            println!("处理完成，共 {} 行", n);
+            if let Ok(content) = std::fs::read_to_string("output.txt") {
+                println!("--- output.txt ---");
+                print!("{}", content);
+            }
+        }
+        Err(e) => match e.kind() {
+            io::ErrorKind::NotFound => eprintln!("错误：找不到输入文件 input.txt"),
+            io::ErrorKind::PermissionDenied => eprintln!("错误：没有权限访问文件"),
+            _ => eprintln!("IO 错误：{}", e),
+        },
+    }
+
+    // 演示文件不存在时的友好提示
+    println!("\n--- 测试不存在的文件 ---");
+    match number_lines("不存在的文件.txt", "output2.txt") {
+        Ok(n) => println!("共 {} 行", n),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!("错误：找不到输入文件「不存在的文件.txt」，请检查路径");
+        }
+        Err(e) => eprintln!("IO 错误：{}", e),
+    }
+}
+```
+
+**输出：**
+
+```text
+处理完成，共 3 行
+--- output.txt ---
+   1 | 第一行
+   2 | 第二行
+   3 | 第三行
+
+--- 测试不存在的文件 ---
+错误：找不到输入文件「不存在的文件.txt」，请检查路径
+```
+
+**关键点解析：**
+
+- **`reader.lines()`**：来自 `BufRead` trait，产出 `Result<String, io::Error>` 的迭代器。**必须 `use std::io::BufRead`** 才能调用，忘记引入是最常见的报错原因
+- **`lines()` 会自动去掉换行符**（包括 Windows 的 `\r\n`），所以写回时要用 `writeln!` 补上
+- **`enumerate()` 从 0 开始**，所以行号要 `i + 1`
+- **`{:>4}`** 表示右对齐、宽度 4，让行号列整齐。`{:<4}` 是左对齐，`{:^4}` 是居中
+- **`writer.flush()` 不能省**：`BufWriter` 攒够一批才真正写盘。虽然它的 `Drop` 实现会尝试 flush，但**那时的错误会被静默忽略**。显式 flush 才能捕获「磁盘满」这类错误
+- **`e.kind()`**：返回 `ErrorKind` 枚举，可以据此区分错误类型给出针对性提示，比直接打印错误对象友好得多
+- **`eprintln!`**：输出到 stderr 而非 stdout。这样用户 `program > out.txt` 重定向时，错误信息仍会显示在终端
+
+**为什么要用 `BufReader` / `BufWriter`？**
+
+不加缓冲的话，每次 `read` / `write` 都是一次**系统调用**（涉及用户态到内核态切换，开销约几微秒）。缓冲层把数据先攒在内存里（默认 8KB），攒够一批再一次性交给内核：
+
+| 操作 | 无缓冲 | 有缓冲 |
+|---|---|---|
+| 读 100 万行 | 100 万次系统调用 | 约几千次 |
+| 性能差距 | 基准 | 通常快 10~100 倍 |
+
+**特别提醒：** 直接对裸 `File` 调用 `lines()` 是不行的——`File` 没有实现 `BufRead`，编译器会报错。这个设计是故意的，逼你意识到缓冲的存在。
+
+**如果不需要行号，还有更简洁的写法：**
+
+```rust
+use std::fs;
+
+fn main() -> io::Result<()> {
+    let content = fs::read_to_string("input.txt")?;
+    let numbered: String = content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| format!("{:>4} | {}\n", i + 1, line))
+        .collect();
+    fs::write("output.txt", numbered)?;
+    Ok(())
+}
+```
+
+**但要注意：** 这会把整个文件读进内存。处理几 GB 的日志文件时会直接吃光内存，而 `BufReader` 逐行处理的版本内存占用恒定，**无论文件多大都能处理**。这是选择哪种方案的核心判断依据。
+
+**关于 `main` 返回 `Result`**
+
+```rust
+fn main() -> io::Result<()> {
+    number_lines("input.txt", "output.txt")?;
+    Ok(())
+}
+```
+
+好处是能在顶层直接用 `?`，出错时进程以非零状态码退出。代价是错误信息用 `Debug` 格式打印，对最终用户不太友好。**做命令行工具时，建议还是手动 `match` 并给出人话提示**，就像本题答案那样。
+
+**追加模式与其他文件选项：**
+
+```rust
+use std::fs::OpenOptions;
+
+// 追加而非覆盖
+let file = OpenOptions::new()
+    .append(true)
+    .create(true)      // 不存在则创建
+    .open("log.txt")?;
+
+// 只在文件不存在时创建（已存在则报错，可用于避免覆盖）
+let file = OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open("new.txt")?;
+```
+
+**处理非 UTF-8 文件**
+
+`lines()` 遇到非法 UTF-8 会返回 `Err`。要读二进制或未知编码的文件，用字节接口：
+
+```rust
+use std::io::Read;
+
+let mut file = File::open("data.bin")?;
+let mut buffer = Vec::new();
+file.read_to_end(&mut buffer)?;      // 读成 Vec<u8>
+
+// 或者宽容地按 UTF-8 解释，非法字节用 U+FFFD 替换
+let text = String::from_utf8_lossy(&buffer);
+```
+
+**跨平台路径处理**
+
+不要手动拼字符串（`"dir" + "/" + "file"` 在 Windows 上会有问题），用 `PathBuf`：
+
+```rust
+use std::path::PathBuf;
+
+let mut path = PathBuf::from("logs");
+path.push("2026");
+path.push("app.log");        // logs/2026/app.log（Windows 上自动用反斜杠）
+
+std::fs::create_dir_all(path.parent().unwrap())?;   // 递归建目录
+```
+</Answer>
 </Callout>
 
 ## 小结

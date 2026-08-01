@@ -239,4 +239,115 @@ TRUNCATE TABLE order_items;  -- 清空：保留结构，重置自增，不可回
 1. 完整执行本章的五表 DDL，用 `SHOW CREATE TABLE orders\G` 检查结果。
 2. 给 products 表用 INSTANT 算法加一列 `sales_count INT UNSIGNED NOT NULL DEFAULT 0`，观察执行耗时。
 3. 开两个会话：会话 A 执行 `BEGIN; SELECT * FROM orders;` 不提交，会话 B 对 orders 执行 ALTER 加列，观察 B 被阻塞；再开会话 C 查询 orders，体会 MDL 连锁阻塞，最后在 A 里 COMMIT 解锁。
+
+<Answer>
+**参考答案：**
+
+**1. 执行五表 DDL 并检查**
+
+按本章「电商示例库完整 DDL」顺序执行（`users` → `categories` → `products` → `orders` → `order_items`，有外键时父表必须先建），然后：
+
+```sql
+SHOW CREATE TABLE orders\G
+```
+
+```text
+*************************** 1. row ***************************
+       Table: orders
+Create Table: CREATE TABLE `orders` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `order_no` varchar(32) NOT NULL,
+  `user_id` bigint unsigned NOT NULL,
+  `status` tinyint NOT NULL DEFAULT '0' COMMENT '0待支付 1已支付 2已发货 3完成 4取消',
+  `total_amount` decimal(12,2) NOT NULL DEFAULT '0.00',
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_order_no` (`order_no`),
+  KEY `idx_user_created` (`user_id`,`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='订单'
+```
+
+检查清单：`ENGINE=InnoDB`、`CHARSET=utf8mb4`、主键存在、`uk_order_no` 是 UNIQUE、`idx_user_created` 是 `(user_id, created_at)` 两列的联合索引（不是两个单列索引）。注意 `\G` 是 mysql 客户端命令，在图形客户端/Playground 里要去掉它、改用普通分号。
+
+**2. INSTANT 加列**
+
+```sql
+ALTER TABLE products
+  ADD COLUMN sales_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '销量',
+  ALGORITHM = INSTANT;
+```
+
+```text
+Query OK, 0 rows affected (0.01 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+```
+
+关键观察点：
+
+- **`0 rows affected` 且耗时接近 0** —— 这就是 INSTANT 的标志：只改了数据字典里的元数据，**一行数据都没动**。对比 COPY 算法会输出 `Records: N`（N = 表行数）并耗时随数据量线性增长。
+- 显式写 `ALGORITHM = INSTANT` 的价值在于：如果这个操作不支持 INSTANT，MySQL 会**直接报错**而不是默默降级成 COPY 把大表锁住：
+
+```text
+ERROR 1845 (0A000): ALGORITHM=INSTANT is not supported for this operation.
+Try ALGORITHM=COPY/INPLACE.
+```
+
+INSTANT 支持的操作有限，主要是：在**表末尾**加列、改列默认值、改列注释、重命名表、扩展 VARCHAR 长度（仅在不改变长度字节数的前提下）。而加索引、改列类型、加 NOT NULL 约束都不支持。想验证已加的列可用 `ALTER TABLE ... ADD COLUMN ... AFTER xxx` 试一下——指定位置就不能 INSTANT 了（8.0.29 前）。
+
+查看实例已累计的 instant 列数量：
+
+```sql
+SELECT NAME, INSTANT_COLS FROM information_schema.INNODB_TABLES
+WHERE NAME LIKE 'shop/products';
+```
+
+**3. MDL 连锁阻塞实验**
+
+三个会话按顺序操作：
+
+```sql
+-- 会话 A：开启事务并读表，不提交 → 持有 orders 的 MDL 读锁
+BEGIN;
+SELECT * FROM orders LIMIT 1;
+-- 停在这里，不要 COMMIT
+
+-- 会话 B：执行 DDL → 需要 MDL 写锁，与 A 的读锁冲突，被阻塞
+ALTER TABLE orders ADD COLUMN remark VARCHAR(200) NOT NULL DEFAULT '';
+-- 挂起
+
+-- 会话 C：一条最普通的 SELECT → 也被挂起！
+SELECT COUNT(*) FROM orders;
+-- 挂起
+```
+
+**这就是本章那条警告的真身**：C 只是要个 MDL 读锁，本该和 A 的读锁兼容，但 MDL 的等待队列是 **FIFO 且不允许插队**的——B 的写锁排在 C 前面，C 只能跟着一起等。于是一个未提交的小事务 + 一个 DDL，就能让整张表的**所有**请求（包括纯读）雪崩式挂起。
+
+在第四个会话里观察现场：
+
+```sql
+SHOW PROCESSLIST;
+-- B 的 State: Waiting for table metadata lock
+-- C 的 State: Waiting for table metadata lock
+
+-- 8.0 更精确的定位方式：直接看谁持有、谁在等
+SELECT object_name, lock_type, lock_status, owner_thread_id
+FROM performance_schema.metadata_locks
+WHERE object_schema = 'shop' AND object_name = 'orders';
+-- 持有者 lock_status = GRANTED，等待者 = PENDING
+```
+
+解锁：
+
+```sql
+-- 会话 A：
+COMMIT;
+-- 此时 B 立刻完成 ALTER，随后 C 也返回
+```
+
+**生产防护措施**（面试高频）：
+
+1. 大表 DDL 前先 `SHOW PROCESSLIST` / 查 `information_schema.innodb_trx` 确认没有长事务；
+2. 设置 `SET lock_wait_timeout = 5;`，让 DDL 拿不到 MDL 时**快速失败**而不是无限期堵塞整张表；
+3. 超大表用 `gh-ost` 或 `pt-online-schema-change`，把长时间的元数据锁窗口压缩到最后一次极短的表切换。
+</Answer>
 </Callout>

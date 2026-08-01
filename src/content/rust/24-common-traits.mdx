@@ -118,6 +118,220 @@ struct Rank { v: u32 }
 
 <Callout type="exercise" title="练习">
 定义 `struct Temperature { kelvin: f64 }`，实现 `From<f64>`（视为摄氏度转开尔文），并 `derive(Debug, Clone, PartialEq)`。写一个把 `Vec<f64>` 用 `into()` 转成 `Vec<Temperature>` 的小例子。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+struct Temperature {
+    kelvin: f64,
+}
+
+// 从摄氏度构造：K = °C + 273.15
+impl From<f64> for Temperature {
+    fn from(celsius: f64) -> Self {
+        Temperature {
+            kelvin: celsius + 273.15,
+        }
+    }
+}
+
+impl Temperature {
+    fn celsius(&self) -> f64 {
+        self.kelvin - 273.15
+    }
+
+    fn fahrenheit(&self) -> f64 {
+        self.celsius() * 9.0 / 5.0 + 32.0
+    }
+}
+
+// Display 必须手写，面向用户展示
+impl fmt::Display for Temperature {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:.2}K ({:.1}°C)", self.kelvin, self.celsius())
+    }
+}
+
+fn main() {
+    // 单个转换的三种等价写法
+    let t1 = Temperature::from(25.0);
+    let t2: Temperature = 25.0.into();
+    let t3: Temperature = (25.0_f64).into();
+
+    println!("{:?}", t1);
+    println!("{}", t2);
+    println!("三者相等：{}", t1 == t2 && t2 == t3);
+
+    // 批量转换 Vec<f64> -> Vec<Temperature>
+    let celsius_values: Vec<f64> = vec![-40.0, 0.0, 25.0, 100.0];
+
+    let temps: Vec<Temperature> = celsius_values
+        .iter()
+        .map(|&c| c.into())
+        .collect();
+
+    println!("\n温度列表：");
+    for t in &temps {
+        println!("  {}  = {:.1}°F", t, t.fahrenheit());
+    }
+
+    // PartialEq 让 == 和 contains 可用
+    println!("\n包含 0°C 吗？{}", temps.contains(&Temperature::from(0.0)));
+
+    // Clone 让我们能复制一份
+    let backup = temps.clone();
+    println!("备份长度 = {}", backup.len());
+}
+```
+
+**输出：**
+
+```text
+Temperature { kelvin: 298.15 }
+298.15K (25.0°C)
+三者相等：true
+
+温度列表：
+  233.15K (-40.0°C)  = -40.0°F
+  273.15K (0.0°C)  = 32.0°F
+  298.15K (25.0°C)  = 77.0°F
+  373.15K (100.0°C)  = 212.0°F
+
+包含 0°C 吗？true
+备份长度 = 4
+```
+
+**批量转换的三种写法：**
+
+```rust
+// 1. 显式调用 from
+let temps: Vec<Temperature> = celsius_values.iter().map(|&c| Temperature::from(c)).collect();
+
+// 2. 用 into（依赖返回类型推断）
+let temps: Vec<Temperature> = celsius_values.iter().map(|&c| c.into()).collect();
+
+// 3. 直接把 from 当函数传（最简洁）
+let temps: Vec<Temperature> = celsius_values.into_iter().map(Temperature::from).collect();
+```
+
+第三种写法尤其地道——`Temperature::from` 本身就是一个 `fn(f64) -> Temperature`，签名恰好匹配 `map` 的要求，连闭包都省了。
+
+**为什么只实现 `From` 就自动有了 `Into`？**
+
+标准库里有这样一条**泛型兜底实现（blanket impl）**：
+
+```rust
+impl<T, U> Into<U> for T
+where
+    U: From<T>,
+{
+    fn into(self) -> U {
+        U::from(self)
+    }
+}
+```
+
+任何满足 `U: From<T>` 的组合，都自动获得 `T: Into<U>`。所以**永远只实现 `From`，不要手写 `Into`**——手写反而会因为冲突而编译失败。
+
+**`From` 和 `Into` 在什么场合各自更好用？**
+
+```rust
+// 定义时：实现 From
+impl From<f64> for Temperature { /* ... */ }
+
+// 函数签名里：用 Into 作约束，调用方更灵活
+fn record(t: impl Into<Temperature>) {
+    let t = t.into();
+    println!("{}", t);
+}
+
+fn main() {
+    record(25.0);                        // 传 f64
+    record(Temperature::from(30.0));     // 传 Temperature 也行（T: From<T> 恒成立）
+}
+```
+
+**`?` 运算符的错误转换也走 `From`**
+
+这是 `From` 最重要的隐藏用途：
+
+```rust
+#[derive(Debug)]
+enum AppError {
+    Parse(std::num::ParseIntError),
+    Io(std::io::Error),
+}
+
+impl From<std::num::ParseIntError> for AppError {
+    fn from(e: std::num::ParseIntError) -> Self {
+        AppError::Parse(e)
+    }
+}
+
+fn parse(s: &str) -> Result<i32, AppError> {
+    let n = s.parse::<i32>()?;   // ParseIntError 自动经 From 变成 AppError
+    Ok(n * 2)
+}
+```
+
+只要实现了 `From`，`?` 就会自动帮你转换错误类型——这就是第 12 章那些代码能如此简洁的底层原因。
+
+**关于 `derive` 的几个注意事项：**
+
+- **`PartialEq` 而非 `Eq`**：`f64` 没有实现 `Eq`（因为 `NaN != NaN` 违反自反性），所以含浮点字段的结构体只能 derive `PartialEq`。同理只能有 `PartialOrd`，不能有 `Ord`
+- **不能 derive `Copy`**：本例其实可以（`f64` 是 `Copy`），加上 `Copy` 后赋值不再 move，用起来更方便。但如果将来给结构体加了 `String` 字段就得移除，属于破坏性变更，所以要谨慎
+- **`derive` 会给所有字段加约束**：`#[derive(Clone)]` 生成的实现要求**每个字段**都是 `Clone`。泛型结构体尤其要注意这点
+
+**浮点比较的坑：**
+
+```rust
+let a = Temperature::from(0.1 + 0.2);
+let b = Temperature::from(0.3);
+println!("{}", a == b);   // false！浮点精度误差
+```
+
+严谨的做法是比较差值是否小于容差，而不是直接 `==`：
+
+```rust
+impl Temperature {
+    fn approx_eq(&self, other: &Temperature) -> bool {
+        (self.kelvin - other.kelvin).abs() < 1e-9
+    }
+}
+```
+
+**`TryFrom`：可能失败的转换**
+
+开尔文温度不能为负（低于绝对零度），用 `TryFrom` 表达这种约束：
+
+```rust
+use std::convert::TryFrom;
+
+impl TryFrom<f64> for Temperature {
+    type Error = String;
+
+    fn try_from(celsius: f64) -> Result<Self, Self::Error> {
+        let kelvin = celsius + 273.15;
+        if kelvin < 0.0 {
+            Err(format!("{}°C 低于绝对零度", celsius))
+        } else {
+            Ok(Temperature { kelvin })
+        }
+    }
+}
+
+fn main() {
+    println!("{:?}", Temperature::try_from(25.0));    // Ok(...)
+    println!("{:?}", Temperature::try_from(-300.0));  // Err("-300°C 低于绝对零度")
+}
+```
+
+**选择原则：转换永不失败用 `From`，可能失败用 `TryFrom`。** 数值缩窄转换（如 `i64 → i32`）就是标准库里用 `TryFrom` 的典型例子。
+</Answer>
 </Callout>
 
 ## 小结

@@ -442,6 +442,120 @@ GROUP BY country;
 2. 分别用 `FINAL`、`argMax`、`LIMIT 1 BY` 三种方式查询去重结果，用 `SET send_logs_level='trace'` 或对比 Elapsed，看哪种最快。
 3. 给表加 `is_deleted` 列，插入一条 `is_deleted = 1` 的行"删除"某订单，验证 `SELECT ... FINAL` 里它消失了。
 4. 用 CollapsingMergeTree 重建一张 `order_stats`，写入一组 `+1` / `-1` 行，在**不执行 OPTIMIZE** 的情况下用 `sum(amount * sign)` 查询，验证结果已经正确——体会它和 Replacing 的本质区别。
+
+<Answer>
+**参考答案：**
+
+1. ReplacingMergeTree 的去重时机：
+
+```sql
+CREATE TABLE orders
+(
+    order_id   UInt64,
+    user_id    UInt64,
+    order_time DateTime,
+    amount     Decimal(18, 2),
+    status     LowCardinality(String),
+    country    LowCardinality(String),
+    updated_at DateTime
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY toYYYYMM(order_time)
+ORDER BY (order_id);
+
+INSERT INTO orders VALUES (1001, 88, '2024-06-15 10:00:00', 299.00, 'created',  'CN', '2024-06-15 10:00:00');
+INSERT INTO orders VALUES (1001, 88, '2024-06-15 10:00:00', 299.00, 'paid',     'CN', '2024-06-15 10:12:33');
+INSERT INTO orders VALUES (1001, 88, '2024-06-15 10:00:00', 299.00, 'shipped',  'CN', '2024-06-16 09:00:00');
+```
+
+- **不执行 OPTIMIZE 直接 `SELECT *`：看到 3 行**。三次 INSERT 生成了 3 个 part，还没合并，重复行全部可见。
+- **执行 `OPTIMIZE TABLE orders FINAL` 后再 `SELECT *`：看到 1 行**，即 `updated_at` 最大的 `shipped` 版本。
+
+这就是「最终一致」：去重要等 merge 发生，查询侧永远不能假设已经去重。
+
+2. 三种去重方式对比：
+
+```sql
+-- 方式一：FINAL（最简单，读全部 ORDER BY 列 + 版本列做临时归并）
+SELECT * FROM orders FINAL WHERE order_id = 1001
+SETTINGS do_not_merge_across_partitions_select_final = 1, max_final_threads = 8;
+
+-- 方式二：argMax + GROUP BY（推荐，走向量化聚合，可并行）
+SELECT
+    order_id,
+    argMax(user_id,    updated_at) AS user_id,
+    argMax(status,     updated_at) AS status,
+    argMax(amount,     updated_at) AS amount,
+    max(updated_at)                AS updated_at
+FROM orders
+GROUP BY order_id;
+
+-- 方式三：LIMIT 1 BY（需全量排序）
+SELECT *
+FROM orders
+ORDER BY order_id, updated_at DESC
+LIMIT 1 BY order_id;
+```
+
+一般观察到的耗时排序是：**argMax < FINAL（带高选择性 WHERE）< LIMIT 1 BY**。请在数据量放大后（比如灌几十万行）对比 Elapsed 验证。
+
+3. `is_deleted` 实现删除：
+
+```sql
+CREATE TABLE orders
+(
+    order_id   UInt64,
+    user_id    UInt64,
+    order_time DateTime,
+    amount     Decimal(18, 2),
+    status     LowCardinality(String),
+    country    LowCardinality(String),
+    updated_at DateTime,
+    is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(updated_at, is_deleted)
+ORDER BY (order_id)
+SETTINGS clean_deleted_rows = 'Always';
+
+INSERT INTO orders VALUES (1002, 91, '2024-06-15 10:05:00', 158.50, 'created', 'US', now(), 0);
+INSERT INTO orders VALUES (1002, 91, '2024-06-15 10:05:00', 158.50, 'cancelled', 'US', now(), 1);
+
+SELECT * FROM orders FINAL WHERE order_id = 1002;   -- 空，订单 1002 "消失"了
+```
+
+`is_deleted = 1` 的版本是同一 order_id 的最终版本时，`FINAL` 会把它整个剔除（`clean_deleted_rows = 'Always'` 时 merge 还会物理删掉）。这就是承接 MySQL binlog 的 DELETE 事件的标准做法。
+
+4. CollapsingMergeTree 的「天然正确」：
+
+```sql
+CREATE TABLE order_stats
+(
+    order_id UInt64,
+    user_id  UInt64,
+    amount   Decimal(18, 2),
+    status   LowCardinality(String),
+    sign     Int8
+)
+ENGINE = CollapsingMergeTree(sign)
+ORDER BY (order_id);
+
+-- 初始状态 + 状态变更（撤销 + 新状态）
+INSERT INTO order_stats VALUES (1001, 88, 299.00, 'created',  1);
+INSERT INTO order_stats VALUES (1001, 88, 299.00, 'created', -1);   -- 撤销
+INSERT INTO order_stats VALUES (1001, 88, 299.00, 'paid',     1);   -- 新状态
+
+-- 不 OPTIMIZE，直接聚合：
+SELECT
+    status,
+    sum(amount * sign) AS total_amount,
+    sum(sign)          AS order_cnt
+FROM order_stats
+GROUP BY status
+HAVING sum(sign) > 0;
+```
+
+结果直接就是 `paid: 299.00, 1`，即使 `+1/-1` 还没 merge，求和时也互相抵消了。**这是与 Replacing 的本质区别**：Replacing 的查询必须显式去重（FINAL / argMax / LIMIT BY）才能得到正确结果；Collapsing 只要「乘 sign 求和」就天然正确，不依赖 merge 时机。代价是应用端必须记住旧行的完整内容才能写出撤销行。
+</Answer>
 </Callout>
 
 ## 小结

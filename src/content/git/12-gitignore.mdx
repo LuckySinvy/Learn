@@ -200,4 +200,60 @@ cd ..`}
 2. 故意 `git add` 一个本该忽略的 `a.log` 并提交，再用 `git rm --cached a.log` 把它移出索引，观察 `git status` 的变化（它应该变成未跟踪且被忽略）。
 3. 在一个已跟踪文件上执行 `git update-index --skip-worktree app.txt`，修改它后看 `git status` 是否忽略改动；再执行 `--no-skip-worktree` 恢复。
 4. 用 `git mv` 重命名一个文件，然后 `git log --follow 新名字` 看能否追溯到改名前的历史。
+
+<Answer>
+**参考答案：**
+
+**1. 忽略 + 例外规则**
+
+```bash
+git init -q -b main ig && cd ig
+mkdir -p build
+echo x > build/out.js && echo x > build/keep.txt && echo x > a.tmp
+cat > .gitignore <<'EOF'
+build/
+*.tmp
+!build/keep.txt
+EOF
+git check-ignore -v build/out.js     # IGNORE：命中 build/
+git check-ignore -v build/keep.txt   # 无输出 = 不被忽略
+git check-ignore -v a.tmp            # IGNORE：命中 *.tmp
+```
+
+关键点：`!build/keep.txt` 必须写在 `build/` 之后——规则叠加，后面可以"翻案"前面的。如果把它写在 `build/` 前面，先执行 `!build/keep.txt` 再执行 `build/`，`keep.txt` 会被 `build/` 重新忽略，`!` 就失效了。
+
+**2. 已跟踪文件转忽略**
+
+```bash
+echo debug > a.log
+git add a.log && git commit -q -m "误提交日志"
+echo 'a.log' >> .gitignore
+git rm --cached a.log
+git status
+```
+
+`git status` 显示 `deleted: a.log`（从索引移除）。提交后 `git status` 不再有任何输出，且 `git check-ignore a.log` 有结果——**a.log 变成了"未跟踪且被忽略"**。要点：`.gitignore` 只对未跟踪文件生效，已跟踪的文件必须先 `git rm --cached` 移出索引（磁盘文件保留）。
+
+**3. skip-worktree 标记的开关**
+
+```bash
+git init -q -b main && echo tracked > app.txt && git add app.txt && git commit -q -m "init"
+git update-index --skip-worktree app.txt
+echo local-override > app.txt
+git status
+```
+
+`git status` 不显示 app.txt 的任何改动——Git 被指示"永不看这个文件的工作区改动"。`git ls-files -v app.txt` 显示小写 `s` 表示标记生效。执行 `git update-index --no-skip-worktree app.txt` 后，改动重新出现在 `git status` 里（小写 `s` 消失）。它适合本地配置覆盖，但注意它不是保险箱，`git reset --hard` / `git pull` 仍可能覆盖该文件。
+
+**4. rename 追溯**
+
+```bash
+echo 'func main() {}' > main.go && git add . && git commit -q -m "feat: 初始代码"
+git mv main.go app.go
+git commit -q -m "refactor: 重命名主文件"
+git log --follow app.go
+```
+
+`git mv` 后 `git status` 显示 `renamed: main.go -> app.go`。`git log --follow app.go` 能顺着改名历史追溯到 `main.go` 时代的提交——这正是用 `git mv` 而不是 `mv` + 手动 add/rm 的好处：Git 明确识别为 rename，改名不截断历史。
+</Answer>
 </Callout>

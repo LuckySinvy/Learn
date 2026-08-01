@@ -93,6 +93,168 @@ await withHistory.invoke(
 
 <Callout type="exercise" title="练习">
 用 `RunnableWithMessageHistory` 写一个命令行多轮聊天，按 `sessionId` 区分两个「用户」，验证彼此历史不串。
+
+<Answer>
+**参考答案：**
+
+**完整实现**
+
+```ts
+// multi-session-chat.ts
+import "dotenv/config";
+import * as readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import { RunnableWithMessageHistory } from "@langchain/core/runnables";
+import { ChatMessageHistory } from "langchain/stores/message/in_memory";
+
+// 1) 基础链：注意必须用 MessagesPlaceholder 给历史留位置
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", "你是一个友好的助手，请用简洁的中文回答。"],
+  new MessagesPlaceholder("history"),
+  ["human", "{input}"],
+]);
+
+const chain = prompt
+  .pipe(new ChatOpenAI({ model: "gpt-4o-mini" }))
+  .pipe(new StringOutputParser());
+
+// 2) 按 sessionId 隔离的历史仓库
+const store = new Map<string, ChatMessageHistory>();
+
+function getHistory(sessionId: string) {
+  if (!store.has(sessionId)) {
+    store.set(sessionId, new ChatMessageHistory());
+  }
+  return store.get(sessionId)!;
+}
+
+const withHistory = new RunnableWithMessageHistory({
+  runnable: chain,
+  getMessageHistory: async (sessionId) => getHistory(sessionId),
+  inputMessagesKey: "input",       // 哪个字段是本轮用户输入
+  historyMessagesKey: "history",   // 历史注入到哪个 placeholder
+});
+
+// 3) 命令行循环，用 /switch 切换用户
+const rl = readline.createInterface({ input, output });
+let sessionId = "alice";
+
+console.log("多轮聊天已启动。");
+console.log("  /switch <名字>  切换用户");
+console.log("  /dump           打印当前用户的历史");
+console.log("  /exit           退出\n");
+
+while (true) {
+  const line = (await rl.question(`[${sessionId}] > `)).trim();
+  if (!line) continue;
+
+  if (line === "/exit") break;
+
+  if (line.startsWith("/switch ")) {
+    sessionId = line.slice(8).trim();
+    console.log(`已切换到用户：${sessionId}\n`);
+    continue;
+  }
+
+  if (line === "/dump") {
+    const msgs = await getHistory(sessionId).getMessages();
+    console.log(`${sessionId} 的历史共 ${msgs.length} 条：`);
+    msgs.forEach((m) => console.log(`  ${m.getType()}: ${m.content}`));
+    console.log();
+    continue;
+  }
+
+  const answer = await withHistory.invoke(
+    { input: line },
+    { configurable: { sessionId } }   // 关键：告诉它用哪个会话的历史
+  );
+  console.log("AI > " + answer + "\n");
+}
+
+rl.close();
+```
+
+**验证互不串台**
+
+按下面的顺序输入，就能看到隔离效果：
+
+```
+[alice] > 我叫小明，今年 28 岁。
+AI > 你好小明！很高兴认识你。
+
+[alice] > /switch bob
+已切换到用户：bob
+
+[bob] > 我叫什么名字？
+AI > 抱歉，你还没有告诉我你的名字。        ← bob 拿不到 alice 的历史 ✅
+
+[bob] > 我叫小红。
+AI > 你好小红！
+
+[bob] > /switch alice
+已切换到用户：alice
+
+[alice] > 我叫什么？我多大了？
+AI > 你叫小明，今年 28 岁。                ← alice 的历史完好保留 ✅
+```
+
+**写成自动化断言更严谨**
+
+```ts
+async function ask(sessionId: string, input: string) {
+  return withHistory.invoke({ input }, { configurable: { sessionId } });
+}
+
+await ask("alice", "记住：我的幸运数字是 42。");
+await ask("bob", "记住：我的幸运数字是 7。");
+
+const a = await ask("alice", "我的幸运数字是多少？只回答数字。");
+const b = await ask("bob", "我的幸运数字是多少？只回答数字。");
+
+console.log("alice →", a);   // 42
+console.log("bob   →", b);   // 7
+console.assert(a.includes("42") && !a.includes("7"), "alice 的历史被污染了！");
+console.assert(b.includes("7") && !b.includes("42"), "bob 的历史被污染了！");
+
+// 两个会话的消息条数各自独立
+console.log("alice 历史条数:", (await getHistory("alice").getMessages()).length);  // 4
+console.log("bob   历史条数:", (await getHistory("bob").getMessages()).length);    // 4
+```
+
+**四个高频踩坑**
+
+| 坑 | 症状 | 解法 |
+|---|---|---|
+| 提示词里用 `["placeholder", "{history}"]` 或普通变量 | 历史被当成字符串塞进去，格式错乱 | 用 `new MessagesPlaceholder("history")` |
+| `historyMessagesKey` 与 placeholder 名字不一致 | 历史注入不进去，模型永远失忆 | 两处名字必须完全相同 |
+| 调用时忘了 `configurable.sessionId` | 抛错「Missing sessionId」 | 每次 `invoke` 都要带第二个参数 |
+| `getMessageHistory` 里每次 `new ChatMessageHistory()` | 每轮都是新历史，等于没加记忆 | 必须先查缓存，命中就复用 |
+
+**走向生产：换成 Redis 持久化**
+
+上面的 `Map` 存在进程内存里，重启即丢，多实例部署时还会各存各的。生产环境把 `getMessageHistory` 换成外部存储即可，**业务代码一行不用改**：
+
+```ts
+import { RedisChatMessageHistory } from "@langchain/redis";
+
+const withHistory = new RunnableWithMessageHistory({
+  runnable: chain,
+  getMessageHistory: async (sessionId) =>
+    new RedisChatMessageHistory({
+      sessionId,
+      sessionTTL: 60 * 60 * 24,          // 24 小时自动过期，避免无限堆积
+      config: { url: process.env.REDIS_URL },
+    }),
+  inputMessagesKey: "input",
+  historyMessagesKey: "history",
+});
+```
+
+**别忘了裁剪**：`ChatMessageHistory` 不做任何限长，聊久了会撑爆上下文窗口。可以在链前加一步 `trimMessages` 只保留最近 N 轮，或改用 `ConversationSummaryMemory` 做摘要压缩。
+</Answer>
 </Callout>
 
 ## 小结

@@ -426,24 +426,319 @@ function click() {
 }
 ```
 点击一次后，n 的值是多少？完整推理三次调用分别往队列里放了什么，以及队列是怎么被消费的。
+
+<Answer>
+**参考答案：点击一次后 `n` 是 `100`。**
+
+**第一步：搞清楚三次调用各自往队列里放了什么**
+
+关键前提：这次渲染中 `n` 是一个**被闭包捕获的常量 0**，它在整个事件处理过程中都不会变。
+
+| 调用 | 实际传入的东西 | 入队的内容 |
+|---|---|---|
+| `setN(n + 1)` | `n` 是 0，所以传的是数字 `1` | 「替换为 1」 |
+| `setN((v) => v + 10)` | 传的是**函数** | 「执行 `v => v + 10`」 |
+| `setN(n + 100)` | `n` 仍然是 0，所以传的是数字 `100` | 「替换为 100」 |
+
+注意第三行：很多人会以为这时 `n` 已经变成 11 了，所以结果是 111。**不会。** `n` 是这次渲染的快照，从头到尾都是 0。
+
+**第二步：React 在重新渲染前消费这个队列**
+
+从当前值 `0` 开始，依次应用：
+
+```text
+起始值            0
+├─ 「替换为 1」    → 1     （直接丢弃前面的结果，用新值）
+├─ 「v => v+10」   → 11    （拿上一步的 1 当参数）
+└─ 「替换为 100」  → 100   （又一次直接丢弃）
+最终               100
+```
+
+**第三步：结论与规律**
+
+- **传值 = 覆盖**：它把之前算出来的一切都扔掉，无条件换成这个值。
+- **传函数 = 累积**：它接收上一步的结果作为参数，在此基础上继续算。
+
+所以整个队列里，只有最后一次「传值」之后的操作才对结果有影响。这里最后一步就是 `setN(100)`，前面两步全白干了。
+
+**扩展验证（把顺序换一下）：**
+
+```tsx
+setN(n + 1);          // → 1
+setN(n + 100);        // → 100
+setN((v) => v + 10);  // → 110  ← 函数拿到的是上一步的 100
+```
+
+改成这个顺序，结果就是 `110`。
+
+**实践建议：** 混用「传值」和「传函数」几乎总是 bug 的温床。本章那句「**只要新值依赖旧值，就用函数式更新**」如果贯彻到底，这道题会写成：
+
+```tsx
+setN((v) => v + 1);
+setN((v) => v + 10);
+setN((v) => v + 100);
+// 结果 111，符合直觉，也和调用顺序无关
+```
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：写不可变更新">
 state 结构是：一个包含 `boards` 数组的对象，每个 board 有 `id` 和 `columns` 数组，每个 column 有 `id` 和 `cards` 数组。
 
 写出「往 board=b1 的 column=c2 里追加一张新卡片」的不可变更新代码，并说明哪些对象被复制了、哪些保持了原引用。
+
+<Answer>
+**参考答案：**
+
+先明确 state 的形状：
+
+```ts
+type Card = { id: string; text: string };
+type Column = { id: string; cards: Card[] };
+type Board = { id: string; columns: Column[] };
+type State = { boards: Board[] };
+```
+
+**更新代码：**
+
+```tsx
+function addCard(boardId: string, columnId: string, card: Card) {
+  setState((s) => ({
+    ...s,                                              // ① 复制根
+    boards: s.boards.map((b) =>                        // ② 新的 boards 数组
+      b.id !== boardId
+        ? b                                            //    不相关的 board：原样返回
+        : {
+            ...b,                                      // ③ 复制 b1
+            columns: b.columns.map((c) =>              // ④ 新的 columns 数组
+              c.id !== columnId
+                ? c                                    //    不相关的 column：原样返回
+                : {
+                    ...c,                              // ⑤ 复制 c2
+                    cards: [...c.cards, card],         // ⑥ 新的 cards 数组
+                  }
+            ),
+          }
+    ),
+  }));
+}
+
+addCard("b1", "c2", { id: "card-9", text: "新卡片" });
+```
+
+**哪些被复制了（共 6 个新对象，正好是从根到修改点这条路径）：**
+
+```text
+State 根对象          ← ① 新对象
+ └─ boards 数组       ← ② 新数组
+     └─ board "b1"    ← ③ 新对象
+         └─ columns 数组  ← ④ 新数组
+             └─ column "c2"  ← ⑤ 新对象
+                 └─ cards 数组   ← ⑥ 新数组
+```
+
+**哪些保持了原引用：**
+
+- 其他所有 board 对象（`b2`、`b3`…）以及它们内部的一切
+- `b1` 里除 `c2` 之外的所有 column 对象及其 cards
+- `c2` 原有的**每一张 card 对象**——`[...c.cards, card]` 只是新建了外层数组，里面的元素都是原来那些引用
+
+**为什么这么重要：**
+
+这正是本章 3.3 节说的「只复制变化路径上的节点」。带来的直接收益是：
+
+1. 用 `React.memo` 包裹 `BoardView`、`ColumnView`、`CardView` 后，只有 `b1` → `c2` 这条链上的组件会重渲染，其他看板、其他列、以及 `c2` 里已有的每张卡片全部被跳过（第 12 章）。
+2. 如果做深拷贝（比如 `JSON.parse(JSON.stringify(state))`），所有引用都会变，`memo` 全部失效，整棵树重渲染——正确但性能全丢。
+
+**注意两个常见错误：**
+
+```ts
+// ❌ push 是原地修改，会改到原 state，且引用不变
+c.cards.push(card);
+
+// ❌ 只复制了根，深层还是原引用，React 认为 c2 没变
+setState({ ...s });
+```
+
+**嵌套确实很深时的两个更优解：**
+
+```ts
+// 方案 A：用 Immer，写法像直接改，底层自动生成不可变结构
+setState(produce((draft) => {
+  const b = draft.boards.find((x) => x.id === boardId);
+  b.columns.find((x) => x.id === columnId).cards.push(card);
+}));
+
+// 方案 B：更根本的办法 —— 把 state 扁平化（本章第 6 节原则 3）
+type State = {
+  boardIds: string[];
+  boards: Record<string, { id: string; columnIds: string[] }>;
+  columns: Record<string, { id: string; cardIds: string[] }>;
+  cards: Record<string, Card>;
+};
+// 追加一张卡片就只需要改两处，嵌套层级从 4 层降到 1 层
+```
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：消除冗余 state">
 某组件有这些 state：`items`、`filteredItems`、`filterText`、`itemCount`、`hasItems`、`selectedItem`、`selectedIndex`。
 
 指出哪些是冗余的，重新设计一套最小 state 集合，并写出被删掉的那些值该如何计算得到。
+
+<Answer>
+**参考答案：**
+
+**逐个判断：**
+
+| 原 state | 是否冗余 | 判断依据 |
+|---|---|---|
+| `items` | ✅ 保留 | 数据源头，无法从别处推导 |
+| `filterText` | ✅ 保留 | 用户输入，无法推导 |
+| `filteredItems` | ❌ 冗余 | 由 `items` + `filterText` 完全决定 |
+| `itemCount` | ❌ 冗余 | 就是 `items.length` |
+| `hasItems` | ❌ 冗余 | 就是 `items.length > 0` |
+| `selectedItem` | ❌ 冗余（且危险） | 存的是对象**快照**，item 更新后它就过期了 |
+| `selectedIndex` | ❌ 冗余（且危险） | 下标在过滤/排序/删除后立刻失效 |
+
+**最小 state 集合（3 个）：**
+
+```tsx
+const [items, setItems] = useState<Item[]>([]);
+const [filterText, setFilterText] = useState("");
+const [selectedId, setSelectedId] = useState<string | null>(null);
+```
+
+**其余全部现算：**
+
+```tsx
+// 过滤结果：数据量大时用 useMemo 缓存（第 7 章）
+const filteredItems = useMemo(
+  () => items.filter((it) => it.name.includes(filterText)),
+  [items, filterText]
+);
+
+const itemCount = items.length;
+const hasItems = items.length > 0;
+
+// 永远拿到最新数据，不会是过期快照
+const selectedItem = items.find((it) => it.id === selectedId) ?? null;
+
+// 想要下标就现找；注意想清楚是「在全量里的下标」还是「在过滤结果里的下标」
+const selectedIndex = filteredItems.findIndex((it) => it.id === selectedId);
+```
+
+**为什么 `selectedItem` 和 `selectedIndex` 特别危险：**
+
+它们不只是「多余」，而是会**主动产生 bug**：
+
+- **存对象**：用户在别处把这条数据改名了，`items` 里的那条更新了，但 `selectedItem` 里存的还是旧对象——界面上详情面板显示旧名字。这就是第 1 章说的「两份真相」。
+- **存下标**：用户改了搜索词，列表重新过滤，下标 2 现在指向的是完全不同的一条数据——选中项莫名其妙地跳走了。删除操作更糟：删掉前面一项，选中项会「悄悄下移一位」。
+- **同时存两个**：`selectedItem` 和 `selectedIndex` 可能互相矛盾（一个指向 A，一个指向 B），而 React 不会帮你检查。
+
+**通用规律 —— 存「身份」而不是存「内容」或「位置」：**
+
+id 是数据的稳定身份，无论列表怎么增删排序过滤，`selectedId` 都能正确地找到那一条（或者正确地找不到，说明它被删了）。这和第 2 章「key 要用稳定 id 而不是数组下标」是同一个道理。
+
+**唯一的例外：** 如果某个派生计算真的很贵（比如上万条数据做复杂聚合），用 `useMemo` 缓存它——**但那仍然是派生值，不是 state**。缓存和存成 state 是两回事：`useMemo` 会在依赖变化时自动重算，而 state 需要你手动同步。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：改造 Playground">
 在本章 Playground 里加一个 `addTodo` 函数，要求返回新 state 且保持所有原有 todo 的引用不变。
 
 然后写一个 `countReused(prev, next)` 函数统计有多少项引用被复用了，验证追加一项后复用数等于原数组长度。
+
+<Answer>
+**参考答案：**
+
+```ts
+interface Todo {
+  id: number;
+  title: string;
+  done: boolean;
+}
+
+interface State {
+  todos: Todo[];
+  filter: string;
+}
+
+function makeState(): State {
+  return {
+    filter: "all",
+    todos: [
+      { id: 1, title: "学 JSX", done: true },
+      { id: 2, title: "学 state", done: false },
+      { id: 3, title: "学 effect", done: false },
+    ],
+  };
+}
+
+// 追加一项：只新建「根对象 + todos 数组 + 新 todo」这三个对象
+function addTodo(state: State, title: string): State {
+  const lastId =
+    state.todos.length === 0 ? 0 : state.todos[state.todos.length - 1].id;
+
+  return {
+    filter: state.filter,
+    todos: state.todos.concat([{ id: lastId + 1, title: title, done: false }]),
+    // 等价写法：[...state.todos, { ... }]
+    // 注意不能用 push —— 那会原地改掉原数组，引用也不变
+  };
+}
+
+// 统计有多少个「旧 todo 对象」在新数组里被原样复用
+function countReused(prev: State, next: State): number {
+  let n = 0;
+  for (const p of prev.todos) {
+    for (const q of next.todos) {
+      if (Object.is(p, q)) {
+        n += 1;
+        break;
+      }
+    }
+  }
+  return n;
+}
+
+const s1 = makeState();
+const s2 = addTodo(s1, "学 useReducer");
+
+console.log("原数组长度: " + s1.todos.length);
+console.log("新数组长度: " + s2.todos.length);
+console.log("引用被复用的项数: " + countReused(s1, s2));
+console.log("原 state 未被修改: " + (s1.todos.length === 3));
+console.log("根对象引用已变化: " + !Object.is(s1, s2));
+
+// 对照：错误写法会让复用数「看起来」也是 3，但根引用没变，React 不会重渲染
+const s3 = makeState();
+const s4 = ((st: State) => {
+  st.todos.push({ id: 4, title: "错误写法", done: false });
+  return st;
+})(s3);
+console.log("[错误写法] 根对象引用已变化: " + !Object.is(s3, s4));
+```
+
+**预期输出：**
+
+```text
+原数组长度: 3
+新数组长度: 4
+引用被复用的项数: 3
+原 state 未被修改: true
+根对象引用已变化: true
+[错误写法] 根对象引用已变化: false
+```
+
+**这个结果说明了什么：**
+
+- **复用数 3 = 原数组长度**，证明追加操作没有碰任何一个已有的 todo 对象。放到真实 React 里，就是「加一条待办时，已有的 3 个 `<TodoItem>` 如果用 `React.memo` 包着，一个都不会重渲染」。
+- 只有 3 个对象是新建的：根 state、`todos` 数组、新增的那个 todo。这就是「只复制变化路径上的节点」在**追加**这个操作上的具体形态——路径只有两层，所以特别便宜。
+- 最后那组对照实验复现了 3.1 节的坑：`push` 之后数据确实变了，但 `Object.is(s3, s4)` 为 `true`，React 判断「没变」，界面纹丝不动。
+
+**一个容易忽略的点：** `countReused` 里用的是 `Object.is` 而不是 `===` 比较 `id`。因为我们要验证的不是「内容相同」，而是「**就是同一个对象**」——后者才是 React 跳过重渲染的依据。
+</Answer>
 </Callout>
 
 ## 小结

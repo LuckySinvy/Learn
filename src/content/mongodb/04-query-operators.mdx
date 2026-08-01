@@ -335,6 +335,64 @@ WHERE u.city IN ('Beijing','Shanghai')
 
 <Callout type="exercise" title="练习">
 用本章的 `posts` 数据完成：一、写一个查询，找出「有一条评分记录同时满足 user 是 bob 且 v 大于等于 4」的帖子，并解释为什么不能用点号写法；二、找出 tags 数组长度大于 2 的帖子，分别用 `$expr` 和冗余字段两种方案，并说明各自的代价；三、找出 `views` 字段类型不是数字的所有文档；四、写一个查询找出「标题以 Mongo 开头（不区分大小写）」的帖子，然后解释它为什么不走索引，以及如何改造使其能走索引。
+
+<Answer>
+**参考答案：**
+
+本章的示例数据为三篇帖子：`_id: 11`（tags 3 个）、`_id: 12`（tags 2 个）、`_id: 13`（tags 1 个）。
+
+**一、评分记录同时满足 user 是 bob 且 v ≥ 4**
+
+```js
+db.posts.find({ scores: { $elemMatch: { user: "bob", v: { $gte: 4 } } } })
+// 匹配 _id: 13（bob 评了 4 分）
+```
+
+**为什么不能用点号写法？** 点号写法 `{ "scores.user": "bob", "scores.v": { $gte: 4 } }` 的两个条件是**分别**在数组中寻找满足的元素：`scores.user` 找含 bob 的元素、`scores.v` 找 v≥4 的元素，两个条件可能被**不同元素**满足（例如数组里 bob 评 1 分、carol 评 5 分，`_id: 12` 就会被误匹配）。只有 `$elemMatch` 强制「**同一个**数组元素同时满足所有条件」。
+
+**二、tags 数组长度大于 2（即 3 个及以上）**
+
+方案 A，`$expr`：
+
+```js
+db.posts.find({ $expr: { $gt: [ { $size: "$tags" }, 2 ] } })
+// 匹配 _id: 11
+```
+
+方案 B，冗余字段：先给文档维护一个 `tagCount` 字段（写入时用 `$push` 加 `$inc` 同步计数，示例数据可手动补上）：
+
+```js
+db.posts.find({ tagCount: { $gt: 2 } })
+```
+
+代价对比：`$expr` + `$size` 需要实时计算每个文档的数组长度，**无法走索引**，全集合扫描；冗余字段方案多维护一个字段、有写放大，但 `tagCount` **可建索引**，高频过滤/排序查询优先选它。
+
+**三、views 字段类型不是数字的文档**
+
+```js
+db.posts.find({ views: { $not: { $type: ["int", "long", "double"] } } })
+```
+
+注意：`$not` 加上 `$type` 的否定会让「`views` 字段不存在」的文档也被算作「类型不是数字」，所以本章示例中 `_id` 为 11、12、13 的三篇帖子（没有 views 字段）也会被匹配。如果只想查「存在但类型错误」的脏数据，要显式排除：
+
+```js
+db.posts.find({ views: { $exists: true, $not: { $type: ["int", "long", "double"] } } })
+```
+
+**四、标题以 Mongo 开头（不区分大小写）**
+
+```js
+db.posts.find({ title: { $regex: "^Mongo", $options: "i" } })
+```
+
+**为什么不走索引？** 普通前缀正则 `^Mongo` 本可利用索引做范围扫描，但带 `$options: "i"` 后引擎无法复用 B 树的顺序（索引里是小写 `mongo` 开头的字符串，无法直接二分定位大写 `Mongo`），只能逐条比对，退化为集合扫描。
+
+**如何改造使其能走索引？** 三种思路：
+
+1. **去掉大小写选项**，前提是数据已统一大小写：`db.posts.find({ title: /^Mongo/ })`，前缀正则可走索引。
+2. **冗余一个规范化字段**：写入时维护 `titleLower: "mongo..."`，加 `titleLower_1` 索引，然后查询 `db.posts.find({ titleLower: /^mongo/ })`。
+3. 需要真正的全文搜索时，用**文本索引**（第 8 章）或 Atlas Search，而非正则。
+</Answer>
 </Callout>
 
 ## 小结

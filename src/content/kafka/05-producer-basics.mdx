@@ -187,4 +187,182 @@ producer.flush()       # 退出前必须 flush
 1. 写一个循环发送 10 万条消息的程序，分别用 `linger.ms=0` 和 `linger.ms=50` + lz4 压缩跑一遍，对比总耗时。
 2. 把 `buffer.memory` 调小到 1MB 并快速发送大消息，观察 send() 阻塞与 `max.block.ms` 超时异常。
 3. 用异步回调统计成功/失败条数，验证进程退出前不调 flush 会丢多少条。
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · linger.ms 与压缩的吞吐对比**
+
+用同一份代码跑两组配置即可，关键是把配置抽成参数：
+
+```java
+public class ThroughputBench {
+    static void run(String label, int lingerMs, String compression) throws Exception {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.LINGER_MS_CONFIG, lingerMs);
+        props.put(ProducerConfig.BATCH_SIZE_CONFIG, 65536);
+        props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, compression);
+
+        String payload = "x".repeat(500);   // 500B 的消息体
+        long start = System.currentTimeMillis();
+        try (Producer<String, String> p = new KafkaProducer<>(props)) {
+            for (int i = 0; i < 100_000; i++) {
+                p.send(new ProducerRecord<>("bench", "k" + (i % 100), payload));
+            }
+        }   // try-with-resources 的 close() 会自动 flush, 计时包含全部落盘
+        long cost = System.currentTimeMillis() - start;
+        System.out.printf("%s: %d ms, %.0f msg/s%n",
+            label, cost, 100_000 * 1000.0 / cost);
+    }
+
+    public static void main(String[] args) throws Exception {
+        run("linger=0  none", 0, "none");
+        run("linger=50 lz4 ", 50, "lz4");
+    }
+}
+```
+
+也可以直接用 Kafka 自带的压测工具，连代码都不用写：
+
+```bash
+# 不攒批、不压缩
+bin/kafka-producer-perf-test.sh --topic bench --num-records 100000 \
+  --record-size 500 --throughput -1 \
+  --producer-props bootstrap.servers=localhost:9092 linger.ms=0 compression.type=none
+
+# 攒批 + lz4
+bin/kafka-producer-perf-test.sh --topic bench --num-records 100000 \
+  --record-size 500 --throughput -1 \
+  --producer-props bootstrap.servers=localhost:9092 linger.ms=50 \
+  batch.size=65536 compression.type=lz4
+```
+
+典型结果（本地单机，数量级供参考，绝对值取决于硬件）：
+
+| 配置 | 耗时 | 吞吐 | 单条延迟 |
+|---|---|---|---|
+| `linger.ms=0` + 不压缩 | ~9 s | ~11,000 msg/s | 低（几乎立刻发出） |
+| `linger.ms=50` + lz4 | ~2 s | ~50,000 msg/s | 高（最多多等 50ms） |
+
+**为什么差这么多**——三个叠加效应：
+
+1. **请求次数骤减**：`linger.ms=0` 时 Sender 线程一有空就发，一个请求可能只带几条消息，10 万条要发上万次网络往返；`linger.ms=50` 让消息在 RecordAccumulator 里攒够 64KB（约 130 条）再发，请求数降低一两个数量级。
+2. **压缩作用于整批**：Kafka 压缩的是**整个 batch** 而不是单条消息。批次越大，重复的 key、字段名越多，压缩率越高。示例中重复字符串压缩后能小 10 倍以上，网络传输量随之骤降。
+3. **broker 侧开销降低**：每个请求 broker 都要走一遍网络线程 → 请求队列 → IO 线程 → 写日志的流程，请求少了 CPU 和锁竞争都下来了。
+
+**结论与取舍**：`linger.ms` 是拿**延迟换吞吐**的旋钮。它不是"必须等满 50ms"，而是"最多等 50ms"——只要 batch 先攒满 `batch.size` 就立即发送。所以流量大时实际等待远小于 50ms，几乎是白赚吞吐；只有流量稀疏时才会真的等满。这也是为什么生产环境几乎总该把 `linger.ms` 设成 5~100 而不是 0。
+
+**第 2 题 · buffer.memory 打满与 max.block.ms**
+
+```java
+Properties props = new Properties();
+props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 1 * 1024 * 1024);  // 只给 1MB
+props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 3000);              // 最多阻塞 3 秒
+props.put(ProducerConfig.LINGER_MS_CONFIG, 1000);                 // 故意拖慢发送
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+String big = "x".repeat(100 * 1024);   // 100KB 一条, 10 条就能撑满 1MB
+
+for (int i = 0; i < 100; i++) {
+    long t0 = System.currentTimeMillis();
+    try {
+        producer.send(new ProducerRecord<>("bench", big));
+        long blocked = System.currentTimeMillis() - t0;
+        if (blocked > 5) System.out.printf("#%d send() 阻塞了 %d ms%n", i, blocked);
+    } catch (org.apache.kafka.common.errors.TimeoutException e) {
+        System.out.printf("#%d 抛出异常: %s%n", i, e.getMessage());
+        break;
+    }
+}
+```
+
+观察到的现象分两个阶段：
+
+```text
+#12 send() 阻塞了 842 ms      <- 缓冲区满, 等 Sender 释放空间
+#13 send() 阻塞了 1003 ms
+#14 抛出异常: Failed to allocate memory within the configured max blocking
+    time 3000 ms.
+```
+
+**原理**：`send()` 之所以"非阻塞"，前提是 RecordAccumulator 里还有空闲内存。当已缓冲但未发送的数据达到 `buffer.memory` 上限时，`send()` 会在分配内存处**阻塞等待** Sender 线程把批次发出去释放空间。等待时长超过 `max.block.ms` 就抛 `TimeoutException`。
+
+`max.block.ms` 实际覆盖两种阻塞：
+
+1. **缓冲区满**（本例）；
+2. **元数据未就绪**——首次给某个 topic 发消息时要先拉元数据，如果 broker 连不上会卡在这里，最终报 `Topic xxx not present in metadata after 60000 ms`。
+
+**这个实验的生产意义**：`send()` 抛 `TimeoutException` 是一个非常强的**背压信号**，说明"业务产生消息的速度 > Kafka 消化的速度"。此时正确做法不是无脑调大 `buffer.memory`（那只是延后崩溃），而是排查根因：broker 是否变慢、网络是否打满、分区数是否不足、是否该开启压缩。同时应用侧要捕获这个异常并降级（写本地队列、丢弃低优先级消息、限流上游），而不是让它冒泡把请求线程打挂。
+
+**第 3 题 · 不调 flush 会丢多少条**
+
+```java
+AtomicInteger ok = new AtomicInteger();
+AtomicInteger fail = new AtomicInteger();
+int TOTAL = 10_000;
+
+Properties props = new Properties();
+props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.LINGER_MS_CONFIG, 100);   // 放大效果
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+for (int i = 0; i < TOTAL; i++) {
+    producer.send(new ProducerRecord<>("flush-demo", "msg-" + i),
+        (meta, ex) -> {
+            if (ex == null) ok.incrementAndGet();
+            else fail.incrementAndGet();
+        });
+}
+
+// 关键对照: 注释掉下面两行 vs 保留
+// producer.flush();
+// producer.close();
+
+System.out.printf("回调统计: ok=%d fail=%d, 未回调=%d%n",
+    ok.get(), fail.get(), TOTAL - ok.get() - fail.get());
+Runtime.getRuntime().halt(0);   // 强制退出, 模拟进程被 kill
+```
+
+对照结果：
+
+| 做法 | 回调统计 | 服务端实收 |
+|---|---|---|
+| 不 flush、不 close，直接强制退出 | `ok≈300 fail=0 未回调≈9700` | 只有几百条 |
+| 调 `flush()` 或 `close()` | `ok=10000 fail=0` | 10000 条 |
+
+服务端计数用这条命令核对：
+
+```bash
+bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 \
+  --topic flush-demo --time -1
+```
+
+**为什么会丢**：`send()` 只是把消息**放进内存中的 RecordAccumulator 就返回了**，真正的网络发送由后台 Sender 线程异步完成。进程被强制终止时，缓冲区里还没轮到发送的消息随进程内存一起蒸发，而且**回调根本不会被触发**——所以你连"丢了"这件事都感知不到，这是最危险的地方。丢失条数取决于 `linger.ms`、`batch.size` 和退出时机，没有固定值。
+
+**正确的收尾姿势**：
+
+- `flush()`：阻塞直到缓冲区中所有消息都收到 broker 响应（成功或最终失败），之后 Producer 还能继续用。
+- `close()`：内部会**先执行一次 flush** 再释放资源。所以只要正常调用了 `close()`（或用 try-with-resources），就不会有这个问题。
+- 生产服务应注册 JVM 关闭钩子，保证收到终止信号时也能优雅退出：
+
+```java
+Runtime.getRuntime().addShutdownHook(new Thread(producer::close));
+```
+
+**注意 `close()` 不是万能的**：强制杀进程、容器 OOMKilled、机器断电这些场景下钩子根本不会执行。所以对"绝对不能丢"的消息，光靠 Producer 缓冲区不够，需要 Outbox 模式（先落库再异步投递）这类方案兜底——这正是下一章可靠性要展开的话题。
+
+Python 侧同理，`produce()` 入队即返回，退出前必须：
+
+```python
+producer.flush()   # 返回值是仍未送达的消息数, 正常应为 0
+```
+</Answer>
 </Callout>

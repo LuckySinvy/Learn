@@ -139,14 +139,136 @@ SSR 是「在服务器把组件渲染成 HTML 字符串发给浏览器，再 hyd
 
 <Callout type="exercise" title="练习 1：划分边界">
 一个商品页：顶部有搜索框（输入即筛选），下面是从数据库读的 1000 条商品列表，每条商品有「加入购物车」按钮（带本地数量 state）。哪些组件是服务端组件、哪些是客户端组件？把 `"use client"` 标在哪些文件？
+
+<Answer>
+**参考答案：**
+
+**划分类别：**
+
+| 组件 | 类别 | 理由 |
+|---|---|---|
+| 商品页 `Page` | 服务端组件 | 默认类别；从数据库读 1000 条商品，查询和源码都留在服务器 |
+| 商品列表 `ProductList` | 服务端组件 | 纯展示、无交互，在服务端渲染成 RSC 载荷传下去即可 |
+| 搜索框 `SearchBox` | 客户端组件 | 需要 `useState` 绑定输入、`onChange` 实时筛选 |
+| 「加入购物车」按钮 `AddToCartButton` | 客户端组件 | 有本地数量 state、需要 `onClick`，但必须做成尽量小的**叶子** |
+
+**`"use client"` 标在哪些文件：**
+
+- `SearchBox.tsx` → 文件顶部写 `"use client"`
+- `AddToCartButton.tsx` → 文件顶部写 `"use client"`
+- `Page.tsx` / `ProductList.tsx` → **不加**（保持服务端组件）
+
+```tsx
+// app/products/page.tsx —— 服务端组件（默认，不加 "use client"）
+import { db } from "@/lib/db";
+import { SearchBox } from "./SearchBox";
+import { AddToCartButton } from "./AddToCartButton";
+
+export default async function Page() {
+  const products = await db.product.findMany();
+  return (
+    <div>
+      <SearchBox products={products} />
+      <ul>
+        {products.map((p) => (
+          <li key={p.id}>
+            {p.name}
+            <AddToCartButton productId={p.id} />
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+要点：`AddToCartButton` 接收的是 `productId`（可序列化的字符串），不是函数；「加入购物车」的本地数量 state 完全留在客户端。`SearchBox` 接收的 `products` 是 JSON 可序列化的纯数据，1000 条做本地过滤可以接受；数据量更大时，可以把搜索改成服务端查询。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：可序列化陷阱">
 服务端组件 `ProductList` 想把一个 `onSelect(id: string) => void` 函数作为 prop 传给客户端组件 `Item`。这能编译通过吗？运行时会发生什么？应该怎么改（提示：把「选中后要做什么」放到服务端组件能触发的地方）？
+
+<Answer>
+**参考答案：**
+
+**能编译通过吗？** 类型层面（tsc）一般能通过——props 类型是一个合法的函数类型，静态检查拦不住。但 Next.js 在**构建时**就会直接报错：`Functions cannot be passed directly to Client Components unless you're using a Server Action`。即使绕过构建，**运行时** RSC 载荷序列化时函数也无法表达，客户端拿到的会是 `undefined` 或直接抛错——因为服务端组件给客户端组件只能传**可序列化数据**（JSON 能表达的东西）。
+
+**应该怎么改：** 把「选中后要做什么」放到服务端组件能触发的地方——也就是把它声明成 **Server Action**：
+
+```tsx
+// actions.ts —— 服务端动作
+"use server";
+export async function onSelect(id: string) {
+  // 服务端逻辑：记录、写库、跳转等
+}
+```
+
+```tsx
+// ProductList.tsx —— 服务端组件
+import { onSelect } from "./actions";
+
+function ProductList() {
+  return (
+    <ul>
+      {products.map((p) => (
+        <Item key={p.id} id={p.id} selectAction={onSelect} />
+      ))}
+    </ul>
+  );
+}
+```
+
+```tsx
+// Item.tsx —— 客户端组件
+"use client";
+export function Item({ id, selectAction }: { id: string; selectAction: (id: string) => void }) {
+  return <button onClick={() => selectAction(id)}>选中</button>;
+}
+```
+
+Server Action 是唯一能「把函数引用安全传给客户端」的通道——React 会把调用包装成 RPC，客户端触发时实际在服务端执行。
+
+如果「选中后要做的」只是纯客户端行为（更新客户端状态、本地跳转），那根本不需要传函数：服务端只传可序列化数据（如 `href`、`id`），交互逻辑在客户端组件内部实现。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：流式渲染设计">
 一个页面有「用户头像」（快，来自缓存）和「年度报表图表」（慢，10 秒查询）。用 `<Suspense>` 设计结构，让头像先出来、图表用占位，并说明浏览器与服务器的数据交换过程。
+
+<Answer>
+**参考答案：**
+
+```tsx
+// app/report/page.tsx —— 服务端组件
+import { Suspense } from "react";
+import { Avatar } from "./Avatar";           // 快：来自缓存
+import { YearlyChart } from "./YearlyChart"; // 慢：10 秒查询
+
+export default function Page() {
+  return (
+    <div>
+      {/* 快的组件不包 Suspense：随首屏一起直接发出 */}
+      <Avatar userId={currentUser.id} />
+      {/* 慢的组件包 Suspense：先发占位，后流式补全 */}
+      <Suspense fallback={<ChartSkeleton />}>
+        <YearlyChart />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+**浏览器与服务器的数据交换过程：**
+
+1. 浏览器请求 `/report`，服务器开始渲染 `Page`；
+2. 服务器渲染 `Avatar`（缓存快，立刻完成），`YearlyChart` 的查询还在等待——于是先把「头像的结果 + 图表的 fallback 骨架」**流式**发给浏览器；
+3. 浏览器立刻渲染出头像和图表骨架，用户**不用等 10 秒**就能看到页面主体；
+4. 10 秒后 `YearlyChart` 的查询完成，服务器把图表渲染结果通过**同一个 HTTP 响应流**推给浏览器；
+5. 浏览器用真实图表**替换**骨架，页面不刷新、客户端状态不丢失。
+
+**关键点：** 慢的部分一定要被 `<Suspense>` 包住。如果不包，服务器会等最慢的 `YearlyChart` 完成才发首包，头像也要陪等 10 秒——流式渲染的意义就没了。
+</Answer>
 </Callout>
 
 ## 小结

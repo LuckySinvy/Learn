@@ -309,6 +309,91 @@ const el = document.getElementById("app")!;   // 去掉 null
 <Callout type="exercise" title="练习">
 1. 写一个函数 `parseAge(input: unknown): number | null`：输入是字符串就尝试转数字，是数字就直接返回，其他情况返回 `null`。用几组不同类型的值验证。
 2. 定义 `type Level = "debug" | "info" | "error"`，写一个 `weight(l: Level): number`，用 switch 加 `never` 穷尽性检查；然后给 `Level` 加一个成员，观察编译器在哪里报错。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：parseAge**
+
+```ts
+function parseAge(input: unknown): number | null {
+  if (typeof input === "number") {
+    // 排除 NaN 和 Infinity，它们的 typeof 也是 number
+    return Number.isFinite(input) ? input : null;
+  }
+  if (typeof input === "string") {
+    const trimmed = input.trim();
+    if (trimmed === "") return null;   // Number("") 是 0，必须先挡掉
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+const cases: unknown[] = [30, "42", " 18 ", "abc", "", null, undefined, true, NaN];
+for (const c of cases) {
+  console.log(JSON.stringify(c) + " → " + String(parseAge(c)));
+}
+// 30 → 30
+// "42" → 42
+// " 18 " → 18
+// "abc" → null
+// "" → null
+// null → null
+// undefined → null
+// true → null
+// null → null      （NaN 经 JSON.stringify 变成 null）
+```
+
+关键点：
+
+- 参数是 `unknown` 而不是 `any`，所以**在 `typeof` 收窄之前编译器不允许你对 input 做任何事**。这正是我们想要的：强制先校验。
+- 收窄之后，`input` 在 if 块里被自动当作 `number` / `string`，可以直接调用 `.trim()`，不需要断言。
+- 两个容易漏的坑：`Number("")` 等于 0，`typeof NaN` 等于 `"number"`。所以用 `Number.isFinite` 统一兜底。
+
+**第 2 题：穷尽性检查**
+
+```ts
+type Level = "debug" | "info" | "error";
+
+function assertNever(x: never): never {
+  throw new Error("未处理的 Level: " + String(x));
+}
+
+function weight(l: Level): number {
+  switch (l) {
+    case "debug":
+      return 10;
+    case "info":
+      return 20;
+    case "error":
+      return 40;
+    default:
+      return assertNever(l);   // 此处 l 的类型已被收窄为 never
+  }
+}
+
+console.log(weight("debug"));  // 10
+console.log(weight("error"));  // 40
+```
+
+**加一个成员后会怎样：**
+
+```ts
+type Level = "debug" | "info" | "warn" | "error";
+//                              ^^^^^^ 新增
+```
+
+编译器会在 **`default` 分支的 `assertNever(l)` 这一行**报错：
+
+```text
+TS2345: 类型“"warn"”的参数不能赋给类型“never”的参数。
+```
+
+原理：switch 处理完 debug / info / error 后，剩余可能值本应为空集（`never`）；新增 `"warn"` 后剩余集合变成 `"warn"`，而 `"warn"` 不能赋给 `never`，于是报错。**编译器精确地把你带到了每一处忘记更新的 switch。**
+
+对比一下：如果 `weight` 只写 `: number` 而没有 `assertNever`，新增成员后函数会静默返回 `undefined`，这个 bug 要等到线上才暴露。这个模式值得在所有基于联合类型的 switch 上养成习惯。
+</Answer>
 </Callout>
 
 ## 小结

@@ -210,4 +210,61 @@ curl -si http://127.0.0.1:8000/bad -H "Origin: http://a.com" | grep -iE "HTTP/|a
 2. 给 Playground 1 增加凭证模式支持：Allow-Credentials: true 并回显 Origin，用 curl -b "sid=xxx" 验证响应头组合。
 3. 用第 8 章的知识解释：SameSite=Lax 与 CORS 分别防住了跨站攻击的哪个环节（发出请求 / 读取响应）？
 4. 排障题：前端报 CORS 错误，但后端同事坚称"我配了 Allow-Origin: *"。列出三个仍会失败的可能原因。
+
+<Answer>
+**参考答案：**
+
+**1. Allow-Headers 缺 X-Token 的后果**
+
+把 Playground 2 预检响应里的 `Access-Control-Allow-Headers` 改成 `Content-Type`（去掉 X-Token）。真实浏览器流程：
+
+1. 先发 OPTIONS 预检，带上 `Access-Control-Request-Headers: x-token`；
+2. 服务器响应里 `Access-Control-Allow-Headers` **不含 x-token**；
+3. 浏览器判定预检失败 → **真实请求根本不会发出**（PUT 根本没到服务器），控制台报错：
+
+```text
+Request header field x-token is not allowed by Access-Control-Allow-Headers
+in preflight response.
+```
+
+注意 curl 不会模拟这个检查（它没有同源策略），只有浏览器会拦。这是 CORS 联调最常见的翻车点之一：预检过了但 Allow-Headers 列表漏了自定义头，或反过来自定义头压根没在预检里声明。
+
+**2. 凭证模式支持**
+
+在 Playground 1 里加两个头：
+
+```python
+self.send_header("Access-Control-Allow-Credentials", "true")
+self.send_header("Access-Control-Allow-Origin", origin)   # 回显具体源，不能用 *
+self.send_header("Vary", "Origin")
+```
+
+用 curl 验证响应头组合：
+
+```bash
+curl -si http://127.0.0.1:8000/api -H "Origin: http://app.example.com" -b "sid=abc123" \
+  | grep -iE "access-control|vary"
+```
+
+应看到 `Access-Control-Allow-Origin: http://app.example.com` + `Access-Control-Allow-Credentials: true` + `Vary: Origin`。三者缺一不可：带凭证的跨源请求要求**回显具体 Origin**（通配符 `*` 会被浏览器直接拒绝），`Vary: Origin` 防止 CDN 把 A 源的许可头缓存给 B 源。
+
+**3. SameSite 与 CORS 各防哪个环节**
+
+跨站攻击有两个环节：**发出请求**和**读取响应**。
+
+- **SameSite=Lax/Strict 防"发出请求"**：控制**跨站请求是否自动携带 Cookie**。没有登录态 Cookie，攻击者伪造的跨站表单/脚本请求就"缺凭证"，到不了受害者的身份上下文（CSRF 的核心防御）。但注意它只针对 Cookie 类凭证，且 Lax 下顶级导航 GET 仍会带。
+- **CORS 防"读取响应"**：控制**浏览器脚本能否读取跨源响应**。即使请求发出去了、服务器也响应了，没有 `Access-Control-Allow-Origin` 许可，浏览器把响应拦下，攻击者脚本**读不到数据**。
+
+两者互补：SameSite 掐"凭证送出"这一环，CORS 掐"数据读出"这一环。同源策略（SOP）本身也是防"读取"，CORS 是它的受控例外。
+
+**4. 配了 `Allow-Origin: *` 仍失败的原因**
+
+`*` 是最宽许可，但仍可能被这三个细节绊住：
+
+1. **请求带了凭证**：跨源请求如果声明了 `credentials: "include"`（或浏览器端设置了 Cookie），`Access-Control-Allow-Origin: *` 是**非法组合**——规范要求带凭证时不能使用通配符，必须回显具体 Origin，且需 `Access-Control-Allow-Credentials: true`。前端一开凭证，`*` 立刻失效；
+2. **响应没带 Vary: Origin**：即使回显了 Origin，漏了 `Vary: Origin` 可能导致 CDN/代理把缓存的许可头错发给其他源，浏览器报错（尤其当 `*` 换成回显后）；
+3. **预检没过/真实请求头没配对**：非简单请求先走 OPTIONS 预检，若预检响应里 `Access-Control-Allow-Headers`/`Allow-Methods` 没包含前端要用的自定义头或方法（比如 PUT + x-token），浏览器在预检阶段就失败——后端只在 GET 里配了 `Allow-Origin` 是没用的。
+
+另外常见隐藏原因：**错误响应没带许可头**（500 时中间件没加 CORS 头），浏览器同样报 CORS error。
+</Answer>
 </Callout>

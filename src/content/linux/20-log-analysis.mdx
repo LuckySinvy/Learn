@@ -273,4 +273,125 @@ chmod +x report.sh
 2. 计算每个路径的 P95 耗时（提示：对每个路径分别收集耗时到文件或用 awk 二维思路：先 sort -k5 -k8n 再分组取位）。
 3. 给 report.sh 增加"每分钟请求数条形图"小节，并让 Top N 的 N 变成可选的第二个参数（默认 3，用 `$2` 加判空实现）。
 4. 真机挑战：找一份真实 nginx access.log（或网上的样例日志），调整字段序号跑通整套流水线，写出你发现的三个事实。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：每个 IP 的错误请求数 Top 3**
+
+```bash
+# 先过滤错误行，再按 IP 聚合计数（先过滤再聚合）
+awk '$6 >= 400' access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -n 3
+
+# 或一条 awk 完成：只对错误行计数
+awk '$6 >= 400 {e[$1]++} END {for (ip in e) print e[ip], ip}' access.log | sort -rn | head -n 3
+```
+
+两种写法等价。前一种管道语义更直白；后一种用模式 `$6 >= 400` 做前置过滤，关联数组只统计错误请求。输出示例（数据由 srand(7) 固定，可自行核对）：
+
+```text
+7 10.0.0.9
+6 192.168.1.3
+5 203.0.113.9
+```
+
+**第 2 题：每个路径的 P95 耗时**
+
+先按路径 + 耗时双重排序，再对每个路径分组取 95% 分位：
+
+```bash
+# 思路一：sort 让同一路径相邻且耗时升序，awk 分组取位
+sort -k5 -k8n access.log | awk '
+  {n[$5]++; t[$5][n[$5]] = $8}
+  END {
+    for (p in n) {
+      idx = int(n[p] * 0.95)
+      if (idx < 1) idx = 1
+      printf "%-16s P95 = %6.1f ms (n=%d)\n", p, t[p][idx], n[p]
+    }
+  }' | sort -k4
+
+# 思路二：每个路径分别抽耗时再算（逐路径）
+for p in /index /api/users /api/orders /login /static/app.js; do
+  awk -v path="$p" '$5 == path {print $8}' access.log | sort -n |
+    awk -v path="$p" '{a[NR]=$1} END {print path, a[int(NR*0.95)] " ms"}'
+done
+```
+
+思路一利用 `sort -k5 -k8n`（先按路径列、再按耗时数字排）让每个路径的耗时有序排列，awk 里用二维数组 `t[$5][n[$5]]` 按出现顺序存耗时，END 里取 `int(次数*0.95)` 位置的耗时。预期结果：`/api/orders` 的 P95 明显高于其他路径（数据生成时故意注入了慢接口）。
+
+**第 3 题：report.sh 加条形图 + 可配置 Top N**
+
+```bash
+cat > report2.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+LOG=$1
+TOP=${2:-3}                    # 第二个参数控制 Top N，默认 3
+
+if [ ! -f "$LOG" ]; then
+  echo "usage: report2.sh <logfile> [topN]"
+  exit 1
+fi
+
+section() { echo ''; echo "===== $1 ====="; }
+
+echo "日志报告: $LOG ($(wc -l < "$LOG") 行)"
+
+section "Top $TOP IP"
+awk '{print $1}' "$LOG" | sort | uniq -c | sort -rn | head -n "$TOP"
+
+section '状态码分布'
+awk '{c[$6]++} END {for (k in c) print k, c[k]}' "$LOG" | sort
+
+section '错误率'
+awk '$6 >= 400 {e++} END {printf "%.1f%% (%d/%d)\n", e*100/NR, e, NR}' "$LOG"
+
+section "最慢路径 Top $TOP (平均耗时)"
+awk '{n[$5]++; s[$5] += $8} END {for (p in n) printf "%8.1f ms  %s\n", s[p]/n[p], p}' "$LOG" | sort -rn | head -n "$TOP"
+
+section '每分钟请求数条形图'
+cut -d ' ' -f 2 "$LOG" | cut -d : -f 1,2 | sort | uniq -c |
+  awk '{bar=""; for (i=0; i<$1/5; i++) bar=bar "#"; printf "%s %4d %s\n", $2, $1, bar}'
+EOF
+chmod +x report2.sh
+
+./report2.sh access.log        # 默认 Top 3
+./report2.sh access.log 5      # Top 5
+```
+
+要点：`${2:-3}` 实现可选参数默认值；`head -n "$TOP"` 把 N 传进管道；条形图小节复用第 5 节的 `cut + uniq -c + awk` 画柱逻辑。
+
+**第 4 题：真实 nginx 日志适配**
+
+真实 nginx `access.log` 常见格式（combined 格式）：
+
+```text
+203.0.113.5 - - [31/Jul/2026:10:00:01 +0800] "GET /api/users HTTP/1.1" 200 532 0.245
+```
+
+字段序号与本章演示日志不同，适配示例：
+
+```bash
+# 字段映射（按空格切分）：
+# $1=IP, $3=时间, $6=方法(带引号), $7=路径, $9=状态码, $10=字节, $11=耗时
+
+# Top 5 IP
+awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -n 5
+
+# 状态码分布
+awk '{print $9}' access.log | sort | uniq -c | sort -rn
+
+# 错误率
+awk '$9 >= 400 {e++} END {printf "error rate: %.1f%%\n", e*100/NR}' access.log
+
+# 慢请求 Top 5（耗时按 nginx $request_time，可能带引号需清理）
+awk '{print $11}' access.log | sort -rn | head -n 5
+
+# 最慢路径
+awk '{n[$7]++; s[$7] += $11} END {for (p in n) printf "%8.3f ms  %s\n", s[p]/n[p], p}' access.log | sort -rn | head
+```
+
+建议写下的三个事实（示例）：某 IP 的请求量异常突出（可能是爬虫或监控探活）；`/api/xxx` 路径的平均耗时是其他路径的数倍（慢接口）；某段时间内 5xx 状态码集中出现（故障窗口）。具体数字取决于你拿到的日志。若字段带引号/中括号，先用 `sed` 或 `awk -F'"'` 清理后再分析。
+</Answer>
 </Callout>

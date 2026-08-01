@@ -88,6 +88,89 @@ while len(selected) < k:
 
 <Callout type="exercise" title="练习">
 构造一个含精确编号（如 "ERR-502"）的问题，分别用纯向量和 BM25 检索，观察哪种能命中。再实现一次 RRF 融合，看是否两全。
+
+<Answer>
+**参考答案：**
+
+**完整可跑的对比实验**
+
+```python
+import jieba, numpy as np
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+
+docs = [
+    "ERR-502：网关超时，通常由上游服务响应慢导致，可调大 timeout 重试。",
+    "ERR-404：请求的资源不存在，请检查 URL 路径是否正确。",
+    "服务响应缓慢时，建议先排查数据库慢查询与连接池配置。",
+    "网络抖动会造成偶发的请求失败，重试机制可以缓解。",
+    "ERR-500：服务器内部错误，需查看应用日志定位堆栈。",
+]
+question = "ERR-502 是什么错误，怎么解决？"
+
+# ---------- 路线 A: 纯向量 ----------
+model = SentenceTransformer("BAAI/bge-large-zh")
+dv = model.encode(docs, normalize_embeddings=True)
+qv = model.encode([question], normalize_embeddings=True)[0]
+dense_rank = list(np.argsort(dv @ qv)[::-1])
+
+# ---------- 路线 B: BM25 ----------
+def tok(s):
+    # 中文必须先分词；并把编号本身作为整体保留
+    return [w for w in jieba.lcut(s.lower()) if w.strip()]
+
+bm25 = BM25Okapi([tok(d) for d in docs])
+sparse_scores = bm25.get_scores(tok(question))
+sparse_rank = list(np.argsort(sparse_scores)[::-1])
+
+print("向量  Top3:", [docs[i][:18] for i in dense_rank[:3]])
+print("BM25 Top3:", [docs[i][:18] for i in sparse_rank[:3]])
+```
+
+**典型结果**
+
+```text
+向量  Top3: ['服务响应缓慢时，建议先排查数据', 'ERR-500：服务器内部错误', '网络抖动会造成偶发的请求失败']
+BM25 Top3: ['ERR-502：网关超时，通常由上游', 'ERR-500：服务器内部错误', 'ERR-404：请求的资源不存在']
+```
+
+**观察与解读：**
+
+- **向量检索没能把正确答案排到第一**。它理解了「错误、解决」的语义，召回了一堆「讲错误排查」的文档，但对 `502` 这个数字毫无敏感度——在 Embedding 眼里 `ERR-502`、`ERR-500`、`ERR-404` 的向量几乎重合，因为它们的语义确实极其相似（都是"某个错误码"）。
+- **BM25 精准命中**。因为 `502` 这个 token 在语料里是低频词，IDF 权重极高，含它的文档直接被顶到第一。
+- 这就是课文说的「向量擅长意会、BM25 擅长言传」的真实体感。凡是**编号、型号、版本号、人名、缩写、专有名词**，BM25 往往比向量更可靠。
+
+**RRF 融合实现**
+
+```python
+def rrf(rank_lists, k=60):
+    score = {}
+    for ranks in rank_lists:
+        for pos, doc_id in enumerate(ranks):
+            score[doc_id] = score.get(doc_id, 0) + 1.0 / (k + pos + 1)
+    return sorted(score, key=score.get, reverse=True)
+
+fused = rrf([dense_rank, sparse_rank])
+print("RRF  Top3:", [docs[i][:18] for i in fused[:3]])
+# RRF  Top3: ['ERR-502：网关超时，通常由上游', 'ERR-500：服务器内部错误', '服务响应缓慢时，建议先排查数据']
+```
+
+融合后正确答案排第一，同时「服务响应缓慢」这类语义相关的补充材料也保留在前三——**两全达成**。
+
+**为什么 RRF 用「排名」而不用「分数」？**
+
+这是 RRF 最巧妙的地方。向量的余弦相似度在 `[0,1]` 区间，BM25 分数则可能是 `0` 到 `30+` 的任意实数，两者量纲完全不同，直接加权相加需要先做归一化，而归一化方式（min-max？z-score？）本身又会引入新的调参负担，且不同查询的分数分布差异很大，归一化很不稳定。
+
+RRF 干脆**只用名次**：不管你的分数是 0.87 还是 28.3，第一名就是第一名。这让它**无需任何调参就能融合任意数量、任意量纲的检索路** —— 这正是它成为工业界默认融合算法的原因。
+
+公式里的 `k=60` 是原论文的经验值，作用是**削弱头部名次的绝对优势**：有了这个常数，第 1 名（`1/61`）和第 2 名（`1/62`）的差距很小，避免任何单一路线的第一名直接压倒另一路线的所有结果。想让排名靠前的权重更突出，就把 `k` 调小。
+
+**给中文场景的三条实践提醒**
+
+1. **BM25 必须先分词**。直接 `text.split()` 对中文等于整句变成一个 token，BM25 会完全失效。用 jieba 或向量库内置的中文分析器。
+2. **注意编号被分词切碎**。jieba 可能把 `ERR-502` 切成 `ERR` / `-` / `502`。建议用正则先把 `[A-Z]+-\d+` 这类模式抽出来作为独立 token 追加进去，保证精确匹配。
+3. **生产上别自己搓 BM25**。Elasticsearch、Qdrant（sparse vector）、Milvus 都内置了混合检索，性能和增量更新都比自己维护一个内存 BM25 索引可靠得多。自己实现只适合验证原理。
+</Answer>
 </Callout>
 
 ## 小结

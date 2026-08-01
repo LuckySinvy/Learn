@@ -519,6 +519,91 @@ ORDER BY pv DESC;
 3. 用 `roundDown` + `bar()` 画出 `duration_ms` 的分布直方图，分桶为 `[0, 200, 500, 1000, 3000, 5000]`。
 4. 用 `WITH ROLLUP` 一次性查出「按国家×设备」「按国家」「总计」三个层级的 PV。
 5. 用 URL 函数从 `page` 里提取路径中的数字 ID（`/p/183` → `183`），统计访问量 top 10 的商品。分别用 `extract` 正则和 `splitByChar` 实现，对比 Elapsed。
+
+<Answer>
+**参考答案：**
+
+1. 每小时 PV 曲线 + 补零：
+
+```sql
+SELECT
+    toStartOfHour(event_time) AS hour,
+    count()                   AS pv
+FROM events
+WHERE event_time >= '2024-06-15' AND event_time < '2024-06-16'
+GROUP BY hour
+ORDER BY hour
+    WITH FILL
+    FROM toDateTime('2024-06-15 00:00:00')
+    TO   toDateTime('2024-06-16 00:00:00')
+    STEP INTERVAL 1 HOUR;
+```
+
+结果有 24 行（0 点到 23 点），没有事件的整点自动补 `pv = 0`。删掉 `WITH FILL` 跑一遍对比，就能看到缺失的小时。这是画时间序列图防断线的必备技巧。
+
+2. 每个国家 PV 最高的 3 个页面：
+
+```sql
+SELECT country, page, count() AS pv
+FROM events
+GROUP BY country, page
+ORDER BY country, pv DESC
+LIMIT 3 BY country;
+```
+
+`LIMIT n BY` 对每个 `country` 分组各取前 3 行，比「窗口函数 + 子查询过滤 rn」更简洁、更快。
+
+3. `duration_ms` 分布直方图：
+
+```sql
+SELECT
+    roundDown(duration_ms, [0, 200, 500, 1000, 3000, 5000]) AS bucket,
+    count() AS cnt,
+    bar(count(), 0, 600000, 40) AS chart
+FROM events
+GROUP BY bucket
+ORDER BY bucket;
+```
+
+每个值会落到「小于等于它的最大桶边界」，如 199→0、250→200、4500→3000，终端里直接画出 ASCII 柱状图。
+
+4. 三个层级一次查：
+
+```sql
+SELECT country, device, count() AS pv
+FROM events
+GROUP BY country, device WITH ROLLUP
+ORDER BY country, device;
+```
+
+输出包含 `(country, device)` 明细行、`(country)` 小计（device 为默认空值）、以及一行总计（country 也为空）。`WITH CUBE` 还会额外输出 `(device)` 维度。
+
+5. 提取商品 ID 的两种实现：
+
+```sql
+-- 方式一：正则 extract（RE2 引擎，较慢）
+SELECT
+    toUInt32(extract(page, '/p/(\\d+)')) AS product_id,
+    count() AS pv
+FROM events
+WHERE page LIKE '/p/%'
+GROUP BY product_id
+ORDER BY pv DESC
+LIMIT 10;
+
+-- 方式二：splitByChar（纯字符串切片，更快）
+SELECT
+    toUInt32OrZero(splitByChar('/', page)[3]) AS product_id,
+    count() AS pv
+FROM events
+WHERE page LIKE '/p/%'
+GROUP BY product_id
+ORDER BY pv DESC
+LIMIT 10;
+```
+
+两种方式结果应一致（top 10 商品及 PV 相同），但 `splitByChar` 通常快一个数量级——这正是「能用普通字符串函数就别用正则」的例证。用 `WHERE page LIKE '/p/%'` 先过滤掉非商品页面，两种方式的扫描量都更小。
+</Answer>
 </Callout>
 
 ## 小结

@@ -114,6 +114,130 @@ fn main() {
 
 <Callout type="exercise" title="练习">
 用迭代器把 `Vec<String>` 里所有长度大于 3 的单词转成大写，收集成新 `Vec<String>`（提示：`filter` + `map` + `to_uppercase` + `collect`）。再统计其中字符总数。
+
+<Answer>
+**参考答案：**
+
+```rust
+fn main() {
+    let words: Vec<String> = vec![
+        String::from("rust"),
+        String::from("go"),
+        String::from("python"),
+        String::from("c"),
+        String::from("java"),
+    ];
+
+    // 筛选 + 转换 + 收集
+    let long_upper: Vec<String> = words
+        .iter()                            // 产出 &String
+        .filter(|w| w.len() > 3)           // 只留长度 > 3 的
+        .map(|w| w.to_uppercase())         // 转大写，产出 String
+        .collect();
+
+    println!("结果：{:?}", long_upper);
+
+    // 统计字符总数
+    let total_chars: usize = long_upper.iter().map(|w| w.chars().count()).sum();
+    println!("字符总数 = {}", total_chars);
+}
+```
+
+**输出：**
+
+```text
+结果：["RUST", "PYTHON", "JAVA"]
+字符总数 = 14
+```
+
+**关键点解析：**
+
+- **`iter()` 产出 `&String`**：所以 `filter` 的闭包参数是 `&&String`（双重引用）。得益于自动解引用，写 `w.len()` 就能正常工作，不用手动写 `(**w).len()`
+- **`to_uppercase()` 返回新 `String`**：它不修改原字符串，正好满足我们「不动原数据、生成新集合」的需求。所以原 `words` 在之后依然完整可用
+- **顺序很重要**：`filter` 放在 `map` 前面，只对通过筛选的元素做转换。反过来先 `map` 再 `filter`，就要对全部 5 个元素都做一次大写转换，白白浪费
+- **整条链是惰性的**：`filter` 和 `map` 只是搭建流水线，直到 `collect()` 才真正开始逐元素计算。**中间不会生成任何临时 Vec**——这就是零成本抽象，性能与手写循环相当
+
+**`len()` 与 `chars().count()` 的重要区别**
+
+```rust
+let s = String::from("中文");
+println!("{}", s.len());            // 6  —— UTF-8 字节数
+println!("{}", s.chars().count());  // 2  —— 字符数
+```
+
+`String::len()` 返回的是**字节数**，不是字符数！本题的单词都是 ASCII 所以两者相同，但只要涉及中文或 emoji 就会有出入。按「字符个数」筛选应该写：
+
+```rust
+.filter(|w| w.chars().count() > 3)
+```
+
+**如果不再需要原 Vec，可以用 `into_iter()` 省一次分配：**
+
+```rust
+let long_upper: Vec<String> = words
+    .into_iter()                       // 产出 String（取得所有权）
+    .filter(|w| w.len() > 3)
+    .map(|w| w.to_uppercase())
+    .collect();
+// 此后 words 不可用
+```
+
+**一次遍历同时完成两件事：`filter_map`**
+
+```rust
+let long_upper: Vec<String> = words
+    .iter()
+    .filter_map(|w| {
+        if w.len() > 3 {
+            Some(w.to_uppercase())
+        } else {
+            None
+        }
+    })
+    .collect();
+```
+
+`filter_map` 把「判断 + 转换」合成一步，返回 `None` 的元素被丢弃。在转换本身就可能失败时特别好用：
+
+```rust
+let nums: Vec<i32> = vec!["1", "abc", "3"]
+    .iter()
+    .filter_map(|s| s.parse().ok())    // 解析失败的自动跳过
+    .collect();
+// [1, 3]
+```
+
+**用 `fold` 一趟搞定统计：**
+
+```rust
+let (count, chars) = words
+    .iter()
+    .filter(|w| w.len() > 3)
+    .fold((0, 0), |(c, ch), w| (c + 1, ch + w.chars().count()));
+
+println!("{} 个单词，共 {} 个字符", count, chars);
+// 3 个单词，共 14 个字符
+```
+
+`fold` 是最通用的消费型方法——`sum`、`count`、`max` 本质上都是它的特化版本。
+
+**其他常用适配器速查：**
+
+```rust
+let v = vec![1, 2, 3, 4, 5];
+
+v.iter().enumerate();              // 带下标：(0, &1), (1, &2)...
+v.iter().zip(other.iter());        // 两两配对
+v.iter().take(3);                  // 只取前 3 个
+v.iter().skip(2);                  // 跳过前 2 个
+v.iter().rev();                    // 反向遍历
+v.iter().chain(other.iter());      // 首尾拼接
+v.iter().max();  v.iter().min();   // 返回 Option
+v.iter().position(|&x| x == 3);    // 查找下标，返回 Option
+v.iter().any(|&x| x > 4);          // 是否存在
+v.iter().all(|&x| x > 0);          // 是否全部满足
+```
+</Answer>
 </Callout>
 
 ## 小结

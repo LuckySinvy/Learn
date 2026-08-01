@@ -195,14 +195,148 @@ const initial = useMemo(() => {
 
 <Callout type="exercise" title="练习 1：补完 reducer">
 补全 `edit`、`remove`、`clearDone`、`setFilter` 四个分支，全部用不可变更新。特别说明 `clearDone` 应该用 `filter` 而不是逐个删。
+
+<Answer>
+**参考答案：**
+
+```tsx
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    // ...add / toggle 同上...
+
+    case "edit":
+      return {
+        ...state,
+        todos: state.todos.map((t) =>
+          t.id === action.id ? { ...t, text: action.text } : t
+        ),
+      };
+
+    case "remove":
+      return {
+        ...state,
+        todos: state.todos.filter((t) => t.id !== action.id),
+      };
+
+    case "clearDone":
+      return {
+        ...state,
+        todos: state.todos.filter((t) => !t.done),
+      };
+
+    case "setFilter":
+      return {
+        ...state,
+        filter: action.filter,
+      };
+  }
+}
+```
+
+**为什么 `clearDone` 用 `filter` 而不是逐个删：**
+
+- `filter` 一步表达「保留所有未完成的」，语义清晰，返回的是**全新数组**——符合不可变更新，`Object.is` 能识别新引用，React 才会触发重渲染；
+- 逐个删要么用 `splice`/`pop` 改原数组（违反不可变更新），要么在循环里删除导致索引错位、还得先收集要删的 id 再统一删，代码又绕又容易出 bug；
+- `filter` 就是为「按条件产出新集合」而生的，一行搞定，不需要维护删除过程中的任何状态。
+
+四个分支的共同点：**绝不改 `state`**，而是展开旧状态、生成新的 `todos` 数组——这正是第 2 节「memo / useMemo 正确工作的地基」。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：memo 失效排查">
 你的 `TodoItem` 加了 `React.memo`，但改一个 todo 时其余项仍然全部重渲染。列出至少三个可能原因，并给出对应修复。
+
+<Answer>
+**参考答案：**
+
+**原因 1：回调函数引用不稳定。**
+`onToggle` / `onRemove` 没有用 `useCallback` 包裹，父组件 `TodoApp` 每次重渲染都会生成新的函数引用。`memo` 对每个 prop 做 `Object.is` 比较，`onToggle` 每次都不等 → 所有 `TodoItem` 重渲染。
+
+修复：
+```tsx
+const toggle = useCallback((id: string) => {
+  dispatch({ type: "toggle", id });
+}, []); // 依赖为空，引用永远稳定
+```
+
+**原因 2：传入的 prop 引用不稳定。**
+父组件每次渲染都直接 `todos.filter(...)`（没有 `useMemo`），即使内容没变，`filter` 也返回**新数组、新对象**——`todo` prop 每次都是新引用 → memo 失效。
+
+修复：派生列表用 `useMemo` 缓存，只有依赖真正变化时才产出新引用：
+```tsx
+const visibleTodos = useMemo(
+  () => todos.filter((t) => matchesFilter(t, filter)),
+  [todos, filter]
+);
+```
+
+**原因 3：组件订阅了 Context。**
+`TodoItem` 内部如果用了 `useContext`（比如 FilterContext、主题 Context），`memo` 只挡 props 变化、**不挡 context 变化**——context 值一变，订阅它的组件照样重渲染。
+
+修复：把易变状态从 Context 里拆出来，让 `TodoItem` 完全通过 props 拿数据。
+
+**原因 4：传了每次渲染都新建的对象字面量 prop。**
+比如 `<TodoItem style={{ color: "red" }}>`——每次父渲染都创建新对象，比较恒不相等。
+
+修复：把常量提到模块作用域：
+```tsx
+const ITEM_STYLE = { color: "red" };
+// <TodoItem style={ITEM_STYLE} />
+```
+
+排查顺序建议：逐个 props 看哪个引用不稳定（可在 `TodoItem` 里打印 `memo` 的比较结果）。通常原因 1 或 2 最常见，先修这两个。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：派生数据">
 「剩余未完成数量」和「按筛选条件显示的列表」应该用 `useMemo` 计算，依赖分别是什么？如果把 `todos` 写进 `localStorage` 的副作用也误放进同一个 `useMemo`，会发生什么？
+
+<Answer>
+**参考答案：**
+
+```tsx
+// 剩余未完成数量：只依赖 todos
+const activeCount = useMemo(
+  () => todos.filter((t) => !t.done).length,
+  [todos]
+);
+
+// 按筛选条件显示的列表：依赖 todos 和 filter
+const visibleTodos = useMemo(
+  () => {
+    switch (filter) {
+      case "active": return todos.filter((t) => !t.done);
+      case "done":   return todos.filter((t) => t.done);
+      default:       return todos;
+    }
+  },
+  [todos, filter]
+);
+```
+
+**依赖：** `activeCount` 依赖 `[todos]`；`visibleTodos` 依赖 `[todos, filter]`。
+
+**如果把 localStorage 副作用误放进 useMemo：**
+
+- `useMemo` 是**纯计算**用的：React 可能因并发/StrictMode 在**一次渲染中多次调用**它，也可能在依赖没变时跳过、在依赖变时重算——放进里面的写操作，执行次数和时机都**不可控**，可能重复写、可能漏写；
+- 这违背了「渲染必须是纯函数」的原则（第 1、6 章）：副作用藏在渲染路径里，React 的缓存失效判断和「可安全重复渲染」的前提全部失效；
+- `useMemo` 的目的本来就是「缓存计算结果」，混入副作用会让代码难以推理：看到 `useMemo` 时你预期它是纯的，它却在偷偷写磁盘。
+
+**正确分工（第 5 章的依赖数组）：**
+
+```tsx
+// 读：只算一次
+const initial = useMemo(() => {
+  const raw = localStorage.getItem("todos");
+  return raw ? (JSON.parse(raw) as Todo[]) : [];
+}, []);
+
+// 写：副作用必须进 useEffect，依赖变化才执行
+useEffect(() => {
+  localStorage.setItem("todos", JSON.stringify(state.todos));
+}, [state.todos]);
+```
+</Answer>
 </Callout>
 
 ## 小结

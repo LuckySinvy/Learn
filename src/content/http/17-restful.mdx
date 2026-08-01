@@ -255,4 +255,98 @@ Richardson 成熟度模型把 REST 分四级：L0 一个 URL 全 POST（RPC 式�
 2. 在 Playground 2 的 cursor 接口上模拟"翻页期间插入新数据"：验证 offset 分页会重复读到某条记录而 cursor 不会。
 3. 把 Playground 3 的余额不足错误改用 409 或 400 是否合适？对比 422 说明理由。
 4. 为"订单退款"设计接口：给出 URL、方法、成功与三种失败的状态码及 problem+json 响应体。
+
+<Answer>
+**参考答案：**
+
+**1. 补 PUT 与 DELETE**
+
+```python
+def do_PUT(self):
+    u = urlsplit(self.path)
+    m = re.fullmatch(r"/v1/books/(\w+)", u.path)
+    if not m:
+        self.reply(404, {"error": "not found"}); return
+    book_id = m.group(1)
+    if book_id not in books:
+        self.reply(404, {"error": "not found"}); return    # 不存在也 404
+    n = int(self.headers.get("Content-Length", 0))
+    data = json.loads(self.rfile.read(n))
+    books[book_id] = {"id": book_id, **data}               # 整体替换
+    self.reply(200, books[book_id])                        # 幂等：重复 PUT 结果相同
+
+def do_DELETE(self):
+    u = urlsplit(self.path)
+    m = re.fullmatch(r"/v1/books/(\w+)", u.path)
+    if not m:
+        self.reply(404, {"error": "not found"}); return
+    book_id = m.group(1)
+    if book_id not in books:
+        self.reply(404, {"error": "not found"}); return    # 幂等：第二次 DELETE 也 404
+    del books[book_id]
+    self.reply(204)                                        # 删除成功用 204，无体
+```
+
+注意两点幂等语义：**PUT 重复执行结果是"同一个资源被替换成同一内容"**；**DELETE 第二次返回 404 依然是幂等**（资源不存在这个最终状态没变）。删除成功推荐 204 No Content（不要体）。
+
+**2. 翻页期间插入新数据的差异**
+
+模拟：翻第 2 页前在 DATA 头部插入一条新记录（id 排到最前或按排序规则落在中间）。
+
+- **offset 分页**：`page=2&per_page=5` 是 `LIMIT 5 OFFSET 5`，插入导致行偏移——原本第 2 页里的某条记录被"挤"到第 1 页，**第 2 页重复读到它**（也可能漏掉某条）。偏移固定，插入越靠前影响越大；
+- **cursor 分页**：第 2 页请求 `cursor=<第 1 页最后一条的 id>` 即 `WHERE id > 104 LIMIT 5`，新插入的记录若 id 不大于游标值就不会混进来，**不会重复也不会漏**。代价是不能跳页（没有"第 N 页"概念）。
+
+结论：数据不断变化的场景（信息流、日志）用 cursor；静态数据翻页才考虑 offset。
+
+**3. 409/400 vs 422 是否合适**
+
+"余额不足"本质是**请求语法合法、内容也格式正确，但业务规则不允许**：
+
+- **400 Bad Request**：最不合适。400 语义是"报文/参数不合法"，而这里参数格式完全没问题，只是余额不够——报 400 会误导前端（以为是参数写错了）和监控（归类为客户端格式错误）；
+- **409 Conflict**：语义是"与资源当前状态冲突"（重复创建、版本冲突）。"余额不足"确实是当前余额状态与请求冲突，**用 409 是合理的**；
+- **422 Unprocessable Entity**：语义是"请求语法正确，但语义上无法处理"（RFC 9110 中常用于业务校验失败）。余额不足正是典型，**用 422 也完全合适**。
+
+我的建议：**422 或 409 都行，关键是团队统一**；若希望强调"请求本身有效、是资源状态问题"用 409，若强调"业务规则校验未通过"用 422。唯独别用 400 和 200。
+
+**4. 订单退款接口设计**
+
+- **URL**：`POST /v1/orders/{orderId}/refunds`（退款是一次"动作"，POST 触发，服务器分配退款单 ID；用子资源表达"对订单发起的退款操作"）
+- **方法**：POST（退款不可幂等地重复提交，POST + 幂等键防重；若按"退款单资源"建模，也可 `PUT /v1/refunds/{id}`）
+
+成功：`201 Created` + `Location: /v1/refunds/rf_123` + problem+json 不适用（成功返回退款单资源）。
+
+三种失败及响应体（`application/problem+json`）：
+
+```json
+// 1) 订单不存在：404
+HTTP/1.1 404 Not Found
+Content-Type: application/problem+json
+
+{"type": "https://api.example.com/problems/order-not-found",
+ "title": "订单不存在",
+ "status": 404,
+ "detail": "orderId=10086 不存在"}
+
+// 2) 订单已退款（重复提交）：409 Conflict
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{"type": "https://api.example.com/problems/already-refunded",
+ "title": "该订单已退款",
+ "status": 409,
+ "detail": "退款单 rf_123 已存在，禁止重复退款"}
+
+// 3) 退款金额超限/订单状态不允许：422 Unprocessable Entity
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/problem+json
+
+{"type": "https://api.example.com/problems/refund-not-allowed",
+ "title": "退款不被允许",
+ "status": 422,
+ "detail": "订单已发货 3 天，超过可退款时限",
+ "instance": "/v1/orders/10086/refunds"}
+```
+
+字段约定遵循 RFC 7807：`type`（错误类型 URI）、`title`（人读短语）、`status`、`detail`（本次具体原因）、`instance`（出错资源），可扩展业务字段。配合正确的 4xx 状态码，前端兜底、监控告警各取所需。
+</Answer>
 </Callout>

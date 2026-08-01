@@ -114,6 +114,53 @@ sum(rate(http_requests_total[5m]))
 
 <Callout type="exercise" title="练习">
 用你环境里的指标，写出：① 各实例 CPU 使用率；② 按 `method` 分组的 QPS；③ P95 延迟（提示：`histogram_quantile(0.95, rate(x_bucket[5m]))`，下章详解）。
+
+<Answer>
+**参考答案：**
+
+**① 各实例 CPU 使用率**
+
+主机指标（node-exporter）：
+
+```promql
+100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100
+```
+
+容器指标（cAdvisor）则用：
+
+```promql
+100 - avg by (instance) (rate(container_cpu_usage_seconds_total[5m])) * 100
+```
+
+`avg by (instance)` 把每个实例的所有 CPU 核取平均，得到该实例整体使用率。
+
+**② 按 method 分组的 QPS**
+
+```promql
+sum by (method) (rate(http_requests_total[5m]))
+```
+
+想只看 5xx 也同理，加一个标签过滤：
+
+```promql
+sum by (method) (rate(http_requests_total{status=~"5.."}[5m]))
+```
+
+**③ P95 延迟**
+
+用 `histogram_quantile` 结合直方图的 `_bucket` 指标：
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+两个细节：
+
+- 结果单位是秒，例如 `0.312` 表示 P95 = 312ms，可在面板 Standard options 里把单位设成 `s` 或 `ms`
+- 多实例时先 `sum by (le)` 把分桶合并再算分位数，结果才是全量请求的 P95
+
+**小提示：** 如果环境里没有直方图指标，P95 可以先按实例分别近似看趋势，但要下正式结论仍需要 histogram 数据。
+</Answer>
 </Callout>
 
 ## 小结

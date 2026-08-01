@@ -349,6 +349,83 @@ db.posts.find({ _id: { $gt: ObjectId.createFromTime(new Date("2024-06-01") / 100
 
 <Callout type="exercise" title="练习">
 在 `community` 库上完成：一、用 `insertMany` 一次插入 5 篇帖子，故意让其中两篇 `_id` 重复，分别用有序和无序模式执行，对比 `nInserted`；二、用 `findOneAndUpdate` 实现「阅读数加一并返回新值」；三、用 `updateOne` 配合 `upsert` 实现按日期累计 PV 的计数器，连续执行三次，观察 `upsertedId` 从有值变成 null；四、取任意一个 ObjectId，用 `getTimestamp()` 打印它的创建时间。
+
+<Answer>
+**参考答案：**
+
+**一、`insertMany` 有序 vs 无序对比**
+
+先构造 5 篇帖子，其中 `_id` 为 101 和 104 的两篇故意重复：
+
+```js
+const docs = [
+  { _id: 100, title: "帖子A", views: 10 },
+  { _id: 101, title: "帖子B", views: 20 },
+  { _id: 102, title: "帖子C", views: 30 },
+  { _id: 101, title: "重复ID", views: 40 },
+  { _id: 104, title: "帖子D", views: 50 }
+]
+```
+
+**有序模式（默认）：**
+
+```js
+db.posts.insertMany(docs)
+// MongoBulkWriteError: E11000 duplicate key error ... nInserted: 2
+```
+
+有序模式遇到第一条重复（`_id: 101`）就立刻停止，**前两条已写入、后三条全部被跳过**，所以 `nInserted: 2`。
+
+**无序模式：**
+
+```js
+db.posts.insertMany(docs, { ordered: false })
+// 抛错但 nInserted 为 4：100、101、102、104 都写进去了，只有第二条重复的 101 失败
+```
+
+无序模式会尝试插入所有文档、跳过有问题的、最后统一汇报错误，所以 `nInserted` 是 4。结论：批量导入用 `{ ordered: false }`，一条脏数据不会阻断整批。
+
+**二、`findOneAndUpdate` 阅读数加一并返回新值**
+
+```js
+db.posts.findOneAndUpdate(
+  { _id: 100 },
+  { $inc: { views: 1 } },
+  { returnDocument: "after" }
+)
+// 返回 { _id: 100, title: "帖子A", views: 11 }
+```
+
+关键在 `returnDocument: "after"`（默认是 `"before"` 返回旧文档），这样返回的就是加一之后的新值。
+
+**三、`updateOne` + `upsert` 的按日 PV 计数器**
+
+```js
+db.stats.updateOne(
+  { date: "2024-06-01" },
+  { $inc: { pv: 1 } },
+  { upsert: true }
+)
+```
+
+连续执行三次，观察返回值：
+
+- **第 1 次**：文档不存在，触发插入。返回 `matchedCount: 0, modifiedCount: 0, upsertedId: ObjectId(...)`，新文档是 `{ date: "2024-06-01", pv: 1 }`——upsert 会把 filter 里的等值条件和 `$inc` 的结果合并进新文档。
+- **第 2 次**：文档已存在，走更新路径。返回 `matchedCount: 1, modifiedCount: 1, upsertedId: null`，`pv` 变成 2。
+- **第 3 次**：同上，`upsertedId: null`，`pv` 变成 3。
+
+关键观察：**只有第一次 `upsertedId` 有值，之后都是 null**——这正是「存在即更新、不存在才插入」的语义。
+
+**四、用 `getTimestamp()` 查看 ObjectId 创建时间**
+
+```js
+const id = ObjectId("665f1a2b3c4d5e6f70819204")
+id.getTimestamp()
+// ISODate("2024-06-04T09:31:23.000Z")
+```
+
+`getTimestamp()` 直接返回 ObjectId 前 4 字节时间戳对应的 UTC 时间，可以据此反推文档的创建时刻，无需单独的 `createdAt` 字段索引。
+</Answer>
 </Callout>
 
 ## 小结

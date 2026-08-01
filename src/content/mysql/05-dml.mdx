@@ -249,4 +249,123 @@ SELECT * FROM order_items ORDER BY id DESC LIMIT 1;`}
 1. 把本章示例数据完整灌入 shop 库，并用批量 INSERT 再造 3 个用户、2 笔订单（含明细）。
 2. 用 ON DUPLICATE KEY UPDATE 实现：按 email upsert 用户手机号，分别观察插入和更新时的 affected rows。
 3. 写一条原子扣库存 SQL，把某商品库存扣到 0 之后再执行一次，验证 affected rows 为 0 而不是出现负库存。
+
+<Answer>
+**参考答案：**
+
+**1. 灌入示例数据 + 批量造数**
+
+先按本章「1.3 灌入示例数据」执行 categories / products / orders / order_items 四段 INSERT，然后追加：
+
+```sql
+-- 3 个新用户（一条语句多组 VALUES）
+INSERT INTO users (username, email, phone) VALUES
+  ('frank', 'frank@demo.com', '13900000006'),
+  ('grace', 'grace@demo.com', '13900000007'),
+  ('heidi', 'heidi@demo.com', '13900000008');
+
+-- 2 笔订单
+INSERT INTO orders (order_no, user_id, status, total_amount) VALUES
+  ('SO20260801005', 6, 1, 4127.00),
+  ('SO20260801006', 7, 0,  177.00);
+```
+
+订单明细需要拿到刚插入订单的 id。两种写法：
+
+```sql
+-- 写法 A：靠 order_no 反查，最稳妥（不依赖自增值的连续性）
+INSERT INTO order_items (order_id, product_id, quantity, price)
+SELECT o.id, 2, 1, 3999.00 FROM orders o WHERE o.order_no = 'SO20260801005'
+UNION ALL
+SELECT o.id, 5, 1,  128.00 FROM orders o WHERE o.order_no = 'SO20260801005'
+UNION ALL
+SELECT o.id, 5, 1,  128.00 FROM orders o WHERE o.order_no = 'SO20260801006'
+UNION ALL
+SELECT o.id, 6, 1,   49.00 FROM orders o WHERE o.order_no = 'SO20260801006';
+```
+
+```sql
+-- 写法 B：单条订单插入后立刻用 LAST_INSERT_ID()
+INSERT INTO orders (order_no, user_id, status, total_amount)
+  VALUES ('SO20260801007', 8, 0, 49.00);
+INSERT INTO order_items (order_id, product_id, quantity, price)
+  VALUES (LAST_INSERT_ID(), 6, 1, 49.00);
+```
+
+`LAST_INSERT_ID()` 是**会话级**的，返回本会话最近一次自增插入的值，并发安全。但要注意：批量插入多行时它返回的是这一批的**第一个** id，不是最后一个。
+
+验证：
+
+```sql
+SELECT o.order_no, o.total_amount, COUNT(oi.id) AS item_cnt,
+       SUM(oi.quantity * oi.price) AS calc_amount
+FROM orders o
+LEFT JOIN order_items oi ON oi.order_id = o.id
+GROUP BY o.id, o.order_no, o.total_amount;
+```
+
+**2. Upsert 与 affected rows**
+
+```sql
+-- 第一次：email 不存在 → 走 INSERT
+INSERT INTO users (username, email, phone)
+VALUES ('ivan', 'ivan@demo.com', '13900000009') AS new
+ON DUPLICATE KEY UPDATE phone = new.phone;
+-- Query OK, 1 row affected      ← 1 = 插入
+
+-- 第二次：email 已存在且 phone 变了 → 走 UPDATE
+INSERT INTO users (username, email, phone)
+VALUES ('ivan', 'ivan@demo.com', '13911111111') AS new
+ON DUPLICATE KEY UPDATE phone = new.phone;
+-- Query OK, 2 rows affected     ← 2 = 更新
+
+-- 第三次：email 已存在但 phone 没变 → 无实际改动
+INSERT INTO users (username, email, phone)
+VALUES ('ivan', 'ivan@demo.com', '13911111111') AS new
+ON DUPLICATE KEY UPDATE phone = new.phone;
+-- Query OK, 0 rows affected     ← 0 = 命中但值相同
+```
+
+affected rows 的三态是 MySQL 的特殊约定，务必记牢：
+
+| 返回值 | 含义 |
+|---|---|
+| 1 | 新插入了一行 |
+| 2 | 命中唯一键并**真的改变了**某列的值 |
+| 0 | 命中唯一键，但新值与旧值完全相同，未产生变更 |
+
+「2」不代表影响了两行，而是 MySQL 把「删旧值 + 写新值」记作 2。如果应用代码用 `affectedRows == 1` 判断「插入成功」，遇到 0 和 2 就会误判——这是很常见的线上 bug。
+
+`AS new` 别名是 8.0.20+ 的推荐写法；老版本用 `ON DUPLICATE KEY UPDATE phone = VALUES(phone)`，两者等价，但 `VALUES()` 在 8.0.20 起已被标记为 deprecated。
+
+**3. 原子扣库存验证**
+
+```sql
+-- 准备：把 id=1 的库存设为 1
+UPDATE products SET stock = 1 WHERE id = 1;
+
+-- 第一次扣减：成功
+UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock >= 1;
+-- Query OK, 1 row affected
+SELECT id, name, stock FROM products WHERE id = 1;   -- stock = 0
+
+-- 第二次扣减：条件 stock >= 1 不成立，一行都匹配不到
+UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock >= 1;
+-- Query OK, 0 rows affected      ← 关键：没扣成
+SELECT id, name, stock FROM products WHERE id = 1;   -- stock 仍是 0，没有变成 -1
+```
+
+扣多件时把数量也写进条件：
+
+```sql
+UPDATE products SET stock = stock - 3 WHERE id = 1 AND stock >= 3;
+```
+
+**为什么这样写是安全的**：
+
+- InnoDB 执行 UPDATE 时会对匹配到的行加**排他行锁**，「读当前值 → 判断 → 写回」在同一条语句内完成，是原子的。并发的两个请求会串行化，不可能同时通过 `stock >= 1` 的检查。
+- 对比「先 `SELECT stock` 判断，再 `UPDATE stock = 0`」：两条语句之间存在时间窗口，两个请求可能都读到 stock=1 都认为可以扣，最终超卖。
+- 业务层判断依据是 **affected rows**，而不是再查一次库存：`affectedRows == 0` 就返回「库存不足」。
+- 额外保险：给 `stock` 加 `UNSIGNED` 类型或 `CHECK (stock >= 0)` 约束，即使 SQL 写漏了条件，负数也会被数据库直接拒绝（UNSIGNED 列减成负数会报 `BIGINT UNSIGNED value is out of range`）。
+</Answer>
 </Callout>

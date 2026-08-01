@@ -167,6 +167,45 @@ WiredTiger cache 之外，操作系统的文件缓存、连接的栈空间、聚
 
 <Callout type="exercise" title="练习">
 不用打开电脑，先用纸笔做一件事：把你现在维护的某个业务的核心表结构（3 到 5 张表）画出来，然后标注哪些表「总是一起读、一起写」。这份标注就是你把它迁到 MongoDB 时的内嵌候选清单，第 12 章我们会回来验证你的判断。
+
+<Answer>
+**参考答案：**
+
+这个练习没有标准答案，重点在于学会用「读写单元」的视角审视表结构。下面以一个典型的**电商订单**业务为例，演示完整的标注过程。
+
+**1. 画出核心表结构（4 张表）**
+
+```text
+users       (id, nickname, mobile)
+orders      (id, user_id, total_amount, status, created_at)
+order_items (id, order_id, sku_id, name, price, qty)
+addresses   (id, user_id, receiver, phone, detail)
+```
+
+**2. 标注「总是一起读、一起写」的组合**
+
+- `orders` + `order_items`：下单时订单和明细是**同一次写**；查看订单详情时又是**同一次读**，从不同开。→ 内嵌候选。
+- `orders` + `addresses`：下单时收货地址应**快照**进订单（地址后续修改不应影响历史订单），读写都在一起。→ 内嵌候选。
+- `users` + `orders`：列表页通常先查用户再分页查订单，两个对象各自独立更新频繁。→ 保持引用，不内嵌。
+
+**3. 得到 MongoDB 文档形态**
+
+```js
+{
+  _id: ObjectId("665f1a2b3c4d5e6f70819200"),
+  userId: ObjectId("665f1a2b3c4d5e6f70819201"),
+  totalAmount: 199,
+  status: "paid",
+  address: { receiver: "张三", phone: "13800000000", detail: "北京市海淀区..." },
+  items: [
+    { skuId: "1001", name: "无线鼠标", price: 99, qty: 1 },
+    { skuId: "1002", name: "机械键盘", price: 100, qty: 1 }
+  ]
+}
+```
+
+**判断口诀**：如果 A 离开 B 就没有独立的读写意义，就内嵌；如果 A 会被多处独立引用、频繁独立更新，就引用。第 12 章会详细展开这两种建模策略的取舍，到时可以回来对照你的标注。
+</Answer>
 </Callout>
 
 ## 小结

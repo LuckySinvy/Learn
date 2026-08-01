@@ -405,18 +405,424 @@ catch (err) {
 3. 头像上传
 4. 验证码输入框，输满 6 位自动提交
 5. 富文本编辑器（第三方库）
+
+<Answer>
+**参考答案：**
+
+| # | 场景 | 选择 | 关键理由 |
+|---|---|---|---|
+| 1 | 实时联想搜索框 | **受控** | 每次输入都要驱动防抖和请求 |
+| 2 | 30 字段企业录入 | **非受控** | 逐字重渲染 30 个字段不划算 |
+| 3 | 头像上传 | **必须非受控** | `file` 输入的 `value` 是只读的 |
+| 4 | 6 位验证码 | **受控** | 要过滤、截断、判断长度 |
+| 5 | 富文本编辑器 | **非受控** | 强行受控会和编辑器抢光标 |
+
+---
+
+**1. 搜索框，实时显示联想结果 → 受控**
+
+值本身就是驱动业务的输入：要做防抖、要在清空时收起联想面板、要显示「清除」按钮、可能还要支持从历史记录点选后回填。这些都需要 React 持有这个值。
+
+而且它一般只有一个字段，重渲染的开销完全可以忽略。
+
+**2. 30 字段企业信息录入，提交时统一校验 → 非受控**
+
+这是「受控的默认选择」应该让位的典型场景，两个原因：
+
+- **性能**：受控模式下，在任何一个字段里打一个字，整个包含 30 个字段的组件树都会重渲染一次。填完整张表可能触发上千次渲染。
+- **没有收益**：题目明说「提交时统一校验」——没有实时联动、没有输入格式化，React 持有这些值换不来任何东西。
+
+用 `FormData` 一次性读取最省事：
+
+```tsx
+function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+  e.preventDefault();
+  const data = Object.fromEntries(new FormData(e.currentTarget));
+  const result = schema.safeParse(data);   // 提交时才校验
+  // ...
+}
+```
+
+生产项目里更常见的是用 React Hook Form——它本质就是「非受控 + 一层好用的封装」，还顺便解决了错误展示和 schema 集成。
+
+**3. 头像上传 → 必须非受控（这是硬性限制，不是选择）**
+
+`<input type="file">` 的 `value` 属性出于安全原因是**只读**的——如果网页能设置它，就等于能读取用户任意路径的文件。所以 React 根本无法「控制」它。
+
+```tsx
+const fileRef = useRef<HTMLInputElement>(null);
+const [preview, setPreview] = useState<string | null>(null);
+
+function onPick(e: React.ChangeEvent<HTMLInputElement>) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  setPreview(URL.createObjectURL(file));   // 预览地址是「我自己的 state」
+}
+
+useEffect(() => {
+  // 记得释放，否则内存泄漏
+  return () => { if (preview) URL.revokeObjectURL(preview); };
+}, [preview]);
+
+return <input type="file" accept="image/*" ref={fileRef} onChange={onPick} />;
+```
+
+注意区分两件事：**输入框的值**是非受控的（在 DOM 里），**预览图地址**是你自己的 state（受控的）。它们不是一回事。
+
+清空已选文件也只能通过 DOM 操作：`fileRef.current.value = ""`。
+
+**4. 验证码输入框，输满 6 位自动提交 → 受控**
+
+必须在每次输入时插手：
+
+```tsx
+function onChange(e: React.ChangeEvent<HTMLInputElement>) {
+  const next = e.target.value.replace(/\D/g, "").slice(0, 6);   // 只留数字，最多 6 位
+  setCode(next);
+  if (next.length === 6) submit(next);                          // 满 6 位自动提交
+}
+```
+
+过滤非数字、截断超长、判断长度触发提交——这三件事都要求 React 持有并能改写这个值，是受控组件的标准用法（本章 1.2 表格里的「格式化输入」一行）。
+
+**注意别在这里踩坑**：自动提交后如果用户手速快又输了一位，可能重复提交，所以 `submit` 里要有防重逻辑（提交中直接 return）。
+
+**5. 富文本编辑器（第三方库）→ 非受控**
+
+富文本编辑器（Quill、TipTap、CKEditor）内部维护着自己的文档模型和 DOM，还要处理光标位置、选区、输入法组合状态、撤销栈。如果强行受控——每次 `onChange` 都 `setState`，再把新值灌回去——会导致：
+
+- 编辑器根据外部传入的值重建内容 → **光标跳到开头**
+- 中文输入法打到一半被打断 → 无法正常输入
+- 撤销历史被清空
+
+正确做法是「初始化时给一次值，之后只监听」：
+
+```tsx
+const editorRef = useRef<Editor | null>(null);
+const [content, setContent] = useState(initialHtml);
+
+useEffect(() => {
+  const editor = createEditor(el, { initialValue: initialHtml });
+  editor.on("change", () => setContent(editor.getHTML()));   // 单向：编辑器 → React
+  editorRef.current = editor;
+  return () => editor.destroy();     // 必须清理
+}, []);   // 注意空依赖：不要因为 content 变化就重建编辑器
+```
+
+数据流是**单向**的（编辑器 → React），而不是受控组件那种闭环。真的需要从外部改内容时（比如「插入模板」按钮），走编辑器提供的命令式 API：`editorRef.current.setContent(...)`，而不是改 state 让它回灌。
+
+**这一条推广开来就是本章表格最后一行的「集成非 React 的第三方组件」——凡是自己管理 DOM 的库，都不要试图受控它。**
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：实现 touched 逻辑">
 写一个 `useField(name, validators)` 自定义 Hook，返回 `value`、`error`、`touched` 和一组可以直接展开到 input 上的 props（value、onChange、onBlur）。
 
 要求：首次校验在 blur，之后每次 change 都校验。写完后用它重构一个三字段的登录表单，对比代码量。
+
+<Answer>
+**参考答案：**
+
+**Hook 实现：**
+
+```tsx
+type Validator = (value: string) => string | null;
+
+function useField(name: string, validators: Validator[] = [], initial = "") {
+  const [value, setValue] = useState(initial);
+  const [touched, setTouched] = useState(false);
+  const [error, setError] = useState("");
+
+  // 调用方一般传的是数组字面量，每次渲染都是新引用。
+  // 用 ref 存住，避免它污染下面的依赖数组（第 5、7 章的老问题）
+  const rulesRef = useRef(validators);
+  rulesRef.current = validators;
+
+  const run = useCallback((v: string): string => {
+    for (const rule of rulesRef.current) {
+      const err = rule(v);
+      if (err) return err;
+    }
+    return "";
+  }, []);
+
+  function onChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const next = e.target.value;
+    setValue(next);
+    if (touched) setError(run(next));   // ★ 碰过之后才实时校验
+  }
+
+  function onBlur() {
+    setTouched(true);                   // ★ 首次校验发生在这里
+    setError(run(value));
+  }
+
+  // 提交时强制校验（用户可能一个字段都没碰就点了提交）
+  function validate(): boolean {
+    setTouched(true);
+    const err = run(value);
+    setError(err);
+    return err === "";
+  }
+
+  const showError = touched && error !== "";
+
+  return {
+    value,
+    error,
+    touched,
+    showError,
+    setValue,
+    validate,
+    // 可以整个展开到 input 上
+    props: {
+      name,
+      id: name,
+      value,
+      onChange,
+      onBlur,
+      "aria-invalid": showError || undefined,
+      "aria-describedby": showError ? name + "-err" : undefined,
+    },
+  };
+}
+```
+
+**用它重构登录表单：**
+
+```tsx
+const required = (msg = "必填"): Validator => (v) => (v.trim() ? null : msg);
+const minLen = (n: number): Validator => (v) =>
+  v.length >= n ? null : "至少 " + n + " 个字符";
+const isEmail: Validator = (v) =>
+  /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v) ? null : "邮箱格式不正确";
+
+function LoginForm() {
+  const email = useField("email", [required(), isEmail]);
+  const password = useField("password", [required(), minLen(8)]);
+  const code = useField("code", [required(), minLen(6)]);
+
+  const [status, setStatus] = useState<"idle" | "submitting">("idle");
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (status === "submitting") return;
+
+    // 注意用数组收集再判断，不能用 && 短路 —— 否则后面的字段不会被校验
+    const results = [email.validate(), password.validate(), code.validate()];
+    if (results.some((ok) => !ok)) return;
+
+    setStatus("submitting");
+    try {
+      await api.login({
+        email: email.value,
+        password: password.value,
+        code: code.value,
+      });
+    } finally {
+      setStatus("idle");
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} noValidate>
+      <Row label="邮箱" field={email} type="email" autoComplete="email" />
+      <Row label="密码" field={password} type="password" autoComplete="current-password" />
+      <Row label="验证码" field={code} inputMode="numeric" />
+      <button type="submit" disabled={status === "submitting"}>
+        {status === "submitting" ? "登录中…" : "登录"}
+      </button>
+    </form>
+  );
+}
+
+// 把「标签 + 输入框 + 错误提示」的重复结构也抽出来
+function Row({ label, field, ...rest }: {
+  label: string;
+  field: ReturnType<typeof useField>;
+} & React.InputHTMLAttributes<HTMLInputElement>) {
+  return (
+    <div>
+      <label htmlFor={field.props.id}>{label}</label>
+      <input {...rest} {...field.props} />
+      {field.showError && (
+        <span id={field.props.id + "-err"} role="alert" data-error>
+          {field.error}
+        </span>
+      )}
+    </div>
+  );
+}
+```
+
+**代码量对比：**
+
+| | 手写（本章 3.1 节的写法） | 用 `useField` |
+|---|---|---|
+| 每个字段需要的代码 | 在 `values` / `touched` / `errors` 三个对象里各维护一份，加上 JSX 里的 5 行绑定 | **1 行** `useField(...)` |
+| 加一个字段 | 改 3 处 state 初始值 + 加规则 + 写 JSX | 加 1 行 Hook + 1 行 `<Row>` |
+| 校验时机逻辑 | 每个表单重写一遍 | 封装在 Hook 里，写一次 |
+| 无障碍属性 | 每个 input 手写 | `props` 里自动带上 |
+
+三字段表单大约从 60 行降到 25 行，而且**字段越多优势越明显**——手写方案是线性增长，Hook 方案每个字段只增加两行。
+
+**三个实现细节值得注意：**
+
+**① 为什么 `validators` 要用 ref 存**
+
+调用方写的是 `useField("email", [required(), isEmail])`——这个数组和里面的函数每次渲染都是**全新的**。如果直接把它放进 `useCallback` 的依赖数组，`run` 就永远不稳定，等于没用 `useCallback`。用 ref 存住是第 7 章 `useLatest` 模式的直接应用：**要读最新值，但不想让它成为依赖**。
+
+**② 提交时不能用 `&&` 短路**
+
+```tsx
+// ❌ 邮箱校验失败后，密码和验证码根本不会被校验，用户只能看到一个错误
+if (!email.validate() || !password.validate()) return;
+
+// ✅ 全部执行完再判断，一次性暴露所有问题
+const results = [email.validate(), password.validate(), code.validate()];
+if (results.some((ok) => !ok)) return;
+```
+
+这正是本章说的「提交时一次性暴露所有问题」。
+
+**③ 这个方案的局限**
+
+`useField` 每个字段独立持有 state，所以**跨字段校验做不了**（比如「确认密码要等于密码」）。要支持的话有两条路：
+
+- 给 `Validator` 多传一个「读取整个表单值」的参数（本章 3.2 节的 `sameAs` 就是这个思路）
+- 上层再包一个 `useForm`，由它统一持有所有字段的值，`useField` 从中取——这基本就是在重新发明 React Hook Form 了
+
+**这也正是「什么时候该上表单库」的分界线**：字段独立、规则简单时自己写这个 Hook 很划算；一旦出现跨字段联动、数组字段、异步校验，就该换库了。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：动态字段">
 设计一个「联系人列表」表单：可以添加任意多行，每行有姓名和电话两个字段，每行可删除，至少要有一行。
 
 写出 state 的结构、增删改的不可变更新代码，以及 key 应该用什么（回顾第 2 章：为什么不能用索引）。
+
+<Answer>
+**参考答案：**
+
+**① state 结构**
+
+```tsx
+type Contact = {
+  id: string;      // ★ 稳定身份，专门为 key 而生，不参与提交
+  name: string;
+  phone: string;
+};
+
+function newContact(): Contact {
+  return { id: crypto.randomUUID(), name: "", phone: "" };
+}
+
+const [contacts, setContacts] = useState<Contact[]>(() => [newContact()]);
+//                                                  ↑ 惰性初始化：
+//    否则每次渲染都会调一次 crypto.randomUUID()，虽然结果被丢弃，但没必要
+```
+
+关键点：**`id` 必须在「创建这一行」的时刻生成一次，并跟着数据走完整个生命周期**。绝不能在渲染时现生成——那样每次渲染 key 都不同，等于告诉 React「这些全是新元素」，输入框会在每次按键后被销毁重建（第 2 章 5.3 节的「不要用随机数」）。
+
+**② 增删改**
+
+```tsx
+// 添加一行
+function addRow() {
+  setContacts((prev) => [...prev, newContact()]);
+}
+
+// 删除一行：至少保留一行
+function removeRow(id: string) {
+  setContacts((prev) => {
+    if (prev.length <= 1) return prev;   // 返回原引用，React 会跳过重渲染
+    return prev.filter((c) => c.id !== id);
+  });
+}
+
+// 修改某一行的某个字段
+function updateRow(id: string, key: "name" | "phone", value: string) {
+  setContacts((prev) =>
+    prev.map((c) => (c.id === id ? { ...c, [key]: value } : c))
+  );
+}
+```
+
+三个函数都用了**函数式更新**——因为新值依赖旧值（第 4 章的默认习惯）。而且 `map` / `filter` 返回新数组，只有被修改的那一项换了新对象，其余项引用不变（第 4 章 3.3 节）。
+
+**渲染：**
+
+```tsx
+<div>
+  {contacts.map((c) => (
+    <div key={c.id}>                            {/* ★ 用 id，不是 index */}
+      <input
+        value={c.name}
+        onChange={(e) => updateRow(c.id, "name", e.target.value)}
+        placeholder="姓名"
+      />
+      <input
+        value={c.phone}
+        onChange={(e) => updateRow(c.id, "phone", e.target.value)}
+        placeholder="电话"
+        inputMode="tel"
+      />
+      <button
+        type="button"
+        onClick={() => removeRow(c.id)}
+        disabled={contacts.length <= 1}         {/* 至少一行，从数据推导 */}
+      >
+        删除
+      </button>
+    </div>
+  ))}
+  <button type="button" onClick={addRow}>添加联系人</button>
+</div>
+```
+
+注意「至少一行」这个约束落在**两个地方**：按钮的 `disabled` 是界面层的提醒，`removeRow` 里的 `if` 是数据层的保证。只写前者不够——用户可以通过键盘或程序绕过禁用的按钮。
+
+**③ 为什么 key 不能用索引**
+
+有人会说：「这些输入框都是受控的，值都存在 `contacts` 数组里，就算 DOM 复用错位了，`value` 也会被 React 纠正过来，文本不会错啊？」
+
+**文本确实不会错，但下面这些全都会错位：**
+
+| 会错位的东西 | 表现 |
+|---|---|
+| **焦点** | 删掉第 2 行时，正在第 3 行输入的光标会莫名跳到第 2 行 |
+| **光标位置 / 选区** | 输入框内的插入点跳到开头或末尾 |
+| **输入法组合状态** | 正在打拼音时列表变动，未上屏的字符被吞掉或错行 |
+| **CSS 过渡 / 动画** | 删除动画作用在了错误的行上 |
+| **行内的非受控子组件** | 比如每行有个 `<input type="file">`，已选的文件会跑到别的行 |
+| **行组件自己的 state** | 比如每行有「展开更多字段」的开关，展开状态会串行 |
+
+举个具体的：三行 A、B、C，用户正在 C 行输入手机号，此时点删除 B。
+
+- 用 `key={index}`：React 认为「key=1 这个元素还在，只是内容从 B 变成了 C」，于是**复用了原来 B 的那些 DOM 节点**。焦点还停在原来 B 行的位置上，光标位置也是 B 行输入框的——用户会感觉「光标凭空跳走了」。
+- 用 `key={c.id}`：React 认为「id=b 那个元素被删了，id=c 那个只是位置上移」，**C 行的 DOM 节点被完整保留并移动**，焦点、光标、输入法状态全部原封不动。
+
+**更根本的一点：** 索引表达的是「第几个」，id 表达的是「哪一个」。动态字段表单的全部操作（增、删、拖拽排序）都会让「第几个」和「哪一个」脱钩，所以这里**必须**用 id。
+
+**④ 两个容易忽略的细节**
+
+**提交时把 `id` 剥掉** —— 它是纯前端的渲染标识，不该发给后端：
+
+```tsx
+await api.save({
+  contacts: contacts.map(({ id, ...rest }) => rest),
+});
+```
+
+**校验也要按 id 组织** —— 错误信息同样不能用下标索引，否则删行后错误提示会挂到别的行上：
+
+```tsx
+const [errors, setErrors] = useState<Record<string, { name?: string; phone?: string }>>({});
+// 用 errors[c.id]?.phone 取，而不是 errors[index]
+```
+
+生产项目里，React Hook Form 的 `useFieldArray` 做的就是这件事——它自动给每一行生成一个稳定的 `field.id`，官方文档专门强调「**key 必须用 `field.id`，不能用 index**」，原因和上面完全一样。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：提交流程加固">
@@ -427,6 +833,125 @@ catch (err) {
 3. 表单有未保存修改时，路由跳转前弹出确认
 
 思考每个功能该用 effect 还是事件处理，以及清理逻辑写在哪。
+
+<Answer>
+**参考答案：三个功能都要用 effect，但理由各不相同。**
+
+---
+
+**功能 1：提交成功后 3 秒自动跳转，期间显示倒计时 → useEffect**
+
+第 5 章练习说过「表单保存成功后跳转」应该写在事件里，为什么这里变了？**因为多了「3 秒」和「倒计时显示」**：
+
+- 倒计时数字是要渲染出来的 state，得有东西驱动它每秒变化
+- 定时器是持续存在的资源，**必须能在组件卸载时取消**——用户可能在这 3 秒内自己点了别的链接走了，这时不取消就会强行把他拽回去
+
+```tsx
+const [countdown, setCountdown] = useState(3);
+
+useEffect(() => {
+  if (status !== "success") return;      // 只在成功态启动
+
+  setCountdown(3);
+  const tick = setInterval(() => setCountdown((c) => c - 1), 1000);
+  const go = setTimeout(() => navigate("/orders"), 3000);
+
+  return () => {                          // ★ 清理写在这里
+    clearInterval(tick);
+    clearTimeout(go);
+  };
+}, [status, navigate]);
+
+// 渲染
+{status === "success" && <p>提交成功，{countdown} 秒后跳转…</p>}
+```
+
+**两个细节：**
+
+- 用 `setInterval` 管显示、`setTimeout` 管跳转，比在 interval 回调里判断 `c <= 1` 再跳转更干净——**不要在 `setState` 的更新函数里做副作用**，更新函数必须是纯的（第 4 章）。
+- `if (status !== "success") return` 放在最前面，等于「非成功态时这个 effect 什么都不做，也不需要清理」。
+
+---
+
+**功能 2：提交中途关闭页面时弹确认 → useEffect**
+
+订阅浏览器 API，是第 5 章说的「和 React 之外的系统同步」的标准场景。**订阅和退订必须配对在同一个 effect 里。**
+
+```tsx
+const isDirty = status === "submitting" || hasUnsavedChanges;
+
+useEffect(() => {
+  if (!isDirty) return;                  // ★ 只在真的有风险时才注册
+
+  function onBeforeUnload(e: BeforeUnloadEvent) {
+    e.preventDefault();
+    e.returnValue = "";                  // 老浏览器需要这一行才会弹
+  }
+
+  window.addEventListener("beforeunload", onBeforeUnload);
+  return () => window.removeEventListener("beforeunload", onBeforeUnload);
+}, [isDirty]);
+```
+
+**为什么不能写在事件里：** 根本没有对应的事件可写——「用户关闭标签页」不是 React 能感知的交互。而且监听器一旦注册，必须保证在组件消失时被移除，否则用户跳到别的页面后关浏览器还会被莫名拦一下。
+
+**三个坑：**
+
+1. **不要无条件注册。** 一进表单页就挂 `beforeunload`，用户什么都没填就想关标签页也被拦——这是很招人烦的体验。必须由 `isDirty` 控制。
+2. **提示文案改不了。** 浏览器出于安全考虑只显示自己的通用文案，`e.returnValue = "你的自定义文字"` 早就被忽略了。
+3. **它只管「关闭 / 刷新 / 跳外链」。** SPA 内部的路由跳转它完全拦不住——那是功能 3 的事。
+
+---
+
+**功能 3：有未保存修改时，路由跳转前弹确认 → 路由库提供的 effect 式 API**
+
+这是最容易答错的一题。很多人以为功能 2 的 `beforeunload` 顺带就把它解决了，**并没有**：SPA 的路由跳转只是改了内存里的状态和地址栏，页面根本没卸载，浏览器不会触发 `beforeunload`。
+
+拦截路由必须由路由层提供能力。以 React Router（第 17 章）为例：
+
+```tsx
+// React Router 6.4+ 的 data router
+const blocker = useBlocker(
+  ({ currentLocation, nextLocation }) =>
+    isDirty && currentLocation.pathname !== nextLocation.pathname
+);
+
+useEffect(() => {
+  if (blocker.state !== "blocked") return;
+  if (window.confirm("有未保存的修改，确定离开吗？")) {
+    blocker.proceed();     // 放行
+  } else {
+    blocker.reset();       // 留下
+  }
+}, [blocker]);
+```
+
+本质上它仍然是「订阅一个外部系统（路由器）」，只是这个外部系统由路由库封装好了，`useBlocker` 内部帮你做了注册和注销。
+
+---
+
+**汇总：**
+
+| 功能 | 归属 | 清理什么 | 清理写在哪 |
+|---|---|---|---|
+| 1 倒计时跳转 | effect（依赖 `status`） | `clearInterval` + `clearTimeout` | effect 的返回函数 |
+| 2 关闭页面确认 | effect（依赖 `isDirty`） | `removeEventListener` | effect 的返回函数 |
+| 3 路由跳转确认 | effect（路由库 API） | 由 `useBlocker` 内部处理 | 库负责 |
+
+**为什么三个都是 effect，可以归纳成一句话：** 它们要建立的都是**持续存在的资源**（定时器、事件监听、导航拦截器），而不是**一次性动作**。凡是「建立了就得记着拆掉」的东西，就必须放进 effect，因为只有 effect 的清理函数能保证「无论组件因为什么原因消失，拆除逻辑都会执行」。
+
+对照第 5 章练习 1 的第 5 题「保存成功后跳转」——那是一次性动作，做完就结束，没有任何东西需要拆除，所以写在事件里。**「一次性动作 vs 持续资源」才是真正的分界线**，而不是「有没有用户操作参与」。
+
+**最后一个工程上的建议：** 功能 2 和 3 应该合成一个自定义 Hook，因为它们是同一个需求的两半：
+
+```tsx
+function useUnsavedChangesWarning(isDirty: boolean, message: string) {
+  // 内部同时处理 beforeunload 和路由 blocker
+}
+```
+
+用一句话就能说清它负责什么，且不含具体页面名——符合第 6 章「好 Hook 的判断标准」。
+</Answer>
 </Callout>
 
 ## 小结

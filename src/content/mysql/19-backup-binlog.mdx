@@ -173,4 +173,85 @@ mysqlbinlog -v --base64-output=decode-rows binlog.000013 \
 1. 对 shop 库做一次带位点的 mysqldump 备份，然后插入几行新数据、再故意 DELETE 一部分，完整走一遍 PITR 把数据恢复到 DELETE 之前，核对行数。
 2. 用 `mysqlbinlog -v --base64-output=decode-rows` 找到你那条 DELETE 在 binlog 里的事件，写出对应的反向 INSERT。
 3. 制定一份备份策略文档：备份方式、频率、保留期、binlog 保留期、恢复演练周期，并说明 RPO/RTO 目标。
+
+<Answer>
+
+**参考答案：**
+
+**1. 完整 PITR 演练（恢复到误删之前）**
+
+假设 `orders` 表原有数据，先做一次带位点的全量备份，再制造「插入 + 误删」，最后在新实例上恢复到误删前并核对行数：
+
+```bash
+# ① 全量备份（记录 binlog 位点），并记下 orders 当前行数
+mysql -uroot -p shop -e "SELECT COUNT(*) AS before_cnt FROM orders;"
+mysqldump --single-transaction --source-data=2 \
+  --routines --triggers --events --databases shop \
+  -uroot -p | gzip > shop_full.sql.gz
+
+# ② 插入几行新数据（制造正常变更）
+mysql -uroot -p shop -e "INSERT INTO orders(order_no,user_id,status,total_amount,created_at) \
+  VALUES ('SO_TEST_1',1,1,99.00,NOW()),('SO_TEST_2',2,1,199.00,NOW());"
+
+# ③ 故意误删一部分（事故点），记下被删行数
+mysql -uroot -p shop -e "DELETE FROM orders WHERE id BETWEEN 100 AND 199;"   # 假设删了 100 行
+
+# ④ 保护现场 + 找到备份里的起始位点
+zcat shop_full.sql.gz | grep "CHANGE MASTER"
+# 假设输出：MASTER_LOG_FILE='binlog.000012', MASTER_LOG_POS=157
+
+# ⑤ 先定位误删的精确位置（用 -v 反解析，找到 DELETE 事务的 end_log_pos）
+mysqlbinlog -v --base64-output=decode-rows binlog.000012 \
+  | grep -n -B2 -A6 "DELETE FROM.*orders" | head
+
+# ⑥ 恢复到【新实例】recover_host，重放 02:00 之后、误删之前的 binlog
+gunzip < shop_full.sql.gz | mysql -h recover_host -uroot -p
+mysqlbinlog --start-position=157 --stop-datetime="<误删前一刻>" \
+  binlog.000012 binlog.000013 | mysql -h recover_host -uroot -p
+
+# ⑦ 核对：新实例行数 = 备份时行数 + 插入的 2 行（误删的 100 行应消失）
+mysql -h recover_host -uroot -p shop -e "SELECT COUNT(*) AS after_cnt FROM orders;"
+```
+
+核对要点：恢复后的行数应当等于「备份时行数 + 正常插入的 2 行」，而误删掉的 100 行不应出现。若用 `--stop-position` 精确截到误删事务之前，比 `--stop-datetime` 更稳。
+
+**2. 反向 INSERT（从 ROW 格式 binlog 解析）**
+
+ROW 格式在 `-v` 下会打印每行的 `WHERE` 旧值镜像。例如 binlog 里看到：
+
+```text
+### DELETE FROM `shop`.`orders`
+### WHERE
+###   @1=150 /* id */
+###   @2='SO000000000150' /* order_no */
+###   @3=3 /* user_id */
+###   @4=1 /* status */
+###   @5=128.50 /* total_amount */
+###   @6='2026-07-30 09:11:22' /* created_at */
+```
+
+对应的反向 INSERT 就是把被删行的各列原样写回（这就是 MyFlash / binlog2sql 这类闪回工具自动做的事）：
+
+```sql
+INSERT INTO shop.orders (id, order_no, user_id, status, total_amount, created_at)
+VALUES (150, 'SO000000000150', 3, 1, 128.50, '2026-07-30 09:11:22');
+```
+
+注意：批量误删会产生大量这样的 DELETE 事件，逐条手写不现实，应配合 binlog2sql 批量生成反向 SQL；且反向 INSERT 前最好先确认目标行确实已不存在，避免主键冲突。
+
+**3. 备份策略文档（示例）**
+
+| 项目 | 策略 |
+|---|---|
+| 全量备份 | 每日 02:00 `mysqldump --single-transaction`（中小库）或周末 XtraBackup 物理全量（大库），压缩后**异地 + 对象存储**双份 |
+| 增量备份 | 依赖 binlog（ROW 格式），实时/准实时滚动 |
+| 备份频率 | 全量每日 1 次；binlog 持续 |
+| 保留期 | 全量备份保留 **30 天**（或 4 个周期）；binlog 保留 **≥ 14 天**（必须长于全量周期，否则 PITR 断档） |
+| 恢复演练 | 每季度至少 1 次，在隔离环境恢复并校验行数/关键金额，记录 RTO |
+| 监控 | 备份失败告警、binlog 剩余保留期告警、恢复演练结果归档 |
+
+- **RPO（恢复点目标）= 数据可容忍丢失的最大时间**。开双 1（`innodb_flush_log_at_trx_commit=1` + `sync_binlog=1`）且 binlog 实时落盘时，RPO 可做到接近 0（秒级）；若允许异步，则可能丢失若干秒。
+- **RTO（恢复耗时目标）= 从故障到恢复可用的最长时间**。由「全量恢复速度 + 需重放的 binlog 量」决定，演练后应有实测基线（例如「30 GB 库 + 1 天 binlog ≈ 40 分钟」）。
+
+</Answer>
 </Callout>

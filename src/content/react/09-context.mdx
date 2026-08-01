@@ -425,6 +425,20 @@ function Header() {
 3. 一个 Table 组件内部的「选中行 id 集合」，需要被表头全选框和每一行读取
 4. 购物车内容，被导航栏角标、购物车页、商品页三处使用
 5. 一个画布应用中鼠标的实时坐标
+
+<Answer>
+**参考答案：**
+
+逐条分析如下：
+
+1. **弹窗的开关状态，只有父子两层** —— 用 **props / `useState` 下传**即可。只有两层、作用域极小，既不需要组合也不需要 Context，「能 props 就不要 Context」。
+2. **全站的「是否折叠侧边栏」** —— 用 **Context**。全局、变化极少、被任意深度组件读取，正好符合 Context 的适用场景。
+3. **Table 内部的「选中行 id 集合」** —— 用 **Context（组件族内部通信）**。作用域被限制在一张 Table 内，被表头全选框和每一行读取，是「复合组件」的典型用法，避免层层透传。
+4. **购物车内容，被导航角标、购物车页、商品页三处使用** —— 用 **状态管理库（Zustand / Redux 等）**。它跨多个页面、高频变化、被大量组件读写，且各组件往往只关心其中一部分（角标只关心数量、商品页只关心某商品是否在车里）。Context 没有选择性订阅，购物车一变会全员重渲染，因此更适合带选择器订阅的状态库。
+5. **画布应用中鼠标的实时坐标** —— **不适合 Context**。鼠标移动是高频事件，放进 Context 会让所有消费者以几十上百 Hz 重渲染。正确做法是：用 `useRef` 存坐标 + 事件监听直接操作 DOM/Canvas，或用 `useSyncExternalStore` 做「瞬态订阅」（只在真正需要的叶子组件里读，且可以绕过 React 渲染直接更新），或用状态库的 transient update。
+
+核心判断标准：**读多写少且作用域明确用 Context；高频变化或需要选择性订阅用状态管理库；只有两层就 props 下传。**
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：修复性能问题">
@@ -442,18 +456,164 @@ function AppProvider({ children }) {
 }
 ```
 这个 Provider 有两类问题。指出它们，并给出重构方案（提示：既要 memo，也要拆分）。重构后说明「显示 toast」时会有哪些组件重渲染。
+
+<Answer>
+**参考答案：**
+
+**问题一：`value` 是每次渲染都新建的对象。** `{ user, setUser, cart, setCart, toast, setToast }` 这个字面量在 `AppProvider` 每次渲染时都是新引用，Context 用 `Object.is` 比较，新对象永远不等于旧对象，导致**所有消费者**无论用到哪个字段都会重渲染。
+
+**问题二：所有状态塞进同一个 Context，且函数没有稳定引用。** 改 `cart` 也会让只读 `user` 的组件重渲染；`setUser` 等函数每次都是新函数，同样破坏 memo。
+
+**重构方案：按变化频率拆分 + 用 `useMemo` / `useCallback` 稳定引用。**
+
+```tsx
+// 拆成三个 Context：user / cart / toast，各自独立变化
+const UserContext = createContext<{ user: User | null; setUser: (u: User | null) => void } | null>(null);
+const CartContext = createContext<{ cart: CartItem[]; setCart: (c: CartItem[]) => void } | null>(null);
+const ToastContext = createContext<{ toast: Toast | null; setToast: (t: Toast | null) => void } | null>(null);
+
+function AppProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [cart, setCart] = useState<CartItem[]>([]);
+  const [toast, setToast] = useState<Toast | null>(null);
+
+  // 函数用 useCallback 稳定
+  const userApi = useMemo(() => ({ user, setUser }), [user, setUser]);
+  const cartApi = useMemo(() => ({ cart, setCart }), [cart, setCart]);
+  const toastApi = useMemo(() => ({ toast, setToast }), [toast, setToast]);
+
+  return (
+    <UserContext.Provider value={userApi}>
+      <CartContext.Provider value={cartApi}>
+        <ToastContext.Provider value={toastApi}>
+          {children}
+        </ToastContext.Provider>
+      </CartContext.Provider>
+    </UserContext.Provider>
+  );
+}
+```
+
+更彻底的做法是「state / dispatch 分离」：把 `setXxx` 提为依赖为空、引用永远不变的 actions，连 `useMemo` 都不需要。
+
+**「显示 toast」时哪些组件重渲染？** 只有**订阅了 `ToastContext` 的组件**（通常是一个全局的 `<ToastHost />` 容器）会重渲染；订阅 `UserContext`、`CartContext` 的导航角标、购物车页等组件**完全不受影响**，因为它们各自的 value 引用没变。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：实现 Accordion">
 用 Context 实现一个手风琴组件族：`Accordion`（可配置是否允许同时展开多项）、`AccordionItem`、`AccordionHeader`、`AccordionPanel`。
 
 要求：`AccordionItem` 通过 Context 把自己的 id 传给内部的 Header 和 Panel（提示：需要两层 Context，一层给整个 Accordion，一层给每个 Item）。
+
+<Answer>
+**参考答案：**
+
+两层 Context 的分工：
+
+- **`AccordionContext`**（每个 `Accordion` 一个 Provider）：保存 `openIds`、`toggle(id)`、`allowMultiple`，让 Item 能控制整组展开逻辑。
+- **`ItemContext`**（每个 `AccordionItem` 一个 Provider）：保存当前 item 的 `id` 和 `isOpen`，让内部的 Header / Panel 知道「我是谁、我开没开」。
+
+```tsx
+type AccordionValue = {
+  openIds: string[];
+  allowMultiple: boolean;
+  toggle: (id: string) => void;
+};
+const AccordionContext = createContext<AccordionValue | null>(null);
+
+type ItemValue = { id: string; isOpen: boolean };
+const ItemContext = createContext<ItemValue | null>(null);
+
+function Accordion({ allowMultiple = false, children }: AccordionProps) {
+  const [openIds, setOpenIds] = useState<string[]>([]);
+  const toggle = useCallback(
+    (id: string) =>
+      setOpenIds((prev) => {
+        const has = prev.includes(id);
+        if (allowMultiple) return has ? prev.filter((x) => x !== id) : [...prev, id];
+        return has ? [] : [id];
+      }),
+    [allowMultiple]
+  );
+  const value = useMemo(() => ({ openIds, allowMultiple, toggle }), [openIds, allowMultiple, toggle]);
+  return <AccordionContext.Provider value={value}>{children}</AccordionContext.Provider>;
+}
+
+function AccordionItem({ id, children }: ItemProps) {
+  const ctx = useContext(AccordionContext)!;
+  const value = useMemo<ItemValue>(() => ({ id, isOpen: ctx.openIds.includes(id) }), [id, ctx.openIds]);
+  return <ItemContext.Provider value={value}>{children}</ItemContext.Provider>;
+}
+
+function AccordionHeader({ children }: { children: React.ReactNode }) {
+  const acc = useContext(AccordionContext)!;
+  const item = useContext(ItemContext)!;
+  return (
+    <button aria-expanded={item.isOpen} onClick={() => acc.toggle(item.id)}>
+      {children}
+    </button>
+  );
+}
+
+function AccordionPanel({ children }: { children: React.ReactNode }) {
+  const item = useContext(ItemContext)!;
+  return item.isOpen ? <div role="region">{children}</div> : null;
+}
+```
+
+每个 `AccordionItem` 都是独立 Provider，所以它的 `ItemContext` 互不干扰；而 `AccordionContext` 由外层 `Accordion` 提供，使多个 Item 之间能共享「同时只能展开一个」这类整体规则。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：children 优化验证">
 写两个版本的组件：A 版本在顶层组件里 useContext 然后渲染一棵大树；B 版本把 useContext 下沉到一个包裹组件，大树通过 children 传入。
 
 在两个版本的子树组件里加 `console.log`，触发 Context 更新，对比打印次数。解释为什么 B 版本的子树不重渲染。
+
+<Answer>
+**参考答案：**
+
+**A 版本（在顶层读 Context，再渲染大树）：**
+
+```tsx
+function PageA() {
+  const { theme } = useTheme();        // 顶层消费 Context
+  return (
+    <div className={theme}>
+      <BigTree />                       {/* 大树在 PageA 内部渲染 */}
+    </div>
+  );
+}
+function BigTree() {
+  console.log("BigTree 渲染");
+  return <div>...</div>;
+}
+```
+
+`theme` 一变，`PageA` 重渲染，它内部 JSX 重新执行，`<BigTree />` 是新创建的元素 → `BigTree` 也会重渲染，`console.log` 会打印。
+
+**B 版本（把 useContext 下沉到包裹组件，大树通过 `children` 传入）：**
+
+```tsx
+function PageB({ children }: { children: React.ReactNode }) {
+  return <ThemedWrapper>{children}</ThemedWrapper>;   // 大树从外部传入
+}
+function ThemedWrapper({ children }: { children: React.ReactNode }) {
+  const { theme } = useTheme();        // 只在包裹层消费
+  console.log("ThemedWrapper 渲染");
+  return <div className={theme}>{children}</div>;
+}
+function BigTree() {
+  console.log("BigTree 渲染");
+  return <div>...</div>;
+}
+// 使用：<PageB><BigTree /></PageB>，BigTree 在 PageB 之外创建
+```
+
+`theme` 一变，`ThemedWrapper` 重渲染，但 `children` 是**从外部传进来的同一个元素引用**。React 做差分时，发现 `children` 的引用没变，于是**跳过整棵子树的重渲染**，所以 `BigTree` 的 `console.log` **不会打印**。
+
+**结论：** 把 `useContext` 下沉到一个薄包装组件，并用 `children` 把不变的子树「透传」进去，是缩小 Context 重渲染范围最有效的技巧之一——Context 变化时只有包装层重渲染，子树因引用稳定而被 React 跳过。
+</Answer>
 </Callout>
 
 ## 小结

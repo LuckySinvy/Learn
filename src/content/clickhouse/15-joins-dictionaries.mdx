@@ -592,6 +592,178 @@ FROM events;
 4. 创建一个 `RANGE_HASHED` 字典存汇率的生效时间区间，用 `dictGet('rate_dict', 'rate', currency, order_time)` 给订单表换算金额。
 5. 用 `system.dictionaries` 查看字典的 `bytes_allocated` 和 `hit_rate`，思考 1000 万行的维表建成字典要多少内存。
 6. 建一个 MV 用 `dictGet` 把 `events` 打宽成 `events_wide`，对比宽表查询和 JOIN 查询的性能差异。
+
+<Answer>
+**参考答案：**
+
+1. ANY LEFT JOIN vs dictGet：
+
+```sql
+-- 建维表并造数据
+CREATE TABLE users
+(
+    user_id    UInt64,
+    reg_time   DateTime,
+    vip_level  UInt8,
+    channel    LowCardinality(String),
+    city       LowCardinality(String)
+)
+ENGINE = MergeTree ORDER BY user_id;
+
+INSERT INTO users SELECT
+    number + 1, toDateTime('2024-01-01') + rand(1) % 15000000, rand(2) % 5,
+    ['organic','ads','referral'][1 + rand(3) % 3],
+    ['北京','上海','深圳','杭州'][1 + rand(4) % 4]
+FROM numbers(50000);
+
+CREATE DICTIONARY users_dict
+(
+    user_id    UInt64,
+    vip_level  UInt8,
+    channel    String,
+    city       String
+)
+PRIMARY KEY user_id
+SOURCE(CLICKHOUSE(DB 'demo' TABLE 'users'))
+LAYOUT(HASHED())
+LIFETIME(300);
+```
+
+```sql
+-- JOIN 方式
+SELECT u.city, count() AS pv FROM events AS e
+ANY LEFT JOIN users AS u ON e.user_id = u.user_id
+GROUP BY u.city;
+
+-- 字典方式
+SELECT dictGet('users_dict', 'city', user_id) AS city, count() AS pv
+FROM events GROUP BY city;
+```
+
+对比 `Elapsed` 和 `system.query_log.memory_usage`（两个查询分别执行后查该表最近记录）。字典方式通常快 5~10 倍、内存少一个数量级，因为字典常驻内存且 `dictGet` 是向量化查找，不必每次重建哈希表。
+
+2. 左右表写反：
+
+```sql
+-- 错误：大表 events 放右边
+SELECT count() FROM users AS u JOIN events AS e ON u.user_id = e.user_id;
+-- 正确：小表 users 放右边
+SELECT count() FROM events AS e JOIN users AS u ON e.user_id = u.user_id;
+```
+
+hash join 总是把右表灌进内存建哈希表。写反后等于把 1 亿行的 `events` 塞进内存——要么 OOM，要么巨慢。对比 `memory_usage` 就能直观看到「小表放右边」为什么是铁律。
+
+3. 用 IN 替换过滤型 JOIN：
+
+```sql
+-- JOIN 写法（为了过滤，但搬了整行）
+SELECT count() FROM events AS e
+INNER JOIN (SELECT user_id FROM users WHERE vip_level >= 3) AS u ON e.user_id = u.user_id;
+
+-- IN 写法（只存一个去重 key 集合）
+SELECT count() FROM events
+WHERE user_id IN (SELECT user_id FROM users WHERE vip_level >= 3);
+```
+
+`IN` 子查询只需在内存里保留去重的 `user_id` 集合，不需要右表整行数据，内存和耗时都更优；且 `user_id` 若在排序键里还能走索引。
+
+4. RANGE_HASHED 汇率字典：
+
+```sql
+-- 源表：每种货币一行，含生效时间区间
+CREATE TABLE rates
+(
+    currency String,
+    start_ts DateTime,
+    end_ts   DateTime,
+    rate     Float64
+) ENGINE = MergeTree ORDER BY (currency, start_ts);
+
+INSERT INTO rates VALUES
+    ('USD', '2024-06-01 00:00:00', '2024-07-01 00:00:00', 7.25),
+    ('USD', '2024-07-01 00:00:00', '2024-08-01 00:00:00', 7.20),
+    ('EUR', '2024-06-01 00:00:00', '2024-08-01 00:00:00', 7.85);
+
+CREATE DICTIONARY rate_dict
+(
+    currency String,
+    start_ts DateTime,
+    end_ts   DateTime,
+    rate     Float64
+)
+PRIMARY KEY currency
+SOURCE(CLICKHOUSE(DB 'demo' TABLE 'rates'))
+LAYOUT(RANGE_HASHED())
+RANGE(MIN start_ts MAX end_ts)
+LIFETIME(600);
+
+-- 给订单换算金额：按 order_time 落在哪个区间取对应汇率
+SELECT
+    order_id,
+    amount,
+    dictGet('rate_dict', 'rate', currency, order_time) AS rate,
+    amount * dictGet('rate_dict', 'rate', currency, order_time) AS amount_usd
+FROM orders
+WHERE currency = 'USD'
+LIMIT 5;
+```
+
+注意订单表需有 `currency` 列（这里是演示用 `'USD'`，实际按订单的币种列传）。`dictGet` 第 4 个参数传时间点，字典自动找到 `start_ts <= t < end_ts` 的区间。
+
+5. 观察字典内存：
+
+```sql
+SELECT name, status, element_count,
+       formatReadableSize(bytes_allocated) AS mem,
+       round(hit_rate * 100, 2) AS hit_pct,
+       last_exception
+FROM system.dictionaries
+FORMAT Vertical;
+```
+
+估算：`1000 万行 × 每行字节数`。`HASHED` 布局下每个元素除数据本身还包含哈希表开销（每个 key 一个指针 + 数据行），假设每行 50~100 字节，1000 万行就是 **500 MB ~ 1 GB** 常驻内存，且**每个副本节点各一份**。若超预算，改 `SPARSE_HASHED`（省约一半）或 `CACHE` 布局（只缓存热点 key）。
+
+6. 字典打宽成宽表：
+
+```sql
+CREATE TABLE events_wide
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32,
+    user_vip    UInt8,
+    user_city   LowCardinality(String)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+
+CREATE MATERIALIZED VIEW mv_widen TO events_wide AS
+SELECT
+    event_time, user_id, event_type, page, country, device, duration_ms,
+    dictGet('users_dict', 'vip_level', user_id) AS user_vip,
+    dictGet('users_dict', 'city',      user_id) AS user_city
+FROM events;
+```
+
+之后查询完全不需要 JOIN：
+
+```sql
+-- 宽表：直接过滤/聚合冗余维度
+SELECT user_city, count() FROM events_wide WHERE user_vip >= 3 GROUP BY user_city;
+
+-- JOIN 查询对比
+SELECT u.city, count() FROM events AS e
+ANY LEFT JOIN users AS u ON e.user_id = u.user_id
+WHERE u.vip_level >= 3 GROUP BY u.city;
+```
+
+宽表查询省去了每次 JOIN 的哈希表构建，速度通常快一个数量级。代价是存储增加（LowCardinality 列后增量可控）和维度变更不回溯历史。**ClickHouse 的最佳实践就是宽表**。
+</Answer>
 </Callout>
 
 ## 小结

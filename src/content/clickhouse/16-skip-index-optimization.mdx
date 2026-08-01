@@ -562,6 +562,97 @@ KILL QUERY WHERE elapsed > 300 AND user = 'analyst';
 3. 给 `page` 列加 `tokenbf_v1` 索引，测试 `WHERE hasToken(page, 'checkout')` 和 `WHERE page LIKE '%eckou%'` 两种查询，验证后者索引失效。
 4. 建一个 `ORDER BY (user_id, event_time)` 的排序投影，用 `EXPLAIN indexes = 1` 确认查询自动走了投影。对比表的磁盘占用变化。
 5. 从 `system.query_log` 按 `normalized_query_hash` 聚合，找出你环境里总耗时最高的三个查询模式，逐个套用第 8 节的 checklist 优化。
+
+<Answer>
+**参考答案：**
+
+1. bloom_filter 索引前后对比：
+
+```sql
+-- 加索引前
+SELECT count() FROM events WHERE user_id = 10086;
+-- 记录 Processed rows（通常是全表，如 2000 万行）和 Elapsed
+
+-- 加 bloom_filter 索引并物化
+ALTER TABLE events ADD INDEX idx_user_bf user_id TYPE bloom_filter(0.01) GRANULARITY 4;
+ALTER TABLE events MATERIALIZE INDEX idx_user_bf;
+
+-- 加索引后
+SELECT count() FROM events WHERE user_id = 10086;
+-- 记录 Processed rows（应大幅下降，如几十万行）和 Elapsed
+```
+
+预期扫描量降一个数量级以上（本章示例 2000 万 → 42 万）。`MATERIALIZE` 会对历史数据构建索引，这一步本身要扫全表、耗时正常。
+
+2. 用 EXPLAIN 看索引是否生效：
+
+```sql
+EXPLAIN indexes = 1
+SELECT count() FROM events WHERE user_id = 10086;
+```
+
+加索引前没有 `Skip` 段（或 PrimaryKey 显示 Granules 接近满值）；加索引并物化后出现：
+
+```text
+Skip
+  Name: idx_user_bf
+  Description: bloom_filter GRANULARITY 4
+  Parts: 3/4
+  Granules: 52/2442
+```
+
+`Granules: 52/2442` 就是索引效率。**如果这个比值没变化，说明索引没生效**——按第 4 节清单排查（忘了 MATERIALIZE？WHERE 包了函数？类型不匹配？）。
+
+3. tokenbf 索引与子串失效：
+
+```sql
+ALTER TABLE events ADD INDEX idx_page_token page TYPE tokenbf_v1(8192, 3, 0) GRANULARITY 4;
+ALTER TABLE events MATERIALIZE INDEX idx_page_token;
+
+-- 有效：checkout 是完整 token
+SELECT count() FROM events WHERE hasToken(page, 'checkout');
+
+-- 无效：'eckou' 不是完整 token，索引被跳过，退化成全扫
+SELECT count() FROM events WHERE page LIKE '%eckou%';
+```
+
+`tokenbf_v1` 按非字母数字切词，`/p/checkout` 切成 `['p','checkout']`。`hasToken` 与 `LIKE '%checkout%'` 能命中，但 `LIKE '%eckou%'`（跨 token 的子串）只能靠全扫。跑两条查询对比 Processed rows 即可验证。
+
+4. 排序投影：
+
+```sql
+ALTER TABLE events ADD PROJECTION proj_by_user
+(
+    SELECT * ORDER BY (user_id, event_time)
+);
+ALTER TABLE events MATERIALIZE PROJECTION proj_by_user;
+
+EXPLAIN indexes = 1
+SELECT count() FROM events WHERE user_id = 10086;
+```
+
+EXPLAIN 输出里出现 `Projections: Name: proj_by_user ... used` 就说明查询自动走了投影，此时 `Granules` 很小。对比 `SELECT sum(bytes_on_disk) FROM system.parts WHERE table='events' AND active` 在加投影前后的差值，即投影占用的额外磁盘（约等于原表一份拷贝）。注意 `MATERIALIZE PROJECTION` 会重写所有 part，比较耗时。
+
+5. 找最耗时的查询模式并优化：
+
+```sql
+SELECT
+    normalized_query_hash,
+    count()                                          AS runs,
+    round(avg(query_duration_ms), 1)                 AS avg_ms,
+    sum(query_duration_ms)                           AS total_ms,
+    formatReadableQuantity(sum(read_rows))           AS total_rows,
+    formatReadableSize(max(memory_usage))            AS peak_mem,
+    any(substring(query, 1, 80))                     AS sample
+FROM system.query_log
+WHERE type = 'QueryFinish' AND event_date >= today() - 7 AND query_kind = 'Select'
+GROUP BY normalized_query_hash
+ORDER BY total_ms DESC
+LIMIT 3;
+```
+
+对排前三的模式逐个套第 8 节 checklist：先看 `Processed rows` 是否≈全表（索引没生效）→ 看 `EXPLAIN indexes = 1` 的分区裁剪 / 主键 / 跳数索引各层比值 → 再检查是否 `SELECT *`、`count(DISTINCT)`、正则、大 JOIN 等反模式。改完重跑对比 `total_ms` 是否下降。
+</Answer>
 </Callout>
 
 ## 小结

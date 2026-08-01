@@ -64,6 +64,52 @@ Langchain.js 在 v0.2 之后拆分为清晰的包结构：
 
 <Callout type="exercise" title="想一想">
 你手头最想用 LLM 解决的场景是什么？把它拆成「提示词 + 模型 + 数据/工具」三块，后面每章我们都会往这个框架上补一块积木。
+
+<Answer>
+**参考答案：**
+
+这是一道开放的思考题，重点是养成「三块拆解」的习惯。下面以**公司内部制度问答机器人**为例走一遍。
+
+| 积木 | 本场景怎么填 | 对应章节 |
+|---|---|---|
+| **提示词** | 系统提示写清角色与边界：「只根据下面的制度原文回答，原文没写就说不知道」，再留 `{context}` 与 `{question}` 两个占位符 | 第 4 章 |
+| **模型** | `gpt-4o-mini`，`temperature: 0`——制度问答要稳定复现，不需要模型发挥创意 | 第 3 章 |
+| **数据/工具** | 员工手册 PDF → 加载 → 切分 → 嵌入入库 → 检索器取回相关片段（这就是 RAG） | 第 8–11 章 |
+
+拆完之后，最小可运行骨架就是一条三段式的链，后面所有章节都是在往这三个位置上「补积木」：
+
+```ts
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+const prompt = ChatPromptTemplate.fromTemplate(
+  "只根据下面的上下文回答，若上下文没有答案就直说不知道。\n" +
+  "上下文：\n{context}\n\n问题：{question}"
+);
+const model = new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 });
+
+// 现在 context 先手工传；第 11 章会把它换成 retriever 自动填充
+const chain = prompt.pipe(model).pipe(new StringOutputParser());
+
+await chain.invoke({
+  context: "年假：入职满一年后每年 5 天……",
+  question: "入职半年有年假吗？",
+});
+```
+
+**几个常见场景的拆法参考：**
+
+- **客服机器人**：提示词＝角色设定与话术边界；模型＝对话模型；数据/工具＝FAQ 知识库（RAG）＋订单查询接口（Tool）
+- **代码评审助手**：提示词＝评审清单（安全、性能、命名）；模型＝推理能力强的模型；数据/工具＝Git diff 文本＋静态检查结果
+- **数据分析助手**：提示词＝输出格式约束（必须返回 JSON）；模型＝支持工具调用的模型；工具＝执行 SQL＋生成图表
+
+**自检小技巧：**
+
+1. 如果「数据/工具」这块你填不出来，说明这个需求**光靠模型自己就能做**，那你可能还不需要 Langchain，直接调 SDK 更省事。
+2. 如果填出来的数据是**私有的、会变化的、模型训练时见不到的**（内部文档、实时库存、用户订单），那 RAG 或 Agent 就是必需品——这也正是本框架的价值所在。
+3. 「提示词」那一栏如果只写得出「你是一个helpful的助手」，说明需求还太模糊。先把**输出长什么样、什么情况下该拒答**想清楚，比纠结选哪个模型重要得多。
+</Answer>
 </Callout>
 
 ## 小结

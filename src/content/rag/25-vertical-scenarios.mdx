@@ -65,6 +65,172 @@ for h in hits:
 
 <Callout type="exercise" title="练习">
 拿一段你熟悉的代码文件，分别用「固定 200 字切分」和「按函数切分」建库，问一个需要跨函数理解的问题，对比两种召回的答案质量。
+
+<Answer>
+**参考答案：**
+
+**两种切分的实现**
+
+```python
+import ast
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+source = open("payment.py", encoding="utf-8").read()
+
+# ---------- 方式 A：固定 200 字硬切 ----------
+def split_fixed(code, size=200, overlap=30):
+    sp = RecursiveCharacterTextSplitter(chunk_size=size, chunk_overlap=overlap)
+    return [{"text": t, "meta": {"type": "fixed"}} for t in sp.split_text(code)]
+
+# ---------- 方式 B：按 AST 符号切分 ----------
+def split_by_symbol(code, filename="payment.py"):
+    tree = ast.parse(code)
+    lines = code.splitlines()
+    chunks = []
+
+    # 模块级 import 单独成块，作为所有函数的公共上下文
+    imports = [l for l in lines
+               if l.startswith(("import ", "from ")) and l.strip()]
+    header = "\n".join(imports)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = "\n".join(lines[node.lineno - 1: node.end_lineno])
+        # 关键：给每个符号块补上「它是谁、在哪、依赖什么」
+        signature = f"# 文件: {filename}\n# 符号: {node.name}\n{header}\n\n"
+        chunks.append({
+            "text": signature + body,
+            "meta": {"type": "symbol", "name": node.name,
+                     "file": filename, "lineno": node.lineno,
+                     "calls": [n.func.id for n in ast.walk(node)
+                               if isinstance(n, ast.Call)
+                               and isinstance(n.func, ast.Name)]},
+        })
+    return chunks
+```
+
+注意方式 B 里的两个加工：**补上 import 头** 和 **记录调用关系（`calls`）**。这是代码 RAG 与普通文本 RAG 最大的区别——代码片段的含义高度依赖它的外部环境，光有函数体本身信息量不够。
+
+**跨函数问题的对比**
+
+```python
+question = "退款金额是怎么计算的？手续费在哪一步扣除？"
+# 真实情况：calculate_refund() 调用了 _apply_fee()，两者分处文件不同位置
+
+for name, chunks in [("固定切分", split_fixed(source)),
+                     ("符号切分", split_by_symbol(source))]:
+    hits = rerank(question, retrieve_from(chunks, question, top_k=15))[:3]
+    print(f"\n===== {name}（共 {len(chunks)} 块）=====")
+    for h in hits:
+        print(f"--- score={h['score']:.3f}")
+        print(h["text"][:220])
+```
+
+**典型输出**
+
+```text
+===== 固定切分（共 47 块）=====
+--- score=0.712
+    total = order.amount - discount
+    if order.status != "PAID":
+        raise ValueError("订单未支付")
+    fee = _apply_fee(         ← 从这里被硬生生截断，看不到参数和返回
+--- score=0.688
+config, rate)
+    return round(total - fee, 2)
+
+
+def _log_refund(order_i     ← 又是一个残缺的片段
+```
+
+```text
+===== 符号切分（共 9 块）=====
+--- score=0.834
+# 文件: payment.py
+# 符号: calculate_refund
+import config
+from decimal import Decimal
+
+def calculate_refund(order, discount=0):
+    """计算退款金额，扣除手续费后返回实付退款额。"""
+    if order.status != "PAID":
+        raise ValueError("订单未支付")
+    total = order.amount - discount
+    fee = _apply_fee(total, config.FEE_RATE)
+    return round(total - fee, 2)
+--- score=0.791
+# 符号: _apply_fee
+def _apply_fee(amount, rate):
+    """按费率计算手续费，最低 1 元。"""
+    return max(Decimal("1.0"), amount * rate)
+```
+
+**观察结论**
+
+1. **固定切分产生的是「语法残骸」。** `fee = _apply_fee(` 这种从括号中间断开的片段，人看不懂，模型更看不懂。而且这些残片的向量质量极差——一段语法不完整的代码，Embedding 模型也编码不出有意义的语义。
+
+2. **符号切分让两个相关函数**都完整地**进了上下文。** 模型能清楚看到 `calculate_refund` 调用了 `_apply_fee`，从而准确回答「手续费在计算总额后、返回前扣除，且有 1 元下限」。
+
+3. **块数从 47 降到 9。** 更少但更完整的块，意味着 `top_k=3` 就能覆盖足够信息，token 效率反而更高。
+
+**再进一步：用调用图补全上下文**
+
+符号切分解决了「片段完整」，但还有一个问题：如果只召回了 `calculate_refund`，没召回 `_apply_fee`，模型仍然不知道手续费怎么算。这时用第 14 章的父子文档思路，配合前面记录的 `calls` 元数据自动补齐：
+
+```python
+def retrieve_code(question, k=3, expand=True):
+    hits = rerank(question, retrieve(embed(question), top_k=15))[:k]
+    if not expand:
+        return hits
+
+    picked = {h["meta"]["name"] for h in hits}
+    extra = []
+    for h in hits:
+        for callee in h["meta"].get("calls", []):
+            if callee not in picked and callee in symbol_index:
+                extra.append(symbol_index[callee])   # 把被调用的函数一并带上
+                picked.add(callee)
+    return hits + extra[:3]        # 限制扩展数量，避免撑爆预算
+```
+
+这一步让「跨函数理解」从碰运气变成确定性的——**只要命中了入口函数，它的依赖会被自动拉进来**。这其实就是第 19 章图检索思想在代码场景的轻量应用：调用关系天然就是一张图。
+
+**代码 RAG 的四条要点**
+
+1. **AST 解析失败要有降级。** 代码文件可能语法错误、可能是 Jinja 模板、可能是你不支持的语言。`ast.parse` 抛异常时要 fallback 到「按空行 + 缩进」的启发式切分，不能让整个文件被跳过。
+
+2. **超长函数仍要二次切分。** 有些遗留代码里一个函数几百行，超过 Embedding 上限。这时按「函数内的逻辑块 + 保留函数签名作为每块的头部」再切，确保每块都知道自己属于谁。
+
+3. **用代码专用 Embedding。** 通用中文模型对 `def`、`return`、驼峰命名的理解很弱。代码检索场景要选在代码语料上训练过的模型，差距通常在 10 个点以上。
+
+4. **元数据要包含文件路径和行号。** 这样引用溯源能精确到 `payment.py:42`，用户可以直接跳转——这在代码场景比「来自某文件」有用得多。
+
+**法律场景的同构解法**
+
+法律 RAG 的坑与代码几乎一模一样，只是把「函数」换成「条款」：
+
+```python
+CLAUSE = re.compile(r"^第\s*([\d一二三四五六七八九十]+(?:\.\d+)*)\s*[条款]")
+
+def split_by_clause(text):
+    chunks, cur, no = [], [], None
+    for line in text.splitlines():
+        m = CLAUSE.match(line.strip())
+        if m:
+            if cur:
+                chunks.append({"text": "\n".join(cur),
+                               "meta": {"clause_no": no}})
+            cur, no = [line], m.group(1)
+        else:
+            cur.append(line)
+    if cur:
+        chunks.append({"text": "\n".join(cur), "meta": {"clause_no": no}})
+    return chunks
+```
+
+「第 8.2 条被从中间切断」造成的后果和「函数被截断」一样严重——甚至更糟，因为法律文本里一个「但书」条款被切掉，意思可能完全反转。所以课文那句「垂直 RAG 的失败多数不在模型，而在切分破坏了领域结构」，在这两个场景里得到了同样的印证。
+</Answer>
 </Callout>
 
 ## 小结

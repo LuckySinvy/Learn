@@ -77,6 +77,73 @@ await evaluate(
 
 <Callout type="exercise" title="练习">
 把第 17 章问答 Bot 接进一个 5 条样本的数据集，用 LLM 评估函数给「相关性」打分，对比改提示词前后的得分。
+
+<Answer>
+**参考答案：**
+
+建一个 5 条样本的数据集，用裁判 LLM 对「相关性」打分，改提示词前后各跑一遍做对比：
+
+```python
+from langsmith import Client
+from langsmith.evaluation import evaluate
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+client = Client()
+
+# 1. 建 5 条样本的数据集
+dataset = client.create_dataset("qa-bot-eval", description="第 17 章问答 Bot 回归测试")
+client.create_examples(
+    dataset_id=dataset.id,
+    inputs=[
+        {"question": "退款多久到账？"},
+        {"question": "支持哪些支付方式？"},
+        {"question": "如何修改绑定手机号？"},
+        {"question": "会员能享受什么折扣？"},
+        {"question": "发票怎么开？"},
+    ],
+    outputs=[
+        {"answer": "通常 3-5 个工作日"},
+        {"answer": "微信、支付宝、银行卡"},
+        {"answer": "在设置-账户安全中修改"},
+        {"answer": "会员享 9.5 折"},
+        {"answer": "订单完成后可在订单页申请"},
+    ],
+)
+
+
+# 2. LLM 评估函数：让裁判模型判断「是否回答了问题、是否相关」
+def relevance(inputs, outputs, reference_outputs):
+    prompt = ChatPromptTemplate.from_template(
+        "问题：{question}\n候选回答：{answer}\n"
+        "请判断该回答是否与问题相关且没有幻觉，只输出 0~1 的一个数字。"
+    )
+    judge = ChatOpenAI(model="gpt-4o-mini")
+    score = judge.invoke(
+        prompt.format(
+            question=inputs["question"],
+            answer=outputs["answer"],
+        )
+    )
+    return {"key": "relevance", "score": float(score.content)}
+
+
+# 3. 被评估对象：第 17 章问答 Bot 的链
+def target(inputs):
+    return chain.invoke({"question": inputs["question"]})
+
+
+# 4. 跑评估，结果落在 LangSmith 面板
+evaluate(target, data=dataset.name, evaluators=[relevance])
+```
+
+对比方法：
+
+- 改提示词前先跑一次，记录 baseline 的平均 `relevance` 分数；
+- 修改提示词或换模型后，对同一个 `dataset` 再跑一次；
+- 到 LangSmith 面板按数据集聚合，对比两次得分——下降就是回归；
+- 可接进 CI：用阈值（如平均相关性 < 0.8）让流水线失败，形成质量门禁。
+</Answer>
 </Callout>
 
 ## 小结

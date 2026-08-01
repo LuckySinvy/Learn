@@ -388,6 +388,153 @@ rs.status().members.map(m => ({ name: m.name, state: m.stateStr, health: m.healt
 
 <Callout type="exercise" title="练习">
 一、用 Docker Compose 搭一个真正的三节点复制集，用 `rs.status()` 确认三个成员的角色；二、执行 `rs.stepDown()` 触发选举，用脚本持续写入并记录不可写窗口有多长；三、把一个成员的 `priority` 设为 0，再次触发选举，验证它不会当选；四、用 `rs.printSecondaryReplicationInfo()` 观察复制延迟，然后执行一次影响 10 万文档的 `updateMany`，再看延迟变化；五、故意用 `w: 1` 写入后立刻 kill 掉 primary，检查 rollback 目录里有没有文件；六、配置一个延迟 5 分钟的隐藏节点，删除一个集合后从它恢复数据。
+
+<Answer>
+**参考答案：**
+
+**一、Docker Compose 搭三节点复制集**
+
+`docker-compose.yml`：
+
+```yaml
+services:
+  mongo1:
+    image: mongo:7.0
+    container_name: mongo1
+    command: mongod --replSet rs0 --port 27017 --bind_ip_all
+    ports: ["27017:27017"]
+  mongo2:
+    image: mongo:7.0
+    container_name: mongo2
+    command: mongod --replSet rs0 --port 27017 --bind_ip_all
+    ports: ["27018:27017"]
+  mongo3:
+    image: mongo:7.0
+    container_name: mongo3
+    command: mongod --replSet rs0 --port 27017 --bind_ip_all
+    ports: ["27019:27017"]
+```
+
+启动并初始化：
+
+```bash
+docker compose up -d
+
+docker exec -it mongo1 mongosh --eval 'rs.initiate({
+  _id: "rs0",
+  members: [
+    { _id: 0, host: "mongo1:27017" },
+    { _id: 1, host: "mongo2:27017" },
+    { _id: 2, host: "mongo3:27017" }
+  ]
+})'
+```
+
+验证：
+
+```js
+rs.status().members.map(m => ({ name: m.name, state: m.stateStr, health: m.health }))
+// 应看到 1 个 PRIMARY + 2 个 SECONDARY
+```
+
+**二、`rs.stepDown()` 记录不可写窗口**
+
+先开一个终端持续写入并计时：
+
+```js
+use community
+db.t.insertOne({ _id: 0, v: "init" })
+
+const start = Date.now()
+let ok = 0, fail = 0
+while (Date.now() - start < 60000) {
+  try {
+    db.t.insertOne({ v: "x" })
+    ok++
+  } catch (e) {
+    fail++
+  }
+}
+print("ok=" + ok + " fail=" + fail + " window_ms=" + (Date.now() - start))
+```
+
+在另一个终端触发选举：
+
+```js
+rs.stepDown(60)
+```
+
+观察输出：选举期间写操作会报 `NotWritablePrimary` / `PrimarySteppedDown`，统计出的 `fail` 时间段长度通常就是 10~12 秒的不可写窗口（与本章 3.2 节一致）。
+
+**三、`priority: 0` 的成员不会当选**
+
+```js
+const cfg = rs.conf()
+cfg.members[2].priority = 0
+rs.reconfig(cfg)
+
+rs.stepDown(60)
+rs.status().members.map(m => ({ name: m.name, state: m.stateStr, priority: m.priority }))
+// 验证：新 primary 只会在 mongo1 / mongo2 里产生，mongo3 永远保持 SECONDARY
+```
+
+`priority: 0` 的成员既不参与竞选也不会被选上（相当于自动把 `votes` 之外的竞选资格去掉），适合做备份、离线分析节点。
+
+**四、`updateMany` 对复制延迟的影响**
+
+```js
+// 先造 10 万条数据，再看初始延迟
+db.big.insertMany(Array.from({ length: 100000 }, (_, i) => ({ _id: i, v: 0 })))
+rs.printSecondaryReplicationInfo()
+
+// 一次大更新
+db.big.updateMany({}, { $set: { v: 1 } })
+rs.printSecondaryReplicationInfo()
+```
+
+观察：`updateMany` 改 10 万文档会写 10 万条 oplog，`syncedTo` 与 primary 的时间差会明显拉大（几百毫秒到几秒，取决于 secondary 硬件）。这是因为每个文档的最终结果都要单独重放。等追赶完成后延迟回落。
+
+**五、`w: 1` 写入后 kill primary，检查 rollback**
+
+```js
+// 步骤 1：用 w:1 写入一条还不存在的数据
+db.posts.insertOne({ _id: "w1-test", v: "x" }, { writeConcern: { w: 1 } })
+
+// 步骤 2：立刻 kill 掉 primary 进程（容器外执行）
+docker kill mongo1
+
+// 步骤 3：等 mongo2/mongo3 选出新 primary 后，检查 rollback 目录
+docker exec -it mongo2 ls /data/db/rollback/
+```
+
+如果这条 `w: 1` 写入还没来得及复制到多数节点，它就会出现在 rollback 目录的 `.bson` 文件里——验证「返回成功的写入也可能被回滚」。改用 `w: "majority"` 重做一遍，则不会出现回滚文件。
+
+**六、延迟 5 分钟隐藏节点 + 误删恢复**
+
+```js
+const cfg = rs.conf()
+cfg.members[2].priority = 0
+cfg.members[2].hidden = true
+cfg.members[2].slaveDelay = 300          // 延迟 300 秒
+rs.reconfig(cfg)
+rs.status().members.map(m => ({ name: m.name, state: m.stateStr, slaveDelay: m.slaveDelay, hidden: m.hidden }))
+```
+
+模拟误删并恢复：
+
+```js
+// 正常节点上误删集合
+db.posts.drop()
+
+// 5 分钟内，连到隐藏节点把数据导出
+mongodump --host mongo3:27017 --db community --collection posts --out /tmp/backup
+
+// 等它追到误删之前的状态后确认数据仍在
+mongosh "mongodb://mongo3:27017/community" --eval 'db.posts.countDocuments()'
+```
+
+恢复思路：隐藏节点永远落后 primary 5 分钟，误删发生后只要在 5 分钟内停止它继续应用 oplog（或直接 dump），就能拿到删除前的数据。注意恢复时要把隐藏节点先临时从复制集摘出来或调整延迟，避免它继续追平把删除也应用掉。
+</Answer>
 </Callout>
 
 ## 小结

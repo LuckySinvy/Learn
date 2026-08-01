@@ -605,6 +605,143 @@ console.log("脚本执行完毕");`}
 2. 新增一条 `edit 编号 新标题` 命令，要求 `TaskStore` 增加 `rename` 方法并发出 `task:renamed` 事件——注意你必须先在 `AppEvents` 里声明这个事件，否则编译不过，这正是映射表的价值。
 3. 把 `Result` 的 `error` 从 `string` 换成第 18 章的可辨识联合 `AppFailure`，并在 `dispatch` 里用 `assertNever` 做穷尽渲染。
 4. 给 `Filter` 加上 `keyword?: string` 支持标题模糊搜索，并补上对应的 `ls --q 关键字` 参数解析。
+
+<Answer>
+**参考答案：**
+
+**第 1 题**——`waitFor`：核心是用一个一次性监听器，在事件触发时清理自己并 resolve。
+
+```ts
+class EventBus<E extends Record<string, unknown>> {
+  private readonly handlers = new Map<keyof E, ((payload: never) => void)[]>();
+
+  on<K extends keyof E>(type: K, fn: (payload: E[K]) => void): void {
+    const list: ((payload: never) => void)[] = this.handlers.get(type) ?? [];
+    list.push(fn);
+    this.handlers.set(type, list);
+  }
+
+  off<K extends keyof E>(type: K, fn: (payload: E[K]) => void): void {
+    const list = this.handlers.get(type);
+    if (list === undefined) return;
+    const i = list.indexOf(fn);
+    if (i >= 0) list.splice(i, 1);
+  }
+
+  waitFor<K extends keyof E>(type: K): Promise<E[K]> {
+    return new Promise<E[K]>((resolve) => {
+      const handler = (payload: E[K]) => {
+        this.off(type, handler); // 监听一次后立即清理，避免泄漏
+        resolve(payload);
+      };
+      this.on(type, handler);
+    });
+  }
+
+  // emit / count 同正文
+}
+```
+
+**第 2 题**——先声明事件，再加 `rename` 方法和 `edit` 命令：
+
+```ts
+type AppEvents = {
+  "task:added": { task: Task };
+  "task:completed": { task: Task };
+  "task:removed": { id: number };
+  "task:renamed": { task: Task; oldTitle: string }; // 必须先声明，否则编译不过
+  "command:failed": { command: string; reason: string };
+};
+
+// TaskStore.rename
+rename(id: number, title: string): Result<Task> {
+  const cur = this.tasks.get(id);
+  if (cur === undefined) return err("任务 " + id + " 不存在");
+  const trimmed = title.trim();
+  if (trimmed === "") return err("标题不能为空");
+  const updated: Task = { ...cur, title: trimmed };
+  this.tasks.set(id, updated);
+  this.bus.emit("task:renamed", { task: updated, oldTitle: cur.title });
+  return ok(updated);
+}
+
+// edit 命令
+const editCmd = defineCommand<{ id: number; title: string }>({
+  name: "edit",
+  usage: "edit 编号 新标题           重命名任务",
+  parse: (argv) => {
+    const idRaw = at(argv, 0);
+    const title = argv.slice(1).join(" ").trim();
+    if (idRaw === undefined) return err("edit 需要一个编号");
+    if (title === "") return err("edit 需要新标题");
+    const id = Number(idRaw);
+    if (!Number.isInteger(id) || id <= 0) return err("非法编号: " + idRaw);
+    return ok({ id, title });
+  },
+  run: (args, ctx) => {
+    const r = ctx.store.rename(args.id, args.title);
+    return r.ok ? ok(["已重命名 " + render(r.value)]) : err(r.error);
+  },
+});
+```
+
+**第 3 题**——把 `error` 换成可辨识联合 `AppFailure`，并用 `assertNever` 穷尽渲染：
+
+```ts
+type AppFailure =
+  | { kind: "validation"; field: string; message: string }
+  | { kind: "notFound"; id: number }
+  | { kind: "conflict"; message: string };
+
+type Err = { ok: false; error: AppFailure }; // 替换原来的 string
+
+function assertNever(x: never): never {
+  throw new Error("未穷尽: " + JSON.stringify(x));
+}
+
+function renderFailure(f: AppFailure): string {
+  switch (f.kind) {
+    case "validation": return "校验错误(" + f.field + "): " + f.message;
+    case "notFound": return "任务 " + f.id + " 不存在";
+    case "conflict": return "冲突: " + f.message;
+    default: return assertNever(f); // 若漏掉某个分支，这里编译报错
+  }
+}
+
+// dispatch 里渲染错误时改用 renderFailure(res.error)
+```
+
+**第 4 题**——`Filter` 加 `keyword` 并补 `ls --q` 解析：
+
+```ts
+type Filter = { done?: boolean; tag?: string; keyword?: string };
+
+// TaskStore.list 里追加
+if (filter.keyword !== undefined) {
+  items = items.filter((t) => t.title.includes(filter.keyword!));
+}
+
+// ls 命令 parse 里处理 --q（它后面跟一个关键字）
+parse: (argv) => {
+  const filter: Filter = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--done") filter.done = true;
+    else if (a === "--pending") filter.done = false;
+    else if (a.startsWith("#")) filter.tag = a.slice(1);
+    else if (a === "--q") {
+      const kw = argv[i + 1];
+      if (kw === undefined) return err("ls --q 需要一个关键字");
+      filter.keyword = kw;
+      i++; // 消费掉关键字
+    } else return err("ls 不认识的参数: " + a);
+  }
+  return ok(filter);
+}
+```
+
+注意用 `i++` 跳过已被消费的关键字，否则 `--q abc` 会被当成两个独立 token 而解析失败。
+</Answer>
 </Callout>
 
 ## 小结

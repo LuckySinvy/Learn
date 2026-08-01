@@ -225,4 +225,54 @@ HTTP 不会阻止你用 GET 删数据、用 POST 查数据——语义是给人�
 2. 用 Playground 1 验证"DELETE 两次"：第二次返回 404，思考这为什么不违反幂等性。
 3. 给 Playground 1 的服务加 do_PATCH：只更新请求体里出现的字段，用 curl -X PATCH 验证与 PUT 的差异。
 4. 设计一个"点赞"接口：分别用 POST /likes 和 PUT /likes/user42-post7 两种方案实现，比较重复点击时的行为差异。
+
+<Answer>
+**参考答案：**
+
+**1. 给 POST 加幂等键**
+
+在 Playground 2 的服务里维护一个 `idempotency` 表，key 取 `X-Idempotency-Key` 头：
+
+```python
+idem = {}          # key -> 上次返回的 (id, body)
+def do_POST(self):
+    key = self.headers.get("X-Idempotency-Key")
+    if key and key in idem:
+        uid, body = idem[key]
+        self.reply(200, {"id": uid, "duplicated": True})
+        return
+    uid = str(seq["next"]); seq["next"] += 1
+    store[uid] = self.read_body()
+    if key:
+        idem[key] = (uid, store[uid])
+    self.reply(201, {"id": uid})
+```
+
+之后 3 次带同一 key 的重试只创建 1 条订单：第一次 201，后两次返回相同的已存结果（200）。这是支付类接口的标准做法——**服务端按 key 去重，让超时重试安全**。
+
+**2. DELETE 两次不违反幂等**
+
+第一次 `DELETE /users/42` 返回 200（资源被删除），第二次返回 404（资源已不存在）。幂等定义是"**服务器最终状态相同**"：两次之后资源都不存在，状态没有变化，所以是幂等的。幂等关心的是**副作用**（资源是否存在），不是响应码。
+
+**3. 加 do_PATCH**
+
+```python
+def do_PATCH(self):
+    uid = self.path.rsplit("/", 1)[-1]
+    data = self.read_body()
+    if uid not in store:
+        self.reply(404, {"error": "not found"}); return
+    store[uid].update(data)        # 只更新出现的字段
+    self.reply(200, store[uid])
+```
+
+对比：`PUT` 是**整体替换**（store[uid] = 新 body，没写的字段被清空）；`PATCH` 是**局部合并**（update 只改出现的字段，其余保留）。用 `curl -X PATCH /users/42 -d '{"age":30}'` 验证：PUT 会丢 name，PATCH 会保留 name。
+
+**4. 点赞接口两种方案对比**
+
+- **POST /likes**：每次点击都新建一条点赞记录（重复点击 = 多条记录，属于"每次点都算一次"），服务器需自行去重，或用于"每次点击切换"之外的计数场景；
+- **PUT /likes/user42-post7**：以"用户-帖子"为资源 ID，**幂等**——重复点击是同一 URL 的同一 PUT，结果都是"存在一条点赞"，天然去重。但要注意：PUT 语义是"整体设置"，重复点击不切换，需要切换点赞/取消点赞的话，要么用 DELETE，要么服务器在 PUT 里做状态翻转逻辑。
+
+结论：点赞这种"一个用户对一帖只能有一份"的数据天然适合 PUT + 资源化 URL（幂等）；如果要记录"点了多少次"，才用 POST /likes。
+</Answer>
 </Callout>

@@ -238,6 +238,42 @@ asyncio.run(main())`}
 - `fetch` 内部用 `await asyncio.sleep(secs)` 模拟 I/O 等待。
 - 用 `await asyncio.gather(...)` 同时跑三个。
 - 内部可以记录开始 / 结束时间，返回 `(name, elapsed)`。
+
+<Answer>
+
+**参考答案：**
+
+```python
+import asyncio, time
+
+async def fetch(name, secs):
+    start = time.perf_counter()
+    await asyncio.sleep(secs)                # 模拟网络请求
+    elapsed = time.perf_counter() - start
+    return f"fetch-{name} -> {elapsed:.2f}s"
+
+async def main():
+    start = time.perf_counter()
+    results = await asyncio.gather(
+        fetch("A", 1.0),
+        fetch("B", 2.0),
+        fetch("C", 3.0),
+    )
+    for r in results:
+        print(r)
+    print(f"总耗时 {time.perf_counter() - start:.2f}s，并发拿到了 {len(results)} 个结果")
+
+asyncio.run(main())
+```
+
+输出与题目期望一致：三条 `fetch-*` 行 + `总耗时约 3.00s`。
+
+要点：
+
+- 三个协程被 `gather` 一起调度，`await asyncio.sleep(secs)` 让出控制权时事件循环就去跑别的协程，所以总耗时约等于最长的那个 3 秒，而不是 1+2+3=6 秒。
+- `gather` 的返回值 `results` 按传入顺序排列，用 `for r in results` 顺序打印即可。
+- 用 `time.perf_counter()` 记录每个任务各自的耗时，也能验证"每段请求耗时等于它自己的 secs"。
+</Answer>
 </Callout>
 
 ## 小结

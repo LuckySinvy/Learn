@@ -86,6 +86,102 @@ fn main() {
 
 <Callout type="exercise" title="练习">
 预测并验证：写一个函数 `fn len(s: String) -> usize` 返回字符串长度（内部 `s.len()`），调用后试着再打印原变量，看编译器如何阻止你使用已 move 的值。
+
+<Answer>
+**参考答案：**
+
+**会失败的版本：**
+
+```rust
+fn len(s: String) -> usize {
+    s.len()
+}   // s 在这里离开作用域，被 drop（堆内存释放）
+
+fn main() {
+    let text = String::from("hello");
+    let n = len(text);            // text 的所有权移交给参数 s
+    println!("长度 = {}", n);
+    println!("原字符串 = {}", text);  // ❌ 编译错误
+}
+```
+
+**编译器的报错：**
+
+```text
+error[E0382]: borrow of moved value: `text`
+ --> src/main.rs:9:34
+  |
+7 |     let text = String::from("hello");
+  |         ---- move occurs because `text` has type `String`,
+  |              which does not implement the `Copy` trait
+8 |     let n = len(text);
+  |                 ---- value moved here
+9 |     println!("原字符串 = {}", text);
+  |                              ^^^^ value borrowed here after move
+  |
+help: consider cloning the value if the performance cost is acceptable
+  |
+8 |     let n = len(text.clone());
+  |                     ++++++++
+```
+
+**报错读懂了什么：**
+
+- 编译器精确指出了三个位置：**在哪里创建**、**在哪里被 move**、**在哪里非法使用**
+- 它解释了根因：`String` 没有实现 `Copy`，所以传参是移动而不是复制
+- 还附带了修复建议
+
+**三种修复方式：**
+
+**方案一：改成借用（最推荐）**
+
+```rust
+fn len(s: &String) -> usize {
+    s.len()
+}
+
+fn main() {
+    let text = String::from("hello");
+    let n = len(&text);                  // 只借用，不转移所有权
+    println!("长度 = {}", n);
+    println!("原字符串 = {}", text);     // ✅ 正常工作
+}
+```
+
+更地道的签名是用 `&str`，这样字面量和 `String` 都能传：
+
+```rust
+fn len(s: &str) -> usize {
+    s.len()
+}
+// len(&text) 和 len("hi") 都可以
+```
+
+**方案二：克隆（有堆拷贝开销，非必要不用）**
+
+```rust
+let n = len(text.clone());
+```
+
+**方案三：把所有权还回来**
+
+```rust
+fn len(s: String) -> (String, usize) {
+    let n = s.len();
+    (s, n)                 // 连同所有权一起返回
+}
+
+fn main() {
+    let text = String::from("hello");
+    let (text, n) = len(text);   // 接回所有权（用 shadowing 重新绑定）
+    println!("{} 的长度是 {}", text, n);
+}
+```
+
+这种写法在 Rust 早期很常见，但很笨拙——**借用机制就是为了取代它而存在的**，这也正是下一章的主题。
+
+**对比实验：** 把 `String` 换成 `i32` 试试，就不会报错了，因为 `i32` 实现了 `Copy`，传参是按位复制，原变量依然有效。
+</Answer>
 </Callout>
 
 ## 小结

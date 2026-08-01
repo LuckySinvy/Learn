@@ -197,4 +197,260 @@ SELECT * FROM sys.innodb_lock_waits;                -- 可读性更好的视图
 1. 复现本章的最小死锁，在 `SHOW ENGINE INNODB STATUS` 输出里找到 LATEST DETECTED DEADLOCK 段落，指出各自持有和等待的锁。
 2. 在 RR 级别下用 `SELECT ... WHERE id BETWEEN 5 AND 15 FOR UPDATE` 锁一个范围，另开会话向间隙中 INSERT 验证被阻塞；切到 READ COMMITTED 再试一次对比。
 3. 用两个会话模拟任务队列：表里 5 条待处理任务，两个 worker 各自 `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1` 抢任务，观察互不阻塞。
+
+<Answer>
+**参考答案：**
+
+**1. 复现死锁并读懂日志**
+
+按时序在两个会话里交叉执行：
+
+```sql
+-- 会话 A                                    -- 会话 B
+BEGIN;
+UPDATE products SET stock = stock - 1
+  WHERE id = 1;        -- ① A 拿到行1的 X 锁
+                                             BEGIN;
+                                             UPDATE products SET stock = stock - 1
+                                               WHERE id = 2;   -- ② B 拿到行2的 X 锁
+UPDATE products SET stock = stock - 1
+  WHERE id = 2;        -- ③ A 等 B 的行2
+                                             UPDATE products SET stock = stock - 1
+                                               WHERE id = 1;   -- ④ 环闭合 → 死锁！
+```
+
+其中一方立刻收到：
+
+```text
+ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction
+```
+
+查看死锁日志：
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+```
+
+关注 `LATEST DETECTED DEADLOCK` 段落：
+
+```text
+------------------------
+LATEST DETECTED DEADLOCK
+------------------------
+2026-08-01 15:30:00
+*** (1) TRANSACTION:
+TRANSACTION 12345, ACTIVE 8 sec starting index read
+mysql tables in use 1, locked 1
+LOCK WAIT 3 lock struct(s), heap size 1136, 2 row lock(s)
+MySQL thread id 10, query id 100 updating
+UPDATE products SET stock = stock - 1 WHERE id = 2
+
+*** (1) HOLDS THE LOCK(S):
+RECORD LOCKS space id 5 page no 4 n bits 80 index PRIMARY of table `shop`.`products`
+trx id 12345 lock_mode X locks rec but not gap
+Record lock, heap no 2 PHYSICAL RECORD: ... 0: len 8; hex 01;;   ← id = 1
+
+*** (1) WAITING FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS space id 5 page no 4 index PRIMARY of table `shop`.`products`
+trx id 12345 lock_mode X locks rec but not gap waiting
+Record lock, heap no 3 PHYSICAL RECORD: ... 0: len 8; hex 02;;   ← id = 2
+
+*** (2) TRANSACTION:
+TRANSACTION 12346, ACTIVE 5 sec starting index read
+MySQL thread id 11, query id 101 updating
+UPDATE products SET stock = stock - 1 WHERE id = 1
+
+*** (2) HOLDS THE LOCK(S):
+... trx id 12346 lock_mode X locks rec but not gap
+Record lock, heap no 3 ... hex 02;;                              ← id = 2
+
+*** (2) WAITING FOR THIS LOCK TO BE GRANTED:
+... trx id 12346 lock_mode X locks rec but not gap waiting
+Record lock, heap no 2 ... hex 01;;                              ← id = 1
+
+*** WE ROLL BACK TRANSACTION (2)
+```
+
+**怎么读这份日志**（这是排查线上死锁的核心技能）：
+
+| 段落 | 看什么 |
+|---|---|
+| `*** (1) TRANSACTION` | 事务 1 **正在执行**的那条 SQL（只显示最后一条，前面的要靠业务代码还原） |
+| `(1) HOLDS THE LOCK(S)` | 事务 1 **已持有**的锁：哪张表、哪个索引、哪条记录 |
+| `(1) WAITING FOR ...` | 事务 1 **在等**的锁 |
+| `*** WE ROLL BACK TRANSACTION (2)` | InnoDB 选择回滚哪一方（通常是**修改行数较少**、代价小的） |
+
+关键字段解读：
+
+- `index PRIMARY of table shop.products` —— 锁加在**聚簇索引**上。行锁永远加在**索引记录**上，这里因为按主键更新，锁的是主键索引。
+- `lock_mode X locks rec but not gap` —— **纯记录锁**（没有间隙锁）。这是因为按主键等值命中了存在的记录，临键锁退化为记录锁。
+- `hex 01` / `hex 02` —— 被锁记录的主键值（十六进制），即 id = 1 和 id = 2。这是定位「到底锁了哪一行」的依据。
+
+把两段拼起来：事务 1 持有 id=1 等 id=2，事务 2 持有 id=2 等 id=1，**环闭合** → InnoDB 的等待图检测（`innodb_deadlock_detect = ON`）立刻发现并回滚代价小的一方。
+
+被回滚的一方**整个事务都被撤销**，另一方继续正常执行。所以死锁报错不是灾难，但频繁死锁说明加锁顺序设计有问题。
+
+**根治方法**：让所有代码路径按**统一顺序**加锁，环就构不成。比如批量更新时永远按主键升序：
+
+```sql
+-- 用一条带 IN 的语句代替循环多条，且 InnoDB 会按索引顺序加锁
+UPDATE products SET stock = stock - 1 WHERE id IN (1, 2) AND stock >= 1;
+```
+
+应用层还应**捕获 1213 错误自动重试**（幂等前提下）——死锁在高并发下是常态化事件。
+
+**2. 间隙锁实验：RR vs RC**
+
+```sql
+-- 先确认隔离级别
+SELECT @@transaction_isolation;   -- REPEATABLE-READ
+```
+
+```sql
+-- 会话 A（RR 级别）
+BEGIN;
+SELECT * FROM products WHERE id BETWEEN 5 AND 15 FOR UPDATE;
+-- 锁住 [5,15] 范围内所有存在的记录 + 它们之间的间隙 + 15 到下一条记录之间的间隙
+```
+
+```sql
+-- 会话 B
+INSERT INTO products (id, category_id, name, price, stock)
+  VALUES (7, 2, 'X', 1.00, 1);
+-- 挂起！即使 id=7 这行根本不存在，也插不进去
+```
+
+在第三个会话观察：
+
+```sql
+SELECT * FROM sys.innodb_lock_waits\G
+-- waiting_lock_mode: X,GAP  ← 等的是间隙锁
+
+SELECT object_name, index_name, lock_type, lock_mode, lock_status, lock_data
+FROM performance_schema.data_locks WHERE object_name = 'products';
+-- 会看到一串 lock_mode = X（临键锁）和 X,GAP（间隙锁）的记录
+```
+
+切到 READ COMMITTED 重来：
+
+```sql
+-- 会话 A
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+BEGIN;
+SELECT * FROM products WHERE id BETWEEN 5 AND 15 FOR UPDATE;
+```
+
+```sql
+-- 会话 B
+INSERT INTO products (id, category_id, name, price, stock)
+  VALUES (7, 2, 'X', 1.00, 1);
+-- 立即成功！RC 下间隙锁基本消失，只锁真实存在的记录
+```
+
+**对比总结：**
+
+| | REPEATABLE READ | READ COMMITTED |
+|---|---|---|
+| 加锁单位 | **临键锁**（记录 + 前面的间隙，左开右闭） | **纯记录锁**，只锁存在的行 |
+| 间隙 INSERT | 被阻塞 | 允许 |
+| 幻读 | 被阻止（这正是间隙锁存在的意义） | 可能发生 |
+| 锁冲突/死锁概率 | 高 | 低 |
+| 并发度 | 低 | 高 |
+
+**这是一个明确的权衡**：RR 用间隙锁换取了「防幻读」，代价是大幅增加阻塞和死锁；RC 反之。很多互联网公司（包括阿里的规范）默认把隔离级别调成 **RC**，理由是：
+
+1. 业务上真正依赖「可重复读」的场景很少；
+2. RC 下锁范围小，并发高，死锁少；
+3. RC 配合 `binlog_format = ROW` 不会有主从数据不一致问题（老的 STATEMENT 格式才必须用 RR）。
+
+但要清楚代价：RC 下同一事务内两次相同查询可能读到不同结果，且**没有间隙锁保护，「先查后插」的并发去重会失效**——必须靠唯一索引兜底。
+
+**间隙锁最经典的死锁模式**（务必记住）：两个事务可以**同时持有同一个间隙的间隙锁**（间隙锁之间互相兼容！），但都想往里 INSERT 时就互相等待：
+
+```sql
+-- 会话 A                              -- 会话 B
+BEGIN;                                 BEGIN;
+SELECT * FROM t WHERE id = 7
+  FOR UPDATE;  -- 不存在 → 拿间隙锁
+                                       SELECT * FROM t WHERE id = 7
+                                         FOR UPDATE;  -- 也拿到同一间隙锁（兼容）
+INSERT INTO t VALUES (7, ...);
+  -- 等 B 释放间隙锁
+                                       INSERT INTO t VALUES (7, ...);
+                                       -- 死锁！
+```
+
+绕法：用唯一索引 + `INSERT ... ON DUPLICATE KEY UPDATE` 代替「先查再插」。
+
+**3. SKIP LOCKED 实现任务队列**
+
+```sql
+CREATE TABLE tasks (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  payload    VARCHAR(200)    NOT NULL,
+  status     TINYINT         NOT NULL DEFAULT 0 COMMENT '0待处理 1处理中 2完成',
+  worker     VARCHAR(50)     NOT NULL DEFAULT '',
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_status (status)
+) ENGINE=InnoDB;
+
+INSERT INTO tasks (payload) VALUES ('job-1'),('job-2'),('job-3'),('job-4'),('job-5');
+```
+
+两个 worker 同时抢任务：
+
+```sql
+-- Worker A
+BEGIN;
+SELECT id, payload FROM tasks
+WHERE status = 0
+ORDER BY id
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+-- 立即返回 id=1，并持有它的 X 锁
+
+UPDATE tasks SET status = 1, worker = 'A' WHERE id = 1;
+-- 先不提交，模拟正在处理
+```
+
+```sql
+-- Worker B（同时执行）
+BEGIN;
+SELECT id, payload FROM tasks
+WHERE status = 0
+ORDER BY id
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+-- 立即返回 id=2 —— 不阻塞！自动跳过了被 A 锁住的 id=1
+
+UPDATE tasks SET status = 1, worker = 'B' WHERE id = 2;
+COMMIT;
+```
+
+```sql
+-- Worker A 完成
+UPDATE tasks SET status = 2 WHERE id = 1;
+COMMIT;
+
+SELECT id, payload, status, worker FROM tasks ORDER BY id;
+```
+
+**核心价值**：如果**不加** `SKIP LOCKED`，Worker B 会**阻塞等待** A 释放 id=1 的锁——所有 worker 排成一队串行执行，多开进程毫无意义。加上 `SKIP LOCKED` 后，B 直接跳过被锁的行去拿下一条，**天然实现了无冲突的任务分发**，不需要任何额外的分布式锁。
+
+三个 8.0 锁等待选项的对比：
+
+| 写法 | 遇到被锁的行 |
+|---|---|
+| `FOR UPDATE` | **等待**，直到超时（`innodb_lock_wait_timeout`，默认 50 秒） |
+| `FOR UPDATE NOWAIT` | **立即报错** `ERROR 3572: Statement aborted because lock(s) could not be acquired` |
+| `FOR UPDATE SKIP LOCKED` | **跳过**这些行，只返回能锁住的 |
+
+工程注意事项：
+
+- `SKIP LOCKED` 会**返回不确定的结果集**（跳过了谁取决于当时谁被锁），所以**只适合任务队列这类"取哪条都行"的场景**，绝不能用于需要精确结果的查询（如对账、报表）。
+- 一定要配 `ORDER BY id` 和 `LIMIT`，否则可能一次锁住大量行。
+- 事务要短：worker 拿到任务后应**尽快提交**（把 status 改成「处理中」就提交），真正的业务处理放到事务外面。否则一个慢任务会长时间持锁，还会造成长事务。
+- 需要容错时加超时回收：定期把「处理中且超过 N 分钟未完成」的任务重置回待处理。
+</Answer>
 </Callout>

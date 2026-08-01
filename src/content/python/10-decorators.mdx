@@ -319,6 +319,37 @@ print(slow_square(5))   # 命中缓存`}
 
 <Callout type="exercise" title="提示">
 内部维护 `cache = {}`，key 用 `(*args, sorted(kwargs.items()))` 这样就能区分位置参数和关键字参数。返回前把结果存进字典。
+
+<Answer>
+
+**参考答案：**
+
+```python
+from functools import wraps
+
+def cached(func):
+    cache = {}
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # 注意：sorted(kwargs.items()) 返回 list，不可哈希，
+        # 要包成 tuple 才能作为字典 key
+        key = (args, tuple(sorted(kwargs.items())))
+        if key not in cache:
+            cache[key] = func(*args, **kwargs)
+        return cache[key]
+
+    return wrapper
+```
+
+运行效果：`slow_square(4)` 第一次真的计算并打印 `正在计算 4*4 ...`，第二次直接命中缓存返回 `16`，不再打印；`slow_square(5)` 同理。
+
+要点：
+
+- `cache` 放在 `wrapper` 外层，每个被装饰函数拥有独立的缓存字典，互不污染。
+- key 同时含位置参数 `args` 和关键字参数，能区分 `slow_square(4)` 与 `slow_square(x=4)` 这类调用。
+- `@wraps(func)` 保留原函数的 `__name__`、`__doc__` 等元信息。
+</Answer>
 </Callout>
 
 ## 小结

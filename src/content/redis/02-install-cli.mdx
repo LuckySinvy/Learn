@@ -198,4 +198,111 @@ SELECT 切换的 16 个逻辑库共享同一个进程和内存，无法独立设
 1. 用 Docker 启动一个 Redis 7，设置密码，并用 redis-cli 完成连接认证。
 2. 写入 100 个形如 `test:N` 的 key（可用 `for i in $(seq 1 100); do redis-cli set test:$i $i; done`），然后用 SCAN 分批遍历出来，观察游标变化。
 3. 给一个 key 设置 60 秒过期，分别在过期前后执行 TTL 和 GET，记录返回值。
+
+<Answer>
+**参考答案：**
+
+**1. Docker 启动带密码的 Redis 7 并认证**
+
+```bash
+# 启动容器，用命令行参数覆盖默认配置设置密码
+docker run -d --name redis7 -p 6379:6379 \
+  redis:7-alpine redis-server --requirepass "MyStr0ngPass"
+
+# 方式一：连接后用 AUTH 认证
+redis-cli -p 6379
+127.0.0.1:6379> PING
+(error) NOAUTH Authentication required.
+127.0.0.1:6379> AUTH MyStr0ngPass
+OK
+127.0.0.1:6379> PING
+PONG
+
+# 方式二：连接时直接带密码（-a 会有明文告警，加 --no-auth-warning 消除）
+redis-cli -a MyStr0ngPass --no-auth-warning PING
+PONG
+
+# 方式三：进容器内部连接
+docker exec -it redis7 redis-cli -a MyStr0ngPass --no-auth-warning
+```
+
+`-a` 会把密码留在 shell history 和 `ps` 输出里，更安全的做法是用环境变量：
+
+```bash
+export REDISCLI_AUTH=MyStr0ngPass
+redis-cli PING
+```
+
+**2. 写入 100 个 key 后用 SCAN 遍历**
+
+```bash
+# 练习写法：循环调用 100 次 redis-cli（每次都建连接，很慢）
+for i in $(seq 1 100); do redis-cli set test:$i $i; done
+
+# 更快的写法：pipe 模式一次性批量灌入
+for i in $(seq 1 100); do echo "set test:$i $i"; done | redis-cli --pipe
+
+# 分批遍历，COUNT 10 表示每次"建议"扫描 10 个槽位
+127.0.0.1:6379> SCAN 0 MATCH "test:*" COUNT 10
+1) "104"                 # 下一次要传回去的游标
+2)  1) "test:73"
+    2) "test:12"
+
+127.0.0.1:6379> SCAN 104 MATCH "test:*" COUNT 10
+1) "56"
+2)  1) "test:38"
+
+# 一直迭代直到游标返回 0
+127.0.0.1:6379> SCAN 91 MATCH "test:*" COUNT 10
+1) "0"                   # 游标为 0 表示遍历结束
+2) 1) "test:64"
+```
+
+游标变化的三个关键观察点：
+
+- **游标不是递增的**：它是"反向二进制迭代"的中间状态，会跳来跳去，不要解读它的数值含义，只要不是 0 就继续传回去
+- **每次返回的数量不固定**：`COUNT` 只是提示不是保证，某次可能返回 0 个元素但游标非 0，这时**不能**当成结束
+- **MATCH 是先扫描后过滤**：即使一个都不匹配，Redis 照样扫描了 COUNT 个槽位，返回空列表是正常现象
+
+SCAN 提供的是**最终一致**保证：遍历期间始终存在的 key 一定会被返回至少一次，但可能重复返回，业务侧要自己去重。
+
+**3. 观察 TTL 与 GET 在过期前后的返回值**
+
+```bash
+127.0.0.1:6379> SET session:abc "user123" EX 60
+OK
+
+# ---- 过期前 ----
+127.0.0.1:6379> TTL session:abc
+(integer) 57              # 正数 = 剩余秒数
+127.0.0.1:6379> GET session:abc
+"user123"
+127.0.0.1:6379> PTTL session:abc
+(integer) 54213           # 毫秒精度
+
+# ---- 等待 60 秒后 ----
+127.0.0.1:6379> TTL session:abc
+(integer) -2              # -2 = key 不存在
+127.0.0.1:6379> GET session:abc
+(nil)
+127.0.0.1:6379> EXISTS session:abc
+(integer) 0
+
+# ---- 对比：没有 TTL 的 key ----
+127.0.0.1:6379> SET forever "v"
+OK
+127.0.0.1:6379> TTL forever
+(integer) -1              # -1 = 存在但永不过期
+```
+
+三个返回值必须记牢：
+
+| 返回值 | 含义 |
+|---|---|
+| 正整数 | key 存在，剩余过期秒数 |
+| `-1` | key 存在，但没有设置过期时间 |
+| `-2` | key 不存在（从未存在，或已过期被删除） |
+
+常见坑：很多人误以为不存在时返回 `0`，其实是 `-2`。另外 `SET` 默认会**清除**已有 TTL（除非加 `KEEPTTL`），对一个有过期时间的 key 重新 `SET` 会让它变成永久 key，这是缓存"永不过期"事故的高发原因。
+</Answer>
 </Callout>

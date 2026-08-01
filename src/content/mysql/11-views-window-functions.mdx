@@ -206,4 +206,184 @@ FROM daily;
 1. 创建视图 v_user_stats（用户名、订单数、消费总额），并给一个只读账号授予该视图的 SELECT 权限。
 2. 查询每个用户金额最大的那一笔订单（完整行），用窗口函数实现；再思考不用窗口函数怎么写，对比可读性。
 3. 计算每日订单量的 3 日移动平均和累计值。
+
+<Answer>
+**参考答案：**
+
+**1. 创建 v_user_stats 视图并授权**
+
+```sql
+CREATE VIEW v_user_stats AS
+SELECT u.id                                AS user_id,
+       u.username,
+       COUNT(o.id)                         AS order_count,
+       IFNULL(SUM(o.total_amount), 0)      AS total_spent,
+       MAX(o.created_at)                   AS last_order_at
+FROM users u
+LEFT JOIN orders o
+       ON o.user_id = u.id AND o.status IN (1, 2, 3)
+GROUP BY u.id, u.username;
+
+SELECT * FROM v_user_stats ORDER BY total_spent DESC;
+```
+
+设计要点：
+
+- 用 **LEFT JOIN** 保证没下过单的用户也出现在结果里；
+- **`COUNT(o.id)` 而不是 `COUNT(*)`**，否则无订单用户会被数成 1；
+- **`IFNULL(SUM(...), 0)`**，SUM 对空集返回 NULL 而不是 0；
+- 「只算有效订单」的条件 `o.status IN (1,2,3)` 放在 **ON** 里，放 WHERE 会让 LEFT JOIN 退化成 INNER JOIN。
+
+创建只读账号并只授予视图权限：
+
+```sql
+CREATE USER 'report'@'%' IDENTIFIED BY 'R3port#Pass';
+
+-- 只给视图，不给底层表
+GRANT SELECT ON shop.v_user_stats TO 'report'@'%';
+
+FLUSH PRIVILEGES;
+SHOW GRANTS FOR 'report'@'%';
+```
+
+用 report 登录验证：查 `v_user_stats` 成功，查 `users` / `orders` 直接被拒：
+
+```text
+ERROR 1142 (42000): SELECT command denied to user 'report'@'%' for table 'users'
+```
+
+**这正是视图最实用的价值之一——权限隔离**。视图默认以 `DEFINER`（创建者）的权限执行，所以调用方即使没有底层表权限也能查视图，同时看不到视图里没暴露的敏感列（如 phone、email）。若希望改为按调用者权限校验，创建时加 `SQL SECURITY INVOKER`。
+
+**2. 每个用户金额最大的那一笔订单（完整行）**
+
+窗口函数写法（推荐）：
+
+```sql
+WITH ranked AS (
+  SELECT o.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY user_id
+           ORDER BY total_amount DESC, id DESC
+         ) AS rn
+  FROM orders o
+)
+SELECT id, order_no, user_id, status, total_amount, created_at
+FROM ranked
+WHERE rn = 1;
+```
+
+注意两点：
+
+- 窗口函数**不能直接写在 WHERE 里**（逻辑执行顺序上 WHERE 先于窗口计算），必须套一层 CTE 或派生表再过滤 `rn`。
+- ORDER BY 里补 `, id DESC` 作为 tie-breaker：金额并列时 `ROW_NUMBER` 仍会硬排出先后，但不加确定的第二排序键，结果就不可复现。若希望**并列的都要**，把 `ROW_NUMBER()` 换成 `RANK()`。
+
+不用窗口函数的三种传统写法：
+
+```sql
+-- 写法 A：关联子查询（可读性尚可，但每行都要跑一次子查询）
+SELECT o.*
+FROM orders o
+WHERE o.total_amount = (
+  SELECT MAX(o2.total_amount) FROM orders o2 WHERE o2.user_id = o.user_id
+);
+```
+
+```sql
+-- 写法 B：先聚合出最大值，再 JOIN 回明细
+SELECT o.*
+FROM orders o
+JOIN (
+  SELECT user_id, MAX(total_amount) AS max_amt
+  FROM orders GROUP BY user_id
+) m ON m.user_id = o.user_id AND m.max_amt = o.total_amount;
+```
+
+```sql
+-- 写法 C：反连接——「不存在比我更大的」
+SELECT o.*
+FROM orders o
+WHERE NOT EXISTS (
+  SELECT 1 FROM orders o2
+  WHERE o2.user_id = o.user_id AND o2.total_amount > o.total_amount
+);
+```
+
+**可读性与正确性对比**：
+
+| | 窗口函数 | 传统写法 |
+|---|---|---|
+| 可读性 | 一眼看懂「按用户分区、按金额排序、取第 1 名」 | 要在脑子里模拟两遍扫描 |
+| 并列处理 | `ROW_NUMBER` 精确取 1 条，`RANK` 取全部，**可控** | A/B/C 三种写法**都会返回多行**，且无法只取一条 |
+| 取 Top-N（N>1） | 改 `WHERE rn <= N` 即可 | 几乎写不出来 |
+| 扫描次数 | 一遍 | A 是关联子查询、B/C 需要两次访问表 |
+
+窗口函数最大的优势是**并列可控**和**易扩展到 Top-N**。传统写法 B 还有个隐蔽 bug：如果两笔订单金额相同且都等于最大值，JOIN 会返回两行——很多线上「数据莫名多一行」的报表问题就出在这里。
+
+这个 `PARTITION BY ... ORDER BY ... WHERE rn <= N` 模板可以套用到：每个用户最新一单、每台设备最后一次上报、每篇文章最热评论……记住它就够了。
+
+**3. 每日订单量的 3 日移动平均与累计值**
+
+```sql
+WITH daily AS (
+  SELECT DATE(created_at)   AS d,
+         COUNT(*)           AS order_cnt,
+         SUM(total_amount)  AS gmv
+  FROM orders
+  GROUP BY DATE(created_at)
+)
+SELECT d,
+       order_cnt,
+       SUM(order_cnt) OVER (ORDER BY d)                AS running_total,
+       ROUND(AVG(order_cnt) OVER (
+         ORDER BY d
+         ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+       ), 2)                                            AS ma3
+FROM daily
+ORDER BY d;
+```
+
+```text
++------------+-----------+---------------+------+
+| d          | order_cnt | running_total | ma3  |
++------------+-----------+---------------+------+
+| 2026-07-01 |         1 |             1 | 1.00 |
+| 2026-07-02 |         1 |             2 | 1.00 |
+| 2026-07-03 |         1 |             3 | 1.00 |
+| 2026-07-04 |         1 |             4 | 1.00 |
++------------+-----------+---------------+------+
+```
+
+关键理解：
+
+- **`SUM(x) OVER (ORDER BY d)` 就是累计求和**。带 ORDER BY 的聚合窗口默认帧是 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`，即「从分区开头累加到当前行」。不带 ORDER BY 时帧是整个分区，得到的是全局总和。
+- **`ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` 是 3 行的滑动窗口**（前 2 行 + 当前行）。N 日移动平均要写 `N-1 PRECEDING`，这里差一错很常见。
+- 前两行因为「不足 3 天」，算的是 1 天和 2 天的平均，不是 NULL。要严格只在满 3 天时出值，需要额外判断：
+
+```sql
+CASE WHEN ROW_NUMBER() OVER (ORDER BY d) >= 3
+     THEN ROUND(AVG(order_cnt) OVER (ORDER BY d ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2)
+END AS ma3_strict
+```
+
+**`ROWS` 与 `RANGE` 的区别**（面试常问）：`ROWS` 按**物理行数**取，`RANGE` 按**值的范围**取。如果日期有断档（某天没订单，该行根本不存在），`ROWS 2 PRECEDING` 取的是「前两个有数据的日子」而不是「前两个自然日」，移动平均就失真了。严谨做法是先用第 10 章的递归 CTE 生成完整日期序列，LEFT JOIN 补 0 后再算：
+
+```sql
+WITH RECURSIVE dates AS (
+  SELECT DATE('2026-07-01') AS d
+  UNION ALL
+  SELECT d + INTERVAL 1 DAY FROM dates WHERE d < '2026-07-31'
+),
+daily AS (
+  SELECT dt.d, COUNT(o.id) AS order_cnt
+  FROM dates dt
+  LEFT JOIN orders o ON DATE(o.created_at) = dt.d
+  GROUP BY dt.d
+)
+SELECT d, order_cnt,
+       SUM(order_cnt) OVER (ORDER BY d) AS running_total,
+       ROUND(AVG(order_cnt) OVER (ORDER BY d ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2) AS ma3
+FROM daily
+ORDER BY d;
+```
+</Answer>
 </Callout>

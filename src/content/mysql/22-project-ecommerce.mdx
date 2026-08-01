@@ -273,4 +273,103 @@ SELECT * FROM sys.schema_unused_indexes;      -- 跑一段时间后回头清理
 1. 完整跑通本章流程：建库→造 100 万订单→五条查询逐一 EXPLAIN ANALYZE 记录前后耗时，产出你自己的对比表。
 2. 新需求：「用户收藏商品」功能（一个用户可收藏多个商品，需查「我的收藏列表」和「商品被收藏数」）。设计表、索引，并写出两个查询的 SQL 与 EXPLAIN 预期。
 3. 压力题：把订单列表查询的 OFFSET 推到 50 万模拟深分页，分别用延迟关联和游标分页优化，给出三种写法的 EXPLAIN ANALYZE 数据。
+
+<Answer>
+
+**参考答案：**
+
+**1. 跑通全流程并产出对比表**
+
+按第 3 节存储过程 `gen_data()` 造 100 万订单 + 250 万明细（记得先 `SET autocommit=0` 分批提交、最后 `ANALYZE TABLE`）。然后逐条用 `EXPLAIN ANALYZE` 记录优化前后耗时，参考第 5 节表格格式产出你自己的对比表，例如：
+
+```sql
+EXPLAIN ANALYZE
+SELECT id, order_no, status, total_amount, created_at
+FROM orders
+WHERE user_id = 1 AND status IN (1,2,3)
+ORDER BY created_at DESC LIMIT 20;
+```
+
+关键验收点：加索引前 `type=ALL` 且 `Using filesort`、扫描近百万行；加索引后 `type=ref`、`rows` 降到十几行、filesort 消失、耗时亚毫秒。五条查询都应体现"建对索引 → `rows` 与耗时数量级下降"。
+
+**2. 「用户收藏商品」功能设计**
+
+表设计（多对多，用联合主键/唯一约束防重复收藏）：
+
+```sql
+CREATE TABLE user_favorites (
+  user_id    BIGINT UNSIGNED NOT NULL,
+  product_id BIGINT UNSIGNED NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, product_id),          -- 避免重复收藏
+  KEY idx_product (product_id)                 -- 支撑"商品被收藏数"聚合
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+- 主键 `(user_id, product_id)`：既是唯一约束，又让"某用户的收藏"天然按 `user_id` 聚集，查"我的收藏列表"直接走主键前缀。
+- 额外 `(product_id)` 索引：支撑按商品聚合收藏数。
+
+两个查询与 EXPLAIN 预期：
+
+```sql
+-- ① 我的收藏列表（按收藏时间倒序分页）
+SELECT product_id, created_at
+FROM user_favorites
+WHERE user_id = 1
+ORDER BY created_at DESC
+LIMIT 20;
+-- 预期：type=ref，key=PRIMARY，rows≈该用户收藏数，无 filesort（若加 (user_id, created_at) 索引则可彻底免排序）
+
+-- ② 商品被收藏数
+SELECT COUNT(*) AS fav_cnt
+FROM user_favorites
+WHERE product_id = 12345;
+-- 预期：type=ref，key=idx_product，rows≈该商品被收藏行数（极小）
+```
+
+若"我的收藏列表"要求同时返回商品名，JOIN `products` 即可，`products.id` 为主键走 `eq_ref`。
+
+**3. 深分页（OFFSET 50 万）三种写法对比**
+
+```sql
+-- 写法 A：原始深分页（灾难写法）
+EXPLAIN ANALYZE
+SELECT id, order_no, status, total_amount, created_at
+FROM orders
+WHERE user_id = 1 AND status IN (1,2,3)
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 500000;
+-- 预期：type=ref 但需扫描并丢弃前 50 万行，rows≈50 万+，耗时随 OFFSET 线性增长
+
+-- 写法 B：延迟关联（先靠覆盖索引拿 ID，再回表）
+EXPLAIN ANALYZE
+SELECT o.id, o.order_no, o.status, o.total_amount, o.created_at
+FROM orders o
+JOIN (
+  SELECT id
+  FROM orders
+  WHERE user_id = 1 AND status IN (1,2,3)
+  ORDER BY created_at DESC
+  LIMIT 20 OFFSET 500000
+) t ON t.id = o.id
+ORDER BY o.created_at DESC;
+-- 预期：子查询走 (user_id, created_at) 覆盖索引只取 id（避免回表大结果），
+--       外层只回表 20 行；rows 显著下降，但排序仍要丢弃前 50 万行
+
+-- 写法 C：游标/Keyset 分页（最优，无 OFFSET）
+-- 上一页最后一条的 created_at 与 id 作为游标
+EXPLAIN ANALYZE
+SELECT id, order_no, status, total_amount, created_at
+FROM orders
+WHERE user_id = 1 AND status IN (1,2,3)
+  AND (created_at, id) < ('2026-03-04 12:00:00', 884122)   -- 上一页末位游标
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+-- 预期：type=range，key=(user_id, created_at)，rows≈20，
+--       直接从游标位置起扫 20 行，耗时与翻到第几页无关
+```
+
+结论：**写法 A 随页深线性恶化；写法 B 用覆盖索引减少回表但仍要排序丢弃；写法 C（游标分页）彻底去掉 OFFSET，耗时恒定、最适合"无限下拉/上一页下一页"场景**。代价是游标分页不支持"任意跳页"，业务上通常用"上一页/下一页"替代随机跳页。
+
+</Answer>
 </Callout>

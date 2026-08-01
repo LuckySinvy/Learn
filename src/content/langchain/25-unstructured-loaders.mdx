@@ -65,6 +65,49 @@ const clean = raw.filter(
 
 <Callout type="exercise" title="练习">
 准备一份含标题与表格的 PDF，用 `UnstructuredLoader` 加载，过滤掉 `Header/Footer`，再切分存入第 10 章的 MemoryVectorStore 做一次检索。
+
+<Answer>
+**参考答案：**
+
+```python
+from langchain_community.document_loaders import UnstructuredLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import MemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+# 1. 加载含标题与表格的 PDF（hi_res 保留版面/表格结构）
+loader = UnstructuredLoader(
+    "./docs/report.pdf",
+    strategy="hi_res",
+    pdf_inference=True,
+)
+docs = await loader.aload()
+
+# 2. 过滤页眉、页脚、页码等噪点
+clean = [
+    d
+    for d in docs
+    if d.metadata.get("category") not in {"Header", "Footer", "PageNumber"}
+]
+
+# 3. 切分
+splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=80)
+splits = splitter.split_documents(clean)
+
+# 4. 存入内存向量库并检索
+store = MemoryVectorStore.from_documents(splits, OpenAIEmbeddings())
+result = store.similarity_search("报告中的表格主要讲了什么", k=3)
+
+for doc in result:
+    print(doc.metadata.get("category"), doc.page_content[:80])
+```
+
+要点：
+
+- 含表格或复杂版式的 PDF 用 `hi_res`，否则表格会被解析成纯文本流，丢失行列结构；
+- `category` 是 `unstructured` 标出的元素类型（`Title`、`Table`、`Header`、`Footer` 等），按它过滤最省事；检索后核对返回结果的 `category`，应只剩正文元素，验证过滤是否生效；
+- 切分参数沿用第 9 章经验（`chunk_size` 约 800、`chunk_overlap` 约 80），再入向量库做一次检索闭环验证。
+</Answer>
 </Callout>
 
 ## 小结

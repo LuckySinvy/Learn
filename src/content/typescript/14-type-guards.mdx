@@ -278,6 +278,168 @@ if (first !== null && first !== undefined) console.log(first.length);
 1. 写一个 `isRecord(v: unknown): v is Record<string, unknown>` 守卫，并用它安全地读取 `JSON.parse` 的结果。
 2. 给一个 `type Result = { ok: true; value: number } | { ok: false; error: string }` 写处理函数，用 `assertNever` 保证穷尽。
 3. 把 `MODES` 换成一个对象常量 `as const`，用 `typeof OBJ[keyof typeof OBJ]` 推出值的联合类型，体会它和数组写法的区别。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：isRecord 守卫**
+
+```ts
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function parseUser(json: string): { name: string; age: number } | null {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    return null;
+  }
+
+  if (!isRecord(raw)) return null;      // 收窄后才能用下标访问
+
+  // 这里 raw 已经是 Record<string, unknown>，可以安全取属性
+  const name = raw.name;
+  const age = raw.age;
+
+  if (typeof name !== "string" || typeof age !== "number") return null;
+
+  return { name, age };                 // 两个变量各自也已被收窄
+}
+
+console.log(parseUser('{"name":"Ada","age":36}'));   // { name: 'Ada', age: 36 }
+console.log(parseUser('{"name":"Ada"}'));            // null
+console.log(parseUser('[1,2,3]'));                   // null
+console.log(parseUser('null'));                      // null
+console.log(parseUser('不是 JSON'));                  // null
+```
+
+三个判断缺一不可：
+
+| 检查 | 挡掉什么 | 为什么必要 |
+|---|---|---|
+| `typeof v === "object"` | 字符串、数字、布尔 | 基本过滤 |
+| `v !== null` | `null` | `typeof null === "object"`，JS 的历史遗留 bug |
+| `!Array.isArray(v)` | 数组 | 数组的 `typeof` 也是 `"object"`，但它不是我们要的「字典」 |
+
+要点：
+
+- `JSON.parse` 的返回类型是 `any`，这是标准库里少数几个坑。**主动把它接成 `unknown`**（`let raw: unknown`），强制自己走守卫流程，是本章说的「外部输入一律用 unknown 接住」的具体做法。
+- 收窄成 `Record<string, unknown>` 后，`raw.name` 的类型是 `unknown` 而不是 `any`，所以后面那层 `typeof` 检查是编译器**强制**你写的，不是可选的谨慎。
+- 谓词函数保持短小直白，符合本章 Callout 的建议——因为编译器不验证它的正确性，写复杂了就是给自己埋雷。
+
+**第 2 题：Result 的穷尽处理**
+
+```ts
+type Result = { ok: true; value: number } | { ok: false; error: string };
+
+function assertNever(x: never): never {
+  throw new Error("未处理的分支: " + JSON.stringify(x));
+}
+
+function describe(r: Result): string {
+  switch (r.ok) {
+    case true:
+      return "成功，值为 " + r.value;    // 这里只有 value，没有 error
+    case false:
+      return "失败：" + r.error;         // 这里只有 error，没有 value
+    default:
+      return assertNever(r);
+  }
+}
+
+const results: Result[] = [
+  { ok: true, value: 42 },
+  { ok: false, error: "网络超时" },
+];
+
+for (const r of results) console.log(describe(r));
+// 成功，值为 42
+// 失败：网络超时
+```
+
+这里的判别字段是 `boolean` 字面量 `true` / `false`，而不是常见的字符串 tag——**可辨识联合的标签可以是任意字面量类型**。用 `if (r.ok)` 配合三元也完全一样：
+
+```ts
+function unwrap(r: Result): number {
+  if (r.ok) return r.value;
+  throw new Error(r.error);
+}
+```
+
+**新增一个分支验证穷尽性：**
+
+```ts
+type Result =
+  | { ok: true; value: number }
+  | { ok: false; error: string }
+  | { ok: "pending" };        // 新增
+
+// describe 的 default 分支立刻报错：
+// TS2345: 类型“{ ok: "pending"; }”的参数不能赋给类型“never”的参数。
+```
+
+编译器精确指向 `assertNever(r)` 那一行，把所有忘记更新的 switch 一次列全。这就是本章说的「重构安全网」。
+
+**第 3 题：对象常量 vs 数组常量**
+
+```ts
+// 写法 A：数组 + as const（原来的写法）
+const MODES = ["idle", "running", "done"] as const;
+type ModeA = (typeof MODES)[number];
+// "idle" | "running" | "done"
+
+// 写法 B：对象 + as const
+const MODE = {
+  Idle: "idle",
+  Running: "running",
+  Done: "done",
+} as const;
+type ModeB = (typeof MODE)[keyof typeof MODE];
+// "idle" | "running" | "done"   —— 结果完全相同
+
+const a: ModeA = "running";
+const b: ModeB = "running";
+console.log(a === b);   // true
+```
+
+两种写法推出的**类型一模一样**，差别全在「运行时怎么用」：
+
+| 维度 | 数组 `as const` | 对象 `as const` |
+|---|---|---|
+| 取值类型的写法 | `T[number]` | `T[keyof typeof T]` |
+| 遍历所有取值 | 天然可以：`MODES.forEach(...)` | 需要 `Object.values(MODE)` |
+| 保证顺序 | 是（数组有序） | 否（不应依赖键顺序） |
+| 按名字引用 | 不行，只能写裸字符串 `"idle"` | 可以：`MODE.Idle` |
+| 值与名解耦 | 不能，名字就是值 | 能，如 `Idle: "IDLE_STATE"` |
+| 反查名字 | 不方便 | 可以遍历 entries |
+
+选型建议：
+
+- **需要遍历、需要顺序**（渲染下拉选项、状态流转顺序、循环切换）→ 用**数组**。
+- **需要用有意义的名字引用**，或者「展示名」和「存储值」不一致 → 用**对象**。
+
+```ts
+// 对象写法的真正优势：名字和值可以不同
+const STATUS = {
+  Pending: "PENDING_REVIEW",
+  Approved: "APPROVED_FINAL",
+} as const;
+
+type Status = (typeof STATUS)[keyof typeof STATUS];
+// "PENDING_REVIEW" | "APPROVED_FINAL"
+
+function submit(s: Status): void {
+  console.log("提交状态 " + s);
+}
+submit(STATUS.Pending);     // 调用处可读性好，不用记后端的魔法字符串
+```
+
+两种写法也可以组合——用对象定义映射，再用数组定义顺序，各取所长。
+
+顺带一提，这两种写法都比 `enum` 更值得推荐（详见第 3 章）：它们是纯 JavaScript，不生成额外运行时代码，且字面量联合在类型收窄上表现更好。
+</Answer>
 </Callout>
 
 ## 小结

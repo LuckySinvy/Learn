@@ -191,4 +191,159 @@ LPUSH + LTRIM 的时间线只能"按插入顺序"排列。如果需要按分数�
 1. 用两个 redis-cli 窗口演练生产者-消费者：一边 BLPOP 阻塞等待，另一边 RPUSH，观察阻塞返回的耗时标记。
 2. 实现"最近浏览记录"：每次浏览 LPUSH 商品 ID，先 LREM 去重再插入，保留最多 10 条，写出完整命令序列。
 3. 向一个 List 连续 RPUSH 200 个元素，用 OBJECT ENCODING 观察从 listpack 到 quicklist 的编码转换。
+
+<Answer>
+**参考答案：**
+
+**1. 两个窗口演练生产者-消费者**
+
+```bash
+# ---- 窗口 A（消费者）先执行，会阻塞在这里 ----
+127.0.0.1:6379> BLPOP task:queue 0        # 0 = 永久阻塞，直到有数据
+                                          # 光标停住，没有任何输出
+
+# ---- 窗口 B（生产者）过一会儿执行 ----
+127.0.0.1:6379> RPUSH task:queue "job-1"
+(integer) 1
+
+# ---- 窗口 A 立刻返回 ----
+1) "task:queue"                           # 第一个元素是队列名
+2) "job-1"                                # 第二个元素才是数据
+(23.47s)                                  # 括号里就是"耗时标记"：阻塞了 23.47 秒
+```
+
+三个关键观察：
+
+- **耗时标记 `(23.47s)`**：redis-cli 只在命令耗时超过 0.5 秒时才显示。这个数字证明连接是真的被挂起了，不是在轮询
+- **返回值是两元素数组**：因为 `BLPOP` 可以同时监听多个队列（`BLPOP q1 q2 q3 0`），所以必须告诉你数据来自哪个队列。这一点写代码时很容易忘，直接取返回值当数据会拿到队列名
+- **阻塞不消耗 CPU**：客户端被挂到该 key 的阻塞链表上，`RPUSH` 时由服务端主动唤醒。对比"每秒 `LPOP` 一次"的轮询方案，既省 CPU 又零延迟
+
+```bash
+# 设置超时，避免连接永久占用
+127.0.0.1:6379> BLPOP task:queue 5
+(nil)
+(5.02s)                                   # 5 秒无数据，返回 nil
+
+# 多个消费者时先阻塞的先拿到数据（FIFO 公平唤醒）
+# 窗口 A 先 BLPOP，窗口 C 后 BLPOP，此时 RPUSH 一条 → A 拿到
+```
+
+**重要提醒**：`BLPOP` 阻塞期间这条连接完全被占用，无法执行其他命令。用连接池的客户端（Jedis、Lettuce、go-redis）必须为阻塞命令**单独分配连接**，否则会把整个池耗尽导致其他业务卡死。
+
+**2. 最近浏览记录（去重 + 定长）**
+
+```bash
+# 用户浏览商品 3001
+127.0.0.1:6379> LREM history:u1001 0 3001      # 先删掉已存在的（0 = 删除全部匹配项）
+(integer) 0
+127.0.0.1:6379> LPUSH history:u1001 3001       # 再从头部插入
+(integer) 1
+127.0.0.1:6379> LTRIM history:u1001 0 9        # 只保留前 10 条（下标 0~9）
+OK
+
+# 又浏览 3002
+127.0.0.1:6379> LREM history:u1001 0 3002
+(integer) 0
+127.0.0.1:6379> LPUSH history:u1001 3002
+(integer) 2
+127.0.0.1:6379> LTRIM history:u1001 0 9
+OK
+
+# 重新浏览 3001（已存在，验证去重 + 置顶效果）
+127.0.0.1:6379> LREM history:u1001 0 3001
+(integer) 1                                     # 返回 1，说明确实删掉了旧记录
+127.0.0.1:6379> LPUSH history:u1001 3001
+(integer) 2
+127.0.0.1:6379> LTRIM history:u1001 0 9
+OK
+
+# 查看结果：3001 跑到了最前面，且只出现一次
+127.0.0.1:6379> LRANGE history:u1001 0 -1
+1) "3001"
+2) "3002"
+
+# 设置过期，30 天不活跃就清理
+127.0.0.1:6379> EXPIRE history:u1001 2592000
+(integer) 1
+```
+
+**必须用事务或 Lua 保证原子性**，否则并发浏览时可能出现重复项：
+
+```bash
+# 方式一：MULTI/EXEC 打包（三条命令连续执行，中间不插入其他客户端命令）
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379> LREM history:u1001 0 3005
+QUEUED
+127.0.0.1:6379> LPUSH history:u1001 3005
+QUEUED
+127.0.0.1:6379> LTRIM history:u1001 0 9
+QUEUED
+127.0.0.1:6379> EXEC
+1) (integer) 0
+2) (integer) 3
+3) OK
+
+# 方式二：Lua 脚本（可复用，只传参数）
+127.0.0.1:6379> EVAL "redis.call('LREM', KEYS[1], 0, ARGV[1]); redis.call('LPUSH', KEYS[1], ARGV[1]); redis.call('LTRIM', KEYS[1], 0, tonumber(ARGV[2]) - 1); return redis.call('LLEN', KEYS[1])" 1 history:u1001 3006 10
+(integer) 4
+```
+
+三条命令的分工：
+
+| 命令 | 作用 | 复杂度 |
+|---|---|---|
+| `LREM key 0 v` | 去重：删除所有等于 v 的元素 | O(N) |
+| `LPUSH key v` | 置顶：从头部插入 | O(1) |
+| `LTRIM key 0 9` | 定长：截断到 10 条 | O(N) |
+
+因为 `LTRIM` 保证了长度始终 ≤ 10，`LREM` 的 O(N) 里 N 最大只有 10，所以整体性能没有问题。**但如果没有 `LTRIM`，`LREM` 会随列表增长越来越慢**——这是这个模式必须三条命令配套使用的原因。
+
+`LREM` 的第二个参数含义：正数 = 从头开始删 N 个，负数 = 从尾开始删 N 个，`0` = 删除全部匹配项。去重场景固定用 `0`。
+
+**3. 观察 listpack 到 quicklist 的转换**
+
+```bash
+127.0.0.1:6379> DEL mylist
+(integer) 1
+
+# 先加 100 个元素（未超过 list-max-listpack-size 128）
+for i in $(seq 1 100); do redis-cli rpush mylist "item$i"; done
+127.0.0.1:6379> LLEN mylist
+(integer) 100
+127.0.0.1:6379> OBJECT ENCODING mylist
+"listpack"
+
+# 继续加到 200 个，突破 128
+for i in $(seq 101 200); do redis-cli rpush mylist "item$i"; done
+127.0.0.1:6379> LLEN mylist
+(integer) 200
+127.0.0.1:6379> OBJECT ENCODING mylist
+"quicklist"
+
+# 验证不可逆：删到只剩 10 个，编码依然是 quicklist
+127.0.0.1:6379> LTRIM mylist 0 9
+OK
+127.0.0.1:6379> LLEN mylist
+(integer) 10
+127.0.0.1:6379> OBJECT ENCODING mylist
+"quicklist"
+
+# 另一条触发路径：单个元素过大（默认单元素超 64 字节也会转）
+127.0.0.1:6379> DEL big
+127.0.0.1:6379> RPUSH big "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+(integer) 1
+127.0.0.1:6379> OBJECT ENCODING big
+"quicklist"
+```
+
+**两种编码的取舍**：
+
+- **listpack**：一整块连续内存，无指针开销，缓存命中率高。缺点是插入/删除要 memmove 整块数据，元素多了会很慢，还可能触发连锁更新
+- **quicklist**：多个 listpack 节点串成的双向链表。每个节点内部仍然紧凑，节点之间用指针连接。这样既避免了单块内存过大导致的 memmove 成本，又比纯双向链表（每个元素两个指针，64 位下 16 字节纯开销）省内存
+
+`list-compress-depth` 配置可以让**中间节点做 LZF 压缩**（两端各保留 N 个节点不压缩）。这对"只操作两端"的队列场景很划算：中间的数据反正不访问，压缩后能省一半以上内存。设为 `1` 表示首尾各留 1 个节点不压缩。
+
+和 Hash 一样，List 的编码转换也是**单向**的，原因同样是避免阈值边界的反复抖动。
+</Answer>
 </Callout>

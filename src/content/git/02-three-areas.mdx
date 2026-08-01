@@ -298,4 +298,70 @@ git commit -q -m "msg"    # 安静模式，少打印
 2. 在同一次编辑里改动两个文件（一个模拟功能代码、一个模拟文档），用暂存区把它们拆成两个提交，最后用 `git log --oneline` 验证。
 3. 新建一个未跟踪的文件，然后执行 `git commit -am "test"`，用 `git status` 确认这个文件仍然是 `??`。解释为什么。
 4. `git ls-files --stage` 输出里第二列是什么？把同一份内容写进两个不同文件名再 `git add`，观察它们的哈希是否相同，并解释原因（第 13 章会给出完整答案）。
+
+<Answer>
+**参考答案：**
+
+**1. 制造并解读 `MM` 状态**
+
+```bash
+git init -q
+echo v1 > a.txt
+git add a.txt
+git commit -q -m "init"
+echo v2 > a.txt     # 第一次修改
+git add a.txt       # 把 v2 快照进暂存区
+echo v3 > a.txt     # 第二次修改，不暂存
+git status -s
+```
+
+此时输出是 `MM a.txt`：第一列 `M` 表示暂存区里有新内容（v2，比 HEAD 里的 v1 新）；第二列 `M` 表示工作区比暂存区更新（v3）。
+
+- `git diff`：比较**工作区 vs 暂存区**，显示的是第二次修改（v2 → v3）的内容。
+- `git diff --staged`：比较**暂存区 vs HEAD**，显示的是第一次修改（v1 → v2）的内容。
+
+如果只执行 `git add a.txt` 再 `git diff --staged`，它会变成 v1 → v3 的完整差异。
+
+**2. 用暂存区拆出两个提交**
+
+```bash
+git init -q
+echo base > README.md
+git add .
+git commit -q -m "init"
+
+# 一次编辑干了两件事
+echo 'def fix(): pass' > feature.py
+echo 'base + docs' > README.md
+
+git add feature.py
+git commit -q -m "feat: 新增功能"
+git add README.md
+git commit -q -m "docs: 更新说明"
+git log --oneline
+```
+
+关键点：`git commit` 只会提交**已暂存**的内容。第一次提交时 README.md 的改动还留在工作区，不会被带进去；第二次 `git add README.md` 后才把文档改动独立提交。历史里就是两个语义清晰的提交。
+
+**3. `git commit -am` 不会带上未跟踪文件**
+
+```bash
+echo test > untracked.txt
+git commit -am "test"
+git status -s
+```
+
+输出仍是 `?? untracked.txt`。原因：`-a` 等价于"暂存所有**已跟踪**文件（tracked）的修改与删除"，它不会添加从未被跟踪的新文件。新文件必须先 `git add` 一次进入索引，才会被 Git 管理。这也是课上提到的经典事故来源——新模块文件没进仓库，推上去后别人编译失败。
+
+**4. `git ls-files --stage` 的第二列**
+
+```bash
+echo hello > f1.txt
+echo hello > f2.txt
+git add f1.txt f2.txt
+git ls-files --stage
+```
+
+输出格式为 `100644 <40位哈希> 0 <路径>`，第二列是**文件内容对象的 SHA-1 哈希**。因为 `f1.txt` 和 `f2.txt` 的内容完全相同，它们的 blob 哈希**也完全相同**（哈希只由内容决定，与文件名无关），所以你会看到两行哈希一模一样、只有路径不同。这正是 Git 去重的原理：相同内容的文件在仓库里只存一份对象，靠哈希寻址（第 13 章会展开）。
+</Answer>
 </Callout>

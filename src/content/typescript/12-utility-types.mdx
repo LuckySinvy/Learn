@@ -244,6 +244,146 @@ console.log(onlyStr, onlyNum, notNull);`}
 1. 手写 `MyExtract<T, U>` 与 `MyNonNullable<T>`，并用 `const` 变量验证它们和内置版本行为一致。
 2. 定义 `type Article = { id: number; title: string; body: string; authorId: number }`，用工具类型组合出「创建文章的入参类型」：不含 `id`，且 `body` 可选。提示：`Omit` 之后再和 `Partial<Pick<...>>` 做交叉。
 3. 写一个 `type DeepPartial<T>`，让嵌套对象的每一层属性都变成可选。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：手写 MyExtract 与 MyNonNullable**
+
+```ts
+type MyExtract<T, U> = T extends U ? T : never;
+type MyNonNullable<T> = T extends null | undefined ? never : T;
+// 也可以照抄 TS 4.9 起的官方写法：type MyNonNullable<T> = T & {};
+
+type Kind = "a" | "b" | 1 | 2 | null | undefined;
+
+// 与内置版本对照验证
+const s1: MyExtract<Kind, string> = "a";
+const s2: Extract<Kind, string> = "a";
+// const bad: MyExtract<Kind, string> = 1;   // 错误：1 不在 "a" | "b" 里
+
+const n1: MyNonNullable<string | null | undefined> = "safe";
+const n2: NonNullable<string | null | undefined> = "safe";
+
+console.log(s1 === s2, n1 === n2);   // true true
+
+// 更严格的一致性验证：让两个类型互相赋值，任一方向不通过就说明不等价
+type AssertSame<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+const check1: AssertSame<MyExtract<Kind, string>, Extract<Kind, string>> = true;
+const check2: AssertSame<MyNonNullable<Kind>, NonNullable<Kind>> = true;
+console.log(check1, check2);   // true true
+```
+
+要点：
+
+- 两者都依赖**分发**：`T` 是裸类型参数，联合会被逐个成员代入判断。`MyExtract<"a" | 1, string>` 展开成 `("a" extends string ? "a" : never) | (1 extends string ? 1 : never)`，即 `"a" | never`，最终是 `"a"`——联合里的 `never` 会被自动吸收掉。
+- `MyExtract` 和 `MyExclude` 只差三元表达式两个分支的顺序。
+- `AssertSame` 这个小工具值得记住：它用**双向可赋值**来判断两个类型是否等价，是验证手写工具类型最直接的办法。注意必须用 `[A] extends [B]` 关掉分发，否则联合类型会被拆开逐个比较，得到错误结论。
+
+**第 2 题：创建文章的入参类型**
+
+```ts
+type Article = {
+  id: number;
+  title: string;
+  body: string;
+  authorId: number;
+};
+
+// 第一步：去掉 id           → { title; body; authorId }
+// 第二步：再去掉 body       → { title; authorId }        （必填部分）
+// 第三步：把 body 单独变可选 → { body?: string }
+// 第四步：两者交叉
+type CreateArticleInput = Omit<Article, "id" | "body"> &
+  Partial<Pick<Article, "body">>;
+
+// 展开后等价于 { title: string; authorId: number; body?: string }
+
+const a: CreateArticleInput = { title: "TypeScript 实战", authorId: 7 };
+const b: CreateArticleInput = { title: "草稿", authorId: 7, body: "正文内容" };
+// const c: CreateArticleInput = { title: "x" };            // 错误：缺少 authorId
+// const d: CreateArticleInput = { id: 1, title: "x", authorId: 7 };  // 错误：id 不该出现
+
+console.log(JSON.stringify(a));   // {"title":"TypeScript 实战","authorId":7}
+console.log(JSON.stringify(b));
+```
+
+这个「部分字段可选」的需求非常常见，值得抽成一个可复用的工具类型：
+
+```ts
+type PartialBy<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
+
+type CreateArticleInput2 = PartialBy<Omit<Article, "id">, "body">;
+// 同样是 { title: string; authorId: number; body?: string }
+```
+
+对应地还有反向的 `RequiredBy`：
+
+```ts
+type RequiredBy<T, K extends keyof T> = Omit<T, K> & Required<Pick<T, K>>;
+```
+
+一个小提示：交叉类型在编辑器悬浮提示里会显示成 `Omit<...> & Partial<...>` 这种不易读的形式。想让它「拍平」成一个干净的对象，可以套一层恒等映射：
+
+```ts
+type Prettify<T> = { [K in keyof T]: T[K] } & {};
+
+type Clean = Prettify<CreateArticleInput>;
+// 提示里直接显示 { title: string; authorId: number; body?: string }
+```
+
+**第 3 题：DeepPartial**
+
+```ts
+type DeepPartial<T> = T extends (...args: any[]) => any
+  ? T                                       // 函数原样保留
+  : T extends readonly (infer E)[]
+    ? readonly DeepPartial<E>[]             // 数组：递归元素类型
+    : T extends object
+      ? { [K in keyof T]?: DeepPartial<T[K]> }
+      : T;                                  // 原始类型：递归终点
+
+interface Config {
+  name: string;
+  server: {
+    host: string;
+    port: number;
+    auth: {
+      user: string;
+      token: string;
+    };
+  };
+  tags: string[];
+}
+
+// 每一层都可以只写一部分
+const patch1: DeepPartial<Config> = {};
+const patch2: DeepPartial<Config> = { name: "dev" };
+const patch3: DeepPartial<Config> = {
+  server: { auth: { user: "admin" } },       // 只改最深层的一个字段
+};
+
+console.log(JSON.stringify(patch3));
+// {"server":{"auth":{"user":"admin"}}}
+
+// 对比内置的浅层 Partial：
+const shallow: Partial<Config> = {
+  // server: { auth: { user: "admin" } },
+  // 错误：缺少 host 和 port —— Partial 只让第一层可选，
+  // server 内部的字段依然全部必填
+  server: { host: "x", port: 1, auth: { user: "a", token: "b" } },
+};
+console.log(Object.keys(shallow).join(","));
+```
+
+要点：
+
+- 与上一章的 `DeepReadonly` 结构完全一致：**先排除函数，再处理数组，然后才是普通对象，最后原始类型兜底**。顺序不能乱——函数和数组都满足 `T extends object`，必须排在前面。
+- 数组分支单独处理是必要的。如果直接走对象分支，`string[]` 会被映射成 `{ 0?: string; length?: number; push?: ... }` 这种荒唐的东西。
+- 典型用途是配置合并与深度更新（deep merge），调用方只需提供想改的那几层。
+- 老规矩提醒：递归类型有实例化深度上限（约 50 层），而且是大型项目编译变慢的常见原因。`DeepPartial` 用在配置对象这种层级可控的场景很合适，不要拿去处理任意深度的数据结构。
+</Answer>
 </Callout>
 
 ## 小结

@@ -248,6 +248,162 @@ console.log("已冻结:", Object.isFrozen(cfg.a), cfg.a.b);`}
 1. 实现 `type CamelToSnake<S extends string>`，把 `"userFirstName"` 变成 `"user_first_name"`。提示：逐字符递归，遇到大写字母就插入下划线。
 2. 实现 `type Split<S extends string, D extends string>`，把 `"a,b,c"` 按 `","` 拆成 `["a", "b", "c"]`。
 3. 基于本章的 `Path` 类型，写出 `type PathValue<T, P extends Path<T>>`，让它返回路径对应的值类型，并实现配套的运行时 `get` 函数。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：CamelToSnake**
+
+```ts
+// 逐字符递归的内部实现
+type CamelToSnakeInner<S extends string> =
+  S extends `${infer Head}${infer Tail}`
+    ? Head extends Uppercase<Head>            // 是大写字母吗？
+      ? Head extends Lowercase<Head>          // 大小写相同 → 是数字或符号
+        ? `${Head}${CamelToSnakeInner<Tail>}`
+        : `_${Lowercase<Head>}${CamelToSnakeInner<Tail>}`
+      : `${Head}${CamelToSnakeInner<Tail>}`   // 小写字母，原样保留
+    : S;                                      // 空字符串，递归终点
+
+// 先 Uncapitalize，避免首字母大写时产生开头的下划线
+type CamelToSnake<S extends string> = CamelToSnakeInner<Uncapitalize<S>>;
+
+type T1 = CamelToSnake<"userFirstName">;   // "user_first_name"
+type T2 = CamelToSnake<"id">;              // "id"
+type T3 = CamelToSnake<"UserName">;        // "user_name"（不是 "_user_name"）
+type T4 = CamelToSnake<"addressLine2">;    // "address_line2"（数字不加下划线）
+
+const a: T1 = "user_first_name";
+const b: T4 = "address_line2";
+console.log(a, b);
+```
+
+判断「是不是大写字母」的技巧值得记住：**`Head extends Uppercase<Head>` 单独用是不够的**，因为数字和符号的大小写形式相同，也会通过这个测试。所以要再嵌套一层 `Head extends Lowercase<Head>`——两个测试都通过说明它根本不是字母（如 `"2"`、`"_"`），只通过第一个才是真正的大写字母。
+
+配合键重映射，可以整体转换接口的命名风格，这正是 ORM 层最常见的需求：
+
+```ts
+type SnakeKeys<T> = {
+  [K in keyof T as K extends string ? CamelToSnake<K> : K]: T[K];
+};
+
+type Model = { userId: number; createdAt: string; isActive: boolean };
+type Row = SnakeKeys<Model>;
+// { user_id: number; created_at: string; is_active: boolean }
+```
+
+**第 2 题：Split**
+
+```ts
+type Split<S extends string, D extends string> =
+  S extends `${infer Head}${D}${infer Tail}`
+    ? [Head, ...Split<Tail, D>]
+    : [S];
+
+type S1 = Split<"a,b,c", ",">;            // ["a", "b", "c"]
+type S2 = Split<"one", ",">;              // ["one"]，没有分隔符时整体作为唯一元素
+type S3 = Split<"2024-06-01", "-">;       // ["2024", "06", "01"]
+type S4 = Split<"a::b::c", "::">;         // ["a", "b", "c"]，分隔符可以是多字符
+type S5 = Split<"a,,b", ",">;             // ["a", "", "b"]，保留空段
+
+const parts: S1 = ["a", "b", "c"];
+const date: S3 = ["2024", "06", "01"];
+console.log(parts.join("/"), date[0]);
+```
+
+递归结构非常直观：**匹配到分隔符就把头部切下来，剩余部分继续递归；匹配不到就说明到了最后一段**，用 `[S]` 收尾。
+
+一个实用的延伸——让运行时的 `split` 也返回精确的元组类型：
+
+```ts
+function split<S extends string, D extends string>(s: S, d: D): Split<S, D> {
+  return s.split(d) as Split<S, D>;
+}
+
+const r = split("2024-06-01", "-");   // 类型是 ["2024", "06", "01"]，不是 string[]
+console.log(r[1]);                     // 编辑器知道这里是 "06"
+```
+
+两个边界情况值得留意：
+
+- `Split<"", ",">` 得到 `[""]` 而不是 `[]`，与 JS 的 `"".split(",")` 行为一致。
+- 分隔符为空串时，TypeScript 会逐字符拆分（`Split<"abc", "">` 得 `["a", "b", "c"]`），不会陷入死循环，但这属于编译器的特殊处理，不建议依赖。
+
+**第 3 题：PathValue 与运行时 get**
+
+```ts
+type Path<T> = T extends object
+  ? { [K in keyof T & string]: K | `${K}.${Path<T[K]>}` }[keyof T & string]
+  : never;
+
+type PathValue<T, P extends string> =
+  P extends `${infer K}.${infer Rest}`      // 还有点号 → 继续往下钻
+    ? K extends keyof T
+      ? PathValue<T[K], Rest>
+      : never
+    : P extends keyof T                     // 最后一段 → 直接取值类型
+      ? T[P]
+      : never;
+
+interface Config {
+  debug: boolean;
+  server: {
+    host: string;
+    port: number;
+    auth: { user: string; retries: number };
+  };
+}
+
+type P1 = PathValue<Config, "debug">;             // boolean
+type P2 = PathValue<Config, "server.host">;       // string
+type P3 = PathValue<Config, "server.auth.user">;  // string
+type P4 = PathValue<Config, "server.port">;       // number
+```
+
+配套的运行时函数：
+
+```ts
+function get<T extends object, P extends Path<T>>(
+  obj: T,
+  path: P,
+): PathValue<T, P> {
+  return path
+    .split(".")
+    .reduce<unknown>(
+      (acc, key) => (acc as Record<string, unknown>)[key],
+      obj,
+    ) as PathValue<T, P>;
+}
+
+const config: Config = {
+  debug: true,
+  server: {
+    host: "example.com",
+    port: 8080,
+    auth: { user: "admin", retries: 3 },
+  },
+};
+
+const host = get(config, "server.host");        // 类型是 string
+const port = get(config, "server.port");        // 类型是 number
+const user = get(config, "server.auth.user");   // 类型是 string
+
+console.log(host.toUpperCase());   // EXAMPLE.COM —— 能直接调字符串方法
+console.log(port + 1);             // 8081        —— 能直接做数字运算
+console.log(user);                 // admin
+
+// get(config, "server.hostname");   // 错误：不在 Path<Config> 的联合里
+// get(config, "debug.x");           // 错误：debug 是 boolean，没有下级路径
+```
+
+要点：
+
+- `PathValue` 与 `Path` 的递归结构互为镜像：`Path` 负责**生成**所有合法路径，`PathValue` 负责**沿着**路径逐级取值类型。两者配合，调用方在输入 `"server."` 时编辑器就会弹出 `host`、`port`、`auth` 的补全。
+- 第二个类型参数写成 `P extends Path<T>`，把「路径必须合法」变成了编译期约束——拼错一个字母就报错，而不是运行时拿到 `undefined`。
+- 运行时实现里的 `as` 断言是必要的：`reduce` 逐层取值的过程编译器无法跟踪。但**断言被封装在这一个函数内部，对外签名完全精确**，这是可接受的用法。
+- 注意 `PathValue` 的第二个参数只约束为 `string` 而非 `Path<T>`。因为递归调用时传入的 `Rest` 是子路径，它属于 `Path<T[K]>` 而不是 `Path<T>`，写成 `P extends Path<T>` 反而会导致递归时约束不满足。
+- 老规矩：`Path<T>` 会为深层对象生成大量字面量类型。用在配置对象、表单 schema 这类层级可控的场景很合适；对着一个几十层深的类型用它，编译器会明显变慢甚至报「类型实例化过深」。
+</Answer>
 </Callout>
 
 ## 小结

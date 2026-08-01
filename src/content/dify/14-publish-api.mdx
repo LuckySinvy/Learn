@@ -99,6 +99,184 @@ curl -N -X POST ... -d '{ "response_mode": "streaming", ... }'
 
 <Callout type="exercise" title="动手做">
 为你的应用创建 API Key，用 curl 以 `blocking` 模式发一条消息，拿到 `conversation_id` 后，再带它发第二条消息，验证多轮上下文生效。
+
+<Answer>
+**参考答案：**
+
+**第一步：创建 API Key**
+
+应用页左侧「访问 API」→ 右上角「API 密钥」→「创建密钥」，复制 `app-` 开头的字符串。**注意应用必须先「发布」过**，否则 API 调用会报应用未发布。
+
+```bash
+export DIFY_BASE=https://your-dify.example.com
+export DIFY_KEY=app-xxxxxxxxxxxxxxxx
+```
+
+**第二步：第一轮对话（不带 conversation_id）**
+
+```bash
+curl -s -X POST "$DIFY_BASE/v1/chat-messages" \
+  -H "Authorization: Bearer $DIFY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": { "user_name": "张三", "language": "中文" },
+    "query": "如何申请报销？",
+    "response_mode": "blocking",
+    "user": "user-001",
+    "conversation_id": ""
+  }'
+```
+
+响应：
+
+```json
+{
+  "event": "message",
+  "message_id": "msg-9f2c...",
+  "conversation_id": "conv-abc123",
+  "mode": "chat",
+  "answer": "张三你好！您可在「财务系统 → 报销」提交申请，需附发票原件扫描件……",
+  "metadata": {
+    "usage": { "prompt_tokens": 1120, "completion_tokens": 96, "total_tokens": 1216 },
+    "retriever_resources": [
+      { "dataset_name": "员工手册", "score": 0.84, "content": "报销流程……" }
+    ]
+  },
+  "created_at": 1785000000
+}
+```
+
+**要点**：首轮 `conversation_id` 传空串或干脆不传，Dify 会新建会话并在响应里返回。`user` 是**必填**的终端用户标识，用于隔离不同用户的会话和统计用量——多个真实用户务必传不同值，否则他们会串到同一份会话历史里。
+
+**第三步：第二轮，带上 conversation_id**
+
+```bash
+curl -s -X POST "$DIFY_BASE/v1/chat-messages" \
+  -H "Authorization: Bearer $DIFY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": {},
+    "query": "那需要多久审批？",
+    "response_mode": "blocking",
+    "user": "user-001",
+    "conversation_id": "conv-abc123"
+  }'
+```
+
+**验证是否真的生效**：第二句「那需要多久审批？」里的「那」没有任何指代对象，如果上下文生效，回答应该是「报销申请一般 3 个工作日内审批完成……」；如果上下文没生效，模型会反问「请问您指的是什么的审批？」——**这个反问就是失败信号**。
+
+**一条命令跑完两轮（可直接复制）**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="https://your-dify.example.com"
+KEY="app-xxxxxxxxxxxxxxxx"
+USER_ID="user-001"
+
+send() {
+  curl -s -X POST "$BASE/v1/chat-messages" \
+    -H "Authorization: Bearer $KEY" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"inputs\": {},
+      \"query\": \"$1\",
+      \"response_mode\": \"blocking\",
+      \"user\": \"$USER_ID\",
+      \"conversation_id\": \"$2\"
+    }"
+}
+
+echo "=== 第一轮 ==="
+R1=$(send "如何申请报销？" "")
+echo "$R1" | jq -r '.answer'
+CID=$(echo "$R1" | jq -r '.conversation_id')
+echo "会话 ID: $CID"
+
+echo "=== 第二轮 ==="
+send "那需要多久审批？" "$CID" | jq -r '.answer'
+```
+
+**几个必须注意的点**
+
+| 参数 | 说明 |
+|---|---|
+| `inputs` | 只在**首轮**需要传应用定义的变量；后续轮次传空对象即可，会沿用会话的变量值 |
+| `user` | 必填，且同一会话的多轮必须传**相同的值**，否则会报 `Conversation not exists` |
+| `conversation_id` | 必须是**同一个 API Key、同一个 user** 下产生的，跨应用/跨用户都无效 |
+| `response_mode` | `blocking` 有超时限制（通常 100s），长回答建议用 `streaming` |
+| `auto_generate_name` | 可选，首轮传 `false` 能省一次生成会话标题的模型调用 |
+
+**其他常用接口**
+
+```bash
+# 查会话历史消息
+curl -s "$DIFY_BASE/v1/messages?conversation_id=conv-abc123&user=user-001&limit=20" \
+  -H "Authorization: Bearer $DIFY_KEY"
+
+# 查用户的会话列表
+curl -s "$DIFY_BASE/v1/conversations?user=user-001&limit=20" \
+  -H "Authorization: Bearer $DIFY_KEY"
+
+# 停止正在流式输出的响应
+curl -s -X POST "$DIFY_BASE/v1/chat-messages/$TASK_ID/stop" \
+  -H "Authorization: Bearer $DIFY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"user": "user-001"}'
+
+# 对回答点赞/点踩（会进入第 15 章的标注数据）
+curl -s -X POST "$DIFY_BASE/v1/messages/$MESSAGE_ID/feedbacks" \
+  -H "Authorization: Bearer $DIFY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"rating": "like", "user": "user-001"}'
+```
+
+**streaming 模式长什么样**
+
+```bash
+curl -N -X POST "$DIFY_BASE/v1/chat-messages" \
+  -H "Authorization: Bearer $DIFY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"inputs":{},"query":"如何申请报销？","response_mode":"streaming","user":"user-001"}'
+```
+
+返回的是 SSE 事件流：
+
+```text
+data: {"event": "message", "answer": "您", "conversation_id": "conv-abc123", ...}
+data: {"event": "message", "answer": "可以", ...}
+data: {"event": "message", "answer": "在「财务", ...}
+data: {"event": "message_end", "metadata": {"usage": {...}}, ...}
+```
+
+客户端需要按 `event` 类型处理：`message` 增量拼接、`message_end` 收尾并读取用量、`error` 报错、`workflow_started` / `node_finished` 等用于展示工作流进度。
+
+**安全提醒（正文那条 warn 的展开）**
+
+API Key 拥有该应用的完整调用权限，**绝对不能出现在前端代码、小程序包、移动端 App 里**——这些地方的代码都可以被反编译或直接查看。正确架构：
+
+```text
+浏览器/App  ──(你自己的登录态)──▶  你的后端  ──(Bearer app-xxx)──▶  Dify
+```
+
+后端在转发时应当额外做三件事：
+
+1. **校验用户身份**，并用真实用户 ID 填充 `user` 字段，实现会话隔离与用量归属
+2. **做限流**，防止单个用户刷爆你的模型账单
+3. **过滤敏感输入**，避免用户把内部机密送进外部模型
+
+**常见报错**
+
+| 状态码 / 报错 | 原因 | 解决 |
+|---|---|---|
+| 401 `invalid_api_key` | Key 错误、多了空格、或用了别的应用的 Key | 重新复制 |
+| 404 `app_unavailable` | 应用未发布或已被删除 | 编排页点「发布」 |
+| 400 `conversation_not_exists` | `user` 与创建会话时不一致 | 保持 `user` 一致 |
+| 400 缺少必填变量 | 应用定义了必填变量但 `inputs` 没传 | 首轮补齐 `inputs` |
+| 504 / 超时 | `blocking` 模式下回答太长 | 改用 `streaming` |
+| 429 | 触发速率限制 | 加退避重试 |
+</Answer>
 </Callout>
 
 ## 小结

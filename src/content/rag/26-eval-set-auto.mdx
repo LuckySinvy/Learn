@@ -77,6 +77,175 @@ result = evaluate(Dataset.from_list(dataset),
 
 <Callout type="exercise" title="练习">
 取 20 个 chunk，用上面的 `make_qa` 各生成 2 条问答，人工抽检并修正其中错误项，得到一个 40 条的初始评测集。
+
+<Answer>
+**参考答案：**
+
+**第一步：合成 40 条问答对**
+
+```python
+import json, random
+from concurrent.futures import ThreadPoolExecutor
+
+GEN_PROMPT = """你是评测集出题人。基于下面的文本，生成 2 个用户可能真实提出的问题及标准答案。
+
+要求：
+1. 问题必须能**仅凭该文本**回答，不得依赖文本外的知识
+2. 问题里要含具体实体（如「年假」「ERR-502」），不要问「这段讲了什么」这类空泛问题
+3. 问题用口语化表达，模拟真实用户的问法，不要照抄原文措辞
+4. 答案必须严格来自文本，不要扩写、不要润色
+5. evidence 填能支撑答案的原文原句（逐字复制）
+6. 两个问题的角度要不同（如一个问定义、一个问流程/条件）
+
+严格输出 JSON 数组，不要任何其他内容：
+[{{"question": "...", "answer": "...", "evidence": "..."}}, ...]
+
+文本：
+{chunk}"""
+
+def make_qa(chunk):
+    raw = llm(GEN_PROMPT.format(chunk=chunk["text"]), temperature=0.7)
+    try:
+        items = json.loads(raw[raw.index("["): raw.rindex("]") + 1])
+    except (ValueError, json.JSONDecodeError):
+        return []
+    return [{
+        "question": it["question"],
+        "reference": it["answer"],
+        "evidence": it["evidence"],
+        "gold_chunk_id": chunk["id"],
+        "source": chunk["meta"]["source"],
+        "status": "auto",            # 标记来源，后面区分人工修正过的
+    } for it in items if it.get("question") and it.get("answer")]
+
+sample = random.sample(all_chunks, 20)
+with ThreadPoolExecutor(max_workers=5) as ex:      # 并发加速
+    dataset = [qa for lst in ex.map(make_qa, sample) for qa in lst]
+
+print(f"生成 {len(dataset)} 条")
+```
+
+`temperature=0.7` 是刻意的：出题需要多样性，温度太低会让 20 个 chunk 生成出高度雷同的问句模板。
+
+**第二步：自动质检（先机器筛，再人工看）**
+
+人工抽检很贵，所以先让机器把明显有问题的挑出来，人只看可疑的：
+
+```python
+import re
+from difflib import SequenceMatcher
+
+VAGUE = ["这段", "这篇", "上文", "本文", "文中", "该文本", "这里"]
+
+def auto_check(qa, chunk_text):
+    issues = []
+    q, a, ev = qa["question"], qa["reference"], qa["evidence"]
+
+    # 1) 问题空泛：不含具体实体
+    if any(v in q for v in VAGUE) or len(q) < 8:
+        issues.append("问题空泛")
+
+    # 2) evidence 不在原文里 → 模型编造了证据
+    if ev and ev[:20] not in chunk_text:
+        issues.append("证据不在原文")
+
+    # 3) 答案与原文重合度过低 → 可能是模型自由发挥
+    ratio = SequenceMatcher(None, a, chunk_text).find_longest_match().size / max(len(a), 1)
+    if ratio < 0.3:
+        issues.append(f"答案脱离原文(重合{ratio:.0%})")
+
+    # 4) 问题里直接抄了答案 → 送分题，没有区分度
+    if a[:10] and a[:10] in q:
+        issues.append("问题泄露答案")
+
+    return issues
+
+
+# 去重：语义高度相似的问题只留一条
+def dedupe(dataset, threshold=0.9):
+    vecs = embed([d["question"] for d in dataset])
+    vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+    keep, dropped = [], []
+    for i, d in enumerate(dataset):
+        if any((vecs[i] @ vecs[j]) > threshold for j in keep):
+            dropped.append(d)
+        else:
+            keep.append(i)
+    return [dataset[i] for i in keep], dropped
+
+
+chunk_map = {c["id"]: c["text"] for c in sample}
+for qa in dataset:
+    qa["issues"] = auto_check(qa, chunk_map[qa["gold_chunk_id"]])
+
+dataset, dups = dedupe(dataset)
+suspect = [q for q in dataset if q["issues"]]
+print(f"去重后 {len(dataset)} 条，其中 {len(suspect)} 条需人工复核")
+```
+
+**第三步：人工修正**
+
+```python
+for i, qa in enumerate(suspect):
+    print(f"\n[{i+1}/{len(suspect)}] 问题标记: {qa['issues']}")
+    print(f"Q: {qa['question']}")
+    print(f"A: {qa['reference']}")
+    print(f"原文: {chunk_map[qa['gold_chunk_id']][:300]}")
+    action = input("(k)保留 / (e)修改 / (d)删除: ").strip()
+    if action == "d":
+        qa["status"] = "deleted"
+    elif action == "e":
+        qa["question"] = input("新问题: ") or qa["question"]
+        qa["reference"] = input("新答案: ") or qa["reference"]
+        qa["status"] = "human_fixed"
+    else:
+        qa["status"] = "human_verified"
+
+final = [q for q in dataset if q["status"] != "deleted"]
+json.dump(final, open("eval_set_v1.json", "w"), ensure_ascii=False, indent=2)
+print(f"最终评测集 {len(final)} 条")
+```
+
+**典型的四类翻车样本**
+
+抽检时你大概率会遇到这些，认识它们比记住代码更重要：
+
+| 生成的问题 | 毛病 | 修正 |
+|---|---|---|
+| 「这段文字主要讲了什么？」 | 空泛，任何 chunk 都能这么问，无区分度 | 改成「年假的申请提前期是几天？」 |
+| 「满一年享 5 天年假，这个天数是多少？」 | 问题里已含答案，送分题 | 改成「工作满一年能休几天年假？」 |
+| 「年假和病假能否叠加？」（原文没写） | 模型编题，原文无依据 | 删除 |
+| 「员工休假需提前申请吗？」×3 条 | 三个 chunk 生成了近乎相同的问题 | 去重保留一条 |
+
+**这个练习真正要传达的四点**
+
+1. **自动生成的问题「太好答」，这是它最大的系统性偏差。** 因为问题是**照着答案原文写出来的**，用词、句式都贴着原文，向量检索几乎必然命中——这会让你的 `context_precision` 虚高。真实用户的问法要模糊、口语化、甚至有错别字得多。所以 prompt 里第 3 条「用口语化表达、不要照抄原文措辞」非常关键，但即便如此也只能缓解，不能消除。
+
+2. **正因如此，合成集只能测「相对变化」。** 0.85 这个绝对分数没有意义，「加了重排从 0.85 涨到 0.92」才有意义。别拿合成集的分数去向老板汇报「我们的 RAG 准确率 85%」。
+
+3. **务必混入真实用户问题。** 有线上日志的话，捞 20 条真实提问手工标注，和 40 条合成的混在一起。真实问题会暴露合成集永远发现不了的问题——比如用户根本不用「年假」这个词，他们说「休假额度」。
+
+4. **`gold_chunk_id` 是自动构建最大的红利。** 手工标注时，「这个问题应该命中哪一段」需要人去翻文档找，非常耗时；而自动生成天然就知道答案出自哪个 chunk。有了它才能算 `context_recall`（该召回的召回了吗），这个指标对诊断检索问题最直接。
+
+**接入回归**
+
+```python
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy, context_recall
+
+ds = Dataset.from_list([{
+    "question": d["question"],
+    "reference": d["reference"],
+    "contexts": [c["text"] for c in my_rag.retrieve(d["question"])],
+    "answer": my_rag.answer(d["question"]),
+} for d in final])
+
+result = evaluate(ds, metrics=[faithfulness, answer_relevancy, context_recall])
+json.dump(dict(result), open("baseline_v1.json", "w"))
+```
+
+按课文 tip 的节奏：**先用自动法扩到 100+ 条做广度回归，再从中挑出模型最容易答错的 50 条人工精标成黄金集**。易错样本的信息量远大于随机样本——这也是主动学习的基本思想。
+</Answer>
 </Callout>
 
 ## 小结

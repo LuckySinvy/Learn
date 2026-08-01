@@ -97,6 +97,77 @@ all_docs = loader.load()
 
 <Callout type="exercise" title="练习">
 找一份你公司的真实 PDF 手册，用 `PyPDFLoader` 加载，打印第 1 页的 `page_content` 与 `metadata`，观察噪声（页眉/页脚）是否混入，想想怎么在切分前清洗。
+
+<Answer>
+**参考答案：**
+
+**第一步：加载并观察**
+
+```python
+from langchain_community.document_loaders import PyPDFLoader
+
+docs = PyPDFLoader("员工手册.pdf").load()
+first = docs[0]
+print(repr(first.page_content[:800]))   # 用 repr 才能看清换行与空白
+print(first.metadata)                   # {'source': '员工手册.pdf', 'page': 0}
+```
+
+用 `repr()` 而不是直接 print，因为噪声往往藏在换行和不可见字符里。
+
+**第二步：典型噪声清单**
+
+跑完通常会看到这几类垃圾：
+
+- **页眉页脚**：每页重复的「XX公司内部资料」「第 3 页 / 共 42 页」
+- **断行连字**：PDF 换行把一个词拆成 `retriev-\nal`，中文则是句子中间莫名断行
+- **目录页**：大量「第一章……………12」这种点线
+- **水印/版权声明**：每页固定出现
+- **多栏错序**：双栏排版被按视觉行读成左右交替的乱序
+
+**第三步：清洗策略**
+
+最有效的思路是**「跨页重复即噪声」**——统计每一行在所有页出现的次数，出现率超过阈值的基本就是页眉页脚：
+
+```python
+from collections import Counter
+import re
+
+def build_noise_set(docs, ratio=0.6):
+    """出现在 60% 以上页面的行，判定为页眉/页脚噪声"""
+    counter = Counter()
+    for d in docs:
+        for line in set(d.page_content.splitlines()):
+            counter[line.strip()] += 1
+    threshold = len(docs) * ratio
+    return {line for line, n in counter.items() if n >= threshold and line}
+
+def clean(text, noise_set):
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s in noise_set:
+            continue
+        if re.fullmatch(r"[-—\s]*第?\s*\d+\s*页?[-—\s]*", s):   # 纯页码行
+            continue
+        lines.append(s)
+    text = "\n".join(lines)
+    text = re.sub(r"(?<=[a-zA-Z])-\n(?=[a-zA-Z])", "", text)     # 英文断行连字
+    text = re.sub(r"(?<=[\u4e00-\u9fa5])\n(?=[\u4e00-\u9fa5])", "", text)  # 中文误断行
+    text = re.sub(r"\n{3,}", "\n\n", text)                        # 压缩空行
+    return text
+
+noise = build_noise_set(docs)
+for d in docs:
+    d.page_content = clean(d.page_content, noise)
+```
+
+**关键原则：**
+
+1. **清洗一定要在切分之前做**。噪声若参与切分，会挤占 chunk 的有效字数，还会污染向量——每个 chunk 都带着「XX公司内部资料」，会让所有片段在向量空间里被拉近，降低区分度。
+2. **清洗不要动 `metadata`**。`source` 和 `page` 是后面做引用溯源的命根子，只清洗 `page_content`。
+3. **清洗后抽查几页再入库**。正则写猛了可能把正文也删掉，尤其是「纯数字行」规则容易误伤表格数据。
+4. **多栏 PDF 单靠 PyPDF 救不了**，需要换 `unstructured` 或 `pdfplumber` 做版面分析，见第 15 章。
+</Answer>
 </Callout>
 
 ## 小结

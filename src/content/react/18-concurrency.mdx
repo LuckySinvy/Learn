@@ -152,14 +152,108 @@ const results = useMemo(() => filterHugeList(deferredQuery), [deferredQuery]);
 
 <Callout type="exercise" title="练习 1：批处理对比">
 在 React 18 下，分别写出「在 Promise.then 里连续调两次 setState」和「在 onClick 里连续调两次 setState」的代码。两者各自渲染几次？如果退回 React 17 行为，结论会变吗？
+
+<Answer>
+**参考答案：**
+
+React 18 下两者都只渲染 **1 次**——自动批处理覆盖所有位置（事件、Promise、setTimeout、原生事件）：
+
+```tsx
+// ① onClick 里连续调两次
+function handleClick() {
+  setCount((c) => c + 1);
+  setFlag((f) => !f);
+}
+// React 18：1 次渲染
+
+// ② Promise.then 里连续调两次
+Promise.resolve().then(() => {
+  setCount((c) => c + 1);
+  setFlag((f) => !f);
+});
+// React 18：1 次渲染（调度器攒批到下一个 tick 统一 flush）
+```
+
+**退回 React 17，结论会变：**
+
+- `onClick` 里：仍是 **1 次**——React 17 本来就在事件处理函数内批处理；
+- `Promise.then` 里：变成 **2 次**——Promise 回调不在事件批处理范围内，每次 `setState` 各触发一次重渲染。
+
+所以两版的分水岭只在「非事件回调」这种位置：React 17 不批、React 18 批。想验证很简单：在组件函数里打一条渲染日志（`console.log`），看一次交互后它打印几次——React 18 只出现一次。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：用 useTransition 改写">
 一个搜索框每次输入都对 10000 条数据过滤，导致打字卡顿。给出用 `useTransition` 改写的关键代码，并说明 `isPending` 应该放在哪里（输入框还是结果区）。
+
+<Answer>
+**参考答案：**
+
+```tsx
+function Search() {
+  const [query, setQuery] = useState("");
+  const [list, setList] = useState<Item[]>([]);
+  const [isPending, startTransition] = useTransition();
+
+  function onChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const q = e.target.value;
+    setQuery(q);                  // 紧急更新：输入框立刻跟着打字
+    startTransition(() => {
+      setList(filterHugeList(q)); // 过渡更新：过滤 1 万条，可被中断、不卡输入
+    });
+  }
+
+  return (
+    <>
+      <input value={query} onChange={onChange} />
+      {isPending ? <Spinner /> : <List items={list} />}
+    </>
+  );
+}
+```
+
+**`isPending` 放在结果区（`<List>` 那一侧），不要放在输入框。**
+
+理由：`isPending` 表示「过渡更新还没做完」。输入框走的是紧急更新，始终跟手，不需要、也不应该用 `isPending` 切换成 Spinner——否则打一个字就闪一下骨架，体验更糟。正确做法是输入框保持原样，结果区在过滤未完成时显示 Spinner（或保留上一屏结果），等 `list` 更新到位再替换。
+
+补充：如果过滤逻辑单独抽成派生计算，也可以改用 `useDeferredValue(query)` + `useMemo`，效果类似；但本场景「一整包更新 + 需要 `isPending` 占位」更贴合 `useTransition`。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：useTransition vs useDeferredValue">
 判断下面两个场景分别更适合哪个：①点击「切换主题」要重渲染全站 200 个组件；②一个输入框的值被用来做实时高亮匹配。说明理由。
+
+<Answer>
+**参考答案：**
+
+**① 点击「切换主题」重渲染全站 200 个组件 → 用 `useTransition`。**
+
+理由：这是一「包」更新——主题变化会波及整个组件树的 200 个组件，不是某个孤立的值。`startTransition` 正好把这包更新标记为低优先级，期间的紧急交互（滚动、点按钮）可以打断它；而且 `useTransition` 附带 `isPending`，主题切换这种整页级操作需要展示加载占位。
+
+```tsx
+const [isPending, startTransition] = useTransition();
+
+function switchTheme(theme: string) {
+  startTransition(() => {
+    setTheme(theme); // 影响全站 200 个组件
+  });
+}
+```
+
+**② 输入框的值被用来做实时高亮匹配 → 用 `useDeferredValue`。**
+
+理由：这里只有「一个值」——输入框内容——被拿去派生「高亮匹配结果」，没有一包状态更新要标记。`useDeferredValue` 粒度更细，直接让这个派生值落后于实时输入：输入保持跟手，高亮计算放到空闲时做，频繁变化时自动丢弃过期计算。
+
+```tsx
+const deferredInput = useDeferredValue(input);
+const highlighted = useMemo(
+  () => computeHighlights(deferredInput),
+  [deferredInput]
+);
+```
+
+**一句话判断：** 有「一包更新要降级 / 需要 `isPending` 占位」→ `useTransition`；只是「某个值被用于昂贵派生」→ `useDeferredValue`。反过来硬套也能运行，但语义和可读性都会差一些。
+</Answer>
 </Callout>
 
 ## 小结

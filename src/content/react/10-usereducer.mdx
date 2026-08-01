@@ -431,12 +431,146 @@ async function load(dispatch: React.Dispatch<Action>, id: string) {
 已知的联动规则：改变 pageSize、sortKey 或 filters 时，page 要重置为 1；改变 filters 时，selectedIds 要清空。
 
 用 useState 实现需要在多个 handler 里重复这些规则。请设计 Action 类型并写出 reducer。
+
+<Answer>
+**参考答案：**
+
+把「联动规则」收进 reducer，事件处理函数就只派发「意图」，不再手动重置 `page` / `selectedIds`。
+
+```tsx
+type State = {
+  page: number;
+  pageSize: number;
+  sortKey: string;
+  sortOrder: "asc" | "desc";
+  filters: Record<string, string>;
+  selectedIds: string[];
+};
+
+type Action =
+  | { type: "pageChanged"; page: number }
+  | { type: "pageSizeChanged"; pageSize: number }
+  | { type: "sortChanged"; sortKey: string; sortOrder: "asc" | "desc" }
+  | { type: "filtersChanged"; filters: Record<string, string> }
+  | { type: "selectedToggled"; id: string }
+  | { type: "selectionCleared" };
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case "pageChanged":
+      return { ...state, page: action.page };
+
+    // 改 pageSize → 重置到第 1 页（但保留选中）
+    case "pageSizeChanged":
+      return { ...state, pageSize: action.pageSize, page: 1 };
+
+    // 改排序 → 重置到第 1 页
+    case "sortChanged":
+      return { ...state, sortKey: action.sortKey, sortOrder: action.sortOrder, page: 1 };
+
+    // 改筛选 → 重置第 1 页且清空选中
+    case "filtersChanged":
+      return { ...state, filters: action.filters, page: 1, selectedIds: [] };
+
+    case "selectedToggled":
+      return {
+        ...state,
+        selectedIds: state.selectedIds.includes(action.id)
+          ? state.selectedIds.filter((x) => x !== action.id)
+          : [...state.selectedIds, action.id],
+      };
+
+    case "selectionCleared":
+      return { ...state, selectedIds: [] };
+
+    default: {
+      const never: never = action;
+      throw new Error("未处理: " + JSON.stringify(never));
+    }
+  }
+}
+```
+
+这样「改变 pageSize/sortKey/filters 时 `page=1`」「改变 filters 时清空 `selectedIds`」这些规则只在 reducer 里存在一份，任何地方派发对应 action 都会自动遵守。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：设计状态机">
 一个文件上传组件有这些状态：未选择、已选择待上传、上传中（有进度）、上传成功（有 url）、上传失败（有原因）、已取消。
 
 用可辨识联合定义 State 和 Action，写出 reducer。要求：上传中才能取消，失败后才能重试，成功后只能重新选择文件。
+
+<Answer>
+**参考答案：**
+
+状态用可辨识联合，每个状态携带自己的数据（`progress`、`url`、`reason`），非法组合在类型层面就不存在。reducer 先 `switch` 当前状态，再判断动作，这就是状态机。
+
+```tsx
+type State =
+  | { status: "idle" }                                   // 未选择
+  | { status: "selected"; file: File }                   // 已选择待上传
+  | { status: "uploading"; file: File; progress: number } // 上传中
+  | { status: "success"; url: string }                   // 上传成功
+  | { status: "error"; file: File; reason: string }      // 上传失败
+  | { status: "canceled"; file: File };                  // 已取消
+
+type Action =
+  | { type: "fileChosen"; file: File }
+  | { type: "uploadStarted" }
+  | { type: "progress"; value: number }
+  | { type: "uploadSucceeded"; url: string }
+  | { type: "uploadFailed"; reason: string }
+  | { type: "canceled" }
+  | { type: "retried" }
+  | { type: "reset" };
+
+function reducer(state: State, action: Action): State {
+  switch (state.status) {
+    case "idle":
+      // 只能选文件
+      return action.type === "fileChosen"
+        ? { status: "selected", file: action.file }
+        : state;
+
+    case "selected":
+      // 选好文件后才能开始上传
+      return action.type === "uploadStarted"
+        ? { status: "uploading", file: state.file, progress: 0 }
+        : state;
+
+    case "uploading":
+      if (action.type === "progress")
+        return { status: "uploading", file: state.file, progress: action.value };
+      if (action.type === "uploadSucceeded")
+        return { status: "success", url: action.url };
+      // 只有上传中才能取消
+      if (action.type === "canceled") return { status: "canceled", file: state.file };
+      return state;
+
+    case "success":
+      // 成功后只能重新选择文件（回到 idle）
+      return action.type === "reset" ? { status: "idle" } : state;
+
+    case "error":
+      // 失败后才能重试（回到 uploading 起点）
+      if (action.type === "retried")
+        return { status: "uploading", file: state.file, progress: 0 };
+      return action.type === "reset" ? { status: "idle" } : state;
+
+    case "canceled":
+      // 取消后只能重新选择
+      return action.type === "reset" ? { status: "idle" } : state;
+
+    default: {
+      const never: never = action;
+      throw new Error("未处理: " + JSON.stringify(never));
+    }
+  }
+}
+```
+
+注意「上传中才能取消」靠 `case "uploading"` 里只认 `canceled` 实现；「失败后才能重试」靠 `case "error"` 里只认 `retried` 实现；「成功后只能重新选择」靠 `case "success"` 只认 `reset` 实现。在其它状态下派发这些动作会被自然忽略，不可能产生非法转移。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：加撤销功能">
@@ -447,12 +581,104 @@ async function load(dispatch: React.Dispatch<Action>, id: string) {
 - 只有会改变数据的 action 才入栈（`filterChanged` 不应该被撤销）
 
 实现后验证：添加两项、切换 filter、撤销一次，得到的应该是只有一项且 filter 保持不变。
+
+<Answer>
+**参考答案：**
+
+撤销/重做的经典做法是把状态拆成 `past`（历史栈）、`present`（当前）、`future`（重做栈）。关键规则：只有「改变数据」的 action（`added` / `toggled` / `clearedDone`）才把当前 `present` 压入 `past`；`filterChanged` 只是视图派生，不入栈，这样撤销时 `filter` 不会回退。
+
+```tsx
+interface State {
+  past: State[];
+  present: State;
+  future: State[];
+}
+
+// 哪些 action 是可撤销的「数据变更」
+const UNDOABLE = new Set(["added", "toggled", "clearedDone"]);
+
+// 对原本的 reducer 包一层 history 逻辑
+function historyReducer(s: State, action: Action): State {
+  if (action.type === "undo") {
+    if (s.past.length === 0) return s;
+    const previous = s.past[s.past.length - 1];
+    return {
+      past: s.past.slice(0, -1),
+      present: previous,
+      future: [s.present, ...s.future],
+    };
+  }
+  if (action.type === "redo") {
+    if (s.future.length === 0) return s;
+    const next = s.future[0];
+    return {
+      past: [...s.past, s.present],
+      present: next,
+      future: s.future.slice(1),
+    };
+  }
+
+  // 其它 action：先算出新 present
+  const newPresent = reducer(s.present, action);
+
+  // 数据变更才入栈；filterChanged 等直接替换 present，不碰 past/future
+  if (UNDOABLE.has(action.type)) {
+    return { past: [...s.past, s.present], present: newPresent, future: [] };
+  }
+  return { ...s, present: newPresent };
+}
+```
+
+**验证推导：** 初始 `present` 为 `{todos:[], filter:"all"}`。
+
+1. `added "A"` → `past=[{[],all}]`, `present={[A],all}`
+2. `added "B"` → `past=[{[],all},{[A],all}]`, `present={[A,B],all}`
+3. `filterChanged "active"`（不入栈）→ `past` 不变，`present={[A,B],active}`
+4. `undo` → 弹出 `past` 最后一项 `{[A],all}` 作为 present，`future=[{[A,B],active},...]`
+   → 结果 `present = {[A], filter:"active"}`，即「只有一项且 filter 保持 active（active）不变」。✓
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：加中间件">
 给 Playground 的 `createStore` 加一个日志中间件：每次 dispatch 时打印 action 类型、变更前后的 todo 数量。
 
 实现方式：包装原来的 dispatch 函数。想一想这个模式和 Express 的中间件、Nest 的拦截器有什么共同点。
+
+<Answer>
+**参考答案：**
+
+中间件本质是「包装原函数，在前后插入逻辑，再调用原版」。这里用高阶函数包一层 `dispatch`：先打印 action 与变更前数量，调用原始 `dispatch`，再打印变更后数量。
+
+```tsx
+function createStoreWithLogger<S, A>(
+  reduce: (s: S, a: A) => S,
+  initial: S
+): Store<S, A> {
+  const store = createStore(reduce, initial);
+
+  const rawDispatch = store.dispatch;
+  const loggedDispatch = function (action: A) {
+    const before = store.getState();
+    const countBefore = (before as { todos: { length: number } }).todos.length;
+    console.log("[dispatch] " + (action as { type: string }).type + " | 变更前 todo 数=" + countBefore);
+    rawDispatch(action);
+    const after = store.getState();
+    const countAfter = (after as { todos: { length: number } }).todos.length;
+    console.log("          -> 变更后 todo 数=" + countAfter);
+  };
+
+  return { ...store, dispatch: loggedDispatch };
+}
+```
+
+**与 Express 中间件 / Nest 拦截器的共同点是「洋葱模型 / 责任链模式」：**
+
+- 它们都接收「下一个处理函数」作为参数，在调用它之前、之后插入逻辑；
+- 调用顺序构成嵌套：外层先进入、后退出；内层先执行完；
+- 都实现了「横切关注点」与业务逻辑的分离——日志、鉴权、耗时统计等不需要写进每个 handler，只需在管道里套一层。
+
+Redux 的 `applyMiddleware`、Express 的 `next()`、Nest 的 `next.handle()` 都是同一思路的不同实现：通过包装/组合函数来扩展行为，而业务代码保持纯净。
+</Answer>
 </Callout>
 
 ## 小结

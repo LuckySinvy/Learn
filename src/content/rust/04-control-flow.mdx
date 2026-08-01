@@ -118,6 +118,80 @@ fn main() {
 
 <Callout type="exercise" title="练习">
 写一个函数 `fn fib(n: u32) -> u32` 用 `loop` 计算第 n 个斐波那契数（用三个变量滚动即可），再用 `for` 打印前 10 项。体会 break 带返回值与 for 遍历。
+
+<Answer>
+**参考答案：**
+
+```rust
+fn fib(n: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+
+    let mut prev = 0u32;   // f(0)
+    let mut curr = 1u32;   // f(1)
+    let mut i = 1u32;
+
+    loop {
+        if i == n {
+            break curr;    // break 带值：整个 loop 表达式的值就是 curr
+        }
+        let next = prev + curr;
+        prev = curr;
+        curr = next;
+        i += 1;
+    }
+}
+
+fn main() {
+    for n in 0..10 {
+        println!("fib({}) = {}", n, fib(n));
+    }
+}
+```
+
+**输出：**
+
+```text
+fib(0) = 0
+fib(1) = 1
+fib(2) = 1
+fib(3) = 2
+fib(4) = 3
+fib(5) = 5
+fib(6) = 8
+fib(7) = 13
+fib(8) = 21
+fib(9) = 34
+```
+
+**要点解析：**
+
+- **`break` 带值**：`break curr;` 让 `loop` 整体成为一个求值为 `curr` 的表达式。因为它是函数体最后一个表达式（无分号），它的值直接成为函数返回值。这是 `loop` 独有的能力——`while` 和 `for` 的 `break` 不能带值
+- **三变量滚动**：`prev`、`curr` 保存相邻两项，`next` 是临时值。每轮向前滚动一格，空间复杂度 O(1)，比递归实现高效得多
+- **边界处理**：`n == 0` 单独提前 `return 0`，否则循环从 `i = 1` 开始会直接返回 `curr = 1`，结果就错了
+- **`0..10`** 是左闭右开区间，产生 0 到 9 共 10 个数；要含 10 得写 `0..=10`
+
+**用 `while` 改写（更常见的风格）：**
+
+```rust
+fn fib(n: u32) -> u32 {
+    let (mut prev, mut curr) = (0u32, 1u32);
+    let mut i = 0;
+    while i < n {
+        let next = prev + curr;
+        prev = curr;
+        curr = next;
+        i += 1;
+    }
+    prev   // 循环 n 次后，prev 就是 f(n)
+}
+```
+
+这个版本连 `n == 0` 的特判都省了：循环 0 次时 `prev` 恰好是 0。
+
+**溢出提醒：** `u32` 大约在 `fib(48)` 处溢出。Debug 模式会 panic，生产代码建议改用 `u64`，或用 `checked_add` 返回 `Option` 来安全处理。
+</Answer>
 </Callout>
 
 ## 小结

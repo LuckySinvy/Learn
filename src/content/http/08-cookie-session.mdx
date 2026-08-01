@@ -233,4 +233,62 @@ curl -s -b $A http://127.0.0.1:8000/me`}
 2. 在 Playground 1 中给 theme Cookie 加上 Path=/settings，验证访问 /me 时它不再被携带（提示：curl 的 jar 会记录 Path）。
 3. 给 Playground 3 的会话加上过期时间：sessions 里记录创建时间，超过 5 秒的 sid 视为失效，用 sleep 验证。
 4. 解释：为什么"记住我 30 天"的网站，改密码后所有设备都应强制重新登录？用 Session 方案如何实现？
+
+<Answer>
+**参考答案：**
+
+**1. 未登录返回真正的 401**
+
+把 Playground 3 里 `/me` 的"未登录(401 才对)"分支改成真正的 401：
+
+```python
+elif u.path == "/me":
+    s = sessions.get(self.sid())
+    if s:
+        self.reply("当前用户: " + s["user"] + "\n")
+    else:
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", "Bearer realm=\"api\"")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+```
+
+用 `curl -si` 观察：未登录访问 `/me` 返回 `401 Unauthorized` 并带 `WWW-Authenticate` 头，提示客户端"该用什么方式认证"（这里是 Bearer）。这样下游系统（网关、浏览器）才能正确识别"未认证"，而不是当普通 200 处理。
+
+**2. theme Cookie 限定 Path=/settings**
+
+把 Playground 1 里 `theme` 的 Set-Cookie 改成 `theme=dark; Path=/settings; Max-Age=3600`。curl 的 cookie jar 会记录每个 Cookie 的 Path，访问 `/me`（路径不匹配 `/settings`）时不再携带 theme，只带 `sid`；访问 `/settings` 时两者都带。
+
+这展示了 Cookie 的**作用域机制**：Domain 限定域、Path 限定路径前缀，浏览器按"请求 URL 与 Cookie 的 Domain+Path 是否匹配"决定带不带。生产上常用它把第三方统计 Cookie 限制在特定路径下。
+
+**3. 会话加过期时间**
+
+在 Playground 3 里给 sessions 记录创建时间：
+
+```python
+sessions[sid] = {"user": user, "created": time.time()}
+
+def is_valid(self, sid):
+    s = sessions.get(sid)
+    if not s:
+        return None
+    if time.time() - s["created"] > 5:   # 超过 5 秒失效
+        sessions.pop(sid, None)
+        return None
+    return s
+```
+
+`/me` 分支用 `is_valid(self.sid())` 判断。用 `sleep 6` 后再访问 `/me`，会发现 sid 还在 jar 里但服务端已删记录 → 返回未登录（401）。这模拟了真实会话的**服务端过期**：即使 Cookie 没到 Max-Age，服务端也会主动判死。
+
+**4. 改密码后强制所有设备重新登录**
+
+"记住我 30 天"意味着会话凭证可以存活 30 天。**改密码只改了密码本身，但已发出的会话凭证（sid / token）依然有效**——如果攻击者此前偷到了你的会话，改完密码他仍能继续冒充你。所以安全要求：改密码（尤其是可疑泄露后）必须**使旧会话全部失效**，等于把所有设备踢下线。
+
+Session 方案的实现方式：会话表里存一个 `password_changed_at`（密码变更时间戳），校验会话时对比该会话的 `issued_at`（或 `login_at`）：
+
+- 若会话创建时间早于密码修改时间 → 该会话作废，强制重新登录；
+- 每个 sid 附带这个时间戳，改密码时**无需遍历删记录**，只要在校验时做一次比较即可。
+
+更粗暴的做法是改密码时把该用户的所有 sid 从会话表清空。注意 JWT/Token 方案做不到"主动失效"（token 在客户端，改密码不能收回已发出的 token），这正是第 8 章对比表里 Session 的"主动失效"优势；Token 方案要做同样效果只能引入黑名单（等于又有了服务端状态）。
+</Answer>
 </Callout>

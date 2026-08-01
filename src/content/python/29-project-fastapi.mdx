@@ -409,6 +409,77 @@ print("演示结束")`}
 1. 一个 `PATCH /tasks/{task_id}` 接口，只更新 `done` 字段（提示：用可选字段的 Pydantic 模型）。
 2. 给 `create_task` 加一个依赖 `Depends(get_current_user)`，让创建的任务自动带上 owner。
 3. 用 `TestClient` 写一个"过滤 + 分页"的测试（搜索 `done=false` 并验证只返回未完成任务）。
+
+<Answer>
+
+**参考答案：**
+
+以下代码都需要在本机 `pip install fastapi uvicorn httpx` 后运行，沙箱里无法执行。
+
+**1) PATCH 接口：只更新 `done` 字段**
+
+```python
+from pydantic import BaseModel
+
+class TaskPatch(BaseModel):
+    done: bool
+
+@app.patch("/tasks/{task_id}", response_model=TaskOut)
+def patch_task(task_id: int, patch: TaskPatch):
+    if task_id not in db:
+        raise HTTPException(status_code=404, detail="task not found")
+    # Pydantic v2 的浅拷贝 + 局部更新，其余字段保持不变
+    db[task_id] = db[task_id].model_copy(update={"done": patch.done})
+    return db[task_id]
+```
+
+**2) `create_task` 注入用户依赖**
+
+```python
+@app.post("/tasks", response_model=TaskOut, status_code=201)
+def create_task(task: TaskCreate, user: str = Depends(get_current_user)):
+    global _next_id
+    new = TaskOut(id=_next_id, owner=user, **task.model_dump())
+    db[_next_id] = new
+    _next_id += 1
+    return new
+```
+
+这样调用方带上 `X-User: alice` 请求头时，创建的任务 `owner` 会自动是 `alice`；没带则落到依赖里的默认值 `anonymous`。
+
+**3) TestClient 测试"过滤 + 分页"**
+
+```python
+from fastapi.testclient import TestClient
+
+client = TestClient(app)
+
+def test_search_filters_unfinished():
+    # 清掉上一次测试残留的数据，保证可重复运行
+    db.clear()
+    client.post("/tasks", json={"title": "A", "priority": 1})
+    client.post("/tasks", json={"title": "B", "priority": 2})
+    client.post("/tasks", json={"title": "C", "priority": 3, "done": True})
+
+    # 过滤 done=false，只应返回未完成的 A、B
+    r = client.get("/tasks/search", params={"done": "false"})
+    assert r.status_code == 200
+    titles = [t["title"] for t in r.json()]
+    assert titles == ["A", "B"]
+
+    # 分页：每页 1 条，第 1 页是 A、第 2 页是 B
+    r2 = client.get("/tasks/search", params={"done": "false", "page": 1, "size": 1})
+    assert [t["title"] for t in r2.json()] == ["A"]
+    r3 = client.get("/tasks/search", params={"done": "false", "page": 2, "size": 1})
+    assert [t["title"] for t in r3.json()] == ["B"]
+```
+
+要点：
+
+- PATCH 用只含 `done` 的 `TaskPatch` 模型，天然"只更新部分字段"；`model_copy(update=...)` 返回新对象，不改动其他字段。
+- 查询参数传字符串 `"false"` 即可，FastAPI 会按 `Optional[bool]` 自动转成布尔 `False`。
+- 测试里 `db.clear()` 是为了避免多次运行测试时内存库被上一次的数据污染。
+</Answer>
 </Callout>
 
 ## 小结

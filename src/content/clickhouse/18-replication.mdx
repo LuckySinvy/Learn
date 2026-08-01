@@ -216,4 +216,112 @@ FROM system.replicas;
 2. 建 `ReplicatedMergeTree` 的 `events_local` 和对应的 `Distributed` 表，往分布式表插 50 万行。
 3. 停掉 shard 1 的 `replica 1` 容器，确认写入/查询仍能成功（落到 replica 2）；重启该容器后，用 `system.replicas` 的 `absolute_delay` 确认它已自动追上。
 4. 在 Keeper 节点上用 `SELECT count() FROM system.zookeeper WHERE path = '/clickhouse/tables'` 观察复制元数据路径（若开启 zookeeper 表引擎）。
+
+<Answer>
+**参考答案：**
+
+> 说明：题目说「3 个 ClickHouse 容器」但 2 分片 × 2 副本需要 **4 个 CH 节点**，以下按 4 个 CH 节点 + 1 个 Keeper 容器来搭。
+
+1. 启动 Keeper + 4 个 CH 节点：
+
+```bash
+docker network create chnet
+
+# ClickHouse Keeper（单节点演示，生产至少 3 节点）
+docker run -d --name keeper --network chnet clickhouse/clickhouse-server:24.8 \
+  bash -c 'echo "<clickhouse><keeper_server><tcp_port>9181</tcp_port><server_id>1</server_id><log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path><snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path><raft_configuration><server><id>1</id><hostname>keeper</hostname><port>9234</port></server></raft_configuration></keeper_server></clickhouse>" > /etc/clickhouse-server/config.d/keeper.xml && clickhouse-server --config-file /etc/clickhouse-server/config.xml'
+
+# 4 个 CH 节点：shard 01 的 replica ch-rep1/ch-rep2，shard 02 的 replica ch-rep3/ch-rep4
+for n in 1 2 3 4; do
+  docker run -d --name ch-rep$n --network chnet clickhouse/clickhouse-server:24.8
+done
+```
+
+给每个节点配置 `macros`（shard 01 的两个副本 shard 相同、replica 不同；shard 02 同理）和集群定义 `cluster.xml`（ch-rep1/ch-rep2 同属 shard 1，ch-rep3/ch-rep4 同属 shard 2）。例如 ch-rep1：
+
+```xml
+<!-- ch-rep1: /etc/clickhouse-server/config.d/macros.xml -->
+<clickhouse>
+    <macros>
+        <shard>01</shard>
+        <replica>ch-rep1</replica>
+    </macros>
+</clickhouse>
+```
+
+ch-rep2 的 `<shard>` 也是 `01` 但 `<replica>` 是 `ch-rep2`；ch-rep3/ch-rep4 的 `<shard>` 是 `02`。全部节点配好后 `docker restart ch-rep1 ch-rep2 ch-rep3 ch-rep4`。
+
+2. 建复制表 + 分布式表：
+
+```sql
+-- 在任一节点执行，ON CLUSTER 广播；每个节点用自己 macros 展开 {shard}/{replica}
+CREATE TABLE events_local ON CLUSTER my_cluster
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = ReplicatedMergeTree(
+    '/clickhouse/tables/{shard}/default/events',
+    '{replica}'
+)
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+
+CREATE TABLE events ON CLUSTER my_cluster
+AS events_local
+ENGINE = Distributed(my_cluster, default, events_local, rand());
+
+INSERT INTO events
+SELECT now() - number, number, 'view', '/p/1', 'CN', 'web', 100
+FROM numbers(500000);
+```
+
+验证两个副本都同步到了：
+
+```sql
+SELECT hostName() AS node, count() AS rows
+FROM system.parts
+WHERE table = 'events_local' AND active
+GROUP BY node;
+```
+
+3. 容灾演练：
+
+```bash
+docker stop ch-rep1    # 停掉 shard 01 的 replica 1
+```
+
+- **写入**：`INSERT INTO events ...` 仍成功——Distributed 引擎自动把 shard 1 的写入转到 ch-rep2。
+- **查询**：`SELECT count() FROM events ...` 仍成功，协调节点只向存活的副本发查询。
+
+```bash
+docker start ch-rep1   # 重启
+```
+
+```sql
+-- 确认已自动追上（absolute_delay 逐渐归 0）
+SELECT database, table, is_leader, absolute_delay
+FROM system.replicas
+WHERE table = 'events_local';
+```
+
+`absolute_delay` 表示该副本落后 Leader 多少秒；重启后后台复制线程会自动把宕机期间产生的 part 从同分片其他副本拉回来，延迟归 0 即追平，无需人工干预。
+
+4. 观察复制元数据：
+
+```sql
+-- 在 Keeper 容器里开启 zookeeper 表引擎并查询
+SELECT count(), path
+FROM system.zookeeper
+WHERE path = '/clickhouse/tables'
+GROUP BY path;
+```
+
+能看到该路径下按 `{shard}` 分出的子路径（如 `01`、`02`），每个分片路径下再按 `{replica}` 区分副本的 znode。这些 znode 记录了每个副本的 part 列表、复制队列、校验和——即「Keeper 只存协调元数据，不存业务数据」的直观证据。`system.zookeeper` 表默认由 `allow_experimental_database_replicated`/zookeeper 表引擎配置控制，查不到时确认该表可用。
+</Answer>
 </Callout>

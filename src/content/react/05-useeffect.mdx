@@ -435,24 +435,424 @@ function useOnlineStatus(): boolean {
 3. 搜索框输入时，300ms 防抖后请求联想词
 4. 弹窗打开时禁止页面滚动，关闭时恢复
 5. 表单保存成功后跳转到列表页
+
+<Answer>
+**参考答案：**
+
+判断依据始终是那一句：**这个副作用是「某个具体用户操作」引起的，还是「组件出现在屏幕上/某个值变了」引起的？**
+
+**1. 点击「收藏」，调接口并弹 toast —— 事件处理函数**
+
+典型的用户操作触发。绕道 state + effect 不但多一次渲染，还会带来「快速点两次会怎样」这类时序问题。
+
+```tsx
+async function handleFav() {
+  await api.favorite(id);
+  toast.success("已收藏");
+}
+```
+
+**2. 商品详情页打开时上报浏览埋点 —— useEffect**
+
+没有任何用户操作，是「组件出现」这件事本身引起的，只能用 effect。
+
+```tsx
+useEffect(() => {
+  reportView(productId);
+}, [productId]);
+```
+
+⚠️ 但要注意 **StrictMode 会让它跑两次**，埋点会重复。三种处理方式：
+
+- 让服务端做幂等去重（最稳妥）
+- 用 `useRef` 记住「这个 id 上报过了」
+- 更好的做法是把埋点提到**路由层**做——「页面被访问」本来就是路由的概念，不是某个组件的概念
+
+**3. 搜索框输入，300ms 防抖后请求联想词 —— useEffect**
+
+这题最容易答错。表面看是「用户输入触发的」，但真正要表达的是「**当 query 稳定在某个值时，让联想结果与它同步**」——这是一个持续的同步关系，不是一次性动作。而且它需要两件 effect 天生擅长的事：**输入变化时取消上一次的定时器**，以及**处理竞态**。
+
+```tsx
+useEffect(() => {
+  if (!query) return;
+  let ignore = false;
+
+  const timer = setTimeout(async () => {
+    const data = await fetchSuggestions(query);
+    if (!ignore) setSuggestions(data);
+  }, 300);
+
+  return () => {
+    clearTimeout(timer);   // query 一变就撤销上次的待发请求
+    ignore = true;         // 已经发出去的，回来了也不采纳
+  };
+}, [query]);
+```
+
+写在 `onChange` 里当然也能实现，但你得自己用 ref 存 timer id、自己在卸载时清理、自己维护请求序号——等于把 effect 的清理机制重新实现一遍。
+
+**4. 弹窗打开时禁止页面滚动，关闭时恢复 —— useEffect**
+
+和外部系统（`document.body` 的样式）同步的教科书例子，而且**必须**用 effect：如果写在「打开/关闭」的点击事件里，一旦弹窗因为路由跳转、父组件卸载等原因**没有走关闭按钮就消失了**，页面就会永久卡住无法滚动。清理函数是唯一能保证「无论怎么消失都会恢复」的机制。
+
+```tsx
+useEffect(() => {
+  if (!isOpen) return;
+  const prev = document.body.style.overflow;
+  document.body.style.overflow = "hidden";
+  return () => {
+    document.body.style.overflow = prev;   // 保存并还原，而不是硬写 "auto"
+  };
+}, [isOpen]);
+```
+
+**5. 表单保存成功后跳转到列表页 —— 事件处理函数**
+
+「保存成功」是提交动作的一部分，直接接在后面写：
+
+```tsx
+async function handleSubmit(e: React.FormEvent) {
+  e.preventDefault();
+  await api.save(form);
+  navigate("/list");
+}
+```
+
+反面教材是「设一个 `saved` 状态，再用 effect 监听它跳转」——多一次渲染，而且 `saved` 这个状态在跳转后还得记得重置，纯属自找麻烦。
+
+---
+
+**归纳成一张表：**
+
+| 题 | 归属 | 一句话理由 |
+|---|---|---|
+| 1 收藏 | 事件 | 用户点了才发生 |
+| 2 埋点 | effect | 组件出现就发生，注意 StrictMode 重复 |
+| 3 联想词 | effect | 是「同步关系」，且需要取消 + 防竞态 |
+| 4 锁滚动 | effect | 必须保证异常卸载时也能恢复 |
+| 5 跳转 | 事件 | 提交流程的下一步 |
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：修复闭包陷阱">
 一个组件里有 `const [seconds, setSeconds] = useState(0)` 和 `const [step, setStep] = useState(1)`，effect 里用 setInterval 每秒执行 `setSeconds(seconds + step)`，依赖数组为空。
 
 这段代码有两个问题：秒数不增长，以及改变 step 后不生效。请给出两种不同的修复方案，并分析各自的代价（定时器是否会被重建）。
+
+<Answer>
+**参考答案：**
+
+**先看有问题的原代码：**
+
+```tsx
+const [seconds, setSeconds] = useState(0);
+const [step, setStep] = useState(1);
+
+useEffect(() => {
+  const id = setInterval(() => {
+    setSeconds(seconds + step);   // seconds 和 step 都被冻结在首次渲染
+  }, 1000);
+  return () => clearInterval(id);
+}, []);
+```
+
+**两个问题的成因其实是同一个：** effect 只在挂载时执行了一次，它内部的箭头函数捕获了**第一次渲染**的 `seconds`（0）和 `step`（1）。
+
+- 每秒都在算 `setSeconds(0 + 1)`，值恒为 1 → 秒数停在 1 不动
+- `step` 永远是 1，改成 5 也不会被那个闭包看到 → 改 step 无效
+
+---
+
+**方案一：函数式更新 + 把 `step` 加进依赖**
+
+```tsx
+useEffect(() => {
+  const id = setInterval(() => {
+    setSeconds((s) => s + step);   // s 是 React 给的最新值，不再依赖闭包
+  }, 1000);
+  return () => clearInterval(id);
+}, [step]);                        // step 变了就重建定时器
+```
+
+- **秒数问题** — 由函数式更新解决。`s` 由 React 从队列里取最新值传入，跟闭包无关。
+- **step 问题** — 由依赖数组解决。`step` 一变，effect 重跑，新闭包拿到新 `step`。
+
+**代价：定时器会被销毁重建。** 用户在第 900 毫秒改了 step，那 900 毫秒就白走了，计时从 0 重新开始。对「每秒 +N」这种场景通常可以接受；但如果是精确计时、或者 step 会被高频修改（比如绑在滑块上拖动），节奏会明显被打乱。
+
+---
+
+**方案二：用 ref 保存最新的 `step`，定时器只建一次**
+
+```tsx
+const stepRef = useRef(step);
+
+// 每次渲染后把最新值同步进 ref
+useEffect(() => {
+  stepRef.current = step;
+}, [step]);
+
+useEffect(() => {
+  const id = setInterval(() => {
+    setSeconds((s) => s + stepRef.current);   // 每次触发时才读，读到的一定是最新的
+  }, 1000);
+  return () => clearInterval(id);
+}, []);                                       // 空依赖：定时器全程只有一个
+```
+
+- **秒数问题** — 同样靠函数式更新解决。
+- **step 问题** — `stepRef.current` 是在**定时器触发的那一刻**读取的，而不是在 effect 创建时捕获的，所以总能读到最新值。
+
+**代价：**
+
+- 定时器**不会**重建，计时节奏完全不受影响 ✅
+- 但多了一个 ref 和一个同步 effect，样板代码变多
+- `step` 变成了「非响应式」的读取——如果哪天需求变成「改 step 时要立刻重置计时」，这个方案反而挡路了
+
+---
+
+**两种方案的选择标准：**
+
+| | 方案一（加依赖） | 方案二（用 ref） |
+|---|---|---|
+| 定时器重建 | 会 | 不会 |
+| 计时节奏 | 改 step 时被打断 | 始终连续 |
+| 代码量 | 少 | 多一个 ref + 一个 effect |
+| 语义 | step 是**订阅参数**，变了就该重连 | step 是**只读的最新值**，不该影响订阅 |
+
+**问自己一句话就能选对：「这个值变化时，我到底想不想重新建立这个副作用？」** 想 → 放依赖数组；不想但要读最新值 → 用 ref。
+
+聊天室的 `roomId` 属于前者（换房间当然要重连），这里的 `step` 属于后者。
+
+---
+
+**补充：一个错误的「修复」**
+
+```tsx
+// ⚠️ 能跑，但每秒都在销毁重建定时器
+useEffect(() => {
+  const id = setInterval(() => setSeconds(seconds + step), 1000);
+  return () => clearInterval(id);
+}, [seconds, step]);
+```
+
+把 `seconds` 也塞进依赖确实能让数字增长，但代价是**每一秒都要清理并重建一次定时器**。更麻烦的是计时会持续偏移：每次重建都从 0 开始计新的 1000 毫秒，而中间渲染的耗时会不断累加进去，跑久了明显变慢。
+
+**React 未来的正式解法是 `useEffectEvent`**（目前还是实验特性），它相当于把方案二的 ref 模式内置了：
+
+```tsx
+const onTick = useEffectEvent(() => setSeconds((s) => s + step));
+
+useEffect(() => {
+  const id = setInterval(onTick, 1000);
+  return () => clearInterval(id);
+}, []);   // onTick 不需要进依赖，但内部总能读到最新的 step
+```
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：消除多余的 effect">
 一个搜索页有 state：`query`、`allItems`、`filteredItems`、`isEmpty`。目前用两个 effect 分别在 query 变化时更新 filteredItems、在 filteredItems 变化时更新 isEmpty。
 
 重写这个组件，去掉所有 effect。说明你删掉了哪些 state。
+
+<Answer>
+**参考答案：**
+
+**改写前（4 个 state + 2 个 effect）：**
+
+```tsx
+function SearchPage() {
+  const [query, setQuery] = useState("");
+  const [allItems, setAllItems] = useState<Item[]>([]);
+  const [filteredItems, setFilteredItems] = useState<Item[]>([]);
+  const [isEmpty, setIsEmpty] = useState(false);
+
+  useEffect(() => {
+    setFilteredItems(allItems.filter((i) => i.name.includes(query)));
+  }, [query, allItems]);
+
+  useEffect(() => {
+    setIsEmpty(filteredItems.length === 0);
+  }, [filteredItems]);
+
+  // ...
+}
+```
+
+**改写后（2 个 state + 0 个 effect）：**
+
+```tsx
+function SearchPage() {
+  const [query, setQuery] = useState("");
+  const [allItems, setAllItems] = useState<Item[]>([]);
+
+  // 派生值：渲染时直接算
+  const filteredItems = allItems.filter((i) => i.name.includes(query));
+  const isEmpty = filteredItems.length === 0;
+
+  return (
+    <div>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      {isEmpty ? <Empty /> : <List items={filteredItems} />}
+    </div>
+  );
+}
+```
+
+**删掉的 state：`filteredItems` 和 `isEmpty`。**
+
+判断标准很简单：**能从其他 state 算出来的，就不是 state。** `filteredItems` 完全由 `query` + `allItems` 决定，`isEmpty` 完全由 `filteredItems` 决定，两者都不携带任何新信息。
+
+---
+
+**为什么原来的写法不只是「啰嗦」，而是**有 bug**：**
+
+原版输入一个字符会经历 **3 次渲染**，而且中间两次的界面是**自相矛盾**的：
+
+| 渲染 | `query` | `filteredItems` | `isEmpty` | 界面状态 |
+|---|---|---|---|---|
+| 1 | 新值 | **旧值** | 旧值 | 搜索框已更新，列表还是上次的结果 ❌ |
+| 2 | 新值 | 新值 | **旧值** | 列表对了，但空状态提示可能反了 ❌ |
+| 3 | 新值 | 新值 | 新值 | 终于一致 ✅ |
+
+用户能不能看到这两帧取决于机器性能，但**「取决于机器性能」本身就是最糟糕的一类 bug**——本地跑得快看不出来，用户的旧手机上就是一闪一闪的。
+
+改写后只渲染 1 次，且 `query`、`filteredItems`、`isEmpty` 天然同步——因为它们本来就是同一次计算的产物。这正是第 1 章说的：**消灭第二份真相**。
+
+---
+
+**关于性能：**
+
+「每次渲染都 filter 一遍会不会慢？」——绝大多数情况下不会。几百上千条数据的 `filter` 是微秒级的，比 React 渲染本身便宜得多。
+
+只有当数据量真的很大（上万条）或计算真的很重时，才用 `useMemo` 缓存：
+
+```tsx
+const filteredItems = useMemo(
+  () => allItems.filter((i) => i.name.includes(query)),
+  [allItems, query]
+);
+const isEmpty = filteredItems.length === 0;   // 这行永远不值得 memo
+```
+
+注意：**`useMemo` 是缓存，不是 state。** 它依然是「派生」的——依赖变了就自动重算，不需要你手动同步。而 effect + state 的写法，同步的责任在你身上。这是本质区别。
+
+`isEmpty` 这种一次比较的计算永远不要 memo，`useMemo` 自身的开销比 `.length === 0` 大得多。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：扩展 Playground">
 在本章的 Playground 里增加一个 useEffectMini 调用，依赖数组传 `null`（表示没写依赖数组），观察它在三次渲染中的行为。
 
 然后修复 fetch 那个 effect 的重复执行问题：把依赖从 `[config]` 改成 `[config.limit]`，重新运行看输出变化。
+
+<Answer>
+**参考答案：**
+
+只需要改 `renderComponent` 一个函数：
+
+```ts
+function renderComponent(roomId: string): void {
+  cursor = 0;
+
+  useEffectMini(
+    "socket",
+    function () {
+      console.log("      connect(" + roomId + ")");
+      return function () {
+        console.log("      close(" + roomId + ")");
+      };
+    },
+    [roomId]
+  );
+
+  const config = { limit: 10 };
+  useEffectMini(
+    "fetch",
+    function () {
+      console.log("      fetch(limit=" + config.limit + ")");
+      return null;
+    },
+    [config.limit]          // ← 改动一：依赖拆成原始值
+  );
+
+  useEffectMini(
+    "log",
+    function () {
+      console.log("      render log: " + roomId);
+      return null;
+    },
+    null                    // ← 改动二：没写依赖数组
+  );
+}
+```
+
+**运行输出：**
+
+```text
+渲染 1: roomId=A
+  [socket] 首次挂载，执行
+      connect(A)
+  [fetch] 首次挂载，执行
+      fetch(limit=10)
+  [log] 首次挂载，执行
+      render log: A
+渲染 2: roomId=A （只是父组件重渲染）
+  [socket] 依赖未变，跳过
+  [fetch] 依赖未变，跳过
+  [log] 依赖变了 -> 先清理上一次
+  [log] 再执行新的
+      render log: A
+渲染 3: roomId=B
+  [socket] 依赖变了 -> 先清理上一次
+      close(A)
+  [socket] 再执行新的
+      connect(B)
+  [fetch] 依赖未变，跳过
+  [log] 依赖变了 -> 先清理上一次
+  [log] 再执行新的
+      render log: B
+组件卸载，执行所有清理
+      close(B)
+```
+
+**观察点一：`null` 依赖（没写依赖数组）**
+
+三次渲染**每次都重新执行**。原因在 `depsChanged` 的第一行：
+
+```ts
+if (prev === null || next === null) return true;   // 直接判定「变了」
+```
+
+React 根本不做比较，无条件重跑。所以「不写依赖数组」的语义是「**每次渲染后都执行一遍，包括先清理上一次**」——这也是为什么它几乎从不该被使用：如果 effect 里有请求，那就是每次渲染都发一次请求。
+
+**观察点二：`[config]` 改成 `[config.limit]` 之后**
+
+| 渲染 | 改之前 | 改之后 |
+|---|---|---|
+| 1 | 首次挂载，执行 | 首次挂载，执行 |
+| 2 | **依赖变了 → 白跑一次** | **依赖未变，跳过** ✅ |
+| 3 | **依赖变了 → 白跑一次** | **依赖未变，跳过** ✅ |
+
+`config` 是每次渲染新建的对象字面量，`Object.is(旧对象, 新对象)` 恒为 `false`，所以依赖永远「变了」——**放进去等于没写依赖数组**。而 `config.limit` 是原始值 `10`，`Object.is(10, 10)` 为 `true`，比较才真正生效。
+
+**这就是「接口被重复请求」最常见的一种成因。** 三个等价的修法：
+
+```ts
+// ① 依赖拆成原始值（本题的做法，最简单）
+useEffect(() => { fetchData(config); }, [config.limit]);
+
+// ② 对象移到组件外部（配置是常量时最干净）
+const CONFIG = { limit: 10 };
+useEffect(() => { fetchData(CONFIG); }, []);
+
+// ③ 用 useMemo 稳定引用（对象字段较多、或依赖 props 时用）
+const config = useMemo(() => ({ limit: pageSize }), [pageSize]);
+useEffect(() => { fetchData(config); }, [config]);
+```
+
+同样的陷阱也适用于**数组**和**函数**——`[]`、`() => {}` 写在组件体里，每次渲染都是新引用。函数的对应解法是 `useCallback`（第 7 章）。
+</Answer>
 </Callout>
 
 ## 小结

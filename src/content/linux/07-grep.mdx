@@ -209,4 +209,57 @@ grep -F '[cache]' app.conf
 2. 用 `grep -oE` 从 access.log 中只提取出所有 IP 地址（提示：`[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+`）。
 3. 构造一个 10 行的日志，让第 6 行是 ERROR，用 `-C` 参数一次性输出第 4 到 8 行。
 4. 解释这两条命令结果为何不同：`grep 'a.c' f.txt` 与 `grep -F 'a.c' f.txt`（先造一个包含 abc 和 a.c 两行的文件验证）。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：三条过滤命令**
+
+```bash
+# 只输出状态码为 404 的行
+grep ' 404 ' access.log
+
+# 输出所有非 GET 请求
+grep -v ' GET ' access.log
+# 或精确到方法列：grep -E '(POST|DELETE)' access.log
+
+# 统计 200 出现的次数
+grep -c ' 200 ' access.log
+```
+
+注意给状态码前后加空格（`' 404 '`）可以避免误匹配，比如 `404` 出现在 `1404` 这类更长数字里时。
+
+**第 2 题：提取所有 IP 地址**
+
+```bash
+grep -oE '[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+' access.log
+```
+
+`-o` 只输出匹配到的片段，`[.]` 表示字面点号（正则里裸 `.` 匹配任意字符，会把非 IP 的文本也匹配进来），`[0-9]+` 匹配一串数字。每一行出现一个 IP 就输出一行。也可以简写成 `grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' access.log`。
+
+**第 3 题：用 `-C` 输出第 4 到 8 行**
+
+```bash
+seq -f 'line %g' 10 > svc.log
+printf 'line 6 ERROR something failed\n' | sed '6c\line 6 ERROR something failed' svc.log > svc2.log
+# 或者更简单：用 sed 把第 6 行替换成 ERROR 行
+seq -f 'line %g' 10 | sed '6s/.*/line 6 ERROR something failed/' > svc.log
+
+grep -C 2 'ERROR' svc.log
+# -C 2 表示匹配行前后各 2 行，正好输出第 4 到 8 行
+```
+
+`-C 2` 会输出匹配行的**前 2 行、匹配行本身、后 2 行**，所以第 6 行是 ERROR 时，输出范围恰好是第 4–8 行。
+
+**第 4 题：正则模式 vs 固定字符串**
+
+```bash
+printf 'abc\na.c\n' > f.txt
+
+grep 'a.c' f.txt     # 输出两行：abc 和 a.c 都匹配
+grep -F 'a.c' f.txt  # 只输出 a.c
+```
+
+原因：默认模式下 `a.c` 是**正则表达式**，其中的 `.` 是元字符"任意单个字符"，所以 `abc`、`a.c`、`aXc` 都会匹配；`-F`（fixed string）把模式当作**字面字符串**处理，`.` 就是普通字符，只匹配恰好包含 `a.c` 的行。搜索含 `.` `*` `[` 等特殊字符的 IP、版本号、URL 时，用 `-F` 更安全。
+</Answer>
 </Callout>

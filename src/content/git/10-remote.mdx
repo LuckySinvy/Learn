@@ -349,4 +349,65 @@ git remote set-url origin git@github.com:user/repo.git
 2. 在同一个实验里制造 push 被拒绝，分别用 `pull`（merge）和 `pull --rebase` 解决，对比 `git log --graph` 的形状。
 3. 解释：为什么 `git status` 显示 "behind 3 commits" 时，我在断网状态下也能看到这个提示？它比较的是哪两个东西？
 4. 用 `git push origin --delete <branch>` 删除一个远程分支，然后在另一个克隆里执行 `git branch -a`，观察它是否还显示。用什么命令清理？
+
+<Answer>
+**参考答案：**
+
+**1. 模拟两人协作 + fetch 观察 behind**
+
+```bash
+git init -q --bare /tmp/myorigin.git
+git clone -q /tmp/myorigin.git alice
+cd alice && echo v1 > app.txt && git add . && git commit -q -m "feat: 初版"
+git push -q -u origin main 2>/dev/null && cd ..
+git clone -q /tmp/myorigin.git bob
+
+cd bob && echo b > bob.txt && git add . && git commit -q -m "feat: bob 的提交"
+git push -q origin main 2>/dev/null && cd ..
+
+cd alice
+git fetch
+git status -sb
+```
+
+`fetch` 后 `git status -sb` 显示 `## main...origin/main [behind 1]`——本地 main 落后远程跟踪分支一个提交。`git log --oneline main..origin/main` 列出远程独有的提交（`feat: bob 的提交`）。此时工作区**没有** bob.txt，因为 fetch 只下载、不合并。
+
+**2. push 被拒绝的两种解法**
+
+接上一步，alice 也提交一个本地改动再 push，会被拒绝：
+
+```bash
+echo a > alice.txt && git add . && git commit -q -m "feat: alice 的提交"
+git push origin main     # -> ! [rejected] (fetch first)
+```
+
+方案一（merge 模式）：`git -c pull.rebase=false pull --no-edit origin main`，`git log --graph` 里历史出现**分叉气泡**，多了一个 Merge 提交，本地提交与远程提交各占一条线。
+
+方案二（rebase 模式）：先 `git reset --hard HEAD~1` 回到被拒绝前的状态，再 `git -c pull.rebase=true pull origin main`，历史变成**一条直线**——alice 的提交被重放到 bob 的提交之后，没有合并提交。两种方式都能解决拒绝，但 rebase 模式历史更干净，这也是 `pull.rebase true` 被推荐为全局默认的原因。
+
+**3. 断网也能看到 behind 的原因**
+
+`git status` 的 ahead/behind 提示**不联网**。它比较的是两个本地对象：
+
+- 你的本地分支 `main`（你自己的工作进度）
+- 本地缓存的远程跟踪分支 `origin/main`（你**上次 fetch/pull/push 时**记住的远程状态）
+
+这两个引用都在本地仓库里，所以哪怕断网，只要缓存里的 `origin/main` 和现在的 `main` 差 3 个提交，就能提示 "behind 3 commits"。这个数字代表的是"从上次同步到现在"的差距，而非远程此刻的真实状态；要拿到最新真实状态，还是得 `git fetch`。
+
+**4. 删除远程分支与清理**
+
+```bash
+# 在 alice 里删除远程分支
+git push origin --delete feature/old
+```
+
+然后在 bob（另一个克隆）里执行 `git branch -a`，`remotes/origin/feature/old` **仍然显示**——因为 `origin/*` 是本地缓存，删除动作不会自动传播到别人的仓库。清理命令：
+
+```bash
+git fetch --prune
+git branch -a    # remotes/origin/feature/old 消失
+```
+
+`--prune` 会让 fetch 删掉"远程已不存在"的跟踪分支；也可以 `git config --global fetch.prune true` 设为默认。
+</Answer>
 </Callout>

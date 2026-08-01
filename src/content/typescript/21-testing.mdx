@@ -286,6 +286,60 @@ console.log("identity 返回类型断言:", idCheck);`}
 1. 给第 12 章手写的 `MyOmit` 写五条类型测试，包括「排除不存在的键」这种边界情况。
 2. 给本章的 `chunk` 函数补充测试：空数组、size 大于数组长度、size 为小数。想一想小数时应该抛错还是向下取整，并把决定写成测试。
 3. 在自己的项目里加一步 `tsc --noEmit`，看看能不能通过。如果不能，说明构建工具一直在替你隐藏类型错误。
+
+<Answer>
+**参考答案：**
+
+**第 1 题**——`MyOmit` 的类型测试（含「排除不存在的键」边界）：
+
+```ts
+// 第 11 章手写的 MyOmit
+type MyOmit<T, K extends keyof T> = { [P in Exclude<keyof T, K>]: T[P] };
+
+type Equal<X, Y> =
+  (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type T1 = { a: number; b: string; c: boolean };
+
+// 排除不存在的键需要把约束放宽到属性键，否则 "x" 无法满足 keyof T1
+type MyOmitLoose<T, K extends PropertyKey> = { [P in Exclude<keyof T, K>]: T[P] };
+
+type Cases = [
+  Expect<Equal<MyOmit<T1, "a">, { b: string; c: boolean }>>,
+  Expect<Equal<MyOmit<T1, "a" | "c">, { b: string }>>,
+  Expect<Equal<MyOmit<T1, never>, T1>>,          // 排除 never = 原样
+  Expect<Equal<MyOmit<T1, keyof T1>, {}>>,       // 排除全部 = 空对象
+  Expect<Equal<MyOmitLoose<T1, "x">, T1>>,       // 排除不存在的键 = 原样返回
+];
+```
+
+注意：受 `K extends keyof T` 约束，直接 `MyOmit<T1, "x">` 会编译报错，所以边界用例改用 `MyOmitLoose` 把约束放宽到 `PropertyKey`，这本身就是「排除不存在的键」的意义——类型层面允许，但运行时原样返回。
+
+**第 2 题**——`chunk` 的运行时测试与「小数 decision」：
+
+```ts
+import { strict as assert } from "node:assert";
+
+// 推荐决策：size 必须是正整数，小数直接抛错（比「悄悄向下取整」更安全、更可预期）
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  if (!Number.isInteger(size) || size <= 0) throw new RangeError("size 必须是正整数");
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
+}
+
+assert.deepEqual(chunk([], 3), []);                       // 空数组
+assert.deepEqual(chunk([1, 2, 3, 4, 5], 10), [[1, 2, 3, 4, 5]]); // size 大于长度
+assert.throws(() => chunk([1, 2, 3], 2.5), RangeError);  // 小数抛错
+```
+
+「小数该抛错还是向下取整」是个设计选择：向下取整会让 `i += 2.5` 产生大小不一致的亚组，行为隐蔽且难排查；抛错则在错误边界就失败，更可预期。所以推荐抛 `RangeError`，并把这条决策写成测试固化下来。
+
+**第 3 题**——这是动手任务：在你的项目 `package.json` 里加一条脚本 `"typecheck": "tsc --noEmit"`，然后运行。如果它报一堆错误，说明 Vite/esbuild/SWC 等只转译不检查的构建工具一直在替你隐藏类型错误——这正是本章要强调的「构建通过 ≠ 类型正确」。
+</Answer>
 </Callout>
 
 ## 小结

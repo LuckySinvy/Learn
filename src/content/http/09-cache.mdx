@@ -211,4 +211,48 @@ Nginx/Apache 默认用 inode + mtime + size 生成文件 ETag。多台服务器�
 2. 修改 Playground 3：把 ETag 改成弱 ETag（W/ 前缀），验证比较逻辑需要怎么调整。
 3. 用 Playground 1 的策略表回答：一个每小时更新的 sitemap.xml 应该用什么 Cache-Control？
 4. 排障题：发版后用户反馈页面还是旧的。按"HTML 入口 → JS 文件名 → CDN s-maxage"的顺序列出你的检查清单。
+
+<Answer>
+**参考答案：**
+
+**1. ETag 优先于 Last-Modified**
+
+在 Playground 3 里同时下发 ETag 和 Last-Modified 两个响应头。请求时带上 `If-Modified-Since: <服务器返回的时间>`（时间是对的）和 `If-None-Match: "一个错误的指纹"`（指纹不对）。
+
+按 RFC 9110：**服务器应先比较 If-None-Match（ETag 优先），匹配才回 304**。这里时间对、指纹不对 → 两者不匹配 → 服务器回 `200` 并带新内容。即使 `If-Modified-Since` 显示"没改过"，只要 ETag 不匹配就按"内容有变"处理。原因：Last-Modified 只有秒级精度、且时间变了内容未必变，ETag 是对内容的精确指纹，优先级更高。
+
+**2. 弱 ETag 的比较逻辑**
+
+把响应里的 ETag 改成 `W/"abc123"`（弱 ETag）。弱 ETag 表示"语义等价即可"——gzip 前后字节不同但内容语义相同。比较逻辑调整：
+
+- 强比较：`If-None-Match: "abc123"` 与 `W/"abc123"` **不相等**（带 W/ 前缀的不能用于字节级强比较）；
+- 弱比较：比较时**忽略 W/ 前缀**，`"abc123"` 与 `W/"abc123"` 视为等价，可判 304。
+
+实现上：把两边都去掉 `W/` 前缀再比较即可。注意断点续传（Range）等需要字节级校验的场景**必须用强 ETag**，弱 ETag 只适用于"语义不变"的判断。
+
+**3. sitemap.xml 的 Cache-Control**
+
+每小时更新、希望用户尽快看到新内容的站点地图，属于"会变、可容忍分钟级延迟、需尽快生效"：
+
+```http
+Cache-Control: max-age=300, must-revalidate
+```
+
+- `max-age=300`：5 分钟内的强缓存，减少请求压力；
+- `must-revalidate`：过期后必须回源验证，不允许过期内容继续用；
+- 可选加 ETag 兜底：过期后带条件头问服务器，没变回 304 省流量。
+
+不建议 `no-cache`（每小时更新的资源每次都验证有点浪费），也不建议 `max-age=3600`（更新后最多 1 小时才生效）。可接受的值约 5-15 分钟。
+
+**4. 发版后页面还是旧的——检查清单**
+
+按顺序排查：
+
+1. **HTML 入口的 Cache-Control**：首页/入口 HTML 是否被 `no-cache`（用前必验）？若配了 `max-age=3600` 甚至更长，浏览器直接用缓存里的旧 HTML，后面的 JS 再新也没用——发版后刷新仍看到旧页面。检查响应头是否含 `Cache-Control: no-cache`；
+2. **JS/CSS 文件名是否带新 hash**：HTML 若已是最新，但引用的还是 `app.8f3a2c.js` 这种旧 hash 文件名，浏览器（即使强缓存过期）也会去请求旧文件，命中 CDN/浏览器的旧缓存。确认发版后 HTML 里的文件名 hash 已更新，且旧文件确实被新文件替换；
+3. **CDN 的 s-maxage**：若静态资源走 CDN 且配了很长的 `s-maxage`（如 604800），CDN 边缘缓存的还是旧版本，即使浏览器回源也会被 CDN 的旧缓存顶住。检查 CDN 上资源的 `s-maxage` 是否过长，发版是否带了缓存刷新（purge）动作；
+4. 兜底手段：让用户强制刷新（Ctrl+F5 跳过强缓存与协商缓存），或临时给资源 URL 加 `?v=版本号` 查询串绕过缓存键。
+
+经验口诀：**先确认入口 HTML 不是旧缓存，再确认资源文件名 hash 已更新，最后确认 CDN 边缘缓存已刷新**。
+</Answer>
 </Callout>

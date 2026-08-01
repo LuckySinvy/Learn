@@ -210,4 +210,63 @@ bin/kafka-configs.sh --bootstrap-server localhost:9093 \
 1. 给本地集群配置 SASL_PLAINTEXT + SCRAM（先不上 SSL 降低难度），创建 admin 与 app 两个用户，验证无凭据的客户端被拒绝。
 2. 开启 StandardAuthorizer，给 app 用户只授 orders 的 Write 权限，验证它能写不能读，且访问其他 topic 报 TopicAuthorizationException。
 3. 给 app 用户设 producer_byte_rate=1MB/s，用 producer-perf-test 压测验证吞吐被限制在 1MB/s 附近。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：SASL_PLAINTEXT + SCRAM 用户与认证**
+
+`server.properties` 关键配置（用 SASL_PLAINTEXT 先不碰 SSL，降低复杂度）：
+
+```properties
+listeners=SASL_PLAINTEXT://:9092
+security.inter.broker.protocol=SASL_PLAINTEXT
+sasl.enabled.mechanisms=SCRAM-SHA-512
+sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512
+listener.name.sasl_plaintext.scram-sha-512.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="kafka" password="kafkapass";
+```
+
+创建用户（用 kafka 凭据连接）：
+
+```bash
+kafka-configs --bootstrap-server localhost:9092 --alter --add-config 'SCRAM-SHA-512=[password=adminpass]' --entity-type users --entity-name admin
+kafka-configs --bootstrap-server localhost:9092 --alter --add-config 'SCRAM-SHA-512=[password=apppass]' --entity-type users --entity-name app
+```
+
+客户端不带 JAAS 凭据连接时，broker 返回 `SASL authentication failed` / `IllegalSaslStateException`，连接被拒——验证认证生效。
+
+**第 2 题：StandardAuthorizer 最小权限**
+
+开启授权（`authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer`，并设 `super.users=User:admin`）。给用户 app 只授 `orders` 的 Write：
+
+```bash
+kafka-acls --bootstrap-server localhost:9092 --add --allow-principal User:app \
+  --operation Write --topic orders
+```
+
+验证：
+- 用 app 凭据 `kafka-console-producer --topic orders` 能写成功。
+- 用 app 凭据 `kafka-console-consumer --topic orders` 报 `TopicAuthorizationException`（无 Read 权限）。
+- 访问其他 topic（如 `others`）无论读写都报 `TopicAuthorizationException`（白名单模式，未显式授权即拒绝）。
+
+**第 3 题：配额 throttling 验证**
+
+给 app 设生产者字节速率配额：
+
+```bash
+kafka-configs --bootstrap-server localhost:9092 --alter \
+  --add-config 'producer_byte_rate=1048576' \
+  --entity-type users --entity-name app
+```
+
+用 app 凭据压测：
+
+```bash
+kafka-producer-perf-test --topic orders --num-records 1000000 --record-size 1024 \
+  --throughput -1 --producer-props bootstrap.servers=localhost:9092 \
+  sasl.mechanism=SCRAM-SHA-512 security.protocol=SASL_PLAINTEXT ...
+```
+
+输出吞吐会被压制在 ~1MB/s 附近（≈ 1048576 B/s）。超出部分 broker 会让 producer「自愿限速」（返回 throttling，客户端睡眠等待），而不是断开——这是多租户隔离的核心机制，防止单用户打满集群带宽。
+</Answer>
 </Callout>

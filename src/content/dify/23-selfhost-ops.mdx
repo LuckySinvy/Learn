@@ -74,6 +74,223 @@ Dify 大版本可能改环境变量、移除旧字段。升级前先读官方变
 
 <Callout type="exercise" title="做一次演练">
 在测试环境执行一次「备份 → 修改镜像版本号 → 升级 → 观察日志 → 回退」全流程，确认你能在 15 分钟内恢复服务。
+
+<Answer>
+**参考答案：**
+
+**演练前提**：必须在**测试环境**做。第一次演练在生产上跑，就不是演练而是事故了。
+
+**第 0 步：记录当前状态（回退的锚点）**
+
+```bash
+cd /opt/dify/docker
+
+# 记录当前版本号——回退时要用
+grep -E "image: langgenius" docker-compose.yaml | tee /root/dify-version-before.txt
+
+# 记录当前健康状态，作为升级后的对照基线
+docker compose ps
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost/console/api/setup
+
+# 备份配置文件（.env 常被忽略，但它比数据还容易改坏）
+cp .env .env.bak.$(date +%F-%H%M)
+cp docker-compose.yaml docker-compose.yaml.bak.$(date +%F-%H%M)
+```
+
+**第 1 步：全量备份（约 3 分钟）**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKUP_DIR="/backup/dify/$(date +%F-%H%M)"
+mkdir -p "$BACKUP_DIR"
+cd /opt/dify/docker
+
+echo "==> 1/4 停止写入（保留 db 与向量库运行）"
+docker compose stop api worker web
+
+echo "==> 2/4 备份 PostgreSQL"
+docker compose exec -T db pg_dumpall -U postgres \
+  | gzip > "$BACKUP_DIR/postgres.sql.gz"
+
+echo "==> 3/4 备份向量库数据卷"
+for VOL in $(docker volume ls -q | grep -E 'weaviate|qdrant'); do
+  docker run --rm \
+    -v "$VOL":/data:ro \
+    -v "$BACKUP_DIR":/backup \
+    busybox tar czf "/backup/${VOL}.tar.gz" -C /data .
+done
+
+echo "==> 4/4 备份配置与上传文件"
+cp .env docker-compose.yaml "$BACKUP_DIR/"
+docker run --rm \
+  -v dify_app_storage:/data:ro \
+  -v "$BACKUP_DIR":/backup \
+  busybox tar czf /backup/app_storage.tar.gz -C /data .
+
+docker compose start api worker web
+echo "备份完成：$BACKUP_DIR"
+ls -lh "$BACKUP_DIR"
+```
+
+**四份数据缺一不可**，这是正文那条 warn 的完整版：
+
+| 备份项 | 丢了会怎样 |
+|---|---|
+| PostgreSQL | 应用配置、知识库元数据、日志、成员全没 |
+| 向量库（weaviate/qdrant） | **知识库变空**，所有文档要重新索引 |
+| `app_storage` 卷 | 上传的原始文档丢失，无法重新索引 |
+| `.env` + compose 文件 | 密钥、端口、域名配置全丢，服务起不来 |
+
+只备份 PostgreSQL 是最常见的错误——恢复后你会发现应用还在、知识库列表还在，但**检索什么都召回不到**，因为向量数据没了。
+
+**第 2 步：升级（约 5 分钟）**
+
+```bash
+cd /opt/dify/docker
+
+# 先读 release notes，重点看有没有新增必填环境变量
+# https://github.com/langgenius/dify/releases
+
+# 修改版本号（示例：0.8.2 → 0.8.3）
+sed -i.bak 's/:0\.8\.2/:0.8.3/g' docker-compose.yaml
+grep -E "image: langgenius" docker-compose.yaml
+
+# 拉镜像（先拉后停，缩短停机时间）
+docker compose pull
+
+docker compose down
+docker compose up -d
+```
+
+**第 3 步：观察日志（约 3 分钟）——这是演练的重点**
+
+```bash
+# api 容器启动时会自动执行数据库迁移，盯住它
+docker compose logs -f api | grep -iE "migrat|error|traceback|failed"
+```
+
+健康的迁移日志：
+
+```text
+INFO  Running database migrations...
+INFO  Context impl PostgresqlImpl.
+INFO  Running upgrade a1b2c3 -> d4e5f6, add xxx column
+INFO  Database migration successful!
+INFO  Application startup complete.
+```
+
+危险信号：
+
+```text
+ERROR  Target database is not up to date          ← 迁移未完成
+ERROR  column "xxx" of relation "yyy" already exists  ← 迁移冲突
+ERROR  KeyError: 'SOME_NEW_ENV'                   ← 缺新增环境变量
+ERROR  could not connect to server                ← db 还没起来（有时重试即可）
+```
+
+验证清单：
+
+```bash
+docker compose ps                    # 所有服务 Up 且非 restarting
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost   # 200
+
+# 功能自检（比看日志更可靠）
+# □ 登录控制台
+# □ 打开一个已有应用，编排页配置完整
+# □ 知识库列表在，随便点开一个文档看片段还在
+# □ 在预览里问一句，确认能召回知识库内容 ← 最关键，验证向量库正常
+# □ 用 curl 调一次 API，确认对外服务正常
+```
+
+**最后一条检查最重要**：能登录、能看到知识库列表，不代表向量数据完好。**必须实际问一个问题，看有没有召回**，否则问题会等到用户投诉时才暴露。
+
+**第 4 步：回退（约 4 分钟）**
+
+```bash
+cd /opt/dify/docker
+BACKUP_DIR=/backup/dify/2026-08-01-1430
+
+# 场景 A：只是新版本有 bug，数据库迁移没问题 → 只回镜像
+sed -i 's/:0\.8\.3/:0.8.2/g' docker-compose.yaml
+docker compose up -d
+```
+
+**但要特别小心**：如果新版本已经执行过数据库迁移，**旧版本代码通常无法直接读取新 schema**，回退镜像后 api 会报错。这时必须连数据库一起回退：
+
+```bash
+# 场景 B：完整回退（数据库也回滚）
+docker compose down
+
+# 恢复配置
+cp "$BACKUP_DIR/.env" .env
+cp "$BACKUP_DIR/docker-compose.yaml" docker-compose.yaml
+
+# 只启 db，恢复数据
+docker compose up -d db
+sleep 15
+gunzip -c "$BACKUP_DIR/postgres.sql.gz" | docker compose exec -T db psql -U postgres
+
+# 恢复向量库
+docker compose stop
+for f in "$BACKUP_DIR"/*weaviate*.tar.gz; do
+  VOL=$(basename "$f" .tar.gz)
+  docker run --rm -v "$VOL":/data -v "$BACKUP_DIR":/backup \
+    busybox sh -c "rm -rf /data/* && tar xzf /backup/$(basename $f) -C /data"
+done
+
+docker compose up -d
+docker compose logs -f api
+```
+
+**演练要计时并记录**
+
+```text
+| 步骤           | 预算  | 实测  | 备注                    |
+|----------------|-------|-------|-------------------------|
+| 0 记录状态     | 1 min | 1 min |                         |
+| 1 全量备份     | 3 min | 5 min | 向量库 8GB，比预期慢    |
+| 2 升级         | 5 min | 4 min | 镜像已预拉取            |
+| 3 观察验证     | 3 min | 3 min |                         |
+| 4 回退         | 4 min | 6 min | pg 恢复较慢             |
+| 合计           | 16min | 19min | 超预算，需优化备份环节  |
+```
+
+**演练一定会暴露的问题（这才是演练的价值）**
+
+真正跑一遍，你大概率会遇到下面某几条：
+
+1. **备份脚本没测过就报错**——卷名写错、权限不足、磁盘空间不够。这些只有真跑才发现。
+2. **不知道向量库卷叫什么名字**——不同部署方式卷名前缀不同，`docker volume ls` 先确认。
+3. **备份文件大得离谱**——向量库几十 GB，备份要半小时。这意味着「15 分钟恢复」的目标不现实，需要改用增量备份或快照。
+4. **恢复时忘了先停服务**——边写边恢复导致数据不一致。
+5. **`.env` 没备份**——新版本改了配置项，回退后旧版本读不懂。
+6. **数据库回退后向量库没回退**——两者版本不匹配，知识库显示有文档但检索为空。
+
+**给生产环境的建议**
+
+```text
+□ 备份自动化：写成 cron 每日执行，别指望手动
+□ 备份异地：备份文件不能只放在同一台机器上
+□ 定期验证恢复：备份文件能否成功恢复，必须定期实测
+   （没验证过的备份 = 没有备份，这是运维铁律）
+□ 保留最近 7 天 + 每月 1 份长期备份
+□ 升级选低峰期，提前通知用户
+□ 大版本升级先在测试环境跑完整回归（第 15 章的评估集在这里派上用场）
+□ 把本次演练的实测耗时写进应急预案文档
+```
+
+**关于「15 分钟恢复」这个目标**
+
+小规模测试环境完全能达到。但生产环境如果知识库有几十 GB 向量数据，光恢复就不止 15 分钟。这时更现实的方案是：
+
+- **蓝绿部署**：新版本起一套独立环境，验证通过后切流量，出问题秒切回来
+- **数据库物理快照**：用云厂商的磁盘快照，恢复速度远快于 `pg_dump` 逻辑恢复
+- **读写分离的降级预案**：知识库暂时不可用时，应用能降级为纯模型问答而不是整个挂掉
+
+演练的真正目的不是记住命令，而是**在没有压力的情况下把所有坑先踩一遍**，并据此写出一份可靠的应急预案。
+</Answer>
 </Callout>
 
 ## 小结

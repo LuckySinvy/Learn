@@ -101,6 +101,206 @@ while (true) {
 
 <Callout type="exercise" title="练习">
 把第 15 章的 `/api/chat` 改成流式返回，并在前端用 `reader.read()` 逐字渲染到页面。
+
+<Answer>
+**参考答案：**
+
+**1) 服务端：`app/api/chat/route.ts`**
+
+推荐直接用 `LangChainAdapter`（`ai` 包提供），一行搞定；下面同时给出零依赖的手写版。
+
+```ts
+// 手写版：不依赖任何额外包
+import { NextRequest } from "next/server";
+import { z } from "zod";
+import { getChain } from "@/lib/chain";
+
+export const runtime = "nodejs";
+export const maxDuration = 60;
+
+const bodySchema = z.object({
+  topic: z.string().trim().min(1).max(2000),
+});
+
+export async function POST(req: NextRequest) {
+  // 关键：所有校验都必须在开始流之前做完
+  const parsed = bodySchema.safeParse(await req.json().catch(() => null));
+  if (!parsed.success) {
+    return Response.json({ error: "参数不合法" }, { status: 400 });
+  }
+
+  const stream = await getChain().stream({ topic: parsed.data.topic });
+  const encoder = new TextEncoder();
+
+  const readable = new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const chunk of stream) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+      } catch (err) {
+        // 流已经以 200 发出，改不了状态码，只能用带内标记通知前端
+        console.error("[/api/chat] stream error", err);
+        controller.enqueue(encoder.encode("\n\n[ERROR] 生成中断，请重试"));
+      } finally {
+        controller.close();
+      }
+    },
+    cancel() {
+      // 用户关闭页面 / AbortController 触发时会走到这里
+      console.log("客户端已断开，停止生成");
+    },
+  });
+
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",   // 防止代理缓冲导致「不流了」
+      "X-Accel-Buffering": "no",                   // Nginx 专用：关闭响应缓冲
+    },
+  });
+}
+```
+
+**2) 前端：用 `reader.read()` 逐字渲染**
+
+```tsx
+"use client";
+
+import { useRef, useState } from "react";
+
+export default function Chat() {
+  const [topic, setTopic] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [loading, setLoading] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+
+  async function send() {
+    setLoading(true);
+    setAnswer("");
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic }),
+        signal: controller.signal,
+      });
+
+      // 非 200 时响应体是 JSON 错误，不是流
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setAnswer("请求失败：" + (data.error ?? res.status));
+        return;
+      }
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        // stream: true 很重要，避免多字节 UTF-8 汉字被切成两半而乱码
+        setAnswer((prev) => prev + decoder.decode(value, { stream: true }));
+      }
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setAnswer("网络错误");
+      }
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+    }
+  }
+
+  return (
+    <main className="mx-auto max-w-2xl space-y-4 p-8">
+      <input
+        className="w-full rounded border p-2"
+        value={topic}
+        onChange={(e) => setTopic(e.target.value)}
+        placeholder="输入一个话题…"
+      />
+
+      <div className="flex gap-2">
+        <button
+          className="rounded bg-black px-4 py-2 text-white disabled:opacity-40"
+          onClick={send}
+          disabled={loading || !topic.trim()}
+        >
+          {loading ? "生成中…" : "发送"}
+        </button>
+
+        {loading && (
+          <button className="rounded border px-4 py-2" onClick={() => abortRef.current?.abort()}>
+            停止
+          </button>
+        )}
+      </div>
+
+      <div className="min-h-32 whitespace-pre-wrap rounded bg-gray-50 p-4">
+        {answer}
+        {loading && <span className="animate-pulse">▍</span>}
+      </div>
+    </main>
+  );
+}
+```
+
+**3) 更省事的写法：`LangChainAdapter`**
+
+```bash
+npm install ai
+```
+
+```ts
+import { LangChainAdapter } from "ai";
+
+export async function POST(req: Request) {
+  const { topic } = await req.json();
+  const stream = await getChain().stream({ topic });
+  return LangChainAdapter.toDataStreamResponse(stream);
+}
+```
+
+前端配合 `useCompletion` / `useChat`，连 `reader.read()` 循环都不用写。**手写版的价值在于理解原理**，生产项目用适配器更省心。
+
+**四个必须知道的坑**
+
+| 坑 | 后果 | 解法 |
+|---|---|---|
+| `decoder.decode(value)` 漏了 `{ stream: true }` | 中文在块边界被截断成「�」 | 必须传 `stream: true`，让 decoder 缓存不完整的字节 |
+| 校验写在开始流之后 | 已经发出 200，无法再返回 400 | 所有校验前置；流中出错只能用 `[ERROR]` 之类的带内标记 |
+| Nginx / CDN 缓冲响应 | 本地流式正常，上线后变成「转圈几秒后一次性全出」 | 加 `X-Accel-Buffering: no` 和 `Cache-Control: no-transform` |
+| 用户关页面后链还在跑 | 白白消耗 Token | 前端用 `AbortController`，服务端在 `cancel()` 里做清理 |
+
+**进阶：同时推送中间事件**
+
+纯文本流只能传答案。如果想让前端显示「正在检索文档…」，改用 `streamEvents` 并把事件编码成 SSE 或 NDJSON：
+
+```ts
+const readable = new ReadableStream({
+  async start(controller) {
+    const enc = new TextEncoder();
+    for await (const ev of chain.streamEvents({ topic }, { version: "v2" })) {
+      if (ev.event === "on_retriever_end") {
+        controller.enqueue(enc.encode(JSON.stringify({ type: "status", text: `检索到 ${ev.data.output.length} 块` }) + "\n"));
+      }
+      if (ev.event === "on_chat_model_stream") {
+        const t = ev.data.chunk?.content;
+        if (t) controller.enqueue(enc.encode(JSON.stringify({ type: "token", text: t }) + "\n"));
+      }
+    }
+    controller.close();
+  },
+});
+```
+
+前端按行 `JSON.parse` 分发，就能同时渲染状态提示和正文。
+</Answer>
 </Callout>
 
 ## 小结

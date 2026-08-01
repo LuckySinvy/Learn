@@ -207,4 +207,129 @@ Redis 没有独立的"数字类型"，`INCR` 操作的仍是 String，只是要�
 1. 分别写入整数、20 字节字符串、100 字节字符串，用 OBJECT ENCODING 验证三种编码；再对 embstr 的 key 执行 APPEND，观察编码变化。
 2. 用 SET NX EX 模拟抢锁：开两个 redis-cli 窗口同时抢同一把锁，验证只有一个成功。
 3. 设计一个"每日签到计数"的 key 命名方案，要求自动过期、支持按天查询。
+
+<Answer>
+**参考答案：**
+
+**1. 验证三种编码及 APPEND 的影响**
+
+```bash
+# int 编码：内容可解析为 64 位整数
+127.0.0.1:6379> SET n 12345
+OK
+127.0.0.1:6379> OBJECT ENCODING n
+"int"
+
+# embstr 编码：字符串长度 <= 44 字节
+127.0.0.1:6379> SET s20 "abcdefghij0123456789"      # 20 字节
+OK
+127.0.0.1:6379> OBJECT ENCODING s20
+"embstr"
+
+# raw 编码：超过 44 字节
+127.0.0.1:6379> SET s100 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+OK
+127.0.0.1:6379> OBJECT ENCODING s100
+"raw"
+
+# 对 embstr 执行 APPEND：即使结果仍然很短，也会变成 raw
+127.0.0.1:6379> APPEND s20 "X"
+(integer) 21
+127.0.0.1:6379> OBJECT ENCODING s20
+"raw"                     # 21 字节仍然 <= 44，但编码已不可逆地变成 raw
+
+# 对 int 编码执行 APPEND 同样退化
+127.0.0.1:6379> APPEND n "6"
+(integer) 6
+127.0.0.1:6379> OBJECT ENCODING n
+"raw"
+
+# 但 INCR 不会破坏 int 编码
+127.0.0.1:6379> SET c 1
+OK
+127.0.0.1:6379> INCR c
+(integer) 2
+127.0.0.1:6379> OBJECT ENCODING c
+"int"
+```
+
+**为什么 APPEND 会让 embstr 变 raw？** embstr 把 redisObject 头和 SDS 字符串分配在**一块连续内存**里，只需一次 malloc，读取时缓存友好，但正因为连续，它是**只读优化**——无法原地扩容。任何修改型命令（`APPEND`、`SETRANGE`、`GETSET` 后的写入）都会先转成 raw（头和数据分开两次分配），之后即使长度回落到 44 字节以内也**不会转回** embstr。
+
+44 这个数字来自：jemalloc 的 64 字节内存块 − redisObject 头（16 字节）− sdshdr8 头（3 字节）− 结尾 `\0`（1 字节）= 44。
+
+**编码转换是单向的**，这条规律在 Hash/List/Set/ZSet 上同样成立，后续章节会反复遇到。
+
+**2. 用 SET NX EX 模拟抢锁**
+
+```bash
+# ---- 窗口 A ----
+127.0.0.1:6379> SET lock:order:1001 "clientA-uuid-8f3a" NX EX 30
+OK                        # 抢锁成功
+
+# ---- 窗口 B（几乎同时执行）----
+127.0.0.1:6379> SET lock:order:1001 "clientB-uuid-2c71" NX EX 30
+(nil)                     # 抢锁失败，key 已存在
+
+127.0.0.1:6379> GET lock:order:1001
+"clientA-uuid-8f3a"       # 锁被 A 持有
+127.0.0.1:6379> TTL lock:order:1001
+(integer) 26              # 26 秒后自动释放
+
+# ---- 窗口 A 释放锁（必须校验持有者，不能直接 DEL）----
+127.0.0.1:6379> EVAL "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end" 1 lock:order:1001 "clientA-uuid-8f3a"
+(integer) 1
+
+# ---- 现在窗口 B 可以抢到了 ----
+127.0.0.1:6379> SET lock:order:1001 "clientB-uuid-2c71" NX EX 30
+OK
+```
+
+三个必须理解的要点：
+
+- **NX 和 EX 必须在同一条命令里**：如果写成 `SETNX` + `EXPIRE` 两步，在两步之间宕机就会留下一把**永不过期的死锁**
+- **value 要放唯一标识**（UUID / 线程 ID）：释放锁时校验持有者，避免"A 的锁被 B 误删"。场景是 A 执行超时锁自动过期、B 抢到锁、A 执行完直接 `DEL` 把 B 的锁删了
+- **校验 + 删除必须原子**：所以用 Lua 而不是 `GET` 后再 `DEL`
+
+这只是单机锁的最简形态，主从切换下仍可能丢锁，完整方案见第 17 章。
+
+**3. 每日签到计数的 key 设计**
+
+推荐方案：**业务前缀 : 维度 : 日期** 的分层命名。
+
+```bash
+# 命名格式：signin:{日期}:{用户ID}  —— 记录某人某天是否签到
+127.0.0.1:6379> SET signin:20260801:u1001 1 EX 604800     # 保留 7 天
+OK
+
+# 命名格式：signin:count:{日期}  —— 全站当日签到总数
+127.0.0.1:6379> INCR signin:count:20260801
+(integer) 1
+127.0.0.1:6379> EXPIRE signin:count:20260801 5184000      # 保留 60 天
+
+# 命名格式：signin:days:{用户ID}:{年月}  —— 某人某月累计签到天数
+127.0.0.1:6379> INCR signin:days:u1001:202608
+(integer) 1
+127.0.0.1:6379> EXPIRE signin:days:u1001:202608 7776000   # 保留 90 天
+
+# 按天查询
+127.0.0.1:6379> GET signin:count:20260801
+"1"
+
+# 查一周的数据：一次 MGET，只要一个 RTT
+127.0.0.1:6379> MGET signin:count:20260726 signin:count:20260727 signin:count:20260728 signin:count:20260729 signin:count:20260730 signin:count:20260731 signin:count:20260801
+1) "8213"
+2) "9102"
+3) (nil)
+```
+
+设计要点：
+
+- **日期放进 key 名**：这是"按天查询"和"自动过期"能同时成立的前提。日期用 `yyyyMMdd` 定长格式，方便拼接和排序
+- **冒号分层**：`业务:类型:维度` 是 Redis 社区约定，RedisInsight 等工具会按冒号折叠成树状视图
+- **每个 key 独立 TTL**：明细保留 7 天、汇总保留 60 天，过期数据自动清理，不用写定时任务
+- **TTL 要在写入时一并设置**：用 `SET ... EX` 一步到位。计数器只能 `INCR` 后再 `EXPIRE`，此时应先判断 `TTL` 是否为 `-1` 再设置，避免每次都重置过期时间
+- **避免用中文或空格**：key 只用字母、数字、冒号、下划线、连字符
+
+**进阶提示**：如果只关心"签到 / 未签到"这个布尔状态，用 Bitmap 会省得多——`SETBIT signin:u1001:202608 15 1` 表示 8 月 16 日签到，一个月只占 4 字节，还能用 `BITCOUNT` 直接算出当月签到天数、用 `BITPOS` 找连续签到。详见第 8 章。
+</Answer>
 </Callout>

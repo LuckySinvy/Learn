@@ -251,6 +251,58 @@ api_response = '''
 - `data = json.loads(api_response)`
 - `csv.DictWriter(..., fieldnames=data[0].keys()).writerows(data)`
 - 用 `defaultdict(int)` 聚合
+
+<Answer>
+
+**参考答案：**
+
+```python
+import csv
+import json
+from collections import defaultdict
+from pathlib import Path
+
+# 1) 模拟从 API 拿到的 JSON（练习里已给 api_response）
+api_response = '''
+[
+  {"city": "北京", "product": "Apple",  "amount": 120},
+  {"city": "上海", "product": "Apple",  "amount": 80},
+  {"city": "北京", "product": "Banana", "amount": 50},
+  {"city": "广州", "product": "Apple",  "amount": 200},
+  {"city": "上海", "product": "Banana", "amount": 70}
+]
+'''
+
+# 2) 解析 JSON
+data = json.loads(api_response)
+
+# 3) 写到 /tmp/orders.csv（含表头）
+csv_path = Path("/tmp/orders.csv")
+with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(f, fieldnames=data[0].keys())
+    writer.writeheader()
+    writer.writerows(data)
+print(f"写入完成, 共 {len(data)} 行")
+
+# 4) 重新读出，按 product 聚合 amount
+by_product = defaultdict(int)
+with open(csv_path, encoding="utf-8") as f:
+    for row in csv.DictReader(f):
+        by_product[row["product"]] += int(row["amount"])
+
+print("按产品求和:")
+for product, total in sorted(by_product.items()):
+    print(f"  {product}: {total}")
+```
+
+输出与题目期望一致：`写入完成, 共 5 行`，然后 `Apple: 400`、`Banana: 120`。
+
+要点：
+
+- `fieldnames=data[0].keys()` 用第一行的键生成表头；写 CSV 时 `newline=""` 可以避免行间多出空行。
+- `DictReader` 按表头把每行读成字典，其中 `amount` 是字符串，聚合前要 `int()` 转换。
+- `defaultdict(int)` 自动把不存在的 key 初始化为 `0`，省去"先判断 key 是否存在"的样板代码。
+</Answer>
 </Callout>
 
 ## 小结

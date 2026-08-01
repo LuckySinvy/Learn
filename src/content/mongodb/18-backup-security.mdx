@@ -477,6 +477,158 @@ if (typeof username !== "string") throw new Error("invalid")
 
 <Callout type="exercise" title="练习">
 一、给本地实例开启认证，创建 admin、app、report 三个账号，验证 report 账号无法写入；二、用 `mongodump --oplog` 备份，再 `mongorestore` 到另一个库名，对比文档数；三、模拟误删：记下当前时间，`deleteMany` 删掉一批帖子，然后用全量备份 + oplog 重放恢复到删除前一秒；四、创建一个只能读 posts 集合的自定义角色，用它登录后尝试读 users，确认被拒绝；五、创建一个脱敏视图 `users_public`，验证通过它看不到 email 字段；六、检查你手上任意一个 MongoDB 实例：`bindIp` 是什么、认证有没有开、有没有暴露在公网。
+
+<Answer>
+**参考答案：**
+
+**一、开启认证 + 三个账号**
+
+修改 `mongod.conf` 后重启：
+
+```yaml
+security:
+  authorization: enabled
+net:
+  bindIp: 127.0.0.1
+```
+
+```bash
+# 重启后利用 localhost exception 创建第一个管理员
+mongosh --port 27017
+```
+
+```js
+use admin
+db.createUser({ user: "admin", pwd: passwordPrompt(), roles: [ { role: "root", db: "admin" } ] })
+db.createUser({ user: "app",  pwd: passwordPrompt(), roles: [ { role: "readWrite", db: "community" } ] })
+db.createUser({ user: "report", pwd: passwordPrompt(), roles: [ { role: "read", db: "community" } ] })
+```
+
+验证：
+
+```bash
+# 用 report 登录后尝试写入
+mongosh "mongodb://report:<pwd>@localhost:27017/community?authSource=admin" --eval 'db.posts.insertOne({ title: "x" })'
+# 报错：not authorized on community to execute command { insert: "posts" }
+```
+
+`report` 只有 `read` 角色，插入被拒绝；`app` 可以正常读写。用 `admin` 给不同职责分配不同权限，这就是最小权限原则。
+
+**二、`mongodump --oplog` 备份并恢复到另一个库**
+
+```bash
+# 备份（复制集必须；单机 standalone 会提示需要 --forceTableScan，复制集直接可用）
+mongodump --uri="mongodb://admin:<pwd>@localhost:27017/?authSource=admin" \
+  --oplog --archive=/backup/consistent.gz --gzip
+
+# 恢复到另一个库名做验证
+mongorestore --uri="mongodb://admin:<pwd>@localhost:27017/?authSource=admin" \
+  --nsFrom="community.*" --nsTo="community_restore.*" \
+  --oplogReplay --archive=/backup/consistent.gz --gzip
+```
+
+对比：
+
+```js
+db.community.posts.countDocuments()            // 原库
+db.community_restore.posts.countDocuments()   // 恢复出来的库
+```
+
+`--oplog` + `--oplogReplay` 保证所有集合对齐到备份结束时刻的一致状态，两个数应一致。
+
+**三、模拟误删 + 恢复到删除前 1 秒**
+
+```js
+// 1. 记录时间点（用 UTC）
+const now = new Date()
+print(now.toISOString())                       // 记下，比如 2024-06-04T15:00:00.000Z
+
+// 2. 模拟误删一批帖子
+db.posts.deleteMany({ status: "published" })
+```
+
+恢复：
+
+```bash
+# 3. 从全量备份恢复
+mongorestore --uri="mongodb://admin:<pwd>@localhost:27018/?authSource=admin" /backup/full-2024-06-04
+
+# 4. 重放 oplog，停在误删前一秒
+mongorestore --uri="mongodb://admin:<pwd>@localhost:27018/?authSource=admin" \
+  --oplogReplay --oplogFile=/backup/oplog/2024-06-04-15/local/oplog.rs.bson \
+  --oplogLimit=<时间戳秒>:1
+```
+
+要点：`oplogLimit` 取误删时间戳**减 1 秒**（格式为 `秒:序号`）。为了精确，也可以先在 `local.oplog.rs` 里查到第一条删除操作的 `ts`：
+
+```js
+db.getSiblingDB("local").oplog.rs.find({
+  ns: "community.posts", op: "d",
+  wall: { $gte: ISODate("2024-06-04T14:59:00Z") }
+}).sort({ ts: 1 }).limit(1)
+// 取返回结果的 ts.t 和 ts.i，用 ts.t - 1 或直接减一作为 oplogLimit
+```
+
+**四、只能读 posts 的自定义角色**
+
+```js
+use community
+db.createRole({
+  role: "postReader",
+  privileges: [
+    { resource: { db: "community", collection: "posts" }, actions: ["find"] }
+  ],
+  roles: []
+})
+db.createUser({ user: "reader", pwd: passwordPrompt(), roles: [ { role: "postReader", db: "community" } ] })
+```
+
+验证：
+
+```bash
+mongosh "mongodb://reader:<pwd>@localhost:27017/community?authSource=community" --eval '
+  db.posts.find().limit(1)        // 成功
+  db.users.find().limit(1)        // 报错：not authorized for find on community.users
+'
+```
+
+`privileges` 只授了 `posts.find`，读 `users` 被拒绝。
+
+**五、脱敏视图 `users_public`**
+
+```js
+use community
+db.createView("users_public", "users", [
+  { $project: { username: 1, "profile.city": 1, "profile.avatar": 1, createdAt: 1 } }
+])
+```
+
+验证：
+
+```js
+db.users_public.findOne()
+// 返回里只有 username / profile / createdAt，没有 email / passwordHash
+```
+
+配合第四题的做法，给报表/前端账号只授 `users_public` 的读权限，即可实现「看不到 email」的字段级脱敏（MongoDB 没有原生列级权限，用视图模拟）。
+
+**六、检查手头实例的安全基线**
+
+```bash
+# 检查 bindIp（配置里）
+grep -E 'bindIp|authorization' /etc/mongod.conf
+
+# 检查是否暴露在公网
+lsof -i :27017
+# 或
+netstat -an | grep 27017
+
+# 检查认证是否开启：不带认证尝试连接
+mongosh "mongodb://localhost:27017/admin" --eval 'db.runCommand({ connectionStatus: 1 })'
+```
+
+自查清单：`bindIp` 是不是 `0.0.0.0`（是 → 危险）；`authorization` 是否 `enabled`（否 → 任何人可连可删）；`lsof` 是否监听在公网网卡（`*:27017` 且机器有公网 IP → 高危）。三项中任何一项不合格，都要尽快修复——2017 年以来 MongoDB 勒索事件的原因几乎全是「无认证 + 绑 0.0.0.0 + 暴露公网」。
+</Answer>
 </Callout>
 
 ## 小结

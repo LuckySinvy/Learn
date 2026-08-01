@@ -215,6 +215,34 @@ SELECT count() FROM numbers(1000000000) WHERE number % 7 = 0;
 1. 用上面的 Docker 命令启动一个 ClickHouse，进入 `clickhouse-client`。
 2. 执行 `SELECT count() FROM numbers(100000000) WHERE number % 3 = 0;`，记下 Elapsed 和吞吐量。
 3. 思考并写下：你当前工作中的哪张 MySQL 表最适合迁移到 ClickHouse？它满足「只追加、量大、按时间聚合」这三个条件吗？
+
+<Answer>
+**参考答案：**
+
+1. 启动并进入客户端：
+
+```bash
+docker run -d --name ch -p 8123:8123 -p 9000:9000 clickhouse/clickhouse-server:24.8
+docker exec -it ch clickhouse-client
+```
+
+2. 执行查询：
+
+```sql
+SELECT count() FROM numbers(100000000) WHERE number % 3 = 0;
+```
+
+`numbers(100000000)` 生成 0~99999999 共 1 亿行，`number % 3 = 0` 约命中 `100000000 / 3 ≈ 33333333` 行，所以结果接近 33,333,333。请记下你机器上的 `Elapsed`（通常不足 1 秒）和结尾的 `Processed ... billion rows/s`（吞吐量，一般每秒数亿行）——这就是向量化执行在纯计算场景下的直观体现。
+
+3. 迁移思考（示例，请结合你自己的业务）：
+
+以「网站 / App 访问日志表」为例：
+- **只追加**：日志只写入、不改删，满足；
+- **量大**：每天几百万到上亿行，几个月累计几十亿行，满足；
+- **按时间聚合**：业务查询几乎都是「按天 / 按小时统计 PV、UV、来源、页面」，满足。
+
+三个条件全满足，是 ClickHouse 的理想场景。反过来，如果业务表经常做单行 UPDATE/DELETE、需要跨表事务、或高并发点查，就不适合迁移。
+</Answer>
 </Callout>
 
 ## 小结

@@ -91,6 +91,34 @@ print(delta.total_seconds()) # 间隔秒数
 
 <Callout type="exercise" title="动手试">
 写一个函数：输入两个 ISO 字符串，返回相差多少「天、小时、分钟」。提示：用 `fromisoformat` 解析后相减，从 `total_seconds()` 拆出天/时/分。
+
+<Answer>
+
+**参考答案：**
+
+```python
+from datetime import datetime
+
+def diff_iso(start: str, end: str):
+    delta = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+    total = int(abs(delta.total_seconds()))   # 取整，丢掉小数秒
+
+    days, rem = divmod(total, 86_400)         # 1 天 = 86400 秒
+    hours, rem = divmod(rem, 3_600)           # 1 小时 = 3600 秒
+    minutes = rem // 60                       # 剩余按分钟
+
+    return days, hours, minutes
+
+print(diff_iso("2024-01-01T00:00:00", "2024-01-02T03:04:05"))          # (1, 3, 4)
+print(diff_iso("2024-06-01T08:00:00+08:00", "2024-05-31T20:00:00+08:00"))  # (0, 12, 0)
+```
+
+说明：
+
+- `datetime.fromisoformat` 直接解析 ISO 8601 字符串，包括带 `+08:00` 时区的 aware 时间。
+- 两个 `datetime` 相减得到 `timedelta`，再按秒拆出天/时/分；`divmod` 一次拿到商和余数，比手写除法更清晰。
+- 注意 naive 和 aware 不能混着相减（会抛 `TypeError`）。如果输入带时区，建议先统一转成同一时区（如 UTC）再算差值。
+</Answer>
 </Callout>
 
 ## 小结

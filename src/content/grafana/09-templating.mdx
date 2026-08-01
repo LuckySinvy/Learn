@@ -102,6 +102,54 @@ rate(http_requests_total[$interval])
 
 <Callout type="exercise" title="练习">
 建一个变量 `env`（Custom: prod,staging），再建一个 `instance` 的 Query 变量依赖 `env`（提示：Prometheus 指标带 `env` 标签）。做一块仪表盘，切换 env 即看对应环境的实例。
+
+<Answer>
+**参考答案：**
+
+在 Dashboard settings → **Variables → New variable** 依次建两个变量。
+
+**① 变量 `env`（Custom 类型）**
+
+- **Name**：`env`
+- **Type**：`Custom`
+- **Values**：`prod,staging`
+- **Label**：可写「环境」，下拉框显示更友好
+
+**② 变量 `instance`（Query 类型，依赖 env）**
+
+- **Name**：`instance`
+- **Type**：`Query`
+- **Data source**：Prometheus
+- **Query**：
+
+```promql
+label_values(up{env="$env"}, instance)
+```
+
+- **Multi-value**：✅（允许选多个实例）
+- **Include All option**：✅
+
+关键在 Query 里带 `{env="$env"}`：先选 `env`，`instance` 下拉自动只列出该环境下的实例，实现级联。
+
+**③ 面板查询里引用两个变量**
+
+```promql
+up{env="$env", instance=~"$instance"}
+```
+
+`instance=~"$instance"` 用正则匹配，多选时才会正确展开成 `instance1|instance2`。
+
+**④ 验证交互**
+
+1. `env` 切到 `staging`，观察 `instance` 下拉只剩 staging 的实例
+2. 面板标题也可以引用变量，例如：
+
+```text
+环境 $env 的实例 $instance
+```
+
+标题会跟随下拉实时变化。切换 `env`，整块仪表盘的数据自动切换到对应环境，无需复制仪表盘。
+</Answer>
 </Callout>
 
 ## 小结

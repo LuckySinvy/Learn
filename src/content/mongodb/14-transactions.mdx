@@ -387,6 +387,167 @@ async function transfer(client, fromId, toId, amount) {
 
 <Callout type="exercise" title="练习">
 一、在本地单成员复制集上跑通本章的转账示例，包括余额不足的失败路径；二、故意在事务里用 `db.accounts` 而不是 `session.getDatabase(...).accounts`，观察结果为什么没有回滚；三、开两个 mongosh 会话同时修改同一个文档，复现 WriteConflict 错误；四、用 `w: 0`、`w: 1`、`w: "majority"` 各插入 1000 条文档，对比耗时；五、把第 2.3 节的评论事务改写成「评论和帖子计数用事务，通知异步插入」的版本，说明这样改的收益；六、设计一个不用事务的「点赞」实现，要求同一用户重复点赞不会重复计数（提示：用 `$addToSet` 的返回值判断）。
+
+<Answer>
+**参考答案：**
+
+**一、单成员复制集跑通转账（含余额不足）**
+
+```js
+// 准备：确认当前是复制集 primary（事务必须复制集）
+db.hello().isWritablePrimary   // 应为 true
+
+db.getSiblingDB("bank").accounts.insertMany([
+  { _id: "acc-1", balance: 100 },
+  { _id: "acc-2", balance: 0 }
+])
+```
+
+**成功路径：**
+
+```js
+const session = db.getMongo().startSession()
+session.startTransaction()
+try {
+  const accounts = session.getDatabase("bank").accounts
+  accounts.updateOne({ _id: "acc-1", balance: { $gte: 50 } }, { $inc: { balance: -50 } })
+  accounts.updateOne({ _id: "acc-2" }, { $inc: { balance: 50 } })
+  session.commitTransaction()
+  print("committed")
+} catch (e) {
+  session.abortTransaction()
+  print("aborted: " + e.message)
+} finally {
+  session.endSession()
+}
+// 验证：acc-1 余额 50，acc-2 余额 50
+```
+
+**余额不足的失败路径：**
+
+```js
+const session2 = db.getMongo().startSession()
+session2.startTransaction()
+try {
+  const accounts = session2.getDatabase("bank").accounts
+  const r = accounts.updateOne({ _id: "acc-1", balance: { $gte: 1000 } }, { $inc: { balance: -1000 } })
+  if (r.matchedCount === 0) throw new Error("INSUFFICIENT_FUNDS")
+  session2.commitTransaction()
+} catch (e) {
+  session2.abortTransaction()
+  print("aborted: " + e.message)   // INSUFFICIENT_FUNDS
+} finally {
+  session2.endSession()
+}
+// 验证：acc-1 余额仍为 50，没有被扣减——事务回滚生效
+```
+
+**二、事务里用 `db.accounts` 为什么不回滚**
+
+```js
+const session3 = db.getMongo().startSession()
+session3.startTransaction()
+db.accounts.updateOne({ _id: "acc-1" }, { $inc: { balance: -100 } })   // ❌ 不在事务里
+session3.abortTransaction()                                            // 事务里没做任何事
+session3.endSession()
+// 验证：acc-1 的余额已经被扣了 100，abort 没有把它还原
+```
+
+原因：`db.accounts` 是 mongosh 的全局句柄，**没有绑定 session**，它发出的写操作根本不属于当前事务。`abortTransaction` 只能回滚事务内（即用 `session.getDatabase(...)` 句柄执行）的操作。所以事务内所有读写都必须显式走 session 的句柄，这是最隐蔽的坑。
+
+**三、两个会话同时改同一文档，复现 WriteConflict**
+
+会话 A（终端 1）：
+
+```js
+const sA = db.getMongo().startSession()
+sA.startTransaction()
+sA.getDatabase("community").posts.updateOne({ _id: 100 }, { $inc: { "stats.views": 1 } })
+// 此时不要 commit，停在事务里
+```
+
+会话 B（终端 2）：
+
+```js
+const sB = db.getMongo().startSession()
+sB.startTransaction()
+sB.getDatabase("community").posts.updateOne({ _id: 100 }, { $inc: { "stats.views": 1 } })
+// 立刻报错：
+// MongoServerError: WriteConflict error: this operation conflicted
+// with another operation. Please retry your operation or multi-document transaction.
+```
+
+回到会话 A commit，然后 B 用 `withTransaction` 或手动重试即可成功。这验证了 MongoDB 是乐观并发：不等待、直接让后到者失败重试。
+
+**四、不同 writeConcern 的插入耗时对比**
+
+```js
+function timedInsert(label, wc) {
+  const docs = Array.from({ length: 1000 }, (_, i) => ({ i, v: "x".repeat(100) }))
+  const start = Date.now()
+  db.t.insertMany(docs, { writeConcern: wc })
+  print(label + ": " + (Date.now() - start) + " ms")
+}
+
+timedInsert("w:0",       { w: 0 })
+timedInsert("w:1",       { w: 1 })
+timedInsert("w:majority",{ w: "majority" })
+```
+
+单成员复制集上 `majority` 只等自己一个节点，差距不大；在真正的三节点复制集上，`w: 0` 与 `w: "majority"` 的差距可达数倍。要点是理解每个级别对应的确认数量与持久性承诺（见本章 4.1 节阶梯）。
+
+**五、评论事务改写成「通知异步」**
+
+```js
+await session.withTransaction(async () => {
+  const db = client.db("community")
+  const comment = { _id: new ObjectId(), postId, author: {...}, body, likes: 0, createdAt: new Date() }
+
+  await db.collection("comments").insertOne(comment, { session })
+  await db.collection("posts").updateOne(
+    { _id: postId },
+    { $inc: { "stats.comments": 1 }, $push: { topComments: { $each: [...], $sort: { likes: -1 }, $slice: 3 } } },
+    { session }
+  )
+  // 通知移出事务：
+  await db.collection("notifications").insertOne({ ... })   // 不带 session，事务提交后才真正落库
+})
+```
+
+**收益**：事务持有的时间大幅缩短（少一次跨集合写入），写冲突概率降低、吞吐提升；即使通知丢失，核心数据（评论 + 计数）依然强一致。代价是通知可能出现「评论成功但通知没发」的不一致——如果通知允许最终一致（通常可以），这是划算的交换。事务范围越小越好。
+
+**六、不用事务的幂等「点赞」**
+
+```js
+// posts 里维护 likedBy 数组和 stats.likes 计数器
+const res = db.posts.updateOne(
+  { _id: postId },
+  {
+    $addToSet: { likedBy: userId },          // 已存在则不动
+    $inc: { "stats.likes": 1 }
+  }
+)
+
+if (res.modifiedCount === 0) {
+  // 说明 likedBy 里已经有该用户 → 这次是重复点赞，抵消掉刚才的错误计数
+  db.posts.updateOne({ _id: postId }, { $inc: { "stats.likes": -1 } })
+}
+```
+
+原理：`$addToSet` 在元素已存在时 `modifiedCount` 为 0。但注意 `$inc` 和 `$addToSet` 在同一更新里，即使重复，`$inc` 也会执行——所以先用返回的 `modifiedCount` 判断是否重复，重复就补偿 `-1`。更稳妥的写法是**先判断再累加**，两步之间用 upsert 兜底：
+
+```js
+const already = db.posts.countDocuments({ _id: postId, likedBy: userId })
+if (already === 0) {
+  db.posts.updateOne(
+    { _id: postId, likedBy: { $ne: userId } },   // 条件防并发
+    { $push: { likedBy: userId }, $inc: { "stats.likes": 1 } }
+  )
+}
+```
+
+后者把「是否已点赞」写进 filter 条件，配合 `$push` + `$inc` 单文档原子性，即使并发点击也不会重复计数。两种方案都不需要事务。
+</Answer>
 </Callout>
 
 ## 小结

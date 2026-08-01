@@ -168,4 +168,80 @@ zip 与 tar.gz 的实用差异：zip 对每个文件独立压缩，可以快速�
 2. 打包时排除所有 `.log` 文件和 `node_modules` 目录（自己造这些文件），用 tzf 验证排除生效。
 3. 造一个 5 行日志并 gzip，之后在**不解压**的前提下：查看全文、统计行数、grep 出其中一行（zcat 管道或 zgrep）。
 4. 思考题：为什么 100 个相似小文件打成 tar.gz 通常比逐个 zip 后再合并小得多？（提示：压缩窗口跨文件）
+
+<Answer>
+**参考答案：**
+
+**第 1 题：打包、验证清单、解包对比**
+
+```bash
+# 构造三层目录
+mkdir -p proj/src/api proj/src/web proj/docs
+echo 'print(1)' > proj/src/api/main.py
+echo 'hi' > proj/src/web/views.py
+echo 'readme' > proj/docs/README.md
+
+# 打包，文件名带日期
+tar czf proj-$(date +%Y%m%d).tar.gz proj/
+
+# 先 tzf 验证清单
+tar tzf proj-$(date +%Y%m%d).tar.gz
+
+# 解到 /tmp 下并对比
+mkdir -p /tmp/restore
+tar xzf proj-$(date +%Y%m%d).tar.gz -C /tmp/restore
+diff -r proj /tmp/restore/proj   # 无输出 = 完全一致
+```
+
+`diff -r` 递归对比两棵目录树，没有任何输出表示内容、权限之外的结构一致（内容层面无损）。
+
+**第 2 题：排除 .log 和 node_modules**
+
+```bash
+mkdir -p app/node_modules app/src
+echo 'debug' > app/debug.log
+echo 'error' > app/error.log
+echo 'dep' > app/node_modules/dep.js
+echo 'code' > app/src/index.js
+
+tar czf app.tar.gz --exclude='*.log' --exclude='node_modules' app/
+tar tzf app.tar.gz
+# 应只看到 app/src/index.js，.log 与 node_modules 都不在
+```
+
+`--exclude` 可写多个，模式与 `find -name` 同规则；注意排除的是**路径模式**，写成 `--exclude='node_modules'` 可匹配任意深度的同名目录。
+
+**第 3 题：不解压操作 gzip 日志**
+
+```bash
+printf 'INFO ok\nERROR db down\nINFO recovered\n' > app.log
+gzip app.log
+
+zcat app.log.gz                        # 查看全文
+zcat app.log.gz | wc -l                # 统计行数
+zgrep ERROR app.log.gz                 # grep 出一行
+# 若无 zgrep：zcat app.log.gz | grep ERROR
+```
+
+`zcat` 把压缩文件解到 stdout 而不落盘，所以可以任意接管道；`zgrep` 内部就是 zcat + grep。
+
+**第 4 题：tar.gz 为什么比逐个 zip 再合并小**
+
+```bash
+# 演示：100 个相似小文件
+mkdir demo && cd demo
+for i in $(seq 1 100); do echo "same base content line one" > "f$i.txt"; done
+cd ..
+
+# 方式一：tar 流式压缩
+tar czf all.tar.gz demo/
+# 方式二：逐个 gzip 再拼包
+tar cf each.tar demo/*.gz   # 先各自 gzip，再归档
+
+ls -lh all.tar.gz each.tar
+# all.tar.gz 会明显更小
+```
+
+原因：**压缩窗口（压缩算法能回溯的历史范围）可以跨越文件边界**。tar.gz 把 100 个文件当成**一个连续字节流**喂给 gzip，文件之间的重复内容（相同模板、相似头部）也能被利用压缩；而逐个 zip 时每个文件是独立压缩单元，压缩窗口在文件边界被截断，跨文件的重复无法利用，压缩率自然更低。这也是 zip"可以快速抽取单个文件"和"整体体积更大"是一体两面的原因。
+</Answer>
 </Callout>

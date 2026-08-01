@@ -168,4 +168,254 @@ bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
 1. 向 4 分区 topic 分别发送 1000 条有 key（10 个 key）和 1000 条无 key 消息，用 get-offsets 统计各分区消息量，观察两种模式的分布。
 2. 实现一个自定义 Partitioner，把以 "audit-" 开头的 key 全部路由到 0 号分区，其余正常哈希，并写消费者验证。
 3. 把 3 分区扩到 6 分区，继续用同一批 key 生产，验证同一 key 扩容前后落在不同分区。
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · 有 key 与无 key 的分布对比**
+
+```bash
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic dist-key --partitions 4 --replication-factor 1
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic dist-nokey --partitions 4 --replication-factor 1
+
+# A) 1000 条带 key（10 个 key 轮流）
+for i in $(seq 1 1000); do echo "k$((i % 10)):v$i"; done | \
+  bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic dist-key --property parse.key=true --property key.separator=:
+
+# B) 1000 条无 key
+for i in $(seq 1 1000); do echo "v$i"; done | \
+  bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic dist-nokey
+
+# 统计各分区消息量（LEO 即条数，因为都是从 0 开始）
+bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic dist-key   --time -1
+bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic dist-nokey --time -1
+```
+
+典型结果：
+
+```text
+有 key（10 个 key 打到 4 个分区）:
+  dist-key:0:300     <- 3 个 key 落这里
+  dist-key:1:200     <- 2 个 key
+  dist-key:2:200     <- 2 个 key
+  dist-key:3:300     <- 3 个 key
+  明显不均匀，且每个分区的量是 100 的整数倍
+
+无 key（粘性分区）:
+  dist-nokey:0:250
+  dist-nokey:1:250
+  dist-nokey:2:250
+  dist-nokey:3:250
+  基本均匀
+```
+
+**要读懂的三件事：**
+
+1. **有 key 时的量一定是 100 的倍数**（每个 key 恰好 100 条）。这直接证明了"同 key 必同分区"——分区消息量只能是若干个完整 key 的和，不会出现某个 key 被拆开。
+
+2. **有 key 时的不均匀是必然的**，不是 bug。10 个 key 哈希到 4 个分区，落点由 `murmur2(key) % 4` 决定，不可能恰好每分区 2.5 个 key。**key 的基数越接近分区数，倾斜越严重**；key 基数远大于分区数时（比如 100 万个 userId 打到 12 个分区），大数定律会让分布趋于均匀。
+
+3. **无 key 时用的是粘性分区（Sticky Partitioner，2.4+）**，不是简单轮询。它的逻辑是"粘住一个分区，直到当前批次发满（`batch.size`）或 `linger.ms` 到期，再换下一个分区"。所以你消费时会看到**连续几十条集中在同一分区**，但长期看各分区总量依然均衡。
+
+   这个设计是为了解决老版本轮询分区器的问题：逐条轮询会让每个分区的批次都攒不满，导致请求数暴增、吞吐大跌。粘性分区让批次饱满，同时用"换分区"保证长期均衡。
+
+**实践启示**：如果监控发现某个分区 LAG 显著高于其他分区，先用这个方法统计各分区消息量，确认是不是热 key 造成的倾斜。
+
+**第 2 题 · 自定义 Partitioner**
+
+```java
+package com.example;
+
+import org.apache.kafka.clients.producer.Partitioner;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.utils.Utils;
+import java.util.List;
+import java.util.Map;
+
+public class AuditPartitioner implements Partitioner {
+
+    private static final int AUDIT_PARTITION = 0;
+    private static final String AUDIT_PREFIX = "audit-";
+
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes, Cluster cluster) {
+        List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
+        int numPartitions = partitions.size();
+
+        // 无 key：交给默认逻辑（这里简化为随机，生产可委托给 DefaultPartitioner）
+        if (keyBytes == null) {
+            return Utils.toPositive(Utils.murmur2(valueBytes)) % numPartitions;
+        }
+
+        String k = (key instanceof String) ? (String) key : new String(keyBytes);
+
+        // 审计消息统一进 0 号分区
+        if (k.startsWith(AUDIT_PREFIX)) {
+            return AUDIT_PARTITION;
+        }
+
+        // 其余按默认哈希，但要避开 0 号分区，防止审计消息被业务消息淹没
+        if (numPartitions > 1) {
+            return 1 + Utils.toPositive(Utils.murmur2(keyBytes)) % (numPartitions - 1);
+        }
+        return 0;
+    }
+
+    @Override
+    public void close() { }
+
+    @Override
+    public void configure(Map<String, ?> configs) { }
+}
+```
+
+启用：
+
+```java
+props.put(ProducerConfig.PARTITIONER_CLASS_CONFIG,
+          "com.example.AuditPartitioner");
+```
+
+验证：
+
+```java
+// 生产端
+try (Producer<String, String> p = new KafkaProducer<>(props)) {
+    p.send(new ProducerRecord<>("custom-part", "audit-login",  "审计1"));
+    p.send(new ProducerRecord<>("custom-part", "audit-delete", "审计2"));
+    p.send(new ProducerRecord<>("custom-part", "user-1001",    "业务1"));
+    p.send(new ProducerRecord<>("custom-part", "user-1002",    "业务2"));
+}
+```
+
+```bash
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic custom-part --from-beginning --max-messages 4 \
+  --property print.key=true --property print.partition=true
+```
+
+```text
+Partition:0  audit-login   审计1     <- 全部进 0 号
+Partition:0  audit-delete  审计2
+Partition:2  user-1001     业务1     <- 哈希到 1..3
+Partition:3  user-1002     业务2
+```
+
+**几个实现要点：**
+
+- **`partition()` 会在每条消息发送时被调用，必须极快且无阻塞**。绝对不要在里面查数据库、调远程接口或加锁——它运行在业务线程上，会直接拖垮整个生产链路。
+- **必须用 `Utils.toPositive()` 包一下哈希值**。`murmur2()` 可能返回负数，直接取模会得到负的分区号并抛异常。
+- `cluster.partitionsForTopic(topic)` 拿到的是**实时分区数**，所以扩分区后无需改代码。但也正因如此，扩分区会改变哈希落点（见第 3 题）。
+- 上面的实现刻意让业务 key 避开 0 号分区。这不是必须的，但在"审计消息量小、业务消息量大"的场景下很有价值——否则审计消息会被业务消息的洪流淹没，消费 0 号分区的审计服务照样要处理海量业务消息。
+
+**这类自定义分区器的典型用途**：
+
+| 场景 | 做法 |
+|---|---|
+| 特定类型消息隔离到专属分区 | 本题的审计场景 |
+| 大客户单独占用分区 | 按客户 ID 白名单映射固定分区 |
+| 热 key 打散 | 对热 key 追加随机后缀分散到多个分区（**牺牲该 key 的顺序**） |
+| 按地理位置就近路由 | key 中解析出机房标识再映射 |
+
+**第 3 题 · 扩分区破坏 key 路由**
+
+```bash
+# 1) 建 3 分区 topic，写入一批 key
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic grow --partitions 3 --replication-factor 1
+
+printf 'k1:before\nk2:before\nk3:before\nk4:before\nk5:before\n' | \
+  bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic grow --property parse.key=true --property key.separator=:
+
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic grow --from-beginning --max-messages 5 \
+  --property print.key=true --property print.partition=true
+```
+
+```text
+Partition:2  k1  before
+Partition:0  k2  before
+Partition:1  k3  before
+Partition:1  k4  before
+Partition:2  k5  before
+```
+
+```bash
+# 2) 扩到 6 分区
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --alter --topic grow --partitions 6
+
+# 3) 用完全相同的 key 再发一批
+printf 'k1:after\nk2:after\nk3:after\nk4:after\nk5:after\n' | \
+  bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic grow --property parse.key=true --property key.separator=:
+
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic grow --from-beginning --max-messages 10 \
+  --property print.key=true --property print.partition=true
+```
+
+```text
+Partition:0  k2  before
+Partition:1  k3  before
+Partition:1  k4  before
+Partition:2  k1  before
+Partition:2  k5  before
+Partition:3  k2  after      <- k2 从 p0 跑到了 p3！
+Partition:4  k3  after      <- k3 从 p1 跑到了 p4！
+Partition:5  k1  after      <- k1 从 p2 跑到了 p5！
+Partition:1  k4  after      <- k4 恰好没变（运气）
+Partition:2  k5  after      <- k5 恰好没变
+```
+
+**原因一目了然**：路由公式是 `hash(key) % 分区数`。`hash(key)` 没变，但除数从 3 变成了 6，余数自然变了。粗略估计，扩分区后约有 `1 - 1/扩容倍数` 比例的 key 会改变落点——3 扩到 6 时约一半的 key 会漂移。
+
+**这为什么是严重问题**：
+
+```text
+时间线（以订单 k2 为例）：
+  T1  订单创建事件  -> p0
+  T2  【扩分区】
+  T3  订单支付事件  -> p3
+  T4  订单完成事件  -> p3
+
+消费端：p0 和 p3 由不同消费者并行处理，没有任何顺序关系
+  => 可能先处理到"支付"，再处理到"创建"
+  => 状态机紊乱、幂等逻辑失效、"订单不存在"报错
+```
+
+Kafka 只保证**分区内**有序，一旦同一实体的消息跨了分区，顺序保证就彻底失效。而且 **Kafka 不会迁移历史数据**——老消息永远留在原分区，这个"骑墙"状态会一直持续到老数据被保留策略清理掉为止。
+
+**依赖 key 顺序的业务，扩分区的正确流程：**
+
+```text
+方案 A：停机窗口（简单，适合能接受短暂停写的场景）
+  1. 停止生产者写入
+  2. 等消费者把所有分区的 LAG 追到 0
+  3. 执行扩分区
+  4. 恢复生产
+  关键：确保"扩分区时刻"之前的消息全部处理完，新旧路由不会时间重叠
+
+方案 B：新建 topic 迁移（无停机，但复杂）
+  1. 建新 topic（目标分区数），如 orders-v2
+  2. 生产端双写 orders 和 orders-v2
+  3. 消费端启动新实例消费 orders-v2，等老 topic 消费完毕
+  4. 下线老 topic 与双写
+```
+
+**其他必须知道的约束：**
+
+- **分区只能增不能减。** `--alter --partitions` 只接受比当前更大的值，写小了会报 `InvalidPartitionsException`。想减少只能新建 topic 迁移。
+- **扩分区会触发消费组 Rebalance**（订阅的分区数变了）。
+- **短期数据倾斜**：新分区从零开始，老分区已有大量数据，消费进度和数据量会不均衡一段时间。
+- **`__consumer_offsets` 等内部 topic 绝对不要扩分区**，会破坏 group 到分区的映射。
+
+**最实际的建议**：**一开始就把分区数留够。** 按 1~2 年后的峰值估算，中小业务 6 或 12 起步（能被 2/3/4/6 整除，方便扩消费者）。分区数多一点的成本只是一些文件句柄和元数据开销，远小于事后扩分区的业务风险。但也别走极端开几百个——小流量配超多分区会让每个批次都攒不满，反而拖高延迟、降低吞吐。
+</Answer>
 </Callout>

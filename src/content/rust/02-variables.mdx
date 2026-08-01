@@ -97,6 +97,58 @@ fn main() {
 
 <Callout type="exercise" title="练习">
 写一个程序：用 `let` 绑定一个字符串 `"42"`，再用 shadowing 把它解析成 `u32`（提示：`"42".parse::<u32>().unwrap()`），最后乘 2 打印。体会类型如何随 shadowing 改变。
+
+<Answer>
+**参考答案：**
+
+```rust
+fn main() {
+    let value = "42";                       // value: &str
+    let value = value.parse::<u32>().unwrap(); // value: u32（新绑定，类型变了）
+    let value = value * 2;                  // value: u32，值为 84
+
+    println!("结果 = {}", value);           // 结果 = 84
+}
+```
+
+**逐行说明：**
+
+1. 第一个 `let value = "42"` 的类型是 `&str`（字符串切片）
+2. 第二个 `let value = ...` 是 **shadowing**：用同名 `let` 创建了一个**全新的绑定**，类型从 `&str` 变成了 `u32`。旧的 `&str` 绑定被遮蔽，后面再也访问不到
+3. `parse::<u32>()` 里的 `::<u32>` 叫 **turbofish** 语法，用来告诉编译器解析成哪种数字类型。它返回 `Result<u32, ParseIntError>`，`unwrap()` 取出成功值（失败则 panic）
+4. 第三次 shadowing 做乘法，类型仍是 `u32`
+
+**为什么 `mut` 做不到这件事？**
+
+```rust
+fn main() {
+    let mut value = "42";
+    // value = value.parse::<u32>().unwrap();
+    // 编译错误：mismatched types
+    //   expected `&str`, found `u32`
+}
+```
+
+`mut` 只允许改**值**，绑定的**类型**在声明时就已经固定了。而 shadowing 是重新声明一个变量，类型可以完全不同——这正是它在「读入字符串 → 解析成数字」这类场景中特别好用的原因。
+
+**更稳健的写法（不 unwrap，优雅处理解析失败）：**
+
+```rust
+fn main() {
+    let value = "42";
+    match value.parse::<u32>() {
+        Ok(n) => println!("结果 = {}", n * 2),
+        Err(e) => println!("解析失败：{}", e),
+    }
+}
+```
+
+也可以用类型标注代替 turbofish，效果完全相同：
+
+```rust
+let value: u32 = "42".parse().unwrap();
+```
+</Answer>
 </Callout>
 
 ## 小结

@@ -96,6 +96,137 @@ struct Config { name: String }
 
 <Callout type="exercise" title="练习">
 写一个声明宏 `hashmap!` 接受 `k => v, ...` 形式（提示：`$( $k:expr => $v:expr ),*`），展开成 `HashMap::from([...])`）。在 `main` 里构造一个字符串到整数的映射并打印。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::collections::HashMap;
+
+macro_rules! hashmap {
+    // 匹配 k => v 逗号分隔的列表，末尾允许多余逗号
+    ( $( $k:expr => $v:expr ),* $(,)? ) => {
+        HashMap::from([
+            $( ($k, $v), )*
+        ])
+    };
+}
+
+fn main() {
+    let scores = hashmap! {
+        "alice" => 95,
+        "bob"   => 87,
+        "carol" => 92,
+    };
+
+    // HashMap 遍历顺序不固定，排序后输出保证结果稳定
+    let mut pairs: Vec<_> = scores.iter().collect();
+    pairs.sort();
+    for (name, score) in pairs {
+        println!("{}: {}", name, score);
+    }
+
+    println!("总人数 = {}", scores.len());
+    println!("alice 的分数 = {:?}", scores.get("alice"));
+
+    // 空 map 也能工作（需要标注类型，因为推断不出来）
+    let empty: HashMap<String, i32> = hashmap! {};
+    println!("空 map 长度 = {}", empty.len());
+}
+```
+
+**输出：**
+
+```text
+alice: 95
+bob: 87
+carol: 92
+总人数 = 3
+alice 的分数 = Some(95)
+空 map 长度 = 0
+```
+
+**宏语法拆解：**
+
+- **`$k:expr`**：捕获一个表达式，命名为 `k`。`expr` 是**片段说明符（fragment specifier）**，其他常用的还有 `ident`（标识符）、`ty`（类型）、`literal`（字面量）、`block`、`stmt`、`pat`（模式）
+- **`$( ... ),*`**：重复零次或多次，**用逗号分隔**。类似的还有 `$( ... );*`（分号分隔）、`$( ... ),+`（至少一次）、`$( ... )?`（零次或一次）
+- **`$(,)?`**：允许**末尾多余的逗号**。这是个体贴的细节——Rust 的 `vec!`、`println!` 都支持，能让多行写法在增删行时不用调整逗号
+- **展开体里的 `$( ($k, $v), )*`**：对每一组捕获，生成一个 `(k, v)` 元组。注意这里逗号写在 `)` **里面**，这样最后一项后面也会有逗号，数组字面量完全接受
+
+**为什么调用时能用 `hashmap! { ... }` 花括号？**
+
+宏调用的三种括号 `()`、`[]`、`{}` 是**完全等价**的，随便选。惯例是：
+
+- `vec![...]` 用方括号（像数组）
+- `println!(...)` 用圆括号（像函数）
+- 构造映射之类的用花括号（像结构体字面量）
+
+**不依赖 `HashMap::from` 的版本（兼容更老的 Rust）**
+
+`HashMap::from` 是 Rust 1.56 才稳定的。更传统的写法是逐个 insert：
+
+```rust
+macro_rules! hashmap {
+    ( $( $k:expr => $v:expr ),* $(,)? ) => {{
+        let mut map = HashMap::new();
+        $( map.insert($k, $v); )*
+        map
+    }};
+}
+```
+
+注意**双层花括号 `{{ }}`**：外层是宏展开体的定界符，内层是真正生成的 Rust **块表达式**。块的最后一个表达式 `map`（无分号）就是整个宏的求值结果。少写一层的话，展开出来就是多条语句而不是一个表达式，没法赋值给变量。
+
+**顺带一提：`HashMap::from` 已经很好用了**
+
+其实标准库自带的写法已经足够简洁，所以这个宏的实际价值主要在于练习：
+
+```rust
+let scores = HashMap::from([
+    ("alice", 95),
+    ("bob", 87),
+]);
+```
+
+宏的优势在于语法更贴近其他语言的字面量写法（`k => v`），以及可以在展开时做额外处理。比如让它自动把 `&str` 键转成 `String`：
+
+```rust
+macro_rules! string_map {
+    ( $( $k:expr => $v:expr ),* $(,)? ) => {{
+        let mut map = std::collections::HashMap::new();
+        $( map.insert($k.to_string(), $v); )*
+        map
+    }};
+}
+
+fn main() {
+    let m = string_map! { "a" => 1, "b" => 2 };
+    // 键的类型是 String，不是 &str
+    println!("{:?}", m.get("a"));
+}
+```
+
+**导出宏给别人用：`#[macro_export]`**
+
+`macro_rules!` 定义的宏遵循**文本顺序**作用域——必须先定义后使用，这和函数不同。想在整个 crate 或其他 crate 里用，要加属性：
+
+```rust
+#[macro_export]
+macro_rules! hashmap { /* ... */ }
+```
+
+导出后，其他 crate 通过 `use my_crate::hashmap;` 引入。注意导出的宏内部应该用**完全限定路径**（如 `std::collections::HashMap`），否则在调用方作用域里可能找不到对应的类型。
+
+**调试宏展开的技巧**
+
+宏出错时报错信息往往很难读。用 `cargo expand`（需先 `cargo install cargo-expand`）可以看到展开后的真实代码：
+
+```bash
+cargo expand --bin my_program
+```
+
+这是排查宏问题最有效的手段。
+</Answer>
 </Callout>
 
 ## 小结

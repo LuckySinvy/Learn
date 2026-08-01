@@ -173,4 +173,45 @@ controlled shutdown（默认开启）会在停止前把该 broker 上的 leader 
 1. 给本地集群挂上 JMX Exporter，用 Prometheus 抓取并在 Grafana 画出 BytesInPerSec 曲线，然后跑 perf-test 观察曲线变化。
 2. 部署 kafka-exporter，制造消费积压（停掉消费者灌数据），验证 kafka_consumergroup_lag 指标与告警规则。
 3. 在三节点集群上演练一次完整滚动重启，全程观察 UnderReplicatedPartitions 的起落，并对比 kill -9 一台 broker 时客户端报错的差异。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：JMX Exporter + Prometheus + Grafana**
+
+在 broker 启动参数加 JMX Exporter（Java agent 方式）：
+
+```bash
+export KAFKA_OPTS="-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent.jar=7071:/opt/jmx_exporter/kafka.yml"
+```
+
+`kafka.yml` 里开启 `kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec` 等 bean。Prometheus `scrape_configs` 加 `targets: ['broker1:7071']`，Grafana 用 PromQL `rate(kafka_server_brokertopicmetrics_bytesin_total[1m])` 画曲线。跑 `kafka-producer-perf-test` 灌数据时，曲线应明显抬升；停灌后回落——这证明采集链路打通，且能直观看到「流入速率」这一核心指标。
+
+**第 2 题：kafka-exporter 与 Lag 告警**
+
+kafka-exporter 暴露 `kafka_consumergroup_lag{topic,partition,consumergroup}`。制造积压：
+
+```bash
+# 让某消费组停掉，用 perf-test 灌 100 万条
+kafka-producer-perf-test --topic lag-test --num-records 1000000 \
+  --record-size 1024 --throughput -1 --producer-props bootstrap.servers=localhost:9092
+```
+
+此时 `kafka_consumergroup_lag` 持续攀升。Grafana 告警规则示例（PromQL）：
+
+```
+kafka_consumergroup_lag{consumergroup="my-group"} > 50000
+```
+
+持续 N 分钟触发。注意：按**趋势/阈值**告警比绝对零值更有意义（突发积压正常，持续不降才异常）。
+
+**第 3 题：滚动重启 + UnderReplicatedPartitions**
+
+三节点滚动重启步骤（每台）：确认 `UnderReplicatedPartitions=0` → 优雅停止（controlled shutdown 自动转移 leader）→ 等 ISR 恢复 → 启下一台。
+
+- 优雅停止时：该 broker 上的分区 leader 被转移，副本短暂进入「under-replicated」，`UnderReplicatedPartitions` 短暂 >0，待存活副本追上 ISR 后回到 0。**曲线呈锯齿状起落，但能自愈**。
+- `kill -9` 一台：该 broker 瞬间失联，所有以它为 leader/副本的分区立刻 under-replicated，客户端若正连它则会报 `NetworkException` / `NotLeaderOrFollowerException`（瞬时，重试或等 leader 选举后恢复）。对比优雅停止：优雅停止客户端几乎无感，kill -9 则是硬故障切换，错误更明显、ISR 恢复更被动。
+
+演练价值：验证「停一台不影响整体可用」与「监控能及时暴露 under-replicated」。
+</Answer>
 </Callout>

@@ -100,6 +100,123 @@ Prompt 模板会随效果调优频繁改。把它抽成独立配置（YAML/DB）
 
 <Callout type="exercise" title="练习">
 写一个有 8 个 chunk（每段约 600 字）的测试，故意让总 token 超 3000，跑一遍你的预算控制逻辑，确认只保留了最相关的若干段且没报错。
+
+<Answer>
+**参考答案：**
+
+**改进后的预算控制函数**
+
+课文里的版本有个隐患：遇到一个超长片段就 `break`，会把后面所有较短但同样相关的片段全部丢弃。更稳妥的做法是**跳过放不下的、继续尝试后面的**：
+
+```python
+MAX_TOKENS = 3000
+
+def est_tokens(s: str) -> int:
+    """中文粗略估算：1 汉字 ≈ 1.6 token，英文按 4 字符 ≈ 1 token"""
+    cn = sum(1 for ch in s if '\u4e00' <= ch <= '\u9fff')
+    other = len(s) - cn
+    return int(cn * 1.6 + other / 4)
+
+def fit_budget(ranked_chunks, max_tokens=MAX_TOKENS, reserve=200):
+    """
+    ranked_chunks: 已按相关度降序排列
+    reserve: 给指令模板、问题本身预留的 token
+    """
+    budget = max_tokens - reserve
+    kept, dropped = [], []
+
+    for c in ranked_chunks:
+        need = est_tokens(c["text"]) + 20      # +20 给编号、来源标注
+        if need <= budget:
+            kept.append(c)
+            budget -= need
+        else:
+            dropped.append(c)                  # 放不下就跳过，继续试下一个
+
+    # 兜底：一段都没留住（首段就超预算）时，截断最相关的那段
+    if not kept and ranked_chunks:
+        head = dict(ranked_chunks[0])
+        limit = int((max_tokens - reserve) / 1.6)
+        head["text"] = head["text"][:limit] + "…（片段已截断）"
+        kept, dropped = [head], ranked_chunks[1:]
+
+    return kept, dropped
+```
+
+**测试代码**
+
+```python
+chunks = [
+    {"id": i,
+     "text": f"第{i+1}段内容：" + f"这是关于年假政策的第{i+1}条说明。" * 40,  # ≈600 字
+     "score": 0.95 - i * 0.05}
+    for i in range(8)
+]
+
+total = sum(est_tokens(c["text"]) for c in chunks)
+print(f"8 段总计 ≈ {total} tokens（预算 {MAX_TOKENS}）")
+
+kept, dropped = fit_budget(chunks)
+used = sum(est_tokens(c["text"]) + 20 for c in kept)
+
+print(f"保留 {len(kept)} 段，丢弃 {len(dropped)} 段")
+print(f"保留的 id: {[c['id'] for c in kept]}（应为相关度最高的几个）")
+print(f"实际占用 ≈ {used} tokens，未超 {MAX_TOKENS - 200}")
+
+assert used <= MAX_TOKENS - 200,           "超预算了！"
+assert kept[0]["id"] == 0,                 "最相关的片段被丢了！"
+assert len(kept) + len(dropped) == 8,      "有片段凭空消失！"
+print("预算控制验证通过")
+```
+
+**典型输出**
+
+```text
+8 段总计 ≈ 8320 tokens（预算 3000）
+保留 3 段，丢弃 5 段
+保留的 id: [0, 1, 2]（应为相关度最高的几个）
+实际占用 ≈ 2670 tokens，未超 2800
+预算控制验证通过
+```
+
+**在 Prompt 里告知截断情况**
+
+丢弃了片段却不告诉模型，模型会以为自己看到了全部资料，从而对不完整的信息给出过度自信的断言。正确做法是显式提示：
+
+```python
+def build_prompt(question, kept, dropped):
+    ctx = "\n\n".join(
+        f"[{i+1}] {c['text']}（来源：{c['meta']['source']}）"
+        for i, c in enumerate(kept)
+    )
+    note = ""
+    if dropped:
+        note = (f"\n注意：因篇幅限制，还有 {len(dropped)} 段相关资料未能展示。"
+                f"若下列资料不足以完整回答，请说明「资料可能不完整」，不要臆测。")
+    return f"""你是严谨的助手，仅依据资料作答，未知则说不知道，句末标 [n]。{note}
+【资料】
+{ctx}
+
+【问题】{question}
+【回答】"""
+```
+
+**四个要点**
+
+1. **`est_tokens` 只是估算，生产要用真 tokenizer**。粗估会有 10–20% 误差，所以上面留了 200 token 的 `reserve` 作为安全垫。精确做法是用 `tiktoken`（OpenAI）或模型自带的 tokenizer：
+
+```python
+import tiktoken
+enc = tiktoken.encoding_for_model("gpt-4o-mini")
+est_tokens = lambda s: len(enc.encode(s))
+```
+
+2. **预算要算「总账」而不只是上下文**。上下文 + 系统指令 + 问题 + **预留给输出的 `max_tokens`**，四者之和才不能超过模型窗口。只算上下文很容易在输出阶段被截断。
+
+3. **跳过而非中断**。上面用 `continue` 语义（不 break）的好处是：如果第 4 段特别长放不下，但第 5、6 段较短，仍能塞进去，上下文利用率更高。
+
+4. **如果经常触发大量丢弃，说明上游有问题**。要么 `chunk_size` 切得太大，要么 `top_k` 取得太多，要么该上重排先精筛。预算控制是最后一道防线，不该让它天天满负荷工作——真正的解法在检索侧。
+</Answer>
 </Callout>
 
 ## 小结

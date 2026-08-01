@@ -200,4 +200,50 @@ cat /etc/os-release`}
 2. 创建一个隐藏文件 `.secret` 和普通文件 `note.txt`，对比 `ls` 与 `ls -a` 的输出差异。
 3. 用 `ls -l` 和 `ls -lt` 观察排序区别：先 touch 三个文件，再修改其中最早创建的那个（用 `echo x > 文件`），看它是否跳到 `ls -lt` 的最前面。
 4. 运行 `uname -a` 和 `cat /etc/os-release`，说出沙箱容器用的是哪个发行版、内核版本是多少。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：创建三层目录并验证相对路径**
+
+```bash
+mkdir -p a/b/c
+cd a/b/c
+pwd          # 输出 /work/a/b/c，确认当前所在位置
+cd ../..     # 相对路径：先上两级，回到 /work/a
+pwd          # 输出 /work/a
+```
+
+`mkdir -p` 会自动创建缺失的中间目录；`cd ../..` 表示"先到上一级，再往上走一级"，`..` 永远指向当前目录的上级目录。
+
+**第 2 题：隐藏文件与 `ls -a`**
+
+```bash
+touch .secret note.txt
+ls            # 只显示 note.txt
+ls -a         # 同时显示 .secret（以及 . 和 ..）
+```
+
+以 `.` 开头的文件默认被 `ls` 忽略，加上 `-a`（all）才会显示。
+
+**第 3 题：`ls -l` 与 `ls -lt` 的排序差异**
+
+```bash
+touch f1.txt f2.txt f3.txt   # 三个文件，时间几乎相同
+echo x > f1.txt              # 修改 f1，使其时间最新
+ls -l                        # 按名称字典序排列
+ls -lt                       # 按修改时间排序，f1.txt 跳到最前面
+```
+
+`-l` 默认按名称排序；`-t` 表示按修改时间排序，最新的在最前。
+
+**第 4 题：查看发行版与内核版本**
+
+```bash
+uname -a
+cat /etc/os-release
+```
+
+沙箱容器用的是 **Alpine Linux**（`/etc/os-release` 中 `ID=alpine`，第 3 节提到它是容器镜像的主流底座），基础镜像约 5 MB。内核版本以 `uname -a` 输出为准（容器共享宿主内核，具体版本号随沙箱环境而定）。
+</Answer>
 </Callout>

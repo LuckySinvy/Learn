@@ -227,4 +227,143 @@ bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic $T
 1. 创建 4 分区 topic，用带 key 生产写入 20 条消息（5 个不同 key），消费时打印分区号，验证同 key 落同分区。
 2. 用一个固定 group.id 消费 10 条后停止，再用 kafka-consumer-groups 查看该组的 CURRENT-OFFSET 与 LAG。
 3. 把该组 offset 重置到 earliest（先 dry-run 再 execute），重新消费验证消息被重复消费。
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · 验证同 key 落同分区**
+
+```bash
+# 1) 建 4 分区 topic
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic key-demo --partitions 4 --replication-factor 1
+
+# 2) 生成 20 条消息，5 个 key（k1..k5）各 4 条
+for i in $(seq 1 20); do
+  echo "k$(( (i - 1) % 5 + 1 )):msg-$i"
+done | bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic key-demo \
+  --property parse.key=true --property key.separator=:
+
+# 3) 打印分区号消费
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic key-demo --from-beginning --max-messages 20 \
+  --property print.key=true --property print.partition=true \
+  --property key.separator=' | '
+```
+
+输出（分区号可能与下面不同，但**同一个 key 的 4 条一定在同一分区**）：
+
+```text
+Partition:2  k1 | msg-1
+Partition:0  k2 | msg-2
+Partition:3  k3 | msg-3
+Partition:1  k4 | msg-4
+Partition:1  k5 | msg-5
+Partition:2  k1 | msg-6      <- k1 又回到 2
+Partition:0  k2 | msg-7      <- k2 又回到 0
+...
+```
+
+用 `sort | uniq` 可以一眼确认每个 key 只对应一个分区：
+
+```bash
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic key-demo --from-beginning --max-messages 20 \
+  --property print.key=true --property print.partition=true 2>/dev/null \
+  | awk '{print $1, $2}' | sort -u
+```
+
+**原理**：默认分区器用 `murmur2(keyBytes) % numPartitions` 计算目标分区，key 相同 → 字节相同 → 哈希相同 → 分区相同。注意 5 个 key 分到 4 个分区必然有碰撞（示例中 k4、k5 同落 p1），这是正常的——保证的是"同 key 同分区"，不是"不同 key 不同分区"。
+
+如果不带 key（`--property parse.key=false`），Kafka 3.x 使用 **Sticky Partitioner**：先粘住一个分区攒满一批再换下一个，所以你会看到连续若干条集中在同一分区，而不是严格轮询。
+
+**第 2 题 · 查看 CURRENT-OFFSET 与 LAG**
+
+```bash
+# 消费 10 条后自动退出（--max-messages 会在退出前提交 offset）
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic key-demo --group demo-group --from-beginning --max-messages 10
+
+# 查看该组状态
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group demo-group
+```
+
+输出：
+
+```text
+GROUP       TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID  HOST  CLIENT-ID
+demo-group  key-demo  0          3               5               2    -            -     -
+demo-group  key-demo  1          3               6               3    -            -     -
+demo-group  key-demo  2          2               5               3    -            -     -
+demo-group  key-demo  3          2               4               2    -            -     -
+```
+
+三列的含义务必分清：
+
+| 列 | 含义 |
+|---|---|
+| `CURRENT-OFFSET` | 该组**已提交**的位点，即"下一条要读的位置" |
+| `LOG-END-OFFSET` | 分区的 LEO，即"最新一条消息的下一个位置"，代表数据总量 |
+| `LAG` | `LOG-END-OFFSET - CURRENT-OFFSET`，即积压条数 |
+
+四个分区的 LAG 加起来正好是 20 − 10 = 10，符合预期。
+
+`CONSUMER-ID / HOST / CLIENT-ID` 显示为 `-`，说明**当前组内没有活跃成员**（消费者已退出），组处于 `Empty` 状态。可以用下面的命令确认：
+
+```bash
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group demo-group --state
+# STATE 列应为 Empty
+```
+
+**第 3 题 · 重置到 earliest 并验证重复消费**
+
+```bash
+# 1) dry-run：不加 --execute 时只打印将要设置成什么，不真正生效
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group demo-group --topic key-demo \
+  --reset-offsets --to-earliest --dry-run
+```
+
+```text
+GROUP       TOPIC     PARTITION  NEW-OFFSET
+demo-group  key-demo  0          0
+demo-group  key-demo  1          0
+demo-group  key-demo  2          0
+demo-group  key-demo  3          0
+```
+
+```bash
+# 2) 确认无误后 execute
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group demo-group --topic key-demo \
+  --reset-offsets --to-earliest --execute
+
+# 3) 再查，LAG 应该回到 20（等于 LOG-END-OFFSET 之和）
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group demo-group
+
+# 4) 用同一个 group 重新消费，20 条全部重放
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic key-demo --group demo-group --max-messages 20
+```
+
+注意第 4 步**没有加 `--from-beginning`** 却依然读到了全部 20 条——因为 `auto.offset.reset` 只在"组没有已提交 offset"时才生效，这里组的 offset 已经被显式重置为 0，消费者直接按提交的位点读。这也说明：**消费起点由已提交 offset 决定，`--from-beginning` 只是首次消费时的兜底策略。**
+
+**三个必须记住的注意事项：**
+
+1. **重置前必须停掉组内所有消费者。** 组里还有活跃成员时执行会直接报错：
+
+   ```text
+   Error: Assignments can only be reset if the group 'demo-group' is inactive,
+   but the current state is Stable.
+   ```
+
+   这是 Kafka 的保护机制——避免重置和正在运行的消费者提交互相覆盖。
+
+2. **永远先 dry-run。** 生产环境重置到 earliest 意味着把几天的数据全部重放一遍，如果下游没有幂等处理，会造成重复扣款、重复发短信这类事故。
+
+3. **排查数据时不要复用业务 group.id。** 用 `kafka-console-consumer` 时如果不指定 `--group`，Kafka 会自动生成一个随机的 `console-consumer-xxxxx` 组，读完即弃、互不干扰；一旦手滑指定成线上服务的 group，你的调试消费会把线上服务的 offset 顶掉，导致线上漏消费。
+</Answer>
 </Callout>

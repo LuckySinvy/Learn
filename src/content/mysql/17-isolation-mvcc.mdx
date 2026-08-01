@@ -171,4 +171,215 @@ STATEMENT 格式记录的是 SQL 语句原文，RC 下语句在主从重放时�
 1. 用两个会话完整复现本章「100 → 还是 100 → UPDATE 后变 89」的实验，并逐步用 ReadView 规则解释每次读到的值。
 2. 把隔离级别切成 RC 重做实验 1，指出哪几步结果变了、为什么。
 3. 设计一个实验证明：RR 下用 `SELECT ... FOR UPDATE` 做范围当前读后，其他会话无法向该范围插入新行（结合第 16 章的临键锁解释）。
+
+<Answer>
+**参考答案：**
+
+**1. RR 下的完整复现与 ReadView 解释**
+
+准备：`UPDATE products SET stock = 100 WHERE id = 1;`，两个会话都确认是 RR。
+
+```sql
+-- 会话 A                                       -- 会话 B
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT stock FROM products WHERE id = 1;   -- ① → 100
+                                                BEGIN;
+                                                UPDATE products SET stock = 90 WHERE id = 1;
+                                                COMMIT;                          -- ②
+SELECT stock FROM products WHERE id = 1;   -- ③ → 100（还是！）
+UPDATE products SET stock = stock - 1
+  WHERE id = 1;                            -- ④
+SELECT stock FROM products WHERE id = 1;   -- ⑤ → 89（不是 99！）
+COMMIT;
+```
+
+**逐步用 ReadView 规则解释：**
+
+假设 A 的事务 ID 是 100，B 的是 101。
+
+**① A 第一次快照读 → 100**
+
+这是 A 事务的**第一次快照读**，此刻生成 ReadView 并在整个事务内**固定复用**（这是 RR 与 RC 唯一的区别）：
+
+```text
+m_ids        = {100}        拍照时活跃的事务（B 还没开始）
+min_trx_id   = 100
+max_trx_id   = 101          下一个将分配的事务 ID
+creator_trx_id = 100
+```
+
+当前行版本的 `trx_id` 是某个很早就提交的事务（比如 50）。判断：`50 < min_trx_id(100)` → **可见**。读到 100。
+
+**② B 修改并提交**
+
+版本链变成：
+
+```text
+最新行 (stock=90, trx_id=101)
+        │ roll_pointer
+        ▼
+undo:  (stock=100, trx_id=50)
+```
+
+**③ A 第二次快照读 → 仍然 100**
+
+**A 复用①生成的那个 ReadView**（RR 的关键）。沿版本链从最新往旧走：
+
+- 第一个版本 `trx_id = 101`：`101 >= max_trx_id(101)` → **不可见**（这是「拍照后才开始的事务」）；
+- 顺着 roll_pointer 走到下一个版本 `trx_id = 50`：`50 < min_trx_id` → **可见**。
+
+于是读到 100。**这就是「可重复读」**——B 提交与否，A 眼里的世界不变。
+
+**④ A 执行 UPDATE → 当前读**
+
+UPDATE 是**当前读**，它**完全不理会 ReadView**，直接读取**最新已提交版本**（stock = 90）并加 X 锁，计算 `90 - 1 = 89` 写回。
+
+**为什么 UPDATE 必须是当前读？** 如果基于快照里的 100 去算，写回 99，就会**覆盖掉 B 已经提交的修改**——B 的更新凭空消失（丢失更新）。数据库绝不能允许这种事。
+
+此时版本链：
+
+```text
+最新行 (stock=89, trx_id=100)   ← trx_id 变成 A 自己了
+        ▼
+undo:  (stock=90,  trx_id=101)
+        ▼
+undo:  (stock=100, trx_id=50)
+```
+
+**⑤ A 第三次快照读 → 89**
+
+仍然复用老 ReadView，但这次第一个版本的 `trx_id = 100` **就是 A 自己**：
+
+```text
+trx_id == creator_trx_id → 可见（自己改的自己当然看得见）
+```
+
+于是读到 89。
+
+**核心结论**：**「可重复读」只对快照读成立，当前读永远面向最新数据。** 一旦事务内做了当前读，修改后的行 trx_id 变成自己，后续快照读就会「见鬼」地看到这个新值——快照被自己**穿透**了。这个例子吃透，MVCC 就毕业了。
+
+**2. 切到 RC 重做，哪几步变了**
+
+```sql
+-- 会话 A
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+BEGIN;
+SELECT stock FROM products WHERE id = 1;   -- ① → 100
+                                                -- B: UPDATE 到 90 并 COMMIT   ②
+SELECT stock FROM products WHERE id = 1;   -- ③ → 90 ★变了！
+UPDATE products SET stock = stock - 1 WHERE id = 1;   -- ④
+SELECT stock FROM products WHERE id = 1;   -- ⑤ → 89
+COMMIT;
+```
+
+**只有第 ③ 步变了：从 100 变成 90。**
+
+原因就是那一句话的区别：**RC 在每条 SELECT 语句执行时都重新生成一个新的 ReadView**，而 RR 只在事务第一次快照读时生成一次。
+
+③ 处 RC 新生成的 ReadView：
+
+```text
+m_ids        = {100}      B 已提交，不在活跃列表里
+min_trx_id   = 100
+max_trx_id   = 102
+```
+
+判断最新版本 `trx_id = 101`：不在 m_ids 里，且 `min_trx_id <= 101 < max_trx_id` → **可见**。所以读到 90。
+
+对比一览：
+
+| 步骤 | RR | RC | 说明 |
+|---|---|---|---|
+| ① 首次快照读 | 100 | 100 | 相同 |
+| ③ 二次快照读 | **100** | **90** | ★唯一差异：RR 复用旧 ReadView，RC 重新拍照 |
+| ④ UPDATE（当前读） | 基于 90 | 基于 90 | **相同**——当前读与隔离级别无关 |
+| ⑤ UPDATE 后快照读 | 89 | 89 | 相同（都是读到自己改的版本） |
+
+**这就是「不可重复读」的定义**：RC 下同一事务内两次读同一行得到不同结果。RC 用「牺牲可重复读」换来了「总能看到最新已提交数据」和更少的锁冲突。
+
+有意思的是 ⑤ 的结果两者一样（都是 89），但**推导路径不同**：RR 是「快照被自己的修改穿透」，RC 是「本来就该看到最新的」。
+
+**3. 证明 RR 下 FOR UPDATE 范围锁能阻止插入**
+
+```sql
+-- 会话 A（RR）
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT * FROM products WHERE id BETWEEN 5 AND 15 FOR UPDATE;
+-- 假设表里现有 id = 5, 6（以及 20 之后的）
+-- 不提交
+```
+
+```sql
+-- 会话 B
+INSERT INTO products (id, category_id, name, price, stock)
+  VALUES (7, 2, 'NewItem', 99.00, 10);
+-- 挂起！最终报 ERROR 1205 Lock wait timeout exceeded
+```
+
+```sql
+-- 会话 B 试试范围外的
+INSERT INTO products (id, category_id, name, price, stock)
+  VALUES (100, 2, 'Outside', 99.00, 10);
+-- 立即成功
+```
+
+**用第 16 章的临键锁解释：**
+
+RR 下 `FOR UPDATE` 的范围当前读，加的不是零散的记录锁，而是一串**临键锁（Next-Key Lock）**——每个临键锁 = 记录锁 + 该记录**前面的间隙**，是左开右闭区间。假设索引上现有值是 `5, 6, 20`，A 锁住的是：
+
+```text
+(-∞, 5]   ← 临键锁（含 5 及它前面的间隙）
+(5, 6]    ← 临键锁
+(6, 20]   ← 临键锁：覆盖了 6 到 20 之间的整个间隙
+```
+
+注意最后一个：为了保证「id 在 15 以内没有新行出现」，InnoDB 必须把 6 到**下一条存在的记录 20** 之间的**整个间隙**锁住。所以 id = 7、10、15 甚至 19 都插不进去，而 id = 100 落在锁定范围之外，可以正常插入。
+
+**间隙锁的唯一目的就是防幻读**：如果不锁间隙，B 插入 id=7 并提交后，A 再执行一次 `SELECT ... FOR UPDATE`（当前读）就会突然多出一行——这就是幻读。锁住间隙后，B 根本插不进来，A 两次当前读的结果必然一致。
+
+在第三个会话观察锁的真实形态：
+
+```sql
+SELECT object_name, index_name, lock_type, lock_mode, lock_status, lock_data
+FROM performance_schema.data_locks
+WHERE object_name = 'products';
+```
+
+```text
+lock_type | lock_mode | lock_status | lock_data
+TABLE     | IX        | GRANTED     | NULL          ← 表级意向排他锁
+RECORD    | X         | GRANTED     | 5             ← 临键锁（X 不带 REC_NOT_GAP）
+RECORD    | X         | GRANTED     | 6
+RECORD    | X         | GRANTED     | 20            ← 锁到了范围外的下一条！
+RECORD    | X,GAP     | WAITING     | 20            ← B 在等这个间隙锁
+```
+
+`lock_mode` 的读法（面试常考）：
+
+- `X` —— 临键锁（记录 + 前置间隙），RR 下的默认单位
+- `X, REC_NOT_GAP` —— 纯记录锁（唯一索引等值命中存在的记录时退化而来）
+- `X, GAP` —— 纯间隙锁（等值查询未命中时退化而来）
+- `X, INSERT_INTENTION` —— 插入意向锁，INSERT 前要先申请，会被间隙锁阻塞
+
+**对照实验：切到 RC**
+
+```sql
+-- 会话 A
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+BEGIN;
+SELECT * FROM products WHERE id BETWEEN 5 AND 15 FOR UPDATE;
+```
+
+```sql
+-- 会话 B
+INSERT INTO products (id, ...) VALUES (7, ...);
+-- 立即成功！
+```
+
+RC 下**间隙锁基本消失**，只锁真实存在的记录（`data_locks` 里全是 `X, REC_NOT_GAP`），所以间隙可以自由插入——代价就是**幻读可能发生**。
+
+这正是第 16 章说的权衡：RR 用间隙锁换防幻读，代价是锁冲突和死锁明显增多；RC 反之。很多互联网公司默认用 RC，同时靠**唯一索引**而不是间隙锁来保证并发下的数据唯一性。
+</Answer>
 </Callout>

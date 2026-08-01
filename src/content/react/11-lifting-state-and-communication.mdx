@@ -352,6 +352,21 @@ DevTools 的组件树能直接查看每个组件的 props 和 hooks 值，选中
 4. 「显示已归档卡片」的开关（Toolbar 切换，Column 需要用）
 5. 详情弹窗打开的卡片 id
 6. 某个 Card 上的「更多操作」下拉菜单是否展开
+
+<Answer>
+**参考答案：**
+
+按「需要读它和改它的组件的最近共同祖先」判断：
+
+1. **每张卡片的标题** —— 放在**对应 `Card` 内部**（或作为 `Card` 的 prop 由上层数据驱动）。只有那一张卡片需要读写它，不该提升到 Board。
+2. **当前正在拖拽的卡片 id** —— 放在 **`Board`**。拖拽会跨越多个 `Column`，需要协调「从哪一列拖出、落到哪一列」，所以放在所有 `Column` 的共同祖先 `Board`。
+3. **Column 的折叠状态** —— 放在**对应 `Column` 内部**。只有它自己和里面的 Card 需要，别人不关心。
+4. **「显示已归档卡片」开关（Toolbar 切换，Column 需要用）** —— 放在 **`App`**。`Toolbar` 和 `Column` 没有更近的共同祖先（一个在 Board 外、一个在 Board 内），只能是 App。这是「需要读改的组件之间最近公共祖先」的直接应用。
+5. **详情弹窗打开的卡片 id** —— 放在 **`App`**。`CardDetailModal` 是 App 的直接子组件，而又可能被任意 `Card` 触发，提升到 App 最干净。
+6. **某个 Card 的「更多操作」下拉展开状态** —— 放在**该 `Card` 内部**。这是纯粹局部的 UI 状态，连兄弟卡片都不需要知道。
+
+一句话总结：**只有 2、4、5 需要向上提升（因为它们被「不相邻的多个组件」共享），其余都属于组件自己的局部状态。**
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：消除矛盾状态">
@@ -360,6 +375,44 @@ DevTools 的组件树能直接查看每个组件的 props 和 hooks 值，选中
 用户报告了一个 bug：偶尔会出现 endDate 早于 startDate 的情况。
 
 重新设计状态结构，让「结束日期早于开始日期」在类型或结构上不可能发生。提示：可以考虑用可辨识联合表示「选择中」和「已完成」两种阶段。
+
+<Answer>
+**参考答案：**
+
+原设计同时持有 `startDate`、`endDate`，二者没有约束关系，所以会出现 `endDate < startDate`。用可辨识联合把状态拆成「选择中」和「已完成」两个阶段：**在「选择中」阶段根本不存在 `endDate` 这个字段**，自然不可能出现 endDate 早于 startDate。
+
+```tsx
+type Range =
+  | { phase: "selecting"; start: Date; hover: Date | null }  // 还没定结束日期
+  | { phase: "complete"; start: Date; end: Date };            // 完成态才同时有 start/end
+
+function reducer(state: Range, action: Action): Range {
+  switch (state.phase) {
+    case "selecting":
+      if (action.type === "hover") return { ...state, hover: action.date };
+      if (action.type === "pickEnd") {
+        // 完成时再保证 end >= start，类型层面 end 一定存在
+        const end = action.date < state.start ? state.start : action.date;
+        return { phase: "complete", start: state.start, end };
+      }
+      return state;
+
+    case "complete":
+      if (action.type === "restart")
+        return { phase: "selecting", start: action.date, hover: null };
+      return state;
+  }
+}
+```
+
+关键收益：
+
+- `phase: "selecting"` 时只有 `start` 和 `hover`，**没有 `endDate` 字段**——「结束早于开始」在结构上无立足之地；
+- 真正要落定 `end` 时，在 reducer 里做一次「兜底修正」（`end < start` 时取 start），这行代码彻底消除了矛盾值；
+- 消费方用 `switch (state.phase)` 区分渲染「选第一个日期中…」和「已选完区间」，类型安全。
+
+对比原来的四个散装 state：可辨识联合把「非法组合」从「靠开发者记着别写错」升级成「类型系统根本不让写」。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：实现可受控组件">
@@ -371,12 +424,120 @@ DevTools 的组件树能直接查看每个组件的 props 和 hooks 值，选中
 - 鼠标悬停时预览（这个状态一定是内部的，为什么？）
 
 写完后思考：如果调用方从「不传 value」变成「传 value」，应该怎么处理？
+
+<Answer>
+**参考答案：**
+
+`hover` 预览为什么一定是内部状态：预览只是「鼠标悬停时的临时视觉反馈」，它既不是业务数据（外部通常不需要持久化一颗星的悬停），也随时在变。如果把它做成受控，每次鼠标移动都触发外部重渲染、还要外部去存，既没必要也损害性能。所以悬停预览是**纯交互态**，放组件内部最合理。
+
+```tsx
+type Props = {
+  value?: number;                       // 传了即受控
+  defaultValue?: number;                // 非受控初始值
+  onChange?: (v: number) => void;
+  max?: number;
+  readOnly?: boolean;
+};
+
+function Rating({ value, defaultValue = 0, onChange, max = 5, readOnly = false }: Props) {
+  const [inner, setInner] = useState(defaultValue);
+  const isControlled = value !== undefined;
+  const display = isControlled ? value : inner;     // 当前展示的分数
+  const [hover, setHover] = useState<number | null>(null);  // 纯内部，预览
+
+  const current = hover ?? display;                  // 有悬停时用悬停值
+
+  function pick(v: number) {
+    if (readOnly) return;
+    if (!isControlled) setInner(v);                 // 非受控才改内部
+    onChange?.(v);                                  // 两种模式都通知
+  }
+
+  return (
+    <div className="rating" onMouseLeave={() => setHover(null)}>
+      {Array.from({ length: max }, (_, i) => i + 1).map((star) => (
+        <span
+          key={star}
+          className={star <= current ? "on" : "off"}
+          onMouseEnter={() => !readOnly && setHover(star)}
+          onClick={() => pick(star)}
+        >
+          ★
+        </span>
+      ))}
+    </div>
+  );
+}
+```
+
+**关于模式中途切换：** 模式由「是否传了 `value`」决定，理论上可以在运行时改变。但要记住「模式不能中途切换」这条原则。处理方式是：在开发模式下（如 `if (process.env.NODE_ENV !== "production")`）检测 `isControlled` 在两次渲染间变了，抛出警告；生产环境则「以当前是否传 `value` 为准」继续工作。组件库（如 Radix、MUI）普遍采用这种「开发期警告 + 运行期跟随当前 props」的策略。绝不提倡在运行时静默来回切换导致行为混乱。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：重构回调透传">
 一个组件树 Page → Section → Group → Field，Field 需要触发四种操作：修改值、删除自己、上移、复制。目前这四个回调从 Page 一路传到 Field。
 
 用两种不同方案重构：一是 useReducer + 传 dispatch，二是 Context。分别写出关键代码，并比较两种方案在「Field 组件用 React.memo 包裹」时的重渲染表现。
+
+<Answer>
+**参考答案：**
+
+**方案一：useReducer + 传 dispatch**
+
+```tsx
+type Action =
+  | { type: "valueChanged"; id: string; value: string }
+  | { type: "deleted"; id: string }
+  | { type: "movedUp"; id: string }
+  | { type: "duplicated"; id: string };
+
+function Page() {
+  const [state, dispatch] = useReducer(formReducer, initial);
+  return (
+    <Section fields={state.fields} dispatch={dispatch} />   // 只传 dispatch
+  );
+}
+// Section → Group 都只是把 dispatch 往下透传，dispatch 引用永远不变
+function Field({ field, dispatch }: { field: FieldData; dispatch: Dispatch<Action> }) {
+  return (
+    <div>
+      <input
+        value={field.value}
+        onChange={(e) => dispatch({ type: "valueChanged", id: field.id, value: e.target.value })}
+      />
+      <button onClick={() => dispatch({ type: "deleted", id: field.id })}>删除</button>
+      <button onClick={() => dispatch({ type: "movedUp", id: field.id })}>上移</button>
+      <button onClick={() => dispatch({ type: "duplicated", id: field.id })}>复制</button>
+    </div>
+  );
+}
+```
+
+**方案二：Context**
+
+```tsx
+const FormDispatchContext = createContext<Dispatch<Action> | null>(null);
+function Page() {
+  const [state, dispatch] = useReducer(formReducer, initial);
+  return (
+    <FormDispatchContext.Provider value={dispatch}>
+      <Section fields={state.fields} />
+    </FormDispatchContext.Provider>
+  );
+}
+function Field({ field }: { field: FieldData }) {
+  const dispatch = useContext(FormDispatchContext)!;   // 直接从 Context 取
+  // 按钮逻辑同方案一，不再需要任何透传 prop
+}
+```
+
+**`React.memo` 下的重渲染表现对比：**
+
+- **方案一（传 dispatch）**：`dispatch` 的引用**永远不变**（React 保证）。即使 `Page` 因为状态变化频繁重渲染，`Field` 收到的 `dispatch` prop 仍是同一个引用，`React.memo` 能据此判断「props 没变」而**跳过重渲染**。`field` 数据变了才会重渲染——粒度完全可控。
+- **方案二（Context）**：`Field` 通过 `useContext` 消费 Context，**Context 消费会绕过 `React.memo`**。只要 `FormDispatchContext`（或更糟：如果 Context 还顺带传了 state）的值一变，所有 `Field` 都会重渲染，`memo` 拦不住。缓解办法是像第 9 章那样把 dispatch 单独拆成不变的 Context（本例 `value={dispatch}` 引用不变，所以实际上本方案也不重渲染），但一旦把 `state` 混进同一个 Context，所有消费者立刻跟着重渲染。
+
+**结论：** 当只需要「改」的能力、且配合 `React.memo` 想精确控制重渲染时，**传 `dispatch` 比 Context 更稳**——引用的不变性让 memo 真正生效；Context 更省事但也更容易「牵一发而动全身」，要靠拆分 Context 来规避。
+</Answer>
 </Callout>
 
 ## 小结

@@ -426,6 +426,19 @@ function App() {
 其中 Memoized 用了 React.memo，Wrapper 内部有自己的 state 但只渲染 children。
 
 点击按钮后，Memoized、Plain、Wrapper、Heavy 分别会不会重渲染？逐个说明理由。
+
+<Answer>
+**参考答案：**
+
+点击按钮触发 `setN(n + 1)`，`n` 变了 → `App` 重新渲染。在此基础上逐个判断：
+
+- **`Memoized`（React.memo）**：**不重渲染**。`App` 重渲染时传给它的只有 `value={text}`，而 `text` 没变（还是 `""`），props 浅比较相等，`memo` 直接跳过。
+- **`Plain`（普通组件）**：**重渲染**。它没被 `memo` 包裹，父组件重渲染会默认带动它重渲染，无论 props 是否变化。
+- **`Wrapper`（内部有 state 但只渲染 children）**：**重渲染**。`Wrapper` 同样没有被 `memo` 包裹，作为 `App` 的子组件，父重渲染它必然跟着重渲染（注意：是「父重渲染」这条规则让它重渲染，与它自己的 state 无关——它的 state 这次并没有被触发）。
+- **`Heavy`（作为 `Wrapper` 的 `children`）**：**不重渲染**。`<Heavy />` 这个元素是在 `App` 里创建的，`App` 重渲染时 `Wrapper` 的 `children` prop 引用没变，React 据此复用整棵子树，`Heavy` 被跳过。`memo` 都没用，靠的是 `children` 引用稳定（第 11 章的 children 传递技巧）。
+
+这个例子正好印证了三点：① `memo` 只对「props 真的没变」有效；② 父重渲染会连累未 memo 的子组件；③ 把不变的子树当 `children` 传入，比 `memo` 更彻底地避免重渲染。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：修复失效的 memo">
@@ -441,18 +454,187 @@ function List({ rows }) {
 }
 ```
 这段代码里 memo 完全没有生效，而且还有一个不属于性能范畴的 bug。找出全部问题并修复。
+
+<Answer>
+**参考答案：**
+
+**问题一（性能）：`config = { dense: true }` 每次渲染都是新对象。**
+`List` 每次渲染都新建字面量，`Item` 收到的 `config` 引用永远不同，`memo` 的浅比较永远不等 → 失效。修复：用 `useMemo` 稳定，或干脆提到组件外做成模块级常量。
+
+**问题二（性能）：`onPick={() => pick(r.id)}` 是内联函数。**
+每次渲染每个 `Item` 拿到不同的函数引用，`memo` 失效。修复：用 `useCallback` 稳定回调。
+
+**问题三（非性能的 bug）：`rows.sort(...)` 是原地排序，会篡改传入的 props `rows`！**
+`Array.prototype.sort` 会修改原数组。这意味着你每次渲染都在改写父组件传进来的 `rows`（React 的 props 应当是只读的），可能污染其它用到同一数组的地方，甚至是收时机的不可预测行为。修复：先拷贝再排序，如 `[...rows].sort(...)` 或 `rows.slice().sort(...)`。
+
+修复后的完整代码：
+
+```tsx
+const DENSE_CONFIG = { dense: true };   // 提到外层，引用永久稳定
+
+const Item = React.memo(function Item({ data, config, onPick }: ItemProps) { /* ... */ });
+
+function List({ rows }: { rows: Row[] }) {
+  const sorted = useMemo(
+    () => [...rows].sort((a, b) => a.n - b.n),   // 拷贝后再排序，不改原数组
+    [rows]
+  );
+  const onPick = useCallback(
+    (id: string) => pick(id),
+    []                                       // pick 若稳定可放空依赖，引用不变
+  );
+  return sorted.map((r) => (
+    <Item key={r.id} data={r} config={DENSE_CONFIG} onPick={onPick} />
+  ));
+}
+```
+
+现在 `config` 引用稳定、`onPick` 引用稳定、`data`（`r`）也没变，新消息到来时旧 `Item` 的 `memo` 才能真正跳过渲染。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：用结构代替 memo">
 一个页面顶部有个每秒更新的时钟，下面是一棵渲染很慢的树。目前时钟的 state 在页面组件里，导致整棵树每秒重渲染一次。
 
 给出两种不加 memo 的解法（提示：一种是状态下沉，一种是 children 传递），并说明各自适用什么情况。
+
+<Answer>
+**参考答案：**
+
+核心思路：让「每秒变的时钟 state」和「渲染很慢的树」不要住在同一个组件里，这样时钟 tick 时慢树根本不会被重新执行。
+
+**解法一：状态下沉（把时钟抽成独立组件）**
+
+```tsx
+function Clock() {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <time>{new Date(now).toLocaleTimeString()}</time>;
+}
+
+function Page() {
+  return (
+    <>
+      <Clock />              {/* 时钟的 state 在这里内部，tick 只重渲染 Clock */}
+      <SlowTree />           {/* 完全不受时钟影响 */}
+    </>
+  );
+}
+```
+
+**适用情况：** 当高频 state 与慢子树可以清晰拆成两个独立、互不嵌套的组件时最自然——时钟和慢树是兄弟关系，各自管自己的 state。
+
+**解法二：children 传递（让容器重渲染，但不波及子树）**
+
+```tsx
+function Page() {
+  return (
+    <ClockContainer>
+      <SlowTree />           {/* 在 Page 里创建，引用稳定 */}
+    </ClockContainer>
+  );
+}
+
+function ClockContainer({ children }: { children: React.ReactNode }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return (
+    <div>
+      <time>{new Date(now).toLocaleTimeString()}</time>
+      {children}             {/* children 引用没变，SlowTree 被跳过 */}
+    </div>
+  );
+}
+```
+
+**适用情况：** 当慢树必须在布局上被「包裹」在时钟容器内部（如时钟在顶部 header、慢树是下面的内容区），而你希望容器整体重渲染时子树仍被复用。适合「容器需要 state、但内容是外部传入的不变量」的场景。
+
+两种解法都**不依赖 `memo`**，通过结构本身就消除了无谓重渲染，比事后加 `memo` 更彻底。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：扩展浅比较">
 给本章 Playground 的 `shallowEqual` 加一个「变化原因」输出：当返回 false 时，打印出是哪个 key 变了、变化前后的值分别是什么。
 
 然后模拟一个真实场景：连续 5 次渲染，其中 style 是内联对象、data 引用稳定、count 递增，观察输出能否准确定位到「style 每次都变」这个问题。
+
+<Answer>
+**参考答案：**
+
+给 `shallowEqual` 在返回 `false` 时记录「哪个 key、旧值 vs 新值」。注意语义：返回 `true` 表示相等（跳过），返回 `false` 表示不相等（要渲染），所以我们在返回 `false` 前把原因打出来。
+
+```tsx
+type Props = Record<string, unknown>;
+
+function shallowEqual(a: Props, b: Props): boolean {
+  if (Object.is(a, b)) return true;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) {
+    console.log("[原因] props 数量变了: " + keysA.length + " -> " + keysB.length);
+    return false;
+  }
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) {
+      console.log("[原因] 缺少 key: " + key);
+      return false;
+    }
+    if (!Object.is(a[key], b[key])) {
+      // 关键：定位到具体哪个 key 变了、前后值是什么
+      console.log(
+        "[原因] key=" + key + " 变了: " +
+        JSON.stringify(a[key]) + " -> " + JSON.stringify(b[key])
+      );
+      return false;
+    }
+  }
+  return true;
+}
+
+// ---- 模拟连续 5 次渲染 ----
+const data = { version: 1 };          // 引用稳定
+let count = 0;
+let last: Props | null = null;
+
+for (let i = 1; i <= 5; i++) {
+  count += 1;
+  const props: Props = {
+    style: { color: "red" },           // 每次新对象
+    data,                              // 引用不变
+    count,                             // 递增
+  };
+  console.log("--- 第 " + i + " 次渲染 ---");
+  if (last !== null && shallowEqual(last, props)) {
+    console.log("跳过渲染");
+  } else {
+    console.log("重新渲染");
+  }
+  last = props;
+}
+```
+
+**预期输出（每次都会打印出 style 这条原因）：**
+
+```text
+--- 第 1 次渲染 ---
+重新渲染
+--- 第 2 次渲染 ---
+[原因] key=style 变了: {"color":"red"} -> {"color":"red"}
+重新渲染
+--- 第 3 次渲染 ---
+[原因] key=style 变了: {"color":"red"} -> {"color":"red"}
+重新渲染
+...（第 4、5 次同理）
+```
+
+**结论：** 即使 `style` 的内容完全相同（都是 `{color:"red"}`），因为每次都是新对象引用，`Object.is` 判定为不等，每次都会打印 `key=style 变了`。这正好把「内联对象让 memo 失效」这个隐蔽问题精准暴露出来——而 `data` 因引用稳定不会被列为原因，`count` 虽然也变但那是业务预期内的变化。这类「变化原因日志」正是 Profiler 的「Record why each component rendered」在底层的原理。
+</Answer>
 </Callout>
 
 ## 小结

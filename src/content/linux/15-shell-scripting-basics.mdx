@@ -223,4 +223,90 @@ echo "exit code = $?"`}
 2. 写脚本接收一个路径参数：参数为空输出用法并 exit 1；是目录则统计里面文件数；是普通文件则输出行数；都不是则报错 exit 2。用不同输入验证各分支的 `$?`。
 3. 用 && 与 || 写一行命令：目录 /tmp/build 存在就删除重建，不存在就直接创建，最后输出 ready（提示：可以组合 rm -rf 与 mkdir -p，思考更简单的等价写法）。
 4. 复现引号事故：创建带空格的文件名，分别用 `rm $F` 和 `rm "$F"` 删除，观察前者的报错并解释拆词过程。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：sysinfo.sh**
+
+```bash
+cat > sysinfo.sh << 'EOF'
+#!/bin/bash
+echo "hostname: $(hostname)"
+echo "kernel: $(uname -r)"
+echo "load1: $(awk '{print $1}' /proc/loadavg)"
+EOF
+chmod +x sysinfo.sh
+./sysinfo.sh
+```
+
+命令替换 `$(...)` 把命令输出装进文本，`awk '{print $1}'` 取 /proc/loadavg 的第一列（1 分钟负载）。
+
+**第 2 题：参数分发脚本**
+
+```bash
+cat > inspect.sh << 'EOF'
+#!/bin/bash
+TARGET=$1
+
+if [ -z "$TARGET" ]; then
+  echo "usage: inspect.sh <path>"
+  exit 1
+fi
+
+if [ -d "$TARGET" ]; then
+  echo "$TARGET 是目录，文件数：$(find "$TARGET" -type f | wc -l)"
+elif [ -f "$TARGET" ]; then
+  echo "$TARGET 是普通文件，行数：$(wc -l < "$TARGET")"
+else
+  echo "错误：$TARGET 不存在"
+  exit 2
+fi
+EOF
+chmod +x inspect.sh
+
+./inspect.sh          # 无参数 → 打印 usage，echo $? 为 1
+./inspect.sh /etc     # 目录 → 输出文件数，$? 为 0
+./inspect.sh sysinfo.sh  # 普通文件 → 输出行数，$? 为 0
+./inspect.sh /nope    # 不存在 → 报错，$? 为 2
+```
+
+要点：`-z "$TARGET"` 判空、`-d`/`-f` 区分目录与文件、不同错误用不同退出码（1 用法错误、2 目标不存在），调用方凭 `$?` 区分失败原因。
+
+**第 3 题：确保目录存在的一行命令**
+
+```bash
+rm -rf /tmp/build && mkdir -p /tmp/build && echo ready
+# 若目录存在：先删掉重建，输出 ready
+# 若不存在：rm 失败（&& 不执行 mkdir 之前的……不对，rm -rf 对不存在路径返回 0）
+```
+
+注意：`rm -rf` 对不存在的路径**不报错、返回 0**，所以上面的写法两个分支都会走到 `mkdir -p && echo ready`。更简单也更稳的等价写法其实是：
+
+```bash
+mkdir -p /tmp/build && echo ready
+```
+
+`mkdir -p` 本身幂等：存在则忽略、不存在则创建，一条命令搞定。这正说明——能用幂等命令（mkdir -p、rm -rf 用于清理）时，就不必绕弯写"存在就删、不存在就建"。
+
+**第 4 题：复现引号事故**
+
+```bash
+touch 'my report.txt'
+F='my report.txt'
+
+rm $F
+# 报错：rm: cannot remove 'my': No such file or directory
+#       rm: cannot remove 'report.txt': No such file or directory
+```
+
+拆词过程：不加引号时，Shell 在把 `$F` 展开成 `my report.txt` 的同时，会**按空格拆成两个词** `my` 和 `report.txt`，所以 rm 收到两个不存在的路径参数，两个都报错，原文件安然无恙。
+
+```bash
+rm "$F"
+# 成功删除：双引号让 `my report.txt` 保持为"一个参数"，空格被保护
+```
+
+这正是"脚本里的变量引用默认写 `"$VAR"`"这条铁律的原因——不加引号，含空格的文件名会被拆词，含 `*` 的内容还会被通配符展开。
+</Answer>
 </Callout>

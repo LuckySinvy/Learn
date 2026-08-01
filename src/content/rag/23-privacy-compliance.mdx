@@ -70,6 +70,142 @@ hits = store.search(
 
 <Callout type="exercise" title="练习">
 为你所在系统的文档分级（公开/内部/机密），给检索查询加上对应 `filter`，并写一条脱敏规则覆盖你业务里最敏感的一类字段。
+
+<Answer>
+**参考答案：**
+
+**第一步：定义密级与用户权限**
+
+```python
+from enum import IntEnum
+
+class Level(IntEnum):
+    PUBLIC   = 0    # 公开：官网 FAQ、产品说明
+    INTERNAL = 1    # 内部：流程规范、部门文档
+    SECRET   = 2    # 机密：薪酬、并购、客户名单
+
+class User:
+    def __init__(self, uid, dept, clearance: Level):
+        self.uid = uid
+        self.dept = dept
+        self.clearance = clearance      # 该用户可访问的最高密级
+```
+
+用 `IntEnum` 而不是字符串，是为了能直接做 `<=` 比较，避免在过滤条件里写一长串 `in ["公开","内部"]`。
+
+**第二步：入库时打标 + 脱敏**
+
+```python
+import re
+
+PATTERNS = [
+    (re.compile(r"(?<!\d)\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
+                r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)"), "[身份证]"),
+    (re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),                  "[手机号]"),
+    (re.compile(r"(?<!\d)\d{16,19}(?!\d)"),                    "[银行卡]"),
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"),                   "[邮箱]"),
+]
+
+def mask(text: str) -> tuple[str, list[str]]:
+    """脱敏并返回命中的敏感类型，用于审计"""
+    hit = []
+    for pat, repl in PATTERNS:
+        text, n = pat.subn(repl, text)
+        if n:
+            hit.append(repl)
+    return text, hit
+
+
+def ingest(chunk_text, meta):
+    clean, sensitive = mask(chunk_text)
+    store.add(
+        vector=embed(clean),                 # 关键：向量也基于脱敏后文本生成
+        payload={
+            "text": clean,
+            "level": int(meta["level"]),
+            "dept": meta["dept"],
+            "source": meta["source"],
+            "has_sensitive": bool(sensitive),
+            "sensitive_types": sensitive,
+        },
+    )
+```
+
+**这里有个极易被忽略的坑：向量必须用脱敏后的文本生成。**
+
+如果先用原文算向量、再存脱敏文本，等于埋了一颗雷——向量里仍然编码着原始身份证号的信息，攻击者可以通过精心构造的查询（比如逐位试探）来判断某个号码是否在库中，这是一种**嵌入反演攻击**。脱敏必须发生在 Embedding **之前**。
+
+正则也要注意用 `(?<!\d)` 和 `(?!\d)` 做边界约束，否则 18 位身份证里的一段会被误判成手机号，或者订单号被当成银行卡。
+
+**第三步：检索时下沉权限过滤**
+
+```python
+from qdrant_client import models
+
+def search(user: User, question: str, k=5):
+    flt = models.Filter(
+        must=[
+            # 条件 1：密级不超过用户权限
+            models.FieldCondition(
+                key="level",
+                range=models.Range(lte=int(user.clearance)),
+            ),
+        ],
+        should=[
+            # 条件 2：本部门文档，或全公司通用文档
+            models.FieldCondition(key="dept",
+                                  match=models.MatchValue(value=user.dept)),
+            models.FieldCondition(key="dept",
+                                  match=models.MatchValue(value="ALL")),
+        ],
+        min_should=models.MinShould(conditions=2, min_count=1),
+    )
+    hits = client.search("kb", embed(question), query_filter=flt, limit=k)
+
+    audit_log(user, question, hits)      # 每次检索都留痕
+    return hits
+```
+
+**第四步：验证权限确实生效**
+
+只测「有权限能看到」不够，**必须测「无权限看不到」**：
+
+```python
+alice = User("u1", "HR",    Level.SECRET)     # HR 主管
+bob   = User("u2", "SALES", Level.PUBLIC)     # 销售新人
+
+q = "公司高管的薪酬结构是怎样的？"
+
+a_hits = search(alice, q)
+b_hits = search(bob, q)
+
+print(f"alice(机密/HR)  召回 {len(a_hits)} 条")
+print(f"bob  (公开/销售) 召回 {len(b_hits)} 条")
+
+# 硬性断言
+assert all(h.payload["level"] <= int(bob.clearance) for h in b_hits), "越权泄露！"
+assert not any(h.payload["level"] == Level.SECRET for h in b_hits), "机密文档泄露给低权限用户！"
+
+# 更重要：验证「无权限时不会硬答」
+ans = generate(q, b_hits)
+assert "薪酬" not in ans or "未找到" in ans, "无资料却编造了答案！"
+print("权限隔离验证通过")
+```
+
+**四条关键原则**
+
+1. **过滤必须在检索层，不能在展示层。** 这是课文强调过但值得再说一遍的：如果先检索全库、再在返回前把机密片段剔掉，那些片段**已经进过 Prompt 了**——LLM 看过了，就可能在答案里泄露其中的信息，哪怕原始片段没有展示给用户。权限必须下沉到向量库的 query filter 里。
+
+2. **零召回要优雅处理，且不能暴露「存在但无权访问」。** bob 查不到薪酬资料时，正确的回复是「未找到相关资料」，**而不是**「该内容需要更高权限」——后者本身就泄露了「公司确实有这份文档」这一信息。在高敏感场景下，这种存在性泄露也是合规问题。
+
+3. **脱敏和权限是两道独立的防线，缺一不可。** 脱敏防的是「内容本身泄露」（哪怕有权限的人也不该看到完整身份证号）；权限防的是「越权获取」（无关人员拿不到这份文档）。只做一个都不够：只脱敏则销售能看到 HR 全部政策；只做权限则 HR 内部人员能看到所有员工的身份证号。
+
+4. **审计日志本身也要脱敏。** `audit_log` 里记录用户问题时，用户可能在提问中输入了自己的身份证号。日志同样要过一遍 `mask()`，否则合规审计的日志反而成了新的泄露点——这是实践中非常常见的疏漏。
+
+**补充：脱敏可以做成可逆的**
+
+如果业务需要在回答里展示部分信息（如「尾号 1234 的银行卡」），可以用 token 化替代直接抹除：把 `6222021234567890` 替换成 `[CARD_a3f2]`，映射关系存在独立的加密库里，生成完答案后再按用户权限决定是否还原成脱敏展示形式（`****7890`）。这样既保证向量库和 LLM 都接触不到原始数据，又不损失可用性。
+</Answer>
 </Callout>
 
 ## 小结

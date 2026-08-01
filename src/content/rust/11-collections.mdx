@@ -115,6 +115,132 @@ fn main() {
 
 <Callout type="exercise" title="练习">
 用 `Vec<i32>` 存一组数，计算平均值；再用 `HashMap<String, u32>` 统计一段文本中各单词出现次数（用 `entry().or_insert(0)` 累加）。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::collections::HashMap;
+
+fn main() {
+    // ===== 第一部分：Vec 求平均值 =====
+    let numbers: Vec<i32> = vec![88, 92, 75, 61, 100, 84];
+
+    let sum: i32 = numbers.iter().sum();
+    let avg = sum as f64 / numbers.len() as f64;
+
+    println!("数据：{:?}", numbers);
+    println!("总和 = {}，平均值 = {:.2}", sum, avg);
+
+    // 顺带求最大最小值（返回 Option，因为 Vec 可能为空）
+    println!("最大 = {:?}，最小 = {:?}", numbers.iter().max(), numbers.iter().min());
+
+    println!();
+
+    // ===== 第二部分：HashMap 统计词频 =====
+    let text = "the quick brown fox jumps over the lazy dog the fox";
+    let mut counts: HashMap<String, u32> = HashMap::new();
+
+    for word in text.split_whitespace() {
+        // entry API：不存在则插入 0，然后无论如何都 +1
+        let counter = counts.entry(word.to_string()).or_insert(0);
+        *counter += 1;
+    }
+
+    // HashMap 遍历顺序不固定，排序后输出保证结果稳定
+    let mut pairs: Vec<_> = counts.iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));  // 按次数降序，同次数按字母升序
+
+    println!("词频统计：");
+    for (word, count) in pairs {
+        println!("  {:<6} {}", word, count);
+    }
+}
+```
+
+**输出：**
+
+```text
+数据：[88, 92, 75, 61, 100, 84]
+总和 = 500，平均值 = 83.33
+最大 = Some(100)，最小 = Some(61)
+
+词频统计：
+  the    3
+  fox    2
+  brown  1
+  dog    1
+  jumps  1
+  lazy   1
+  over   1
+  quick  1
+```
+
+**关键点解析：**
+
+- **`sum as f64 / numbers.len() as f64`**：Rust 不做隐式数值转换。`sum` 是 `i32`、`len()` 是 `usize`，两者直接相除会得到**整数除法**（结果 83 而非 83.33），必须先 `as f64`
+- **`entry().or_insert(0)` 返回的是 `&mut u32`**：所以要用 `*counter += 1` 解引用后再累加。这是最容易写错的地方
+- **为什么用 `word.to_string()`**：`HashMap<String, u32>` 的键类型是 `String`（拥有所有权），而 `split_whitespace()` 产出的是 `&str`（借用）。必须转换成拥有所有权的 `String` 存进去，否则 HashMap 的生命周期会被绑死在 `text` 上
+- **`entry` 只查一次哈希**：比「先 `get` 判断、再 `insert`」快，而且不会有借用冲突
+
+**更简洁的 entry 写法：**
+
+```rust
+for word in text.split_whitespace() {
+    *counts.entry(word.to_string()).or_insert(0) += 1;
+}
+```
+
+或用 `or_default()`（对数字类型默认值就是 0）：
+
+```rust
+*counts.entry(word.to_string()).or_default() += 1;
+```
+
+**处理空 Vec 的健壮版本：**
+
+```rust
+fn average(nums: &[i32]) -> Option<f64> {
+    if nums.is_empty() {
+        return None;   // 空集合没有平均值，别返回 NaN
+    }
+    let sum: i32 = nums.iter().sum();
+    Some(sum as f64 / nums.len() as f64)
+}
+
+fn main() {
+    match average(&[88, 92, 75]) {
+        Some(a) => println!("平均值 = {:.2}", a),
+        None => println!("没有数据"),
+    }
+    println!("{:?}", average(&[]));   // None
+}
+```
+
+**大小写与标点的处理：** 真实文本统计通常还要归一化，否则 `"The"` 和 `"the"` 会被算成两个词：
+
+```rust
+for word in text.split_whitespace() {
+    let key: String = word
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    if !key.is_empty() {
+        *counts.entry(key).or_insert(0) += 1;
+    }
+}
+```
+
+**如果不想要键的所有权：** 可以用 `HashMap<&str, u32>`，省掉每个词的堆分配，但代价是这个 map 不能活得比 `text` 久：
+
+```rust
+let mut counts: HashMap<&str, u32> = HashMap::new();
+for word in text.split_whitespace() {
+    *counts.entry(word).or_insert(0) += 1;
+}
+```
+</Answer>
 </Callout>
 
 ## 小结

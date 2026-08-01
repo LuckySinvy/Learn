@@ -211,4 +211,355 @@ Function 随 RDB/AOF 持久化、随主从复制传播、有名字可管理—�
 1. 复现两种事务错误：入队错误导致 EXECABORT，执行错误导致部分成功，体会"不回滚"。
 2. 开两个终端演练 WATCH：终端 A 监视并准备扣减，终端 B 在 A 执行 EXEC 前修改该 key，观察 A 的 EXEC 返回 nil。
 3. 写一个 Lua 脚本实现"限购"：某用户对某商品的购买计数不超过 2，超过返回 0，否则计数加 1 并返回新值（提示：key 形如 buy:uid:sku，记得设 TTL）。
+
+<Answer>
+**参考答案：**
+
+**1. 复现两种事务错误**
+
+**错误类型一：入队错误 → 整个事务被拒绝（EXECABORT）**
+
+```bash
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379> SET k1 "v1"
+QUEUED
+127.0.0.1:6379> SSET k2 "v2"                # 命令名拼错，不存在的命令
+(error) ERR unknown command 'SSET', with args beginning with: 'k2', 'v2',
+127.0.0.1:6379> SET k3 "v3"
+QUEUED
+127.0.0.1:6379> EXEC
+(error) EXECABORT Transaction discarded because of previous errors.
+
+# 验证：一条都没执行
+127.0.0.1:6379> EXISTS k1 k3
+(integer) 0                                  # k1 和 k3 都不存在
+```
+
+另一种入队错误是参数个数不对：
+
+```bash
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379> SET onlykey                 # SET 缺少 value 参数
+(error) ERR wrong number of arguments for 'set' command
+127.0.0.1:6379> EXEC
+(error) EXECABORT Transaction discarded because of previous errors.
+```
+
+**这类错误在"入队阶段"就被发现**：Redis 解析命令名和参数个数时就能判断出问题，于是给事务打上 `CLIENT_DIRTY_EXEC` 标记，`EXEC` 时直接拒绝整个事务。这是唯一一种"全部不执行"的情况。
+
+**错误类型二：执行期错误 → 部分成功，不回滚**
+
+```bash
+127.0.0.1:6379> FLUSHDB
+OK
+127.0.0.1:6379> SET counter 100
+OK
+127.0.0.1:6379> LPUSH mylist "a"
+(integer) 1
+
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379> INCR counter                # 正常
+QUEUED
+127.0.0.1:6379> INCR mylist                 # 对 List 执行 INCR —— 类型错误
+QUEUED
+127.0.0.1:6379> SET after "executed"        # 错误命令之后的命令
+QUEUED
+127.0.0.1:6379> EXEC
+1) (integer) 101                            # 第 1 条成功
+2) (error) WRONGTYPE Operation against a key holding the wrong kind of value
+3) OK                                       # 第 3 条照样成功！
+
+# ---- 验证"不回滚" ----
+127.0.0.1:6379> GET counter
+"101"                                        # 加了就是加了，没有回滚
+127.0.0.1:6379> GET after
+"executed"                                   # 错误后面的命令也执行了
+127.0.0.1:6379> LRANGE mylist 0 -1
+1) "a"                                       # 只有出错的那条没生效
+```
+
+**这是 Redis 事务最反直觉的地方**：`EXEC` 返回的是一个数组，每个元素对应一条命令的结果，出错的位置就是一个 error 对象。事务**不会中断**，也**不会回滚**。
+
+**为什么 Redis 不支持回滚？** 官方的理由是：执行期错误几乎都是**编程错误**（对 List 用 INCR、对字符串用 LPUSH），这类 bug 应该在开发测试阶段就被发现，而不是靠运行时回滚来兜底。支持回滚需要维护 undo log，会显著增加复杂度和性能开销，为了掩盖程序 bug 付出这个代价不划算。
+
+**所以 Redis 事务不是 ACID 事务**：
+
+| ACID 特性 | Redis 事务 |
+|---|---|
+| 原子性（A） | **不满足**——部分成功不回滚 |
+| 一致性（C） | 部分满足——不会产生非法数据结构 |
+| 隔离性（I） | **满足**——单线程串行，事务期间无其他命令插入 |
+| 持久性（D） | 取决于持久化配置，与事务无关 |
+
+它真正提供的价值只有一个：**打包串行执行，中间不会被其他客户端的命令插入**。
+
+**需要真正的原子性怎么办？用 Lua。** Lua 脚本里可以先做类型校验，不满足条件就直接 `return`，一条写命令都不执行：
+
+```bash
+127.0.0.1:6379> EVAL "if redis.call('TYPE', KEYS[1])['ok'] ~= 'string' then return {err='type check failed'} end; return redis.call('INCR', KEYS[1])" 1 mylist
+(error) type check failed
+```
+
+注意 Lua 脚本本身也**不支持回滚**——如果脚本执行到一半出错，前面已执行的写命令同样生效。区别在于 Lua 让你有机会**在写之前做完所有检查**，这是事务做不到的（事务里无法根据前一条命令的结果决定后一条）。
+
+**2. 两个终端演练 WATCH**
+
+```bash
+# ========== 终端 A ==========
+127.0.0.1:6379> SET stock 10
+OK
+127.0.0.1:6379> WATCH stock                 # 开始监视
+OK
+127.0.0.1:6379> GET stock                   # 读取当前值（在 MULTI 之前读！）
+"10"
+# 业务逻辑：库存 10 > 0，可以扣减
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379> DECRBY stock 1
+QUEUED
+127.0.0.1:6379> SET last:buyer "userA"
+QUEUED
+# 先别急着 EXEC，切到终端 B
+
+# ========== 终端 B（在 A 执行 EXEC 之前）==========
+127.0.0.1:6379> SET stock 5                 # 修改被监视的 key
+OK
+
+# ========== 回到终端 A ==========
+127.0.0.1:6379> EXEC
+(nil)                                        # 事务被取消！
+
+# ---- 验证：事务里的命令一条都没执行 ----
+127.0.0.1:6379> GET stock
+"5"                                          # 是 B 设置的 5，不是 4
+127.0.0.1:6379> EXISTS last:buyer
+(integer) 0                                  # 没有被设置
+```
+
+**`EXEC` 返回 `nil` 是 WATCH 失败的信号**，注意和"事务成功但返回空数组"区分开。客户端库通常会把 `nil` 映射成 null / None / nil，业务代码必须显式判断。
+
+**几个重要细节**：
+
+```bash
+# ---- 细节 1：值改回原样也算修改 ----
+# 终端 A
+127.0.0.1:6379> SET x 100
+OK
+127.0.0.1:6379> WATCH x
+OK
+# 终端 B
+127.0.0.1:6379> SET x 200
+OK
+127.0.0.1:6379> SET x 100                   # 又改回 100
+OK
+# 终端 A
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379> INCR x
+QUEUED
+127.0.0.1:6379> EXEC
+(nil)                                        # 依然失败！
+
+# WATCH 检测的是"是否被修改过"（内部靠 dirty 标记），不是"值是否变了"
+
+# ---- 细节 2：EXEC 或 DISCARD 后 WATCH 自动清除 ----
+127.0.0.1:6379> WATCH a b c
+OK
+127.0.0.1:6379> DISCARD                     # 或 EXEC
+OK
+# 此时 a b c 都不再被监视，重试必须重新 WATCH
+
+# ---- 细节 3：UNWATCH 手动取消 ----
+127.0.0.1:6379> WATCH stock
+OK
+127.0.0.1:6379> GET stock
+"0"
+# 发现库存为 0，不需要执行事务了
+127.0.0.1:6379> UNWATCH                     # 及时释放，避免影响后续操作
+OK
+
+# ---- 细节 4：可以一次监视多个 key，任意一个被改都会失败 ----
+127.0.0.1:6379> WATCH stock price coupon
+OK
+```
+
+**完整的重试模式**（伪代码）：
+
+```bash
+# for attempt in 1..maxRetries:
+#     WATCH stock
+#     current = GET stock
+#     if current <= 0:
+#         UNWATCH
+#         return "库存不足"
+#     MULTI
+#     DECRBY stock 1
+#     result = EXEC
+#     if result != nil:
+#         return "成功"
+#     # EXEC 返回 nil，说明有并发修改，退避后重试
+#     sleep(random(1, 10) ms)
+# return "重试次数耗尽"
+```
+
+**WATCH 是乐观锁**：不加锁直接干，提交时检查有没有冲突，有冲突就重试。它的适用条件是**冲突概率低**。
+
+**高冲突场景下 WATCH 会退化**：秒杀时几千个请求抢同一个 `stock` key，几乎每次 `EXEC` 都返回 nil，客户端疯狂重试，网络往返和 CPU 全浪费在重试上，成功率极低。这种场景必须用 Lua——一次往返、服务端原子完成，不存在冲突重试。
+
+**连接池陷阱**（生产事故高发）：
+
+```bash
+# WATCH 的状态绑定在【连接】上，不是绑定在客户端对象上
+#
+# 错误示范（伪代码）：
+#   conn1 = pool.get(); conn1.WATCH("stock"); pool.release(conn1)
+#   conn2 = pool.get(); conn2.MULTI(); conn2.EXEC()   # conn2 上根本没有 WATCH！
+#
+# 结果：WATCH 完全失效，并发保护形同虚设，而且不报错，静默出错
+#
+# 正确做法：从池里取一条连接，WATCH/MULTI/EXEC 全程用同一条，用完再归还
+```
+
+大多数客户端库提供了封装好的 API（Jedis 的 `transaction()`、go-redis 的 `Watch()` 回调、Lettuce 的 `RedisTransactionalCommands`），**务必用官方封装而不是手动拼命令**。
+
+**3. Lua 实现限购**
+
+```bash
+# ---- 脚本内容（格式化后便于阅读）----
+# local key   = KEYS[1]              -- buy:uid:sku
+# local limit = tonumber(ARGV[1])    -- 限购数量
+# local ttl   = tonumber(ARGV[2])    -- 过期秒数
+#
+# local current = tonumber(redis.call('GET', key) or "0")
+# if current >= limit then
+#     return 0                        -- 超过限购，拒绝
+# end
+#
+# local newVal = redis.call('INCR', key)
+# if newVal == 1 then
+#     redis.call('EXPIRE', key, ttl)  -- 首次购买时设置 TTL
+# end
+# return newVal
+
+# ---- 单行版本，可直接粘贴执行 ----
+127.0.0.1:6379> EVAL "local key = KEYS[1] local limit = tonumber(ARGV[1]) local ttl = tonumber(ARGV[2]) local current = tonumber(redis.call('GET', key) or '0') if current >= limit then return 0 end local newVal = redis.call('INCR', key) if newVal == 1 then redis.call('EXPIRE', key, ttl) end return newVal" 1 buy:u1001:sku2001 2 86400
+(integer) 1                                  # 第 1 次购买成功
+
+127.0.0.1:6379> EVAL "..." 1 buy:u1001:sku2001 2 86400
+(integer) 2                                  # 第 2 次购买成功
+
+127.0.0.1:6379> EVAL "..." 1 buy:u1001:sku2001 2 86400
+(integer) 0                                  # 第 3 次：超过限购，返回 0
+
+# ---- 验证状态 ----
+127.0.0.1:6379> GET buy:u1001:sku2001
+"2"                                          # 计数停在 2，没有继续增长
+127.0.0.1:6379> TTL buy:u1001:sku2001
+(integer) 86391                              # TTL 正常设置了
+
+# ---- 不同用户互不影响 ----
+127.0.0.1:6379> EVAL "..." 1 buy:u1002:sku2001 2 86400
+(integer) 1                                  # u1002 的计数独立
+```
+
+**用 EVALSHA 减少网络开销**（生产做法）：
+
+```bash
+# 1. 先加载脚本，拿到 SHA1
+127.0.0.1:6379> SCRIPT LOAD "local key = KEYS[1] local limit = tonumber(ARGV[1]) local ttl = tonumber(ARGV[2]) local current = tonumber(redis.call('GET', key) or '0') if current >= limit then return 0 end local newVal = redis.call('INCR', key) if newVal == 1 then redis.call('EXPIRE', key, ttl) end return newVal"
+"a3f8c2e1b4d5..."
+
+# 2. 之后只传 SHA1，省掉每次传输整个脚本的带宽
+127.0.0.1:6379> EVALSHA a3f8c2e1b4d5... 1 buy:u1003:sku2001 2 86400
+(integer) 1
+
+# 3. 检查脚本是否还在缓存里
+127.0.0.1:6379> SCRIPT EXISTS a3f8c2e1b4d5...
+1) (integer) 1
+```
+
+**EVALSHA 的陷阱**：脚本缓存会因为 `SCRIPT FLUSH`、实例重启、主从切换而丢失，此时 `EVALSHA` 返回 `NOSCRIPT` 错误。标准做法是**捕获 NOSCRIPT 后降级用 EVAL 重新执行并重新缓存**——好在主流客户端库（Jedis、Lettuce、go-redis、redis-py）都内置了这个逻辑，直接用它们的 `Script` 封装即可。
+
+**为什么必须用 Lua 而不是"GET + 判断 + INCR"三步？**
+
+```bash
+# 错误做法的竞态（限购 2 件）：
+#   时刻 T1：请求 A  GET buy:u1001:sku2001 → 1
+#   时刻 T1：请求 B  GET buy:u1001:sku2001 → 1     （同时读到 1）
+#   时刻 T2：请求 A  判断 1 < 2，INCR → 2          （通过）
+#   时刻 T2：请求 B  判断 1 < 2，INCR → 3          （也通过！）
+#   结果：用户买到了 3 件，超卖
+```
+
+Lua 脚本在服务端**原子执行**——脚本运行期间不会有任何其他命令插入，"读取 → 判断 → 写入"三步是一个整体，从根本上消除了竞态。同时它把 3 次网络往返压缩成 1 次，延迟也更低。
+
+**Lua 使用的四条铁律**：
+
+1. **key 必须通过 KEYS 传入，不能在脚本里硬编码或拼接**
+
+```bash
+# 错误：Cluster 模式下 Redis 无法提前知道脚本会访问哪些 key，
+#       路由到的节点可能根本没有这个 key
+# EVAL "return redis.call('GET', 'buy:u1001:sku2001')" 0
+
+# 正确
+# EVAL "return redis.call('GET', KEYS[1])" 1 buy:u1001:sku2001
+```
+
+Cluster 会根据 `KEYS` 里第一个 key 计算 slot 来路由。如果脚本操作多个 key，它们**必须在同一个 slot**，否则报 `CROSSSLOT` 错误。可以用 hash tag 强制归拢：`buy:{u1001}:sku2001` 和 `lock:{u1001}` 会落在同一个 slot。
+
+2. **脚本必须短小快速**
+
+Lua 执行期间**主线程完全阻塞**，一个耗时 100ms 的脚本会让整个实例卡 100ms。超过 `busy-reply-threshold`（默认 5 秒，旧版叫 `lua-time-limit`）后，Redis 会对其他客户端返回 `BUSY` 错误，但脚本仍在跑——此时只有 `SCRIPT KILL`（脚本未执行写命令时）或 `SHUTDOWN NOSAVE`（已写入时，会丢数据）能救场。
+
+```bash
+# 绝对不要写这种脚本
+# for i = 1, 1000000 do redis.call('SET', 'k'..i, i) end
+
+# 批量操作要在客户端分批，每批控制在几百个以内，多次调用脚本
+```
+
+3. **脚本必须是纯函数，不能有副作用**
+
+不要在脚本里用 `os.time()`、`math.random()`（未设种子时）等非确定性函数。原因是旧版本 Redis 采用"脚本传播"方式复制到从库，同一个脚本在主从上执行结果不同会导致数据不一致。Redis 5.0+ 改成了"效果复制"（把脚本产生的实际写命令传给从库），这个限制放宽了，但**时间、随机数等仍应通过 ARGV 从客户端传入**，这样行为可预测、易于测试。
+
+4. **注意 Lua 与 Redis 的类型转换**
+
+```bash
+# Lua → Redis 的转换规则里有两个大坑：
+#
+# 坑 1：Lua 的 number 会被【截断】成整数
+#   return 3.14   →  客户端收到 (integer) 3
+#   要返回小数必须转成字符串：return tostring(3.14)
+#
+# 坑 2：Lua 的 nil / false 转成 Redis 的 nil（空回复）
+#   return false  →  (nil)
+#   return true   →  (integer) 1
+#
+# 坑 3：Lua table 转成数组时，遇到 nil 就【提前截断】
+#   return {1, 2, nil, 4}  →  客户端只收到 1) 1  2) 2
+#
+# 坑 4：redis.call('GET', k) 在 key 不存在时返回 false（不是 nil！）
+#   所以要写 tonumber(redis.call('GET', key) or "0")
+#   而不是 tonumber(redis.call('GET', key))  —— 后者会得到 nil 导致比较报错
+```
+
+上面限购脚本里的 `or '0'` 就是在处理坑 4，这是 Lua 脚本最常见的 bug 来源。
+
+**`redis.call` vs `redis.pcall`**：
+
+```bash
+# redis.call  ：出错时直接抛出，脚本中止（推荐，能快速暴露问题）
+# redis.pcall ：出错时返回一个 error table，脚本继续执行（需要自己检查）
+
+# 需要自定义错误信息时：
+# return redis.error_reply('库存不足')
+# return redis.status_reply('OK')
+```
+
+**Redis 7 的 Function**：相比 EVAL/EVALSHA，Function 提供了持久化（跟随 RDB/AOF，重启不丢）、可命名调用、库级别的组织方式。如果你的服务端是 7.x 且脚本较多，值得迁移过去。不过 EVALSHA 生态成熟、客户端支持好，存量项目继续用也完全没问题。
+</Answer>
 </Callout>

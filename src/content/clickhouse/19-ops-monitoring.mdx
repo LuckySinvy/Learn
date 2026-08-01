@@ -212,4 +212,98 @@ ClickHouse 瓶颈常在磁盘 IO 和内存，而非 CPU。看到 CPU 闲但查�
 2. 把 `max_bytes_before_external_group_by` 设得很小（如 1MB）再跑同一查询，对比 `system.query_log` 里该查询的 `query_duration_ms` 与外部聚合是否触发（看 ProfileEvents 的 `ExternalAggregationWritePart`）。
 3. 对一张表执行 `ALTER TABLE ... FREEZE PARTITION '202401'`，到数据目录的 `shadow/` 下找到硬链接快照，确认其大小远小于原表。
 4. 触发一次 `ALTER TABLE ... DELETE WHERE ...`，用 `system.mutations` 跟踪其从 `is_done=0` 到完成的过程，并记录 `parts_to_do` 变化。
+
+<Answer>
+**参考答案：**
+
+1. 大聚合 + 实时观察：
+
+```sql
+-- 灌 1000 万行（若 events 已有数据可跳过）
+INSERT INTO events
+SELECT now() - number, number,
+       ['view','click','purchase','signup'][1 + number % 4],
+       concat('/p/', toString(number % 500)),
+       ['CN','US','JP','DE','IN'][1 + number % 5],
+       ['ios','android','web'][1 + number % 3],
+       50 + number % 5000
+FROM numbers(10000000);
+```
+
+会话 A 启动大聚合：
+
+```sql
+SELECT country, event_type, page, device, count()
+FROM events
+GROUP BY country, event_type, page, device;
+```
+
+会话 B 在聚合执行期间反复查：
+
+```sql
+SELECT query_id, user, elapsed,
+       formatReadableQuantity(read_rows) AS rows,
+       formatReadableSize(memory_usage)  AS mem,
+       substring(query, 1, 50) AS q
+FROM system.processes
+ORDER BY elapsed DESC LIMIT 5;
+```
+
+可以看到该查询的 `read_rows` 从 0 涨到 1000 万、`memory_usage` 随 GROUP BY 哈希表增长。这正是「processes 表排查谁在拖慢集群」的现场。
+
+2. 强制外部聚合：
+
+```sql
+-- 把落盘阈值压到 1 MB，让聚合必然溢出磁盘
+SET max_bytes_before_external_group_by = 1000000;
+SELECT country, event_type, page, device, count()
+FROM events
+GROUP BY country, event_type, page, device;
+```
+
+对比 `system.query_log`：
+
+```sql
+SELECT query_duration_ms,
+       ProfileEvents['ExternalAggregationWritePart'] AS external_parts,
+       ProfileEvents['ExternalAggregationMerge']    AS external_merges,
+       formatReadableSize(memory_usage) AS mem
+FROM system.query_log
+WHERE type = 'QueryFinish'
+ORDER BY event_time DESC LIMIT 3;
+```
+
+`ExternalAggregationWritePart > 0` 说明中间状态写盘了。对比默认设置（全内存）跑同一查询：外部聚合的 `query_duration_ms` 明显更长、峰值内存更低。这就是「用时间换内存」——大查询能跑完，但别把阈值设得这么激进。
+
+3. FREEZE 硬链接快照：
+
+```sql
+ALTER TABLE events FREEZE PARTITION '202406';   -- 换成你实际存在的分区
+```
+
+到服务器/容器里找快照：
+
+```bash
+ls -la /var/lib/clickhouse/shadow/
+find /var/lib/clickhouse/shadow -name "*.bin" | head
+du -sh /var/lib/clickhouse/shadow/*/   # 看起来很小
+```
+
+`shadow/<时间戳>/` 下的文件是**硬链接**，与线上 part 共享同一份磁盘块，`du` 显示的大小远小于原表实际占用。验证：在原表 `DROP PARTITION` 前，`shadow` 里的硬链接仍能读到旧数据（快照不变）；之后可以 rsync 到备份机再删除。
+
+4. mutation 跟踪：
+
+```sql
+ALTER TABLE events DELETE WHERE country = 'IN';
+
+-- 反复查询，观察从 is_done=0 → 1 的过程
+SELECT
+    database, table, mutation_id, command,
+    create_time, parts_to_do, parts_done, is_done
+FROM system.mutations
+ORDER BY create_time DESC LIMIT 5;
+```
+
+`parts_to_do` 是被这条 mutation 标记为待处理（需要重写）的 part 数，`parts_done` 是已完成数。你会看到 `parts_to_do` 一开始等于所有含 `IN` 数据的 part 数（可能几十个），随后 `parts_done` 逐个递增，全部完成后 `is_done = 1`。注意：**每完成一个 part，意味着把整个 part 重写了一遍**——即使只删了几行。所以 mutation 一定要低频、批量，频繁小删除请用 Replacing/Collapsing 引擎（第 7 章）。
+</Answer>
 </Callout>

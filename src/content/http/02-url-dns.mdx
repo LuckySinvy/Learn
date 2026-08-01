@@ -183,4 +183,55 @@ curl -sv --resolve api.example.com:8000:127.0.0.1 \
 2. 修改 Playground 2：把 myapp.local 映射后，再追加一行把它映射到 0.0.0.0，观察 curl 的行为（提示：hosts 取第一条匹配）。
 3. 在 Playground 3 中去掉 --resolve 参数直接请求 api.example.com:8000，观察 curl 报什么错，理解"解析失败"和"连接失败"的区别。
 4. 思考：为什么 CDN 厂商普遍用 CNAME 而不是 A 记录接入客户域名？
+
+<Answer>
+**参考答案：**
+
+**1. fragment 不会出现在 query 中**
+
+用 Playground 1 的方式解析 `http://a.com/p?x=1#y=2`：
+
+```python
+from urllib.parse import urlsplit, parse_qs
+u = urlsplit("http://a.com/p?x=1#y=2")
+print(u.query)      # x=1
+print(parse_qs(u.query))  # {'x': ['1']}
+print(u.fragment)   # y=2
+```
+
+可以看到 `y=2` 被归入 `fragment`，query 里只有 `x=1`。fragment 是纯浏览器行为（锚点/前端路由），**永远不出现在 HTTP 请求中**——这是 SPA 早期用 hash 路由的前提。
+
+**2. hosts 第一条匹配生效**
+
+在 `/etc/hosts` 里追加：
+
+```text
+127.0.0.1 myapp.local
+0.0.0.0   myapp.local
+```
+
+解析时取**第一条**匹配的记录，所以 curl 访问 `myapp.local` 仍连到 `127.0.0.1`，第二个 `0.0.0.0` 映射不生效。这也正是广告屏蔽软件把广告域名指向 `0.0.0.0` 的原理——它只要保证该域名没有别的可用映射即可。
+
+**3. 去掉 --resolve 后的表现**
+
+```bash
+curl -sv http://api.example.com:8000/index.html
+```
+
+沙箱无外网，curl 会报：
+
+```text
+curl: (6) Could not resolve host: api.example.com
+```
+
+这是**解析失败**：域名根本没翻译成 IP，还没到发连接包那一步。而加了 `--resolve api.example.com:8000:127.0.0.1` 后如果 127.0.0.1:8000 没服务，报的会是 `curl: (7) Failed to connect`——那是**连接失败**。两者区别：前者 DNS 环节挂了，后者 DNS 成功但 TCP 连不上。
+
+**4. CDN 为什么用 CNAME 而不是 A 记录**
+
+- **A 记录要 CDN 提供 IP**：客户域名直接指向 CDN 节点 IP，IP 一变客户就要改 DNS，且 CDN 无法按区域调度；
+- **CNAME 指向 CDN 的域名**：客户域名 `www.客户.com` CNAME 到 `www.客户.com.cdn.example.net`，解析时由 CDN 的权威服务器动态返回**离用户最近节点**的 IP（智能 DNS / GSLB），IP 变化对客户完全透明；
+- CNAME 还能让 CDN 侧做容灾、多活切换，不用客户配合。
+
+代价是增加一次 DNS 查询（多一跳），但换来的是调度灵活性和可运维性，所以 CDN 厂商普遍采用 CNAME 接入。
+</Answer>
 </Callout>

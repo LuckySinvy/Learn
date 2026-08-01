@@ -86,6 +86,97 @@ await store.addDocuments(splits);
 
 <Callout type="exercise" title="练习">
 用 MemoryVectorStore 装入一份你自己的笔记，分别用 `similaritySearch` 与 `maxMarginalRelevanceSearch` 查询同一问题，对比返回结果差异。
+
+<Answer>
+**参考答案：**
+
+**完整对比脚本**
+
+```ts
+// compare-search.ts
+import "dotenv/config";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings } from "@langchain/openai";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { TextLoader } from "langchain/document_loaders/fs/text";
+
+// 1) 加载 + 切分 + 入库
+const raw = await new TextLoader("./notes/my-notes.md").load();
+const splits = await new RecursiveCharacterTextSplitter({
+  chunkSize: 400,
+  chunkOverlap: 40,
+}).splitDocuments(raw);
+
+const store = await MemoryVectorStore.fromDocuments(splits, new OpenAIEmbeddings());
+console.log("入库块数：", splits.length);
+
+const query = "如何配置开发环境？";
+
+// 2) 普通相似度搜索：带分数，方便观察
+const sim = await store.similaritySearchWithScore(query, 4);
+
+console.log("\n===== similaritySearch =====");
+sim.forEach(([doc, score], i) => {
+  console.log(`[${i + 1}] score=${score.toFixed(4)}  ${doc.pageContent.slice(0, 60).replace(/\n/g, " ")}…`);
+});
+
+// 3) MMR 搜索：先粗筛 20 个候选，再从中挑 4 个「既相关又互不重复」的
+const mmr = await store.maxMarginalRelevanceSearch(query, {
+  k: 4,           // 最终返回数量
+  fetchK: 20,     // 候选池大小，必须明显大于 k 才有挑选空间
+  lambda: 0.5,    // 1=只看相关性（退化成 similaritySearch），0=只看多样性
+});
+
+console.log("\n===== maxMarginalRelevanceSearch (lambda=0.5) =====");
+mmr.forEach((doc, i) => {
+  console.log(`[${i + 1}] ${doc.pageContent.slice(0, 60).replace(/\n/g, " ")}…`);
+});
+
+// 4) 量化差异：两种方法返回的内容重合了多少？
+const simSet = new Set(sim.map(([d]) => d.pageContent));
+const overlap = mmr.filter((d) => simSet.has(d.pageContent)).length;
+console.log(`\n两者重合 ${overlap}/4 块，MMR 引入了 ${4 - overlap} 块新内容`);
+```
+
+**你会观察到什么**
+
+| | `similaritySearch` | `maxMarginalRelevanceSearch` |
+|---|---|---|
+| 排序依据 | 只看与查询的向量距离，从近到远 | 相关性 **减去** 与「已选中结果」的相似度 |
+| 典型结果 | 前几块常常是**同一段话的相邻切片**，内容高度重复 | 第一块通常和 similarity 的第一块相同，之后会主动跳开，覆盖不同小节 |
+| 适合场景 | 事实型精确问答（「端口号是多少」） | 概览型、多方面问题（「这个项目怎么用」「有哪些注意事项」） |
+
+**为什么会重复？** 因为 `chunkOverlap` 的存在，相邻两块本来就共享一部分文字，向量自然极其接近。`similaritySearch` 不去重，于是 4 个名额可能被同一段落的 4 个切片占满，模型看到的其实只有一段内容。MMR 就是为了解决这个浪费。
+
+**调 `lambda` 看效果变化**
+
+```ts
+for (const lambda of [1.0, 0.7, 0.5, 0.2]) {
+  const docs = await store.maxMarginalRelevanceSearch(query, { k: 4, fetchK: 20, lambda });
+  const same = docs.filter((d) => simSet.has(d.pageContent)).length;
+  console.log(`lambda=${lambda}  与 similarity 重合 ${same}/4`);
+}
+// lambda=1.0 → 4/4（完全等价于 similaritySearch）
+// lambda 越小 → 重合越少，结果越发散
+```
+
+**两个常见坑**
+
+1. **`fetchK` 忘了设或设太小**。如果 `fetchK` 等于 `k`，候选池里没有多余的可挑，MMR 就退化成普通搜索，看不出任何差异。经验值：`fetchK` 取 `k` 的 4–5 倍。
+2. **笔记太短**。只有三五个块时两种方法结果必然一样。建议用至少几十个块的语料才能看出区别。
+
+**实践建议**：RAG 里可以直接在检索器层面切换，不用改下游代码——
+
+```ts
+const retriever = store.asRetriever({
+  k: 4,
+  searchType: "mmr",
+  searchKwargs: { fetchK: 20, lambda: 0.5 },
+});
+```
+
+一般做法是**先用默认的 similarity 跑通**，当发现「取回的 4 块内容雷同、模型答不全」时再切到 MMR。
+</Answer>
 </Callout>
 
 ## 小结

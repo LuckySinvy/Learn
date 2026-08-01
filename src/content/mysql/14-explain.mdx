@@ -203,4 +203,187 @@ SELECT /*+ MAX_EXECUTION_TIME(3000) */ * FROM orders;
 1. 对 `SELECT * FROM orders WHERE DATE(created_at) = '2026-07-01'` 执行 EXPLAIN，确认 type=ALL；改写成范围条件后再看，记录 type 与 rows 的变化。
 2. 构造一条 ORDER BY 引发 Using filesort 的查询，通过加联合索引让 filesort 消失。
 3. 用 EXPLAIN FORMAT=TREE 观察一条三表 JOIN 的执行顺序，指出驱动表，并用 JOIN_ORDER Hint 改变顺序对比 rows 估算。
+
+<Answer>
+**参考答案：**
+
+**1. 函数条件 vs 范围条件**
+
+先确保 `created_at` 上有索引并把表灌大（几行的表优化器一律全表扫，看不出差异）：
+
+```sql
+ALTER TABLE orders ADD INDEX idx_created (created_at);
+ANALYZE TABLE orders;
+```
+
+```sql
+-- 改写前
+EXPLAIN SELECT id, order_no FROM orders WHERE DATE(created_at) = '2026-07-01';
+```
+
+```text
++------+---------------+------+------+-------------+
+| type | possible_keys | key  | rows | Extra       |
++------+---------------+------+------+-------------+
+| ALL  | NULL          | NULL |  700 | Using where |
++------+---------------+------+------+-------------+
+```
+
+```sql
+-- 改写后：左闭右开的范围条件
+EXPLAIN SELECT id, order_no FROM orders
+WHERE created_at >= '2026-07-01' AND created_at < '2026-07-02';
+```
+
+```text
++-------+---------------+-------------+------+-----------------------+
+| type  | possible_keys | key         | rows | Extra                 |
++-------+---------------+-------------+------+-----------------------+
+| range | idx_created   | idx_created |  100 | Using index condition |
++-------+---------------+-------------+------+-----------------------+
+```
+
+对比记录：
+
+| | 改写前 | 改写后 |
+|---|---|---|
+| type | `ALL`（全表扫描） | `range`（索引范围扫描） |
+| possible_keys | `NULL`（优化器根本没把它当候选） | `idx_created` |
+| key | `NULL` | `idx_created` |
+| rows | 全表行数 | 只有命中区间的行数 |
+
+**原因**：B+ 树是按 `created_at` 的**原始值**有序排列的。`DATE(created_at)` 是对列做函数变换，变换后的结果在索引里**没有任何有序性**，优化器无法用它做树上定位，只能全表扫描后逐行计算函数再比较。
+
+`possible_keys` 都是 NULL 这一点很关键——说明优化器**连考虑都没考虑**这个索引，这和「考虑了但算下来不划算而放弃」（possible_keys 有值、key 为 NULL）是两回事。
+
+同类失效写法：`WHERE YEAR(created_at) = 2026`、`WHERE id + 1 = 10`、`WHERE SUBSTR(order_no, 1, 2) = 'SO'`。**口诀：让列保持"裸露"，要变换就变换另一侧的常量。**
+
+改写不了时用函数索引（8.0.13+）：
+
+```sql
+ALTER TABLE orders ADD INDEX idx_created_date ((DATE(created_at)));
+-- 之后原 SQL 就能命中，但查询表达式必须与索引定义完全一致
+```
+
+**2. 用联合索引消除 filesort**
+
+构造一条产生 filesort 的查询：
+
+```sql
+EXPLAIN SELECT id, order_no, total_amount, created_at
+FROM orders
+WHERE user_id = 1
+ORDER BY total_amount DESC
+LIMIT 20;
+```
+
+```text
+type: ref
+key : idx_user_created
+Extra: Using where; Using filesort     ← 排序列 total_amount 不在索引有序性里
+```
+
+现有索引 `(user_id, created_at)` 只能保证组内按 `created_at` 有序，按 `total_amount` 排必须把命中行全读出来在 sort buffer 里排一遍。
+
+加一个「等值列 + 排序列」的联合索引：
+
+```sql
+ALTER TABLE orders ADD INDEX idx_user_amount (user_id, total_amount);
+ANALYZE TABLE orders;
+
+EXPLAIN SELECT id, order_no, total_amount, created_at
+FROM orders WHERE user_id = 1 ORDER BY total_amount DESC LIMIT 20;
+```
+
+```text
+type: ref
+key : idx_user_amount
+Extra: Using where              ← Using filesort 消失了
+```
+
+**原理**：索引 `(user_id, total_amount)` 里，`user_id = 1` 的记录连续存放且组内**天然按 total_amount 有序**。要 DESC 只需沿叶子双向链表**反向扫描**，扫够 20 行即停——既不用读全部命中行，也不用排序。
+
+三个容易踩的坑：
+
+- **排序方向必须一致**。`ORDER BY a ASC, b DESC` 无法被普通的 `(a, b)` 索引消除排序，需要 8.0 的**降序索引**：`ADD INDEX idx (a ASC, b DESC)`。
+- **等值列在前、排序列在后**。写成 `(total_amount, user_id)` 就没用了。
+- **中间夹范围条件会破坏有序性**。`WHERE user_id = 1 AND status > 1 ORDER BY total_amount` 用 `(user_id, status, total_amount)` 仍会 filesort，因为范围之后的列不再有序。这时应建 `(user_id, total_amount)` 让排序优先。
+
+顺带一提，`Using temporary` 也能用同样的思路消除：
+
+```sql
+EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status;
+-- Extra: Using temporary
+ALTER TABLE orders ADD INDEX idx_status (status);
+-- GROUP BY 可以顺着有序索引流式聚合，temporary 消失
+```
+
+**3. FORMAT=TREE 看三表 JOIN 与 JOIN_ORDER**
+
+```sql
+EXPLAIN FORMAT=TREE
+SELECT o.order_no, u.username, p.name
+FROM orders o
+JOIN users u        ON u.id = o.user_id
+JOIN order_items oi ON oi.order_id = o.id
+JOIN products p     ON p.id = oi.product_id
+WHERE o.status = 1;
+```
+
+典型输出：
+
+```text
+-> Nested loop inner join  (cost=12.4 rows=8)
+    -> Nested loop inner join  (cost=8.2 rows=6)
+        -> Nested loop inner join  (cost=4.1 rows=2)
+            -> Filter: (o.status = 1)  (cost=1.4 rows=2)
+                -> Index lookup on o using idx_status (status=1)
+            -> Single-row index lookup on u using PRIMARY (id = o.user_id)
+        -> Index lookup on oi using idx_order (order_id = o.id)
+    -> Single-row index lookup on p using PRIMARY (id = oi.product_id)
+```
+
+**怎么读树形输出**（和表格格式的读法完全不同，这是关键）：
+
+- **缩进最深的节点最先执行**。上例最深处是 `Index lookup on o`，所以 **`orders` 是驱动表**。
+- 每个 `Nested loop inner join` 节点下有两个子节点：**上面的是外层（已积累的结果集），下面的是本次被驱动的表**。所以 JOIN 顺序是 `o → u → oi → p`。
+- `Single-row index lookup ... using PRIMARY` 对应表格格式的 `type = eq_ref`（主键唯一匹配，每次最多一行），`Index lookup` 对应 `ref`。
+- `cost` 和 `rows` 是**逐层累积**的：内层 2 行，接上 oi 变 6 行，再接 p 变 8 行——能直观看到「行数放大」发生在哪一步。
+
+为什么优化器选 orders 做驱动表：`o.status = 1` 过滤后只剩 2 行，而其他三张表都是按主键/索引被精确探测（每次 1 行）。这符合**「小表（过滤后行数少的）驱动大表，被驱动表连接列必须有索引」**的原则。
+
+用 Hint 强制改变顺序做对比实验：
+
+```sql
+EXPLAIN FORMAT=TREE
+SELECT /*+ JOIN_ORDER(p, oi, o, u) */ o.order_no, u.username, p.name
+FROM orders o
+JOIN users u        ON u.id = o.user_id
+JOIN order_items oi ON oi.order_id = o.id
+JOIN products p     ON p.id = oi.product_id
+WHERE o.status = 1;
+```
+
+```text
+-> Nested loop inner join  (cost=48.6 rows=8)      ← cost 明显变高
+    ...
+        -> Table scan on p  (cost=0.9 rows=6)      ← products 变成驱动表，全表扫
+        -> Index lookup on oi using idx_product (product_id = p.id)
+```
+
+对比结论：
+
+- 强制让 `products` 打头后，它变成全表扫描的驱动表，外层循环次数从 2 变成 6，**cost 显著上升**（这里从 12.4 涨到 48.6）；
+- 更糟的是 `o.status = 1` 这个高选择性的过滤条件被推迟到最后才生效，中间步骤白白放大了行数。
+
+这恰好证明**优化器原来的选择是对的**——这也正是做这个实验的价值：Hint 主要用于**验证猜想**，而不是常规武器。真要用（比如优化器确实选错了），也应优先按「改写 SQL → 调整索引 → `ANALYZE TABLE` 更新统计信息 → 最后才是 Hint」的顺序，并在代码里留注释说明原因和有效期。
+
+想看真实耗时而不是估算，把 `FORMAT=TREE` 换成 `ANALYZE`：
+
+```sql
+EXPLAIN ANALYZE SELECT ... ;
+-- 每个节点会多出 (actual time=首行耗时..总耗时 rows=实际行数 loops=循环次数)
+-- 重点看「估算 rows」与「actual rows」是否差了数量级 —— 差得多就 ANALYZE TABLE
+```
+</Answer>
 </Callout>

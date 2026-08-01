@@ -71,6 +71,51 @@ const docs = await hybrid.getRelevantDocuments("接口返回 500 怎么办");
 
 <Callout type="exercise" title="练习">
 给文档补上 `year` 元数据后用 `SelfQueryRetriever` 查询「去年发布的接口文档」，观察生成的过滤条件是否符合预期。
+
+<Answer>
+**参考答案：**
+
+先建库时补上 `year` 元数据，再挂 `SelfQueryRetriever`：
+
+```python
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain.retrievers.self_query.base import SelfQueryRetriever
+from langchain.chains.query_constructor.base import AttributeInfo
+
+# 1. 入库时附上结构化元数据
+docs = [
+    "2024 版支付接口文档：支持微信、支付宝……",
+    "2025 版支付接口文档：新增数字人民币……",
+]
+metadatas = [{"year": 2024, "category": "api"}, {"year": 2025, "category": "api"}]
+
+vectorstore = Chroma.from_texts(docs, OpenAIEmbeddings(), metadatas=metadatas)
+
+# 2. 声明可过滤字段
+attribute_info = [
+    AttributeInfo(name="year", description="文档发布年份", type="integer"),
+    AttributeInfo(name="category", description="所属分类", type="string"),
+]
+
+# 3. 用自查询检索器查询「去年发布的接口文档」
+retriever = SelfQueryRetriever.from_llm(
+    llm=llm,
+    vectorstore=vectorstore,
+    document_contents="接口文档",
+    metadata_field_info=attribute_info,
+)
+
+result = retriever.get_relevant_documents("去年发布的接口文档")
+# 内部生成类似：query=接口文档, filter=Comparison(comparator=eq, attribute=year, value=2025)
+```
+
+观察点：
+
+- 生成的过滤条件应为 `year = 2025`（今年 2026，去年即 2025），说明 LLM 正确完成了「自然语言 → 结构化过滤」的翻译，而不是把「去年」原样丢给向量检索；
+- 若文档缺 `year` 元数据，过滤后可能查不到结果——这正是本章强调「自查询依赖元数据质量」的原因；
+- 可以在回调（第 14 章）里打印实际生成的 `filter` 验证是否与预期一致；出现偏差时，调整 `attribute_info` 里的 `description` 描述即可。
+</Answer>
 </Callout>
 
 ## 小结

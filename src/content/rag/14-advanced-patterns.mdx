@@ -80,6 +80,124 @@ merged = dedupe(all_hits)
 
 <Callout type="exercise" title="练习">
 在你最易「召回不到」的一类问题上，试试「查询改写 + 父子文档」组合，对比改写前后的 context_relevancy 分数是否提升。
+
+<Answer>
+**参考答案：**
+
+**先明确：最容易召回不到的是哪类问题？**
+
+实践中主要是这三类，而它们恰好各自对应不同的解法：
+
+| 问题类型 | 例子 | 为什么召回不到 | 对症解法 |
+|---|---|---|---|
+| 多轮指代 | 「那它的期限是多久？」 | 「它」无实体，向量化后是一团模糊语义 | **查询改写** |
+| 口语化/黑话 | 「这玩意儿咋报销」 | 与文档的书面表达（「费用报销流程」）用词差距大 | **查询改写** |
+| 答案跨段 | 「A 和 B 有什么区别」 | 答案分散在两个 chunk，各自都只沾一半边 | **父子文档 / 多查询** |
+
+**第一步：查询改写**
+
+```python
+REWRITE_PROMPT = """把用户问题改写成一个独立、完整、含具体实体的检索问句。
+要求：
+1. 用对话历史补全所有指代（「它」「这个」等）
+2. 口语表达换成文档中可能出现的正式术语
+3. 只输出改写后的问句，不要解释
+
+对话历史：
+{history}
+用户问题：{question}
+改写结果："""
+
+def rewrite(question, history=""):
+    q = llm(REWRITE_PROMPT.format(history=history, question=question)).strip()
+    # 兜底：改写失败或输出异常时退回原问题，绝不能让链路断掉
+    if not q or len(q) > len(question) * 5:
+        return question
+    return q
+
+# 效果示例
+# 原问题: "那它的期限是多久？"（上文在聊「竞业协议」）
+# 改写后: "竞业限制协议的期限是多长时间？"
+```
+
+**第二步：父子文档**
+
+```python
+# 建库：子块进向量库，父块单独存
+for section in sections:                      # section = 一个完整小节
+    parent_id = save_parent(section.text)     # 父块存 KV / 关系库
+    for child in split(section.text, chunk_size=250):   # 子块切小，利于精确匹配
+        vector_store.add(
+            vector=embed(child),
+            payload={"text": child, "parent_id": parent_id},
+        )
+
+def retrieve_with_parent(query, k=5):
+    hits = vector_store.search(embed(query), top_k=k * 3)
+    seen, results = set(), []
+    for h in hits:
+        pid = h.payload["parent_id"]
+        if pid in seen:                       # 同一父块只取一次，天然去重
+            continue
+        seen.add(pid)
+        results.append({"text": get_parent(pid), "score": h.score})
+        if len(results) == k:
+            break
+    return results
+```
+
+注意 `k * 3` 这个细节：多个子块常命中同一个父块，去重后数量会缩水，所以要多召回一些做缓冲。
+
+**第三步：四组消融对比**
+
+不要只对比「有 vs 没有」，要做**消融实验**，才知道每个技巧各自贡献了多少：
+
+```python
+from ragas import evaluate
+from ragas.metrics import context_precision, context_recall, faithfulness
+
+variants = {
+    "baseline":      lambda q, h: plain_retrieve(q),
+    "+改写":          lambda q, h: plain_retrieve(rewrite(q, h)),
+    "+父子":          lambda q, h: retrieve_with_parent(q),
+    "+改写+父子":     lambda q, h: retrieve_with_parent(rewrite(q, h)),
+}
+
+for name, retriever in variants.items():
+    contexts = [[c["text"] for c in retriever(q, h)]
+                for q, h in zip(questions, histories)]
+    ds = Dataset.from_dict({
+        "question": questions, "contexts": contexts,
+        "answer": [generate(q, c) for q, c in zip(questions, contexts)],
+        "reference": references,
+    })
+    print(name, evaluate(ds, metrics=[context_precision, context_recall, faithfulness]))
+```
+
+**典型结果**
+
+```text
+baseline      context_precision=0.52  context_recall=0.61  faithfulness=0.79
++改写         context_precision=0.71  context_recall=0.78  faithfulness=0.83
++父子         context_precision=0.58  context_recall=0.74  faithfulness=0.88
++改写+父子    context_precision=0.74  context_recall=0.86  faithfulness=0.91
+```
+
+**怎么读这张表（这是练习真正的收获）**
+
+1. **两个技巧解决的是不同问题，所以能叠加。** 查询改写主要拉高 `precision`（问对了，召回的自然更准）；父子文档主要拉高 `faithfulness`（上下文更完整，模型不用靠猜来补空缺）。它们不冲突，组合后各自的收益基本都保留了。
+
+2. **父子文档对 `context_precision` 提升有限，甚至可能微降。** 因为返回的是更大的父块，里面夹带了一些无关句子，按「片段中相关内容占比」算的精度自然会被稀释。**但这不是坏事** —— 看 `faithfulness` 从 0.79 涨到 0.88 就明白了：模型拿到完整上下文后，编造的部分大幅减少。这提醒我们**不能只盯单一指标做优化**。
+
+3. **查询改写的收益最大且最便宜**，一次额外 LLM 调用换来近 20 个点，这也是课文说「查询改写 + 父子文档是性价比最高组合」的原因。
+
+**上生产前必须注意的四点**
+
+- **改写会引入延迟**（多一次 LLM 往返，约 300–800ms）。可以用小模型（如 `gpt-4o-mini`）专门做改写，或者只在「首轮检索分数偏低」时才触发改写，避免每次都付出这个成本。
+- **改写可能改坏。** 模型偶尔会把问题改得面目全非，导致本来能召回的反而召不回。稳妥做法是**同时用原问题和改写问题各检索一次，再用 RRF 融合**（第 9 章），这样只会更好不会更差。
+- **父块别太大。** 父块超过 1500 字就会开始挤占 token 预算，反而触发第 11 章的截断逻辑。建议父块用「一个小节」而不是「一整章」。
+- **先验证再上线。** 这两个技巧在指代密集、术语差异大的语料上收益显著，但在「用户提问方式已经很规范」的场景（比如内部工单系统有固定模板）可能几乎无增益，白白增加延迟。一切以自己语料的指标为准。
+</Answer>
 </Callout>
 
 ## 小结

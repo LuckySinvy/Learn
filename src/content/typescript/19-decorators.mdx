@@ -334,6 +334,284 @@ function Inject(token: string) {
 1. 写一个 `@memoize` 方法装饰器，用参数的 JSON 序列化结果做 key 缓存返回值，注意缓存要按实例隔离（提示：`context.addInitializer` 里给实例挂 Map）。
 2. 写一个 `@deprecated(msg)` 装饰器，第一次调用被装饰方法时打印一次警告，之后不再打印。
 3. 用 `context.metadata` 实现一个迷你「校验框架」：`@required`、`@maxLength(n)` 标记字段，再写一个 `validate(obj)` 函数读取元数据执行校验。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：`@memoize`（按实例隔离缓存）**
+
+```ts
+function memoize<This extends object, Args extends unknown[], Return>(
+  target: (this: This, ...args: Args) => Return,
+  context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => Return>,
+) {
+  // 用 Symbol 做键，避免和业务属性撞名
+  const cacheKey = Symbol("memoize:" + String(context.name));
+
+  // 每个实例构造时挂一个自己的 Map
+  context.addInitializer(function (this: This) {
+    (this as Record<symbol, unknown>)[cacheKey] = new Map<string, Return>();
+  });
+
+  return function (this: This, ...args: Args): Return {
+    const cache = (this as Record<symbol, unknown>)[cacheKey] as Map<string, Return>;
+    const key = JSON.stringify(args);
+
+    if (cache.has(key)) {
+      return cache.get(key) as Return;
+    }
+    const result = target.call(this, ...args);
+    cache.set(key, result);
+    return result;
+  };
+}
+```
+
+验证按实例隔离：
+
+```ts
+class Calculator {
+  calls = 0;
+
+  @memoize
+  slowSquare(n: number): number {
+    this.calls += 1;
+    return n * n;
+  }
+}
+
+const a = new Calculator();
+const b = new Calculator();
+
+a.slowSquare(4);
+a.slowSquare(4);        // 命中 a 的缓存
+console.log(a.calls);   // 1
+
+b.slowSquare(4);        // b 有自己的缓存，不会命中 a 的
+console.log(b.calls);   // 1
+```
+
+要点：
+
+- **`addInitializer` 里的 `this` 是实例**（对实例方法而言），所以每个实例都会拿到一个独立的 Map。如果把 `const cache = new Map()` 直接写在装饰器函数体里，它会被**所有实例共享**——这是本题的核心考点，共享缓存在有状态对象上会返回错误结果。
+- 用 `Symbol` 作为存储键，既不会和业务字段冲突，也不会出现在 `Object.keys()` 里。
+- 另一种更干净、不污染实例的写法是用 `WeakMap`：
+
+```ts
+function memoize<This extends object, Args extends unknown[], Return>(
+  target: (this: This, ...args: Args) => Return,
+  context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => Return>,
+) {
+  const caches = new WeakMap<This, Map<string, Return>>();
+  return function (this: This, ...args: Args): Return {
+    let cache = caches.get(this);
+    if (cache === undefined) {
+      cache = new Map<string, Return>();
+      caches.set(this, cache);
+    }
+    const key = JSON.stringify(args);
+    if (cache.has(key)) return cache.get(key) as Return;
+    const result = target.call(this, ...args);
+    cache.set(key, result);
+    return result;
+  };
+}
+```
+
+`WeakMap` 版本的优势是实例被回收时缓存自动释放，且完全不修改实例本身。
+
+**两个必须知道的局限：**
+
+1. **`JSON.stringify` 做 key 不可靠。** 参数含 `undefined`、函数、`Symbol`、循环引用时会出错或丢信息；对象属性顺序不同（`{a:1,b:2}` 与 `{b:2,a:1}`）会产生不同的 key。仅适用于参数是原始值或简单对象的场景。
+2. **只适合纯函数。** 方法如果依赖会变化的实例状态，或者有副作用，缓存会给出过期的结果。真实场景还应加上 TTL 和容量上限，否则就是内存泄漏。
+
+**第 2 题：`@deprecated(msg)`**
+
+```ts
+function deprecated(message: string) {
+  return function <This, Args extends unknown[], Return>(
+    target: (this: This, ...args: Args) => Return,
+    context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => Return>,
+  ) {
+    let warned = false;                       // 闭包变量，跨调用保持
+    const name = String(context.name);
+
+    return function (this: This, ...args: Args): Return {
+      if (!warned) {
+        warned = true;
+        console.warn("[废弃警告] " + name + "() 已废弃：" + message);
+      }
+      return target.call(this, ...args);
+    };
+  };
+}
+```
+
+验证：
+
+```ts
+class Api {
+  @deprecated("请改用 fetchV2()")
+  fetchV1(): string {
+    return "v1 数据";
+  }
+
+  fetchV2(): string {
+    return "v2 数据";
+  }
+}
+
+const api = new Api();
+console.log(api.fetchV1());   // 先打印警告，再返回 v1 数据
+console.log(api.fetchV1());   // 只返回 v1 数据，不再警告
+console.log(api.fetchV1());   // 同上
+
+const another = new Api();
+console.log(another.fetchV1());  // 也不警告 —— warned 是按「方法」共享的
+```
+
+要点：
+
+- **`warned` 的位置决定了警告粒度。** 放在装饰器函数体里（如上），它属于「这个被装饰的方法」，整个进程只警告一次，无论创建多少实例——这正是废弃警告想要的效果，否则日志会被刷屏。如果想改成「每个实例警告一次」，就把状态挪进 `addInitializer`，做法同第 1 题。
+- 与第 1 题形成对照：第 1 题的缓存**必须**按实例隔离（否则结果错误），本题的警告标记**必须**共享（否则日志泛滥）。**装饰器里状态该放哪一层，取决于业务语义**，这是使用装饰器时最需要想清楚的一点。
+- 生产版本通常还会带上调用栈，方便定位是谁在用废弃 API：
+
+```ts
+console.warn(
+  "[废弃警告] " + name + "() 已废弃：" + message + "\n" +
+    new Error().stack?.split("\n").slice(2, 4).join("\n"),
+);
+```
+
+**第 3 题：用 `context.metadata` 实现迷你校验框架**
+
+```ts
+interface FieldRule {
+  required?: boolean;
+  maxLength?: number;
+}
+
+type RuleMap = Record<string, FieldRule>;
+
+// 从共享的 metadata 对象上取出（或初始化）规则表
+function getRules(metadata: DecoratorMetadata): RuleMap {
+  const meta = metadata as Record<string, unknown>;
+  if (meta.rules === undefined) {
+    meta.rules = {} as RuleMap;
+  }
+  return meta.rules as RuleMap;
+}
+
+function required(
+  _value: undefined,
+  context: ClassFieldDecoratorContext,
+): void {
+  const rules = getRules(context.metadata);
+  const key = String(context.name);
+  rules[key] = { ...rules[key], required: true };
+}
+
+function maxLength(n: number) {
+  return function (
+    _value: undefined,
+    context: ClassFieldDecoratorContext,
+  ): void {
+    const rules = getRules(context.metadata);
+    const key = String(context.name);
+    rules[key] = { ...rules[key], maxLength: n };
+  };
+}
+```
+
+校验函数：
+
+```ts
+function validate(obj: object): string[] {
+  const ctor = obj.constructor as { [Symbol.metadata]?: DecoratorMetadata };
+  const metadata = ctor[Symbol.metadata];
+  if (metadata === undefined) return [];
+
+  const rules = (metadata as Record<string, unknown>).rules as RuleMap | undefined;
+  if (rules === undefined) return [];
+
+  const errors: string[] = [];
+  const record = obj as Record<string, unknown>;
+
+  for (const [field, rule] of Object.entries(rules)) {
+    const value = record[field];
+
+    if (rule.required === true) {
+      if (value === undefined || value === null || value === "") {
+        errors.push(field + " 是必填项");
+        continue;                  // 必填都没过，长度就不用查了
+      }
+    }
+    if (rule.maxLength !== undefined && typeof value === "string") {
+      if (value.length > rule.maxLength) {
+        errors.push(
+          field + " 长度不能超过 " + rule.maxLength + "（当前 " + value.length + "）",
+        );
+      }
+    }
+  }
+  return errors;
+}
+```
+
+使用：
+
+```ts
+class UserForm {
+  @required
+  @maxLength(20)
+  username = "";
+
+  @required
+  email = "";
+
+  @maxLength(100)
+  bio = "";
+}
+
+const form = new UserForm();
+form.username = "这是一个特别特别特别特别长的用户名超过二十个字了";
+form.email = "";
+form.bio = "简介";
+
+console.log(validate(form));
+// [
+//   'username 长度不能超过 20（当前 24）',
+//   'email 是必填项'
+// ]
+```
+
+要点：
+
+- **`context.metadata` 是同一个类上所有装饰器共享的对象**，所以 `@required` 和 `@maxLength` 能往同一张规则表里写。这正是它取代 `reflect-metadata` 的核心能力。
+- 用展开语法 `{ ...rules[key], required: true }` 合并而不是直接赋值，这样同一字段叠加多个装饰器时规则不会互相覆盖。
+- **装饰器的应用顺序是自下而上**：`username` 上先应用 `@maxLength(20)`，再应用 `@required`。本例中因为是合并写入，顺序不影响结果；但如果装饰器之间有依赖关系，就必须留意这一点。
+- 元数据最终挂在 `Class[Symbol.metadata]` 上，所以 `validate` 通过 `obj.constructor` 拿到类、再取 `Symbol.metadata`。**注意元数据是挂在类上而非实例上**——它描述的是「这个类的字段有什么约束」，与具体实例无关。
+- 元数据会**沿原型链继承**，子类能读到父类装饰器写入的规则，这对表单基类的复用很有用。
+
+**开启方式：** 使用 `context.metadata` 需要 tsconfig 的 `lib` 包含 `esnext.decorators`：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "esnext.decorators"]
+  }
+}
+```
+
+运行时若 `Symbol.metadata` 不存在，加一行 polyfill 即可：
+
+```ts
+(Symbol as { metadata?: symbol }).metadata ??= Symbol("Symbol.metadata");
+```
+
+这套约 60 行的代码，就是 class-validator 这类库的核心原理。真实的库无非是规则更多（邮箱、正则、数值范围、嵌套对象）、错误信息可国际化，机制完全一样。
+</Answer>
 </Callout>
 
 ## 小结

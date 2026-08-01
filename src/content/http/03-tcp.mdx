@@ -216,4 +216,46 @@ cli.close()
 2. 在 Playground 2 中，把 listen 的 backlog 改为 0，连续发起多个不被 accept 的连接，观察第几个开始失败。
 3. 画出完整状态机中主动方的路径：ESTABLISHED → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → CLOSED，标注触发每次迁移的报文。
 4. 思考：为什么 HTTP/1.1 响应头里带 Connection: close 的服务器，更容易在自己身上堆 TIME_WAIT？
+
+<Answer>
+**参考答案：**
+
+**1. 服务器先 close，TIME_WAIT 换边**
+
+在 Playground 1 里把顺序改成"服务器先关闭"：
+
+```python
+conn.close()   # 服务器先关 -> 服务器进入 TIME_WAIT
+cli.close()    # 客户端后关 -> 客户端 CLOSE_WAIT
+```
+
+观察 `/proc/net/tcp`：这次是**服务器侧**端口进入 `TIME_WAIT`，客户端侧停在 `CLOSE_WAIT`。印证了"谁主动关闭谁背 TIME_WAIT"——TIME_WAIT 永远属于**主动发送 FIN 的一方**。
+
+**2. backlog = 0 的效果**
+
+把 `srv.listen(backlog)` 的 backlog 设为 0（或 1），连续发起多个不被 accept 的连接。此时全连接队列极短，内核会拒绝超过队列容量的新连接：后面发起的 `connect` 会抛 `ConnectionRefusedError` 或长时间超时，具体第几个失败取决于队列容量与内核行为。
+
+这个实验说明：**三次握手由内核完成**，但握手成功后连接要先排队进全连接队列，`accept` 只是从队列里取。队列满时新握手直接失败——这就是高并发下"连接超时"故障的来源。生产上要么调大 backlog，要么加快 accept（线程池/事件循环）。
+
+**3. 主动方状态机路径**
+
+```text
+ESTABLISHED  --① 发送 FIN-->  FIN_WAIT_1
+FIN_WAIT_1   --② 收到对端 ACK-->  FIN_WAIT_2
+FIN_WAIT_2   --③ 收到对端 FIN-->  TIME_WAIT
+TIME_WAIT    --④ 等待 2MSL 结束-->  CLOSED
+```
+
+注意：
+- ① 是应用调用 `close()`，内核发 FIN；
+- ② 的对端 ACK 只表示"你的 FIN 我收到了"，不表示对端也要关；
+- ③ 表示对端也发完了（它的数据可能早在 ②③ 之间发完）；
+- ④ TIME_WAIT 里要再发一个 ACK 确认③ 的 FIN，并等 2MSL 让旧报文自然死亡。
+
+**4. 为什么 `Connection: close` 的服务器更容易堆 TIME_WAIT**
+
+HTTP/1.1 默认长连接；当服务器在响应里写 `Connection: close` 时，它主动宣告"响应完我就断开"。之后服务器自己调用 close，**主动发送 FIN**——于是服务器成为主动关闭方，进入 TIME_WAIT，堆在自己的端口上。
+
+高并发短连接场景下，每秒成千上万次主动关闭，TIME_WAIT 就会大量堆积，耗尽本地端口（回看 2MSL=60 秒，每连接要等 60 秒才释放）。缓解手段：改用长连接复用（根治）、开 `tcp_tw_reuse`，或把关闭行为设计成让客户端先关。
+</Answer>
 </Callout>

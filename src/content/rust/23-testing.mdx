@@ -135,6 +135,260 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }
 
 <Callout type="exercise" title="练习">
 给第 8 章的 `Rectangle::area` 写单元测试：测 0 尺寸、正常尺寸两种情况，并用 `cargo test` 运行确认全绿。再加一个文档测试示例。
+
+<Answer>
+**参考答案：**
+
+`src/lib.rs`：
+
+```rust
+/// 一个矩形。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rectangle {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Rectangle {
+    /// 创建一个矩形。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use my_lib::Rectangle;
+    ///
+    /// let r = Rectangle::new(3, 4);
+    /// assert_eq!(r.width, 3);
+    /// assert_eq!(r.height, 4);
+    /// ```
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    /// 创建一个正方形。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use my_lib::Rectangle;
+    ///
+    /// let sq = Rectangle::square(5);
+    /// assert_eq!(sq.area(), 25);
+    /// ```
+    pub fn square(size: u32) -> Self {
+        Self { width: size, height: size }
+    }
+
+    /// 计算矩形面积。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use my_lib::Rectangle;
+    ///
+    /// let r = Rectangle::new(3, 4);
+    /// assert_eq!(r.area(), 12);
+    ///
+    /// // 任一边为 0，面积就是 0
+    /// let flat = Rectangle::new(0, 10);
+    /// assert_eq!(flat.area(), 0);
+    /// ```
+    pub fn area(&self) -> u32 {
+        self.width * self.height
+    }
+
+    /// 判断能否容纳另一个矩形。
+    pub fn can_hold(&self, other: &Rectangle) -> bool {
+        self.width > other.width && self.height > other.height
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn area_of_normal_rectangle() {
+        let r = Rectangle::new(3, 4);
+        assert_eq!(r.area(), 12);
+    }
+
+    #[test]
+    fn area_with_zero_width() {
+        let r = Rectangle::new(0, 10);
+        assert_eq!(r.area(), 0, "宽为 0 时面积应为 0");
+    }
+
+    #[test]
+    fn area_with_zero_height() {
+        let r = Rectangle::new(10, 0);
+        assert_eq!(r.area(), 0);
+    }
+
+    #[test]
+    fn area_of_zero_rectangle() {
+        let r = Rectangle::new(0, 0);
+        assert_eq!(r.area(), 0);
+    }
+
+    #[test]
+    fn area_of_square() {
+        assert_eq!(Rectangle::square(5).area(), 25);
+    }
+
+    #[test]
+    fn larger_can_hold_smaller() {
+        let larger = Rectangle::new(8, 7);
+        let smaller = Rectangle::new(5, 1);
+        assert!(larger.can_hold(&smaller));
+        assert!(!smaller.can_hold(&larger));
+    }
+
+    #[test]
+    fn area_overflows_on_huge_values() {
+        // Debug 模式下整型溢出会 panic
+        let r = Rectangle::new(u32::MAX, 2);
+        let result = std::panic::catch_unwind(|| r.area());
+        assert!(result.is_err(), "溢出时应当 panic");
+    }
+}
+```
+
+**运行 `cargo test` 的输出：**
+
+```text
+running 7 tests
+test tests::area_of_normal_rectangle ... ok
+test tests::area_of_square ... ok
+test tests::area_of_zero_rectangle ... ok
+test tests::area_with_zero_height ... ok
+test tests::area_with_zero_width ... ok
+test tests::larger_can_hold_smaller ... ok
+test tests::area_overflows_on_huge_values ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored
+
+   Doc-tests my_lib
+
+running 3 tests
+test src/lib.rs - Rectangle::area (line 38) ... ok
+test src/lib.rs - Rectangle::new (line 10) ... ok
+test src/lib.rs - Rectangle::square (line 24) ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored
+```
+
+注意 `cargo test` 分两批运行：先是 `#[cfg(test)]` 里的单元测试，再是文档注释里的文档测试。
+
+**关键点解析：**
+
+- **`#[cfg(test)]` 的意义**：这个模块只在测试编译时存在，`cargo build --release` 时完全不会被编译进产物，零体积成本
+- **`use super::*;`**：把父模块的所有项引入测试模块。因为 `tests` 是子模块，它能访问父模块的**私有**项——这正是单元测试可以测私有函数的原因
+- **测试函数命名**：用描述性的长名字（`area_with_zero_width` 而非 `test1`）。失败时测试名就是最好的错误说明
+- **`assert_eq!` 的第三个参数**：自定义失败消息，支持格式化。断言失败时会连同左右值一起打印
+- **文档测试里的 `use my_lib::Rectangle;`**：文档测试是作为**外部使用者**编译运行的，所以必须写完整的 `use` 语句，而且只能访问 `pub` 项
+
+**文档测试的额外价值**
+
+它同时是**文档**和**测试**——API 一旦改动导致示例失效，`cargo test` 立刻报错。这从机制上杜绝了「文档里的示例早就跑不通了」这个几乎所有项目都有的顽疾。
+
+用 `cargo doc --open` 生成的 HTML 文档里，这些示例会渲染成漂亮的代码块。
+
+**文档测试的特殊标注：**
+
+````text
+/// ```ignore        —— 不运行（谨慎使用）
+/// ```no_run        —— 只编译不运行（适合会联网、要读文件的示例）
+/// ```should_panic  —— 期望它 panic
+/// ```compile_fail  —— 期望它编译失败（用来演示类型系统的约束）
+````
+
+**隐藏无关的样板代码：** 行首加 `#` 的行会被执行但不显示在文档里：
+
+```rust
+/// ```
+/// # use my_lib::Rectangle;
+/// let r = Rectangle::new(3, 4);
+/// assert_eq!(r.area(), 12);
+/// ```
+```
+
+读者看到的文档就只有后两行，很清爽。
+
+**测试 panic 的标准做法：**
+
+```rust
+#[test]
+#[should_panic]
+fn index_out_of_bounds() {
+    let v = vec![1, 2, 3];
+    let _ = v[99];
+}
+
+#[test]
+#[should_panic(expected = "除数不能为零")]
+fn divide_by_zero() {
+    divide(10, 0);
+}
+```
+
+`expected` 会检查 panic 消息**是否包含**该子串——加上它更严谨，能避免「因为别的原因 panic 了，测试却误判为通过」。
+
+**返回 Result 的测试：**
+
+```rust
+#[test]
+fn parse_config() -> Result<(), Box<dyn std::error::Error>> {
+    let n: i32 = "42".parse()?;    // 可以用 ? 了
+    assert_eq!(n, 42);
+    Ok(())
+}
+```
+
+返回 `Err` 即视为测试失败。好处是测试体里能用 `?`，不用到处 `unwrap()`。注意这种测试**不能**配合 `#[should_panic]`。
+
+**集成测试：从用户视角验证**
+
+在项目根目录建 `tests/` 目录（与 `src/` 同级）：
+
+```text
+my_lib/
+  src/lib.rs
+  tests/
+    integration_test.rs
+```
+
+`tests/integration_test.rs`：
+
+```rust
+use my_lib::Rectangle;
+
+#[test]
+fn rectangle_workflow() {
+    let r = Rectangle::new(10, 20);
+    assert_eq!(r.area(), 200);
+
+    let sq = Rectangle::square(5);
+    assert!(r.can_hold(&sq));
+}
+```
+
+`tests/` 下每个文件都是独立的 crate，只能访问 `pub` API——这恰好模拟了真实用户的使用方式，能帮你发现「某个类型忘了加 `pub`」这类问题。
+
+**常用命令：**
+
+```bash
+cargo test                        # 全部测试
+cargo test area                   # 只跑名字含 "area" 的
+cargo test -- --nocapture         # 显示 println! 输出（默认被吞掉）
+cargo test -- --test-threads=1    # 串行执行（默认并行）
+cargo test --lib                  # 只跑单元测试
+cargo test --doc                  # 只跑文档测试
+cargo test --test integration_test  # 只跑指定的集成测试文件
+```
+
+**测试覆盖率：** 想知道哪些代码没被测到，可以用 `cargo install cargo-llvm-cov` 然后运行 `cargo llvm-cov --html`。
+</Answer>
 </Callout>
 
 ## 小结

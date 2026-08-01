@@ -130,6 +130,106 @@ struct User { /* ... */ }
 
 <Callout type="exercise" title="练习">
 定义一个 `struct Rectangle { width: u32, height: u32 }`，实现方法 `fn area(&self) -> u32`，再写一个关联函数 `fn square(size: u32) -> Rectangle`。用 `derive(Debug)` 打印一个实例。
+
+<Answer>
+**参考答案：**
+
+```rust
+#[derive(Debug)]
+struct Rectangle {
+    width: u32,
+    height: u32,
+}
+
+impl Rectangle {
+    // 关联函数：无 self，用作构造器，调用时用 ::
+    fn new(width: u32, height: u32) -> Rectangle {
+        Rectangle { width, height }   // 字段初始化简写
+    }
+
+    // 关联函数：构造正方形
+    fn square(size: u32) -> Rectangle {
+        Rectangle {
+            width: size,
+            height: size,
+        }
+    }
+
+    // 方法：只读，用 &self
+    fn area(&self) -> u32 {
+        self.width * self.height
+    }
+
+    // 方法：判断能否容纳另一个矩形
+    fn can_hold(&self, other: &Rectangle) -> bool {
+        self.width > other.width && self.height > other.height
+    }
+
+    // 方法：原地缩放，需要 &mut self
+    fn scale(&mut self, factor: u32) {
+        self.width *= factor;
+        self.height *= factor;
+    }
+}
+
+fn main() {
+    let rect = Rectangle::new(30, 50);
+    println!("{:?}", rect);
+    println!("面积 = {}", rect.area());
+
+    let sq = Rectangle::square(20);
+    println!("{:?}", sq);
+    println!("正方形面积 = {}", sq.area());
+
+    println!("rect 能装下 sq 吗？{}", rect.can_hold(&sq));
+
+    // 漂亮打印（多行缩进）
+    println!("{:#?}", rect);
+
+    let mut growing = Rectangle::square(5);
+    growing.scale(3);
+    println!("放大后：{:?}，面积 {}", growing, growing.area());
+}
+```
+
+**输出：**
+
+```text
+Rectangle { width: 30, height: 50 }
+面积 = 1500
+Rectangle { width: 20, height: 20 }
+正方形面积 = 400
+rect 能装下 sq 吗？true
+Rectangle {
+    width: 30,
+    height: 50,
+}
+放大后：Rectangle { width: 15, height: 15 }，面积 225
+```
+
+**要点解析：**
+
+- **方法 vs 关联函数**：带 `self` 参数的是**方法**，用 `实例.方法()` 调用；不带 `self` 的是**关联函数**，用 `类型::函数()` 调用。`square` 和 `new` 属于后者，`String::from` 也是同样的道理
+- **`area` 为什么用 `&self`**：它只读取字段、不修改，所以借用就够了。如果写成 `self`（取得所有权），调用一次后实例就被消耗掉了，`rect.area()` 之后再用 `rect` 会报错
+- **字段初始化简写**：参数名和字段名相同时，`Rectangle { width, height }` 等价于 `Rectangle { width: width, height: height }`
+- **`can_hold(&self, other: &Rectangle)`**：第二个参数也用引用，这样调用 `rect.can_hold(&sq)` 后 `sq` 依然可用
+- **`{:?}` vs `{:#?}`**：前者单行紧凑，后者多行缩进，调试大结构体时后者可读性更好
+- **`#[derive(Debug)]` 的作用**：自动为结构体生成 `Debug` trait 实现。没有它，`println!("{:?}", rect)` 会报 ``Rectangle doesn't implement Debug``
+
+**关于 `Self` 关键字：**
+
+在 `impl` 块内部，可以用 `Self` 代替具体类型名，重构时更省事：
+
+```rust
+impl Rectangle {
+    fn square(size: u32) -> Self {
+        Self { width: size, height: size }
+    }
+}
+```
+
+这是社区更推崇的写法。
+</Answer>
 </Callout>
 
 ## 小结

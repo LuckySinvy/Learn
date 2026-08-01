@@ -313,4 +313,63 @@ git config --global commit.template ~/.gitmessage
 2. 在某个提交里加入字符串 `TIMEOUT = 30`，在后面的提交里把它删掉。用 `git log -S 'TIMEOUT'` 找出这两个提交，并解释为什么中间那些提交没有被列出来。
 3. 用 `--pretty=format` 自定义一个输出：`短哈希 | 相对时间 | 标题`，并加上 `--graph`。
 4. 把下面这条差劲的提交信息改写成符合 Conventional Commits 的形式，正文要补上"为什么"：`更新了缓存代码`（背景：原来缓存永不过期导致用户改了昵称后一天都不生效，现在改成 10 分钟过期）。
+
+<Answer>
+**参考答案：**
+
+**1. `--grep` vs `--oneline -2`**
+
+```bash
+git init -q
+for m in "feat: 初始化项目" "fix(auth): 修复登录跳转" "docs: 补充说明" "fix(order): 修复金额计算" "chore: 清理日志"; do
+  echo "$m" >> log.txt
+  git add . && git commit -q -m "$m"
+done
+```
+
+- `git log --oneline --grep='fix'`：遍历**全部历史**，按提交信息内容筛选，列出信息里含 `fix` 的两个提交（`fix(auth): ...` 和 `fix(order): ...`）。
+- `git log --oneline -2`：不管信息内容，只取**最近的 2 条**提交（这里是最新的 `chore` 和 `fix(order)` 两条）。
+
+两者的区别是"按内容过滤"还是"按数量截断"，正好对应筛选与限制两种需求。
+
+**2. `git log -S` 找出加/删某串的提交**
+
+```bash
+echo 'TIMEOUT = 30' > config.py
+git add . && git commit -q -m "feat: 引入超时配置"
+echo 'TIMEOUT = 60' > config.py
+git add . && git commit -q -m "chore: 调大超时"
+rm config.py && echo 'x = 1' > config.py
+git add . && git commit -q -m "fix: 移除超时配置"
+git log --oneline -S 'TIMEOUT = 30'
+```
+
+`-S` 是 pickaxe 搜索：只列出**该字符串在提交前后出现次数发生变化的提交**。`TIMEOUT = 30` 在引入时出现次数从 0 变成 1（+1），被改写成 `TIMEOUT = 60` 时从 1 变成 0（-1），这两条都会被列出。而中间的提交（如果该串保持出现次数不变）不会出现——比如那次"调大超时"把 30 改成 60，对 `TIMEOUT = 30` 而言是删除，所以也会被列出；关键是**内容没增没减的中间提交**不会入选。
+
+（说明：如果某个中间提交改的是别处、`TIMEOUT = 30` 一直在，它的出现次数没变，就不会被列出来，这就是"中间提交没有被列出"的原因。）
+
+**3. 自定义 format + 拓扑图**
+
+```bash
+git log --graph --pretty=format:'%h | %ar | %s'
+```
+
+占位符含义：`%h` 短哈希、`%ar` 相对时间（如 "3 days ago"）、`%s` 提交标题。`--graph` 会在左边画 `*` 和分支连线，与自定义格式互不影响。
+
+**4. 改写提交信息**
+
+```text
+fix(cache): 缓存改为 10 分钟过期
+
+原实现缓存永不过期，用户修改昵称后最长一天内
+仍显示旧值，反馈强烈。
+
+改为 10 分钟过期，保证昵称等展示信息最迟
+10 分钟内生效；代价是缓存命中率略降，可接受。
+
+Closes #128
+```
+
+用 `fix` 因为这是修 bug；scope 写 `cache`；标题说清"做了什么"；正文解释"为什么"——原行为的问题、新方案的选择与代价。
+</Answer>
 </Callout>

@@ -401,6 +401,192 @@ type DeepReadonly<T> = {
 2. 写一个 `DeepReadonly<T>`：递归地把嵌套对象的所有属性都变成只读（提示：值是对象时递归调用自身）。
 3. 写一个 `FunctionKeys<T>`：用 key remapping 加 `never` 过滤，只保留 `T` 中值为函数的键名。
 4. 验证 never 陷阱：定义 `type Wrap<T> = T extends unknown ? T[] : never`，分别传入 `never` 和 `string`，观察结果差异。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：手写 MyPick 与 MyOmit**
+
+```ts
+type MyPick<T, K extends keyof T> = {
+  [P in K]: T[P];
+};
+
+// Omit = 先用 Exclude 把要删的键从 keyof T 里剔掉，再 Pick 剩下的
+type MyOmit<T, K extends keyof T> = MyPick<T, Exclude<keyof T, K>>;
+
+interface User {
+  id: number;
+  name: string;
+  password: string;
+  email: string;
+}
+
+type PublicUser = MyPick<User, "id" | "name">;
+// { id: number; name: string }
+
+type SafeUser = MyOmit<User, "password">;
+// { id: number; name: string; email: string }
+
+const a: PublicUser = { id: 1, name: "Ada" };
+// const bad: PublicUser = { id: 1, name: "Ada", email: "x" };  // 错误：email 不存在
+
+const b: SafeUser = { id: 2, name: "Alan", email: "alan@x.com" };
+// b.password;   // 错误：属性 password 不存在
+
+console.log(a.name + " / " + b.email);
+```
+
+要点：
+
+- `MyPick` 映射的是 `K` 而不是 `keyof T`，所以只产出被挑中的那几个键。注意它**不是同态映射**（映射源不是 `keyof T`），因此不会自动保留原有的 `readonly` 与 `?` 修饰符——这也是内置 `Pick` 的真实行为。
+- `MyOmit` 完全建立在 `MyPick` + `Exclude` 之上，一行搞定。这体现了工具类型的可组合性：`Exclude` 负责在键名联合上做减法，`Pick` 负责按键名构造对象。
+- 这里的 `Exclude<keyof T, K>` 用到了分发：`keyof T` 是联合，逐个成员判断是否属于 `K`，命中的变 `never` 被自动剔除。
+
+**第 2 题：DeepReadonly**
+
+```ts
+type DeepReadonly<T> = T extends (...args: any[]) => any
+  ? T                                    // 函数原样返回，不要展开它的属性
+  : T extends object
+    ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+    : T;                                 // 原始类型是递归的终点
+
+interface Config {
+  name: string;
+  server: {
+    host: string;
+    ports: number[];
+    auth: { user: string; token: string };
+  };
+  onError: (e: Error) => void;
+}
+
+type FrozenConfig = DeepReadonly<Config>;
+
+const cfg: FrozenConfig = {
+  name: "prod",
+  server: {
+    host: "example.com",
+    ports: [80, 443],
+    auth: { user: "admin", token: "t0ken" },
+  },
+  onError: (e) => console.log(e.message),
+};
+
+console.log(cfg.server.auth.user);   // admin
+
+// 下面每一行都会报错：只读一直穿透到最深层
+// cfg.name = "dev";
+// cfg.server.host = "other.com";
+// cfg.server.auth.token = "new";
+// cfg.server.ports.push(8080);       // 数组也变成了 readonly number[]
+```
+
+要点：
+
+- **终止条件有两个**：原始类型（`string`、`number` 等不满足 `extends object`）直接返回自身；函数被单独挡在最前面。
+- 为什么要特判函数？函数在 TypeScript 里满足 `T extends object`。如果不排除，`onError` 会被当成对象逐个映射属性，结果变成 `{ readonly length: ...; readonly name: ... }` 这种面目全非的东西，再也没法调用了。这正是本章 Callout 强调的「**先想清楚在哪里停下来**」。
+- 实际项目中通常还要排除 `Date`、`Map`、`Set`、`RegExp` 等内置对象：
+
+```ts
+type DeepReadonly<T> = T extends (...args: any[]) => any
+  ? T
+  : T extends Date | RegExp
+    ? T
+    : T extends Map<infer K, infer V>
+      ? ReadonlyMap<DeepReadonly<K>, DeepReadonly<V>>
+      : T extends object
+        ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+        : T;
+```
+
+分支越加越多，编译也越来越慢——这就是本章说「类型编程要克制」的现实原因。日常项目里，内置的浅层 `Readonly<T>` 往往就够用了。
+
+**第 3 题：FunctionKeys**
+
+```ts
+type FunctionKeys<T> = {
+  [K in keyof T as T[K] extends (...args: any[]) => any ? K : never]: T[K];
+};
+
+// 只想要键名的联合，而不是整个对象类型时，再取一次 keyof
+type FunctionKeyNames<T> = keyof FunctionKeys<T>;
+
+interface Service {
+  name: string;
+  version: number;
+  start(): void;
+  stop(): Promise<void>;
+  onTick: (n: number) => void;
+  config: { retries: number };
+}
+
+type Methods = FunctionKeys<Service>;
+// { start(): void; stop(): Promise<void>; onTick: (n: number) => void }
+
+type MethodNames = FunctionKeyNames<Service>;
+// "start" | "stop" | "onTick"
+
+const names: MethodNames[] = ["start", "stop", "onTick"];
+// const bad: MethodNames = "name";   // 错误：name 的值不是函数，已被过滤
+
+console.log(names.join(", "));   // start, stop, onTick
+
+// 实用场景：只允许调用对象上的方法
+function callMethod<T, K extends FunctionKeyNames<T>>(obj: T, key: K): void {
+  const fn = obj[key as keyof T];
+  if (typeof fn === "function") (fn as () => void).call(obj);
+}
+```
+
+要点：
+
+- 核心机制是 `as` 子句求值为 `never` 时**该键会被整个丢弃**。值不是函数的键（`name`、`version`、`config`）在 `as` 处映射为 `never`，于是从结果类型中消失。
+- 注意 `onTick` 也被保留了：它是一个**属性**而非方法，但值的类型确实是函数，符合题目要求「值为函数的键」。
+- 函数的匹配模式统一写 `(...args: any[]) => any`。这里用 `any` 而不是 `unknown` 是有原因的：`(...args: unknown[]) => unknown` 会因为参数的逆变规则漏掉一部分函数类型（比如 `(n: number) => void` 就匹配不上）。这是少数几个 `any` 更合适的场合。
+
+**第 4 题：验证 never 陷阱**
+
+```ts
+type Wrap<T> = T extends unknown ? T[] : never;
+
+type W1 = Wrap<string>;            // string[]        —— 符合直觉
+type W2 = Wrap<string | number>;   // string[] | number[]  —— 分发了
+type W3 = Wrap<never>;             // never           —— 陷阱在这里！
+```
+
+很多人会预期 `Wrap<never>` 得到 `never[]`，实际却是 `never`。用赋值来验证：
+
+```ts
+const w1: W1 = ["a", "b"];         // 合法
+const w3a: W3 = [];                // 错误：不能将类型 never[] 分配给类型 never
+// 事实上 W3 是 never，没有任何值能赋给它
+```
+
+**原因：** `never` 是**空联合**——不包含任何成员的联合类型。分发式条件类型的工作方式是「把联合拆成成员，逐个代入，再把结果并起来」。空联合里没有成员可以遍历，所以循环一次都不执行，结果自然是空联合，也就是 `never`。
+
+用 `Exclude` 更能看清这个逻辑：
+
+```ts
+type E1 = Exclude<"a" | "b", "a">;   // "b"      —— 遍历 2 个成员
+type E2 = Exclude<"a", "a">;         // never    —— 遍历 1 个，被剔除
+type E3 = Exclude<never, "a">;       // never    —— 遍历 0 个
+```
+
+**关掉分发就能拿到「直觉答案」：**
+
+```ts
+type WrapNoDist<T> = [T] extends [unknown] ? T[] : never;
+
+type W4 = WrapNoDist<never>;   // never[]   ← 这次符合直觉了
+const w4: W4 = [];             // 合法
+```
+
+因为 `[never]` 是一个元组类型，不是裸类型参数，分发被关闭，`T` 被整体当作 `never` 代入 `T[]`。
+
+**实践提醒：** 遇到「我的条件类型明明写对了，结果却是 `never`」，第一个要怀疑的就是输入是不是 `never`。这种情况常出现在链式的类型运算中——上一步的 `Exclude` 或 `Extract` 恰好把所有成员都过滤光了，产出 `never`，后续每一步都跟着变成 `never`，而报错却出现在很远的地方。
+</Answer>
 </Callout>
 
 ## 小结

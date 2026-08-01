@@ -98,6 +98,167 @@ let r2: &str = s.as_str();           // 等价写法
 
 <Callout type="exercise" title="练习">
 写一个 `fn reverse_chars(s: &str) -> String`，按 Unicode 字符反转字符串（用 `chars().rev().collect()`）。对「Rust语言」调用，验证是「言语tsuR」而非按字节乱码。
+
+<Answer>
+**参考答案：**
+
+```rust
+fn reverse_chars(s: &str) -> String {
+    s.chars().rev().collect()
+}
+
+fn main() {
+    let s = "Rust语言";
+
+    println!("原串：{}", s);
+    println!("反转：{}", reverse_chars(s));
+
+    println!("字节数 = {}", s.len());              // 10
+    println!("字符数 = {}", s.chars().count());    // 6
+
+    // 更多例子
+    println!("{}", reverse_chars("hello"));        // olleh
+    println!("{}", reverse_chars("你好世界"));      // 界世好你
+    println!("{}", reverse_chars(""));             // 空串
+}
+```
+
+**输出：**
+
+```text
+原串：Rust语言
+反转：言语tsuR
+字节数 = 10
+字符数 = 6
+hello -> olleh
+你好世界 -> 界世好你
+```
+
+**为什么 `Rust语言` 是 10 字节？**
+
+`R`、`u`、`s`、`t` 是 ASCII，各占 1 字节；`语`、`言` 是中文，UTF-8 下各占 3 字节。合计 `4 + 3 + 3 = 10`。
+
+**如果按字节反转会怎样？**
+
+```rust
+fn reverse_bytes_wrong(s: &str) -> String {
+    let bytes: Vec<u8> = s.bytes().rev().collect();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn main() {
+    println!("{}", reverse_bytes_wrong("Rust语言"));
+    // 输出：������tsuR  —— 中文字符的字节序被打乱，变成非法 UTF-8
+}
+```
+
+中文字符的 3 个字节顺序被颠倒后，不再构成合法的 UTF-8 序列。`from_utf8_lossy` 只能用替换字符 `U+FFFD` 顶替。这正是「Rust 不允许你直接按字节索引字符串」的原因——它宁可让你多写 `.chars()`，也不让你悄悄产出乱码。
+
+**`chars()` 也不是万能的：字素簇（grapheme cluster）**
+
+`chars()` 迭代的是 **Unicode 标量值**，但「用户眼中的一个字符」可能由多个标量值组成：
+
+```rust
+fn main() {
+    // 带组合音标的字符
+    let s = "e\u{301}";   // e + 组合尖音符 = é
+    println!("看起来是：{}", s);                  // é
+    println!("字符数 = {}", s.chars().count());   // 2！
+    println!("反转后：{}", reverse_chars(s));     // ́e —— 音标跑到前面去了
+
+    // emoji 家族（由多个 emoji 加零宽连接符组成）
+    let family = "👨‍👩‍👧";
+    println!("字符数 = {}", family.chars().count());   // 5
+}
+```
+
+要正确处理这类情况，需要 `unicode-segmentation` crate：
+
+```toml
+[dependencies]
+unicode-segmentation = "1"
+```
+
+```rust
+use unicode_segmentation::UnicodeSegmentation;
+
+fn reverse_graphemes(s: &str) -> String {
+    s.graphemes(true).rev().collect()
+}
+
+fn main() {
+    let s = "e\u{301}llo";
+    println!("{}", reverse_chars(s));       // 音标错位
+    println!("{}", reverse_graphemes(s));   // olle� —— 正确保持 é 完整
+}
+```
+
+**三个层次，按需选择：**
+
+| 层次 | 方法 | 适用场景 |
+|---|---|---|
+| 字节 `u8` | `.bytes()` / `.len()` | 网络传输、文件大小、二进制处理 |
+| 标量值 `char` | `.chars()` | 大多数文本处理，本题的正确答案 |
+| 字素簇 | `.graphemes(true)` | 光标移动、截断显示、用户可见的"字符数" |
+
+**其他常见的字符串操作：**
+
+```rust
+fn main() {
+    let s = "Hello, 世界!";
+
+    // 带字节索引的字符遍历
+    for (i, c) in s.char_indices() {
+        print!("{}:{} ", i, c);
+    }
+    // 0:H 1:e 2:l 3:l 4:o 5:, 6:  7:世 10:界 13:!
+    // 注意索引不连续——中文占 3 字节
+    println!();
+
+    // 安全地取前 n 个字符（不会 panic）
+    let prefix: String = s.chars().take(5).collect();
+    println!("{}", prefix);   // Hello
+
+    // 查找与替换
+    println!("{:?}", s.find('世'));           // Some(7) —— 字节索引
+    println!("{}", s.replace("世界", "Rust"));
+
+    // 大小写、去空白、切分
+    println!("{}", "  hi  ".trim());
+    println!("{:?}", "a,b,c".split(',').collect::<Vec<_>>());
+    println!("{}", "abc".to_uppercase());
+
+    // 判断
+    println!("{}", s.starts_with("Hello"));
+    println!("{}", s.contains("世"));
+}
+```
+
+**安全截断字符串的实用函数**
+
+直接 `&s[0..n]` 可能切在字符中间导致 panic。这个版本永远安全：
+
+```rust
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+fn main() {
+    println!("{}", truncate_chars("Rust语言编程", 6));   // Rust语言
+}
+```
+
+也可以用 `char_indices` 找到安全的字节边界，这样能返回 `&str` 而不用分配新 `String`：
+
+```rust
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,   // 字符数不足，返回全部
+    }
+}
+```
+</Answer>
 </Callout>
 
 ## 小结

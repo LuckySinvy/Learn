@@ -66,6 +66,336 @@ ERP、内部系统的凭证应走插件环境变量或 Dify 的密钥配置，�
 
 <Callout type="exercise" title="动手做">
 挑一个你最熟悉的简单 HTTP 接口（如查询天气、查快递），写一份插件清单，声明 1 个参数与 1 个返回字段，并试着在 Dify 里加载为工具。
+
+<Answer>
+**参考答案：**
+
+以「查询城市天气」为例。先说清楚一件事：Dify 里接外部 HTTP 接口有**两条路**，难度差很多，建议先走简单的那条。
+
+| 方式 | 难度 | 适用 |
+|---|---|---|
+| **自定义工具（OpenAPI 导入）** | 低，纯配置无需写代码 | 接口是标准 REST，直接转发即可 |
+| **插件（Plugin）** | 中，要写代码打包 | 需要鉴权处理、数据加工、多接口聚合 |
+
+**路径一：自定义工具（推荐先做这个）**
+
+「工具 → 创建自定义工具」，粘贴 OpenAPI schema：
+
+```yaml
+openapi: 3.1.0
+info:
+  title: 天气查询
+  description: 查询指定城市的实时天气
+  version: 1.0.0
+servers:
+  - url: https://api.openweathermap.org/data/2.5
+paths:
+  /weather:
+    get:
+      operationId: get_current_weather
+      summary: 查询指定城市当前天气
+      description: >
+        当用户询问某个城市的实时天气、气温、天气状况时使用本工具。
+        输入城市的英文名或拼音（如 Beijing、Shanghai）。
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: 城市名称，英文或拼音，例如 Beijing
+          schema:
+            type: string
+        - name: units
+          in: query
+          required: false
+          description: 单位制，metric 为摄氏度
+          schema:
+            type: string
+            default: metric
+        - name: lang
+          in: query
+          required: false
+          schema:
+            type: string
+            default: zh_cn
+      responses:
+        "200":
+          description: 天气数据
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    description: 城市名
+                  main:
+                    type: object
+                    properties:
+                      temp:
+                        type: number
+                        description: 当前温度（摄氏度）
+                  weather:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        description:
+                          type: string
+                          description: 天气状况描述
+```
+
+鉴权配置（在「鉴权方法」里填，不要写进 schema）：
+
+```text
+鉴权类型: API Key
+传参位置: Query 参数
+参数名:   appid
+值:       你的 API Key
+```
+
+保存后在应用的「工具」区就能勾选使用了。整个过程不用写一行代码。
+
+**路径二：插件开发（manifest + 实现）**
+
+需要更强的控制力时才走这条。Dify 插件的目录结构：
+
+```text
+weather-plugin/
+├── manifest.yaml           # 插件元信息
+├── requirements.txt
+├── main.py                 # 插件入口
+├── provider/
+│   ├── weather.yaml        # 供应商级配置（凭据定义）
+│   └── weather.py          # 凭据校验逻辑
+├── tools/
+│   ├── get_weather.yaml    # 工具声明
+│   └── get_weather.py      # 工具实现
+└── _assets/
+    └── icon.svg
+```
+
+**`manifest.yaml`**
+
+```yaml
+version: 0.1.0
+type: plugin
+author: your-name
+name: weather-plugin
+label:
+  zh_Hans: 天气查询
+  en_US: Weather Lookup
+description:
+  zh_Hans: 查询指定城市的实时天气
+  en_US: Look up current weather for a city
+icon: icon.svg
+resource:
+  memory: 268435456
+  permission: {}
+plugins:
+  tools:
+    - provider/weather.yaml
+meta:
+  version: 0.0.1
+  arch:
+    - amd64
+    - arm64
+  runner:
+    language: python
+    version: "3.12"
+    entrypoint: main
+```
+
+**`provider/weather.yaml`** —— 凭据在这里声明，绝不硬编码
+
+```yaml
+identity:
+  author: your-name
+  name: weather
+  label:
+    zh_Hans: 天气查询
+  icon: icon.svg
+credentials_for_provider:
+  api_key:
+    type: secret-input          # secret-input 会在 UI 上打码
+    required: true
+    label:
+      zh_Hans: API Key
+    placeholder:
+      zh_Hans: 请输入 OpenWeatherMap API Key
+    help:
+      zh_Hans: 在 openweathermap.org 注册后获取
+tools:
+  - tools/get_weather.yaml
+extra:
+  python:
+    source: provider/weather.py
+```
+
+**`tools/get_weather.yaml`** —— 参数与描述
+
+```yaml
+identity:
+  name: get_weather
+  author: your-name
+  label:
+    zh_Hans: 查询天气
+description:
+  human:
+    zh_Hans: 查询指定城市的实时天气
+  llm: >
+    Get the current weather for a specified city.
+    Use this when the user asks about temperature, weather conditions,
+    or forecast for a specific location.
+    Input: city name in English or pinyin (e.g. Beijing, Shanghai).
+    Returns: city name, temperature in Celsius, and weather description.
+parameters:
+  - name: city
+    type: string
+    required: true
+    form: llm                   # llm 表示由模型填写；form 表示用户在 UI 填
+    label:
+      zh_Hans: 城市
+    human_description:
+      zh_Hans: 要查询的城市名称
+    llm_description: >
+      City name in English or pinyin, e.g. "Beijing", "Shanghai".
+      Do not use Chinese characters.
+extra:
+  python:
+    source: tools/get_weather.py
+```
+
+**`tools/get_weather.py`** —— 实现
+
+```python
+from collections.abc import Generator
+from typing import Any
+
+import requests
+from dify_plugin import Tool
+from dify_plugin.entities.tool import ToolInvokeMessage
+
+API_URL = "https://api.openweathermap.org/data/2.5/weather"
+
+
+class GetWeatherTool(Tool):
+    def _invoke(
+        self, tool_parameters: dict[str, Any]
+    ) -> Generator[ToolInvokeMessage, None, None]:
+        city = (tool_parameters.get("city") or "").strip()
+        if not city:
+            yield self.create_text_message("错误：城市名称不能为空")
+            return
+
+        # 凭据从运行时注入，不出现在代码里
+        api_key = self.runtime.credentials.get("api_key")
+
+        try:
+            resp = requests.get(
+                API_URL,
+                params={
+                    "q": city,
+                    "appid": api_key,
+                    "units": "metric",
+                    "lang": "zh_cn",
+                },
+                timeout=10,
+            )
+        except requests.RequestException as e:
+            yield self.create_text_message(f"网络请求失败：{e}")
+            return
+
+        if resp.status_code == 404:
+            yield self.create_text_message(
+                f"未找到城市「{city}」，请确认使用英文名或拼音。"
+            )
+            return
+        if resp.status_code == 401:
+            yield self.create_text_message("API Key 无效，请在插件设置中检查凭据。")
+            return
+        if resp.status_code != 200:
+            yield self.create_text_message(
+                f"查询失败：HTTP {resp.status_code}"
+            )
+            return
+
+        data = resp.json()
+        temp = data["main"]["temp"]
+        desc = data["weather"][0]["description"]
+        name = data.get("name", city)
+
+        # 给模型看的文本
+        yield self.create_text_message(
+            f"{name} 当前天气：{desc}，气温 {temp}°C。"
+        )
+        # 给下游节点用的结构化数据
+        yield self.create_json_message({
+            "city": name,
+            "temperature": temp,
+            "description": desc,
+        })
+```
+
+**本地调试**
+
+```bash
+# 安装 CLI
+pip install dify-plugin
+
+# 初始化脚手架（比手写目录快得多）
+dify plugin init
+
+# 本地运行，通过 remote 模式连到你的 Dify 实例
+dify plugin dev .
+
+# 打包
+dify plugin package ./weather-plugin
+# 产出 weather-plugin.difypkg，在「插件 → 安装插件 → 本地上传」加载
+```
+
+**加载后的验证**
+
+```text
+1. 插件页面填入 API Key → 保存，应显示「已授权」
+2. 新建 Agent 应用，工具区勾选「查询天气」
+3. 问：「北京现在天气怎么样？」
+4. 观察工具调用轨迹：
+   🔧 get_weather(city="Beijing")
+   ✅ 返回：北京 当前天气：晴，气温 24°C。
+   💬 模型基于返回生成回答
+```
+
+**验证边界行为（更重要）**
+
+```text
+□ 问「火星天气怎么样」→ 应返回「未找到城市」而不是崩溃
+□ 故意填错 API Key → 应提示凭据无效，而不是抛出堆栈
+□ 问「今天心情怎么样」→ 模型不应调用这个工具
+□ 断网 → 应返回网络错误提示，不应超时挂死
+```
+
+**本练习最该带走的三点**
+
+1. **description 是插件的灵魂**（正文第 2 节 tip 的实证）。`llm_description` 写清「什么时候用、输入什么格式、返回什么」，模型才调得准。参数描述里的「Do not use Chinese characters」这类约束能避免大量参数错误。
+2. **凭据必须走 `credentials_for_provider`**（正文那条 warn）。用 `secret-input` 类型声明，运行时从 `self.runtime.credentials` 读取。硬编码在代码里的密钥会随插件包一起分发出去，等于公开。
+3. **错误要转成人话返回，不要抛异常**。工具抛异常时 Agent 拿到的是一堆堆栈信息，它会困惑甚至重试到超限。返回一句「未找到城市，请用英文名」，模型就知道该怎么补救——这个细节对 Agent 的可用性影响很大。
+
+**什么时候该写插件而不是用自定义工具**
+
+```text
+用自定义工具就够：
+  ✅ 标准 REST 接口，参数直接透传
+  ✅ 鉴权是简单的 API Key / Bearer
+  ✅ 返回的 JSON 模型能直接看懂
+
+需要写插件：
+  ✅ 鉴权复杂（OAuth 流程、签名计算、token 自动刷新）
+  ✅ 要聚合多个接口的结果
+  ✅ 返回数据需要清洗、转换、裁剪后才适合喂给模型
+  ✅ 要接入模型供应商（自定义工具做不到）
+  ✅ 要复用给多个团队 / 上架插件市场
+```
+</Answer>
 </Callout>
 
 ## 小结

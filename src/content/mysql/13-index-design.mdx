@@ -192,4 +192,164 @@ SELECT * FROM sys.schema_unused_indexes;
 1. 针对查询 `WHERE status = 1 AND created_at >= ? ORDER BY created_at DESC LIMIT 20`，设计 orders 表的最优索引并说明列顺序理由。
 2. 建索引 `(user_id, created_at)` 后，分别 EXPLAIN 覆盖查询（只取索引内列）与非覆盖查询，对比 Extra 列的 Using index。
 3. 写出三条会让索引失效的 SQL 并各给出修正版本。
+
+<Answer>
+**参考答案：**
+
+**1. 为 `status` 等值 + `created_at` 范围/排序设计索引**
+
+```sql
+ALTER TABLE orders ADD INDEX idx_status_created (status, created_at);
+```
+
+**列顺序理由**（这是索引设计的核心口诀）：
+
+- **等值条件列必须放最前面**。`status = 1` 是等值，把它放第一列后，索引树上所有 `status = 1` 的记录**连续存放**，一次定位即可圈定范围。
+- **范围 / 排序列放在等值列后面**。在 `status = 1` 这一段连续区间内部，记录**天然按 `created_at` 有序**——于是 `created_at >= ?` 可以直接在这段区间里二分定位起点，而 `ORDER BY created_at DESC` 只需**沿叶子双向链表反向扫描**，完全不需要排序，EXPLAIN 的 Extra 里不会出现 `Using filesort`。
+- 配合 `LIMIT 20`，扫够 20 行就能停止，这是「索引消除排序」带来的最大收益：**不需要把满足条件的全部行读出来排序后再取前 20**。
+
+如果顺序反过来建成 `(created_at, status)` 会怎样：
+
+- `created_at` 是范围条件，**「范围之后的列失效」**——`status` 无法用于树上定位，只能靠 ICP 在索引里过滤或回表后过滤；
+- 更糟的是索引里记录先按 `created_at` 排，`status = 1` 的行散落各处，要扫描整个时间范围的所有行。
+
+验证：
+
+```sql
+EXPLAIN SELECT id, order_no, status, total_amount, created_at
+FROM orders
+WHERE status = 1 AND created_at >= '2026-07-01'
+ORDER BY created_at DESC
+LIMIT 20;
+-- key: idx_status_created
+-- type: range
+-- Extra: 不含 Using filesort   ← 关键
+```
+
+**进一步优化成覆盖索引**：如果这个列表页只展示 `order_no / total_amount`，可以把它们追加到索引尾部，彻底消灭回表：
+
+```sql
+ALTER TABLE orders
+  ADD INDEX idx_status_created_cover (status, created_at, order_no, total_amount);
+-- EXPLAIN 的 Extra 会出现 Using index
+```
+
+代价是索引变宽、写入变慢，只对高频核心查询这么做。
+
+**一个反直觉的补充**：`status` 只有 5 个值，区分度极低，**单独**给它建索引几乎没用（筛完还剩 20%+ 的行，优化器多半直接全表扫）。但作为联合索引的**第一列**它很有价值——因为真正干活的是后面的 `created_at`，`status` 只是把范围收窄一档。所以「低区分度列不建索引」是针对单列索引说的，别教条。
+
+**2. 覆盖 vs 非覆盖的 EXPLAIN 对比**
+
+```sql
+ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at);
+ANALYZE TABLE orders;   -- 数据太少时记得先造数，否则优化器一律选全表扫
+```
+
+```sql
+-- 覆盖查询：id 是主键（二级索引叶子里本就有）、user_id 和 created_at 是索引列
+EXPLAIN SELECT id, user_id, created_at FROM orders WHERE user_id = 1;
+```
+
+```text
+type: ref
+key : idx_user_created
+Extra: Using index          ← 覆盖索引，全程不回表
+```
+
+```sql
+-- 非覆盖查询：total_amount 不在索引里
+EXPLAIN SELECT id, user_id, total_amount FROM orders WHERE user_id = 1;
+```
+
+```text
+type: ref
+key : idx_user_created
+Extra: NULL                 ← 没有 Using index，说明每行都要回表
+```
+
+两者 `key` 和 `type` **完全一样**，唯一差别就在 Extra 的 `Using index`。这说明：**光看「走没走索引」是不够的，还要看「回不回表」**。
+
+`SELECT *` 则连索引都可能不走：
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 1;
+-- 若 user_id=1 的行占比较大，优化器会算出「回表 N 次的随机 IO」
+-- 比「全表顺序扫描」还贵，于是 key = NULL、type = ALL 主动放弃索引
+```
+
+这正是不写 `SELECT *` 的最硬理由——**多取一个不需要的列，覆盖索引就废了**，甚至可能让索引整个被放弃。
+
+别把三个长得像的 Extra 搞混：
+
+| Extra | 含义 | 是否回表 |
+|---|---|---|
+| `Using index` | 覆盖索引 | **不回表** |
+| `Using index condition` | 索引下推 ICP | 回表，但回表次数被减少了 |
+| `Using where` | Server 层拿到行后再过滤 | 通常回表了 |
+
+**3. 三条索引失效的 SQL 及修正**
+
+**（1）列上包了函数 / 参与运算**
+
+```sql
+-- 失效：函数包住了列，B+ 树是按 created_at 原值排序的，
+-- 无法按 DATE(created_at) 的结果定位 → type=ALL
+SELECT id, order_no FROM orders WHERE DATE(created_at) = '2026-07-01';
+
+-- 修正 A（首选）：改写成范围条件，左闭右开
+SELECT id, order_no FROM orders
+WHERE created_at >= '2026-07-01' AND created_at < '2026-07-02';
+
+-- 修正 B：实在改写不了就建函数索引（8.0.13+）
+ALTER TABLE orders ADD INDEX idx_created_date ((DATE(created_at)));
+```
+
+同类问题还有 `WHERE id + 1 = 10`（改成 `WHERE id = 9`）、`WHERE YEAR(created_at) = 2026`。**口诀：永远不要让列出现在函数或运算符里面，要变换就变换另一侧的常量。**
+
+**（2）隐式类型转换**
+
+```sql
+-- 失效：phone 是 VARCHAR，条件值是数字。
+-- MySQL 会把「列值」CAST 成数字再比较，等价于给列套了函数 → 索引失效
+SELECT * FROM users WHERE phone = 13800000001;
+
+-- 修正：字符串列的条件值必须加引号
+SELECT * FROM users WHERE phone = '13800000001';
+```
+
+除了性能，这里还有**正确性**风险：`'138abc'` 转成数字是 138，可能造成误匹配。
+
+同类的隐蔽场景是 **JOIN 两侧字符集/排序规则不一致**（如 utf8mb4 表关联 utf8mb3 表的字符串列），也会触发隐式转换让被驱动表索引失效——EXPLAIN 里表现为该表 `type = ALL`。修正是统一两表的字符集：
+
+```sql
+ALTER TABLE t2 CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**（3）前导通配符 / 违反最左前缀 / OR**
+
+```sql
+-- 失效 a：前导 %，B+ 树按前缀有序，开头不确定无从定位
+SELECT * FROM products WHERE name LIKE '%Pro%';
+-- 修正：改成前缀匹配；真要全文检索用 FULLTEXT 索引或 Elasticsearch
+SELECT * FROM products WHERE name LIKE 'iPhone%';
+ALTER TABLE products ADD FULLTEXT INDEX ft_name (name);
+SELECT * FROM products WHERE MATCH(name) AGAINST('Pro' IN NATURAL LANGUAGE MODE);
+
+-- 失效 b：索引是 (user_id, created_at)，条件跳过了最左列
+SELECT * FROM orders WHERE created_at >= '2026-07-01';
+-- 修正：补上最左列，或为该查询单建 (created_at) 索引
+SELECT * FROM orders WHERE user_id = 1 AND created_at >= '2026-07-01';
+
+-- 失效 c：OR 一侧无索引，整条语句退化为全表扫描
+SELECT * FROM orders WHERE user_id = 1 OR total_amount > 10000;
+-- 修正：拆成 UNION（两边各走各的索引），或给 total_amount 补索引
+SELECT * FROM orders WHERE user_id = 1
+UNION
+SELECT * FROM orders WHERE total_amount > 10000;
+```
+
+注意失效 c 用 `UNION` 而非 `UNION ALL`——OR 的语义是取并集且去重，两个分支可能返回同一行。
+
+最后提醒：EXPLAIN 显示 `type = ALL` 不一定都是「索引失效」。如果表很小，或优化器估算出「回表次数太多、随机 IO 比顺序全扫还贵」，主动放弃索引是**理性选择**。这时可以用 `FORCE INDEX` 对照跑一下，如果强制走索引反而更慢，说明优化器是对的。
+</Answer>
 </Callout>

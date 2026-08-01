@@ -218,4 +218,70 @@ Google、Meta 用 monorepo（配强工具链）；大多数微服务团队用多
 2. 在子模块目录里 `cd libs/core && git status`，观察是否处于"HEAD detached"。先 `git checkout main` 再改文件、提交、push，回主项目 `git add libs/core` 并提交，看 gitlink 是否更新。
 3. 对一个含多个目录的仓库，分别用普通 clone 和 `git clone --filter=blob:none <url>` 克隆，比较 `git config remote.origin.promisor` 的值，并说明部分克隆适合什么场景。
 4. 你们团队有"前端 + 后端 + 公共组件"三个部分，改动常常要一起改。请用本文的对比表，论证该用 monorepo 还是多仓库，并给出一条关键理由。
+
+<Answer>
+**参考答案：**
+
+**1. 引入子模块 + 克隆后 init**
+
+```bash
+git config --global protocol.file.allow always
+git init -q --bare -b main /tmp/sub.git
+git clone -q /tmp/sub.git lib && cd lib
+echo 'API v1' > api.txt && git add . && git commit -q -m "lib: v1" && git push -q -u origin main 2>/dev/null
+cd ..
+git init -q -b main app && cd app
+git submodule add -q /tmp/sub.git libs/core
+git add . && git commit -q -m "chore: 引入子模块"
+cd ..
+
+git clone -q app app2 && cd app2
+ls libs/core          # 空目录
+git submodule update --init
+cat libs/core/api.txt # v1 出现了
+```
+
+克隆只复制了 gitlink（指向子模块某提交的哈希），子模块**内容不会自动拉取**，所以 `libs/core` 是空的；执行 `git submodule update --init` 后内容才出现——这正是"主仓库不存子模块内容"的体现。
+
+**2. 子模块游离 HEAD 与更新 gitlink**
+
+```bash
+cd app2/libs/core
+git status        # 显示 "HEAD detached at <哈希>"
+git checkout main # 先离开游离 HEAD
+echo 'API v2' > api.txt && git add . && git commit -q -m "lib: v2" && git push -q
+cd ..
+git add libs/core          # 把新的子模块哈希记录回主项目
+git commit -q -m "chore: 升级 core"
+git ls-files --stage libs/core   # gitlink（160000 行）哈希已更新
+```
+
+子模块默认固定在其某次提交上（游离 HEAD）；不 `git checkout main` 直接改，提交会悬空且下次 `submodule update` 被冲掉。正确姿势是切到分支、改、push，再回主项目 `git add` 子模块路径提交，让 gitlink 指向新哈希。
+
+**3. 普通克隆 vs partial clone**
+
+```bash
+git config --global protocol.file.allow always
+git init -q --bare -b main /tmp/big.git
+git init -q -b main w && cd w && mkdir -p src docs assets
+echo a > src/a.js && echo d > docs/d.md && echo b > assets/b.bin
+git add . && git commit -q -m "init" && git push -q -u origin main 2>/dev/null && cd ..
+git clone -q /tmp/big.git normal
+git clone -q --filter=blob:none file:///tmp/big.git partial
+cd normal && git config remote.origin.promisor   # 空（false），非 promisor
+cd ../partial && git config remote.origin.promisor  # true
+```
+
+`git config remote.origin.promisor` 输出 `true` 说明该仓库是 promisor 仓库——克隆时**没下载文件内容（blob）**，按需从源仓库现取。部分克隆适合：超大型仓库的 CI、只需查代码/改一两个文件的场景，可以大幅缩短克隆时间。注意本地 `file://` 协议不真正执行过滤（服务端不支持协商），真实 GitHub/GitLab 上才会体现体积优势，但 promisor 机制与线上一致。
+
+**4. 前端 + 后端 + 公共组件 → monorepo**
+
+应该用 **monorepo**。对照本文的对比表，三个决定性理由：
+
+- **跨项目改动**：改动常常要一起改，monorepo 可以一次提交原子性地完成前端 + 后端 + 公共组件联动修改；多仓库则要跨多个仓库协调提交、发布顺序，极易出现"一半改了另一半没改"的不一致状态。
+- **依赖共享**：公共组件在 monorepo 里可直接被前端/后端引用，无需发布版本号、没有"依赖漂移"问题；多仓库则要频繁发布公共组件版本，三方版本一旦不同步就出 bug。
+- **工具/规范统一**：monorepo 让 lint、测试、构建配置天然统一。
+
+其中最关键的一条理由：**"改动常常要一起改"正是 monorepo 的核心适用条件**——代码变更频繁跨项目联动时，单一仓库的原子提交是最高价值；反之（各自独立发布）才该选多仓库。
+</Answer>
 </Callout>

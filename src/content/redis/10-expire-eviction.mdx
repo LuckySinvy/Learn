@@ -211,4 +211,295 @@ OBJECT FREQ hot:key`}
 1. 给一个 key 设 5 秒 TTL，过期后立即 GET 与 TTL，解释返回值；再验证 SET 覆盖会清掉 TTL 而 INCR 不会。
 2. 在测试实例上 CONFIG SET maxmemory 10mb 且策略为 noeviction，用脚本灌数据直到写入报错，再改成 allkeys-lru 观察 evicted_keys 增长。
 3. 你的业务里哪些 key 该设 TTL、哪些不该？如果两类混在一个实例，选哪种淘汰策略？写出你的推理。
+
+<Answer>
+**参考答案：**
+
+**1. TTL 过期行为，以及 SET / INCR 对 TTL 的不同影响**
+
+```bash
+# ---- 设 5 秒 TTL ----
+127.0.0.1:6379> SET k "v" EX 5
+OK
+127.0.0.1:6379> TTL k
+(integer) 5
+127.0.0.1:6379> GET k
+"v"
+
+# ---- 等待 6 秒后 ----
+127.0.0.1:6379> GET k
+(nil)
+127.0.0.1:6379> TTL k
+(integer) -2
+127.0.0.1:6379> EXISTS k
+(integer) 0
+```
+
+**返回值解释**：
+
+- `GET` 返回 `nil`：key 已过期。注意这里发生的其实是**惰性删除**——你这次 `GET` 触发了过期检查，Redis 发现它已过期，于是**当场删掉并返回 nil**。在你访问它之前，这个 key 很可能还实实在在占着内存
+- `TTL` 返回 `-2`：约定的"key 不存在"信号。区别于 `-1`（存在但无过期时间）
+- **"过期"不等于"已删除"**：Redis 用惰性删除 + 定期删除两种机制配合。定期删除每秒执行 10 次（由 `hz` 配置决定），每次从设置了过期时间的 key 里**随机抽 20 个**检查，如果过期比例超过 25% 就再来一轮。所以一个过期但从没被访问的 key，可能在内存里多待一段时间
+
+```bash
+# 可以观察定期删除的统计
+127.0.0.1:6379> INFO stats | grep expired_keys
+expired_keys:1523
+
+# 查看当前有多少 key 设置了过期时间
+127.0.0.1:6379> INFO keyspace
+db0:keys=10000,expires=8500,avg_ttl=0
+```
+
+```bash
+# ---- 验证 SET 会清掉 TTL ----
+127.0.0.1:6379> SET k2 "v1" EX 100
+OK
+127.0.0.1:6379> TTL k2
+(integer) 100
+127.0.0.1:6379> SET k2 "v2"          # 普通 SET 覆盖
+OK
+127.0.0.1:6379> TTL k2
+(integer) -1                          # TTL 没了！key 变成永久
+
+# 用 KEEPTTL 保留（Redis 6.0+）
+127.0.0.1:6379> SET k3 "v1" EX 100
+OK
+127.0.0.1:6379> SET k3 "v2" KEEPTTL
+OK
+127.0.0.1:6379> TTL k3
+(integer) 97                          # TTL 保住了
+
+# ---- 验证 INCR 不会清掉 TTL ----
+127.0.0.1:6379> SET counter 1 EX 100
+OK
+127.0.0.1:6379> TTL counter
+(integer) 100
+127.0.0.1:6379> INCR counter
+(integer) 2
+127.0.0.1:6379> TTL counter
+(integer) 96                          # TTL 保留，只是自然流逝了
+
+127.0.0.1:6379> INCRBY counter 10
+(integer) 12
+127.0.0.1:6379> TTL counter
+(integer) 93                          # 依然保留
+```
+
+**规律**：**"改值"的命令保留 TTL，"替换整个 key"的命令清除 TTL。**
+
+| 命令 | 对 TTL 的影响 |
+|---|---|
+| `SET`（不带 KEEPTTL） | **清除** |
+| `SET ... KEEPTTL` | 保留 |
+| `GETSET` | **清除** |
+| `INCR` / `INCRBY` / `DECR` | 保留 |
+| `APPEND` / `SETRANGE` | 保留 |
+| `HSET` / `LPUSH` / `SADD` / `ZADD` | 保留 |
+| `HDEL` / `LPOP` / `SREM` | 保留（除非删空导致 key 消失） |
+| `RENAME` | 保留源 key 的 TTL（覆盖目标 key 的） |
+| `PERSIST` | **清除**（这就是它的作用） |
+
+底层原因：TTL 存在一个独立的字典 `expires` 里，key 是指向主字典 key 的指针。`SET` 的实现是"删除旧 key 再创建新 key"，`expires` 里的条目跟着一起被清掉；而 `INCR` 只是修改值对象，key 本身没动，`expires` 里的条目自然还在。
+
+**这是生产事故的高发点**：缓存刷新逻辑写成 `SET key newValue` 忘了 `KEEPTTL`，缓存就变成了永不过期的脏数据。正确写法是每次都显式带上过期时间：`SET key value EX 3600`。
+
+**2. maxmemory 与淘汰策略实验**
+
+```bash
+# ---- 准备：在测试实例上设置 10MB 上限 + noeviction ----
+127.0.0.1:6379> CONFIG SET maxmemory 10mb
+OK
+127.0.0.1:6379> CONFIG SET maxmemory-policy noeviction
+OK
+127.0.0.1:6379> FLUSHALL
+OK
+
+# ---- 灌数据直到报错 ----
+for i in $(seq 1 200000); do echo "set bigkey:$i $(head -c 100 /dev/zero | tr '\0' 'x')"; done | redis-cli --pipe
+
+# 或者在 redis-cli 里循环，会看到：
+127.0.0.1:6379> SET k100000 "xxxxxxxxxx..."
+(error) OOM command not allowed when used memory > 'maxmemory'.
+
+# ---- 查看内存状态 ----
+127.0.0.1:6379> INFO memory
+used_memory_human:10.01M
+maxmemory_human:10.00M
+maxmemory_policy:noeviction
+
+127.0.0.1:6379> DBSIZE
+(integer) 87342
+
+# ---- 关键：读命令仍然可用 ----
+127.0.0.1:6379> GET bigkey:1
+"xxxxxxxxxx..."
+127.0.0.1:6379> DEL bigkey:1          # 删除也可以（能释放内存的命令被允许）
+(integer) 1
+
+# ---- 切换到 allkeys-lru ----
+127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lru
+OK
+127.0.0.1:6379> INFO stats | grep evicted
+evicted_keys:0
+
+# ---- 继续写入，这次不报错了 ----
+for i in $(seq 200001 250000); do echo "set bigkey:$i xxxxxxxxxx"; done | redis-cli --pipe
+All data transferred. errors: 0, replies: 50000
+
+127.0.0.1:6379> INFO stats | grep evicted
+evicted_keys:41285                    # 淘汰计数开始增长
+
+127.0.0.1:6379> INFO memory | grep used_memory_human
+used_memory_human:9.98M               # 内存被稳定压在上限之下
+
+127.0.0.1:6379> DBSIZE
+(integer) 88203                       # key 总数基本持平：写多少淘汰多少
+```
+
+**观察要点**：
+
+- **`noeviction` 下只有写命令报错**：`GET`、`TTL`、`DEL` 等不增加内存的命令照常工作。这个设计是为了让你还有机会连上去救火
+- **`evicted_keys` 是核心监控指标**：它持续增长说明内存不够用了。健康的缓存实例这个值应该是 0 或者缓慢增长；如果每秒淘汰上千 key，说明容量规划有问题，缓存命中率也会很难看
+- **淘汰是同步发生在命令执行前的**：每次执行写命令前，Redis 会检查内存是否超限，超了就先淘汰再执行。所以大量淘汰会直接拖慢写入延迟
+- **不要在生产上随便调小 maxmemory**：会立刻触发大规模淘汰，缓存命中率断崖式下跌，压力全部打到数据库
+
+```bash
+# 补充：观察 LRU/LFU 的内部状态
+127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lfu
+OK
+127.0.0.1:6379> SET hot:key "v"
+OK
+127.0.0.1:6379> GET hot:key
+"v"
+127.0.0.1:6379> GET hot:key
+"v"
+127.0.0.1:6379> OBJECT FREQ hot:key   # 只在 LFU 策略下可用
+(integer) 5                            # 对数计数器，不是真实访问次数
+
+127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lru
+OK
+127.0.0.1:6379> OBJECT IDLETIME hot:key   # 只在 LRU 策略下可用
+(integer) 12                               # 空闲秒数
+
+# 采样精度：调大更接近真实 LRU，但更耗 CPU
+127.0.0.1:6379> CONFIG GET maxmemory-samples
+1) "maxmemory-samples"
+2) "5"
+```
+
+**3. 哪些 key 该设 TTL、混合场景选什么策略**
+
+**该设 TTL 的（可再生数据）**：
+
+| 类型 | 例子 | 建议 TTL |
+|---|---|---|
+| 数据库查询缓存 | 商品详情、用户资料 | 5 分钟 ~ 1 小时 |
+| 会话 / 登录态 | Session、Token | 30 分钟 ~ 7 天（滑动续期） |
+| 验证码、一次性令牌 | 短信验证码 | 5 分钟 |
+| 分布式锁 | 订单锁 | 10 ~ 60 秒（必须设，防死锁） |
+| 限流计数器 | 接口频控 | 与窗口等长 |
+| 防重复提交标记 | 幂等键 | 几分钟 ~ 24 小时 |
+| 页面 / 接口结果缓存 | 首页推荐列表 | 1 ~ 10 分钟 |
+
+判断标准：**丢了能从数据库或其他数据源重新算出来**。
+
+**不该设 TTL 的（Redis 是唯一数据源）**：
+
+| 类型 | 例子 | 原因 |
+|---|---|---|
+| 全局配置 / 开关 | 功能灰度开关、限流阈值 | 丢了服务行为异常 |
+| 排行榜 | 赛季积分榜 | 无法重建（增量累加的） |
+| 分布式 ID 号段 | `seq:order` | 丢了会导致 ID 重复 |
+| 消息队列 | Stream、List 队列 | 丢了就是丢消息 |
+| 库存扣减计数 | 秒杀库存 | 丢了会超卖 |
+| 去重集合 | 长期黑名单 | 业务语义要求持久 |
+
+判断标准：**丢了会造成数据不一致或业务错误**。
+
+**两类混在一个实例时选哪种策略？**
+
+**答案：`volatile-lru`（或 `volatile-lfu`）。**
+
+推理过程：
+
+1. **首先排除 `noeviction`**：内存满了之后所有写入直接报错，缓存部分完全瘫痪，服务不可用。除非这个实例纯粹当数据库用且容量有绝对保证，否则不能选
+
+2. **然后排除 `allkeys-*` 系列**：`allkeys-lru` 会在所有 key 里挑淘汰对象，**包括那些没设 TTL 的持久数据**。后果是排行榜莫名其妙少了一截、配置开关突然读不到、ID 号段丢失导致重号——这类问题排查起来极其痛苦，因为它是随机的、间歇性的
+
+3. **`volatile-lru` 正好匹配需求**：它**只在设置了过期时间的 key 里**做 LRU 淘汰。这意味着：
+   - 你通过"设不设 TTL"这个动作，同时表达了"这个 key 能不能被淘汰"
+   - 没设 TTL 的持久数据获得了保护，永远不会被淘汰
+   - 缓存数据按最近最少使用淘汰，符合缓存的访问局部性
+
+4. **`volatile-lru` vs `volatile-lfu` vs `volatile-ttl`**：
+   - **LRU**（最近最少使用）：通用选择，适合大多数场景
+   - **LFU**（最不经常使用）：热点数据集中且长期稳定时更优。它能识别"偶尔被扫一遍的冷数据"，不会让一次全表扫描把真正的热点挤出去。代价是要额外维护计数器
+   - **TTL**（优先淘汰快过期的）：只在"TTL 长短确实反映数据价值"时才合适，实际业务中很少成立
+
+```bash
+# 推荐配置
+127.0.0.1:6379> CONFIG SET maxmemory-policy volatile-lru
+OK
+```
+
+**但 `volatile-*` 有个致命陷阱**：
+
+```bash
+# 如果内存满了，而所有 key 都没有 TTL（或有 TTL 的都已被淘汰完）
+# volatile-* 会退化成 noeviction —— 写命令直接报错
+127.0.0.1:6379> SET newkey "v"
+(error) OOM command not allowed when used memory > 'maxmemory'.
+```
+
+也就是说，`volatile-lru` 的前提是"缓存类 key 占了足够大的比例"。如果持久数据不断增长最终吃满内存，服务照样会写不进去。所以必须配套：
+
+- **监控 `used_memory` 与 `maxmemory` 的比值**，超过 80% 告警
+- **监控 `evicted_keys`**，突然飙升说明缓存空间被挤压
+- **给持久数据的增长做容量规划**，别让它无限膨胀
+
+**更好的方案：物理隔离。**
+
+上面这套推理是"不得不混用"时的最优解，但正确的做法是**用两个实例**：
+
+```bash
+# 实例 A（6379）：纯缓存
+maxmemory 8gb
+maxmemory-policy allkeys-lru      # 全部可淘汰，简单直接
+appendonly no                      # 缓存不需要持久化，省 IO
+save ""                            # 关掉 RDB
+
+# 实例 B（6380）：持久数据
+maxmemory 2gb
+maxmemory-policy noeviction        # 绝不淘汰，宁可写失败也不丢数据
+appendonly yes                     # 开 AOF
+appendfsync everysec
+```
+
+隔离的好处：
+
+- 缓存实例可以放心用 `allkeys-lru`，不用担心误伤业务数据
+- 持久实例用 `noeviction` + AOF，数据安全有保障
+- 两者的持久化策略、内存配额、监控告警阈值都可以独立设置
+- 缓存雪崩不会影响持久数据的读写
+- 缓存实例可以随时清空重建，运维压力小得多
+
+内存成本上，两个实例并不比一个大实例贵多少，但可靠性提升是数量级的。如果你现在正好在做这个技术选型，**优先选隔离**。
+
+**最后补充：TTL 要加随机抖动。**
+
+```bash
+# 错误：所有 key 同一时刻过期，会造成延迟尖刺 + 缓存雪崩
+SET cache:1 v EX 3600
+SET cache:2 v EX 3600
+# ... 10 万个 key 都是 3600
+
+# 正确：基础时间 + 随机偏移
+# TTL = 3600 + random(0, 600)
+SET cache:1 v EX 3712
+SET cache:2 v EX 3891
+```
+
+原因有两层：一是大批 key 集中过期时，定期删除任务会在某个周期内疯狂删 key，占用主线程造成延迟毛刺；二是这些缓存同时失效，请求会瞬间全部打到数据库上（缓存雪崩），详见第 18 章。
+</Answer>
 </Callout>

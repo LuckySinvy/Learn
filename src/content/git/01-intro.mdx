@@ -255,4 +255,45 @@ git log --oneline`}
 2. 试试给自己配一个别名：`git config alias.hist "log --oneline --graph"`，然后在有多条提交的仓库里执行 `git hist`，看输出和 `git log` 有什么不同。
 3. 用一句话向没接触过 Git 的同事解释："为什么 Git 断网也能提交，SVN 不行？"
 4. 思考题：如果 Git 用的是"记录差异"而不是"记录快照"，切换到一个 500 个提交之前的版本会发生什么？这解释了 Git 为什么选择快照模型。
+
+<Answer>
+**参考答案：**
+
+**1. 三次提交与 `HEAD -> main`**
+
+在 Playground 里执行这一套脚本：
+
+```bash
+git init -q demo && cd demo
+echo v1 > app.txt
+git add app.txt
+git commit -q -m "提交一"
+echo v2 >> app.txt
+git add app.txt
+git commit -q -m "提交二"
+echo v3 >> app.txt
+git add app.txt
+git commit -q -m "提交三"
+git log --oneline
+```
+
+`git log --oneline` 会从最新到最旧列出三条提交，最新的一条在最上面。`HEAD -> main` 会指向那一条最新的提交（第三次提交），表示 `main` 分支和当前所在位置 `HEAD` 都落在这条提交上。
+
+**2. 别名 `git hist`**
+
+```bash
+git config alias.hist "log --oneline --graph"
+git hist
+```
+
+`git hist` 等价于 `git log --oneline --graph`，与普通 `git log` 相比：每行只显示一条提交（`--oneline`），并用 `*` 和连线画出分支拓扑。在有多个分支或合并过的仓库里，能直观看到提交之间的分叉与合并关系，而 `git log` 默认按时间线性排列。
+
+**3. 一句话解释**
+
+因为 SVN 是集中式的，提交需要把差异上传到中央服务器，断网时本地没有完整历史，根本没法提交；而 Git 是分布式的，每个人的克隆都是完整仓库，提交只是在本地快照链上新增一个节点，不依赖任何服务器，所以断网也能提交。
+
+**4. 思考题**
+
+如果 Git 记录的是"差异"，要回到 500 个提交之前的版本，就必须从起点开始把 500 个补丁**顺序、逐个地反向应用**，中间任何一个补丁因为上下文变化而应用失败都会卡住，耗时还随历史长度线性增长。快照模型则不同：每个提交都完整保存了当时所有文件的状态（未变的文件只是指向旧快照的链接），切回去只需要把 HEAD 指向那个提交并更新工作区，与中间隔了多少个提交无关。这就是 Git 选择快照模型的原因——快、稳、每个版本都能独立还原。
+</Answer>
 </Callout>

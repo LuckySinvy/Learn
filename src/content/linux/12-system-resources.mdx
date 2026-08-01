@@ -165,4 +165,59 @@ cat /proc/1/cmdline | tr '\0' ' '   # 启动命令（参数以 NUL 分隔）
 2. 构造三层目录并用 truncate 放入不同大小的文件，仅用 du 与 sort 的组合，三步内定位到最大的那个文件所在目录。
 3. 读取 /proc/uptime 第一个字段（秒），用 awk 换算成"X 天 Y 小时"格式输出。
 4. 思考题：一台 8 核机器 load average 是 6.5 / 7.0 / 7.2，CPU 使用率只有 30%，最可能的瓶颈类型是什么？该看 top 的哪个指标、进程的哪个状态来证实？
+
+<Answer>
+**参考答案：**
+
+**第 1 题：从 /proc/meminfo 计算 buff/cache**
+
+```bash
+awk '/^Buffers/ {b=$2} /^Cached/ {c=$2} END {printf "buff/cache = %.1f MB\n", (b+c)/1024}' /proc/meminfo
+```
+
+注意 `/proc/meminfo` 的单位是 **KB**，所以 `(b+c)/1024` 换算成 MB。对照 `free -m` 输出中的 `buff/cache` 列，两者应基本一致（`free` 的 buff/cache 内部就是由这些项汇总的）。
+
+**第 2 题：三步定位最大文件所在目录**
+
+```bash
+# 构造演示数据
+mkdir -p proj/{src,data,tmp}
+truncate -s 2M proj/src/a.bin
+truncate -s 8M proj/data/b.bin
+truncate -s 4M proj/tmp/c.bin
+
+# 第一步：看第一层，锁定大头目录
+du -h --max-depth=1 proj | sort -rh
+# proj/data 最大 → 锁定 data
+
+# 第二步：进入 data 下钻
+du -h --max-depth=1 proj/data | sort -rh
+
+# 第三步：直接看该目录里的文件
+ls -lhS proj/data
+# b.bin（8M）是最大的
+```
+
+核心思路：`du --max-depth=1 | sort -rh` 逐层下钻——每次只看当前层谁最大，顺着最大的子目录往下走，三步就能定位。
+
+**第 3 题：uptime 秒数换算成"X 天 Y 小时"**
+
+```bash
+awk '{s=$1; d=int(s/86400); h=int((s%86400)/3600); printf "%d 天 %d 小时\n", d, h}' /proc/uptime
+```
+
+思路：`$1` 是开机秒数；一天 86400 秒、一小时 3600 秒。`int(s/86400)` 取整天数，`(s%86400)/3600` 取剩余部分的小时数。也可以简化成 `awk '{print int($1/86400)" 天 " int($1%86400/3600)" 小时"}' /proc/uptime`。
+
+**第 4 题：负载高但 CPU 使用率低**
+
+负载 6.5–7.2 在 8 核机器上接近满负荷（每个核一个任务），但 CPU 使用率只有 30%——说明 CPU 并不忙，任务却在排队等**别的东西**。最可能的瓶颈是 **IO 等待（I/O 密集型负载）**：进程大量处于不可中断的磁盘/网络等待状态。
+
+证实方法（top 里）：
+
+- 看 **%wa**（wait，CPU 等待 IO 完成的时间占比）——IO 型瓶颈时 %wa 明显偏高；
+- 看进程 **STAT 列**——大量进程处于 **D 状态**（不可中断睡眠，通常就是在等磁盘 IO）；CPU 型瓶颈则多是 R 状态；
+- 对照 **%us / %sy**：CPU 型时用户/内核态占用高，IO 型时它们都低。
+
+结论：瓶颈类型是 **IO 等待**，应查磁盘（iostat 看 await/util）、存储网络或慢速存储（如机械盘、云盘突发受限），而不是盲目加核。
+</Answer>
 </Callout>

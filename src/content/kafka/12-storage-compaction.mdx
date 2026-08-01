@@ -157,4 +157,262 @@ bin/kafka-topics.sh --bootstrap-server localhost:9092 \
 1. 把某测试 topic 的 segment.bytes 调到 1MB，写入几 MB 数据后去 log.dirs 目录观察 segment 滚动与文件命名规律。
 2. 创建 compact topic，对同一 key 写入 5 个版本再写一个 null 墓碑，等待压实后从头消费验证只剩最新值（可调低 min.cleanable.dirty.ratio 与 segment.ms 加速触发）。
 3. 用 kafka-log-dirs 查看 __consumer_offsets 的大小，解释它为什么用 compact 策略而不是 delete。
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · 观察 segment 滚动与文件命名**
+
+```bash
+# 建 topic 时直接指定小 segment，方便观察
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic seg-demo --partitions 1 --replication-factor 1 \
+  --config segment.bytes=1048576        # 1MB
+
+# 已有 topic 也可以动态改
+bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --entity-type topics --entity-name seg-demo \
+  --add-config segment.bytes=1048576
+
+# 灌入约 5MB 数据（5000 条 × 1KB）
+bin/kafka-producer-perf-test.sh --topic seg-demo \
+  --num-records 5000 --record-size 1024 --throughput -1 \
+  --producer-props bootstrap.servers=localhost:9092
+```
+
+查看数据目录（`log.dirs` 配置的路径，Docker 里通常是 `/var/lib/kafka/data` 或 `/tmp/kraft-combined-logs`）：
+
+```bash
+ls -lh /tmp/kraft-combined-logs/seg-demo-0/
+```
+
+```text
+-rw-r--r--  10M  00000000000000000000.index
+-rw-r--r--  1.0M 00000000000000000000.log
+-rw-r--r--  10M  00000000000000000000.timeindex
+-rw-r--r--  10M  00000000000000001021.index
+-rw-r--r--  1.0M 00000000000000001021.log
+-rw-r--r--  10M  00000000000000001021.timeindex
+-rw-r--r--  10M  00000000000000002042.index
+-rw-r--r--  1.0M 00000000000000002042.log
+-rw-r--r--  10M  00000000000000002042.timeindex
+-rw-r--r--  10M  00000000000000004084.index      <- active segment
+-rw-r--r--  356K 00000000000000004084.log        <- 还没写满
+-rw-r--r--  10M  00000000000000004084.timeindex
+-rw-r--r--  8    leader-epoch-checkpoint
+-rw-r--r--  43   partition.metadata
+```
+
+**命名规律**：文件名是该 segment 中**第一条消息的 offset**，左侧补零到 20 位。所以 `00000000000000001021.log` 表示"这个段从 offset 1021 开始"。
+
+三类文件的分工：
+
+| 后缀 | 内容 |
+|---|---|
+| `.log` | 实际消息数据，追加写 |
+| `.index` | offset → 文件物理位置的**稀疏索引** |
+| `.timeindex` | 时间戳 → offset 的稀疏索引，供 `offsetsForTimes` 使用 |
+
+**为什么用起始 offset 命名**：查找 offset=1500 的消息时，Kafka 对文件名做**二分查找**，立刻定位到 `00000000000000001021.log`（1021 ≤ 1500 < 2042），再查该段的 `.index` 找到最近的索引点，最后顺序扫描少量数据。整个过程是 `O(log n)` 定位 + 短距顺序读，这就是为什么 Kafka 在 TB 级数据上按 offset 查找依然极快。
+
+**索引文件为什么显示 10MB**：这是 `log.index.size.max.bytes` 预分配的大小（稀疏文件，实际占用远小于此），段关闭时会被裁剪到真实大小。
+
+用官方工具可以直接查看内容：
+
+```bash
+# 看消息
+bin/kafka-dump-log.sh --files /tmp/kraft-combined-logs/seg-demo-0/00000000000000000000.log \
+  --print-data-log | head -20
+
+# 看索引（能直观看到"稀疏"：不是每条消息都有索引项）
+bin/kafka-dump-log.sh --files /tmp/kraft-combined-logs/seg-demo-0/00000000000000000000.index
+```
+
+```text
+offset: 0     position: 0
+offset: 42    position: 4128       <- 每约 4KB 才建一个索引项
+offset: 84    position: 8256
+```
+
+索引稀疏度由 `log.index.interval.bytes`（默认 4096）控制。稀疏是刻意为之——索引足够小可以常驻内存，代价只是定位后多扫几 KB。
+
+**segment 滚动的四个触发条件**（满足任一即滚动）：
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `segment.bytes` | 1GB | 段文件大小上限 |
+| `segment.ms` | 7 天 | 段的最长存活时间 |
+| `index.interval.bytes` 累积导致索引写满 | - | 索引文件达到 `segment.index.bytes` |
+| offset 超出 32 位表示范围 | - | 极少触发 |
+
+**为什么这件事重要**：**删除的最小单位是 segment，而 active segment 永远不会被删除或压实**。如果 `segment.bytes` 设成 1GB 而某个 topic 每天只写 10MB，那么这个段要 100 天才写满，期间 `retention.ms=7天` 完全不起作用——数据会一直堆着不删。这是"明明配了保留 7 天，磁盘却一直涨"的常见原因。解决办法是同时配 `segment.ms` 强制按时间滚动。
+
+**第 2 题 · compact 压实实验**
+
+```bash
+# 建 compact topic，参数调到最激进以便快速看到效果
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic compact-demo --partitions 1 --replication-factor 1 \
+  --config cleanup.policy=compact \
+  --config min.cleanable.dirty.ratio=0.01 \
+  --config segment.ms=5000 \
+  --config delete.retention.ms=1000 \
+  --config max.compaction.lag.ms=5000 \
+  --config min.compaction.lag.ms=0
+```
+
+```bash
+# 写入：u1 的 5 个版本 + u2 的 3 个版本 + u2 的墓碑
+printf 'u1:v1\nu1:v2\nu1:v3\nu1:v4\nu1:v5\nu2:a\nu2:b\nu2:c\nu2:\n' | \
+  bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic compact-demo \
+    --property parse.key=true --property key.separator=: \
+    --property null.marker=NULL
+```
+
+注意：console-producer 里空 value 默认是空字符串而不是 null。要发真正的墓碑，用 `--property null.marker=NULL` 然后写 `u2:NULL`，或者用代码：
+
+```java
+producer.send(new ProducerRecord<>("compact-demo", "u2", null));  // 墓碑
+```
+
+**压实前**（立即消费）：
+
+```bash
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic compact-demo --from-beginning --timeout-ms 5000 \
+  --property print.key=true --property print.offset=true
+```
+
+```text
+Offset:0  u1  v1
+Offset:1  u1  v2
+Offset:2  u1  v3
+Offset:3  u1  v4
+Offset:4  u1  v5
+Offset:5  u2  a
+Offset:6  u2  b
+Offset:7  u2  c
+Offset:8  u2  null
+```
+
+**触发压实**：需要让消息离开 active segment（active segment 永不压实）。再写几条消息推动段滚动，然后等待 cleaner 线程运行：
+
+```bash
+# 推动段滚动
+printf 'u3:x\nu4:y\n' | bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic compact-demo \
+  --property parse.key=true --property key.separator=:
+
+sleep 30   # 等 log cleaner 工作（log.cleaner.backoff.ms 默认 15s）
+```
+
+**压实后**：
+
+```text
+Offset:4  u1  v5      <- u1 只剩最新版本，offset 保持原值 4
+Offset:9  u3  x
+Offset:10 u4  y
+                      <- u2 完全消失（墓碑生效后连墓碑一起清除）
+```
+
+**四个必须理解的要点：**
+
+1. **offset 不重排、不连续。** 压实后 `u1` 仍在 offset 4，中间的 0、1、2、3 变成了空洞。**消费逻辑绝不能假设 offset 连续**——这是从 compact topic 消费时最容易踩的坑。
+
+2. **墓碑的两阶段生命周期。** `u2:null` 先标记删除，`delete.retention.ms`（默认 24 小时）后墓碑本身才被清除。这个延迟是必需的：要给所有消费者留出足够时间读到"这个 key 被删了"的信号。如果墓碑立刻消失，一个正在追赶的消费者会永远认为 `u2` 还是旧值 `c`。生产环境**不要把 `delete.retention.ms` 调得太小**。
+
+3. **active segment 永不压实。** 所以最近写入的数据总是完整保留所有版本，压实只作用于已关闭的历史段。实验中必须推动段滚动才能看到效果。
+
+4. **压实是异步的、尽力而为的。** 由 `min.cleanable.dirty.ratio`（默认 0.5，脏数据过半才清）触发，`log.cleaner.threads` 控制并发。**这意味着消费者完全可能读到同一 key 的多个历史版本**——compact 绝不等于实时去重，业务端必须按"后读覆盖先读"的语义处理。
+
+**其他约束**：compact topic 的消息**必须有 key**，发送无 key 消息会导致该分区无法被压实（服务端日志报错）。另外可以组合两种策略：
+
+```bash
+--config cleanup.policy=compact,delete --config retention.ms=2592000000
+# 既按 key 留最新值，又删除超过 30 天的数据（防止无限增长）
+```
+
+**第 3 题 · `__consumer_offsets` 为什么用 compact**
+
+```bash
+bin/kafka-log-dirs.sh --bootstrap-server localhost:9092 \
+  --describe --topic-list __consumer_offsets | \
+  python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read().split('\n')[-2])
+total = 0
+for b in d['brokers']:
+    s = sum(p['size'] for p in b['logDirs'][0]['partitions'])
+    total += s
+    print(f\"broker {b['broker']}: {s/1024/1024:.2f} MB\")
+print(f'总计: {total/1024/1024:.2f} MB')
+"
+```
+
+或者直接看原始输出：
+
+```bash
+bin/kafka-log-dirs.sh --bootstrap-server localhost:9092 \
+  --describe --topic-list __consumer_offsets
+
+# 确认它的配置
+bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+  --describe --entity-type topics --entity-name __consumer_offsets
+# cleanup.policy=compact, segment.bytes=104857600
+```
+
+一个跑了很久的集群，`__consumer_offsets` 通常也只有几十到几百 MB——**尽管它承载的写入量极其巨大**。
+
+**为什么必须用 compact 而不能用 delete：**
+
+先看它的数据模型：
+
+```text
+key   = (group.id, topic, partition)      <- 有限的、稳定的实体集合
+value = (offset, metadata, timestamp)     <- 频繁变化的状态
+```
+
+这是一个典型的**"数据是状态而非事件"**的场景。对于 `(order-service, orders, 0)` 这个 key，我们**只关心它当前的消费位点是多少**，历史上它曾经是 100、200、300 这些中间值毫无价值。
+
+**写入量有多大**：每个消费组、每个分区，默认每 5 秒（`auto.commit.interval.ms`）提交一次。假设集群有 100 个消费组，每组 50 个分区：
+
+```text
+100 组 × 50 分区 ÷ 5 秒 = 1000 条/秒
+一天 = 8640 万条
+一年 = 315 亿条
+```
+
+**如果用 delete 策略会怎样：**
+
+| 保留时间设置 | 后果 |
+|---|---|
+| 设短（如 7 天） | 一个**空置超过 7 天**的消费组，其位点记录被整段删除。重新上线时 offset 丢失，只能按 `auto.offset.reset` 走——`latest` 则跳过所有积压，`earliest` 则全量重刷。**位点是必须长期持有的状态，不能因为"旧"就删掉** |
+| 设长（如永久） | 上面算过，一年 315 亿条记录，磁盘无限膨胀。而且 broker 启动时要**加载全部位点到内存**建立缓存，海量历史记录会让启动变得极其缓慢甚至 OOM |
+
+**compact 完美契合这个场景：**
+
+```text
+无论一个 (group, topic, partition) 被提交过多少亿次，
+压实后磁盘上永远只保留【最新的那一条】。
+
+存储量 ≈ 消费组数 × topic 数 × 分区数  （与提交频率完全无关）
+100 组 × 50 分区 × 约 100 字节 ≈ 500 KB
+```
+
+**同时它天然支持 broker 的状态恢复**：组协调器启动时，只需从头把 `__consumer_offsets` 完整读一遍，就能重建所有消费组的当前位点——因为每个 key 的最新值就是当前状态。这正是 compact 的核心价值：**日志既是变更流，又是状态快照**。
+
+**顺带解释"消费组下线太久位点会消失"**：这不是 compact 造成的，而是 `offsets.retention.minutes`（默认 7 天）这个独立机制——组变为 Empty 状态超过该时长后，协调器会主动写入**墓碑消息**删除其位点。一个停用两周的服务重新上线时进度已不存在，会按 `auto.offset.reset` 处理。长期停用的组要心里有数。
+
+**同样思路的其他 compact 用途：**
+
+| topic | 为什么用 compact |
+|---|---|
+| `__transaction_state` | 每个 `transactional.id` 只需最新事务状态 |
+| Kafka Streams 的 changelog | 状态存储备份，恢复时只需每个 key 的最新值 |
+| CDC 数据库变更流 | 每个主键只需最新镜像，新消费者读一遍即得全量快照 |
+| 配置/字典分发 | 消费者从头读完即得全量最新配置 |
+
+**判断口诀**：问自己"这个 key 的历史版本还有价值吗？"——没有价值就用 compact（状态型数据），有价值就用 delete（事件型数据，如订单流水、点击日志）。
+</Answer>
 </Callout>

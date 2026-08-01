@@ -76,6 +76,68 @@ FROM docs ORDER BY emb <-> '[0.1,0.2,...,0.3]' LIMIT 5;
 
 <Callout type="exercise" title="练习">
 估算你的知识库规模：文档数 × 每文档 chunk 数 ≈ 向量总数。对照上表，选出你的第一候选数据库，并说明理由（规模 / 运维 / 合规）。
+
+<Answer>
+**参考答案：**
+
+**第一步：算出向量总数与内存占用**
+
+```python
+docs = 5000                 # 文档数
+pages_per_doc = 20          # 平均页数
+chars_per_page = 1200       # 每页字数
+chunk_size = 500
+overlap_factor = 1.2        # overlap 会让 chunk 数比理论值多 ~20%
+
+chunks_per_doc = pages_per_doc * chars_per_page / chunk_size * overlap_factor
+total_vectors = int(docs * chunks_per_doc)
+
+dim = 1024                  # bge-large-zh
+bytes_per_vec = dim * 4     # float32
+raw_gb = total_vectors * bytes_per_vec / 1024**3
+
+print(f"向量总数 ≈ {total_vectors:,}")
+print(f"裸向量   ≈ {raw_gb:.2f} GB")
+print(f"HNSW 索引 ≈ {raw_gb * 1.5:.2f} GB（含图结构开销）")
+print(f"加原文与元数据 ≈ {raw_gb * 2.5:.2f} GB（整机内存预算）")
+```
+
+输出：
+
+```text
+向量总数 ≈ 288,000
+裸向量   ≈ 1.10 GB
+HNSW 索引 ≈ 1.65 GB
+加原文与元数据 ≈ 2.75 GB（整机内存预算）
+```
+
+**估算时的三个经验系数**（很多人只算裸向量，结果上线内存爆掉）：
+
+- **overlap 系数 1.2**：15% overlap 大约让 chunk 数多两成。
+- **HNSW 系数 1.5**：图索引的邻居链表本身要占约 50% 额外空间。
+- **原文系数**：原文和 metadata 通常与向量同量级，别忘了算。
+
+**第二步：按规模对号入座**
+
+| 向量总数 | 首选 | 理由 |
+|---|---|---|
+| 小于 10 万 | **FAISS** 或 **PGVector** | 单机内存装得下，不值得起独立服务 |
+| 10 万 – 1000 万 | **Qdrant** 或 **PGVector** | 需要过滤与持久化，但单节点仍够用 |
+| 1000 万 – 10 亿 | **Milvus** / Qdrant 集群 | 必须分片、副本，接受较重运维 |
+| 任意规模但不想运维 | **Pinecone** | 前提是数据允许出网 |
+
+上面算出的 28.8 万落在第二档，**首选 Qdrant**。
+
+**第三步：用规模之外的三个因素做终选**
+
+规模只是入场券，真正决定选型的往往是另外三条：
+
+1. **合规是一票否决项**。只要数据不许出域，Pinecone 直接出局，无论它多省事。这个判断要**放在最前面**，别等选完了才发现过不了安全评审。
+2. **有没有现成的 Postgres？** 如果团队已经在跑 PG、且规模在百万以内，PGVector 的性价比无人能敌——不用新增组件、不用学新运维、事务和向量在同一个库里保证一致，备份复用现有方案。为一个百万级知识库单独引入 Milvus 集群，是典型的过度设计。
+3. **元数据过滤能力够不够？** 如果业务需要「按部门 + 按密级 + 按时间范围」组合过滤，FAISS 就很吃力（它本身不管元数据，得自己在外层维护映射），这时 Qdrant 的 payload 过滤会省掉大量自研代码。
+
+**一条实用建议**：不确定时**先用 FAISS 或 PGVector 把链路跑通**，因为向量库在 RAG 里是最容易替换的一环——接口无非「加向量、查 top-k」。先把切分、Embedding、Prompt 这些真正影响效果的环节调好，等规模真的顶不住了再迁移，迁移成本远低于一开始就上重武器的成本。
+</Answer>
 </Callout>
 
 ## 小结

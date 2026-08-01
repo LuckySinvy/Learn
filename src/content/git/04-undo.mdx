@@ -299,4 +299,66 @@ git revert C:
 2. 用 `git reset --soft HEAD~3` + `git commit` 把三个零碎提交合并成一个，用 `git log --oneline` 验证。
 3. 造一个 A→B→C 的历史，`revert` 掉中间的 B，观察 C 的内容是否受影响。然后再 `revert` 一次刚生成的 revert 提交，说明发生了什么。
 4. 判断题，说明理由：同事把一个含有密钥的提交推到了 main 分支，现在应该用 `reset --hard` 还是 `revert`？（提示：除了历史安全，还要考虑密钥已经泄露这个事实——两种做法都不能让密钥从远程历史里消失，正确动作是什么？）
+
+<Answer>
+**参考答案：**
+
+**1. 三模式实验**
+
+```bash
+git init -q
+for i in 1 2 3; do
+  echo "v$i" > f.txt
+  git add . && git commit -q -m "commit-$i"
+done
+echo 'uncommitted-edit' >> f.txt && git add f.txt
+```
+
+对同样的状态分别执行 `git reset --soft / --mixed / --hard HEAD~1`，观察结果对照本章表格：
+
+| 模式 | log | status | f.txt |
+|---|---|---|---|
+| `--soft` | 只剩 2 个提交 | `M f.txt`（已暂存） | 仍是 v3 + 编辑 |
+| `--mixed` | 只剩 2 个提交 | ` M f.txt`（未暂存） | 仍是 v3 + 编辑 |
+| `--hard` | 只剩 2 个提交 | 干净 | **变回 v2** |
+
+要点：`--soft` 与 `--mixed` 的差别只在暂存区（一个保留暂存、一个退回工作区）；`--hard` 则把工作区也重置为 v2，未暂存/已暂存的改动全部丢失。
+
+**2. 把三个零碎提交合并成一个**
+
+```bash
+git init -q
+for i in 1 2 3; do
+  echo "$i" >> log.txt
+  git add . && git commit -q -m "wip-$i"
+done
+git reset --soft HEAD~3
+git commit -m "feat: 完整功能"
+git log --oneline
+```
+
+`reset --soft HEAD~3` 把分支指针退到 3 个提交之前，但内容全部保留在暂存区；`git commit` 直接把这份内容提交成一个新提交，于是 3 条 wip 变成 1 条干净的 feat。
+
+**3. revert 中间的 B，C 不受影响**
+
+```bash
+echo A > a.txt && git add . && git commit -q -m "A"
+echo B > b.txt && git add . && git commit -q -m "B"
+echo C > c.txt && git add . && git commit -q -m "C"
+BAD=$(git log --grep='^B$' --format=%H)
+git revert --no-edit $BAD
+git log --oneline
+ls
+```
+
+`revert B` 只生成一个**针对 B 的反向提交**（删掉 b.txt），C 的内容和提交原封不动。历史变成 A → B → C → Revert，`ls` 里 b.txt 消失、c.txt 还在。再用 `git revert --no-edit HEAD` 反做这个 revert，等于把 B 的内容加回来，b.txt 重新出现——即"revert 的 revert 就是原修改"。
+
+**4. 判断题：revert**
+
+应该用 `git revert <commit>`，不能 `reset --hard`：
+
+- main 是公共分支，`reset --hard` 会改写历史、删除提交，别人 pull 时会出现冲突或把你删掉的提交又推回来；`revert` 只追加一个反向提交，团队安全。
+- 但要注意：**无论哪种做法，密钥都已经躺在远程历史里了**，回退分支不会让它消失——它就在那些提交对象里，任何有仓库访问权的人都能翻出来。
+- 正确动作是：先**吊销/轮换密钥**（删掉旧 key、重新生成），再 revert 掉包含密钥的提交。让密钥"作废"才是根除泄露，回退代码只是减少暴露面。
+</Answer>
 </Callout>

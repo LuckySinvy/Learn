@@ -937,6 +937,205 @@ init done:
 
 <Callout type="exercise" title="综合练习">
 一、跑通第 8 节的初始化脚本，用 `db.posts.getIndexes()` 核对索引；二、实现 Q1 热门流的游标分页函数，翻到第 5 页，用 `explain` 确认没有 SORT 阶段且 `totalDocsExamined` 接近 20；三、造 5 万条评论（分布不均，让某一篇帖子有 2 万条），实现 Q4 的游标分页并测量耗时；四、实现 5.2 节的评论事务，故意在中途抛错，验证评论和计数都没有生效；五、写一个 Change Streams 消费者实现 5.4 节的改名同步，实测从改名到 posts 更新的延迟；六、用 6.3 节的聚合生成作者排行榜，并用 `$merge` 写入 `authorRanking`；七、为 `posts` 设计一个「按标签 + 时间」的新查询，判断现有索引够不够，不够就补一个并说明 ESR 分析；八、对照第 9 节的检查清单，列出你自己项目里还没做到的三项，并排出优先级。
+
+<Answer>
+**参考答案：**
+
+**一、跑通初始化脚本并核对索引**
+
+```bash
+mongosh "mongodb://localhost:27017/community?replicaSet=rs0" --file init.js
+```
+
+```js
+db.posts.getIndexes().map(i => i.name)
+// 期望包含：slug_1、hotScore_-1__id_-1、publishedAt_-1__id_-1、
+// author._id_1_publishedAt_-1、tags_1_hotScore_-1、_id_
+```
+
+逐一对照第 8 节脚本里的 `createIndex` 语句，确认 5 个业务索引 + `_id` 主键都在，且名字与预期一致（部分索引的 `partialFilterExpression` 可以用 `db.posts.getIndexes()` 的输出核对）。
+
+**二、Q1 热门流游标分页翻到第 5 页并 explain**
+
+```js
+// 参考 4.1 节的 hotFeed 函数，这里手动推进游标
+let cursor = null
+for (let page = 1; page <= 5; page++) {
+  const filter = { status: "published" }
+  if (cursor) {
+    filter.$or = [
+      { hotScore: { $lt: cursor.score } },
+      { hotScore: cursor.score, _id: { $lt: cursor.id } }
+    ]
+  }
+  const docs = db.posts.find(filter, { title: 1, hotScore: 1, _id: 1 })
+    .sort({ hotScore: -1, _id: -1 })
+    .limit(20)
+    .toArray()
+  const last = docs[docs.length - 1]
+  cursor = { score: last.hotScore, id: last._id }
+}
+
+// 用第 5 页的游标条件做 explain
+const filter5 = { status: "published",
+  $or: [
+    { hotScore: { $lt: cursor.score } },
+    { hotScore: cursor.score, _id: { $lt: cursor.id } }
+  ] }
+db.posts.find(filter5, { title: 1, hotScore: 1, _id: 1 })
+  .sort({ hotScore: -1, _id: -1 })
+  .limit(20)
+  .explain("executionStats")
+```
+
+`explain` 里应看到执行计划**没有 `SORT` 阶段**（stage 链为 LIMIT → FETCH → IXSCAN，走 `hotScore_-1__id_-1` 部分索引），且 `totalDocsExamined` 接近 20（理想情况下等于 20，因为索引已按 `hotScore`、`_id` 排好序，取出即是结果）。
+
+**三、造 5 万条评论并测 Q4 游标分页**
+
+```js
+// 造评论：postA 有 2 万条，其余分散
+const postA = ObjectId()
+const comments = []
+for (let i = 0; i < 50000; i++) {
+  comments.push({
+    postId: i < 20000 ? postA : ObjectId(),
+    author: { _id: ObjectId(), username: "u" + (i % 100), avatar: "" },
+    body: "评论 " + i,
+    parentId: null, ancestors: [], depth: 0, replyCount: 0,
+    likes: i % 50, status: "visible", createdAt: new Date(Date.now() - i * 1000)
+  })
+}
+db.comments.insertMany(comments)
+db.comments.createIndex({ postId: 1, status: 1, createdAt: -1, _id: -1 })
+```
+
+```js
+// Q4 游标分页 + 计时
+function commentsPage(postId, cursor, size = 20) {
+  const filter = { postId, status: "visible", parentId: null }
+  if (cursor) filter._id = { $lt: cursor }
+  return db.comments.find(filter).sort({ _id: -1 }).limit(size).toArray()
+}
+
+let cursor = null
+const t0 = Date.now()
+for (let page = 1; page <= 5; page++) {
+  const docs = commentsPage(postA, cursor)
+  cursor = docs[docs.length - 1]._id
+}
+print("5 pages: " + (Date.now() - t0) + " ms")
+```
+
+即使某一篇帖子有 2 万条评论，游标分页每页耗时也稳定在毫秒级（索引直接 seek 到 `_id` 断点），深页不劣化。对比一下同样 5 页用 `skip(4000)` 的耗时，能直观看到差距。
+
+**四、评论事务中途抛错验证回滚**
+
+```js
+const session = db.getMongo().startSession()
+session.startTransaction()
+try {
+  const db2 = session.getDatabase("community")
+  const comment = { _id: new ObjectId(), postId, author: {...}, body: "测试", parentId: null, ... }
+  db2.comments.insertOne(comment)                                  // ① 插入评论
+  db2.posts.updateOne({ _id: postId }, { $inc: { "stats.comments": 1 } })  // ② 更新计数
+  throw new Error("SIMULATED_FAILURE")                             // ③ 中途抛错
+  session.commitTransaction()
+} catch (e) {
+  session.abortTransaction()
+  print("aborted: " + e.message)
+} finally {
+  session.endSession()
+}
+
+// 验证：评论没插入、计数没变
+db.comments.countDocuments({ body: "测试" })    // 0
+db.posts.findOne({ _id: postId }).stats.comments  // 仍为原值
+```
+
+如果 ③ 的 throw 放在 `commitTransaction` 之前，`abortTransaction` 会把 ①、② 全部回滚——这正是「评论和计数要么一起生效、要么都不生效」的保证。
+
+**五、Change Streams 改名同步并测延迟**
+
+```js
+const cs = db.users.watch([
+  { $match: {
+      operationType: "update",
+      "updateDescription.updatedFields.username": { $exists: true }
+  } }
+], { fullDocument: "updateLookup" })
+
+// 消费者
+(async () => {
+  while (await cs.hasNext()) {
+    const change = cs.next()
+    const u = change.fullDocument
+    const t0 = Date.now()
+    db.posts.updateMany({ "author._id": u._id }, { $set: { "author.username": u.username } })
+    print("sync latency: " + (Date.now() - t0) + " ms")
+    saveResumeToken(change._id)
+  }
+})()
+```
+
+另开一个窗口改名：
+
+```js
+db.users.updateOne({ username: "alice" }, { $set: { username: "alice_new" } })
+```
+
+实测「改名写入」到「posts 冗余字段更新完成」的延迟，通常是几十到几百毫秒（取决于消费者轮询间隔和 updateMany 的规模）。注意开启 `fullDocument: "updateLookup"` 才能拿到新用户名。
+
+**六、作者排行榜 + `$merge` 写入 `authorRanking`**
+
+```js
+db.posts.aggregate([
+  { $match: { status: "published", publishedAt: { $gte: thirtyDaysAgo } } },
+  { $group: {
+      _id: "$author._id",
+      username: { $first: "$author.username" },
+      posts: { $sum: 1 },
+      views: { $sum: "$stats.views" },
+      likes: { $sum: "$stats.likes" }
+  } },
+  { $setWindowFields: { sortBy: { views: -1 }, output: { rank: { $rank: {} } } } },
+  { $match: { rank: { $lte: 100 } } },
+  { $merge: { into: "authorRanking", whenMatched: "replace", whenNotMatched: "insert" } }
+], { allowDiskUse: true })
+
+// 验证
+db.authorRanking.find({ rank: { $lte: 3 } })
+```
+
+这就是 6.3 节的完整实现：先按 30 天窗口分组汇总，用窗口函数打排名，前 100 名 `$merge` 落库。由于 `whenMatched: "replace"`，重复执行是幂等的（同作者用最新统计覆盖），不会重复累加。
+
+**七、「按标签 + 时间」新查询的 ESR 分析**
+
+新查询：**某个标签下按发布时间倒序的帖子列表**（即 Q6 的时间序变体）：
+
+```js
+db.posts.find({ status: "published", tags: "mongodb" }).sort({ publishedAt: -1 })
+```
+
+现有索引检查：`{ tags: 1, hotScore: -1 }`（Q6 按热度）只能服务「标签 + 热度排序」，按时间排序时 `publishedAt` 不在索引键里 → 需要内存排序（SORT 阶段）。`{ publishedAt: -1, _id: -1 }` 是前缀，不能服务带 `tags` 条件的查询。
+
+**ESR 分析**：E = `status`、`tags`（等值）；S = `publishedAt`（排序）；R = 无。按 ESR 应补：
+
+```js
+db.posts.createIndex({ tags: 1, publishedAt: -1, _id: -1 }, PUB)
+```
+
+验证补索引前后的 `explain`：补之前有 `SORT` 阶段、`totalKeysExamined` 很大；补之后 SORT 消失，扫描量接近命中数。如果你同时很在意热门流 Q1，两个索引分别对应「热度」和「时间」两种排序，无法合并，需要共存。
+
+**八、对照检查清单自查（示例，请对照你自己的项目）**
+
+以常见情况举例：
+
+1. **备份恢复演练**（未做）：备份脚本在跑，但从没真正恢复过。优先级 **最高**——数据丢失风险无法用其他手段弥补，本季度内完成一次完整恢复演练。
+2. **故障转移演练**（未做）：`rs.stepDown()` 从没执行过，不可写窗口、应用报错行为都是未知数。优先级 **高**——季度内演练一次。
+3. **连接串参数**（不达标）：还在用 `w:1`，没设 `retryWrites=true` 和 `serverSelectionTimeoutMS`。优先级 **高**——改连接串很快，但能直接消除「写成功却回滚」「故障切换时应用挂死」两类问题。
+
+（请把你项目里缺失的检查项按「丢数据风险 > 不可用风险 > 性能风险」排序，优先做前三项，每一项给出明确的完成动作和时间点。）
+</Answer>
 </Callout>
 
 ## 小结

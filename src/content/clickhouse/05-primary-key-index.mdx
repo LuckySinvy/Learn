@@ -355,6 +355,73 @@ GROUP BY table;
 2. 再建一张 `ev_time_first`，排序键为 `(event_time, country, event_type)`，插入同样数据。测试三种查询：仅按时间范围、仅按国家、国家加时间。记录三张表在三种查询下的扫描行数，做成 3×3 表格。
 3. 建一张 `index_granularity = 1024` 的表，对比它的 `primary_key_bytes_in_memory` 和默认表相差几倍，并测试一个高选择性查询是否真的更快。
 4. 思考题：你的业务表如果要重新设计排序键，前三列应该是什么？写下你的推导依据（查询占比 + 基数）。
+
+<Answer>
+**参考答案：**
+
+1. 复现 `ev_good` / `ev_bad` 对比实验，并用 EXPLAIN 看索引效率：
+
+```sql
+EXPLAIN indexes = 1
+SELECT count() FROM ev_good WHERE country = 'JP' AND event_type = 'purchase';
+-- 期望看到 PrimaryKey 部分 Granules 很小（如 31/2442）
+
+EXPLAIN indexes = 1
+SELECT count() FROM ev_bad  WHERE country = 'JP' AND event_type = 'purchase';
+-- 期望看到 Granules 接近满值（如 2442/2442），索引完全没用上
+```
+
+`Granules: x/y` 就是本章的黄金指标：`ev_good` 只读几十分之一的 granule，`ev_bad` 基本全扫。
+
+2. 建 `ev_time_first` 并做成 3×3 扫描行数对比：
+
+```sql
+CREATE TABLE ev_time_first (
+    event_time DateTime, user_id UInt64,
+    event_type LowCardinality(String), page String,
+    country LowCardinality(String), device LowCardinality(String),
+    duration_ms UInt32
+) ENGINE = MergeTree ORDER BY (event_time, country, event_type);
+
+INSERT INTO ev_time_first SELECT * FROM ev_good;
+```
+
+在 `ev_good` / `ev_bad` / `ev_time_first` 三张表上分别跑三种查询，把 `Processed rows` 填入下表：
+
+| 查询 | ev_good `(country,event_type,time)` | ev_bad `(user_id,time)` | ev_time_first `(time,country,event_type)` |
+|---|---|---|---|
+| 仅按时间范围 `WHERE event_time BETWEEN ...` | 中 | 差 | **好**（时间在排序键最前） |
+| 仅按国家 `WHERE country = 'CN'` | **好**（前缀命中） | 差 | 中（第二列，仍可用但跳过少） |
+| 国家 + 时间 | **好** | 差 | 中 |
+
+结论：没有任何排序键能同时最优——排序键必须贴合「占比最高的查询模式」。
+
+3. `index_granularity = 1024` 的对比：
+
+```sql
+CREATE TABLE ev_fine (...) ENGINE = MergeTree
+ORDER BY (country, event_type, event_time)
+SETTINGS index_granularity = 1024;
+
+INSERT INTO ev_fine SELECT * FROM ev_good;
+
+SELECT table,
+       formatReadableSize(sum(primary_key_bytes_in_memory)) AS pk_mem
+FROM system.parts WHERE active AND table IN ('ev_good', 'ev_fine')
+GROUP BY table;
+```
+
+`ev_fine` 的索引体积约为 `ev_good` 的 8 倍（8192/1024）。对高选择性查询（如 `WHERE country='CN' AND event_type='purchase'`），更细的粒度可能让扫描行数再降一些，但多数场景收益有限、索引和 mark 文件的 I/O 反而增加。只有确认「每次只命中几十行」时才值得调小。
+
+4. 思考题（示例推导）：
+
+假设业务是「运营看板」，统计显示：85% 的查询带 `WHERE country = ?`，25% 再带 `WHERE event_type = ?`，时间几乎总是范围条件。
+- 第一列：`country`——出现频率最高，且基数低（几十~几百），放最前既能跳过也能压缩；
+- 第二列：`event_type`——次高频过滤列，基数低（几个~几十个）；
+- 第三列：`event_time`——范围查询放最后，前面等值条件已把范围缩得很小。
+
+排序键即 `ORDER BY (country, event_type, event_time)`。如果还有「按 user_id 点查」的需求，那列不要放进排序键（基数太高），改用 bloom_filter 跳数索引或投影（第 16 章）。
+</Answer>
 </Callout>
 
 ## 小结

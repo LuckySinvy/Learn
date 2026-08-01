@@ -455,6 +455,160 @@ curl -X DELETE localhost:8080/api/tasks/1
 
 <Callout type="exercise" title="动手练习">
 给任务加一个 `priority`（优先级）字段，并在列表接口支持 `?priority=high` 过滤；再写一个 `httptest` 用例覆盖「按优先级过滤」这一分支。
+
+<Answer>
+**参考答案：**
+
+### 1. 模型：加 `priority` 字段
+
+在 `Task` 与 `CreateTaskRequest` 上各加一个 `Priority` 字段（创建时优先级可选，缺省为空串表示普通）：
+
+```go
+type Task struct {
+    ID        int       `json:"id"`
+    Title     string    `json:"title"`
+    Priority  string    `json:"priority"`
+    Done      bool      `json:"done"`
+    CreatedAt time.Time `json:"created_at"`
+}
+
+type CreateTaskRequest struct {
+    Title    string `json:"title" binding:"required"`
+    Priority string `json:"priority"`
+}
+```
+
+### 2. 存储层：Create 接收优先级
+
+`Create` 方法签名从 `Create(title string)` 改为 `Create(title, priority string)`，并写进新任务：
+
+```go
+func (s *Store) Create(title, priority string) Task {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    t := Task{ID: s.nextID, Title: title, Priority: priority, CreatedAt: time.Now()}
+    s.nextID++
+    s.tasks = append(s.tasks, t)
+    return t
+}
+```
+
+对应地，`createTask` handler 把请求里的 `priority` 传进去：
+
+```go
+func (s *Server) createTask(c *gin.Context) {
+    var req CreateTaskRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    c.JSON(201, s.store.Create(req.Title, req.Priority))
+}
+```
+
+> 如果还想支持「修改优先级」，在 `UpdateTaskRequest` 里加一个 `Priority *string` 指针字段，并仿照 `Title` 在 `Store.Update` 里判空赋值即可。
+
+### 3. 列表接口：支持 `?priority=high` 过滤
+
+在第 5 节的 `listTasks` 过滤链里补一段：从查询参数读 `priority`，空串表示不过滤，否则只保留优先级相等的任务。
+
+```go
+func (s *Server) listTasks(c *gin.Context) {
+    doneParam := c.Query("done")
+    q := c.Query("q")
+    priority := c.Query("priority") // 空串表示不过滤
+    page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+    size, _ := strconv.Atoi(c.DefaultQuery("size", "10"))
+
+    var filtered []Task
+    for _, t := range s.store.List() {
+        if doneParam == "true" && !t.Done {
+            continue
+        }
+        if doneParam == "false" && t.Done {
+            continue
+        }
+        if q != "" && !strings.Contains(strings.ToLower(t.Title), strings.ToLower(q)) {
+            continue
+        }
+        if priority != "" && t.Priority != priority {
+            continue
+        }
+        filtered = append(filtered, t)
+    }
+
+    total := len(filtered)
+    start := (page - 1) * size
+    if start >= total {
+        start = total
+    }
+    end := start + size
+    if end > total {
+        end = total
+    }
+
+    c.JSON(200, gin.H{
+        "data":  filtered[start:end],
+        "total": total,
+        "page":  page,
+        "size":  size,
+    })
+}
+```
+
+验证（服务启动后另开终端）：
+
+```bash
+curl -X POST localhost:8080/tasks -H 'Content-Type: application/json' -d '{"title":"高优","priority":"high"}'
+curl -X POST localhost:8080/tasks -H 'Content-Type: application/json' -d '{"title":"低优","priority":"low"}'
+curl 'localhost:8080/tasks?priority=high'
+# 只返回 priority 为 high 的那一条
+```
+
+### 4. httptest：覆盖「按优先级过滤」分支
+
+直接给 `Store` 造两条不同优先级的数据，再请求 `?priority=high`，断言只返回 high 那一条。注意第 5 节里列表接口返回的是 `{"data": ..., "total": ...}` 结构，测试要按这个结构解码：
+
+```go
+func TestListByPriority(t *testing.T) {
+    store := NewStore()
+    srv := NewServer(store)
+    // 造数据：两条任务，优先级不同
+    store.Create("高优先级任务", "high")
+    store.Create("普通任务", "low")
+
+    r := gin.New()
+    r.GET("/tasks", srv.listTasks)
+
+    req := httptest.NewRequest("GET", "/tasks?priority=high", nil)
+    w := httptest.NewRecorder()
+    r.ServeHTTP(w, req)
+
+    if w.Code != 200 {
+        t.Fatalf("期望 200，得到 %d", w.Code)
+    }
+
+    var resp struct {
+        Data  []Task `json:"data"`
+        Total int    `json:"total"`
+    }
+    if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+        t.Fatalf("解析响应失败：%v", err)
+    }
+
+    if resp.Total != 1 {
+        t.Fatalf("期望过滤后剩 1 条，得到 %d", resp.Total)
+    }
+    if len(resp.Data) != 1 || resp.Data[0].Priority != "high" {
+        t.Fatalf("期望只剩 high 优先级任务，得到 %+v", resp.Data)
+    }
+}
+```
+
+运行测试：`go test ./...`。测试文件里记得 import `encoding/json`、`net/http/httptest`、`testing`。
+
+**要点回顾：** 加字段要「三处联动」——模型 struct、存储层 `Create`、创建 handler；查询过滤在 `listTasks` 的循环里多一条 `if priority != "" && t.Priority != priority` 即可；`httptest` 直接调 `store.Create` 造数据 + `r.ServeHTTP` 灌请求，全程内存、无需起端口。
+</Answer>
 </Callout>
 
 ## 小结

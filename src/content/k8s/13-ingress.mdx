@@ -110,6 +110,84 @@ curl -H "Host: example.com" http://<入口IP>/
 
 <Callout type="exercise" title="练习">
 为前几章的 frontend、backend 两个 Service 建一个 Ingress：根路径 `/` 走 frontend，`/api` 走 backend，并加上 `example.com` 的 TLS。用 `curl` 带 Host 头分别验证两条路由。
+
+<Answer>
+**参考答案：**
+
+前置条件：frontend、backend 两个 Service 已存在（如第 7 章方式创建），集群里已装 Ingress Controller（如 nginx-ingress）。
+
+先把证书放进 Secret：
+
+```bash
+# 若还没有证书，可先生成自签证书用于本地验证
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout example.com.key -out example.com.crt -subj "/CN=example.com"
+
+kubectl create secret tls web-tls \
+  --cert=example.com.crt --key=example.com.key
+```
+
+创建 Ingress，保存为 `web-ingress.yaml`：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-ingress
+spec:
+  tls:
+    - hosts: ["example.com"]
+      secretName: web-tls
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+```
+
+应用并验证：
+
+```bash
+kubectl apply -f web-ingress.yaml
+
+# 看 Ingress 是否拿到入口地址
+kubectl get ingress web-ingress
+# NAME          CLASS    HOSTS         ADDRESS     PORTS   AGE
+# web-ingress   nginx    example.com   127.0.0.1   80,443  5s
+
+# 带 Host 头分别验证两条路由（把 <入口IP> 换成上面的 ADDRESS）
+# 根路径 → frontend
+curl -k -H "Host: example.com" http://<入口IP>/
+# 返回 frontend 的页面/响应
+
+# /api 路径 → backend
+curl -k -H "Host: example.com" http://<入口IP>/api
+# 返回 backend 的响应
+
+# HTTPS 验证（-k 忽略自签证书告警）
+curl -k https://example.com/ --resolve example.com:443:<入口IP>
+
+# 清理
+kubectl delete -f web-ingress.yaml
+```
+
+本地没域名时，也可以改 `/etc/hosts` 把 `example.com` 指向入口 IP 后直接 `curl https://example.com/`。
+
+**要点回顾：** Ingress 按 `host` + `pathType`（Prefix）把流量路由到不同 Service；TLS 段引用存了证书的 Secret，由 Controller 统一做 HTTPS 终止；验证时用 `curl -H "Host: ..."` 即可在无真实域名时测试。
+</Answer>
 </Callout>
 
 ## 小结

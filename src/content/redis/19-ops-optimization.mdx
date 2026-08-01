@@ -230,4 +230,73 @@ KEYS/FLUSHALL 重命名禁用；SCAN 系列替代全量遍历命令；删大 key
 1. 把 slowlog-log-slower-than 临时调到 1000（1ms），执行一次对 10 万成员集合的 SMEMBERS，用 SLOWLOG GET 抓到它。
 2. 写脚本对比：循环 1 万次 SET 与 pipeline 批量 1 万次 SET 的总耗时（本机与远程 Redis 各测一次，体会 RTT 的影响）。
 3. 用 redis-cli --bigkeys 扫描你的测试实例，找出最大的 key 并给出治理方案。
+
+<Answer>
+**参考答案：**
+
+**1. 调慢日志阈值并抓 SMEMBERS**
+
+先造一个 10 万成员的大集合，再把慢日志阈值临时调到 1ms：
+
+```bash
+# 用 Lua 快速灌 10 万成员
+127.0.0.1:6379> EVAL "for i=1,100000 do redis.call('SADD', KEYS[1], i) end return redis.call('SCARD', KEYS[1])" 1 big:set
+(integer) 100000
+
+# 临时把阈值调到 1ms（微秒单位 1000），重启后失效，不影响线上配置
+127.0.0.1:6379> CONFIG SET slowlog-log-slower-than 1000
+OK
+
+# 全量读取大集合，这一步就是要被记录的"慢命令"
+127.0.0.1:6379> SMEMBERS big:set
+
+# 抓慢日志，第一条就是刚执行的 SMEMBERS
+127.0.0.1:6379> SLOWLOG GET 1
+1) 1) (integer) 1
+   2) (integer) 1722310000
+   3) (integer) 42000              # 42ms, 远超 1ms 阈值, 实锤
+   4) 1) "SMEMBERS"
+      2) "big:set"
+   5) "10.0.0.21:53311"
+```
+
+做完记得恢复阈值：`CONFIG SET slowlog-log-slower-than 10000`，避免所有命令都进慢日志刷屏。
+
+**2. 循环 1 万次 vs Pipeline 1 万次**
+
+串行循环——1 万次独立网络往返：
+
+```bash
+time for i in $(seq 1 10000); do redis-cli SET "loop:$i" "$i" >/dev/null; done
+# 本机约 1~3 秒（建连+命令本身开销）
+```
+
+Pipeline 批量——1 万条一次打包发出：
+
+```bash
+time (printf 'SET pipe:%d %d\r\n' $(seq 1 10000 | sed 'p') | redis-cli --pipe)
+# 输出 errors: 0, replies: 10000, 总耗时约 50~200ms
+```
+
+测远程 Redis 时给 redis-cli 加 `-h <host> -p <port>`（必要时再加 `-a <password>`）。远程场景 RTT（比如 1ms）会把串行循环放大到 10 秒级别，而 pipeline 几乎不受 RTT 影响——差距从几十倍拉到百倍以上，这正是"RTT 是最大敌人"的直观证据。
+
+**3. --bigkeys 扫描与治理**
+
+```bash
+# 扫描测试实例，-i 0.1 表示每 100ms 暂停一次，避免打满 CPU
+$ redis-cli --bigkeys -i 0.1
+
+# 输出示例
+[00.00%] Biggest set    found so far '"big:set"' with 100000 members
+...
+Biggest   set    found '"big:set"' has 100000 members
+```
+
+假设最大 key 就是刚才的 `big:set`（10 万成员），按本章第 2 节四板斧治理：
+
+- **拆分**：按业务维度哈希分片，如 `big:set:0` ~ `big:set:15`，读写前先对 id 取模定位分片；
+- **换结构**：如果只需要"存在性"判断，改用 Bitmap 或 HyperLogLog（后者有误差），放弃巨型 Set；
+- **压缩**：若存的是可序列化对象，gzip/snappy 后再存；
+- **删除**：确实没用就 `UNLINK big:set` 异步删除，不阻塞主线程。
+</Answer>
 </Callout>

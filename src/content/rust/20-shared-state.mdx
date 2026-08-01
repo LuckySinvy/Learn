@@ -94,6 +94,156 @@ fn main() {
 
 <Callout type="exercise" title="练习">
 用 `Arc<Mutex<Vec<i32>>>` 起 4 个线程，每个线程向向量 push 自己线程编号（0..3），最后主线程打印长度应为 4 且包含全部编号。体会锁的互斥性。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    // Arc 提供多线程共享所有权，Mutex 提供互斥的可变访问
+    let data = Arc::new(Mutex::new(Vec::<i32>::new()));
+    let mut handles = Vec::new();
+
+    for id in 0..4 {
+        // 每个线程都需要自己的一份 Arc（只是计数 +1）
+        let data = Arc::clone(&data);
+
+        let handle = thread::spawn(move || {
+            // lock() 返回 Result，锁被「毒化」时才会是 Err
+            let mut vec = data.lock().unwrap();
+            vec.push(id);
+            println!("线程 {} 已写入", id);
+        });   // vec（MutexGuard）在这里离开作用域，锁自动释放
+
+        handles.push(handle);
+    }
+
+    // 等待全部线程结束
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // 排序后打印，保证输出稳定（push 顺序由调度决定）
+    let mut result = data.lock().unwrap().clone();
+    result.sort();
+
+    println!("长度 = {}", result.len());
+    println!("内容 = {:?}", result);
+}
+```
+
+**输出（前 4 行顺序不定）：**
+
+```text
+线程 0 已写入
+线程 2 已写入
+线程 1 已写入
+线程 3 已写入
+长度 = 4
+内容 = [0, 1, 2, 3]
+```
+
+**关键点解析：**
+
+- **`Arc::clone(&data)` 必须在 `spawn` 之前**：`move` 闭包会拿走 `data` 的所有权，循环第二轮就没得用了。所以每轮先克隆一个 `Arc`（仅原子计数 +1，不复制底层数据），再把克隆体移进闭包
+- **变量遮蔽的小技巧**：`let data = Arc::clone(&data);` 在循环体内新建同名绑定，闭包捕获的是这个内层的。写起来比 `data_clone` 之类的名字更干净
+- **锁的自动释放**：`lock()` 返回 `MutexGuard`，它实现了 `Drop`。守卫离开作用域就自动解锁，**不存在忘记 unlock 的可能**。这比 C++ 手动管理安全得多
+- **为什么 `lock()` 返回 `Result`**：如果某个持锁线程 panic 了，锁会被标记为**毒化（poisoned）**，后续 `lock()` 返回 `Err` 来警告「数据可能处于不一致状态」。示例代码 `unwrap()` 即可，生产代码可以用 `.lock().unwrap_or_else(|e| e.into_inner())` 强行取用
+- **顺序不确定是正常的**：`Mutex` 只保证**互斥**（同一时刻仅一个线程能进临界区），不保证**公平性**或**顺序**。所以最后要 `sort()` 才能得到稳定输出
+
+**为什么必须是 `Arc` 而不是 `Rc`？**
+
+试着把 `Arc` 换成 `Rc`，编译器立刻拦下：
+
+```text
+error[E0277]: `Rc<Mutex<Vec<i32>>>` cannot be sent between threads safely
+   |
+   = help: within `Rc<Mutex<Vec<i32>>>`, the trait `Send` is not implemented
+note: required because it appears within the type `Rc<Mutex<Vec<i32>>>`
+```
+
+`Rc` 的引用计数是**普通加减**，两个线程同时 `clone` 会导致计数错乱，进而引发提前释放或内存泄漏。`Arc` 用**原子操作**维护计数，因此是 `Send + Sync`。代价是原子操作比普通加减慢一点——所以单线程场景仍应优先用 `Rc`。
+
+**这就是 `Send`/`Sync` 的价值：** 你根本不可能「不小心」把 `Rc` 用到多线程里，编译器会替你把关。
+
+**演示锁的互斥性（加上耗时操作）：**
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let counter = Arc::new(Mutex::new(0));
+    let mut handles = Vec::new();
+
+    for id in 0..4 {
+        let counter = Arc::clone(&counter);
+        handles.push(thread::spawn(move || {
+            for _ in 0..1000 {
+                let mut num = counter.lock().unwrap();
+                let current = *num;
+                thread::sleep(Duration::from_nanos(1));   // 放大竞争窗口
+                *num = current + 1;                        // 读-改-写
+            }
+            println!("线程 {} 完成", id);
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    println!("最终计数 = {}", *counter.lock().unwrap());   // 恒等于 4000
+}
+```
+
+即便中间插入了 sleep 来放大「读-改-写」的竞争窗口，结果依然精确是 4000。因为整个读改写过程都在锁的保护之下——这在没有锁的语言里是典型的数据竞争 bug 温床。
+
+**常见陷阱：持锁时间过长**
+
+```rust
+// ❌ 不好：整个耗时计算期间都占着锁，其他线程全被堵住
+let mut vec = data.lock().unwrap();
+let result = expensive_computation();   // 耗时 1 秒
+vec.push(result);
+
+// ✅ 好：先算完，再进临界区
+let result = expensive_computation();
+data.lock().unwrap().push(result);      // 临时守卫，语句结束立刻解锁
+```
+
+**另一个陷阱：在持锁时 join**
+
+```rust
+// ❌ 死锁：主线程持着锁不放，子线程 lock() 永远等不到
+let guard = data.lock().unwrap();
+for h in handles {
+    h.join().unwrap();
+}
+```
+
+**其他同步原语：**
+
+| 类型 | 适用场景 |
+|---|---|
+| `Mutex<T>` | 读写都需要独占 |
+| `RwLock<T>` | 读多写少——允许多个并发读，写时独占 |
+| `AtomicUsize` 等 | 简单计数器，无锁，性能最好 |
+| `mpsc::channel` | 消息传递，能用它就优先用它 |
+
+只是做计数的话，原子类型比 `Mutex` 轻量得多：
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+let counter = Arc::new(AtomicUsize::new(0));
+counter.fetch_add(1, Ordering::SeqCst);   // 无需加锁
+```
+</Answer>
 </Callout>
 
 ## 小结

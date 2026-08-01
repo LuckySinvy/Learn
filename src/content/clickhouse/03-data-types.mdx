@@ -344,6 +344,52 @@ ORDER BY sum(column_data_compressed_bytes) DESC;
 1. 建两张结构相同的表，一张 `country String`，一张 `country LowCardinality(String)`，各插入 200 万行（只有 5 种国家）。用上面的 `system.parts_columns` 查询对比压缩后大小。
 2. 对两张表分别跑 `SELECT country, count() FROM t GROUP BY country`，记录 Elapsed 差异。
 3. 再建一张表把 `user_id` 声明为 `LowCardinality(UInt64)`，插入 200 万个不同 user_id，观察它的压缩体积——验证「高基数不要用 LowCardinality」。
+
+<Answer>
+**参考答案：**
+
+1. 建两张结构相同的表并各插 200 万行（5 种国家）：
+
+```sql
+CREATE TABLE t_string (country String) ENGINE = MergeTree ORDER BY country;
+CREATE TABLE t_lc     (country LowCardinality(String)) ENGINE = MergeTree ORDER BY country;
+
+INSERT INTO t_string SELECT ['CN','US','JP','DE','IN'][1 + rand(1) % 5] FROM numbers(2000000);
+INSERT INTO t_lc     SELECT ['CN','US','JP','DE','IN'][1 + rand(1) % 5] FROM numbers(2000000);
+```
+
+用第 7 节的 `system.parts_columns` 查询对比（把表名分别换成 `t_string` 和 `t_lc`）：
+
+```sql
+SELECT name, type,
+       formatReadableSize(sum(column_data_compressed_bytes))   AS compressed,
+       formatReadableSize(sum(column_data_uncompressed_bytes)) AS uncompressed
+FROM system.parts_columns
+WHERE table = 't_string' AND active
+GROUP BY name, type;
+```
+
+预期结果：`t_lc` 的 `country` 列压缩后只有 `t_string` 的几十分之一（字典编码 + 整数列的高压缩率），例如 200 万行从约 2 MB 降到几十 KB。
+
+2. 对比聚合耗时：
+
+```sql
+SELECT country, count() FROM t_string GROUP BY country;   -- 较慢
+SELECT country, count() FROM t_lc     GROUP BY country;   -- 更快
+```
+
+`t_lc` 的 GROUP BY 会把字符串比较变成字典 id 的整数比较，通常快 3~5 倍。请记录你自己机器上的 `Elapsed` 差异。
+
+3. 验证「高基数不要用 LowCardinality」：
+
+```sql
+CREATE TABLE t_user_lc (user_id LowCardinality(UInt64)) ENGINE = MergeTree ORDER BY user_id;
+
+INSERT INTO t_user_lc SELECT number FROM numbers(2000000);   -- 200 万个互不相同的 user_id
+```
+
+再看 `system.parts_columns`：这张表的 `user_id` 列压缩后体积比普通 `UInt64` 还大（或接近 16 MB 未压缩），因为 200 万项的字典本身就要占用大量空间，还要为每行存字典 id，两头不讨好。而普通 `UInt64` 列压缩后往往只有几 MB。这就是「基数超过十万级别别用 LowCardinality」的原因——字典膨胀抵消了编码收益。
+</Answer>
 </Callout>
 
 ## 小结

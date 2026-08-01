@@ -96,6 +96,166 @@ def rag_with_fallback(question):
 
 <Callout type="exercise" title="练习">
 给你的 RAG 管线加上 Redis 语义缓存与 tenacity 重试，并写一条降级分支：当 LLM 连续失败 3 次时，直接返回 Top-3 原文片段。
+
+<Answer>
+**参考答案：**
+
+**完整实现**
+
+```python
+import json, hashlib, logging
+import numpy as np
+import redis
+from tenacity import (retry, stop_after_attempt, wait_exponential,
+                      retry_if_exception_type, RetryError)
+
+log = logging.getLogger(__name__)
+r = redis.Redis(host="localhost", port=6379, decode_responses=False)
+
+CACHE_TTL = 3600 * 24          # 24 小时
+SIM_THRESHOLD = 0.95           # 语义缓存命中阈值，宁高勿低
+KB_VERSION = "v3"              # 知识库每次重建就 +1，用于整体失效
+
+
+# ---------- 1. 语义缓存 ----------
+class SemanticCache:
+    """精确缓存 + 向量近邻缓存两级"""
+
+    def __init__(self, index_key=f"qcache:{KB_VERSION}"):
+        self.index_key = index_key
+
+    def _exact_key(self, q):
+        h = hashlib.md5(q.strip().lower().encode()).hexdigest()
+        return f"qexact:{KB_VERSION}:{h}"
+
+    def get(self, question, q_vec):
+        # 一级：精确匹配，O(1)，最快
+        hit = r.get(self._exact_key(question))
+        if hit:
+            log.info("cache hit: exact")
+            return json.loads(hit)
+
+        # 二级：语义近邻
+        entries = r.hgetall(self.index_key)
+        if not entries:
+            return None
+        keys = list(entries.keys())
+        mat = np.stack([np.frombuffer(entries[k], dtype=np.float32) for k in keys])
+        sims = mat @ q_vec                       # 向量均已归一化
+        best = int(np.argmax(sims))
+        if sims[best] >= SIM_THRESHOLD:
+            cached = r.get(keys[best].decode())
+            if cached:
+                log.info("cache hit: semantic sim=%.3f", sims[best])
+                return json.loads(cached)
+        return None
+
+    def set(self, question, q_vec, answer):
+        key = self._exact_key(question)
+        r.setex(key, CACHE_TTL, json.dumps(answer, ensure_ascii=False))
+        r.hset(self.index_key, key, q_vec.astype(np.float32).tobytes())
+        r.expire(self.index_key, CACHE_TTL)
+
+
+# ---------- 2. 带退避的重试 ----------
+class LLMError(Exception):
+    pass
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),   # 1s → 2s → 4s
+    retry=retry_if_exception_type(LLMError),
+    reraise=True,
+)
+def call_llm(prompt: str) -> str:
+    try:
+        resp = llm.chat(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=512,
+            timeout=15,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        # 4xx 参数错误重试也没用，直接抛出不重试
+        if getattr(e, "status_code", 500) < 500 and getattr(e, "status_code", 0) != 429:
+            raise
+        raise LLMError(str(e)) from e
+
+
+# ---------- 3. 主流程 + 降级 ----------
+cache = SemanticCache()
+
+def ask(question: str) -> dict:
+    q_vec = embed_normalized(question)
+
+    cached = cache.get(question, q_vec)
+    if cached:
+        return {**cached, "cached": True}
+
+    chunks = retrieve(q_vec, top_k=20)
+    top = rerank(question, chunks)[:5]
+
+    try:
+        answer = call_llm(build_prompt(question, top))
+        result = {
+            "answer": answer,
+            "citations": [c["meta"] for c in top],
+            "degraded": False,
+        }
+        cache.set(question, q_vec, result)      # 只缓存成功结果
+        return {**result, "cached": False}
+
+    except (LLMError, RetryError) as e:
+        log.error("LLM 连续失败，触发降级: %s", e)
+        return degrade(top[:3])
+
+
+def degrade(top3) -> dict:
+    """降级：不生成，直接把检索到的原文交给用户"""
+    body = "\n\n".join(
+        f"【{i+1}】{c['text']}\n　　—— 来源：{c['meta'].get('source')} "
+        f"第 {c['meta'].get('page', '?')} 页"
+        for i, c in enumerate(top3)
+    )
+    return {
+        "answer": "生成服务暂时不可用，以下是为你检索到的最相关原文，请直接参考：\n\n" + body,
+        "citations": [c["meta"] for c in top3],
+        "degraded": True,
+    }
+```
+
+**降级为什么这样设计**
+
+关键在于：**降级不等于报错**。直接返回「服务异常，请稍后重试」是最差的做法——检索明明已经成功了，最有价值的原文就在手上，只是最后一步「润色成自然语言」失败了。把原文原样交给用户，他自己读一样能解决问题，体验远好于一个错误页。
+
+这体现了一个通用原则：**降级要沿着「能力递减」的阶梯走，而不是直接掉到零**。
+
+```text
+完整能力: 检索 → 重排 → 生成 → 带引用的流畅答案
+  ↓ LLM 挂了
+降级 1:  检索 → 重排 → 直接返回 Top-3 原文（本练习）
+  ↓ 重排也挂了
+降级 2:  检索 → 返回向量 Top-3 原文
+  ↓ 向量库也挂了
+降级 3:  返回缓存中最相似的历史问答（标注「可能不完全匹配」）
+  ↓ 全挂
+降级 4:  明确告知不可用 + 人工客服入口
+```
+
+**六个生产要点**
+
+1. **阈值宁高勿低。** 语义缓存阈值设 0.95 而不是 0.85，因为**缓存返回错答案的代价远大于缓存未命中**。第 5 章那个实验已经证明了：反义句的相似度能到 0.85——「A 产品支持退款吗」和「B 产品支持退款吗」相似度极高但答案可能完全相反。上线后要抽查语义命中的样本，确认没有张冠李戴。
+
+2. **缓存 key 必须带知识库版本号。** 文档更新后旧答案就过期了，靠 TTL 自然淘汰太慢。用 `KB_VERSION` 做前缀，重建索引时版本号一变，全部旧缓存自动失效。
+
+3. **区分「该重试」和「不该重试」的错误。** 429（限流）、5xx、超时值得重试；400（参数错误）、401（鉴权失败）重试三次只是浪费 3 倍时间和配额。代码里用 `status_code` 做了区分。
+
+4. **退避必须是指数级的。** `wait_exponential` 是 1s → 2s → 4s。如果用固定间隔重试，下游抖动时所有请求会同时重试，形成脉冲把服务彻底打死——这就是课文警告的「重试雪崩」。生产上还建议加随机抖动（jitter）打散重试时刻。
+
+5. **降级要打点，而且要告警。** `degraded: True` 这个字段要进监控。降级本身是正常的保护行为，但**降级率突然升高**是重大故障信号，必须触发告警。同时缓存命中率也要监控——命中率异常下跌通常意味着缓存配置出了问题。
+
+6. **只缓存成功的结果。** 千万别把降级答案写进缓存，否则一次短暂故障会污染缓存 24 小时，所有相似问题都拿到「服务不可用」的回答。
+</Answer>
 </Callout>
 
 ## 小结

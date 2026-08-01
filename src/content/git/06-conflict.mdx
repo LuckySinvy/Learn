@@ -323,4 +323,77 @@ rerere = **RE**use **RE**corded **RE**solution。开启后 Git 会记录你对�
 2. 在冲突状态下用 `git show :1:` `:2:` `:3:` 分别打印三个版本，并画出这次合并的"祖先-我方-对方"三角关系。
 3. 制造 modify/delete 冲突：一个分支修改文件，另一个分支删除同一文件，然后合并。读懂 Git 给出的提示，并用 `git rm` 或 `git add` 两种方式分别完成解决。
 4. 构造两个分支改同一文件相隔 1 行和相隔 10 行的两种情况，验证前者冲突、后者自动合并，并解释为什么（提示：diff hunk 的上下文行数）。
+
+<Answer>
+**参考答案：**
+
+**1. 默认样式 vs diff3**
+
+```bash
+git init -q
+echo 'print("hello")' > app.py && git add . && git commit -q -m "init"
+git switch -qc feature && echo 'print("hello feature")' > app.py && git commit -qam "feat"
+git switch -q main && echo 'print("hello main")' > app.py && git commit -qam "main"
+git merge feature
+```
+
+默认样式只有 `<<<<<<< HEAD` / `=======` / `>>>>>>> feature` 两段，你只能看到"我方结果"和"对方结果"。执行 `git checkout --conflict=diff3 app.py` 后，冲突块中间多出 `||||||| base` 一段，显示**共同祖先原本的内容**。有了 base 就能一眼看出双方各自改了什么、改动方向是什么，而不是面对两个陌生版本瞎猜。例如看到 base 是 `hello`、我方改成 `hello main`、对方改成 `hello feature`，就明白"加后缀"这个意图其实是一致的，容易调和。
+
+**2. 三个版本与三角关系**
+
+```bash
+git show :1:app.py   # base：共同祖先
+git show :2:app.py   # ours：当前分支（main）
+git show :3:app.py   # theirs：被合并分支（feature）
+git ls-files -u      # 看索引里的三条 stage 记录
+```
+
+三角关系：
+
+```text
+          base  (共同祖先，commit-1)
+          /  \
+   ours /    \ theirs
+        /      \
+    main      feature
+    (HEAD)      |
+        \      /
+         merge
+```
+
+`merge` 的三方合并就是基于这个三角形：以 base 为参照，把 ours 侧和 theirs 侧的改动叠加；两处改动重叠且不一致时，把三个版本都放进索引（stage 1/2/3），交给人决定。
+
+**3. modify/delete 冲突**
+
+```bash
+git init -q
+echo v1 > f.txt && git add . && git commit -q -m "init"
+git switch -qc feature && echo v2 > f.txt && git commit -qam "feature 修改"
+git switch -q main && git rm -q f.txt && git commit -qam "main 删除 f.txt"
+git merge feature
+```
+
+Git 会报类似 `CONFLICT (modify/delete): f.txt deleted in HEAD and modified in feature` 的提示，`git status` 会把文件列为 unmerged。两种解决方式：
+
+- 保留删除（接受删除）：`git rm f.txt`，表示"就按删掉处理"，然后 `git add`（或用 `git commit` 直接完成合并）。
+- 保留修改（撤销删除）：`git add f.txt`，把 feature 版本的修改内容放回工作区并标记已解决，然后提交。
+
+两条路都通向同一个终点：让文件回到**单一确定状态**并 `git commit` 完成合并。
+
+**4. 相隔 1 行 vs 相隔 10 行**
+
+构造方法：在 8 行文件上，一边改第 1 行、另一边改第 2 行（相隔 1 行），或者一边改第 1 行、另一边改第 10 行（相隔 10 行）：
+
+```bash
+git init -q
+{ echo L1; for i in 2 3 4 5 6 7 8 9 10; do echo "L$i"; done; } > f.txt
+git add . && git commit -q -m "init"
+git switch -qc a && { echo 'L1-A'; sed -n '2,10p' f.txt; } > f.txt
+git add f.txt && git commit -q -m "a 改第1行"
+git switch -q main && { echo 'L1'; sed -n '2,10p' f.txt; } > f.txt
+# 分别试：改第 2 行（与 A 相隔 1 行）-> 冲突；改第 10 行（相隔 10 行）-> 自动合并
+```
+
+结果：改动相隔 1 行时冲突；相隔 10 行时自动合并。原因是 Git 把每个文件的改动按 **hunk（变更块）** 处理，hunk 会带若干行**上下文**（context，默认前后各 3 行）。两侧改动如果落入同一个 hunk 的上下文窗口内，就被判定为"改了同一区域"→ 冲突；窗口完全不相交，则各自作为独立 hunk 自动合并。改动隔得越远，窗口越不可能重叠，就越能自动合并——这也解释了"改动挨得太近就算同一区块"的说法。
+</Answer>
 </Callout>

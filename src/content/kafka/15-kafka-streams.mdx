@@ -170,4 +170,49 @@ async def count_orders(stream):
 1. 写一个 Streams 应用：从 orders 读 JSON，过滤金额大于 100 的写入 big-orders，运行后用 kafka-topics --list 找找自动创建的内部 topic。
 2. 实现每用户 1 分钟滚动窗口的订单计数，输出到结果 topic，用 console consumer 观察窗口结果的更新方式。
 3. 起两个相同 application.id 的实例，kill 掉一个，观察任务迁移与状态恢复日志；再配 num.standby.replicas=1 对比恢复速度。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：过滤 + 内部 topic**
+
+核心代码骨架：
+
+```java
+StreamsBuilder builder = new StreamsBuilder();
+KStream<String, String> orders = builder.stream("orders");
+orders
+  .filter((k, v) -> JsonPath.parse(v).read("$.amount", Double.class) > 100)
+  .to("big-orders");
+```
+
+`application.id` 设为 `order-filter-app`。启动后 `kafka-topics --list` 会发现 Streams 自动建了一批内部 topic，命名规律是 `<application.id>-<后缀>`：
+
+- `<app>-<op>-<hash>-repartition`：当发生重分区（如 key 改变、groupBy）时创建的临时 topic，本题若只是 filter 不改 key，可能不出现。
+- 若后续用到聚合/连接，还会看到 `-rocksdbchangelog`（changelog 主题，用于把本地状态备份到 Kafka，故障后可重放恢复）。
+
+这些内部 topic 普通客户端不该直接读写，删除它们会让状态丢失。
+
+**第 2 题：滚动窗口计数**
+
+```java
+orders
+  .groupBy((k, v) -> JsonPath.parse(v).read("$.userId"))
+  .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1)))
+  .count()
+  .toStream()
+  .map((w, c) -> KeyValue.pair(w.key() + "@" + w.window().start(), c))
+  .to("user-order-counts");
+```
+
+用 `kafka-console-consumer --topic user-order-counts` 观察会发现：**窗口结果不是一次定死，而是随新消息持续更新**。例如某用户在 10:00:00–10:01:00 窗口，先来 1 条输出 `...1`，又来 2 条变成 `...3`，窗口关闭（grace 期过后）不再更新。key 形如 `user-42@1700000000000`，含窗口起始时间，便于区分不同分钟。这是 KTable 语义：同一 key 的新值覆盖旧值，下游拿到的是「当前最新计数」而非「每次增量」。
+
+**第 3 题：实例扩容与 standby 恢复**
+
+- 起两个实例（相同 `application.id=order-filter-app`），任务按分区均摊到两实例。
+- `kill -9` 其中一个：消费组触发 rebalance，存活实例接管全部分区。若该实例持有状态（如窗口/计数），需从 changelog topic 重放恢复状态——日志里会看到 `Restoring state`、从 offset 重读 changelog，恢复时间取决于状态量（无 standby 时全量重放）。
+- 加 `num.standby.replicas=1`：每个分区的状态会在另一个实例上维护一份热备。再 kill 一台，接管实例直接用 standby 状态继续，**几乎无重放延迟**，恢复日志明显更快。
+
+对比结论：standby 用「额外存储 + 计算」换「故障恢复时间」，有状态应用上线强烈建议开启。
+</Answer>
 </Callout>

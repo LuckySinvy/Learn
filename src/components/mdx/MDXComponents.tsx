@@ -1,5 +1,6 @@
 import { CodeBlock, Callout } from './CodeBlock';
 import { Playground } from '@/components/playground/Playground';
+import { Answer } from './Answer';
 import type { Language } from '@/lib/types';
 
 export const MDXComponents = {
@@ -8,4 +9,5 @@ export const MDXComponents = {
     <Playground {...props} />
   ),
   Callout,
+  Answer,
 };

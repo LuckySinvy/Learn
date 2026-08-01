@@ -444,6 +444,96 @@ clickhouse-client -q "ALTER TABLE demo.events DROP PARTITION '${OLD}'"
 2. 执行 `EXPLAIN indexes = 1 SELECT count() FROM events WHERE event_time >= '2024-06-01'`，记下 `Parts: x/y`，验证分区裁剪生效。
 3. 对同一个分区依次执行 `DETACH PARTITION`（查询验证数据消失）→ `ATTACH PARTITION`（数据回来）→ `FREEZE PARTITION`（去 shadow 目录看硬链接）→ `DROP PARTITION`，测量各自耗时。
 4. 建一张带 `TTL event_time + INTERVAL 1 MINUTE` 的小表，插入数据后等两分钟，观察数据是否消失。如果没消失，执行 `ALTER TABLE ... MATERIALIZE TTL` 再看。思考为什么需要手动触发。
+
+<Answer>
+**参考答案：**
+
+1. 建分区表并插入横跨 3 个月的数据：
+
+```sql
+CREATE TABLE events
+(
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        String,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    duration_ms UInt32
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (country, event_type, event_time);
+
+-- 横跨 2024-04 / 05 / 06 三个月
+INSERT INTO events
+SELECT toDateTime('2024-04-01') + number % 7862400,   -- 91 天
+       number, 'view', '/p/1', 'CN', 'web', 100
+FROM numbers(900000);
+```
+
+```sql
+SELECT partition, count() AS parts, sum(rows) AS rows
+FROM system.parts WHERE table = 'events' AND active
+GROUP BY partition ORDER BY partition;
+-- 期望看到 202404 / 202405 / 202406 三个分区
+```
+
+2. 验证分区裁剪：
+
+```sql
+EXPLAIN indexes = 1
+SELECT count() FROM events WHERE event_time >= '2024-06-01';
+```
+
+看 `Partition` 或 `MinMax` 部分的 `Parts: x/y`——如果裁剪生效，读的 part 数应明显小于总 part 数（例如 `Parts: 1/3`，只读 6 月那个分区的 part）。注意 WHERE 条件要让 `event_time` 裸露，不要用 `toString(event_time)` 之类的函数包裹，否则无法推导出分区键、裁剪失效。
+
+3. 分区级操作演练（以 `202406` 为例，逐条执行并对比耗时）：
+
+```sql
+-- 查看有哪些分区
+SELECT DISTINCT partition FROM system.parts WHERE table = 'events' AND active;
+
+-- 软删除：数据下线但还留在 detached/
+ALTER TABLE events DETACH PARTITION '202406';
+SELECT count() FROM events;            -- 少了 6 月的数据
+
+-- 恢复
+ALTER TABLE events ATTACH PARTITION '202406';
+SELECT count() FROM events;            -- 数据回来了
+
+-- 快照（硬链接）
+ALTER TABLE events FREEZE PARTITION '202406';
+-- 到容器/服务器里查看：
+-- ls /var/lib/clickhouse/shadow/<时间戳>/... ，里面是指向原 part 文件的硬链接，
+-- 大小（du）看起来是 0 或很小，因为硬链接共享同一份磁盘块
+
+-- 物理删除
+ALTER TABLE events DROP PARTITION '202406';
+SELECT count() FROM events;            -- 6 月数据被秒级删掉
+```
+
+这些操作都是「元数据 + 目录」级别，几百万行也几乎瞬间完成，与行级 DELETE 重写整个 part 形成鲜明对比。
+
+4. TTL 实验：
+
+```sql
+CREATE TABLE ttl_demo (event_time DateTime, v String)
+ENGINE = MergeTree
+ORDER BY event_time
+TTL event_time + INTERVAL 1 MINUTE;
+
+INSERT INTO ttl_demo VALUES (now(), 'a');
+-- 等 2 分钟后直接查：数据可能还在
+SELECT count() FROM ttl_demo;
+
+-- 手动强制触发
+ALTER TABLE ttl_demo MATERIALIZE TTL;
+SELECT count() FROM ttl_demo;   -- 现在应该是 0
+```
+
+**为什么需要手动触发**：TTL 只在后台 merge 或专门的 TTL 后台任务处理某个 part 时才会执行。如果表写入少、part 长时间不被合并选中，过期数据就会一直躺着。`MATERIALIZE TTL` 会立即对该表所有 part 应用 TTL 规则，适合用来验证 TTL 配置或紧急清理。生产上对「过期粒度 = 分区粒度」的删除，用定时 `DROP PARTITION` 比 TTL DELETE 高效得多（本章第 6 节）。
+</Answer>
 </Callout>
 
 ## 小结

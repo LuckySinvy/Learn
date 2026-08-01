@@ -210,4 +210,176 @@ TTL 只能设在整个 key 上。若业务需要"每个字段独立过期"（如
 1. 创建一个 Hash，先写 100 个短 field 确认编码为 listpack，再写入一个 100 字节的 value，验证编码转为 hashtable 且不可逆。
 2. 用 Hash 实现购物车：加购、改数量、删商品、结算取全量，写出完整命令序列。
 3. 假设要缓存 500 万用户的资料（每人 5 个字段），设计拆分方案避免大 key，并说明如何根据用户 ID 定位到对应的 key。
+
+<Answer>
+**参考答案：**
+
+**1. 验证 listpack 到 hashtable 的单向转换**
+
+```bash
+# 先写 100 个短 field（少于 hash-max-listpack-entries 128）
+127.0.0.1:6379> DEL h
+(integer) 1
+for i in $(seq 1 100); do redis-cli hset h f$i v$i; done
+
+127.0.0.1:6379> HLEN h
+(integer) 100
+127.0.0.1:6379> OBJECT ENCODING h
+"listpack"                # 元素少、值短 → 紧凑编码
+
+# 写入一个 100 字节的 value（超过 hash-max-listpack-value 64）
+127.0.0.1:6379> HSET h big "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+(integer) 1
+127.0.0.1:6379> OBJECT ENCODING h
+"hashtable"               # 触发转换
+
+# 验证不可逆：删掉那个长 value，编码不会退回 listpack
+127.0.0.1:6379> HDEL h big
+(integer) 1
+127.0.0.1:6379> HLEN h
+(integer) 100
+127.0.0.1:6379> OBJECT ENCODING h
+"hashtable"               # 仍然是 hashtable，不会转回去
+
+# 另一条触发路径：field 数量超过 128
+127.0.0.1:6379> DEL h2
+for i in $(seq 1 129); do redis-cli hset h2 f$i v$i; done
+127.0.0.1:6379> OBJECT ENCODING h2
+"hashtable"
+```
+
+**两个阈值任意一个被突破就转换**：
+
+| 配置项 | 默认值 | 含义 |
+|---|---|---|
+| `hash-max-listpack-entries` | 128 | field 数量上限 |
+| `hash-max-listpack-value` | 64 | 单个 field 名或 value 的字节数上限 |
+
+**为什么不可逆？** 转换需要遍历重建整个数据结构，如果双向都做，一个在阈值边界反复增删的 key 会不停地来回转换，抖动的开销远大于省下的内存。Redis 选择"一次转换、永不回头"，用一点内存换取行为可预测。
+
+实践意义：如果你的 Hash 本应保持紧凑，就要**确保任何一个 value 都不会超长**。一次意外写入的大 value 会让这个 key 永久失去内存优势——比如缓存用户资料时某人填了超长签名，整个 Hash 的编码就退化了。
+
+**2. 用 Hash 实现购物车**
+
+```bash
+# ---- 加购：field = SKU，value = 数量 ----
+127.0.0.1:6379> HSET cart:u1001 sku:2001 1
+(integer) 1
+127.0.0.1:6379> HSET cart:u1001 sku:2002 3 sku:2003 2    # 一次加多个
+(integer) 2
+
+# ---- 改数量：+1 用 HINCRBY，原子操作，无需读改写 ----
+127.0.0.1:6379> HINCRBY cart:u1001 sku:2001 1
+(integer) 2
+127.0.0.1:6379> HINCRBY cart:u1001 sku:2002 -1           # 减 1
+(integer) 2
+# 直接设为指定数量用 HSET 覆盖
+127.0.0.1:6379> HSET cart:u1001 sku:2003 5
+(integer) 0                # 返回 0 表示是更新已有 field，不是新增
+
+# ---- 减到 0 要删除，否则购物车里会残留数量为 0 的商品 ----
+127.0.0.1:6379> HINCRBY cart:u1001 sku:2002 -2
+(integer) 0
+127.0.0.1:6379> HDEL cart:u1001 sku:2002
+(integer) 1
+
+# ---- 删商品 ----
+127.0.0.1:6379> HDEL cart:u1001 sku:2003
+(integer) 1
+
+# ---- 查询 ----
+127.0.0.1:6379> HGET cart:u1001 sku:2001         # 单个商品数量
+"2"
+127.0.0.1:6379> HEXISTS cart:u1001 sku:2001      # 是否已加购
+(integer) 1
+127.0.0.1:6379> HLEN cart:u1001                  # 购物车商品种类数（角标数字）
+(integer) 1
+
+# ---- 结算：取全量 ----
+127.0.0.1:6379> HGETALL cart:u1001
+1) "sku:2001"
+2) "2"
+
+# ---- 清空购物车 ----
+127.0.0.1:6379> DEL cart:u1001
+(integer) 1
+
+# ---- 购物车保活 30 天 ----
+127.0.0.1:6379> EXPIRE cart:u1001 2592000
+(integer) 1
+```
+
+为什么购物车适合 Hash 而不是 String 存 JSON：
+
+- **改数量只需一条 `HINCRBY`**，而 JSON 方案要"读整个 JSON → 反序列化 → 改 → 序列化 → 写回"，既有网络开销又有并发覆盖问题
+- **`HLEN` 直接拿到角标数字**，不用取回全部数据
+- 购物车商品数天然有限（几十个），不会触发大 key
+
+注意 `HINCRBY` 减到负数时 Redis 不会拦截，业务侧要自己判断结果 `<= 0` 就 `HDEL`。要严格防止负数，用 Lua 脚本把"减 + 判断 + 删除"做成原子操作。
+
+**3. 500 万用户资料的拆分方案**
+
+**错误做法**：`HSET all:users u1001 "{...}"` —— 500 万 field 的巨型 Hash，`HGETALL` 会卡死主线程，Cluster 下还无法分片。
+
+**方案一：一人一个 Hash（推荐，最简单）**
+
+```bash
+127.0.0.1:6379> HSET user:1001 name "张三" age 28 city "深圳" level 3 avatar "http://cdn/a.jpg"
+(integer) 5
+127.0.0.1:6379> HGETALL user:1001
+127.0.0.1:6379> HGET user:1001 name          # 只取一个字段
+127.0.0.1:6379> EXPIRE user:1001 3600
+```
+
+定位方式：直接拼 `user:` + 用户 ID。
+
+- 优点：定位零成本、每人独立 TTL、Cluster 下天然均匀分片、单 key 极小
+- 缺点：500 万个 key，每个 key 的 redisObject + 字典entry 开销约 50~100 字节，纯元数据就要 300~500 MB
+
+**方案二：取模分桶（省内存，适合超大规模）**
+
+```bash
+# 桶数取质数或 2 的幂，这里用 10000 个桶
+# 桶号 = userId % 10000，field = 用户ID，value = 序列化后的资料
+127.0.0.1:6379> HSET users:1001 1001 "{\"name\":\"张三\",\"age\":28}"
+(integer) 1
+127.0.0.1:6379> HSET users:0842 20842 "{\"name\":\"李四\",\"age\":31}"
+(integer) 1
+
+# 读取
+127.0.0.1:6379> HGET users:1001 1001
+```
+
+定位公式（伪代码，实际用你的语言实现）：
+
+```bash
+# bucket = userId % 10000
+# key    = "users:" + 左补零到4位(bucket)
+# field  = userId
+# 例：userId=1234567 → 1234567 % 10000 = 4567 → key = "users:4567"
+```
+
+桶数怎么定？目标是**每个 Hash 的 field 数控制在 5000 以内**（大 key 判定线）：
+
+```bash
+# 500 万用户 / 目标每桶 500 个 = 至少 10000 个桶
+# 取 10000 桶：每桶 500 个 field，安全
+# 取 1024 桶：每桶 4883 个 field，接近 5000 上限，不建议
+```
+
+- 优点：key 数量从 500 万降到 1 万，元数据开销大幅下降；但注意每桶 500 个 field 已远超 128，编码是 hashtable，省的主要是 key 层面的开销
+- 缺点：**无法给单个用户设 TTL**（TTL 只能设在整个桶上）；`HGETALL` 一个桶会拉回 500 个用户的数据，必须用 `HGET`/`HMGET` 精确取
+
+**怎么选？**
+
+| 需求 | 推荐方案 |
+|---|---|
+| 需要按用户独立过期 | 方案一 |
+| 有 Cluster，要求分片均匀 | 方案一（方案二桶少时可能倾斜） |
+| 用户量极大、内存吃紧、可接受整桶过期 | 方案二 |
+
+大多数业务选**方案一**：500 万个小 key 对 Redis 完全不是问题（Redis 单实例撑住上亿 key 很常见），而独立 TTL 和分片均匀这两个好处非常实在。方案二只在内存成本压力极大时才值得引入它的复杂度。
+
+另外，无论哪种方案，Cluster 下如果需要"一次取多个用户"，注意跨 slot 的 `MGET`/pipeline 会被拆成多次请求，可以用 hash tag（如 `user:{group1}:1001`）把同组用户固定到同一 slot——但要小心这会破坏分片均匀性。
+</Answer>
 </Callout>

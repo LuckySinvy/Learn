@@ -177,4 +177,83 @@ dig/nslookup 与公网 ping 需要外网与相应工具包（Debian 系 `apt ins
 2. 造一个多字段的 JSON 文件经本地服务返回，用 jq 完成：美化输出、提取某数组全部 id、select 过滤某条件的对象。
 3. 分别以 `--bind 127.0.0.1` 和 `--bind 0.0.0.0` 起两个端口，用 netstat 截图对比 Local Address 列，说明哪个能被外部访问。
 4. 真机作业：对任一公网域名执行 dig（或 nslookup），找出它的 A 记录与 TTL；再改 /etc/hosts 把它指向 127.0.0.1，观察 curl 行为变化后**记得改回**。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：curl 健康检查（200 输出 OK 否则 FAIL）**
+
+```bash
+mkdir -p www
+echo '{"status":"ok"}' > www/health.json
+cd www
+python3 -m http.server 8000 --bind 127.0.0.1 > /dev/null 2>&1 &
+sleep 1
+
+# 写法一：if 判断
+if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health.json)" = "200" ]; then
+  echo OK
+else
+  echo FAIL
+fi
+
+# 写法二：&& / || 短路
+curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health.json | grep -q '^200' && echo OK || echo FAIL
+```
+
+核心：`-w '%{http_code}'` 让 curl 只输出状态码，`-o /dev/null` 丢弃响应体，然后与 200 比较。
+
+**第 2 题：jq 美化、提取、过滤**
+
+```bash
+cat > www/users.json << 'EOF'
+{"data":[{"id":1,"name":"ada","role":"admin"},{"id":2,"name":"bob","role":"dev"},{"id":3,"name":"carol","role":"dev"}]}
+EOF
+
+curl -s http://127.0.0.1:8000/users.json | jq .                    # 美化输出
+curl -s http://127.0.0.1:8000/users.json | jq '.data[].id'         # 全部 id
+curl -s http://127.0.0.1:8000/users.json | jq '.data[] | select(.role == "dev")'   # 过滤 dev
+```
+
+`jq .` 美化全文，`'...[]'` 遍历数组元素，`select(条件)` 在管道里过滤对象。
+
+**第 3 题：127.0.0.1 vs 0.0.0.0**
+
+```bash
+python3 -m http.server 9001 --bind 127.0.0.1 > /dev/null 2>&1 &
+python3 -m http.server 9002 --bind 0.0.0.0  > /dev/null 2>&1 &
+sleep 1
+netstat -tln | grep -E '900[12]'
+```
+
+netstat 输出中 Local Address 列：
+
+- `127.0.0.1:9001` —— 只监听回环地址，**仅本机能访问**，外部机器连不上；
+- `0.0.0.0:9002` —— 监听所有网卡地址，**外部可以访问**（配合安全组放行后）。
+
+这是"本机能通、外面不通"的头号原因：服务只绑了 127.0.0.1。生产服务对外暴露时应绑 `0.0.0.0`（或具体内网 IP），仅本机使用则绑 `127.0.0.1` 更安全。
+
+**第 4 题：真机 DNS 排查作业**
+
+```bash
+# 1. 查 A 记录与 TTL
+dig example.com
+# 看 ANSWER SECTION：
+# example.com.  86400  IN  A  93.184.216.34
+#           ↑TTL(秒)         ↑A 记录
+
+# 2. 改 /etc/hosts 指向 127.0.0.1（需 root/sudo）
+# echo '127.0.0.1 example.com' | sudo tee -a /etc/hosts
+
+# 3. 观察 curl 行为
+curl -I http://example.com
+# 会请求到本机 127.0.0.1 的 web 服务（若本机 80 端口有服务则返回它的响应；
+# 否则报 Connection refused / 超时）——证明 hosts 优先于 DNS
+
+# 4. 改回（必须！）
+# sudo sed -i '/example.com/d' /etc/hosts  或手动删除那一行
+```
+
+要点：`/etc/hosts` 的解析优先级高于 DNS，这就是"本地想绕过真实解析做调试"的常用手段，但调试完务必删掉对应行，否则域名会一直被指向 127.0.0.1。
+</Answer>
 </Callout>

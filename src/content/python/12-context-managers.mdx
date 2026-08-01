@@ -239,6 +239,43 @@ print("回到第一层")`}
 - `builtins.print = lambda *a, **kw: _original_print("  " + (a[0] if a else ""), *a[1:], **kw)` 这种写法
 - 也可以维护一个 `level` 计数器，每次 `indent()` 累加，离开时减掉
 - 别忘了 `finally` 里恢复原 `print`
+
+<Answer>
+
+**参考答案：**
+
+```python
+import builtins
+from contextlib import contextmanager
+
+_original_print = builtins.print
+_level = 0
+
+def _indented_print(*args, **kwargs):
+    # 在内容前加上 2 × 层数 个空格，再交给原版 print
+    _original_print("  " * _level + " ".join(str(a) for a in args), **kwargs)
+
+@contextmanager
+def indent():
+    global _level
+    _level += 1                       # 进入一层缩进
+    builtins.print = _indented_print  # 全局替换 print
+    try:
+        yield
+    finally:
+        _level -= 1                   # 退出一层
+        if _level == 0:
+            builtins.print = _original_print  # 全部退出后恢复原版
+```
+
+运行结果与题目期望一致：`第一层` → `  第二层 A` → `    第三层` → `  第二层 B` → `回到第一层`。
+
+要点：
+
+- 用全局 `_level` 记录嵌套深度，每次 `indent()` 加一、退出减一，`"  " * _level` 让缩进随嵌套正确累加。
+- `_indented_print` 永远调用 `_original_print`（而不是当前的 `builtins.print`），避免自我递归导致栈溢出。
+- `finally` 保证即使块内抛异常，`_level` 也会减、`print` 也能恢复。
+</Answer>
 </Callout>
 
 ## 小结

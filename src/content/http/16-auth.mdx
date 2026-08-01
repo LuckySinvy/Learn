@@ -193,4 +193,109 @@ Bearer 的含义是"持票即入"，令牌泄露 = 密码泄露。日志、URL�
 2. 在 Playground 2 中给 verify 增加 alg 白名单校验，构造一个 header 里 alg 字段为 none 的令牌，验证它被拒绝。
 3. 把 Playground 2 的 exp 设为过去时间，验证过期分支；再实现一个 refresh 函数：旧令牌未过期超过 7 天时允许换发新令牌。
 4. 画出"用 GitHub 账号登录某网站"的完整时序图，标注授权码与 access_token 分别出现在哪条信道上。
+
+<Answer>
+**参考答案：**
+
+**1. /login 用 Basic 换发 JWT，其余路由 Bearer 校验**
+
+把 Playground 1 的 Basic 校验与 Playground 2 的 JWT 签发/校验组合：
+
+```python
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/login":
+            auth = self.headers.get("Authorization", "")
+            if not (auth.startswith("Basic ") and
+                    base64.b64decode(auth[6:]).decode() == VALID):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Basic realm=\"demo\"")
+                self.end_headers(); return
+            user = base64.b64decode(auth[6:]).decode().split(":")[0]
+            token = issue({"sub": user, "role": "user",
+                           "exp": int(time.time()) + 3600})
+            body = ("token: " + token + "\n").encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body); return
+        # 其余路由：Bearer 校验
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            payload, err = verify(auth[7:])
+            if err is None:
+                body = ("welcome, " + payload["sub"] + "\n").encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body); return
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", "Bearer realm=\"api\"")
+        self.end_headers()
+```
+
+流程：`curl -u ada:s3cret /login` 拿到 JWT → 之后请求带 `Authorization: Bearer <token>` 访问受保护路由。**Basic 只在登录那一次用（HTTPS 下），后续用无状态的 Bearer**——这就是"登录换令牌"的标准形态。
+
+**2. alg 白名单校验 + 拒绝 none**
+
+给 `verify` 加上 alg 校验：
+
+```python
+def verify(token: str):
+    try:
+        head_b64, pay_b64, sig = token.split(".")
+        header = json.loads(base64.urlsafe_b64decode(head_b64 + "=="))
+        if header.get("alg") != "HS256":       # 白名单：只接受 HS256
+            return None, "不支持的 alg: " + str(header.get("alg"))
+        hp = head_b64 + "." + pay_b64
+        if not hmac.compare_digest(sig, sign(hp)):
+            return None, "签名不匹配"
+        ...
+```
+
+构造 `alg=none` 的攻击令牌：`{"alg":"none"}` 头 + 篡改过的 payload + 空签名（或随便拼的第三段）。校验时先看 alg，发现不是 HS256 → 直接拒绝。这正是守则第一条"必须校验 alg，拒绝 none"——`none` 算法意味着不签名，攻击者改了 payload 也能通过老实现。
+
+**3. 过期验证 + refresh**
+
+把 `exp` 设为过去时间：
+
+```python
+token = issue({"sub": "ada", "exp": int(time.time()) - 10})
+print(verify(token))    # -> (None, '令牌已过期')
+```
+
+refresh 函数：旧令牌未过期且签发时间在 7 天内，允许换发新令牌：
+
+```python
+def refresh(token: str):
+    payload, err = verify(token)
+    if err:
+        return None, err
+    iat = payload.get("iat", 0)
+    if time.time() - iat > 7 * 86400:      # 签发超过 7 天，拒绝续期
+        return None, "超过可续期窗口"
+    return issue({"sub": payload["sub"], "role": payload["role"],
+                  "exp": int(time.time()) + 3600, "iat": int(time.time())}), "OK"
+```
+
+思路：access token 短命（1 小时）+ refresh 用 iat 判断可续期窗口。JWT 无法主动吊销，靠"短 exp + refresh"逼近 Session 的失效能力（守则第二条）。
+
+**4. GitHub 登录时序图**
+
+```text
+浏览器(用户)            某网站后端               GitHub
+   │  ① 点击"用 GitHub 登录"              │
+   │ ◀── 302 重定向到 GitHub 授权页 ──│     │
+   │   (client_id, scope, redirect_uri, state) │
+   │ ───────────────────────▶ ② 在 GitHub 上登录并同意授权
+   │ ◀─────────────────────── 302 重定向回网站，URL 带 code ────┐
+   │   ③ code 出现在【浏览器 URL 上】＝前端信道(可被看到/记录)     │
+   │ ──── ④ 网站后端拿 code+client_secret 请求 GitHub ────▶
+   │        ⑤ GitHub 返回 access_token，只在【后端对后端】信道    │
+   │ ◀── ⑥ 网站后端用 access_token 调 GitHub API 取用户信息 ──▶   │
+   │ ◀── ⑦ 网站建立自己的登录态(Set-Cookie) ─────┘
+```
+
+关键标注：
+
+- **授权码 code**：出现在 ③ 的**浏览器重定向 URL** 里（前端信道，会进地址栏、历史记录、日志）——所以 code 必须一次性使用且短命；
+- **access_token**：只出现在 ⑤ 的**后端对后端通信**（安全信道），浏览器永远看不到——这就是 OAuth2 绕一道"授权码"的全部意义；
+- 若 GitHub 直接在第 ③ 步给 access_token，令牌就会暴露在 URL/历史里。授权码即使被截获，没有 client_secret 也换不到令牌。
+</Answer>
 </Callout>

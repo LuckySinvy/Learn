@@ -268,6 +268,215 @@ void main();`}
 1. 给 `mapLimit` 加上 `signal?: AbortSignal` 参数，取消时立即停止派发新任务并抛出错误。
 2. 实现 `withTimeout<T>(p: Promise<T>, ms: number): Promise<T>`，超时则 reject。提示：用 `Promise.race`。
 3. 写一个异步生成器 `chunk<T>(source: AsyncIterable<T>, size: number)`，把逐个到达的元素攒成定长数组再 yield 出去。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：给 mapLimit 加上取消支持**
+
+```ts
+async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number, signal?: AbortSignal) => Promise<R>,
+  signal?: AbortSignal,
+): Promise<R[]> {
+  // 入口先检查一次：已经取消了就别白费力气
+  if (signal?.aborted === true) {
+    throw new Error("操作已取消");
+  }
+
+  const out: R[] = new Array<R>(items.length);
+  let cursor = 0;
+
+  async function worker(): Promise<void> {
+    while (cursor < items.length) {
+      // 每次派发新任务前检查，取消后立即停止派发
+      if (signal?.aborted === true) {
+        throw new Error("操作已取消");
+      }
+      const i = cursor;
+      cursor += 1;
+      out[i] = await fn(items[i] as T, i, signal);
+    }
+  }
+
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < Math.min(limit, items.length); w += 1) {
+    workers.push(worker());
+  }
+
+  await Promise.all(workers);
+  return out;
+}
+```
+
+用法：
+
+```ts
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function main(): Promise<void> {
+  const controller = new AbortController();
+
+  // 30ms 后取消
+  setTimeout(() => controller.abort(), 30);
+
+  try {
+    const result = await mapLimit(
+      [1, 2, 3, 4, 5, 6, 7, 8],
+      2,
+      async (n) => {
+        await delay(20);
+        console.log("完成任务 " + n);
+        return n * n;
+      },
+      controller.signal,
+    );
+    console.log(result);
+  } catch (e) {
+    console.log("捕获: " + (e as Error).message);   // 捕获: 操作已取消
+  }
+}
+```
+
+要点：
+
+- **检查点放在 while 循环的开头**，也就是「派发下一个任务之前」。这满足题目要求的「立即停止派发新任务」：已经在跑的任务会自然跑完（除非 `fn` 自己也响应 signal），但不会再开新的。
+- `signal` 被透传给 `fn`，这样单个任务内部（比如 `fetch`）也能响应取消。这是现代库的通用约定。
+- 用 `signal?.aborted === true` 而不是 `signal?.aborted`：`signal` 为 `undefined` 时前者明确得到 `false`，后者得到 `undefined`，虽然在 `if` 里效果相同，但显式比较更清晰，也符合 `strict` 下的习惯。
+- **完全遵循 Web 标准的写法**应该抛 `DOMException` 并使用 signal 自带的原因：
+
+```ts
+if (signal?.aborted === true) {
+  throw signal.reason;   // reason 默认是一个 name 为 "AbortError" 的 DOMException
+}
+// 或者直接用标准方法（Node 18+ / 现代浏览器）
+signal?.throwIfAborted();
+```
+
+`signal.throwIfAborted()` 就是「检查并抛出」的标准封装，生产代码里优先用它。
+
+**第 2 题：withTimeout**
+
+```ts
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error("操作超时（" + ms + "ms）"));
+    }, ms);
+  });
+
+  // race：谁先结束用谁的结果
+  return Promise.race([p, timeout]).finally(() => {
+    clearTimeout(timer);   // 无论哪边赢，都要清理定时器
+  });
+}
+```
+
+验证：
+
+```ts
+function delay<T>(ms: number, value: T): Promise<T> {
+  return new Promise((resolve) => setTimeout(() => resolve(value), ms));
+}
+
+async function main(): Promise<void> {
+  // 情况 1：按时完成
+  const fast = await withTimeout(delay(10, "完成"), 100);
+  console.log(fast);   // 完成
+
+  // 情况 2：超时
+  try {
+    await withTimeout(delay(200, "太慢了"), 50);
+  } catch (e) {
+    console.log((e as Error).message);   // 操作超时（50ms）
+  }
+}
+```
+
+要点：
+
+- 超时那个 Promise 的类型是 **`Promise<never>`**，因为它只会 reject、永远不会 resolve。这样 `Promise.race([Promise<T>, Promise<never>])` 的结果类型正好是 `Promise<T>`——`never` 在联合里被自动吸收。这是 `never` 在实际代码中一个非常漂亮的用法。
+- **`clearTimeout` 不能省。** 如果原 Promise 10ms 就完成了，而超时设的是 60 秒，不清理的话进程会被这个定时器多挂住 60 秒（Node 里表现为程序不退出）。用 `.finally()` 保证两种结局都清理。
+- **重要局限：超时不等于取消。** `Promise.race` 只是「不再等待」原 Promise，原操作**仍在后台继续运行**。真正需要中止底层操作时，必须配合 `AbortController`：
+
+```ts
+async function fetchWithTimeout(url: string, ms: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+顺带一提，现代运行时已经内置了这个能力：`AbortSignal.timeout(ms)` 可以直接生成一个到点自动 abort 的 signal。
+
+**第 3 题：异步生成器 chunk**
+
+```ts
+async function* chunk<T>(
+  source: AsyncIterable<T>,
+  size: number,
+): AsyncGenerator<T[], void, unknown> {
+  if (size < 1) throw new RangeError("size 必须大于等于 1");
+
+  let buffer: T[] = [];
+
+  for await (const item of source) {
+    buffer.push(item);
+    if (buffer.length === size) {
+      yield buffer;
+      buffer = [];        // 必须新建数组，不能 buffer.length = 0
+    }
+  }
+
+  // 收尾：剩余不足一批的元素也要吐出去
+  if (buffer.length > 0) {
+    yield buffer;
+  }
+}
+```
+
+验证：
+
+```ts
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function* numbers(n: number): AsyncGenerator<number, void, unknown> {
+  for (let i = 1; i <= n; i += 1) {
+    await delay(2);
+    yield i;
+  }
+}
+
+async function main(): Promise<void> {
+  for await (const batch of chunk(numbers(7), 3)) {
+    console.log(JSON.stringify(batch));
+  }
+  // [1,2,3]
+  // [4,5,6]
+  // [7]        ← 最后一批不足 3 个，同样被 yield 出来
+}
+```
+
+要点：
+
+- **`buffer = []` 而不是 `buffer.length = 0`。** 这是最容易踩的坑：`yield buffer` 交出去的是数组的**引用**，如果原地清空，消费者手里的数组也会跟着变空。必须新建一个数组。
+- **收尾的 `if` 不能漏。** 元素总数不是 `size` 整数倍时，最后那批会留在缓冲区里。这是这类「攒批」函数最常见的 bug。
+- `AsyncGenerator<T[], void, unknown>` 三个参数：yield 出去的是 `T[]`，函数结束时 return 的是 `void`，外部不通过 `next(v)` 传值所以是 `unknown`。
+- 参数类型用 `AsyncIterable<T>` 而不是 `AsyncGenerator<T>`：前者是更宽的接口，任何实现了异步迭代协议的对象（包括 Node 的可读流）都能传进来。**在参数位置要求最小接口**是良好的类型设计习惯。
+- 实际用途：数据库批量插入、批量调用有条数限制的 API、日志攒批上报——都是「逐条到达但需要成批处理」的典型场景。
+</Answer>
 </Callout>
 
 ## 小结

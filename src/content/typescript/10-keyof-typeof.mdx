@@ -361,6 +361,152 @@ TypeScript 里大部分「看起来太严格」的地方，背后都有一条站
 1. 定义一个 `const HTTP_STATUS` 对象（如 200 对应 OK、404 对应 Not Found），用 `as const` 冻结，然后推导出 `type StatusCode` 与 `type StatusText` 两个字面量联合。
 2. 写一个 `pluck<T, K extends keyof T>(items: T[], key: K): T[K][]`，从对象数组中抽出某一列，用一组数据验证返回类型是否精确。
 3. 定义一个 i18n 词条对象并用 `satisfies Record<string, string>` 校验，然后写 `t(key: keyof typeof messages): string`；试着故意把某个值写成数字，看报错是否指向具体那一行。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：HTTP_STATUS 与两个字面量联合**
+
+```ts
+const HTTP_STATUS = {
+  200: "OK",
+  201: "Created",
+  400: "Bad Request",
+  404: "Not Found",
+  500: "Internal Server Error",
+} as const;
+
+type StatusCode = keyof typeof HTTP_STATUS;
+// 200 | 201 | 400 | 404 | 500   ← 注意是数字字面量，不是 string
+
+type StatusText = (typeof HTTP_STATUS)[StatusCode];
+// "OK" | "Created" | "Bad Request" | "Not Found" | "Internal Server Error"
+
+function statusText(code: StatusCode): StatusText {
+  return HTTP_STATUS[code];
+}
+
+console.log(statusText(404));   // Not Found
+console.log(statusText(200));   // OK
+// statusText(418);   // 错误：类型 418 的参数不能赋给类型 StatusCode 的参数
+
+const ok: StatusText = "OK";
+// const bad: StatusText = "Teapot";   // 错误：不能赋给 StatusText
+console.log(ok);
+```
+
+要点：
+
+- 如果去掉 `as const`，`HTTP_STATUS` 的值类型会被拓宽成 `string`，`StatusText` 也就退化成 `string`，字面量精度全部丢失。这正是 `as const` 存在的意义。
+- `StatusText` 的推导用了本章的两个组合技：`typeof` 由值取类型，再用**索引访问 + 键名联合**一次性取出所有值类型。也可以写成更通用的 `(typeof HTTP_STATUS)[keyof typeof HTTP_STATUS]`。
+- 一个容易踩的坑：`Object.keys(HTTP_STATUS)` 返回的是 `string[]`（`["200", "404", ...]`），因为 JS 对象的键在运行时永远是字符串。想拿回数字键需要转换：
+
+```ts
+const codes = Object.keys(HTTP_STATUS).map(Number) as StatusCode[];
+console.log(codes.join(", "));   // 200, 201, 400, 404, 500
+```
+
+**第 2 题：pluck**
+
+```ts
+function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
+  return items.map((item) => item[key]);
+}
+
+interface Product {
+  id: number;
+  title: string;
+  price: number;
+  inStock: boolean;
+}
+
+const products: Product[] = [
+  { id: 1, title: "键盘", price: 299, inStock: true },
+  { id: 2, title: "鼠标", price: 99, inStock: false },
+  { id: 3, title: "显示器", price: 1299, inStock: true },
+];
+
+const titles = pluck(products, "title");    // 推断为 string[]
+const prices = pluck(products, "price");    // 推断为 number[]
+const stocks = pluck(products, "inStock");  // 推断为 boolean[]
+
+// 返回类型确实精确：可以直接调用各自类型的方法，无需断言
+console.log(titles.map((t) => t.toUpperCase()).join("、"));  // 键盘、鼠标、显示器
+console.log("总价 = " + prices.reduce((a, b) => a + b, 0));  // 总价 = 1697
+console.log("有货数量 = " + stocks.filter(Boolean).length);   // 有货数量 = 2
+
+// pluck(products, "color");   // 错误：类型 "color" 的参数不能赋给类型 keyof Product
+```
+
+要点：
+
+- `K extends keyof T` 保证键名合法，`T[K]`（索引访问类型）保证返回的元素类型跟着键名走。两个类型参数被绑定在一起，这是本章与第 9 章共同强调的核心手法。
+- 验证「类型是否精确」最直接的办法就是**去调用只有该类型才有的方法**：`titles` 能调 `.toUpperCase()` 说明它确实是 `string[]` 而不是 `unknown[]` 或 `(string | number | boolean)[]`。
+- 如果签名写成 `pluck(items: T[], key: string): unknown[]`，上面三行调用全都得手动断言，泛型的价值就在这个对比里。
+
+**第 3 题：i18n 词条与 satisfies**
+
+```ts
+const messages = {
+  greeting: "你好",
+  farewell: "再见",
+  confirm: "确定要继续吗？",
+  cancel: "取消",
+} satisfies Record<string, string>;
+
+type MessageKey = keyof typeof messages;
+// "greeting" | "farewell" | "confirm" | "cancel"
+
+function t(key: MessageKey): string {
+  return messages[key];
+}
+
+console.log(t("greeting"));   // 你好
+console.log(t("cancel"));     // 取消
+// t("hello");   // 错误：类型 "hello" 的参数不能赋给类型 MessageKey 的参数
+```
+
+**故意写错一个值：**
+
+```ts
+const messages = {
+  greeting: "你好",
+  farewell: 42,          // ← 故意写成数字
+  confirm: "确定要继续吗？",
+} satisfies Record<string, string>;
+```
+
+报错会**精确指向 `farewell` 这一行**：
+
+```text
+TS2322: 不能将类型“number”分配给类型“string”。
+  farewell: 42,
+  ~~~~~~~~
+```
+
+这就是 `satisfies` 相比另外两种写法的优势：
+
+| 写法 | 写错值时 | 键名精度 |
+|---|---|---|
+| `const messages = { ... }` | **不报错**，静默通过 | 精确 |
+| `const messages: Record<string, string> = { ... }` | 报错，但指向整个对象 | 丢失，`keyof` 得到 `string` |
+| `const messages = { ... } satisfies Record<string, string>` | 报错且**指向具体那一行** | 精确 |
+
+第二行的问题尤其致命：一旦加了 `: Record<string, string>` 注解，`keyof typeof messages` 就变成 `string`，`t("随便写")` 也不会报错，词条 key 的拼写检查完全失效。
+
+如果还想让每条词条的**值**也保留字面量类型（比如做类型级的文案校验），可以叠加 `as const`：
+
+```ts
+const messages = {
+  greeting: "你好",
+  farewell: "再见",
+} as const satisfies Record<string, string>;
+
+type Greeting = (typeof messages)["greeting"];   // "你好"，而不是 string
+```
+
+顺序是固定的：`as const` 在前，`satisfies` 在后。
+</Answer>
 </Callout>
 
 ## 小结

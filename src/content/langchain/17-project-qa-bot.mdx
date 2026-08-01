@@ -106,6 +106,169 @@ export async function POST(req: Request) {
 
 <Callout type="exercise" title="练习">
 为上面的 Bot 加上「引用来源」：让模型在答案后附上 `[来源: 第 N 块]`，并用 `retriever` 返回的 `metadata` 映射回原文位置。
+
+<Answer>
+**参考答案：**
+
+核心思路三步：**① 给每个检索块编号并连同编号一起喂给模型 → ② 提示词强制要求标注编号 → ③ 把模型答案里的编号映射回 `metadata` 得到真实出处**。
+
+**完整实现**
+
+```ts
+// qa-bot-with-citation.ts
+import "dotenv/config";
+import { TextLoader } from "langchain/document_loaders/fs/text";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings, ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { RunnableSequence, RunnableMap } from "@langchain/core/runnables";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import type { Document } from "@langchain/core/documents";
+
+// ---------- 1) 把检索到的块编号后格式化 ----------
+function formatWithIndex(docs: Document[]): string {
+  return docs
+    .map((d, i) => {
+      const src = d.metadata.source ?? "未知文件";
+      const page = d.metadata.loc?.pageNumber;
+      const where = page ? `${src} 第 ${page} 页` : src;
+      // 把出处也写进上下文，模型偶尔会直接引用文件名，更友好
+      return `【第 ${i + 1} 块｜${where}】\n${d.pageContent}`;
+    })
+    .join("\n\n");
+}
+
+// ---------- 2) 提示词强制标注 ----------
+const prompt = ChatPromptTemplate.fromTemplate(
+  `你是文档问答助手。只根据下面带编号的上下文回答问题。
+
+规则：
+1. 上下文中没有的信息，直接回答「文档中未提及」，绝不编造。
+2. 每一句结论后面必须标注它依据的块编号，格式为 [来源: 第 N 块]。
+3. 一句话综合了多块信息时写成 [来源: 第 1 块, 第 3 块]。
+4. 只引用你真正用到的块，不要罗列所有编号。
+
+上下文：
+{context}
+
+问题：{question}`
+);
+
+async function buildChain(docsPath: string) {
+  const raw = await new TextLoader(docsPath).load();
+  const splits = await new RecursiveCharacterTextSplitter({
+    chunkSize: 500,
+    chunkOverlap: 50,
+  }).splitDocuments(raw);
+
+  const vectorStore = await MemoryVectorStore.fromDocuments(splits, new OpenAIEmbeddings());
+  const retriever = vectorStore.asRetriever({ k: 4 });
+
+  const answerChain = RunnableSequence.from([
+    // docs 已在外层取好，这里只做格式化
+    RunnableMap.from({
+      context: (i: { docs: Document[] }) => formatWithIndex(i.docs),
+      question: (i: { question: string }) => i.question,
+    }),
+    prompt,
+    new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 }),
+    new StringOutputParser(),
+  ]);
+
+  // 对外暴露的函数：同时返回答案和引用明细
+  return async function ask(question: string) {
+    const docs = await retriever.invoke(question);
+    const answer = await answerChain.invoke({ docs, question });
+    return { answer, docs, citations: mapCitations(answer, docs) };
+  };
+}
+
+// ---------- 3) 把答案里的编号映射回原文 ----------
+type Citation = {
+  index: number;
+  source: string;
+  page?: number;
+  excerpt: string;
+};
+
+function mapCitations(answer: string, docs: Document[]): Citation[] {
+  // 匹配 [来源: 第 1 块, 第 3 块] 里的所有数字
+  const used = new Set<number>();
+
+  for (const m of answer.matchAll(/\[来源:([^\]]+)\]/g)) {
+    for (const n of m[1].matchAll(/第\s*(\d+)\s*块/g)) {
+      used.add(Number(n[1]));
+    }
+  }
+
+  return [...used]
+    .sort((a, b) => a - b)
+    .filter((i) => i >= 1 && i <= docs.length)   // 过滤模型编造的越界编号
+    .map((i) => {
+      const d = docs[i - 1];
+      return {
+        index: i,
+        source: String(d.metadata.source ?? "未知"),
+        page: d.metadata.loc?.pageNumber,
+        excerpt: d.pageContent.slice(0, 100).replace(/\n/g, " ") + "…",
+      };
+    });
+}
+
+// ---------- 使用 ----------
+const ask = await buildChain("./docs/handbook.md");
+const { answer, citations } = await ask("如何申请测试环境？");
+
+console.log(answer);
+console.log("\n===== 引用出处 =====");
+for (const c of citations) {
+  console.log(`[第 ${c.index} 块] ${c.source}${c.page ? ` 第 ${c.page} 页` : ""}`);
+  console.log(`    ${c.excerpt}`);
+}
+```
+
+**典型输出**
+
+```
+申请测试环境需要在内网工单系统提交「环境申请」工单 [来源: 第 1 块]，
+由直属主管和运维双重审批后开通 [来源: 第 1 块, 第 3 块]，
+一般 1 个工作日内完成 [来源: 第 3 块]。
+
+===== 引用出处 =====
+[第 1 块] ./docs/handbook.md
+    3.2 测试环境申请流程：登录内网工单系统，选择「环境申请」类别，填写…
+[第 3 块] ./docs/handbook.md
+    审批规则：环境类工单需直属主管与运维组双重审批，承诺时效 1 个工作日…
+```
+
+**方案对比：为什么不用结构化输出？**
+
+| 方案 | 优点 | 缺点 |
+|---|---|---|
+| **提示词 + 正则解析**（上面） | 简单、流式友好、答案自然带内联标注 | 模型偶尔漏标或编造编号，需要过滤越界 |
+| `withStructuredOutput` 返回 `{ answer, citedChunks }` | 结构可靠，不用正则 | **不能流式**（要等完整 JSON），且引用与句子的对应关系丢失 |
+| 每句话单独调一次模型判断依据 | 最精确 | 成本翻数倍，延迟不可接受 |
+
+日常用第一种就够。如果对准确性要求极高，可以两者结合：正文流式输出，结束后再用一次小模型调用做引用校验。
+
+**四个实践要点**
+
+1. **编号要写进上下文里**。只在提示词说「标注第几块」而不给块编号，模型只能瞎猜。`【第 N 块】` 这个前缀是整套方案的锚点。
+2. **必须过滤越界编号**。模型有时会引用「第 7 块」而你只给了 4 块。`filter` 那一行不是可选的防御，是必需的——否则 `docs[6]` 会是 `undefined` 直接崩。
+3. **`metadata` 是自动继承的**。`splitDocuments` 会把原 Document 的 `metadata` 拷贝到每个小块上，所以切分后仍能拿到 `source` 和 `loc.pageNumber`，不用自己维护映射表。
+4. **流式场景下引用后置解析**。流式时先把 token 全推给前端，`done` 之后再对完整文本跑 `mapCitations`，然后单独推一条引用列表消息。
+
+**前端可点击溯源**
+
+把 `citations` 一起返回给前端，就能把 `[来源: 第 1 块]` 渲染成可点击的角标，点开显示 `excerpt`，甚至跳转到 PDF 对应页：
+
+```ts
+return Response.json({ answer, citations });
+```
+
+这也是课文「上线三个优化点」里「答案无出处」那一项的完整解法。
+</Answer>
 </Callout>
 
 ## 小结

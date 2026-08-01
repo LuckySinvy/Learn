@@ -99,6 +99,261 @@ let total: usize = paths.par_iter()
 
 <Callout type="exercise" title="练习">
 把上面工具改成：用 `Arc<Mutex<HashMap<String, usize>>>` 让工作线程直接写共享结果表，主线程 `join` 所有 worker 后再打印；对比 channel 版，体会两种共享方式的差异。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::collections::HashMap;
+use std::fs;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    let paths = vec![
+        "a.txt".to_string(),
+        "b.txt".to_string(),
+        "c.txt".to_string(),
+        "d.txt".to_string(),
+    ];
+
+    // 共享结果表：Arc 提供多线程共享，Mutex 提供互斥可变
+    let results: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // 待处理的任务队列，工作线程自己来取
+    let queue = Arc::new(Mutex::new(paths.clone()));
+
+    let mut handles = Vec::new();
+    let workers = 3;
+
+    for worker_id in 0..workers {
+        let results = Arc::clone(&results);
+        let queue = Arc::clone(&queue);
+
+        let handle = thread::spawn(move || {
+            loop {
+                // 1. 取任务——注意用小作用域，取完立刻释放锁
+                let path = {
+                    let mut q = queue.lock().unwrap();
+                    match q.pop() {
+                        Some(p) => p,
+                        None => break,   // 队列空了，退出
+                    }
+                };
+
+                // 2. 读文件统计——这一步是耗时操作，绝不能持锁进行
+                let lines = fs::read_to_string(&path)
+                    .map(|c| c.lines().count())
+                    .unwrap_or(0);
+
+                // 3. 写回结果——同样只在最小作用域内持锁
+                results.lock().unwrap().insert(path.clone(), lines);
+
+                println!("worker {} 完成 {}", worker_id, path);
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // 等待所有 worker 结束
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // 此时所有线程已结束，可以安全读取结果
+    let results = results.lock().unwrap();
+
+    let mut entries: Vec<_> = results.iter().collect();
+    entries.sort();   // 排序保证输出稳定
+
+    let mut total = 0;
+    for (path, lines) in entries {
+        println!("{}: {} 行", path, lines);
+        total += lines;
+    }
+    println!("合计: {} 行", total);
+}
+```
+
+**输出（worker 完成顺序不定）：**
+
+```text
+worker 0 完成 d.txt
+worker 2 完成 c.txt
+worker 1 完成 b.txt
+worker 0 完成 a.txt
+a.txt: 12 行
+b.txt: 30 行
+c.txt: 8 行
+d.txt: 45 行
+合计: 95 行
+```
+
+**最关键的一条纪律：临界区要尽可能小**
+
+```rust
+// ❌ 灾难性写法：持锁期间读文件，并发度直接退化成 1
+let mut r = results.lock().unwrap();
+let lines = fs::read_to_string(&path)...;   // 慢！其他线程全在干等
+r.insert(path, lines);
+
+// ✅ 正确：先做耗时活儿，再进临界区
+let lines = fs::read_to_string(&path)...;   // 并行执行
+results.lock().unwrap().insert(path, lines); // 临时守卫，语句结束即解锁
+```
+
+这是共享状态并发中最容易犯、后果也最严重的错误——代码看起来是多线程，实际性能和单线程没区别，还白白背上了锁的开销。
+
+**另一个细节：取任务用了块表达式**
+
+```rust
+let path = {
+    let mut q = queue.lock().unwrap();
+    match q.pop() { Some(p) => p, None => break }
+};   // 守卫在这里 drop，锁释放
+```
+
+如果直接写 `let mut q = queue.lock().unwrap();`，守卫会一直活到循环体末尾，导致整个「读文件 + 写结果」阶段都占着队列锁。用块把它包起来，是控制锁作用域的标准手法。
+
+**注意：这里同时用了两把锁**
+
+`queue` 和 `results` 是两把独立的锁。本例没有死锁风险，因为**从不同时持有两把锁**——取任务时只持 `queue`，写结果时只持 `results`。如果某段代码需要同时持有多把锁，就必须保证**所有线程都按相同顺序加锁**，否则就是经典的死锁场景。
+
+---
+
+## 两种方案的对比
+
+| 维度 | channel 版 | `Arc<Mutex<HashMap>>` 版 |
+|---|---|---|
+| **数据流向** | 单向：任务 → 结果 | 双向：任意线程读写同一份数据 |
+| **数据竞争** | 结构上不可能发生 | 靠锁保证，忘了加锁就出错 |
+| **死锁风险** | 无（但会忘记 drop 发送端导致挂起） | 有（多把锁顺序不一致时） |
+| **结果获取** | 边产生边消费，可流式处理 | 必须等全部 `join` 完才安全读取 |
+| **背压控制** | `sync_channel` 可限制队列长度 | 无天然背压机制 |
+| **性能** | 每条消息有传递开销 | 锁竞争激烈时成为瓶颈 |
+| **心智负担** | 低——想清楚数据流即可 | 高——每处访问都要想「锁了吗」 |
+| **适用场景** | 流水线、生产者-消费者、任务分发 | 共享缓存、计数器、状态表 |
+
+**该怎么选？**
+
+Rust 社区的默认建议是 **「优先用 channel」**——即 Go 那句名言「不要用共享内存来通信，要用通信来共享内存」。原因是 channel 版本从**结构上**就不可能有数据竞争，你不需要在每次访问数据时都停下来思考「这里需要加锁吗」。
+
+但共享状态在这些场景下更自然：
+
+- **数据本身就是共享的**：缓存、连接池、全局配置
+- **多个线程要频繁读同一份数据**：这时用 `RwLock` 让读操作并行，比 channel 高效得多
+- **数据量大，复制成本高**：channel 需要转移所有权（大对象要么 move 要么 clone），共享内存则零拷贝
+
+---
+
+## 关于课文中 channel 版的一个重要提示
+
+课文里的 `rx_task.clone()` 实际上**无法编译**——标准库的 `mpsc::Receiver` **没有实现 `Clone`**。`mpsc` 的全称是 **multi-producer, single-consumer**（多生产者、单消费者），接收端天生只能有一个。
+
+**修正方案一：把 Receiver 包进 `Arc<Mutex<...>>` 共享**
+
+```rust
+use std::sync::{mpsc, Arc, Mutex};
+
+let (tx_task, rx_task) = mpsc::channel::<String>();
+let rx_task = Arc::new(Mutex::new(rx_task));
+
+for _ in 0..3 {
+    let rx = Arc::clone(&rx_task);
+    let tx_result = tx_result.clone();
+    thread::spawn(move || {
+        loop {
+            // 锁住接收端取一条消息，立刻释放
+            let path = match rx.lock().unwrap().recv() {
+                Ok(p) => p,
+                Err(_) => break,   // 发送端全部关闭
+            };
+            let lines = fs::read_to_string(&path)
+                .map(|c| c.lines().count())
+                .unwrap_or(0);
+            tx_result.send((path, lines)).unwrap();
+        }
+    });
+}
+```
+
+注意 `rx.lock().unwrap().recv()` 是一条语句，临时守卫在语句末尾就释放了。**千万不要写成 `for path in rx.lock().unwrap().iter()`**——那样一个线程会永久霸占接收端的锁，其余线程全部饿死。
+
+这其实就是**线程池**的经典实现方式，《Rust 程序设计语言》最后一章的 web server 项目用的正是这个模式。
+
+**修正方案二：用 `crossbeam-channel`（推荐）**
+
+```toml
+[dependencies]
+crossbeam-channel = "0.5"
+```
+
+```rust
+use crossbeam_channel as channel;
+
+let (tx_task, rx_task) = channel::unbounded::<String>();
+
+for _ in 0..3 {
+    let rx = rx_task.clone();   // ✅ crossbeam 的 Receiver 可以直接 clone
+    thread::spawn(move || {
+        for path in rx {        // 多个线程各自迭代，自动竞争消费
+            // ...
+        }
+    });
+}
+```
+
+`crossbeam-channel` 是 **MPMC**（多生产者多消费者），接收端可直接克隆，而且性能通常比 std 的 `mpsc` 更好，还支持 `select!` 多路复用。做多消费者场景时，它是首选。
+
+---
+
+## 最省事的方案：rayon
+
+如果只是想并行处理一个集合，前面两种手写方案都太啰嗦了：
+
+```rust
+use rayon::prelude::*;
+use std::collections::HashMap;
+
+fn main() {
+    let paths = vec!["a.txt", "b.txt", "c.txt", "d.txt"];
+
+    // 一行搞定并行 + 结果收集，没有锁，没有 channel
+    let results: HashMap<String, usize> = paths
+        .par_iter()
+        .map(|p| {
+            let lines = fs::read_to_string(p)
+                .map(|c| c.lines().count())
+                .unwrap_or(0);
+            (p.to_string(), lines)
+        })
+        .collect();
+
+    let total: usize = results.values().sum();
+    println!("合计: {} 行", total);
+}
+```
+
+把 `iter()` 换成 `par_iter()` 就完成了并行化。rayon 内部使用**工作窃取（work-stealing）**调度器，自动按 CPU 核数分配任务、自动负载均衡。它的 `collect` 会为每个线程准备独立的容器，最后合并——**全程无锁竞争**。
+
+**三种方案的选择建议：**
+
+| 场景 | 推荐 |
+|---|---|
+| 并行处理一个集合，得到结果 | **rayon** |
+| 流水线、任务分发、需要背压 | **channel** |
+| 长期存在的共享状态（缓存、计数器） | **`Arc<Mutex<T>>`** / `Arc<RwLock<T>>` |
+| 高并发 I/O（网络请求、数据库） | **async + tokio**（第 22 章） |
+
+**别忘了：** 本例的瓶颈其实是**磁盘 I/O 而非 CPU**。文件读取受限于磁盘带宽时，开再多线程也不会更快——机械硬盘上甚至可能因为随机寻道而**变慢**。真正 I/O 密集的场景，异步（`tokio::fs`）通常比多线程更合适。
+
+**性能优化的第一原则永远是：先测量，再优化。** 用 `std::time::Instant` 或 `criterion` crate 量出真实数据，再决定用哪种并发模型。
+
+---
+
+🎉 **恭喜你完成全部 30 章 Rust 课程！** 你已经掌握了所有权、借用、生命周期这些 Rust 独有的核心概念，也走过了 trait、泛型、并发、异步等进阶主题，并完成了三个实战项目。接下来最好的学习方式就是**动手写项目**——从一个你自己会用的小工具开始吧。
+</Answer>
 </Callout>
 
 ## 小结

@@ -71,6 +71,72 @@ LangGraph 与 LangSmith 天然兼容，`compile()` 后的图在 `LANGCHAIN_TRACI
 
 <Callout type="exercise" title="练习">
 把上面的示例改成「带工具」的图：新增一个 `toolNode`，让 `route` 根据模型是否请求工具决定走 `toolNode` 还是 `END`。
+
+<Answer>
+**参考答案：**
+
+给模型 `bind_tools` 后，新增 `tool_node` 节点，并用条件路由在「调用工具」和「结束」之间切换：
+
+```python
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
+
+model = ChatOpenAI(model="gpt-4o-mini").bind_tools([search_api])
+
+
+@tool
+def search_api(keyword: str) -> str:
+    """按关键词搜索知识库，返回匹配的文档内容"""
+    return f"关于 {keyword} 的文档：……"
+
+
+# 1. 工具节点：取出模型的工具调用请求，执行并回填结果
+def tool_node(state):
+    last = state["messages"][-1]
+    args = last.tool_calls[0]["args"]
+    return {
+        "messages": [
+            ToolMessage(
+                content=str(search_api.invoke(args)),
+                tool_call_id=last.tool_calls[0]["id"],
+            )
+        ]
+    }
+
+
+# 2. 模型节点：只负责生成，不直接改状态
+def agent(state):
+    return {"messages": [model.invoke(state["messages"])]}
+
+
+# 3. 条件路由：模型请求了工具就走 tool_node，否则结束
+def route(state):
+    last = state["messages"][-1]
+    return "tool_node" if last.tool_calls else END
+
+
+graph = (
+    StateGraph(MessagesState)
+    .add_node("agent", agent)
+    .add_node("tool_node", tool_node)
+    .add_edge(START, "agent")
+    .add_conditional_edges("agent", route, {"tool_node": "tool_node", END: END})
+    .add_edge("tool_node", "agent")  # 工具执行完回到模型，形成 ReAct 循环
+    .compile()
+)
+
+out = graph.invoke({"messages": [{"role": "user", "content": "搜索「接口返回 500」怎么处理"}]})
+```
+
+关键点：
+
+- `bind_tools` 让模型能「请求」调用工具，请求记录在最后一条消息的 `tool_calls` 字段里；
+- `route` 判断 `tool_calls` 是否为空：有 → `tool_node`，没有 → `END`，从而既能执行工具也能正常终止；
+- 工具结果必须以 `ToolMessage` 回填，且 `tool_call_id` 与模型的请求 ID 一致，模型才能正确消费；
+- `tool_node` 连回 `agent`，形成「思考 → 调工具 → 再思考」的循环，直到模型不再请求工具。
+</Answer>
 </Callout>
 
 ## 小结

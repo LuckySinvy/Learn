@@ -319,6 +319,146 @@ interface DateCtor {
 1. 写一个 `clamp(value: number, min?: number, max?: number): number`，缺省时分别用 0 和 100；再改成用默认参数实现，比较两版函数体的复杂度。
 2. 给 `query` 写重载：传 `string` 返回单个结果对象，传 `string[]` 返回结果数组。实现签名用联合参数并在内部收窄。
 3. 定义一个带调用签名的类型 `Memoized`，它既能被调用，又有一个 `cacheSize` 属性；写一个函数返回这样的对象。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：clamp 的两个版本**
+
+版本 A —— 可选参数，函数体里必须判空：
+
+```ts
+function clamp(value: number, min?: number, max?: number): number {
+  const lo = min !== undefined ? min : 0;
+  const hi = max !== undefined ? max : 100;
+  return Math.min(hi, Math.max(lo, value));
+}
+```
+
+版本 B —— 默认参数，函数体干净得多：
+
+```ts
+function clamp(value: number, min = 0, max = 100): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+console.log(clamp(150));          // 100
+console.log(clamp(-20));          // 0
+console.log(clamp(42));           // 42
+console.log(clamp(5, 10, 20));    // 10
+console.log(clamp(5, undefined, 20));  // 5，显式 undefined 同样触发默认值
+```
+
+**对比：**
+
+| | 可选参数版 | 默认参数版 |
+|---|---|---|
+| 函数体内 `min` 的类型 | `number \| undefined` | `number` |
+| 需要判空 | 需要，每个参数一次 | 不需要 |
+| 默认值写在哪 | 藏在函数体里 | 就在签名上，调用方一眼可见 |
+
+默认参数版少了两行判空，而且**默认值成为了函数签名的一部分**——编辑器悬浮提示会直接显示 `min?: number` 及其默认值，调用方不用点进实现去猜。这就是本章「默认值优于可选参数」的具体体现。
+
+注意 `min = 0` 不需要写 `: number`，类型会从默认值推断出来。
+
+**第 2 题：query 重载**
+
+```ts
+interface Row {
+  id: string;
+  title: string;
+}
+
+const db: Record<string, string> = {
+  a1: "TypeScript 手册",
+  b2: "JavaScript 权威指南",
+  c3: "重构",
+};
+
+function fetchOne(id: string): Row {
+  return { id, title: db[id] ?? "未知条目" };
+}
+
+// 重载签名：调用方只能看到这两个
+function query(id: string): Row;
+function query(ids: string[]): Row[];
+// 实现签名：对外不可见，必须兼容上面所有重载
+function query(input: string | string[]): Row | Row[] {
+  if (Array.isArray(input)) {
+    return input.map(fetchOne);
+  }
+  return fetchOne(input);
+}
+
+const one = query("a1");          // 推断为 Row，不是 Row | Row[]
+const many = query(["b2", "c3"]); // 推断为 Row[]
+
+console.log(one.title);                     // TypeScript 手册
+console.log(many.map((r) => r.title).join("、")); // JavaScript 权威指南、重构
+```
+
+要点：
+
+- 返回类型精确到了 `Row` 或 `Row[]`，调用方**不需要再做类型收窄或断言**。这正是重载相对于「单一签名返回联合」的价值所在。
+- 实现签名里用 `Array.isArray` 收窄，编译器据此确定各分支返回值合法。
+- 已知的坑：变量类型是联合时调不动重载。
+
+```ts
+const key: string | string[] = Math.random() > 0.5 ? "a1" : ["b2"];
+// query(key);   // 错误：没有与此调用匹配的重载
+```
+
+遇到这种情况，要么在调用处先收窄，要么额外加一条 `function query(input: string | string[]): Row | Row[];` 重载签名。
+
+**第 3 题：带调用签名的 Memoized**
+
+```ts
+interface Memoized {
+  (n: number): number;    // 调用签名：没有属性名，直接写参数列表
+  cacheSize: number;      // 附加属性
+}
+
+function memoize(fn: (n: number) => number): Memoized {
+  const cache = new Map<number, number>();
+
+  const m = ((n: number): number => {
+    const hit = cache.get(n);
+    if (hit !== undefined) return hit;
+    const value = fn(n);
+    cache.set(n, value);
+    m.cacheSize = cache.size;
+    return value;
+  }) as Memoized;
+
+  m.cacheSize = 0;
+  return m;
+}
+
+let calls = 0;
+const slowSquare = (n: number): number => {
+  calls++;
+  return n * n;
+};
+
+const fastSquare = memoize(slowSquare);
+
+console.log(fastSquare(4));        // 16
+console.log(fastSquare(4));        // 16（这次命中缓存）
+console.log(fastSquare(9));        // 81
+console.log("缓存条数 = " + fastSquare.cacheSize);  // 2
+console.log("真实计算次数 = " + calls);              // 2
+```
+
+要点：
+
+- **函数类型表达式 `(n: number) => number` 无法附加属性**，必须改用带调用签名的对象类型（`interface` 或 `type` 都行）。
+- 这里用了 `as Memoized` 断言：先创建一个普通函数，再补上属性。TypeScript 无法凭空知道「这个函数马上就会被加上 `cacheSize`」，所以断言在此是合理且常见的用法——注意紧接着的 `m.cacheSize = 0` 立刻兑现了断言的承诺，断言窗口非常短。
+- 想避免断言，也可以用 `Object.assign`，它的返回类型是交叉类型，能被正确推断：
+
+```ts
+const m = Object.assign(wrapped, { cacheSize: 0 });   // 类型自动是函数 & { cacheSize: number }
+```
+</Answer>
 </Callout>
 
 ## 小结

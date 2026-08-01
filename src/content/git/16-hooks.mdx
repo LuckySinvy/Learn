@@ -149,4 +149,67 @@ husky 依赖 npm 安装与 Node 环境、且需要 `git config core.hooksPath` �
 2. 写一个 `commit-msg` 钩子，要求提交信息**必须**以英文半角括号包裹的 issue 号开头，如 `[#123] fix bug`。故意用不合规信息提交验证被拦截。
 3. 为什么钩子检查应该读 `git diff --cached` 而不是工作区文件？如果读工作区，可能出现什么"漏网"情况？
 4. 查阅 husky 文档（团队外资料），说明 `core.hooksPath` 这个 Git 配置的作用，以及它如何解决了"钩子不随仓库分发"的问题。
+
+<Answer>
+**参考答案：**
+
+**1. pre-commit 限制大文件**
+
+```bash
+git init -q -b main demo && cd demo
+cat > .git/hooks/pre-commit <<'EOF'
+#!/bin/sh
+# 遍历已暂存文件，任一超过 1KB 就拦截
+git diff --cached --name-only | while read -r f; do
+  if [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 1024 ]; then
+    echo "【pre-commit】拦截：$f 体积 $(wc -c < "$f") 字节，超过 1KB"
+    exit 1
+  fi
+done
+exit 0
+EOF
+chmod +x .git/hooks/pre-commit
+
+echo small > ok.txt && git add ok.txt && git commit -q -m "feat: 小文件"   # 通过
+head -c 2048 /dev/zero > big.bin && git add big.bin
+git commit -m "feat: 大文件"   # 被拦截，git log 条数不变
+```
+
+注意管道里的 `exit 1` 只退出子 shell，所以更稳的写法是把结果先存下来再判断（上面示例用 `while ... exit 1` 在 sh 里通常也能生效，但严谨做法是收集标记变量统一返回）。核心是：`git diff --cached --name-only` 列出本次**已暂存**的文件，逐个 `wc -c` 校验。
+
+**2. commit-msg 强制 issue 号开头**
+
+```bash
+cat > .git/hooks/commit-msg <<'EOF'
+#!/bin/sh
+msg=$(cat "$1")
+if ! echo "$msg" | grep -qE '^\[#[0-9]+\] .+'; then
+  echo '【commit-msg】提交信息必须以 [#issue号] 开头，例如：[#123] fix bug'
+  exit 1
+fi
+exit 0
+EOF
+chmod +x .git/hooks/commit-msg
+
+echo a > a.txt && git add a.txt
+git commit -m "随便写写"          # 被拦截
+git commit -m "[#123] fix bug"    # 通过
+```
+
+`commit-msg` 钩子的第一个参数 `$1` 是存放提交信息的临时文件，读取后正则校验，不符合就 `exit 1` 拒绝提交。
+
+**3. 为什么读 `git diff --cached` 而不是工作区**
+
+因为钩子要校验的是**即将进入历史的内容**，而工作区文件可能是"下一半的改动"：
+
+- 你已经 `git add` 了干净版本，工作区随后又被改出了垃圾内容——如果读工作区，会被"没 add 的垃圾"误伤，拦截掉本该合法的提交；反过来，工作区存在合法内容但暂存区有禁用词，读工作区又可能漏过。
+- `git diff --cached` 只反映"这次提交实际会包含什么"，与 `commit` 的语义一致，不会因为暂存区之外的文件而误判或漏网。
+- 典型漏网场景：某个含密钥的文件改动还没 `add`，读工作区的钩子检查通过，但密钥其实已在历史里；或者临时生成的大文件在工作区但没暂存，读工作区的钩子误拦了无关提交。
+
+**4. `core.hooksPath` 与 husky**
+
+`core.hooksPath` 是 Git 的一个配置项，允许把钩子目录从默认的 `.git/hooks` 改到**仓库内的任意路径**（通常是版本化的 `.husky/` 目录）。Git 执行钩子时到配置的路径去找脚本。
+
+它解决"钩子不随仓库分发"的原理：默认 `.git/hooks` 在 `.git` 内部、不进版本库，所以 clone 后是空的；而把钩子脚本放进 `.husky/` 提交到仓库后，`core.hooksPath=.husky` 会让 Git 直接使用**版本化**的钩子——别人 clone 后运行 `npm install`（husky 的 `prepare` 脚本）自动执行 `git config core.hooksPath .husky` 完成链接，钩子就跟着仓库分发和同步了。注意它依然只是"默认生效"，仍可被 `--no-verify` 绕过，强制门禁仍在 CI。
+</Answer>
 </Callout>

@@ -119,6 +119,108 @@ enum Result<T, E = std::io::Error> {
 
 <Callout type="exercise" title="练习">
 实现一个泛型 `struct Pair<T> { first: T, second: T }`，加一个方法 `fn cmp(&self) -> ...`（提示：约束 `T: PartialOrd`）返回较大者。再写个 `where` 子句版本的打印函数。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::fmt::Display;
+
+struct Pair<T> {
+    first: T,
+    second: T,
+}
+
+// 这个 impl 块不加约束：任何 T 都能构造
+impl<T> Pair<T> {
+    fn new(first: T, second: T) -> Self {
+        Self { first, second }
+    }
+}
+
+// 这个 impl 块只对可比较的 T 生效
+impl<T: PartialOrd> Pair<T> {
+    // 返回较大者的引用，避免要求 T: Copy
+    fn larger(&self) -> &T {
+        if self.first >= self.second {
+            &self.first
+        } else {
+            &self.second
+        }
+    }
+}
+
+// where 子句版本的打印函数
+fn print_pair<T>(p: &Pair<T>)
+where
+    T: Display + PartialOrd,
+{
+    println!("({}, {}) 中较大的是 {}", p.first, p.second, p.larger());
+}
+
+fn main() {
+    let nums = Pair::new(10, 42);
+    print_pair(&nums);
+
+    let floats = Pair::new(3.7, 1.2);
+    print_pair(&floats);
+
+    let words = Pair::new(String::from("apple"), String::from("banana"));
+    print_pair(&words);
+
+    let chars = Pair::new('z', 'a');
+    print_pair(&chars);
+}
+```
+
+**输出：**
+
+```text
+(10, 42) 中较大的是 42
+(3.7, 1.2) 中较大的是 3.7
+(apple, banana) 中较大的是 banana
+(z, a) 中较大的是 z
+```
+
+**为什么方法名叫 `larger` 而不是 `cmp`？**
+
+`cmp` 是标准库 `Ord` trait 的方法名。虽然自己定义同名的固有方法（inherent method）在语法上合法，而且固有方法优先级更高，但这会让读代码的人困惑——他们会以为你在调用 `Ord::cmp`（返回 `Ordering`），实际上却返回了别的东西。**给方法起名时避开标准库的常用名**是个好习惯。
+
+**为什么返回 `&T` 而不是 `T`？**
+
+如果写成 `fn larger(&self) -> T`，就得从 `&self` 里把值搬出来——这需要额外加 `T: Copy` 或 `T: Clone` 约束，`String` 这种类型就用不了了。返回引用则零成本，任何 `T` 都适用。
+
+**为什么分成两个 `impl` 块？**
+
+这是泛型的一个重要技巧——**条件化实现**：
+
+- `impl<T> Pair<T>`：所有 `Pair` 都有 `new`
+- `impl<T: PartialOrd> Pair<T>`：只有元素可比较的 `Pair` 才有 `larger`
+
+如果把 `PartialOrd` 约束加在结构体定义上，那么连构造一个不可比较类型的 `Pair` 都做不到了。**约束应该加在真正需要它的地方**，而不是一股脑加在类型定义上。
+
+**为什么用 `PartialOrd` 而不是 `Ord`？**
+
+因为浮点数只实现了 `PartialOrd`，没有实现 `Ord`——`f64::NAN` 与任何值比较都返回 `false`，不满足全序关系。用 `PartialOrd` 能同时支持整数和浮点数，代价是遇到 `NAN` 时结果没有意义。
+
+**两种约束写法的对比：**
+
+```rust
+// 内联 bound：约束少时更紧凑
+fn print_pair<T: Display + PartialOrd>(p: &Pair<T>) { }
+
+// where 子句：约束多或复杂时可读性更好
+fn complex<T, U>(a: T, b: U) -> String
+where
+    T: Display + Clone,
+    U: Display + PartialOrd + Default,
+{
+    format!("{} {}", a, b)
+}
+```
+
+两者语义完全相同，编译后代码也一样。签名一长，`where` 就明显更好读——函数名和参数列表不会被一堆约束淹没。
+</Answer>
 </Callout>
 
 ## 小结

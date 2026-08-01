@@ -82,6 +82,151 @@ Agent 能执行任意工具代码，存在「提示注入」与「越权」风�
 
 <Callout type="exercise" title="练习">
 定义一个 `getWeather(city)` 工具（可返回假数据），和 `calculator` 组合成 Agent，让它回答「北京比上海温度高多少？」（假设两城温度已知）。
+
+<Answer>
+**参考答案：**
+
+**完整实现**
+
+```ts
+// weather-agent.ts
+import "dotenv/config";
+import { z } from "zod";
+import { tool } from "@langchain/core/tools";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { createToolCallingAgent, AgentExecutor } from "langchain/agents";
+
+// ---------- 工具 1：查天气（假数据） ----------
+const FAKE_WEATHER: Record<string, { temp: number; desc: string }> = {
+  北京: { temp: 28, desc: "晴" },
+  上海: { temp: 21, desc: "多云" },
+  广州: { temp: 31, desc: "雷阵雨" },
+};
+
+const getWeather = tool(
+  async ({ city }) => {
+    const hit = FAKE_WEATHER[city];
+    if (!hit) {
+      // 工具找不到数据时，返回「说明性文字」而不是抛异常，
+      // 这样模型能理解并换个思路，而不是让整条链崩掉
+      return `暂无 ${city} 的天气数据，目前只支持：${Object.keys(FAKE_WEATHER).join("、")}`;
+    }
+    return `${city} 当前气温 ${hit.temp}℃，${hit.desc}。`;
+  },
+  {
+    name: "getWeather",
+    description:
+      "查询指定城市的当前天气和气温。输入一个中文城市名（如“北京”），返回气温与天气状况。需要知道某地温度时使用。",
+    schema: z.object({
+      city: z.string().describe("城市名称，中文，如“北京”“上海”"),
+    }),
+  }
+);
+
+// ---------- 工具 2：计算器 ----------
+const calculator = tool(
+  async ({ expression }) => {
+    // 白名单校验：只允许数字、四则运算符、小数点、括号和空格
+    if (!/^[\d+\-*/().\s]+$/.test(expression)) {
+      return "表达式包含非法字符，只支持数字与 + - * / ( ) 运算。";
+    }
+    try {
+      // 演示用；生产请换 mathjs 等安全表达式引擎
+      const result = Function(`"use strict"; return (${expression})`)();
+      return String(result);
+    } catch {
+      return "表达式无法计算，请检查格式。";
+    }
+  },
+  {
+    name: "calculator",
+    description: "计算数学表达式，如 '28 - 21'。需要做加减乘除运算时使用。",
+    schema: z.object({
+      expression: z.string().describe("要计算的数学表达式，如 '28-21'"),
+    }),
+  }
+);
+
+// ---------- 组装 Agent ----------
+const tools = [getWeather, calculator];
+
+const prompt = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    "你是一个生活助手。涉及天气必须调用 getWeather 获取真实数据，不要凭记忆回答；" +
+    "涉及数值计算必须调用 calculator，不要心算。最后用简洁中文回复用户。",
+  ],
+  ["placeholder", "{chat_history}"],
+  ["human", "{input}"],
+  ["placeholder", "{agent_scratchpad}"],
+]);
+
+const agent = createToolCallingAgent({
+  llm: new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 }),
+  tools,
+  prompt,
+});
+
+const executor = new AgentExecutor({
+  agent,
+  tools,
+  verbose: true,        // 打开后能看到每一步的思考与工具调用
+  maxIterations: 6,     // 防死循环
+});
+
+const res = await executor.invoke({ input: "北京比上海温度高多少？" });
+console.log("\n最终回答：", res.output);
+```
+
+**预期的执行轨迹**
+
+打开 `verbose: true` 后，你会看到模型自己规划出三步——**你一行 if/else 都没写**：
+
+```
+1. 调用 getWeather({ city: "北京" })  → "北京 当前气温 28℃，晴。"
+2. 调用 getWeather({ city: "上海" })  → "上海 当前气温 21℃，多云。"
+3. 调用 calculator({ expression: "28 - 21" })  → "7"
+最终回答：北京目前 28℃，上海 21℃，北京比上海高 7℃。
+```
+
+支持并行工具调用的模型（如 `gpt-4o-mini`）通常会把前两次 `getWeather` **一次性同时发起**，只用两轮就完成，比串行更快。
+
+**几个决定成败的细节**
+
+| 细节 | 为什么重要 |
+|---|---|
+| `description` 写清「什么时候用」 | 模型完全靠它决策。只写「查天气」，模型可能觉得自己知道答案就不调用了；写明「需要知道某地温度时使用」命中率明显提高 |
+| 系统提示强调「必须调用工具」 | LLM 有强烈的「我自己就会」倾向，容易编造温度。显式约束能大幅减少幻觉 |
+| `temperature: 0` | Agent 的决策要稳定可复现，随机性只会带来误调用 |
+| 工具出错返回文字而非抛异常 | 抛异常会中断 `AgentExecutor`；返回说明文字则让模型有机会自我纠正（比如换个城市名重试） |
+| `maxIterations` | 万一模型陷入「查天气→算→再查」的循环，这是唯一的刹车 |
+| `expression` 白名单校验 | 课文原例直接 `eval` 用户可控字符串，等于把任意代码执行权交给了 LLM。正则白名单是最低限度的防线 |
+
+**调试技巧：看清模型到底想调什么**
+
+如果 Agent 行为不符合预期，用 `returnIntermediateSteps` 拿到结构化的调用记录，比读 `verbose` 日志清楚得多：
+
+```ts
+const executor = new AgentExecutor({
+  agent,
+  tools,
+  returnIntermediateSteps: true,
+});
+
+const res = await executor.invoke({ input: "北京比上海温度高多少？" });
+
+for (const [action, observation] of res.intermediateSteps) {
+  console.log(`调用 ${action.tool}`, action.toolInput, "→", observation);
+}
+```
+
+**常见问题**
+
+- **模型不调工具，直接编了个温度**：多半是 `description` 太笼统，或系统提示没强调。先补 description，再在 system 里加硬性约束。
+- **报错缺少 `agent_scratchpad`**：这个 placeholder 是 Agent 存放中间步骤的地方，删掉必崩。
+- **模型把城市名传成了 "Beijing"**：在 `schema` 的 `describe` 里写明「中文城市名」并给例子即可纠正。
+</Answer>
 </Callout>
 
 ## 小结

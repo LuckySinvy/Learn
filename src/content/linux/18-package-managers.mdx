@@ -149,4 +149,77 @@ file /usr/bin/jq 2>/dev/null | head -n 1`}
 2. 用对照表完成"翻译"：把 `apt update && apt install -y git && apt autoremove` 翻译成 RHEL 系和 Alpine 的等价命令。
 3. 真机作业：在一台 Ubuntu 上执行 `apt show curl`，找出它的版本、依赖列表；再用 `dpkg -S $(which curl)` 验证 curl 命令属于哪个包。
 4. 思考题：Dockerfile 里为什么强调 `apt update` 和 `apt install` 必须写在**同一条** RUN 里？拆成两条会有什么缓存陷阱？（提示：镜像层缓存导致 update 层长期不失效）
+
+<Answer>
+**参考答案：**
+
+**第 1 题：判断发行版并给出安装命令**
+
+```bash
+cat /etc/os-release
+# ID=alpine → Alpine 系
+# ID=ubuntu / ID=debian → Debian 系
+# ID=rocky / ID=centos / ID=rhel → RHEL 系
+
+# Alpine
+apk update && apk add htop
+
+# Ubuntu/Debian
+sudo apt update && sudo apt install -y htop
+
+# RHEL 系
+sudo dnf install -y htop
+```
+
+`/etc/os-release` 的 `ID` 字段直接给出发行版名称，据此选用对应的包管理器。沙箱是 Alpine，所以实际命令是 `apk update && apk add htop`。
+
+**第 2 题：三大家族翻译**
+
+```bash
+# 原文（Debian 系）
+apt update && apt install -y git && apt autoremove
+
+# RHEL 系（yum/dnf）
+dnf check-update && dnf install -y git && dnf autoremove
+
+# Alpine
+apk update && apk add git && apk del  # Alpine 没有直接的 autoremove，
+                                      # 可用 apk del $(apk info -a ... ) 手动清，日常忽略即可
+```
+
+对照表逐项替换：update → `apk update`/`dnf check-update`，install → `apk add`/`dnf install`。Alpine 的 apk 默认不留孤儿依赖概念较弱，通常不需要 autoremove 等价物。
+
+**第 3 题：真机查包信息**
+
+```bash
+apt show curl
+# 输出中包含 Version 字段和 Depends 依赖列表
+
+dpkg -S $(which curl)
+# 例如：curl: /usr/bin/curl → 说明 /usr/bin/curl 属于 curl 这个包
+```
+
+`apt show` 看版本与依赖；`dpkg -S 文件`（-S = search）反查"这个文件属于哪个包"，是"命令不知从哪来"时的定位利器。
+
+**第 4 题：apt update 与 install 必须同一条 RUN**
+
+```bash
+# 错误示范：拆成两条
+RUN apt update
+RUN apt install -y curl
+
+# 正确示范：合成一条
+RUN apt update && apt install -y curl && rm -rf /var/lib/apt/lists/*
+```
+
+原因（镜像层缓存陷阱）：
+
+- Docker 对每条 RUN 生成一个**缓存层**，构建时若某层没变化，就直接复用缓存、**不重新执行**；
+- 拆成两条后，第一层 `apt update` 一旦被缓存，之后每次构建只要 RUN 指令文本没变，这个"刷新索引"步骤就**永远不再执行**——索引长期停留在首次构建时的旧状态；
+- 随后 `apt install` 新包时，索引里查不到新出现的版本/新包，出现 `Unable to locate package` 或装到陈旧版本；
+- 合并在**同一条 RUN** 里，只要 install 有变化，update 也会一起重跑，保证索引新鲜；
+- 末尾 `rm -rf /var/lib/apt/lists/*` 删掉索引缓存，进一步压缩镜像层体积。
+
+这就是"一条 RUN 内完成 update + install + 清理"成为 Dockerfile 惯例的原因。
+</Answer>
 </Callout>

@@ -440,6 +440,99 @@ GROUP BY day ORDER BY day LIMIT 5;
 2. 建 `events_agg` AggregatingMergeTree，用 `uniqState` 存 UV。分别按 `(day, country, event_type)` 和只按 `(day)` 聚合，验证 `uniqMerge` 在降维时给出的 UV 小于各维度 UV 之和（因为去重了）。
 3. 对比 `SELECT uv FROM events_agg LIMIT 1`（乱码）和 `SELECT finalizeAggregation(uv) FROM events_agg LIMIT 1`（数字），理解 AggregateFunction 的存储形态。
 4. 用明细表和预聚合表跑同一个业务查询，对比 Elapsed 和 Processed rows，算出加速比。
+
+<Answer>
+**参考答案：**
+
+1. SummingMergeTree 与「存比率」的陷阱：
+
+```sql
+CREATE TABLE events_daily
+(
+    day        Date,
+    country    LowCardinality(String),
+    event_type LowCardinality(String),
+    pv         UInt64,
+    total_ms   UInt64,
+    avg_ms     Float64        -- 故意存的"平均时长"（错误示范）
+)
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, country, event_type);
+
+INSERT INTO events_daily VALUES ('2024-06-15', 'CN', 'view', 1000, 250000, 250);
+INSERT INTO events_daily VALUES ('2024-06-15', 'CN', 'view',  500, 130000, 260);
+
+OPTIMIZE TABLE events_daily FINAL;
+SELECT * FROM events_daily;
+-- pv 正确相加成 1500，total_ms 正确相加成 380000，
+-- 但 avg_ms 被"相加"成 510 —— 两个平均值相加毫无意义（正确值应为 380000/1500 ≈ 253.3）
+```
+
+结论：预聚合表**只存可加的量**（count、sum），比率/平均值在查询时再算。
+
+2. AggregatingMergeTree 的 UV 降维去重：
+
+```sql
+CREATE TABLE events_agg
+(
+    day        Date,
+    country    LowCardinality(String),
+    event_type LowCardinality(String),
+    pv         SimpleAggregateFunction(sum, UInt64),
+    uv         AggregateFunction(uniq, UInt64)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, country, event_type);
+
+INSERT INTO events_agg
+SELECT toDate(event_time), country, event_type,
+       count(), uniqState(user_id)
+FROM events GROUP BY toDate(event_time), country, event_type;
+```
+
+```sql
+-- 按 (day, country, event_type) 聚合
+SELECT day, sum(pv) AS pv, sum(uv) AS uv_sum
+FROM (SELECT day, pv, uniqMerge(uv) AS uv FROM events_agg GROUP BY day, country, event_type)
+GROUP BY day;
+
+-- 只按 day 聚合（降维）
+SELECT day, uniqMerge(uv) AS uv_day
+FROM events_agg GROUP BY day;
+```
+
+你会看到 `uv_day`（整体去重）**小于** `uv_sum`（各维度 UV 之和）——因为同一个用户在同一天出现在多个 `country/event_type` 组合里，降维时 HLL 位图求并集做了去重。这正是 `uniqState/Merge` 相比 SummingMergeTree 的核心价值。
+
+3. AggregateFunction 的存储形态：
+
+```sql
+SELECT uv FROM events_agg LIMIT 1;
+-- 返回一串二进制乱码（HLL 状态的字符串表示）
+
+SELECT day, finalizeAggregation(uv) AS uv_this_row FROM events_agg LIMIT 3;
+-- 返回数字（只代表"这一行"状态里的 UV，不是跨行合并结果）
+```
+
+理解：`uv` 列存的是可合并的聚合状态（二进制 blob），不是最终数字。直接 `SELECT *` 会拿到乱码，必须用 `-Merge` 或 `finalizeAggregation` 折叠成数字。
+
+4. 加速比对比：
+
+```sql
+-- 明细表
+SELECT country, count(), uniq(user_id) FROM events
+WHERE event_time >= '2024-06-01' GROUP BY country;
+-- 记录 Elapsed 与 Processed rows（比如 1.8 秒 / 1 亿行）
+
+-- 预聚合表
+SELECT country, sum(pv), uniqMerge(uv) FROM events_agg
+WHERE day >= '2024-06-01' GROUP BY country;
+-- 记录 Elapsed 与 Processed rows（比如 0.008 秒 / 2.4 万行）
+```
+
+加速比 = `明细耗时 / 聚合表耗时`（本章实测约 230 倍），扫描行数从「亿级」降到「万级」。这个数量级差异就是预聚合的价值——把计算提前到写入/merge 时完成，查询只做轻量合并。
+</Answer>
 </Callout>
 
 ## 小结

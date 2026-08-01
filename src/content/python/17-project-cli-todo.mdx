@@ -395,6 +395,92 @@ from typing import List
 - `find` 实现：`[t for t in self._todos if keyword.lower() in t.title.lower()]`
 - 测试 1：插入 `"Buy Milk"` 和 `"Read Book"`，搜 `"milk"` 应返回 1 个
 - 测试 2：搜 `"xyz"` 应返回空列表
+
+<Answer>
+
+**参考答案：**
+
+`find` 方法只需一行列表推导，注意两边都做 `.lower()` 才是大小写不敏感：
+
+```python
+def find(self, keyword):
+    # 大小写不敏感的子串匹配
+    return [t for t in self._todos if keyword.lower() in t.title.lower()]
+```
+
+完整可运行版（含 TodoStore 与 2 个测试，可直接替换练习 Playground 里的代码）：
+
+```python
+import json, unittest
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List
+
+@dataclass
+class Todo:
+    id: int
+    title: str
+    done: bool = False
+    tags: List[str] = field(default_factory=list)
+    def to_dict(self): return asdict(self)
+
+class TodoStore:
+    def __init__(self, path: Path):
+        self.path = path; self._todos = []; self._load()
+    def _load(self):
+        if self.path.exists():
+            self._todos = [Todo(**d) for d in json.loads(self.path.read_text(encoding="utf-8"))]
+    def _save(self):
+        self.path.write_text(json.dumps([t.to_dict() for t in self._todos], ensure_ascii=False), encoding="utf-8")
+    def add(self, title, tags=None):
+        nid = (max((t.id for t in self._todos), default=0)) + 1
+        t = Todo(id=nid, title=title, tags=tags or [])
+        self._todos.append(t); self._save(); return t
+    def list(self, only_pending=False):
+        return [t for t in self._todos if not t.done] if only_pending else list(self._todos)
+    def complete(self, tid):
+        for t in self._todos:
+            if t.id == tid:
+                t.done = True; self._save(); return True
+        return False
+    def delete(self, tid):
+        before = len(self._todos)
+        self._todos = [t for t in self._todos if t.id != tid]
+        if len(self._todos) < before:
+            self._save(); return True
+        return False
+
+    def find(self, keyword):
+        return [t for t in self._todos if keyword.lower() in t.title.lower()]
+
+class TestFind(unittest.TestCase):
+    def setUp(self):
+        self.path = Path(f"/tmp/todo_find_{id(self)}.json")
+        self.store = TodoStore(self.path)
+    def tearDown(self):
+        if self.path.exists():
+            self.path.unlink()
+
+    def test_find_case_insensitive(self):
+        self.store.add("Buy Milk")
+        self.store.add("Read Book")
+        hits = self.store.find("milk")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].title, "Buy Milk")
+
+    def test_find_no_match(self):
+        self.store.add("Buy Milk")
+        self.assertEqual(self.store.find("xyz"), [])
+
+unittest.main(argv=[''], exit=False, verbosity=2)
+```
+
+要点：
+
+- `keyword.lower() in t.title.lower()`：两边都小写化，实现大小写不敏感的子串匹配。
+- 测试 1 验证 `"milk"` 能匹配到 `"Buy Milk"`；测试 2 验证无匹配时返回空列表。
+- 每个测试用独立的临时 JSON 文件，`tearDown` 里清理，避免用例之间互相污染。
+</Answer>
 </Callout>
 
 ## 小结

@@ -298,6 +298,164 @@ const b = pickB("hello");    // "hello"  ← 约束让它保留了字面量
 1. 写一个 `omit<T extends object, K extends keyof T>(obj: T, keys: K[]): Omit<T, K>`，与本章的 `pick` 互补。
 2. 写一个带默认类型参数的 `interface Paged<TItem, TCursor = string>`，包含 `items: TItem[]`、`nextCursor?: TCursor`，并写一个构造它的泛型函数。
 3. 验证分发行为：定义 `type Boxed<T> = T extends unknown ? { value: T } : never`，分别传入 `string` 和 `string | number`，把结果赋给具体变量看编译器是否接受。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：omit**
+
+```ts
+function omit<T extends object, K extends keyof T>(obj: T, keys: K[]): Omit<T, K> {
+  const out = { ...obj } as T;                 // 先整体复制
+  for (const k of keys) {
+    delete out[k];                             // 再删掉不要的键
+  }
+  return out as Omit<T, K>;
+}
+
+interface User {
+  id: number;
+  name: string;
+  password: string;
+  email: string;
+}
+
+const user: User = {
+  id: 1,
+  name: "Ada",
+  password: "s3cret",
+  email: "ada@example.com",
+};
+
+const safe = omit(user, ["password"]);
+// safe 的类型是 Omit<User, "password">，即 { id, name, email }
+
+console.log(JSON.stringify(safe));
+// {"id":1,"name":"Ada","email":"ada@example.com"}
+console.log(safe.name);
+// safe.password;              // 错误：属性 password 在类型上不存在
+// omit(user, ["nickname"]);   // 错误：nickname 不是 User 的键
+```
+
+要点：
+
+- `K extends keyof T` 保证只能删真实存在的键，拼错键名会在编译期被抓住。
+- 返回类型用内置的 `Omit<T, K>`，调用方拿到的类型里**真的没有**被删掉的键，这正是 `omit` 与 `pick` 互补的地方。
+- 这里同样有本章 Callout 提到的 `as` 妥协：`delete` 之后对象的静态类型仍是 `T`，编译器无法跟踪「键被删掉了」这个事实，所以需要在**函数出口处**断言一次。断言局限在函数内部，对外签名是准确的，这是可接受的用法。
+- 不想用 `delete`（它对 V8 的隐藏类有性能影响）时，可以改成过滤 `Object.entries` 再重建对象：
+
+```ts
+function omit<T extends object, K extends keyof T>(obj: T, keys: K[]): Omit<T, K> {
+  const drop = new Set<PropertyKey>(keys);
+  return Object.fromEntries(
+    Object.entries(obj).filter(([k]) => !drop.has(k)),
+  ) as Omit<T, K>;
+}
+```
+
+**第 2 题：带默认类型参数的 Paged**
+
+```ts
+interface Paged<TItem, TCursor = string> {
+  items: TItem[];
+  nextCursor?: TCursor;
+}
+
+function paginate<TItem, TCursor = string>(
+  items: TItem[],
+  nextCursor?: TCursor,
+): Paged<TItem, TCursor> {
+  return nextCursor !== undefined ? { items, nextCursor } : { items };
+}
+
+interface Post {
+  id: number;
+  title: string;
+}
+
+// 用默认游标类型（string），只写一个类型参数
+const page1: Paged<Post> = paginate(
+  [
+    { id: 1, title: "第一篇" },
+    { id: 2, title: "第二篇" },
+  ],
+  "cursor_abc",
+);
+
+console.log("本页 " + page1.items.length + " 条，下一页游标 " + String(page1.nextCursor));
+// 本页 2 条，下一页游标 cursor_abc
+
+// 覆盖游标类型为数字（比如用自增 ID 做游标）
+const page2: Paged<Post, number> = paginate([{ id: 3, title: "第三篇" }], 3);
+console.log("数字游标 = " + String(page2.nextCursor));   // 3
+
+// 最后一页，没有游标
+const last = paginate<Post>([{ id: 9, title: "末篇" }]);
+console.log("还有下一页? " + (last.nextCursor !== undefined));  // false
+```
+
+要点：
+
+- `TCursor = string` 让 90% 的调用方只写 `Paged<Post>` 即可，需要时才用 `Paged<Post, number>` 定制——这就是默认类型参数的意义。
+- 规则提醒：**有默认值的类型参数必须排在没有默认值的后面**。把它写成 `Paged<TCursor = string, TItem>` 会直接报错。
+- `nextCursor` 用可选属性表达「最后一页没有下一页游标」，符合业务语义。
+
+**第 3 题：验证分发行为**
+
+```ts
+type Boxed<T> = T extends unknown ? { value: T } : never;
+
+// 情况 A：传入单一类型
+type B1 = Boxed<string>;
+// 结果：{ value: string }
+
+// 情况 B：传入联合类型 —— 发生分发
+type B2 = Boxed<string | number>;
+// 结果：{ value: string } | { value: number }
+// 注意：不是 { value: string | number }！
+```
+
+用变量赋值来验证编译器的实际行为：
+
+```ts
+// B2 是「两个盒子的联合」，所以下面两行都合法
+const b1: B2 = { value: "hello" };
+const b2: B2 = { value: 42 };
+
+// 但它绝不等于 { value: string | number }。下面这行揭示了差别：
+declare const mixed: string | number;
+// const b3: B2 = { value: mixed };
+// 错误：类型“{ value: string | number; }”不能赋给类型“B2”。
+//   不能将类型“string | number”分配给类型“string”。
+
+// 反过来，把 B2 赋给「一个盒子装联合」是可以的
+type OneBox = { value: string | number };
+const b4: OneBox = b1;   // 合法
+```
+
+**关掉分发做对比：**
+
+```ts
+type BoxedNoDist<T> = [T] extends [unknown] ? { value: T } : never;
+
+type B3 = BoxedNoDist<string | number>;
+// 结果：{ value: string | number }
+
+declare const mixed2: string | number;
+const b5: B3 = { value: mixed2 };   // 这次就合法了
+```
+
+**结论：**
+
+| 写法 | `Boxed<string \| number>` 的结果 | 能装 `string \| number` 变量吗 |
+|---|---|---|
+| `T extends unknown ? ...` | `{ value: string } \| { value: number }` | 不能 |
+| `[T] extends [unknown] ? ...` | `{ value: string \| number }` | 能 |
+
+分发的判定条件是：条件类型中被检查的类型是一个**裸的类型参数**（naked type parameter）。一旦把它包进元组 `[T]`、数组或其它结构里，就不再是「裸」的，分发随之关闭。
+
+这个区别在实践中很常见。比如你写了个 `Boxed<Payload>` 想表示「一个装着 payload 的容器」，结果 `Payload` 恰好是联合类型，你拿到的却是「多个容器的联合」，赋值处莫名其妙地报错——这时候就该想起 `[T] extends [X]` 这个开关了。
+</Answer>
 </Callout>
 
 ## 小结

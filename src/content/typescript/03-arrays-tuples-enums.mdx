@@ -295,6 +295,103 @@ type Status = (typeof Status)[keyof typeof Status];  // "PENDING" | "SUCCESS"
 <Callout type="exercise" title="练习">
 1. 定义 `type Rgb = [r: number, g: number, b: number]`，写一个 `toHex(c: Rgb): string` 把它转成六位十六进制字符串（提示：`n.toString(16).padStart(2, "0")`）。
 2. 用字符串枚举定义一周七天，写一个函数判断是否是周末；然后把它改写成 `as const` 对象加字面量联合的形式，对比两种写法的差异。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：Rgb 转十六进制**
+
+```ts
+type Rgb = [r: number, g: number, b: number];
+
+function toHex(c: Rgb): string {
+  const part = (n: number): string =>
+    Math.max(0, Math.min(255, Math.round(n)))   // 夹紧到 0-255
+      .toString(16)
+      .padStart(2, "0");
+  return "#" + part(c[0]) + part(c[1]) + part(c[2]);
+}
+
+console.log(toHex([255, 128, 0]));   // #ff8000
+console.log(toHex([0, 0, 0]));       // #000000
+console.log(toHex([255, 255, 255])); // #ffffff
+
+// 元组长度受检查
+// toHex([255, 128]);        // 错误：源具有 2 个元素，但目标需要 3 个
+// toHex([255, 128, 0, 1]);  // 错误：源具有 4 个元素，但目标仅允许 3 个
+```
+
+也可以用解构写得更直观，具名元素让编辑器提示更友好：
+
+```ts
+function toHex2([r, g, b]: Rgb): string {
+  return "#" + [r, g, b].map((n) => n.toString(16).padStart(2, "0")).join("");
+}
+```
+
+`padStart(2, "0")` 是必需的：`10..toString(16)` 得到 `"a"` 只有一位，不补零会产生 `#a8000` 这种五位的错误结果。
+
+**第 2 题：两种写法对比**
+
+写法 A —— 字符串枚举：
+
+```ts
+enum Day {
+  Mon = "MON",
+  Tue = "TUE",
+  Wed = "WED",
+  Thu = "THU",
+  Fri = "FRI",
+  Sat = "SAT",
+  Sun = "SUN",
+}
+
+function isWeekend(d: Day): boolean {
+  return d === Day.Sat || d === Day.Sun;
+}
+
+console.log(isWeekend(Day.Sat));  // true
+console.log(isWeekend(Day.Wed));  // false
+```
+
+写法 B —— `as const` 对象加字面量联合：
+
+```ts
+const Day = {
+  Mon: "MON",
+  Tue: "TUE",
+  Wed: "WED",
+  Thu: "THU",
+  Fri: "FRI",
+  Sat: "SAT",
+  Sun: "SUN",
+} as const;
+
+type Day = (typeof Day)[keyof typeof Day];
+// 等价于 "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN"
+
+function isWeekend(d: Day): boolean {
+  return d === "SAT" || d === "SUN";
+}
+
+console.log(isWeekend(Day.Sat));  // true
+console.log(isWeekend("WED"));    // false —— 可以直接传字符串字面量
+```
+
+**差异对比：**
+
+| 维度 | 字符串枚举 | as const 对象 + 联合 |
+|---|---|---|
+| 编译产物 | 生成一个额外的 IIFE 对象 | 就是一个普通对象字面量 |
+| 能否直接传字符串 | 不能，必须写 `Day.Sat` | 能，`"SAT"` 直接可用 |
+| 工具链兼容性 | esbuild/swc 需特殊处理 | 纯 JS，处处可用 |
+| 类型收窄能力 | 一般 | 更好，是可辨识联合的基础 |
+| 类型与值同名 | 天然同名 | 需手动声明同名 type（如上） |
+
+最关键的实用差异是**第二行**：枚举是「名义类型」，即使 `Day.Sat` 的值就是 `"SAT"`，你也不能把裸字符串 `"SAT"` 传给参数类型为 `Day` 的函数。这在处理 JSON 反序列化数据时很麻烦——从接口拿到的是普通字符串，得再断言或映射一次。字面量联合没有这个问题。
+
+因此现代项目通常推荐写法 B；只有在确实需要枚举的名义类型特性（防止不同枚举间误用）时才选 A。
+</Answer>
 </Callout>
 
 ## 小结

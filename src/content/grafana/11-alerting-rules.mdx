@@ -119,6 +119,76 @@ groups:
 
 <Callout type="exercise" title="练习">
 为你的服务创建两条规则：① 5xx 错误率 > 5% 持续 5 分钟（critical）；② 实例 `up == 0` 即告警（用 `absent`）。给它们打好 `severity`/`team` 标签。
+
+<Answer>
+**参考答案：**
+
+**规则① 5xx 错误率 > 5%，持续 5 分钟（critical）**
+
+查询 A（错误率）：
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+条件（Expression）：`Threshold`，`WHEN last() OF A IS ABOVE 0.05`
+
+- **For**：`5m`
+- **Labels**：`severity=critical`，`team=backend`
+- **Annotations**：
+  - `summary`：`5xx 错误率过高`
+  - `description`：`{{ $labels.team }} 错误率 {{ $values.A.Value }} 超过 5%`
+
+**规则② 实例掉线即告警（absent）**
+
+查询 A：
+
+```promql
+absent(up{job="api"})
+```
+
+`absent` 在 `up` 指标消失（实例下线）时返回 `1`，正常时无数据。
+
+条件：`WHEN last() OF A IS ABOVE 0`
+
+- **For**：`1m`（掉线 1 分钟确认，避免网络抖动误报）
+- **Labels**：`severity=critical`，`team=backend`
+- **Annotations**：`summary`：`api 实例失联`
+
+**验证思路：**
+
+1. 到 Alerting → Alert rules 看两条规则初始状态应为 `Inactive`
+2. 规则①：临时把阈值调低（或改用 `> bool 0.0001`），确认能进入 `Pending` → `Alerting`，测完改回
+3. 规则②：直接停掉一个实例（如 `docker stop` 对应容器），确认 `absent` 触发
+
+**用 Provisioning 文件声明（推荐纳入 Git）：**
+
+```yaml
+apiVersion: 1
+groups:
+  - name: backend-alerts
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: critical, team: backend }
+        annotations:
+          summary: "5xx 错误率过高"
+      - alert: ApiInstanceDown
+        expr: absent(up{job="api"})
+        for: 1m
+        labels: { severity: critical, team: backend }
+        annotations:
+          summary: "api 实例失联"
+```
+
+注意两条规则的 `severity` / `team` 标签一定打对，下一章的路由全靠它们。
+</Answer>
 </Callout>
 
 ## 小结

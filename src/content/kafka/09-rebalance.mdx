@@ -152,4 +152,216 @@ consumer.subscribe(List.of("orders"), new ConsumerRebalanceListener() {
 1. 用默认分配器启动 3 个消费者，杀掉一个观察日志里的 Rebalance 全过程；换成 CooperativeStickyAssignor 重做，对比其余消费者是否继续消费。
 2. 给消费者配上 group.instance.id 并把 session.timeout 调到 2 分钟，快速重启一个实例，验证没有触发 Rebalance。
 3. 订阅两个各 3 分区的 topic、启动 2 个消费者，分别用 Range 与 RoundRobin 观察分配结果的倾斜差异。
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · Eager vs Cooperative 的 Rebalance 全过程对比**
+
+先打开消费者的相关日志：
+
+```properties
+# log4j.properties
+log4j.logger.org.apache.kafka.clients.consumer.internals.ConsumerCoordinator=DEBUG
+log4j.logger.org.apache.kafka.clients.consumer.internals.AbstractCoordinator=DEBUG
+```
+
+**A. 默认 RangeAssignor（Eager 协议）**
+
+杀掉 3 个消费者中的一个，**其余两个存活消费者**的日志：
+
+```text
+INFO  Attempt to heartbeat failed since group is rebalancing
+INFO  Revoke previously assigned partitions six-0, six-1        <- 先交出全部分区
+INFO  (Re-)joining group
+      ...  这中间完全没有消息被消费（停顿窗口）  ...
+INFO  Successfully joined group with generation 5
+INFO  Notifying assignor about the new Assignment
+INFO  Adding newly assigned partitions: six-0, six-1, six-2     <- 又拿回来了
+```
+
+注意最刺眼的一点：**存活的消费者明明什么问题都没有，却被要求先把 `six-0`、`six-1` 全部交出去，Rebalance 完成后又原样拿回来。** 这中间的空窗期整组零消费。
+
+Eager 协议的流程是这样的：
+
+```text
+成员变化
+  ↓
+所有成员 onPartitionsRevoked（交出全部分区）  <- Stop-The-World 起点
+  ↓
+所有成员 JoinGroup -> Leader 计算新分配 -> SyncGroup
+  ↓
+所有成员 onPartitionsAssigned（领取新分区）   <- Stop-The-World 终点
+```
+
+停顿时长 ≈ 一轮 JoinGroup + SyncGroup 的往返，取决于组大小、`max.poll.interval.ms` 等，通常几百毫秒到数秒；组很大时可达数十秒。
+
+**B. CooperativeStickyAssignor（Cooperative 协议）**
+
+```properties
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+```
+
+同样杀掉一个，存活消费者的日志：
+
+```text
+INFO  Updating assignment with
+        Assigned partitions:      [six-0, six-1]
+        Current owned partitions: [six-0, six-1]
+        Added partitions (assigned - owned): []
+        Revoked partitions (owned - assigned): []
+INFO  Skipping revocation, no partitions to revoke      <- 一个都不用交出
+INFO  (Re-)joining group
+INFO  Successfully joined group with generation 5
+-- 第二轮 --
+INFO  Adding newly assigned partitions: six-2           <- 只增量领取死者的分区
+```
+
+**核心差异**：存活消费者对 `six-0`、`six-1` 的消费**全程没有中断**，它只是在第二轮额外接手了 `six-2`。可以在杀实例的同时持续生产消息来直观验证——Eager 下会看到消费明显断档，Cooperative 下几乎无感。
+
+Cooperative 的做法是把一次 Rebalance 拆成**两轮**：
+
+```text
+第 1 轮：计算目标分配，只 revoke "确实需要转手" 的分区（本例为空）
+第 2 轮：把这些分区分给新主人
+未受影响的分区自始至终没有离开原持有者 -> 无 Stop-The-World
+```
+
+| 维度 | Eager（Range/RoundRobin/Sticky） | Cooperative（CooperativeSticky） |
+|---|---|---|
+| 存活成员是否停止消费 | **是**，全部停 | 否，未变动的分区继续消费 |
+| Rebalance 轮数 | 1 轮 | 最多 2 轮 |
+| 分区移动量 | 可能全部重排 | 只移动必要的 |
+| 大规模组的影响 | 严重 | 轻微 |
+
+**新项目直接用 `CooperativeStickyAssignor`，没有理由不用。**
+
+**但存量系统切换必须滚动两次**（章节里的警告值得重复）：
+
+```properties
+# 第一次滚动发布：两种策略都留，Cooperative 在前
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor,\
+org.apache.kafka.clients.consumer.RangeAssignor
+
+# 等全部实例都发布完成后，第二次滚动发布：去掉旧策略
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+```
+
+原因：组内成员的策略取"所有成员都支持的策略中优先级最高的那个"。第一次滚动期间新老实例混跑，共同支持的是 `RangeAssignor`，于是继续用 Eager 协议，平稳过渡；等全员都支持 Cooperative 后，第二次滚动去掉旧策略，协议才真正切换。**跳过这个步骤直接一把换，会让两种协议混跑并抛 `IllegalStateException`。**
+
+**第 2 题 · 静态成员让重启免于 Rebalance**
+
+```properties
+group.id=inventory
+group.instance.id=inventory-pod-0    # 每实例唯一，重启保持不变
+session.timeout.ms=120000            # 2 分钟，要大于重启耗时
+heartbeat.interval.ms=10000
+```
+
+对照实验（准备两个终端，一个跑消费者，一个盯 describe）：
+
+```bash
+# 另一个终端持续观察组的 generation 与成员
+watch -n1 'bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group inventory --state'
+```
+
+**不配 `group.instance.id` 时**重启一个实例：
+
+```text
+[实例退出]  INFO Member consumer-inventory-1-abc sending LeaveGroup request
+            -> 触发第 1 次 Rebalance，分区分给其他成员
+[实例启动]  INFO (Re-)joining group
+            -> 触发第 2 次 Rebalance，分区又分回来
+generation: 7 -> 8 -> 9        (涨了 2 次)
+```
+
+**配了 `group.instance.id` 后**（且重启在 120 秒内完成）：
+
+```text
+[实例退出]  静态成员退出时【不发送 LeaveGroup】，协调器保留其身份和分区归属
+[实例启动]  INFO Successfully joined group with generation 7
+            (generation 没变，日志里也没有 Revoke/Assign 的字样)
+generation: 7 -> 7             (完全没动)
+```
+
+**原理**：默认情况下消费者的 member ID 是协调器随机分配的，重启后拿到的是**全新身份**，协调器完全无法把它和之前那个成员关联起来，只能当成"一个走了、一个来了"处理，于是两次 Rebalance。`group.instance.id` 给了消费者一个**由用户指定的稳定身份**，协调器据此认出"还是原来那位"，直接把原分区还给它。
+
+同时，静态成员**退出时不发 LeaveGroup**，这是它免于 Rebalance 的关键——协调器压根不知道它离开过，只要在 `session.timeout.ms` 内回来就当无事发生。
+
+**代价与权衡**（必须清楚，否则会踩坑）：
+
+| 收益 | 代价 |
+|---|---|
+| 滚动重启/发布不触发 Rebalance | 实例**真的挂了**也要等满 `session.timeout.ms` 才转移分区 |
+| 分区归属稳定，本地状态（缓存、RocksDB）可复用 | 这 2 分钟内该实例的分区**完全无人消费**，LAG 持续上涨 |
+
+所以 `session.timeout.ms` 的取值是在"覆盖重启耗时"和"故障接管速度"之间取平衡：设得刚好比正常重启时间长一点即可（比如重启要 30 秒就设 60 秒），不要盲目设成 5 分钟。
+
+**最佳搭配场景是 Kubernetes StatefulSet**：Pod 名（`inventory-0`、`inventory-1`）天然唯一且重启不变，直接取用即可：
+
+```yaml
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  # 应用里用 POD_NAME 作为 group.instance.id
+```
+
+**注意**：`group.instance.id` **在组内必须唯一**。两个实例用同一个 ID，后加入的会把先加入的 fence 掉，被踢的实例抛 `FencedInstanceIdException`。Deployment（Pod 名随机）不适合直接用 Pod 名，需要用有序索引或其他稳定标识。
+
+**第 3 题 · Range 与 RoundRobin 在多 topic 下的倾斜差异**
+
+场景：订阅 `t1`、`t2` 两个 topic，各 3 分区（共 6 分区），2 个消费者。
+
+```bash
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic t1 --partitions 3 --replication-factor 1
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic t2 --partitions 3 --replication-factor 1
+```
+
+**RangeAssignor（默认）的结果：**
+
+```text
+C1: t1-0, t1-1, t2-0, t2-1     <- 4 个分区
+C2: t1-2,        t2-2          <- 2 个分区
+```
+
+**RoundRobinAssignor 的结果：**
+
+```text
+C1: t1-0, t1-2, t2-1           <- 3 个分区
+C2: t1-1, t2-0, t2-2           <- 3 个分区
+```
+
+**倾斜的根源在于 Range 是"按 topic 逐个分配"的：**
+
+```text
+RangeAssignor 的算法：
+  for each topic:                        <- 关键：每个 topic 单独算一遍
+      n = 分区数 / 消费者数  = 3 / 2 = 1
+      m = 分区数 % 消费者数  = 3 % 2 = 1
+      前 m 个消费者各拿 n+1 = 2 个，其余各拿 n = 1 个
+
+  t1 单独算： C1 拿 2 个，C2 拿 1 个
+  t2 单独算： C1 拿 2 个，C2 拿 1 个     <- 又是 C1 多拿！
+  ---------------------------------------------------
+  累计：      C1 = 4，C2 = 2            <- 倾斜被放大
+```
+
+**问题的本质**：每个 topic 的余数都优先给排在前面的消费者，**订阅的 topic 越多，倾斜累积得越严重**。订阅 10 个各 3 分区的 topic、2 个消费者时，C1 会拿 20 个而 C2 只有 10 个——负载差一倍。
+
+RoundRobin 则把所有 topic 的分区**打平成一个列表**再轮流发牌，所以总数一定均衡（最多差 1 个）。
+
+| 分配器 | 多 topic 均衡性 | Rebalance 时的分区稳定性 | 备注 |
+|---|---|---|---|
+| `RangeAssignor` | **差**，倾斜随 topic 数累积 | 一般 | 默认值，单 topic 场景够用 |
+| `RoundRobinAssignor` | 好 | **差**，成员变化时分区大范围漂移 | 均衡但不稳定 |
+| `StickyAssignor` | 好 | 好，尽量保留原有归属 | Eager 协议 |
+| `CooperativeStickyAssignor` | 好 | 好 + 无 Stop-The-World | **推荐** |
+
+RoundRobin 的短板在于**不粘性**：成员变化时它从头重新发牌，可能导致几乎所有分区都换主人。对于有本地状态的消费者（本地缓存、Kafka Streams 的 state store），分区漂移意味着状态要重建，代价很高。
+
+**结论**：`StickyAssignor` 系列同时解决了"均衡"和"稳定"两个问题，而 `CooperativeStickyAssignor` 在此基础上再消除了 Stop-The-World。三选一的话——**无脑选 CooperativeSticky**。只有一个例外值得知道：`RangeAssignor` 会把不同 topic 中**编号相同的分区**分给同一个消费者（`t1-0` 和 `t2-0` 都归 C1），这在做两个 topic 按 key 关联的 join 时很有用，Kafka Streams 内部就依赖类似机制。除此之外，Range 的默认地位纯粹是历史原因。
+</Answer>
 </Callout>

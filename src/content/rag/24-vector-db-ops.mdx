@@ -71,6 +71,149 @@ store.delete(doc_id="A", version=1)            # 下线旧版，防重复命中
 
 <Callout type="exercise" title="练习">
 为你的向量库写一条定时快照的 cron，并模拟一次「误删集合」后用快照恢复，验证原文与元数据是否完整。
+
+<Answer>
+**参考答案：**
+
+**第一步：备份脚本**
+
+```bash
+#!/usr/bin/env bash
+# /opt/rag/backup_kb.sh
+set -euo pipefail                      # 任一步失败立即退出，避免"假成功"
+
+COLLECTION="kb"
+QDRANT="http://localhost:6333"
+BACKUP_DIR="/data/backups/qdrant"
+KEEP_DAYS=30
+STAMP=$(date +%F_%H%M)
+
+mkdir -p "$BACKUP_DIR"
+
+# 1) 触发快照
+SNAP=$(curl -sf -X POST "$QDRANT/collections/$COLLECTION/snapshots" \
+       | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["name"])')
+
+# 2) 下载到备份目录
+curl -sf -o "$BACKUP_DIR/${COLLECTION}_${STAMP}.snapshot" \
+     "$QDRANT/collections/$COLLECTION/snapshots/$SNAP"
+
+# 3) 记录清单（校验和 + 条数），恢复时用来核对
+COUNT=$(curl -sf "$QDRANT/collections/$COLLECTION" \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["points_count"])')
+sha256sum "$BACKUP_DIR/${COLLECTION}_${STAMP}.snapshot" > "$BACKUP_DIR/${COLLECTION}_${STAMP}.sha256"
+echo "{\"stamp\":\"$STAMP\",\"points\":$COUNT}" > "$BACKUP_DIR/${COLLECTION}_${STAMP}.meta.json"
+
+# 4) 同步到异地对象存储（关键！本机磁盘坏了备份也没了）
+aws s3 cp "$BACKUP_DIR/${COLLECTION}_${STAMP}.snapshot" "s3://my-rag-backup/qdrant/"
+
+# 5) 清理服务端快照与本地过期文件
+curl -sf -X DELETE "$QDRANT/collections/$COLLECTION/snapshots/$SNAP"
+find "$BACKUP_DIR" -name "${COLLECTION}_*" -mtime +$KEEP_DAYS -delete
+
+echo "[$(date)] backup ok: $STAMP, points=$COUNT"
+```
+
+**cron 配置**
+
+```bash
+# crontab -e
+# 每天凌晨 3:15 全量快照，日志留档
+15 3 * * * /opt/rag/backup_kb.sh >> /var/log/rag_backup.log 2>&1
+
+# 每周一凌晨 4:00 做一次恢复演练（在隔离环境）
+0 4 * * 1 /opt/rag/verify_restore.sh >> /var/log/rag_restore_drill.log 2>&1
+```
+
+**第二步：模拟误删并恢复**
+
+```python
+import hashlib, json, requests
+
+QDRANT = "http://localhost:6333"
+COLL = "kb"
+
+def fingerprint(collection):
+    """遍历全库，算一个稳定指纹，用于比对恢复前后是否一致"""
+    items, offset = [], None
+    while True:
+        r = requests.post(f"{QDRANT}/collections/{collection}/points/scroll",
+                          json={"limit": 1000, "offset": offset,
+                                "with_payload": True, "with_vector": False}).json()["result"]
+        for p in r["points"]:
+            items.append((p["id"], p["payload"].get("text", ""),
+                          p["payload"].get("source"), p["payload"].get("page"),
+                          p["payload"].get("level")))
+        offset = r.get("next_page_offset")
+        if offset is None:
+            break
+    items.sort(key=lambda x: str(x[0]))
+    digest = hashlib.sha256(
+        json.dumps(items, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    return len(items), digest
+
+# --- 灾难前：记录基线 ---
+n_before, fp_before = fingerprint(COLL)
+print(f"灾难前: {n_before} 条, 指纹 {fp_before[:16]}")
+
+# --- 模拟误删（务必在测试环境执行）---
+requests.delete(f"{QDRANT}/collections/{COLL}")
+print("集合已删除")
+
+# --- 从快照恢复 ---
+with open("/data/backups/qdrant/kb_2026-08-01_0315.snapshot", "rb") as f:
+    requests.post(f"{QDRANT}/collections/{COLL}/snapshots/upload",
+                  files={"snapshot": f})
+
+# --- 灾难后：比对 ---
+n_after, fp_after = fingerprint(COLL)
+print(f"恢复后: {n_after} 条, 指纹 {fp_after[:16]}")
+
+assert n_after == n_before, f"条数不符：{n_before} → {n_after}"
+assert fp_after == fp_before, "指纹不符，原文或元数据有丢失/变化！"
+print("恢复完整性验证通过")
+```
+
+**第三步：不能只验条数，还要验「能用」**
+
+条数对上了不代表系统恢复正常。恢复演练必须跑一遍**端到端功能验证**：
+
+```python
+# 1) 索引是否重建完成（有些方案恢复后需要重新构建索引）
+info = requests.get(f"{QDRANT}/collections/{COLL}").json()["result"]
+assert info["status"] == "green", f"集合状态异常: {info['status']}"
+
+# 2) payload 索引是否还在（这个最容易丢！）
+assert "level" in info["payload_schema"], "权限过滤索引丢失，会导致越权！"
+assert "updated_at" in info["payload_schema"], "时间过滤索引丢失"
+
+# 3) 检索结果是否与灾难前一致
+for q in golden_queries:
+    ids = [h["id"] for h in search(q, k=5)]
+    assert ids == baseline_results[q], f"检索结果变化: {q}"
+
+# 4) 权限过滤是否仍然生效（安全兜底）
+bob_hits = search_as_user(bob_public_user, "高管薪酬")
+assert all(h["payload"]["level"] == 0 for h in bob_hits), "恢复后权限过滤失效！"
+
+print("端到端验证通过")
+```
+
+**第 2 项和第 4 项是最容易出事的地方。** 有些恢复流程会把数据恢复回来但**丢掉 payload 索引**——此时过滤条件不报错，只是变成全量扫描；更危险的是某些实现里索引缺失会导致过滤条件被静默忽略，直接造成越权泄露。这种问题不专门测就发现不了。
+
+**五条运维经验**
+
+1. **没演练过的备份等于没有备份。** 现实中最常见的事故不是「没做备份」，而是「备份一直在跑，真出事时发现恢复不了」——文件损坏、格式不兼容、恢复脚本从没跑通过。所以 cron 里除了备份任务，还要有**定期恢复演练任务**。
+
+2. **备份必须异地。** 快照存在同一台机器上，磁盘坏了就一起没了。务必同步到对象存储或另一个可用区。
+
+3. **原文和元数据比向量更宝贵。** 向量丢了可以重新 Embedding（花钱花时间但能恢复）；原文和 metadata（尤其是**权限标签**）丢了就真的找不回来了。如果原文另有权威数据源（如 Confluence、Git），备份策略可以侧重元数据。
+
+4. **记录「恢复所需时间」（RTO）。** 演练时掐表：从发现故障到服务恢复要多久？如果快照恢复要 2 小时而业务只能忍受 15 分钟，那就需要主从副本而不只是快照。
+
+5. **重建索引前先快照。** 呼应课文的 tip：调 HNSW 参数会触发全量重建，中途失败可能让集合处于不可用状态。先打快照，再操作，恢复才有退路。
+</Answer>
 </Callout>
 
 ## 小结

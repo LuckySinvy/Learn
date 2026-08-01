@@ -178,4 +178,77 @@ git push -u origin feature/xxx  # 开 PR / MR
 2. 在 feature 分支上制造 3 个提交，用交互式 rebase 把其中 2 个 `squash` 成 1 个，对比整理前后的 `git log --oneline`。
 3. 在任意仓库里 `git commit` 一个新文件后立刻 `git reset --hard HEAD~1`，然后用 `git reflog` 找到那个提交哈希并 `git cherry-pick` 它回来（复习第 9 章），体会"找回"的另一种方式。
 4. 反思：为什么团队约定"main 永远可发布、所有改动走 feature 分支 + PR"能显著降低协作风险？结合你踩过的（或设想的）坑说明。
+
+<Answer>
+**参考答案：**
+
+**1. 不同行各改一处：rebase 不冲突**
+
+照 git-18-1 搭环境，但让 Alice 和 Bob 改 `app.txt` 的不同行：
+
+```bash
+git init -q --bare /tmp/origin.git
+git clone -q /tmp/origin.git alice && cd alice
+echo 'line1' > app.txt && echo 'line9' >> app.txt
+git add . && git commit -q -m "init" && git push -q -u origin main 2>/dev/null && cd ..
+git clone -q /tmp/origin.git bob && cd bob
+sed -i '1s/.*/line1-by-bob/' app.txt
+git commit -qam "docs: bob 改第1行" && git push -q origin main 2>/dev/null && cd ..
+cd alice
+echo 'line1' > app.txt && echo 'line9-by-alice' >> app.txt
+git commit -qam "feat: alice 改第9行"
+git fetch -q origin
+git rebase origin/main    # 无冲突，自动合并
+cat app.txt               # 两处改动都在
+```
+
+结果：rebase 直接成功，无需任何手工解决。因为 Git 按 hunk 判断冲突，两边改动在不同行、上下文窗口不重叠，被识别为"不同区域"，自动合并两处改动（第 6 章结论）。
+
+**2. squash 两个提交**
+
+```bash
+git init -q -b main tidy && cd tidy
+echo init > app.txt && git add . && git commit -q -m "chore: 初始化"
+git switch -qc feature
+echo a > f.txt && git add . && git commit -q -m "feat: 功能雏形"
+echo b >> f.txt && git add . && git commit -q -m "wip"
+echo c >> f.txt && git add . && git commit -q -m "fix typo"
+git log --oneline    # 整理前：4 个提交
+git rebase -i HEAD~3   # 后两行 pick 改 squash，第一行保留，最后写新信息
+git log --oneline    # 整理后：2 个提交（chore + feat），内容不变
+```
+
+整理前是 `chore / feat / wip / fix typo` 四条；把后两行 `squash` 进 `feat` 后变成 `chore / feat` 两条。验证内容没丢：`cat f.txt` 仍含 a、b、c。
+
+**3. reflog + cherry-pick 找回**
+
+```bash
+git init -q -b main demo && cd demo
+echo base > a.txt && git add . && git commit -q -m "init"
+echo new > b.txt && git add b.txt && git commit -q -m "feat: 新文件 b.txt"
+git reset --hard HEAD~1     # 手滑丢掉 b.txt 的提交
+git reflog | head -3        # 找到含 '新文件' 的那行，取最左哈希
+LOST=$(git reflog --format='%H %gs' | grep '新文件' | head -1 | awk '{print $1}')
+git cherry-pick $LOST       # 把那个提交摘回来
+ls                          # b.txt 回来了
+```
+
+和第 14 章 `reset --hard <哈希>` 恢复的区别：`cherry-pick` 是在当前分支上**复制**那份改动生成新提交，原分支指针不动，适合"我只想要那一个提交的内容"；`reset --hard` 则是把整个分支指针挪回去。两者都证明：`reset --hard` 丢的提交没真丢，reflog 里有的是。
+
+**4. main 永远可发布 + feature 分支 + PR 的价值**
+
+这条约定用"隔离"换来了安全性：
+
+- **main 永远可发布**：因为所有未完成、半成品、实验性改动都被挡在 feature 分支上，main 的历史始终是"完整、可测试、可回退"的稳定点。任何人在任何时刻 checkout main 都能得到一个能跑的版本；发布、热修、回滚都有一致的基线。
+- **所有改动走 feature 分支**：把"开发中的混乱"和"可发布状态"物理隔离。你随时可以在分支上 WIP、重构、试错（第 8 章说的开发期安全感），不影响任何人；合并时才把干净的结果接回 main。
+- **走 PR 审查 + CI**：每笔改动合入 main 前都被人看过、被自动化测过，能把"格式垃圾""误提交密钥""破坏性重构"拦在门外。
+
+我设想过的坑（现实中这类事故很常见）：
+
+- 直接推 main 时手滑 `git push --force`，覆盖了别人刚合入的提交——feature + PR 流程下强推被 `--force-with-lease` 和分支保护拦住。
+- 在 main 上留了 `wip` 半成品，同事基于它开发，合并时出现连锁冲突——feature 分支隔离后不会发生。
+- 提交里夹带了 `console.log` 或密钥，走 PR 时被 reviewer/CI 当场拦下——正是"审查 + 强制校验"的价值。
+
+一句话：**约定把"允许犯错"的区域限定在 feature 分支，让 main 永远是一个可信的基准**，协作风险因此大幅降低。
+</Answer>
 </Callout>

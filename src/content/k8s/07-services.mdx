@@ -99,6 +99,53 @@ kubectl get endpoints nginx    # 空 = selector 没匹配到 Pod
 
 <Callout type="exercise" title="练习">
 为第 6 章的 nginx Deployment 创建一个 ClusterIP Service，再用 `kubectl run client --rm -it --image=busybox -- wget -qO- nginx` 从集群内访问它，验证服务发现生效。
+
+<Answer>
+**参考答案：**
+
+先确保 nginx Deployment 存在且带 `app: nginx` 标签（第 6 章的模板即如此），然后创建 Service，保存为 `nginx-svc.yaml`：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx            # 必须与 Deployment 的 template 标签一致
+  ports:
+    - port: 80            # Service 暴露端口
+      targetPort: 80      # Pod 容器实际监听端口
+```
+
+按顺序执行：
+
+```bash
+# 1. 创建 Service
+kubectl apply -f nginx-svc.yaml
+
+# 2. 确认 Service 拿到了 ClusterIP
+kubectl get svc nginx
+# NAME    TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)   AGE
+# nginx   ClusterIP   10.96.x.x   <none>        80/TCP    5s
+
+# 3. 关键一步：确认 endpoints 非空（空 = selector 没匹配到 Pod）
+kubectl get endpoints nginx
+# NAME    ENDPOINTS          AGE
+# nginx   10.244.x.x:80,... 5s
+
+# 4. 从集群内访问：用临时客户端 Pod 走 DNS 名 nginx
+kubectl run client --rm -it --image=busybox -- wget -qO- nginx
+# <!DOCTYPE html>
+# <html> ... nginx 默认首页 ... </html>
+
+# 清理
+kubectl delete -f nginx-svc.yaml
+```
+
+**要点回顾：** Service 用 Label Selector 选中后端 Pod 并提供稳定 DNS 名（`nginx`）；`wget nginx` 能拿到首页即服务发现生效。若访问不通，先查 `kubectl get endpoints nginx` 是否为空——空通常意味着 selector 与 Pod 标签不匹配。
+</Answer>
 </Callout>
 
 ## 小结

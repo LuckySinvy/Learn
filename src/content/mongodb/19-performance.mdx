@@ -554,6 +554,130 @@ posts.forEach(p => { p.author = map.get(p.authorId.toString()) })
 
 <Callout type="exercise" title="练习">
 一、造 100 万条帖子数据，对一个没有索引的字段做查询，记录 `explain` 的三个关键指标；二、加上索引后重测，计算改善倍数；三、进一步做成覆盖查询，验证 `totalDocsExamined` 归零；四、开启 profiler（slowms 设 50），跑一批混合查询，用聚合找出总耗时最高的三个查询形状；五、在一个窗口跑一个耗时很长的聚合，在另一个窗口用 `currentOp` 找到它并 `killOp`；六、用 `db.serverStatus().connections` 观察连接数，然后把 `maxPoolSize` 从 100 调到 20，看应用延迟有没有变化；七、找出本章 6.1 到 6.7 中三种模式在你自己项目里的实例，并改写它们。
+
+<Answer>
+**参考答案：**
+
+**一、造 100 万条数据，对无索引字段查询**
+
+```js
+use community
+db.posts.drop()
+for (let i = 0; i < 1000000; i += 5000) {
+  const batch = []
+  for (let j = 0; j < 5000; j++) {
+    const k = i + j
+    batch.push({ title: "post-" + k, authorId: "user-" + (k % 1000), views: k % 10000 })
+  }
+  db.posts.bulkWrite(batch.map(doc => ({ insertOne: { document: doc } })))
+}
+```
+
+查询（`authorId` 暂时没索引）：
+
+```js
+db.posts.find({ authorId: "user-42" }).explain("executionStats")
+// 记录：totalKeysExamined: 0（没走索引）
+//       totalDocsExamined: 1000000（COLLSCAN 扫全表）
+//       executionTimeMillis: 几百到几千 ms
+```
+
+**二、加索引后重测**
+
+```js
+db.posts.createIndex({ authorId: 1 })
+
+db.posts.find({ authorId: "user-42" }).explain("executionStats")
+// totalDocsExamined 从 1000000 降到 ~1000（命中数）
+// executionTimeMillis 通常下降 2~3 个数量级
+```
+
+改善倍数 = 优化前耗时 / 优化后耗时，通常几百倍到上千倍（取决于数据量和命中数）。理想情况下三个指标接近 1:1:1。
+
+**三、做成覆盖查询，`totalDocsExamined` 归零**
+
+```js
+db.posts.createIndex({ authorId: 1, title: 1 })
+
+db.posts.find(
+  { authorId: "user-42" },
+  { title: 1, _id: 0 }          // 必须排除 _id
+).explain("executionStats")
+// stage = PROJECTION_COVERED，totalDocsExamined: 0
+// totalKeysExamined ≈ nReturned
+```
+
+条件字段（authorId）和投影字段（title）都在索引里，MongoDB 不读文档直接从索引返回。
+
+**四、profiler + 聚合找总耗时最高的查询形状**
+
+```js
+// 开启 profiler（slowms 50）
+db.setProfilingLevel(1, { slowms: 50 })
+
+// 跑一批混合查询
+db.posts.find({ authorId: "user-1" }).toArray()
+db.posts.find({ title: /mongodb/ }).toArray()
+db.posts.find({ views: { $gt: 9000 } }).sort({ views: -1 }).toArray()
+db.comments.find({ postId: 11 }).toArray()
+```
+
+```js
+// 按「集合 + 执行计划」聚合，找总耗时 Top 3
+db.system.profile.aggregate([
+  { $match: { millis: { $gte: 50 } } },
+  { $group: {
+      _id: { ns: "$ns", plan: "$planSummary" },
+      count: { $sum: 1 },
+      totalMs: { $sum: "$millis" },
+      avgMs: { $avg: "$millis" }
+  } },
+  { $sort: { totalMs: -1 } },
+  { $limit: 3 }
+])
+```
+
+结果会显示类似 `COLLSCAN` 的标题正则查询、无索引的 `views` 排序等形状占据总耗时大头——这些就是该优化的目标。
+
+**五、`currentOp` 找到长聚合并 `killOp`**
+
+窗口 1（跑长聚合）：
+
+```js
+db.posts.aggregate([
+  { $group: { _id: "$authorId", total: { $sum: "$views" } } },
+  { $sort: { total: -1 } }
+])
+```
+
+窗口 2（找到并杀掉）：
+
+```js
+db.currentOp({ active: true, secs_running: { $gte: 3 }, ns: /^community\./ })
+// 在 inprog 里找到 opid（比如 84213），确认 command.aggregate
+db.killOp(84213)
+```
+
+窗口 1 会报错 `Interrupted at shutdown` 或类似中断提示，聚合被终止。注意 `killOp` 只在可中断点生效，正在写数据的操作可能要等，聚合通常能很快被杀掉。
+
+**六、连接池调小后观察延迟**
+
+```js
+db.serverStatus().connections
+// current 842, active 27 → 大量闲置连接，池设大了
+```
+
+把驱动连接串的 `maxPoolSize` 从 100 调到 20，观察应用 P99 延迟：如果当前 `current` 远高于 `active`（很多连接闲置在排队论意义上的池内），调小后每个连接利用率提高、服务端排队减少，延迟通常会下降或持平；如果 20 小于实际并发查询数，会出现 `waitQueueTimeoutMS` 超时。用「并发查询数 ≈ QPS × 平均响应时间」估算合理值。
+
+**七、从 6.1~6.7 中找自己项目的实例改写**
+
+以最常见的三种为例（请对照你自己的代码）：
+1. **正则中间匹配**：`db.users.find({ nickname: /abc/ })` → 改前缀正则 `nickname: /^abc/`，或冗余 `nicknameLower` 字段建索引，或上 ES。
+2. **深分页**：接口用 `skip(200000).limit(20)` → 改 `_id` 游标分页，或在接口层限制最大页码。
+3. **N+1 查询**：循环里逐条 `findOne` 作者 → 先 `db.users.find({ _id: { $in: ids } })` 批量取出，在内存里建 Map 关联。
+
+其余四种（`$ne`、无索引排序、`$lookup` 放大、超大数组）同理：**先 explain 确认瓶颈，再套用对应改写，改完用对比数据验证**。
+</Answer>
 </Callout>
 
 ## 小结

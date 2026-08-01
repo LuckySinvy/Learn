@@ -142,4 +142,51 @@ Sender 线程发送          follower 副本拉取同步            处理业务
 <Callout type="exercise" title="练习">
 1. 列出你当前系统中三个可以用消息系统解耦的调用链，并说明用 Kafka 还是 RabbitMQ 更合适、为什么。
 2. 思考：Kafka "消费后不删除消息"的设计，对实现"新上线一个数据分析服务、需要重算过去 7 天数据"这类需求有什么帮助？
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · 三条典型可解耦的调用链**
+
+| 调用链 | 现状痛点 | 选型 | 理由 |
+|---|---|---|---|
+| 下单成功 → 扣库存 / 发短信 / 加积分 / 同步数仓 | 下游任一挂掉都拖垮下单接口；新增消费方要改上游代码 | **Kafka** | 一份 `orders` 事件多个消费组独立订阅，天然广播；大促时可削峰；数仓侧还要回放历史 |
+| 应用日志 / 访问日志 → ES + 离线分析 | 数据量巨大（每天 TB 级），直写 ES 打满 | **Kafka** | 吞吐量是核心诉求，日志允许"至少一次"，且需要缓冲区顶住 ES 抖动 |
+| 用户上传视频 → 转码 worker 派发任务 | 需要单条任务的 ACK、失败重投、优先级、按 worker 能力分发 | **RabbitMQ** | 任务队列语义（单条 ACK/nack 重投、优先级、死信队列）Kafka 不原生支持 |
+
+选型的判断口诀：
+
+- **事件流**（一份数据多方订阅、要回放、量大）→ Kafka
+- **任务队列**（一条消息只给一个 worker、要单条确认与重投、要延迟/优先级）→ RabbitMQ
+- 需要复杂路由规则（按 routing key 匹配到不同队列）→ RabbitMQ 的 exchange 模型更合适
+
+**第 2 题 · "消费后不删除"带来了什么**
+
+关键在于：Kafka 的消费进度是**消费组各自持有的 offset**，而不是"消息被消费掉"这个动作本身。数据保留由 `retention.ms` / `retention.bytes` 统一决定，与谁消费过无关。
+
+因此新上线一个分析服务时：
+
+1. **用一个全新的 `group.id`**，它的 offset 从零开始，不会和已有消费组冲突，也不会影响线上服务的消费进度。
+2. 设置 `auto.offset.reset=earliest`，即可从日志中现存的最早消息开始重放。
+3. 只要 topic 的保留期 ≥ 7 天，过去 7 天的数据就全在磁盘上，直接重算即可——**不需要上游重发，也不需要从数据库反查补数**。
+
+```bash
+# 新分析服务用独立 group，从最早开始重算
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic orders --group analytics-v1 --from-beginning
+
+# 或者精确从 7 天前的时间点开始（已有 group 的重置写法）
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group analytics-v1 --topic orders \
+  --reset-offsets --to-datetime 2026-07-25T00:00:00.000 --execute
+```
+
+由此延伸出的三个实际收益：
+
+- **重算 / 补数**：分析逻辑写错了，改完代码把 offset 重置回去再跑一遍即可。
+- **灰度与 A/B**：新旧两版消费逻辑用两个 group 同时消费同一份数据，比对结果后再切换。
+- **故障恢复**：下游数据库被误删，可以用 Kafka 里的事件日志重建状态（事件溯源思路）。
+
+**注意前提**：能回放多久完全取决于保留策略。默认 `retention.ms=604800000`（7 天）刚好卡在边界上，如果业务确实需要长期回放，要显式调大保留时间或改用 compaction 策略，否则"想回放时数据已经被清理了"。
+</Answer>
 </Callout>

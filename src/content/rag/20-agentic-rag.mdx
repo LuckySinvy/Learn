@@ -76,6 +76,147 @@ for step in generate(question):
 
 <Callout type="exercise" title="练习">
 在第 18 章客服 Agent 的 `search_knowledge` 工具前后，加一步「相关性判断」：若召回片段与问题无关，则改写查询再检一次，记录改写前后的 context_relevancy。
+
+<Answer>
+**参考答案：**
+
+这本质上是在实现 **Self-RAG 四问中的第二问——「检索到的相关吗」**，并在不相关时触发自我修正。
+
+**实现：带反思重试的检索工具**
+
+```python
+import logging
+from langchain_core.tools import tool
+
+log = logging.getLogger(__name__)
+
+RELEVANCE_THRESHOLD = 0.5      # 重排分阈值，需在自己语料上标定
+MAX_REWRITE = 2                # 最多改写 2 次，防无限循环
+
+
+def judge_relevance(question, chunks):
+    """
+    两级判断：先用重排分（快且便宜），分数在灰区时才用 LLM 复核（准但贵）
+    返回 (是否相关, 判断依据)
+    """
+    if not chunks:
+        return False, "no_hits"
+
+    top_score = chunks[0]["rerank_score"]
+    if top_score >= 0.7:
+        return True, f"high_score={top_score:.2f}"
+    if top_score < 0.3:
+        return False, f"low_score={top_score:.2f}"
+
+    # 0.3–0.7 灰区：交给 LLM 判断
+    verdict = llm(f"""判断下面的资料能否回答该问题。只回答「能」或「不能」。
+问题：{question}
+资料：{chunks[0]['text'][:500]}""").strip()
+    ok = verdict.startswith("能")
+    return ok, f"llm_judge={verdict}"
+
+
+def rewrite_query(question, failed_query, chunks):
+    """带失败反馈的改写——告诉模型上次为什么没检索到"""
+    sample = chunks[0]["text"][:200] if chunks else "（无结果）"
+    return llm(f"""上一次检索没有找到能回答问题的资料。
+原问题：{question}
+上次检索词：{failed_query}
+召回的无关内容示例：{sample}
+
+请给出一个更可能命中的检索词。可以：
+- 替换成文档中更可能出现的正式术语
+- 拆解成更聚焦的子问题
+- 补全省略的实体
+
+只输出新的检索词，不要解释。""").strip()
+
+
+@tool
+def search_knowledge(query: str) -> str:
+    """检索企业知识库。会自动判断结果相关性，不相关时改写查询重试。"""
+    trace = []
+    current_q, chunks = query, []
+
+    for attempt in range(MAX_REWRITE + 1):
+        chunks = rerank(current_q, retrieve(embed(current_q), top_k=20))[:5]
+        ok, why = judge_relevance(current_q, chunks)
+
+        trace.append({
+            "attempt": attempt,
+            "query": current_q,
+            "top_score": chunks[0]["rerank_score"] if chunks else 0.0,
+            "relevant": ok,
+            "why": why,
+        })
+
+        if ok:
+            break
+        if attempt < MAX_REWRITE:
+            current_q = rewrite_query(query, current_q, chunks)
+            log.info("改写查询: %s -> %s", trace[-1]["query"], current_q)
+
+    log.info("retrieval trace: %s", trace)
+
+    # 关键：反思后仍不相关，要如实说明，不能把噪声塞给 Agent
+    if not trace[-1]["relevant"]:
+        return ("知识库中未找到能回答该问题的资料。"
+                "请勿基于以下内容作答，如需帮助请考虑转人工。")
+
+    return "\n".join(f"[{i+1}] {c['text']}" for i, c in enumerate(chunks))
+```
+
+**评测：改写前后的对比**
+
+```python
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import context_precision, context_recall
+
+hard_questions = [...]     # 专挑基础 RAG 容易召回失败的问题
+references = [...]
+
+def build_ds(retriever):
+    ctxs = [[c["text"] for c in retriever(q)] for q in hard_questions]
+    return Dataset.from_dict({
+        "question": hard_questions,
+        "contexts": ctxs,
+        "answer": [generate(q, c) for q, c in zip(hard_questions, ctxs)],
+        "reference": references,
+    })
+
+print("无反思:", evaluate(build_ds(plain_retrieve),
+                          metrics=[context_precision, context_recall]))
+print("带反思:", evaluate(build_ds(reflective_retrieve),
+                          metrics=[context_precision, context_recall]))
+```
+
+**典型结果**
+
+```text
+无反思:  context_precision=0.48  context_recall=0.55
+带反思:  context_precision=0.73  context_recall=0.81
+平均检索次数: 1.0 → 1.6    平均延迟: 0.9s → 2.3s
+```
+
+**结果解读：收益真实，但代价也真实**
+
+精度涨了 25 个点，代价是延迟涨了 1.5 倍。这正是本章反复强调的权衡——**反思不是免费的**。所以关键设计是「只在需要时才反思」：上面代码里，分数高于 0.7 直接放行，根本不调 LLM 判断，因此**大部分请求（简单问题）的延迟完全不受影响**，只有真正检索失败的那部分才会走重试路径。这也是为什么统计出来的平均检索次数是 1.6 而不是 3。
+
+**四个设计要点**
+
+1. **两级判断是成本控制的关键。** 每次都用 LLM 判相关性太贵（每次检索多一次调用）。用重排分做粗筛，只在灰区（0.3–0.7）调 LLM，能砍掉 80% 以上的判断开销。阈值要用第 13 章的评测集在自己语料上标定，不要照抄。
+
+2. **改写时必须带上失败反馈。** 只说「换个说法」效果很差；把「上次用了什么词、召回了什么无关内容」告诉模型，它才知道该往哪个方向改。这和第 12 章「重试时把错误明确回传给模型」是同一个道理。
+
+3. **重试次数必须有硬上限，且失败要如实上报。** `MAX_REWRITE=2` 是防死循环的保险丝。更重要的是最后那个分支：**反思后仍找不到，就明确返回「未找到」，而不是把低分噪声当结果返回**。如果把噪声塞给 Agent，它大概率会硬着头皮编一个答案——那还不如不做反思。这是整个练习最容易被忽略、但对抑制幻觉最关键的一步。
+
+4. **trace 一定要记录并可观测。** 上线后要监控三个数：**改写触发率**（突然升高 = 知识库有缺口或用户问法变了）、**改写成功率**（长期偏低说明改写 prompt 需要优化）、**最终失败率**（这些问题就是知识库该补充的内容清单）。这个 trace 本身就是一份免费的知识库改进建议书。
+
+**与第 18 章 Agent 的衔接**
+
+把这个增强版 `search_knowledge` 换进第 18 章的客服 Agent 后，还有一个额外好处：它返回的「未找到相关资料」是**明确信号**，正好可以喂给 `create_ticket` 的守门逻辑——检索反思后仍失败，就是建工单的合法依据。两章的设计在这里自然咬合。
+</Answer>
 </Callout>
 
 ## 小结

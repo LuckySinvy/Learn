@@ -81,6 +81,34 @@ Root policy
 
 <Callout type="exercise" title="练习">
 画一张你团队的告警路由草图：critical / warning 分别去哪，哪些团队有专属群。这正是下一章要落地的配置。
+
+<Answer>
+**参考答案：**
+
+这是一道「设计 + 画图」题。先想清楚三件事：告警有多严重（severity）、属于谁（team）、通知给谁最有效。下面给一个可参考的模板。
+
+**示例草图（文本形式）：**
+
+```text
+Root policy（默认兜底）→ Contact: email-oncall@example.com
+ ├─ severity=critical  → 电话/短信 oncall（或钉钉群 @全员）
+ ├─ severity=warning   → Slack #alerts
+ ├─ team=payment       → 钉钉「支付告警群」
+ ├─ team=infra         → Slack #infra-alerts
+ └─ team=frontend      → Slack #frontend-alerts
+```
+
+**设计要点：**
+
+1. **critical 一定要「最吵」**：电话 / 短信 / 机器人 @所有人，保证有人响应
+2. **warning 走安静的渠道**：Slack 公共频道，大家有空再看，避免打扰
+3. **专属群按团队 / 业务拆**：支付、核心链路这类高价值业务单独成组，避免和无关告警混在一起
+4. **永远留一条默认路径**：Root policy 兜底，防止没打标签的告警无人接收
+
+**画图建议：** 画完后对照检查——「是不是每条告警都必然落到至少一个 Contact point？」如果有漏网之鱼，Root policy 必须补上。
+
+下一章你就会发现：规则只负责打 `severity` / `team` 标签，上面这张草图就是 Notification policy 路由树的蓝本。
+</Answer>
 </Callout>
 
 ## 小结

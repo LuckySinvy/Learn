@@ -180,4 +180,72 @@ SELECT id, order_no, user_id, status, total_amount, created_at FROM orders;`}
 1. 用你手边任何一个 MySQL 实例执行 `SELECT VERSION();` 和 `SHOW ENGINES;`，确认版本与默认引擎。
 2. 执行 `SHOW VARIABLES LIKE 'innodb_buffer_pool_size';`，把结果换算成 MB，思考它相对机器内存的占比是否合理（专用数据库服务器通常设为物理内存的 50%–70%）。
 3. 口述一遍：一条 SELECT 从客户端发出到返回结果，经过了哪些组件？
+
+<Answer>
+**参考答案：**
+
+**1. 查看版本与引擎**
+
+```sql
+SELECT VERSION();
+-- 8.0.42
+
+SHOW ENGINES;
+-- 关注 Support 列：InnoDB 那一行应为 DEFAULT，
+-- 其余（MyISAM / MEMORY / CSV / ARCHIVE）为 YES，
+-- 并留意 Transactions=YES、XA=YES、Savepoints=YES 只有 InnoDB 满足。
+```
+
+只看默认引擎也可以直接查变量：
+
+```sql
+SELECT @@default_storage_engine;   -- InnoDB
+```
+
+**2. Buffer Pool 大小换算**
+
+```sql
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+-- 结果是字节数，例如 134217728
+
+-- 直接让 MySQL 帮你换算成 MB / GB
+SELECT @@innodb_buffer_pool_size / 1024 / 1024              AS mb,
+       @@innodb_buffer_pool_size / 1024 / 1024 / 1024       AS gb;
+```
+
+判断标准：
+
+- `134217728` 字节 = **128 MB**，这是 MySQL 的**默认值**，几乎一定偏小——它只够缓存 8192 个 16KB 数据页。
+- **专用**数据库服务器：设为物理内存的 **50%–70%**。例如 32GB 内存的机器给 20GB 左右，剩下的留给操作系统、连接线程的私有内存（sort_buffer、join_buffer 等）和其他进程。
+- **共享**机器（本机开发、和应用同机部署）：不能按 70% 给，否则会触发 OOM Kill，一般给 1–4GB 即可。
+- 太小的直接后果：数据页反复被淘汰又从磁盘读回，读请求大量落盘，QPS 上不去。可以用命中率佐证：
+
+```sql
+-- 命中率 = 1 - (物理读次数 / 逻辑读次数)，健康值应 > 99%
+SELECT
+  (1 - (
+     (SELECT VARIABLE_VALUE FROM performance_schema.global_status
+       WHERE VARIABLE_NAME = 'Innodb_buffer_pool_reads')
+   / (SELECT VARIABLE_VALUE FROM performance_schema.global_status
+       WHERE VARIABLE_NAME = 'Innodb_buffer_pool_read_requests')
+  )) * 100 AS hit_rate_pct;
+```
+
+**3. 一条 SELECT 的完整旅程**
+
+以 `SELECT * FROM users WHERE id = 10;` 为例：
+
+1. **连接层**：从连接池取到（或新建）一个 TCP 连接，完成用户认证与权限校验，分配一个线程承载这次请求。
+2. **解析器**：词法 + 语法分析，把 SQL 文本变成解析树，识别出表名 `users`、条件 `id = 10`；语法错误在这一步报 `You have an error in your SQL syntax`。
+3. **预处理 / 语义检查**：确认表和列真实存在，展开 `*`，做表级和列级权限检查。
+4. **优化器**：基于成本模型决定执行计划——这里发现 `id` 是主键，选择走主键索引做等值查找（而不是全表扫描）；多表时还会决定 JOIN 顺序。
+5. **执行器**：按计划逐行调用存储引擎的读接口。
+6. **存储引擎（InnoDB）**：先查 **Buffer Pool**，命中则直接返回内存中的数据页；未命中则从磁盘读入对应的 16KB 页，放进 Buffer Pool 再返回。读取时还要按 MVCC 规则判断该版本对当前事务是否可见。
+7. **执行器**：把符合条件的行返回给客户端（结果集边算边发，不是全部算完再发）。
+
+补充两点常被追问的细节：
+
+- **8.0 没有查询缓存**了（5.7 里第 2 步之前还会先查 Query Cache），需要缓存请在应用层用 Redis。
+- **binlog 在 Server 层**、redo/undo log 在 InnoDB 层，这是「两阶段提交」的关键前提，第 15、19 章会展开。
+</Answer>
 </Callout>

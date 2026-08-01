@@ -154,4 +154,54 @@ bin/kafka-e2e-latency.sh localhost:9092 perf-test 10000 all 1024
 1. 用 producer-perf-test 分别测 linger.ms=0/20/100 三组（其他参数固定），记录吞吐与 p99 延迟，画出取舍曲线。
 2. 同一批数据分别用 none/lz4/zstd 压测，对比吞吐、延迟与 broker 端磁盘占用（kafka-log-dirs 查看）。
 3. 把 record-size 从 100B 改到 10KB 再到 100KB，观察吞吐（MB/s 与 records/s）的变化规律并解释原因。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：linger.ms 吞吐/延迟取舍**
+
+固定其他参数，只变 `linger.ms`：
+
+```bash
+for L in 0 20 100; do
+  kafka-producer-perf-test --topic tune --num-records 1000000 --record-size 1024 \
+    --throughput -1 --producer-props bootstrap.servers=localhost:9092 linger.ms=$L
+done
+```
+
+预期曲线（典型）：
+- `linger.ms=0`：逐条立即发，吞吐最低，p99 延迟最低（实时性好）。
+- `linger.ms=20`：攒一小批再发，吞吐显著上升，延迟小幅增加。
+- `linger.ms=100`：攒更多批，吞吐接近上限，但 p99 延迟 ~100ms 量级。
+
+规律：**linger 越大 → 批越大 → 网络/磁盘 IO 越省 → 吞吐越高，代价是延迟下限升高**。生产按「能接受的最大延迟」挑 linger，多数场景 20–50ms 是甜点。
+
+**第 2 题：压缩算法对比**
+
+```bash
+for C in none lz4 zstd; do
+  kafka-producer-perf-test --topic tune-$C --num-records 1000000 --record-size 1024 \
+    --throughput -1 --producer-props bootstrap.servers=localhost:9092 compression.type=$C
+done
+# broker 端磁盘占用
+kafka-log-dirs --bootstrap-server localhost:9092 --describe --topic-list tune-none,tune-lz4,tune-zstd
+```
+
+预期：`none` 磁盘占用最大、吞吐最低（网络搬运原样字节）；`lz4` CPU 轻、吞吐和压缩率都明显好；`zstd` 压缩率最高（磁盘最小、带宽最省），CPU 略高。文本/JSON 类数据收益大；若本身已是压缩文件（zip/图片）再压几乎无效甚至负收益。**选型：CPU 敏感用 lz4，带宽/存储敏感用 zstd**。
+
+**第 3 题：record-size 与吞吐指标**
+
+```bash
+for S in 100 10240 102400; do
+  kafka-producer-perf-test --topic tune-$S --num-records 100000 --record-size $S \
+    --throughput -1 --producer-props bootstrap.servers=localhost:9092
+done
+```
+
+观察两个指标：
+- **MB/s（带宽吞吐）**：通常随 record 变大而上升——大消息批次少、协议头/网络往返开销占比下降，磁盘顺序写更充分。到很大时会受限于磁盘/网络带宽上限。
+- **records/s（消息条数吞吐）**：通常随 record 变大而**下降**——单条大了，同样时间内能处理的条数变少。
+
+结论：Kafka 是「大块顺序 IO」模型，**大消息带宽利用率高、小消息条数吞吐高**。设计时应尽量批量、避免海量小消息；单条过大（接近/超过 `max.message.bytes`）则要改服务端配置并小心内存与 GC。
+</Answer>
 </Callout>

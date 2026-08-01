@@ -217,6 +217,37 @@ asyncio.run(main())`}
 
 <Callout type="exercise" title="提示">
 `results = await asyncio.gather(*(fetch(u) for u in urls))`。
+
+<Answer>
+
+**参考答案：**
+
+```python
+import asyncio, time
+
+async def fetch(url):
+    await asyncio.sleep(0.1)      # 模拟 0.1s 网络延迟
+    return f"完成: {url}"
+
+async def main():
+    urls = [f"https://api.example.com/items/{i}" for i in range(10)]
+    start = time.perf_counter()
+    results = await asyncio.gather(*(fetch(u) for u in urls))
+    elapsed = time.perf_counter() - start
+    print(f"完成 {len(results)} 个请求")
+    print(f"总耗时 {elapsed:.2f}s（串行要 1.00s）")
+
+asyncio.run(main())
+```
+
+输出与题目期望一致：`完成 10 个请求`、`总耗时约 0.10s`。
+
+要点：
+
+- `*(fetch(u) for u in urls)` 把生成器解包成 10 个协程参数传给 `gather`，10 个请求同时发起。
+- 每个请求各自等 0.1s，并发跑总耗时约 0.1s；如果串行就是 10×0.1 = 1.0s。
+- `results` 长度应为 10，用 `len()` 统计即可，不需要预先知道数量。
+</Answer>
 </Callout>
 
 ## 小结

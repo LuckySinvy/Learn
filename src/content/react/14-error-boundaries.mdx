@@ -381,18 +381,138 @@ function safeHandler<T extends unknown[]>(fn: (...args: T) => void) {
 4. `useEffect` 里 `fetch().then()` 中抛出错误
 5. lazy 加载的 chunk 返回 404
 6. 错误边界自己的 fallback 组件渲染时报错
+
+<Answer>
+**参考答案：**
+
+对照第 2 节那张表逐条判断：
+
+1. **渲染时 `items.map` 而 `items` 是 `undefined`** —— **能捕获**。`items.map` 在组件渲染期间执行，抛出的是渲染期错误，错误边界正是为此设计的。
+2. **`onClick` 里 `JSON.parse` 非法字符串** —— **不能捕获**。这是事件处理函数，不在渲染流程内，错误会直接冒泡到 `window`。
+3. **`useEffect` 里同步抛出错误** —— **能捕获**。`useEffect` 的回调在 commit 阶段同步执行，同步抛出的错误会被 React 冒泡给最近的边界。（章节表格写的是「`useEffect` 里的**异步**错误不能」，恰恰说明同步抛出是能的。）
+4. **`useEffect` 里 `fetch().then()` 中抛出错误** —— **不能捕获**。`fetch().then(...)` 里抛错发生在微任务队列，脱离了本次渲染/提交的流程，边界捕获不到。
+5. **lazy 加载的 chunk 返回 404** —— **能捕获**。懒加载失败属于「子树加载/渲染期的错误」，表格里明确列为能捕获。
+6. **错误边界自己的 fallback 组件渲染时报错** —— **不能（由该边界自己捕获），会冒泡给上层边界**。边界不能捕获「自己渲染时」的错误，必须由更外层的边界接住；这也是为什么要分层布置多个边界。
+
+一句话记忆：**边界只管「子树渲染期」的错误；事件、定时器、Promise、async 这类脱离渲染流程的错误都不归它管。**
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：设计边界布局">
 一个电商详情页包含：顶部导航、商品主图与信息、价格与购买按钮、店铺信息、推荐商品、用户评价、页脚。
 
 设计错误边界的布置方案：每层放在哪、fallback 显示什么、哪些区域出错可以直接隐藏。说明你的判断依据。
+
+<Answer>
+**参考答案：**
+
+按第 3 节「这里挂了，用户还能不能完成主要任务」来分层：
+
+**① 应用级（最外层，最后防线）**
+包住整个页面。fallback 显示「系统开小差了，请刷新」+ 刷新按钮。只有当更内层都没兜住时才出现。
+
+**② 页面/核心区边界（覆盖「商品主图与信息 + 价格与购买按钮」）**
+这是用户的核心任务（看商品、下单），必须给明确的恢复路径：fallback 显示「商品加载失败」+ 重试按钮（`resetErrorBoundary`）+ 返回列表链接。不能静默隐藏——否则用户连买都买不了。
+
+**③ 组件级边界 ×3（非关键区域，出错可降级甚至隐藏）：**
+- **推荐商品**：包裹一个独立边界，`fallback={null}` —— 推荐位挂了直接不显示，绝不影响主内容。
+- **用户评价**：独立边界，fallback 显示一行「评价暂时加载不出来」，而不是整页崩溃。
+- **店铺信息**：独立边界，fallback 为简短占位或隐藏。
+
+**④ 顶部导航、页脚**：属于应用骨架，一般不放局部边界（或跟应用级一起），因为它们「挂了」基本等于整站故障，没必要单独降级。
+
+**判断依据总结：**
+| 区域 | 是否核心任务 | 边界策略 | fallback |
+|---|---|---|---|
+| 商品主图/价格/购买 | 是 | 页面级边界 | 重试 + 返回，带恢复路径 |
+| 推荐商品 | 否 | 组件级，静默 | `null`（隐藏） |
+| 用户评价 | 否 | 组件级 | 轻量提示 |
+| 店铺信息 | 否 | 组件级 | 占位/隐藏 |
+| 全站 | 兜底 | 应用级 | 刷新页面 |
+
+关键点：一个非核心模块（推荐/评价）崩溃时，主商品信息照常可用——这正是分层边界的意义。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：实现重试限制">
 给错误边界加一个功能：同一个错误连续重试超过 3 次后，不再显示「重试」按钮，改为显示「刷新页面」。
 
 需要考虑：怎么判断「同一个错误」？重试计数在什么时候清零？（提示：可以用 resetKeys 变化作为清零信号。）
+
+<Answer>
+**参考答案：**
+
+核心思路：用「错误指纹」判断是不是同一个错误；用「错误指纹变化 / resetKeys 变化」作为重试计数的清零信号。
+
+```tsx
+type Props = {
+  children: React.ReactNode;
+  fallback: (error: Error, reset: () => void) => React.ReactNode;
+  resetKeys?: unknown[];     // 变化时清零计数
+};
+
+type State = { error: Error | null; fingerprint: string; retryCount: number };
+
+// 把错误转成稳定指纹（message + 关键栈帧），相同的错误指纹相同
+function fingerprintOf(error: Error): string {
+  return error.message + "::" + (error.stack ?? "").split("\n")[1] ?? "";
+}
+
+class RetryLimitedBoundary extends React.Component<Props, State> {
+  state: State = { error: null, fingerprint: "", retryCount: 0 };
+
+  static getDerivedStateFromError(error: Error): Partial<State> {
+    // 只负责把 error 存进 state，触发降级渲染；计数交给 componentDidCatch
+    return { error };
+  }
+
+  // 提交阶段：在这里读 prev state 比较指纹、累加/归零计数
+  componentDidCatch(error: Error) {
+    const fp = fingerprintOf(error);
+    this.setState((prev) =>
+      fp === prev.fingerprint
+        ? { fingerprint: fp, retryCount: prev.retryCount + 1 }   // 同一错误，计数 +1
+        : { fingerprint: fp, retryCount: 1 }                     // 不同错误，重新计数
+    );
+  }
+
+  componentDidUpdate(prevProps: Props) {
+    // resetKeys 变化 → 认为用户进入了新场景，清零计数
+    const a = JSON.stringify(prevProps.resetKeys);
+    const b = JSON.stringify(this.props.resetKeys);
+    if (a !== b) this.setState({ retryCount: 0, fingerprint: "" });
+  }
+
+  reset = () => this.setState({ error: null });
+
+  render() {
+    const { error, retryCount } = this.state;
+    if (error === null) return this.props.children;
+
+    const limited = retryCount >= 3;   // 连续失败 3 次以上
+    return this.props.fallback(error, this.reset, limited);
+  }
+}
+
+// fallback 渲染时根据 limited 切换文案
+function Fallback(error: Error, reset: () => void, limited: boolean) {
+  return (
+    <div role="alert">
+      {limited ? (
+        <button onClick={() => location.reload()}>刷新页面</button>   // 不再提供重试
+      ) : (
+        <button onClick={reset}>重试</button>
+      )}
+    </div>
+  );
+}
+```
+
+**两个关键问题：**
+
+- **怎么判断「同一个错误」**：用 `fingerprintOf` 给每个错误生成一个稳定指纹（消息 + 栈顶帧）。`getDerivedStateFromError` 里若新错误指纹和旧的一致，计数 `+1`；不一致（比如用户先点了别的东西触发了别的错）则归零。这样「连续点重试都失败」才会计数，偶然的不同错误不会误伤。
+- **重试计数什么时候清零**：两类信号都会清零——① `resetKeys`（如 `route.pathname`）变化时，`componentDidUpdate` 检测到并清零，对应「用户切到了新页面，旧的错误计数没意义了」；② 新指纹的错误出现时归零（上面的 `same` 判断）。注意 `reset` 本身只清空 `error` 重新渲染子树，不会动计数——计数只在「新错误 / resetKeys 变化」时清零，所以连续 3 次重试同一错误就会触发「刷新页面」。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：加固一个组件">
@@ -409,6 +529,62 @@ function OrderDetail({ order }) {
 }
 ```
 接口返回的数据可能缺字段。列出所有可能崩溃的位置，用三种不同层次的手段加固：可选链、运行时校验（Zod）、错误边界。说明各自适合处理哪一类问题。
+
+<Answer>
+**参考答案：**
+
+**一、所有可能崩溃的位置（接口缺字段时）：**
+
+1. `order.title` —— 若 `order` 本身是 `null/undefined`，整行 `.title` 崩溃。
+2. `order.buyer.name` —— `order.buyer` 可能是 `undefined` → 崩溃。
+3. `order.buyer.address.city` —— `buyer.address` 可能是 `undefined` → 崩溃。
+4. `order.items.map(...)` —— `order.items` 可能是 `undefined`/`null` → 崩溃。
+5. `order.items.reduce(...)` —— 同样依赖 `items` 非 null，且若 `items` 为 null 先崩。
+
+**二、三种手段各管一类问题：**
+
+**① 可选链（`?.` + `??` 默认值）—— 处理「个别字段可能缺失，但缺了也能优雅展示」的局部问题。**
+适合：字段可有可无、缺失时给个兜底文案即可，不影响整体渲染。
+
+```tsx
+<h2>{order?.title ?? "未命名订单"}</h2>
+<p>{order?.buyer?.name ?? "匿名"} · {order?.buyer?.address?.city ?? "未知城市"}</p>
+<ul>{(order?.items ?? []).map((i) => <li key={i.id}>{i.name}</li>)}</ul>
+<p>合计 {(order?.items ?? []).reduce((s, i) => s + i.price, 0)}</p>
+```
+
+改动小、零依赖，但它是「就地打补丁」，无法保证 `items` 里每一项都有 `id`/`name`/`price`。
+
+**② 运行时校验（Zod）—— 处理「跨越系统边界的数据契约」问题。**
+适合：在接收接口响应的那一刻（系统边界）就校验整个结构是否合法，而不是等渲染时才一个个 `?.`。一旦数据不符合契约，要么转换要么及早报错，从源头保证进组件的数据是完整的。
+
+```tsx
+const OrderSchema = z.object({
+  title: z.string(),
+  buyer: z.object({ name: z.string(), address: z.object({ city: z.string() }) }),
+  items: z.array(z.object({ id: z.string(), name: z.string(), price: z.number() })),
+});
+const safeOrder = OrderSchema.parse(fetchedRaw);   // 失败会抛错 → 交给边界
+```
+
+这比可选链更「主动」：要么数据完整可用，要么在边界处立刻失败，不会出现「显示了一半的残缺页面」。
+
+**③ 错误边界 —— 处理「任何未预料的渲染崩溃」的最终防线。**
+适合：即使上面两层都做了，仍可能有漏网之鱼（校验规则不全、第三方库内部报错）。用边界保证「哪怕 `OrderDetail` 崩了，也只是一块降级 UI，而不是整页白屏」。
+
+```tsx
+<ErrorBoundary fallback={<OrderLoadFailed onRetry={refetch} />}>
+  <OrderDetail order={order} />
+</ErrorBoundary>
+```
+
+**三、三者关系（层次）：**
+- **可选链**是「渲染内的防御」，最轻量，处理零散的字段缺失。
+- **Zod**是「入口处的契约校验」，把不合法数据挡在组件之外，从根源消灭大多数崩溃。
+- **错误边界**是「最后的兜底」，覆盖前两者都没拦住的情况。
+
+推荐组合：Zod 在边界（获取数据处）做整体校验 + 可选链在组件内做友好兜底 + 错误边界包住组件做白屏防线。
+</Answer>
 </Callout>
 
 ## 小结

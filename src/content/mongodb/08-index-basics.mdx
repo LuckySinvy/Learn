@@ -384,6 +384,102 @@ GeoJSON 规范是 `[longitude, latitude]`，和我们习惯说的「纬度、经
 
 <Callout type="exercise" title="练习">
 一、给 `posts.authorId` 建索引，用 `explain("executionStats")` 对比建索引前后的 `totalDocsExamined`；二、给 `users.phone` 建一个「只约束有手机号的文档」的唯一部分索引，插入两条没有 phone 的文档验证不冲突；三、给 `sessions` 建一个 TTL 索引让会话 30 分钟过期，插入一条并观察它在一小时内被删除；四、给 `posts.tags` 建多键索引，然后尝试建 `{ tags: 1, categories: 1 }` 并插入两个数组字段的文档，复现 parallel arrays 报错；五、用聚合算出 `posts.tags` 的平均长度，估算多键索引会有多少条目。
+
+<Answer>
+**参考答案：**
+
+**一、`explain` 对比建索引前后的扫描量**
+
+建索引前（假设 `posts` 有大量数据）：
+
+```js
+db.posts.find({ authorId: "alice" }).explain("executionStats")
+// executionStats.stage = COLLSCAN
+// totalDocsExamined 等于整个集合的文档数
+```
+
+建索引后：
+
+```js
+db.posts.createIndex({ authorId: 1 })
+
+db.posts.find({ authorId: "alice" }).explain("executionStats")
+// executionStages 里是 IXSCAN → FETCH
+// totalDocsExamined 等于实际匹配到的文档数（远小于全集）
+```
+
+核心结论：`totalDocsExamined` 从「全集合文档数」降到「命中条数」，这就是索引把 842ms 变成 1ms 的直接原因。
+
+**二、只约束有手机号的唯一部分索引**
+
+```js
+db.users.createIndex(
+  { phone: 1 },
+  { unique: true, partialFilterExpression: { phone: { $type: "string" } } }
+)
+
+// 两条都没有 phone 字段——不满足部分索引的条件，不参与唯一性判断
+db.users.insertOne({ username: "n1" })
+db.users.insertOne({ username: "n2" })
+// 都成功，没有 E11000 冲突
+```
+
+对比：普通唯一索引会把缺失字段当 null，第二条就会报重复；部分索引只约束「有 phone 字符串」的文档，所以两条无 phone 的文档互不冲突。
+
+**三、30 分钟过期的 TTL 索引**
+
+```js
+db.sessions.createIndex({ createdAt: 1 }, { expireAfterSeconds: 1800 })
+
+db.sessions.insertOne({
+  sid: "s-001",
+  user: "alice",
+  createdAt: new Date()
+})
+```
+
+TTL 线程每 60 秒扫一次（负载高时更慢），插入后约 30 分钟内可观察到文档被删除：
+
+```js
+// 周期性执行查询，确认文档是否已被 TTL 删除
+db.sessions.find({ sid: "s-001" }).count()   // 起初是 1，半小时后变为 0
+```
+
+更精确的做法是把过期时刻存成字段、`expireAfterSeconds` 设为 0：
+
+```js
+db.tokens.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+db.tokens.insertOne({ token: "t1", expiresAt: new Date(Date.now() + 1800 * 1000) })
+```
+
+**四、复现 parallel arrays 报错**
+
+```js
+db.posts.createIndex({ tags: 1 })              // 多键索引，正常
+
+db.posts.createIndex({ tags: 1, categories: 1 })  // 定义时可能不报错
+db.posts.insertOne({ tags: ["a", "b"], categories: ["x", "y"] })
+// MongoServerError: cannot index parallel arrays [categories] [tags]
+```
+
+报错原因：复合索引里有两个数组字段，索引条目数变成笛卡尔积（2×2 = 4 条），数组再大一点一个文档就能撑爆索引。**一个复合索引里最多只能有一个多键字段**。
+
+**五、估算多键索引条目数**
+
+```js
+db.posts.aggregate([
+  { $unwind: "$tags" },
+  { $group: { _id: null, totalTags: { $sum: 1 }, docCount: { $sum: 1 } } },
+  { $project: { avgTagsPerDoc: { $divide: ["$totalTags", "$docCount"] } } }
+])
+```
+
+```json
+[ { "avgTagsPerDoc": 2.6 } ]
+```
+
+估算：`{ tags: 1 }` 的索引条目数 ≈ `文档数 × 平均标签数`。若 `posts` 有 100 万文档、平均 2.6 个标签，则索引约有 260 万条条目，体积约为单字段索引的 2.6 倍。数组越长，多键索引越臃肿，建索引前务必算一下平均数组长度。
+</Answer>
 </Callout>
 
 ## 小结

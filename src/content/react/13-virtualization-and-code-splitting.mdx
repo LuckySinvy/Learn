@@ -376,24 +376,153 @@ chunk 加载失败是真实会发生的（网络抖动、部署后旧 chunk 404�
 当 scrollTop = 12000 时，计算 startIndex、endIndex、实际渲染的行数、偏移量 offsetTop。
 
 然后思考：如果 overscan 设为 0，快速滚动时会看到什么现象？为什么？
+
+<Answer>
+**参考答案：**
+
+按第 2.2 节的公式代入：
+
+- `rowHeight = 48`，`viewportHeight = 600`，`overscan = 4`，`total = 5000`
+- `startIndex = max(0, floor(scrollTop / rowHeight) - overscan) = max(0, floor(12000 / 48) - 4) = 250 - 4 = 246`
+- `visibleCount = ceil(viewportHeight / rowHeight) + overscan * 2 = ceil(600 / 48) + 8 = 13 + 8 = 21`
+- `endIndex = min(total, startIndex + visibleCount) = min(5000, 246 + 21) = 267`
+- **实际渲染行数** = `endIndex - startIndex = 21`（即第 246 ~ 266 行visible）
+- `offsetTop = startIndex * rowHeight = 246 * 48 = 11808`（用 `translateY(11808px)` 把可视区定位到正确位置）
+
+**如果 `overscan = 0` 会怎样？** 可视区只有 `ceil(600/48) = 13` 行，前后没有任何缓冲。快速滚动（一次滚动事件跳过多行）时，浏览器还没来得及渲染「即将进入视口」的那些行，于是用户会在列表顶部/底部看到**短暂空白（露白）**，滚动停下后才会补齐。overscan 的作用正是「提前多渲染几行当缓冲」，用一点点额外 DOM 换掉快速滚动时的露白感。一般 overscan 取 3~8 行。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：设计分割方案">
 一个后台系统有这些部分：登录页、仪表盘（含 ECharts）、用户列表、用户详情（含富文本编辑器）、设置页、导出功能（含 xlsx 库）。
 
 设计代码分割方案：哪些按路由分割、哪些按交互分割、哪些预加载、在什么时机预加载。说明理由。
+
+<Answer>
+**参考答案：**
+
+先按「用户进入成本」把模块分类：
+
+**1. 按路由分割（首屏只下载当前路由的代码）**
+
+- `登录页`、`仪表盘`、`用户列表`、`用户详情`、`设置页` 都用 `lazy(() => import(...))` 包成独立 chunk，外层一个 `<Suspense>` 包裹 `<Routes>`。
+- 理由：路由切换时才需要对应页面的代码，访问登录页的人完全不需要下载「用户详情 / 设置页」的代码，这是收益最大、成本最低的分割。
+
+**2. 按交互分割（重依赖只在被触发时才下载）**
+
+- `ECharts`（仪表盘内，几百 KB）：不随仪表盘路由一起下，改为 `const Chart = lazy(() => import("./Chart"))`，仪表盘渲染时再加载，配 `<ChartSkeleton />`。
+- `富文本编辑器`（用户详情页内，可能几百 KB）：只在点击「编辑」按钮后才 `lazy` 加载，未进入编辑态时完全不下载。
+- `xlsx 库`（导出功能）：只在点击「导出」时才加载，绝不能进首屏包。
+
+**3. 预加载（消除点击后的等待感）**
+
+- **导出按钮**：`onMouseEnter={loadXlsx}` / `onFocus={loadXlsx}`，鼠标一悬停就开始拉 xlsx chunk，200~500ms 后用户真点导出时已经就绪。
+- **用户详情里的编辑器**：在「用户列表 → 详情」路由过渡、或详情页骨架屏显示时，`requestIdleCallback` 预加载编辑器，因为进详情页大概率会编辑。
+- **ECharts**：仪表盘是主要入口，可在登录后空闲期（`requestIdleCallback`）预加载，避免进首页看到图表骨架。
+
+**4. 原则补充**
+
+- 单个 chunk 小于 20KB 不值得单独拆（HTTP 开销反而变慢）。
+- 登录页的校验逻辑很小，可保留在主包；真正重的是图表/编辑器/xlsx 这三个，必须懒加载。
+- 记得给所有 `lazy` 配**错误边界**，处理 chunk 加载失败（部署后旧 chunk 404）时的刷新兜底。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：实现 useVirtual">
 写一个 `useVirtual({ count, rowHeight, viewportHeight, overscan })` 自定义 Hook，返回 `startIndex`、`endIndex`、`offsetTop`、`totalHeight` 和一个 `onScroll` 处理函数。
 
 进阶：用 requestAnimationFrame 节流 scroll 事件（回顾第 12 章），对比节流前后 setState 的调用次数。
+
+<Answer>
+**参考答案：**
+
+Hook 内部维护 `scrollTop` 的 state，并暴露 `onScroll`（挂到滚动容器上）、`offsetTop`、`totalHeight` 等。进阶版用 rAF 把「多次 scroll 事件」合并成「每帧一次 setState」。
+
+```tsx
+import { useCallback, useMemo, useState } from "react";
+
+type Options = {
+  count: number;
+  rowHeight: number;
+  viewportHeight: number;
+  overscan?: number;
+};
+
+function useVirtual({ count, rowHeight, viewportHeight, overscan = 3 }: Options) {
+  const [scrollTop, setScrollTop] = useState(0);
+
+  // 用 rAF 节流：scroll 事件一秒可能触发上百次，但每帧只 setState 一次
+  const onScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    const top = e.currentTarget.scrollTop;
+    requestAnimationFrame(() => setScrollTop(top));
+  }, []);
+
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visibleCount = Math.ceil(viewportHeight / rowHeight) + overscan * 2;
+  const endIndex = Math.min(count, startIndex + visibleCount);
+  const offsetTop = startIndex * rowHeight;
+  const totalHeight = count * rowHeight;
+
+  return { startIndex, endIndex, offsetTop, totalHeight, onScroll };
+}
+
+// 使用
+function List({ items }: { items: Item[] }) {
+  const { startIndex, endIndex, offsetTop, totalHeight, onScroll } = useVirtual({
+    count: items.length,
+    rowHeight: 48,
+    viewportHeight: 600,
+  });
+  const visible = items.slice(startIndex, endIndex);
+  return (
+    <div style={{ height: 600, overflowY: "auto" }} onScroll={onScroll}>
+      <div style={{ height: totalHeight, position: "relative" }}>
+        <div style={{ position: "absolute", top: 0, left: 0, right: 0, transform: "translateY(" + offsetTop + "px)" }}>
+          {visible.map((it) => (
+            <div key={it.id} style={{ height: 48 }}>{it.name}</div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+**节流前后对比：** 假设快速滚动 1 秒触发了 120 次 `scroll` 事件。
+
+- **不节流**：120 次事件 → 120 次 `setScrollTop` → 120 次组件渲染。绝大多数渲染的中间结果用户根本看不到，纯属浪费，且可能掉帧。
+- **用 rAF 节流**：120 次事件都只是「登记一下」，浏览器每帧（约 16.7ms）合并成一次 `setScrollTop` → 1 秒约 60 次渲染，正好跟屏幕刷新率对齐，既流畅又不浪费。
+
+要点：`scroll` 事件本身不贵，贵的是每次事件引发的 React 渲染 + diff，所以要在「事件 → setState」这一环做节流/防抖，让渲染频率对齐帧率。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：分析取舍">
 一个商品列表页要展示 800 个商品卡片，每个卡片有图片、标题、价格、加购按钮。
 
 列出至少四种方案（虚拟化、分页、无限滚动、图片懒加载），从首屏速度、滚动流畅度、实现复杂度、SEO、无障碍五个维度对比，给出你的推荐和理由。
+
+<Answer>
+**参考答案：**
+
+| 方案 | 首屏速度 | 滚动流畅度 | 实现复杂度 | SEO | 无障碍 |
+|---|---|---|---|---|---|
+| **虚拟化** | 好（只渲染可视区） | 极好（DOM 永远 ~20 个） | 高（动态高度、滚动定位、aria 属性） | 差（未渲染行不在 DOM，爬取不到） | 需手动加 `aria-setsize`/`aria-posinset` |
+| **分页** | 好（每页少量 DOM） | 好（翻页才换） | 低 | 好（每页独立 URL，可被索引） | 最好（页码导航天然可访问） |
+| **无限滚动** | 好（先加载一屏） | 一般（持续追加，列表变长后渐卡） | 中（加载阈值、防重复加载、回退位置） | 差（爬虫不会滚动） | 差（键盘/读屏难定位，易迷失位置） |
+| **图片懒加载** | 好（首屏只加载可视图片） | 好 | 低（`loading="lazy"` 一行） | 好（图片 alt 仍在 DOM 结构里） | 好（原生支持，无需额外处理） |
+
+**推荐方案：虚拟化 + 图片懒加载 为主，配合分页兜底。**
+
+理由：
+
+1. **图片懒加载是必选项**——800 个商品的图片是首屏体积和无谓请求的最大来源，用 `loading="lazy"` 几乎零成本解决，和任何其它方案都不冲突。
+2. **虚拟化解决滚动流畅度**——800 个卡片（含图片、按钮）一次性进 DOM 会让布局计算很重，虚拟化把 DOM 锁在 ~20 个，滚动丝滑；它的缺点（SEO、无障碍）可用下面两条弥补。
+3. **分页作为「可访问性 / SEO 兜底」**——对需要被搜索引擎收录、或需要无障碍导航的场景，提供「分页视图」入口；无限滚动对爬虫和屏幕阅读器都不友好，不推荐作为唯一方案。
+4. 若商品数据来自后端且本身是分页接口，虚拟化 + 分页接口的「按需拉取 + 窗口渲染」组合最稳；纯前端 800 条用客户端虚拟化即可。
+
+一句话：**图片懒加载打底，虚拟化保证流畅，分页兜住 SEO 和无障碍，三者组合而非二选一。**
+</Answer>
 </Callout>
 
 ## 小结

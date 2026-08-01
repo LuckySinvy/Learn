@@ -231,6 +231,50 @@ TypeScript 要给已有的海量 JavaScript 代码「事后」加类型。那些
 
 <Callout type="exercise" title="练习">
 写一个函数 `bmi(weightKg: number, heightM: number): number` 计算体质指数（体重除以身高的平方），再写一个 `level(v: number): string` 根据数值返回「偏瘦」「正常」「超重」。用 `console.log` 打印几组数据的结果，并尝试给 `bmi` 传一个字符串，观察类型检查的报错信息。
+
+<Answer>
+**参考答案：**
+
+```ts
+function bmi(weightKg: number, heightM: number): number {
+  return weightKg / (heightM * heightM);
+}
+
+function level(v: number): string {
+  if (v < 18.5) return "偏瘦";
+  if (v < 24) return "正常";
+  return "超重";
+}
+
+const samples: Array<[string, number, number]> = [
+  ["小李", 52, 1.7],
+  ["小王", 65, 1.75],
+  ["小张", 90, 1.72],
+];
+
+for (const [name, w, h] of samples) {
+  const v = bmi(w, h);
+  console.log(name + " BMI = " + v.toFixed(1) + " → " + level(v));
+}
+// 小李 BMI = 18.0 → 偏瘦
+// 小王 BMI = 21.2 → 正常
+// 小张 BMI = 30.4 → 超重
+```
+
+**传字符串会发生什么：**
+
+```ts
+bmi("52", 1.7);
+// 错误 TS2345: 类型“string”的参数不能赋给类型“number”的参数。
+```
+
+几点说明：
+
+- 报错发生在**编译期**，这行代码根本不会被执行——这正是静态类型的价值。对比纯 JS，`"52" / (1.7 * 1.7)` 会因为隐式转换算出 17.99，悄悄给出一个看似合理的错误结果。
+- 参数个数也会被检查，`bmi(52)` 会报「应有 2 个参数，但获得 1 个」。
+- 返回值注解 `: number` 不是必需的（TS 能推断出来），但显式写上能在函数体改错时立刻报错，充当一层自我校验。
+- 进阶思考：`level` 返回 `string` 意味着任何字符串都合法。改成字面量联合类型 `"偏瘦" | "正常" | "超重"` 会更精确，第 5 章会讲到这种写法。
+</Answer>
 </Callout>
 
 ## 小结

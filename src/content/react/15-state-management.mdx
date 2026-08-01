@@ -370,12 +370,100 @@ store 暴露的应该是**业务操作**，不是裸的 setter。这和第 10 �
 6. 正在编辑的评论草稿
 7. 其他在线协作者的光标位置
 8. 是否显示「已保存」提示
+
+<Answer>
+**参考答案：**
+
+按四类状态逐条归类：
+
+1. **文档内容** → **服务端状态**。它是异步拉取、会过期、多处共享、需要缓存和重新请求——交给 **TanStack Query / SWR**（第 16 章），不要自己塞进 store。
+2. **当前打开的文档 id** → **URL 状态**。可分享链接、刷新保持、可后退/前进——放进**路由参数**（如 `/doc/:id`）。
+3. **当前用户的昵称和头像** → **全局客户端状态**。跨页面共享、纯前端、变化极少——用 **Zustand / Context**（主题、登录态同类）。
+4. **侧边栏是否折叠** → **全局客户端状态**（虽是 UI，但影响全站布局、被多处读取）——用 **Context / Zustand**。注：如果只有「布局壳」自己关心，也可降级为局部 `useState`，但通常全局更省事。
+5. **评论面板的筛选条件（全部/未解决）** → **URL 状态**。用户常希望「把当前筛选后的视图分享给同事」，且刷新要保持——放**路由 query**（`?filter=open`）。
+6. **正在编辑的评论草稿** → **局部 UI 状态**。只影响那一个输入框、刷新丢失也无妨——**`useState`**。
+7. **其他在线协作者的光标位置** → **全局客户端状态（实时同步）**。多个组件要读，且是高频变化——用 **Zustand**（或专门的实时通道），**绝不能用 Context**（高频会拖垮所有消费者，第 9 章讲过）。
+8. **是否显示「已保存」提示** → **局部 UI 状态**。就是个临时 toast/开关，只跟当前编辑区相关——**`useState`** 或轻量 `useEffect` 定时隐藏。
+
+规律：先想着「能不能放 URL / 是不是服务端数据 / 是不是局部」做减法，最后剩下的跨页面纯前端数据才进全局库——本例最终真正进 store 的只有 3、4、7。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：用三种库实现同一个 store">
 实现一个通知队列：`notifications` 数组，支持 `push(msg, type)`、`dismiss(id)`、`clearAll()`，每条通知 3 秒后自动移除。
 
 分别用 Zustand、Redux Toolkit、Jotai 实现，对比代码量和「自动移除」这个副作用各自放在哪里最自然。
+
+<Answer>
+**参考答案：**
+
+**Zustand（最直白，副作用就写在 action 里）：**
+
+```ts
+import { create } from "zustand";
+
+type Notification = { id: string; msg: string; type: "info" | "error" };
+type Store = {
+  notifications: Notification[];
+  push: (msg: string, type?: Notification["type"]) => void;
+  dismiss: (id: string) => void;
+  clearAll: () => void;
+};
+
+export const useNotifications = create<Store>((set, get) => ({
+  notifications: [],
+  push: (msg, type = "info") => {
+    const id = crypto.randomUUID();
+    set((s) => ({ notifications: [...s.notifications, { id, msg, type }] }));
+    // 副作用：3 秒后自动移除，直接写在 action 内
+    setTimeout(() => get().dismiss(id), 3000);
+  },
+  dismiss: (id) => set((s) => ({ notifications: s.notifications.filter((n) => n.id !== id) })),
+  clearAll: () => set({ notifications: [] }),
+}));
+```
+
+**Redux Toolkit（副作用放 thunk，action 保持纯）：**
+
+```ts
+import { createSlice, configureStore, nanoid } from "@reduxjs/toolkit";
+
+const slice = createSlice({
+  name: "notifications",
+  initialState: { items: [] as Notification[] },
+  reducers: {
+    pushed: (s, a: PayloadAction<Notification>) => { s.items.push(a.payload); },
+    dismissed: (s, a: PayloadAction<string>) => { s.items = s.items.filter((n) => n.id !== a.payload); },
+    cleared: (s) => { s.items = []; },
+  },
+});
+// push 用 thunk 包一层：dispatch(pushed) 再 setTimeout(() => dispatch(dismissed))
+// 或者更推荐 listenerMiddleware 统一处理「pushed 后 3 秒 dismissed」
+```
+
+**Jotai（原子 + action 原子里 setTimeout）：**
+
+```ts
+import { atom, useSetAtom } from "jotai";
+const notificationsAtom = atom<Notification[]>([]);
+const pushAtom = atom(null, (get, set, payload: { msg: string; type?: Notification["type"] }) => {
+  const id = crypto.randomUUID();
+  set(notificationsAtom, [...get(notificationsAtom), { id, ...payload }]);
+  setTimeout(() => set(dismissAtom, id), 3000);   // 副作用在 action 原子内
+});
+const dismissAtom = atom(null, (get, set, id: string) =>
+  set(notificationsAtom, get(notificationsAtom).filter((n) => n.id !== id))
+);
+```
+
+**对比结论：**
+
+- **代码量**：Zustand ≈ Jotai（最少），Redux Toolkit 最多（要 slice / dispatch / 类型）。
+- **「自动移除」副作用放哪最自然**：
+  - Zustand / Jotai 里直接写在 `push` action 内部最自然——store 暴露的是业务操作，副作用跟着业务走；
+  - Redux Toolkit 强调 action 纯，所以副作用更适合放在 **thunk / listenerMiddleware**，或组件层用 `setTimeout` 调 `dispatch(dismissed)`。代价是多一层。
+- 三条共同原则：随机 id 在 action 内用 `crypto.randomUUID()` 生成（不写进纯 reducer）、不可变更新、移除以 id 过滤。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：修复选择器问题">
@@ -389,6 +477,35 @@ function Header() {
 }
 ```
 这段 Zustand 代码有性能问题。指出原因，给出两种修复方案，并说明各自适用什么情况。
+
+<Answer>
+**参考答案：**
+
+**原因：** 选择器 `(s) => ({ user: s.user, cartCount: s.cart.items.length, theme: s.theme })` **每次都返回一个新的对象字面量**。Zustand 默认用 `Object.is` 比较新旧选择器结果——新对象永远不等于旧对象，于是 `Header` 在**任何一次 store 更新时都会重渲染**，哪怕变的只是跟它无关的字段（甚至 store 根本没变）。这正是第 2.4 节说的「选择器返回新对象会导致每次都重渲染」陷阱。
+
+**方案一：拆成多次独立订阅**
+
+```ts
+const user = useStore((s) => s.user);
+const cartCount = useStore((s) => s.cart.items.length);
+const theme = useStore((s) => s.theme);
+```
+
+每个选择器返回一个基础值或稳定引用，只有对应字段变化时才重渲染对应那行。适用：**字段少、且各自独立**——最直观，零额外 API。
+
+**方案二：用 `useShallow` 做浅比较**
+
+```ts
+import { useShallow } from "zustand/react/shallow";
+const { user, cartCount, theme } = useStore(
+  useShallow((s) => ({ user: s.user, cartCount: s.cart.items.length, theme: s.theme }))
+);
+```
+
+`useShallow` 会逐字段浅比较返回的对象，只有某个字段真正变了才重渲染。适用：**字段较多、希望保留「一次解构」写法**，又不想逐个拆 useEffect/订阅——比方案一写法紧凑，语义也更明确（「我是要整组一起比较」）。
+
+**额外提醒：** 如果 `user` 本身是个对象且经常会整体被替换成新引用（即使内容相同），方案一里 `s.user` 仍会触发重渲染；这种场景可结合 `useShallow` 或只取 `s.user.name` 这类基础字段来进一步细化。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：做一次选型">
@@ -397,6 +514,25 @@ function Header() {
 1. 一个内部工具，5 个页面，主要是表格和表单，2 人开发
 2. 一个 SaaS 后台，40+ 页面，12 人团队，需要严格的代码规范和完整的问题排查能力
 3. 一个在线白板协作应用，大量高频局部更新（拖拽、缩放、多人光标）
+
+<Answer>
+**参考答案：**
+
+**① 内部工具（5 页面，2 人，表格表单为主）**
+- **选型：不引入库，或最多 `useState` + Context。** 状态量小、页面少、人员少，Zustand 都算重了。
+- **理由**：第 1.2 节「先做减法」后几乎剩不下需要全局库的状态；表格表单的局部状态用 `useState` 足矣。若确有少量跨组件共享，一个拆分的 Context（第 9 章）就够。
+- **风险**：别因为「以后可能变大」提前引入 Redux——等真需要再重构，成本很低（第 11 章）。
+
+**② SaaS 后台（40+ 页面，12 人团队，强规范 + 强排查需求）**
+- **选型：Redux Toolkit。**
+- **理由**：12 人协作最怕「每个人写法不一样」——RTK 的强约定让代码高度一致；40+ 页面的复杂状态，出问题时要靠 **Redux DevTools 的时间旅行、状态 diff、完整 action 历史** 来查「这个值怎么变成这样」；需要中间件做埋点/持久化时也现成。
+- **风险**：样板代码多、概念多（slice/reducer/thunk/middleware）、体积约 12KB；2 人以下小项目用它会「仪式感大于价值」。另外别用它管服务端数据（交给 TanStack Query），否则 80% 的 store 是重复的缓存逻辑。
+
+**③ 在线白板（高频局部更新：拖拽、缩放、多人光标）**
+- **选型：Jotai（原子化），或 Zustand + transient update。**
+- **理由**：白板是「上千个元素各自独立高频变化」的典型——每个图形是一个独立原子，只有订阅了「被拖动那个图形」的组件重渲染，细粒度天然契合。派生（如「选中元素的总面积」）用派生原子自动追踪依赖。多人光标也是高频全局状态，用 Zustand 做实时通道、配 `useSyncExternalStore` 绕过 React 渲染也可。
+- **风险**：状态分散在大量 atom 里，大型项目里「这个原子在哪定义、谁在改」可能不好追踪；调试工具比 Redux 弱。另一种稳妥选是 **Zustand**——无 Provider、可在 React 外读写（光标同步的 WebSocket 回调里直接 `setState`），对高频场景用 `subscribe` 做瞬态更新避免整树重渲染。
+</Answer>
 </Callout>
 
 ## 小结

@@ -206,4 +206,74 @@ seq 4 | xargs -n 2 echo pair:`}
 2. 解释 `cmd 2>&1 > f` 和 `cmd > f 2>&1` 的区别，并用 `ls okdir /nope` 在沙箱验证两者行为。
 3. 造一个 20 行、有重复的单词列表，用管道统计每个单词出现次数并按频次倒序输出前 5。
 4. 用 find + xargs 实现：找出当前目录树里所有 .sh 文件并统一加上可执行权限；思考如果文件名带空格，命令要怎么改。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：报错与结果分流**
+
+```bash
+mkdir -p /tmp/ok 2>/dev/null; mkdir -p okdir
+
+# 只把报错存入 err.txt（stdout 留在屏幕）
+ls okdir /nonexist 2> err.txt
+
+# stdout 和 stderr 存入同一个 all.txt
+ls okdir /nonexist > all.txt 2>&1
+# 注意顺序：先 > 再 2>&1，让 stderr 跟随 stdout 一起去文件
+
+# 全部丢弃不显示
+ls okdir /nonexist > /dev/null 2>&1
+# 或简写：ls okdir /nonexist &> /dev/null
+```
+
+**第 2 题：两个顺序的区别**
+
+```bash
+# cmd 2>&1 > f：错误写法
+ls okdir /nope 2>&1 > only-stdout.log
+# 2>&1 执行时 fd 1 还指向屏幕，stderr 跟随"当时的 1"去了屏幕
+# 之后 > only-stdout.log 才让 1 指向文件
+# → 报错出现在屏幕上，文件里只有正常输出
+
+# cmd > f 2>&1：正确写法
+ls okdir /nope > all.log 2>&1
+# 先让 1 指向文件，再让 2 跟随 1
+# → stdout 和 stderr 都进了 all.log，屏幕上什么都没有
+```
+
+验证方法：执行后 `cat all.log`（应同时含目录列表和报错）与 `cat only-stdout.log`（应只有目录列表），再观察执行时屏幕上有无报错。口诀：**重定向按从左到右的顺序生效，"先指向，后跟随"**。
+
+**第 3 题：单词频次统计**
+
+```bash
+# 造 20 行有重复的单词
+printf 'apple\nbanana\napple\ncherry\napple\nbanana\ndate\ncherry\napple\nelder\nbanana\napple\nfig\ngrape\nbanana\nfig\napple\ngrape\nbanana\ncherry\n' > words.txt
+
+sort words.txt | uniq -c | sort -rn | head -n 5
+# 输出示例：
+#   6 apple
+#   5 banana
+#   3 cherry
+#   2 fig
+#   2 grape
+```
+
+流程：`sort` 让相同单词相邻（`uniq` 只合并相邻重复行）→ `uniq -c` 计数 → `sort -rn` 按次数数值倒序 → `head -n 5` 取前 5。
+
+**第 4 题：find + xargs 加执行权限**
+
+```bash
+# 普通写法
+find . -name '*.sh' | xargs chmod +x
+
+# 更稳的写法：-print0 + xargs -0（文件名含空格、换行也不出错）
+find . -name '*.sh' -print0 | xargs -0 chmod +x
+
+# 验证
+find . -name '*.sh' -exec ls -l {} +
+```
+
+如果文件名带空格，`xargs` 默认按空白切分会把一个名字拆成两个参数，导致 chmod 处理错误甚至报错。解决办法就是用零字节分隔协议：`find ... -print0` 用 NUL 字符分隔每个路径，`xargs -0` 按 NUL 切分，空格、换行都不再是陷阱。
+</Answer>
 </Callout>

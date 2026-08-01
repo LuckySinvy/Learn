@@ -505,6 +505,118 @@ SELECT user_id, count() AS c FROM events GROUP BY user_id ORDER BY c DESC LIMIT 
 3. 用 `countIf` 一次性算出每个国家的 view / click / purchase 三个数量，对比写三条独立 SQL 的总耗时。
 4. 用 `argMax(page, event_time)` 找出每个用户的最后访问页面，再用 `topK(10)` 找出最常见的「最后访问页面」——这是分析流失点的常用方法。
 5. 用 `uniqIfState` 建一个漏斗物化视图，然后用 `uniqMerge` 查出各步骤转化率。
+
+<Answer>
+**参考答案：**
+
+1. 四种 uniq 对比：
+
+```sql
+SELECT
+    uniqExact(user_id)     AS exact,
+    uniq(user_id)          AS u,
+    uniqCombined(user_id)  AS combined,
+    uniqHLL12(user_id)     AS hll
+FROM events;
+```
+
+以 `uniqExact` 为基准（100% 精确），误差率 = `|近似值 - 精确值| / 精确值`。按本章实测的量级，`uniq` 误差约 0.3%、`uniqCombined` 约 0.2%、`uniqHLL12` 约 1.5%，而速度/内存差距巨大（从 18 秒降到 1 秒级）。结论：日常报表用 `uniqCombined`，超大规模才考虑 `uniqHLL12`。
+
+2. groupBitmap 精确 UV 与内存对比：
+
+```sql
+SELECT country, groupBitmap(toUInt32(user_id)) AS exact_uv
+FROM events GROUP BY country;
+```
+
+用 `system.query_log` 对比内存：
+
+```sql
+SELECT query, formatReadableSize(memory_usage) AS mem, query_duration_ms
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND query LIKE '%uniqExact%' OR query LIKE '%groupBitmap%'
+ORDER BY event_time DESC LIMIT 4;
+```
+
+要求是 `user_id` 是连续整数（用 `toUInt32` 转成位图索引）。RoaringBitmap 对稠密整数集合压缩极高，通常比 `uniqExact` 的哈希表省一个数量级内存，且完全精确。若 `user_id` 是随机大整数，位图稀疏、收益下降，仍用 `uniqExact`。
+
+3. countIf 一次扫出多条件：
+
+```sql
+SELECT
+    country,
+    countIf(event_type = 'view')     AS views,
+    countIf(event_type = 'click')    AS clicks,
+    countIf(event_type = 'purchase') AS purchases
+FROM events
+GROUP BY country;
+```
+
+对比三条独立 `WHERE event_type = ...` 的 SQL：`countIf` 只扫一遍数据就能算出所有分支，耗时约为三次独立查询总耗时的三分之一（甚至更低，因为少了重复读列）。
+
+4. 最常见的「最后访问页面」：
+
+```sql
+SELECT
+    user_id,
+    argMax(page, event_time) AS last_page
+FROM events
+GROUP BY user_id
+ORDER BY last_page ASC;   -- 需要先物化结果才能接 topK，所以用子查询：
+
+-- 正确的两段式写法：
+SELECT topK(10)(last_page) AS top_last_pages
+FROM (
+    SELECT argMax(page, event_time) AS last_page
+    FROM events
+    GROUP BY user_id
+);
+```
+
+`topK(10)` 返回一个数组，即最常见的 10 个「最后访问页面」。如果大量用户最后停留的页面集中（比如都在 `/checkout`），说明那里很可能存在流失点。
+
+5. `uniqIfState` 漏斗 MV：
+
+```sql
+-- 聚合表
+CREATE TABLE agg_funnel
+(
+    day       Date,
+    country   LowCardinality(String),
+    viewers   AggregateFunction(uniq, UInt64),
+    clickers  AggregateFunction(uniq, UInt64),
+    buyers    AggregateFunction(uniq, UInt64)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, country);
+
+-- MV：写入 events 时按天计算各步骤去重用户的状态
+CREATE MATERIALIZED VIEW mv_funnel TO agg_funnel AS
+SELECT
+    toDate(event_time)                            AS day,
+    country,
+    uniqIfState(user_id, event_type = 'view')     AS viewers,
+    uniqIfState(user_id, event_type = 'click')    AS clickers,
+    uniqIfState(user_id, event_type = 'purchase') AS buyers
+FROM events
+GROUP BY day, country;
+
+-- 查询转化率
+SELECT
+    day,
+    uniqMerge(viewers)  AS viewers,
+    uniqMerge(clickers) AS clickers,
+    uniqMerge(buyers)   AS buyers,
+    round(uniqMerge(clickers) / uniqMerge(viewers) * 100, 2) AS click_rate,
+    round(uniqMerge(buyers)  / uniqMerge(clickers) * 100, 2) AS buy_rate
+FROM agg_funnel
+GROUP BY day ORDER BY day;
+```
+
+`uniqIfState` = uniq + If + State：只对满足条件的行计算去重状态。跨批 merge 时状态自动合并，最终 `uniqMerge` 给出的是「整体去重」后的各步骤人数，转化率因此正确。
+</Answer>
 </Callout>
 
 ## 小结

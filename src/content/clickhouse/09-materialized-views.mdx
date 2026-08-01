@@ -474,6 +474,111 @@ AS SELECT toDate(event_time) AS day, count() AS pv FROM events GROUP BY day;
 3. 建一张 `Null` 引擎的入口表，挂两个 MV（一个存明细一个存聚合），验证入口表 `SELECT count()` 永远是 0 但两个目标表都有数据。
 4. 建 MV 后，对源表执行 `ALTER TABLE events DELETE WHERE country = 'IN'`，然后对比明细表和聚合表的 IN 国家数据——验证 MV 不感知删除。
 5. 查询 `system.query_views_log`，找出你的 MV 里 `view_duration_ms` 最大的那个。
+
+<Answer>
+**参考答案：**
+
+1. TO 表写法建按天聚合 MV：
+
+```sql
+-- 目标表
+CREATE TABLE demo.events_agg
+(
+    day      Date,
+    pv       SimpleAggregateFunction(sum, UInt64),
+    uv       AggregateFunction(uniq, UInt64),
+    total_ms SimpleAggregateFunction(sum, UInt64)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY day;
+
+-- MV：每次向 events INSERT 时，对这"一批"数据按天聚合并追加进 events_agg
+CREATE MATERIALIZED VIEW demo.events_agg_mv TO demo.events_agg AS
+SELECT
+    toDate(event_time) AS day,
+    count()            AS pv,
+    uniqState(user_id) AS uv,
+    sum(duration_ms)   AS total_ms
+FROM demo.events
+GROUP BY day;
+```
+
+插入一批新数据后立刻查目标表，行已同步出现（MV 与源 INSERT 在同一事务里同步完成）：
+
+```sql
+INSERT INTO demo.events SELECT ... FROM numbers(100000);
+SELECT day, sum(pv) AS pv, uniqMerge(uv) AS uv, sum(total_ms) AS total_ms
+FROM demo.events_agg GROUP BY day ORDER BY day DESC LIMIT 3;
+```
+
+2. 别名不对齐的「静默出错」：
+
+```sql
+-- 错误示范：目标表列名是 pv，MV 里却写 AS cnt
+CREATE MATERIALIZED VIEW demo.events_agg_bad_mv TO demo.events_agg AS
+SELECT toDate(event_time) AS day, count() AS cnt, uniqState(user_id) AS uv, sum(duration_ms) AS total_ms
+FROM demo.events GROUP BY day;
+
+-- 插入数据后查目标表：pv 列全是 0（默认值），uv/total_ms 正常
+```
+
+MV 的输出列**按名称**匹配目标表（22.x 起），名字对不上就静默填默认值，不报任何错。报表会悄悄拿到全 0 的 PV——这就是为什么「写完 MV 必须插测试数据验证每一列」。
+
+3. Null 引擎入口表 + 扇出：
+
+```sql
+CREATE TABLE events_ingest (...) ENGINE = Null;   -- 与 events 同结构
+
+CREATE MATERIALIZED VIEW mv_keep TO events AS
+SELECT * FROM events_ingest WHERE event_type IN ('purchase', 'signup');
+
+CREATE MATERIALIZED VIEW mv_agg TO events_agg AS
+SELECT toDate(event_time) AS day, count() AS pv, uniqState(user_id) AS uv, sum(duration_ms) AS total_ms
+FROM events_ingest GROUP BY day;
+
+INSERT INTO events_ingest SELECT ...;
+
+SELECT count() FROM events_ingest;   -- 永远是 0（数据被丢弃）
+SELECT count() FROM events;          -- 有部分明细（只含 purchase/signup）
+SELECT count() FROM events_agg;      -- 有聚合行
+```
+
+Null 表不落盘，但每个 INSERT 都会触发挂在它上面的所有 MV，是「不存明细、只要聚合/过滤结果」的标准架构。
+
+4. MV 不感知删除：
+
+```sql
+-- 先确认明细和聚合表里都有 IN 的数据
+SELECT count() FROM demo.events     WHERE country = 'IN';
+SELECT sum(pv) FROM demo.events_agg WHERE ...;   -- 聚合表没有 country 维度时按天看总量
+
+-- 删除源表 IN 数据（mutation）
+ALTER TABLE demo.events DELETE WHERE country = 'IN';
+
+-- 再看：明细表 IN 行数变成 0，但聚合表里由 IN 贡献的计数不会减少
+```
+
+物化视图是「INSERT 触发器」，源表的 UPDATE / DELETE / TTL 删除都不会触发它，聚合表会残留已删除数据的计数。需要严格一致时只能定期从明细重算对应分区（`REPLACE PARTITION`，见本章 5.1）。
+
+5. 找最耗时的 MV：
+
+```sql
+SELECT
+    view_name,
+    event_time,
+    view_duration_ms,
+    read_rows,
+    written_rows,
+    exception
+FROM system.query_views_log
+WHERE event_date = today()
+ORDER BY view_duration_ms DESC
+LIMIT 5;
+```
+
+第一条就是 `view_duration_ms` 最大的 MV。如果它明显拖慢 INSERT，考虑简化 SELECT、减少维度或拆成多个 MV 并行。若该表没数据，先在 `config.d/` 里启用 `query_views_log`（本章第 6 节）。
+</Answer>
 </Callout>
 
 ## 小结

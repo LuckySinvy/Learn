@@ -85,6 +85,99 @@ console.log(answer);
 
 <Callout type="exercise" title="练习">
 把上面的 `question` 抽成命令行参数（`process.argv`），做一个能在终端里反复提问的小脚本。
+
+<Answer>
+**参考答案：**
+
+**版本一：一次性提问（读 `process.argv`）**
+
+`process.argv` 的前两项固定是 Node 可执行文件路径和脚本路径，真正的用户参数从下标 2 开始。用 `slice(2).join(" ")` 可以把「不加引号的多个词」也拼回一句话。
+
+```ts
+// ask.ts
+import "dotenv/config";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+const question = process.argv.slice(2).join(" ").trim();
+
+if (!question) {
+  console.error("用法: tsx ask.ts <你的问题>");
+  process.exit(1);
+}
+
+const chain = ChatPromptTemplate.fromTemplate(
+  "你是一个乐于助人的助手。请回答：{question}"
+)
+  .pipe(new ChatOpenAI({ model: "gpt-4o-mini" }))
+  .pipe(new StringOutputParser());
+
+console.log(await chain.invoke({ question }));
+```
+
+运行：
+
+```bash
+npx tsx ask.ts 什么是 RAG？
+```
+
+**版本二：可反复提问的交互式 REPL（推荐）**
+
+用 Node 内置的 `node:readline/promises`，不需要装任何额外依赖。注意**链只构建一次**放在循环外，循环里只 `invoke`——每轮都 `new ChatOpenAI()` 是常见的浪费。
+
+```ts
+// chat.ts
+import "dotenv/config";
+import * as readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+const chain = ChatPromptTemplate.fromTemplate(
+  "你是一个乐于助人的助手。请回答：{question}"
+)
+  .pipe(new ChatOpenAI({ model: "gpt-4o-mini" }))
+  .pipe(new StringOutputParser());
+
+const rl = readline.createInterface({ input, output });
+
+console.log("输入问题开始提问，输入 exit 或按 Ctrl+C 退出。\n");
+
+while (true) {
+  const question = (await rl.question("你 > ")).trim();
+
+  if (!question) continue;                       // 空行跳过
+  if (question === "exit" || question === "quit") break;
+
+  try {
+    // 流式输出，体验更好（第 16 章详解）
+    process.stdout.write("AI > ");
+    for await (const chunk of await chain.stream({ question })) {
+      process.stdout.write(chunk);
+    }
+    console.log("\n");
+  } catch (err) {
+    console.error("请求失败：", (err as Error).message, "\n");
+  }
+}
+
+rl.close();
+console.log("再见！");
+```
+
+**几个容易踩的坑：**
+
+| 坑 | 说明 |
+|---|---|
+| 忘了 `import "dotenv/config"` | 必须放在**所有其他 import 之前**，否则 `ChatOpenAI` 构造时环境变量还没加载，报 401 |
+| 在循环里重建模型实例 | 每次 `new ChatOpenAI()` 都会重建 HTTP 客户端，白白增加开销，应提到循环外 |
+| 没做 try/catch | 网络抖动或限流会让整个脚本崩掉，交互式工具应该捕获后继续下一轮 |
+| 参数带空格 | `process.argv[2]` 只取第一个词，用 `slice(2).join(" ")` 才能拿到完整句子 |
+
+**进阶**：这个脚本目前每轮都是独立的，模型不记得上一句。想让它连贯对话，需要 Memory——第 13 章会用 `RunnableWithMessageHistory` 补上这块。
+</Answer>
 </Callout>
 
 ## 小结

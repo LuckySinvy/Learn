@@ -186,4 +186,75 @@ sed 还有追加（a）、插入（i）、行内换行处理等更多命令，�
 2. 用 `seq 10` 生成 10 行数字，分别用 `sed -n '3,6p'` 和 `head -n 6 | tail -n 4` 取第 3~6 行，确认结果一致。
 3. 用 `sed -i.bak` 把某文件里所有 `http://` 改为 `https://`（用 `|` 做分隔符），再 diff 修改后文件与 .bak 备份查看变化。
 4. 挑战：`echo 'user=ada id=42'`，用 `sed -E` 加分组回引改写成 `id=42 user=ada`。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：一条 sed 删注释、删空行并替换 localhost**
+
+```bash
+cat > app.conf << 'EOF'
+# main config
+db_host = localhost
+port = 8080
+
+# cache
+cache_host = localhost
+EOF
+
+sed -e '/^#/d' -e '/^$/d' -e 's/localhost/127.0.0.1/' app.conf
+```
+
+三种写法等价（分号串联 / 多个 `-e`）：
+
+```bash
+sed '/^#/d; /^$/d; s/localhost/127.0.0.1/' app.conf
+sed -e '/^#/d' -e '/^$/d' -e 's/localhost/127.0.0.1/' app.conf
+```
+
+`/^#/d` 删注释行，`/^$/d` 删空行，`s/localhost/127.0.0.1/` 做替换，三个命令依次作用于每一行。
+
+**第 2 题：两种方式取第 3~6 行，结果一致**
+
+```bash
+seq 10
+sed -n '3,6p'        # 输出 3 4 5 6
+seq 10 | sed -n '3,6p'
+
+seq 10 | head -n 6 | tail -n 4   # 也是 3 4 5 6
+```
+
+两者结果一致。区别：`sed -n '3,6p'` 一步到位且语义直接；`head | tail` 需要心算区间（取第 A~B 行 = `head -n B | tail -n (B-A+1)`），sed 更省心。
+
+**第 3 题：`sed -i.bak` 批量替换 http 为 https**
+
+```bash
+printf 'site = http://example.com/api\ncdn = http://static.example.com\n' > app.conf
+
+sed -i.bak 's|http://|https://|g' app.conf
+# 用 | 做分隔符，避免转义 http:// 里的斜杠
+
+cat app.conf       # 两处都已变成 https://
+diff app.conf app.conf.bak
+# diff 显示 - http:// 行与 + https:// 行，其余无变化
+```
+
+`-i.bak` 会在修改前自动备份一份 `app.conf.bak`，`diff` 可对比确认只改了目标内容。
+
+**第 4 题：分组回引调换字段顺序**
+
+```bash
+echo 'user=ada id=42' | sed -E 's/(user=)([a-z]+) (id=)([0-9]+)/\3\4 \1\2/'
+# 输出：id=42 user=ada
+```
+
+思路：用两组括号分别捕获 `user=ada` 与 `id=42`，然后调换顺序输出。更简洁的写法是只捕获取值部分：
+
+```bash
+echo 'user=ada id=42' | sed -E 's/user=([a-z]+) id=([0-9]+)/id=\2 user=\1/'
+# 输出：id=42 user=ada
+```
+
+`\1` 引用第一个括号组 `ada`，`\2` 引用第二个括号组 `42`，替换文本把它们按目标顺序拼起来。
+</Answer>
 </Callout>

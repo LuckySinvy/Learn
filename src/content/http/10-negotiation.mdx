@@ -204,4 +204,73 @@ curl 收完全程约 1.5 秒，但**第一块 0.5 秒内就到了**——客户�
 2. 在 Playground 2 中增加一个 /logo.png 路由返回随机字节（模拟已压缩图片），对比它 gzip 前后的体积，验证"压不动"。
 3. 修改 Playground 3：把三块数据改成 SSE 格式（Content-Type: text/event-stream，每块形如 data: hello 加两个换行），观察输出。
 4. 排障题：某老旧客户端收到乱码，抓包发现响应是 gzip 的但请求没带 Accept-Encoding。缓存层的哪个头没配对？
+
+<Answer>
+**参考答案：**
+
+**1. 真正的 q 值解析**
+
+按 q 值从高到低排序，选第一个支持的语言：
+
+```python
+def pick(al, supported):
+    choices = []
+    for item in al.split(","):
+        parts = item.strip().split(";")
+        lang = parts[0].strip().lower()
+        q = 1.0
+        for p in parts[1:]:
+            if p.strip().startswith("q="):
+                q = float(p.strip()[2:])
+        choices.append((q, lang))
+    choices.sort(reverse=True)          # q 高者优先
+    for q, lang in choices:
+        base = lang.split("-")[0]
+        if base in supported:
+            return supported[base]
+    return supported.get("en")
+```
+
+测试 `Accept-Language: zh;q=0.3, ja;q=0.9`：ja 的 q=0.9 > zh 的 q=0.3，应选中日文输出 `こんにちは`。注意还要处理默认 q=1、带区域的 `zh-CN` 拆主语言、以及"一个都没匹配到"的兜底。
+
+**2. 已压缩图片压不动**
+
+给 Playground 2 加一个 `/logo.png` 路由，返回随机字节（模拟已压缩的 PNG）：
+
+```python
+import random, os
+PNG = os.urandom(50 * 1024)   # 50KB "已压缩" 二进制
+def do_GET(self):
+    ...
+    elif self.path == "/logo.png":
+        body = PNG
+        ctype = "image/png"
+```
+
+对比接受 gzip 前后的 `size_download`：几乎不变（甚至可能变大）。因为 PNG/JPEG/MP4 内容本身已经是压缩格式，再做 gzip 熵已耗尽，压不动；且白耗 CPU、多一层解压。结论：**只对文本类（HTML/JS/CSS/JSON/SVG）压缩，已压缩的二进制格式不要二次压缩**。
+
+**3. 改成 SSE 格式**
+
+把 Playground 3 的每一块改成 SSE 事件流：
+
+```python
+conn.sendall(b"HTTP/1.1 200 OK\r\n"
+             b"Content-Type: text/event-stream\r\n"
+             b"Cache-Control: no-cache\r\n"
+             b"Transfer-Encoding: chunked\r\n\r\n")
+for i in range(1, 4):
+    piece = ("data: hello 第 " + str(i) + " 块\n\n").encode()
+    conn.sendall(format(len(piece), "x").encode() + b"\r\n" + piece + b"\r\n")
+    time.sleep(0.5)
+conn.sendall(b"0\r\n\r\n")
+```
+
+`curl -sN` 会逐块打印 `data: hello 第 N 块`，中间空一行是 SSE 的消息分隔符（事件 = 多行 `data:` + 一个空行）。这就是 ChatGPT 式打字机效果的底层：**chunked 流式传输 + text/event-stream 语义**，每一帧推一段 `data:` 行，浏览器按事件逐步渲染。
+
+**4. 缓存层没配 Vary**
+
+症状：客户端没声明 `Accept-Encoding: gzip`，却收到 gzip 压缩的响应 → 乱码。根因：**共享缓存（CDN/代理）漏配 `Vary: Accept-Encoding`**。
+
+过程还原：某个声明了 gzip 的客户端先请求，CDN 把 gzip 版本存进缓存；老旧客户端不带 Accept-Encoding 再来，CDN 命中缓存直接吐出 gzip 版本——但它不会解压，于是乱码。正确做法：响应头必须带 `Vary: Accept-Encoding`，让缓存按"URL + Accept-Encoding"区分存储，不同客户端各拿各的版本（第 10 章核心：**凡是参与协商的请求头都要写进 Vary**）。
+</Answer>
 </Callout>

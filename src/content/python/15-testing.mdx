@@ -262,6 +262,35 @@ unittest.main(argv=[''], exit=False, verbosity=2)`}
 - `below`：`clamp(-3, 0, 10) == 0`
 - `above`：`clamp(99, 0, 10) == 10`
 - `equal`：`clamp(5, 5, 5) == 5`
+
+<Answer>
+
+**参考答案：**
+
+```python
+class TestClamp(unittest.TestCase):
+    def test_inside(self):
+        self.assertEqual(clamp(5, 0, 10), 5)
+
+    def test_below(self):
+        self.assertEqual(clamp(-3, 0, 10), 0)
+
+    def test_above(self):
+        self.assertEqual(clamp(99, 0, 10), 10)
+
+    def test_equal(self):
+        self.assertEqual(clamp(5, 5, 5), 5)
+```
+
+四个用例分别覆盖 `clamp` 的四个分支：
+
+- `inside`：`5` 在 `[0, 10]` 区间内，原样返回 `5`。
+- `below`：`-3 < lo`，返回下界 `0`。
+- `above`：`99 > hi`，返回上界 `10`。
+- `equal`：`lo == hi == 5`，区间退化成单点，返回 `5`。
+
+跑完 4 个测试全部 `ok`，与题目的期望输出一致。
+</Answer>
 </Callout>
 
 ## 小结

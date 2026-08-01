@@ -326,6 +326,118 @@ MinKey  <  Null  <  数字(Int/Long/Double/Decimal)  <  String
 
 <Callout type="exercise" title="练习">
 一、插入一个 `NumberLong("9007199254740993")` 和一个字面量 `9007199254740993`，用 `$type` 和精确查询验证后者已经丢精度；二、用 Double 存 `0.1` 和 `0.2`，用聚合把它们相加，观察结果；再换成 Decimal128 重做一遍；三、写一个聚合，统计 `posts` 集合中 `createdAt` 字段的类型分布，找出被存成字符串的脏数据；四、设计一个「桶模式」的评论存储方案：每桶 200 条，写出插入时的 upsert 语句（提示：用 `$inc` 维护 count，用 filter 限制 `count` 小于 200）。
+
+<Answer>
+**参考答案：**
+
+**一、验证 Double 丢精度**
+
+```js
+db.t.insertMany([
+  { tag: "long",  c: NumberLong("9007199254740993") },
+  { tag: "double", c: 9007199254740993 }
+])
+
+// 看实际存了什么
+db.t.find({}, { tag: 1, c: 1 })
+// double 那一条已经变成 9007199254740992
+```
+
+```js
+// 用 $type 验证类型不同
+db.t.find({ c: { $type: "long" } })     // 只有 tag: "long" 那条
+db.t.find({ c: { $type: "double" } })   // 只有 tag: "double" 那条
+
+// 用精确查询验证值已变
+db.t.find({ c: 9007199254740993 })      // 查不到！字面量在 JS 侧就已解析成 9007199254740992
+db.t.find({ c: NumberLong("9007199254740993") })  // 能查到 tag: "long" 那条
+```
+
+结论：`9007199254740993` 超过 Double 的 53 位尾数，写入前在 mongosh（JS）侧就被舍入成 `9007199254740992` 了，用 `$type` 能看到它仍是 double、用精确值查询找不到原值。大整数（雪花 ID、订单号）必须用 `NumberLong("...")` 字符串构造。
+
+**二、Double 相加 vs Decimal128**
+
+Double 版本：
+
+```js
+db.t.insertMany([ { tag: "double", a: 0.1, b: 0.2 } ])
+db.t.aggregate([ { $project: { tag: 1, total: { $add: ["$a", "$b"] } } } ])
+// 结果 total: 0.30000000000000004 —— 二进制浮点误差
+```
+
+Decimal128 版本：
+
+```js
+db.t.insertMany([
+  { tag: "decimal", a: NumberDecimal("0.1"), b: NumberDecimal("0.2") }
+])
+db.t.aggregate([ { $project: { tag: 1, total: { $add: ["$a", "$b"] } } } ])
+// 结果 total: NumberDecimal("0.3") —— 精确
+```
+
+金额、税率、汇率这类对精确性有要求的字段一律 Decimal128；度量值、评分、坐标用 Double 即可（性能更快）。
+
+**三、统计 `createdAt` 的类型分布**
+
+```js
+db.posts.aggregate([
+  { $group: { _id: { $type: "$createdAt" }, count: { $sum: 1 } } }
+])
+```
+
+预期看到类似：
+
+```json
+[ { "_id": "date", "count": 49980 },
+  { "_id": "string", "count": 20 } ]
+```
+
+其中 `string` 那一组就是被存成字符串的脏数据。定位它们：
+
+```js
+db.posts.find({ createdAt: { $type: "string" } }).limit(10)
+```
+
+修复（管道更新，把字符串转回 Date）：
+
+```js
+db.posts.updateMany(
+  { createdAt: { $type: "string" } },
+  [ { $set: { createdAt: { $toDate: "$createdAt" } } } ]
+)
+```
+
+**四、桶模式评论存储的 upsert 方案**
+
+每桶 200 条，评论 `comments_buckets` 集合，一个文档是一个桶：
+
+```js
+// 插入一条评论：把评论加进「未满」的桶
+db.comments_buckets.updateOne(
+  { postId: 100, count: { $lt: 200 } },      // filter：锁定未满的桶
+  {
+    $push: { comments: { author: "alice", body: "好文", createdAt: new Date() } },
+    $inc: { count: 1 }
+  },
+  { upsert: true }
+)
+```
+
+执行逻辑拆解：
+
+- **有未满的桶**（count < 200）：命中 filter，`$push` 追加评论、`$inc` 把 count 加一，不会新建桶。
+- **没有未满的桶**（或桶不存在）：upsert 触发插入，新桶就是 `{ postId: 100, count: 1, comments: [第一条评论] }`。
+
+配套索引：`db.comments_buckets.createIndex({ postId: 1, count: 1 })`。
+
+读取时按桶顺序取：
+
+```js
+db.comments_buckets.find({ postId: 100 }).sort({ _id: 1 })
+```
+
+注意这个写法在**高并发**下可能多个请求同时命中「未满」状态、各插各的桶，因此对并发要求严格的场景建议以「确定性桶号」代替「count < 200 探测」：先算出桶号 `bucket = Math.floor(n / 200)`，再 `updateOne({ postId, bucket }, { $push: ..., $inc: ... }, { upsert: true })`，配合 `{ postId: 1, bucket: 1 }` 唯一索引更稳。第 12 章的桶模式会再展开。
+</Answer>
 </Callout>
 
 ## 小结

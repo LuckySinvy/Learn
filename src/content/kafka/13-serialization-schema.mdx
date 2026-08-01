@@ -178,4 +178,81 @@ curl -X PUT -H "Content-Type: application/vnd.schemaregistry.v1+json" \
 1. 起一个 Schema Registry（Docker 即可），用 Avro 生产消费一轮，然后给 schema 加一个带默认值的新字段，验证旧消费者仍能正常读。
 2. 故意注册一个不兼容的 schema（改字段类型），观察生产端收到的 409 错误。
 3. 对比同一条订单消息用 JSON 与 Avro 序列化后的字节大小，写 1 万条对比总量。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：Avro 往返 + 向后兼容演进**
+
+起 Registry 与集群：
+
+```bash
+# Schema Registry（单机 demo）
+docker run -d --name schema-registry -p 8081:8081 \
+  -e SCHEMA_REGISTRY_KAFKABOOTSTRAP_SERVERS=PLAINTEXT://host.docker.internal:9092 \
+  -e SCHEMA_REGISTRY_HOST_NAME=schema-registry \
+  confluentinc/cp-schema-registry:latest
+```
+
+用 `kafka-avro-console-producer` / `kafka-avro-console-consumer` 先跑通一轮（它们会自动注册 schema 到 Registry 并拿到 schema ID）。
+
+之后给 Avro schema 追加一个带默认值的字段，例如从：
+
+```json
+{"type":"record","name":"Order","fields":[
+  {"name":"id","type":"string"},
+  {"name":"amount","type":"double"}
+]}
+```
+
+演进成：
+
+```json
+{"type":"record","name":"Order","fields":[
+  {"name":"id","type":"string"},
+  {"name":"amount","type":"double"},
+  {"name":"note","type":["null","string"],"default":null}
+]}
+```
+
+因为新字段有 `default`，且 Registry 默认 `BACKWARD` 兼容，注册会成功。此时：
+- 新 Producer 用新 schema 写入（消息里带新字段）。
+- 旧 Consumer 仍用旧 schema 读取——Avro 按字段名（而非位置）匹配，未知的 `note` 字段被忽略，缺失字段自动取默认值。所以旧消费者照常工作，无需改代码、无需重启。
+
+**第 2 题：故意制造不兼容，观察 409**
+
+把字段类型从 `double` 改成 `string`（破坏性变更，旧数据无法反序列化）：
+
+```json
+{"name":"amount","type":"string"}
+```
+
+用新 schema 去注册（`POST /subjects/order-value/versions`）时，Registry 比对最新版本，发现旧消息的 `double` 无法按 `string` 解析，违背 `BACKWARD` 兼容，返回：
+
+```
+HTTP 409 Conflict
+{"error_code":409,"message":"Schema being registered is incompatible with an earlier schema..."}
+```
+
+注意：前提是兼容级别不是 `NONE`。生产端真正写消息时若用的是不兼容 schema，序列化阶段就会拿到这个 409（通过 `auto.register.schemas=true` 触发注册）。
+
+**第 3 题：JSON vs Avro 体积对比**
+
+同一条订单（字段 `id`、`amount`、`note`）写 1 万条：
+
+- **JSON**：每条都重复完整字段名（`"id"`、`"amount"`、`"note"` 这些 key 字符串）和结构字符，1 万条 ≈ 字段名被重复 1 万次。
+- **Avro**：schema 只在 Registry 里存一次，消息 wire format = 1 字节 magic + 4 字节 schema ID + 紧凑二进制（数字用变长整数、字符串只存长度+内容，无字段名）。
+
+实操对比命令（用 console producer 各写 1 万条后看 topic/文件大小，或直接用一小段 Java/Python 程序序列化计时与字节数）：
+
+```bash
+# Avro：看生成的 topic 占用
+kafka-run-class kafka.tools.GetOffsetShell --topic orders-avro --bootstrap-server localhost:9092
+# 或用 du 看 log 段文件
+du -sh /tmp/kafka-logs/orders-avro-*
+du -sh /tmp/kafka-logs/orders-json-*
+```
+
+结论：单条 Avro 通常只有 JSON 的 30%–50%，字段越多、key 越长，Avro 优势越大；1 万条累计差距可达数 MB 级别。代价是消息不可直接肉眼读，必须配 Registry + 对应反序列化器。
+</Answer>
 </Callout>

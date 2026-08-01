@@ -229,4 +229,66 @@ SQL 与索引（收益最大、成本最低）→ 缓存与归档 → 读写分�
 1. 打开慢查询日志（long_query_time=0.1），跑几条本课程里的「反面教材」SQL，用 pt-query-digest 或 performance_schema 找出 Top 3 并逐条优化。
 2. 查询你实例的 buffer pool 命中率，并解释 read_requests 与 reads 两个指标的关系。
 3. 假设 orders 表 5 年后达到 20 亿行：写出你的演进路线（归档策略、分片键选择、需要的异构索引表），并说明每一步解决什么瓶颈。
+
+<Answer>
+
+**参考答案：**
+
+**1. 慢查询日志 + Top3 优化（以本课反面教材为例）**
+
+```sql
+-- 开启慢日志（运行时）
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 0.1;
+SET GLOBAL log_queries_not_using_indexes = ON;
+```
+
+跑几条典型反面 SQL，再用 `pt-query-digest` 或 `performance_schema` 聚合：
+
+```sql
+SELECT DIGEST_TEXT, COUNT_STAR,
+       ROUND(SUM_TIMER_WAIT/1e12,2) AS total_sec,
+       SUM_ROWS_EXAMINED
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY SUM_TIMER_WAIT DESC LIMIT 10;
+```
+
+常见 Top 3 与改法：
+
+| 反面 SQL | 问题 | 优化 |
+|---|---|---|
+| `WHERE DATE(created_at) = '2026-02-01'` | 函数包列，索引失效全表扫 | 改左闭右开 `created_at >= '2026-02-01' AND created_at < '2026-02-02'`，建 `(created_at)` |
+| `WHERE user_id = 1 AND status IN(1,2,3) ORDER BY created_at DESC LIMIT 20`（无索引） | `type=ALL` + filesort | 建 `(user_id, created_at)` 联合索引，条件+排序一体 |
+| `LIKE '%手机%'` 或 `OR` 两侧无索引 | 全表扫 | 前缀匹配/`(category_id, status, price)` 联合索引；OR 拆 `UNION ALL` |
+
+原则：**先按 `SUM_TIMER_WAIT`（总耗时）排，优先修"频繁×耗时"的大头，而非单次最慢那条**。每条优化前后都用 `EXPLAIN` 对比 `type / rows / Extra`。
+
+**2. Buffer Pool 命中率**
+
+```sql
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- Innodb_buffer_pool_read_requests  (逻辑读，来自内存)
+-- Innodb_buffer_pool_reads          (物理读，真去磁盘)
+```
+
+命中率 ≈ `1 - reads / read_requests`。例：若 `read_requests = 10,000,000`、`reads = 30,000`，命中率 ≈ 99.7%，属健康。
+
+- `read_requests`：InnoDB 发出的**逻辑读**次数（希望绝大多数命中内存）；
+- `reads`：其中真正落到**磁盘**的次数（应远低于 1%）。
+
+`reads / read_requests` 比值越高，说明热点数据没在内存里、频繁缺页触发磁盘 IO——此时应调大 `innodb_buffer_pool_size`（专用机取物理内存 50%~70%）。
+
+**3. 20 亿行 orders 的演进路线（按金字塔顺序，由监控驱动）**
+
+| 阶段 | 做法 | 解决什么瓶颈 |
+|---|---|---|
+| ① 归档 | 把 2 年前的订单按年/月 `INSERT INTO` 历史库后 `DELETE`/`DROP PARTITION`，主表保留近 1~2 年 | 单表容量、备份/恢复时长、热数据变小，绝大多数查询变快 |
+| ② 读写分离 | 加从库承接"我的订单列表""商品搜索"等读，关键读走主库 | 读吞吐瓶颈，主库减负 |
+| ③ 分区/汇总 | 历史查询走按月分区；运营日报落**汇总表**（每天定时聚合一次） | 实时聚合的大 GROUP BY 慢、临时表落盘 |
+| ④ 水平分片 | 按 `user_id` 分片（如 64 库×N 表）；"查用户订单"单库命中；"按商家查订单"需再加一份按 `seller_id` 分片的**异构索引表**（binlog 同步写入） | 写 QPS 与单实例容量上限；跨片 JOIN 改应用层聚合、跨片事务改最终一致、全局 ID 用雪花/号段 |
+| ⑤ 分布式库 | 若分片治理成本过高，迁移 TiDB/OceanBase 免去手动分片 | 分片复杂度爆炸 |
+
+每一步都应由监控数据（慢日志、行数增长、QPS、磁盘）驱动决策，而不是提前过度设计——表才几千万行就分库分表是典型的过度工程。
+
+</Answer>
 </Callout>

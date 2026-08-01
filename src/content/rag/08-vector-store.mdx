@@ -101,6 +101,134 @@ IndexHNSW   图索引，快且 recall 高，占内存，生产常用
 
 <Callout type="exercise" title="练习">
 给你的向量库加上 `category` 和 `updated_at` 两个元数据字段，写一条「只检索技术类且半年内更新」的过滤查询，验证结果确实被过滤了。
+
+<Answer>
+**参考答案：**
+
+**第一步：入库时写入元数据**
+
+```python
+from datetime import datetime, timedelta
+from qdrant_client import QdrantClient, models
+
+client = QdrantClient(url="http://localhost:6333")
+client.recreate_collection(
+    collection_name="kb",
+    vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
+)
+
+points = []
+for i, (vec, text, meta) in enumerate(zip(vecs, texts, metas)):
+    points.append(models.PointStruct(
+        id=i,
+        vector=vec.tolist(),
+        payload={
+            "text": text,
+            "source": meta["source"],
+            "category": meta["category"],                 # "技术" / "HR" / "财务"
+            "updated_at": int(meta["updated_at"].timestamp()),  # 存 Unix 时间戳
+        },
+    ))
+client.upsert(collection_name="kb", points=points)
+```
+
+**关键细节：时间存成 Unix 时间戳（整数），不要存字符串。** 字符串日期只有在严格 `YYYY-MM-DD` 定长格式下字典序才等于时间序，一旦混入 `2024-3-5` 这种没补零的写法，范围查询就会静默出错。整数时间戳没有这个隐患，且各家向量库对数值范围查询的支持最完善。
+
+**第二步：建立 payload 索引（否则过滤会很慢）**
+
+```python
+client.create_payload_index("kb", "category",
+                            field_schema=models.PayloadSchemaType.KEYWORD)
+client.create_payload_index("kb", "updated_at",
+                            field_schema=models.PayloadSchemaType.INTEGER)
+```
+
+不建索引也能过滤，但 Qdrant 只能逐条扫描 payload，数据量大时延迟会明显上升。这一步很多人会漏掉。
+
+**第三步：写过滤查询**
+
+```python
+half_year_ago = int((datetime.now() - timedelta(days=182)).timestamp())
+
+hits = client.search(
+    collection_name="kb",
+    query_vector=q_vec.tolist(),
+    query_filter=models.Filter(
+        must=[
+            models.FieldCondition(
+                key="category",
+                match=models.MatchValue(value="技术"),
+            ),
+            models.FieldCondition(
+                key="updated_at",
+                range=models.Range(gte=half_year_ago),
+            ),
+        ]
+    ),
+    limit=5,
+    with_payload=True,
+)
+```
+
+**第四步：验证过滤确实生效**
+
+光看结果「像是对的」不算验证，要做**对照实验**：
+
+```python
+def show(hits, title):
+    print(f"\n--- {title}: {len(hits)} 条 ---")
+    for h in hits:
+        ts = datetime.fromtimestamp(h.payload["updated_at"]).date()
+        print(f"  score={h.score:.3f} [{h.payload['category']}] {ts} "
+              f"{h.payload['text'][:40]}")
+
+no_filter = client.search("kb", q_vec.tolist(), limit=5, with_payload=True)
+show(no_filter, "不过滤")
+show(hits, "过滤后")
+
+# 断言式验证
+assert all(h.payload["category"] == "技术" for h in hits), "混入了非技术类！"
+assert all(h.payload["updated_at"] >= half_year_ago for h in hits), "混入了过期文档！"
+print("\n过滤验证通过")
+```
+
+典型输出：
+
+```text
+--- 不过滤: 5 条 ---
+  score=0.891 [技术] 2026-06-12 服务部署流程说明...
+  score=0.874 [HR]   2023-01-08 员工设备申领规定...     ← 类别不符
+  score=0.866 [技术] 2022-11-30 旧版接口文档...          ← 已过期
+  ...
+
+--- 过滤后: 5 条 ---
+  score=0.891 [技术] 2026-06-12 服务部署流程说明...
+  score=0.802 [技术] 2026-03-21 灰度发布规范...
+  ...
+
+过滤验证通过
+```
+
+注意看：**过滤后第二名的分数（0.802）比不过滤时的第二名（0.874）低**。这正是过滤在起作用的证据——它把分数更高但不符合条件的结果剔除了，让排名靠后但合规的结果补位。
+
+**PGVector 版本的等价写法**
+
+```sql
+SELECT id, content, category, updated_at,
+       emb <=> :q_vec AS distance
+FROM docs
+WHERE category = '技术'
+  AND updated_at >= NOW() - INTERVAL '6 months'
+ORDER BY emb <=> :q_vec
+LIMIT 5;
+```
+
+**三个容易踩的坑**
+
+1. **过滤太严可能返回空**。「技术类 + 半年内」如果本来就没几篇，可能一条都返回不了。生产上要处理空结果：要么放宽条件重试一次，要么明确告诉用户「在指定范围内没有找到资料」，而不是让 LLM 在零上下文下瞎编。
+2. **前置过滤 vs 后置过滤**。Qdrant/Milvus 做的是「前置过滤」——在 ANN 搜索过程中就排除不符合的点，能保证返回满 k 条。有些方案是「先取 top-k 再过滤」（后置），那样过滤完可能只剩 1 条。选型时要确认清楚，这直接影响召回数量的稳定性。
+3. **过滤字段务必在入库时就写好**。事后想加 `category` 就得把全库 payload 更新一遍，成本很高。设计 schema 时宁可多留几个字段（部门、密级、文档类型、有效期），也别等上线后返工。
+</Answer>
 </Callout>
 
 ## 小结

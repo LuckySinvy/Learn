@@ -102,6 +102,67 @@ kubectl rollout undo deployment/nginx --to-revision=2
 
 <Callout type="exercise" title="练习">
 创建一个 2 副本的 Deployment，分别用 `kubectl scale` 加到 4 个、用 `kubectl set image` 换版本、再用 `kubectl rollout undo` 回滚，体会"声明期望状态"带来的自愈与可回退。
+
+<Answer>
+**参考答案：**
+
+先准备 Deployment YAML（2 副本），保存为 `nginx.yaml`：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+```
+
+按顺序执行命令链：
+
+```bash
+# 1. 创建 2 副本
+kubectl apply -f nginx.yaml
+kubectl get pods -l app=nginx
+# 应有 2 个 Running
+
+# 2. 扩到 4 个副本
+kubectl scale deployment nginx --replicas=4
+kubectl get pods -l app=nginx
+# 应有 4 个 Running；新 Pod 自动补上，不需要你手动创建
+
+# 3. 换镜像版本，触发滚动更新
+kubectl set image deployment/nginx nginx=nginx:1.28
+kubectl rollout status deployment/nginx
+# deployment "nginx" successfully rolled out
+
+# 4. 查看历史版本，确认可回退
+kubectl rollout history deployment/nginx
+
+# 5. 回滚到上一个版本（即 1.27）
+kubectl rollout undo deployment/nginx
+kubectl rollout status deployment/nginx
+
+# 验证回滚后镜像回到 1.27
+kubectl get deployment nginx -o jsonpath='{.spec.template.spec.containers[0].image}'
+# nginx:1.27
+
+# 清理
+kubectl delete -f nginx.yaml
+```
+
+**要点回顾：** 声明期望状态（replicas、image）后，Deployment 自行负责"收敛"：扩缩容自动补/删 Pod，换镜像走滚动更新，`rollout undo` 一键回退历史版本——这正是"自愈 + 可回退"的来源。
+</Answer>
 </Callout>
 
 ## 小结

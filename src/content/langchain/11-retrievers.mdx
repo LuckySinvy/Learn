@@ -98,6 +98,120 @@ const retriever = new ParentDocumentRetriever({
 
 <Callout type="exercise" title="练习">
 用 `ParentDocumentRetriever` 改造第 10 章的 MemoryVectorStore，对比「直接检索」与「父文档检索」在长文档上的回答质量。
+
+<Answer>
+**参考答案：**
+
+**完整对比脚本**
+
+```ts
+// compare-retrievers.ts
+import "dotenv/config";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings, ChatOpenAI } from "@langchain/openai";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { TextLoader } from "langchain/document_loaders/fs/text";
+import { ParentDocumentRetriever } from "langchain/retrievers/parent_document";
+import { InMemoryStore } from "@langchain/core/stores";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import { RunnableSequence, RunnableMap } from "@langchain/core/runnables";
+
+const rawDocs = await new TextLoader("./docs/handbook.md").load();
+const embeddings = new OpenAIEmbeddings();
+
+// ---------- 方案 A：直接检索（第 10 章做法） ----------
+const flatSplits = await new RecursiveCharacterTextSplitter({
+  chunkSize: 400,
+  chunkOverlap: 40,
+}).splitDocuments(rawDocs);
+
+const flatStore = await MemoryVectorStore.fromDocuments(flatSplits, embeddings);
+const flatRetriever = flatStore.asRetriever({ k: 4 });
+
+// ---------- 方案 B：父文档检索 ----------
+// 注意：这里的 vectorstore 要建成空的，由 retriever 自己灌入 child 块
+const childStore = new MemoryVectorStore(embeddings);
+
+const parentRetriever = new ParentDocumentRetriever({
+  vectorstore: childStore,
+  byteStore: undefined,
+  docstore: new InMemoryStore(),                                   // 存 parent 大块
+  parentSplitter: new RecursiveCharacterTextSplitter({ chunkSize: 2000, chunkOverlap: 200 }),
+  childSplitter: new RecursiveCharacterTextSplitter({ chunkSize: 400, chunkOverlap: 40 }),
+  childK: 8,       // 先用小块召回 8 个
+  parentK: 3,      // 去重后最多返回 3 个大块
+});
+
+// 必须显式 addDocuments，它会自动完成「切 parent → 切 child → child 入向量库、parent 入 docstore」
+await parentRetriever.addDocuments(rawDocs);
+
+// ---------- 对比检索结果 ----------
+const question = "新员工入职第一周需要完成哪些事项？";
+
+const flatDocs = await flatRetriever.invoke(question);
+const parentDocs = await parentRetriever.invoke(question);
+
+console.log("=== 直接检索 ===");
+console.log("块数：", flatDocs.length);
+console.log("总字符：", flatDocs.reduce((s, d) => s + d.pageContent.length, 0));
+flatDocs.forEach((d, i) => console.log(`[${i + 1}] ${d.pageContent.slice(0, 50).replace(/\n/g, " ")}…`));
+
+console.log("\n=== 父文档检索 ===");
+console.log("块数：", parentDocs.length);
+console.log("总字符：", parentDocs.reduce((s, d) => s + d.pageContent.length, 0));
+parentDocs.forEach((d, i) => console.log(`[${i + 1}] ${d.pageContent.slice(0, 50).replace(/\n/g, " ")}…`));
+```
+
+**接上 RAG 链，真正对比回答质量**
+
+```ts
+const prompt = ChatPromptTemplate.fromTemplate(
+  "只根据下面的上下文回答，若上下文没写就说不知道。\n上下文：\n{context}\n\n问题：{question}"
+);
+const llm = new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 });
+
+function buildRag(retriever: any) {
+  return RunnableSequence.from([
+    RunnableMap.from({
+      context: RunnableSequence.from([
+        (i: { question: string }) => i.question,
+        retriever,
+        (docs: any[]) => docs.map((d) => d.pageContent).join("\n---\n"),
+      ]),
+      question: (i: { question: string }) => i.question,
+    }),
+    prompt,
+    llm,
+    new StringOutputParser(),
+  ]);
+}
+
+console.log("\n【直接检索的回答】\n" + (await buildRag(flatRetriever).invoke({ question })));
+console.log("\n【父文档检索的回答】\n" + (await buildRag(parentRetriever).invoke({ question })));
+```
+
+**典型观察结果**
+
+| 维度 | 直接检索（400 字小块） | 父文档检索（400 检索 / 2000 返回） |
+|---|---|---|
+| 上下文总长度 | 约 1600 字 | 约 6000 字 |
+| 命中精度 | 高，向量匹配的就是小块本身 | 同样高（检索用的还是小块） |
+| 内容完整性 | **差**：常从句子中间截断，列表只截到第 2 条 | **好**：整个小节完整返回 |
+| 典型失败模式 | 「入职第一周需要……（后面被截断）」，模型只能答出部分事项 | 能完整列出全部事项 |
+| Token 成本 | 低 | 高约 3–4 倍 |
+| 适合场景 | 事实型单点问答（「WiFi 密码是多少」） | 流程型、清单型、需要上下文连贯的问题 |
+
+**核心原理再明确一遍**：两者**检索用的都是 400 字小块**，精度完全一样。区别只在「找到之后给模型看什么」——直接检索给小块本身，父文档检索拿小块的 ID 回查它所属的 2000 字大块。所以它换来的是完整性，代价是 Token。
+
+**三个实现上的坑**
+
+1. **`vectorstore` 必须传空库**。如果传了已经 `fromDocuments` 填好的库，里面装的是你自己切的块，没有 `doc_id` 元数据，父文档回查会失败。正确做法是 `new MemoryVectorStore(embeddings)` 建空库，再用 `parentRetriever.addDocuments(rawDocs)` 灌入**原始文档**。
+2. **`parentSplitter` 可以省略**。不传的话，整个原始 Document 就是 parent。文档很长时会把几万字全塞进提示词，务必按上下文窗口设一个合理的 `chunkSize`。
+3. **`parentK` 要小**。多个 child 常命中同一个 parent，去重后数量会缩水；但一旦命中 3 个不同 parent，上下文就是 6000 字。建议从 `parentK: 2` 起步，观察 Token 消耗再调。
+
+**折中方案**：如果嫌 2000 字太长，可以把 parent 设成 800–1000 字，往往就能在完整性和成本之间取得平衡。
+</Answer>
 </Callout>
 
 ## 小结

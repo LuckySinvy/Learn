@@ -89,6 +89,123 @@ const chain = RunnableSequence.from([
 
 <Callout type="exercise" title="练习">
 把「翻译 → 润色」两步走用 `RunnableSequence` 重写，并试着对最终结果调用 `.stream()`。
+
+<Answer>
+**参考答案：**
+
+**完整实现**
+
+关键在于：第一步的输出是**字符串**，而第二步的提示模板需要一个**对象**（键名要对上 `{draft}`）。中间用一个普通函数做转换即可——任何函数都能作为 LCEL 的一环。
+
+```ts
+import "dotenv/config";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import { RunnableSequence } from "@langchain/core/runnables";
+
+const llm = new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0.3 });
+const parser = new StringOutputParser();
+
+// 第一步：直译
+const translatePrompt = ChatPromptTemplate.fromTemplate(
+  "把下面的中文忠实翻译成英文，只输出译文：\n{sentence}"
+);
+
+// 第二步：润色
+const polishPrompt = ChatPromptTemplate.fromTemplate(
+  "下面是一段机器翻译的英文。请把它润色得更地道、更符合母语者习惯，只输出润色后的结果：\n{draft}"
+);
+
+const chain = RunnableSequence.from([
+  translatePrompt,
+  llm,
+  parser,
+  // 承上启下：string → { draft: string }
+  (draft: string) => ({ draft }),
+  polishPrompt,
+  llm,
+  parser,
+]);
+
+const result = await chain.invoke({ sentence: "今天天气真好，我们出去走走吧。" });
+console.log(result);
+```
+
+**对最终结果流式输出**
+
+`RunnableSequence` 的 `.stream()` 会自动把**最后一环**的输出逐块吐出来。因为末尾接的是 `StringOutputParser`，拿到的直接是字符串片段：
+
+```ts
+const stream = await chain.stream({ sentence: "今天天气真好，我们出去走走吧。" });
+
+for await (const chunk of stream) {
+  process.stdout.write(chunk);   // 逐字打印润色结果
+}
+console.log();
+```
+
+**流式的边界在哪**：这里只有**第二步（润色）**是逐字流出的。第一步翻译必须完整生成后才能作为第二步的输入，所以你会看到「先停顿几秒，然后突然开始逐字输出」。这是顺序链的固有特性，不是 bug。
+
+**改进一：用 `RunnableLambda` 让转换步骤可命名可追踪**
+
+直接传函数最简洁，但在 LangSmith 里会显示成匿名节点。想让链路更可读，用 `RunnableLambda` 包一层：
+
+```ts
+import { RunnableLambda } from "@langchain/core/runnables";
+
+const toDraft = RunnableLambda.from((draft: string) => ({ draft }))
+  .withConfig({ runName: "拼装润色输入" });
+```
+
+**改进二：同时拿到译文和润色稿**
+
+上面的链只返回最终结果，中间的直译稿丢了。如果想对比两版，用 `RunnableMap` 把原文带下去：
+
+```ts
+import { RunnableMap } from "@langchain/core/runnables";
+
+const chainWithBoth = RunnableSequence.from([
+  translatePrompt,
+  llm,
+  parser,
+  RunnableMap.from({
+    draft: (d: string) => d,                              // 原样保留直译
+    polished: RunnableLambda.from((d: string) => ({ draft: d }))
+      .pipe(polishPrompt)
+      .pipe(llm)
+      .pipe(parser),
+  }),
+]);
+
+const out = await chainWithBoth.invoke({ sentence: "今天天气真好，我们出去走走吧。" });
+console.log("直译：", out.draft);
+console.log("润色：", out.polished);
+```
+
+注意这种写法下 `.stream()` 拿到的是**逐步累积的对象补丁**而非字符串，前端消费方式要相应调整。
+
+**改进三：加容错**
+
+给模型加回退，主模型挂了自动切备用（第 7 章会详解）：
+
+```ts
+const robustLlm = llm.withFallbacks({
+  fallbacks: [new ChatOpenAI({ model: "gpt-4o" })],
+});
+```
+
+**与 `SequentialChain` 的对比**
+
+| | `SequentialChain` | `RunnableSequence` |
+|---|---|---|
+| 传值方式 | 靠 `outputKey` 字符串约定，写错了运行时才发现 | 上一环返回什么，下一环就收什么，TS 能推断 |
+| 流式 | 不支持 | `.stream()` 开箱即用 |
+| 批处理 | 需自己写循环 | `.batch([...])` 自动并发 |
+| 插入自定义逻辑 | 要包成一个 Chain 类 | 直接塞一个箭头函数 |
+
+这也是课文建议「新项目直接用 LCEL」的原因——本题里那个 `(draft) => ({ draft })` 转换，用 `SequentialChain` 需要额外定义 `outputKey` 并保证下游 `inputVariables` 完全匹配，反而更绕。
+</Answer>
 </Callout>
 
 ## 小结

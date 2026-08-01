@@ -171,4 +171,82 @@ MySQL --binlog--> Debezium Source --> Kafka --> Sink --> ES / ClickHouse / S3
 1. 用 Distributed 模式起一个 FileStreamSource（读本地文件进 topic）和 FileStreamSink（写出到另一文件），体验全程零代码的数据管道。
 2. 给 Sink 加一个 InsertField SMT 注入同步时间戳，验证输出文件里多了字段。
 3. 用 Docker 起 MySQL + Debezium，对一张表做 insert/update/delete，观察 CDC 消息中的 before/after 结构与 op 字段。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：Distributed 模式 FileStream 零代码管道**
+
+先以 distributed 模式启动 Connect Worker（配置 `connect-distributed.properties` 里 `group.id`、`config.storage.topic`、`offset.storage.topic`、`status.storage.topic` 三个内部 topic，bootstrap.servers 指向集群），启动后通过 REST API 提交两个 connector：
+
+```bash
+# Source：把 /tmp/input.txt 每行作为一条消息写进 topic file-topic
+curl -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d '{
+  "name":"file-source",
+  "config":{
+    "connector.class":"org.apache.kafka.connect.file.FileStreamSourceConnector",
+    "tasks.max":"1",
+    "file":"/tmp/input.txt",
+    "topic":"file-topic"
+  }
+}'
+
+# Sink：把 file-topic 的消息逐行写到 /tmp/output.txt
+curl -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d '{
+  "name":"file-sink",
+  "config":{
+    "connector.class":"org.apache.kafka.connect.file.FileStreamSinkConnector",
+    "tasks.max":"1",
+    "file":"/tmp/output.txt",
+    "topics":"file-topic"
+  }
+}'
+```
+
+往 `/tmp/input.txt` 追加几行，观察 `/tmp/output.txt` 同步出现相同内容——全程没有写任何业务代码，仅靠配置完成「文件 → Kafka → 文件」管道。查看状态：`GET http://localhost:8083/connectors/file-sink/status`。
+
+**第 2 题：InsertField SMT 注入同步时间戳**
+
+在 Sink connector 的 config 里加 SMT（transforms）：
+
+```json
+"config":{
+  "connector.class":"org.apache.kafka.connect.file.FileStreamSinkConnector",
+  "tasks.max":"1",
+  "file":"/tmp/output.txt",
+  "topics":"file-topic",
+  "transforms":"addTs",
+  "transforms.addTs.type":"org.apache.kafka.connect.transforms.InsertField$Value",
+  "transforms.addTs.timestamp.field":"sync_ts"
+}
+```
+
+`InsertField$Value` 会在每条记录的 value 里插入 `sync_ts` 字段，值为 Connect 处理时的时间戳。用 JSON converter 时，输出文件每行会多出 `"sync_ts":<毫秒数>`；用 String converter（`org.apache.kafka.connect.storage.StringConverter`）时 SMT 不会生效（它只作用于结构化 schema 数据），所以本题要保证 value converter 是 JSON/Avro。验证：`tail -f /tmp/output.txt` 看每行多了时间戳字段。
+
+**第 3 题：MySQL + Debezium CDC 观察 before/after/op**
+
+用 Docker 起一个开启 binlog 的 MySQL 和 Debezium Connect（或 Debezium 独立容器），注册 MySQL Source connector：
+
+```json
+"config":{
+  "connector.class":"io.debezium.connector.mysql.MySqlConnector",
+  "database.hostname":"mysql",
+  "database.port":"3306",
+  "database.user":"debezium","database.password":"dbz",
+  "database.server.name":"dbserver1",
+  "database.include.list":"inventory",
+  "table.include.list":"inventory.orders",
+  "database.history.kafka.bootstrap.servers":"kafka:9092",
+  "database.history.kafka.topic":"schema-changes.inventory"
+}
+```
+
+对 `inventory.orders` 做增删改，用 console consumer 读 `dbserver1.inventory.orders` topic，重点看 `payload` 结构：
+
+- **insert**：`op":"c"`（create），`before` 为 null，`after` 是整行新值。
+- **update**：`op":"u"`，`before` 是修改前的旧值，`after` 是修改后的新值（可对比字段差异）。
+- **delete**：`op":"d"`，`after` 为 null，`before` 保存被删行的完整内容（靠它做软删除/审计）。
+
+此外 `payload.source` 含 `ts_ms`（数据库变更时间）、`table`、`pos`（binlog 位点）；`op":"r"` 是全量快照阶段读的已有数据。这就是 CDC「捕获每行前后镜像」的本质，下游可据此精确重建数据库状态。
+</Answer>
 </Callout>

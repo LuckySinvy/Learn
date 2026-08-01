@@ -109,6 +109,40 @@ kubectl delete pods --all -n default
 
 <Callout type="exercise" title="动手练">
 起一个 `kubectl run debug --image=busybox --restart=Never -- sleep 3600`，然后依次用 `get`、`describe`、`logs`、`exec` 观察它，最后删除。把这条命令链走通你就入门了。
+
+<Answer>
+**参考答案：**
+
+按顺序跑完下面这条命令链即可：
+
+```bash
+# 1. 创建一个一次性调试 Pod（--restart=Never 避免被当作常驻服务重启）
+kubectl run debug --image=busybox --restart=Never -- sleep 3600
+
+# 2. get：查看 Pod 列表，确认状态为 Running
+kubectl get pods
+# NAME    READY   STATUS    RESTARTS   AGE
+# debug   1/1     Running   0          5s
+
+# 3. describe：查看详情与事件（调度到哪个节点、镜像拉取、容器启动等）
+kubectl describe pod debug
+
+# 4. logs：查看容器输出。busybox 的 sleep 没有输出，
+#    但命令本身可以验证容器在跑（空日志也正常）
+kubectl logs debug
+
+# 5. exec：进入容器执行命令，验证容器内环境
+kubectl exec debug -- echo hello-from-container
+kubectl exec -it debug -- /bin/sh
+# 进入 shell 后可随便敲命令，如 `ps`、`ls /`，完了输入 exit 退出
+
+# 6. 最后删除
+kubectl delete pod debug
+# pod "debug" deleted
+```
+
+**要点回顾：** `get` 看列表与状态，`describe` 看配置与 Events（排障第一步），`logs` 看容器日志，`exec` 进容器执行命令/交互式 shell，`delete` 按名称清理。
+</Answer>
 </Callout>
 
 ## 小结

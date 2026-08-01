@@ -75,6 +75,147 @@ for await (const ev of stream) {
 
 <Callout type="exercise" title="练习">
 构造一段故意缺引号的 JSON 字符串，用 `OutputFixingParser` 修复，并对比直接 `JSON.parse` 抛错的情况。
+
+<Answer>
+**参考答案：**
+
+**完整对比脚本**
+
+```ts
+// fix-json.ts
+import "dotenv/config";
+import { z } from "zod";
+import { StructuredOutputParser, OutputFixingParser } from "langchain/output_parsers";
+import { ChatOpenAI } from "@langchain/openai";
+
+// 故意构造的脏输出：键没引号、用了单引号、末尾多逗号、外面还裹了 Markdown 代码围栏
+const BAD = `\`\`\`json
+{ name: '张三', age: 28, city: "上海", tags: ['前端', 'Node'], }
+\`\`\``;
+
+console.log("原始脏输出：\n" + BAD + "\n");
+
+// ---------- 对照组：直接 JSON.parse ----------
+console.log("===== 直接 JSON.parse =====");
+try {
+  const r = JSON.parse(BAD);
+  console.log("解析成功：", r);
+} catch (err) {
+  console.log("❌ 抛错：" + (err as Error).message);
+  // SyntaxError: Unexpected token ` in JSON at position 0
+}
+
+// ---------- 实验组：OutputFixingParser ----------
+const schema = z.object({
+  name: z.string(),
+  age: z.number(),
+  city: z.string(),
+  tags: z.array(z.string()),
+});
+
+const baseParser = StructuredOutputParser.fromZodSchema(schema);
+
+console.log("\n===== 基础解析器（不修复） =====");
+try {
+  await baseParser.parse(BAD);
+} catch (err) {
+  console.log("❌ 同样失败：" + (err as Error).message.slice(0, 120) + "…");
+}
+
+console.log("\n===== OutputFixingParser =====");
+const fixParser = OutputFixingParser.fromLLM(
+  new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 }),  // 修复要确定性
+  baseParser
+);
+
+const t0 = Date.now();
+const fixed = await fixParser.parse(BAD);
+console.log("✅ 修复成功（耗时 " + (Date.now() - t0) + " ms）：");
+console.log(fixed);
+// { name: '张三', age: 28, city: '上海', tags: [ '前端', 'Node' ] }
+console.log("类型检查 age 是数字：", typeof fixed.age === "number");
+```
+
+**典型输出**
+
+```
+===== 直接 JSON.parse =====
+❌ 抛错：Unexpected token ` in JSON at position 0
+
+===== 基础解析器（不修复） =====
+❌ 同样失败：Failed to parse. Text: "```json\n{ name: '张三'…
+
+===== OutputFixingParser =====
+✅ 修复成功（耗时 1240 ms）：
+{ name: '张三', age: 28, city: '上海', tags: [ '前端', 'Node' ] }
+类型检查 age 是数字： true
+```
+
+**它到底做了什么？**
+
+`OutputFixingParser.parse()` 的内部逻辑很朴素：
+
+1. 先调用 `baseParser.parse(text)`；
+2. **成功就直接返回**（这点很重要——正常输出不会产生任何额外开销）；
+3. 失败则把「原始文本 + 报错信息 + 期望的格式说明」拼成一个新提示词，发给修复模型；
+4. 拿模型的新输出再跑一次 `baseParser.parse()`。
+
+所以它本质上是**多花一次 LLM 调用换取一次重试机会**，而不是什么本地的 JSON 语法修补算法。
+
+**分层对比：不同手段的取舍**
+
+| 手段 | 能修什么 | 额外成本 | 适用 |
+|---|---|---|---|
+| `JSON.parse` | 什么都修不了 | 0 | 输出绝对干净时 |
+| 先剥 Markdown 围栏再 parse | 只能修「被 ``` 包裹」这一种 | 0 | 最常见的脏法，值得先试 |
+| `JsonOutputParser` | 自带围栏剥离和一定容错 | 0 | 大多数场景够用 |
+| `OutputFixingParser` | 语法错、缺字段、类型不对 | +1 次 LLM 调用，约 1–2 秒 | 偶发脏输出的兜底 |
+| `withStructuredOutput` | 从源头避免（模型侧强制 schema） | 0 | **首选**，支持 function calling 的模型 |
+
+**性价比最高的组合：先本地兜底，再上模型**
+
+大部分「脏」其实只是外面裹了 Markdown 围栏，花一次 LLM 调用去修它非常不划算。实用做法是加一层零成本预处理：
+
+```ts
+function stripFence(text: string): string {
+  const m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  return (m ? m[1] : text).trim();
+}
+
+async function robustParse(raw: string) {
+  const cleaned = stripFence(raw);
+
+  // 第一层：免费的本地尝试
+  try {
+    return schema.parse(JSON.parse(cleaned));
+  } catch { /* 落到下一层 */ }
+
+  // 第二层：花钱的 LLM 修复
+  try {
+    return await fixParser.parse(raw);
+  } catch (err) {
+    console.error("修复也失败，放弃：", (err as Error).message);
+    return null;
+  }
+}
+```
+
+**更进一步：从源头杜绝**
+
+如果模型支持工具调用，`withStructuredOutput` 让模型侧直接按 schema 生成，几乎不会出现非法 JSON，比事后修复又快又省：
+
+```ts
+const model = new ChatOpenAI({ model: "gpt-4o-mini" }).withStructuredOutput(schema);
+const out = await model.invoke("提取信息：张三，28 岁，上海，会前端和 Node");
+// 直接就是类型安全的对象，无需任何解析器
+```
+
+**三个注意事项**
+
+1. **修复模型可以用便宜的**。修 JSON 是简单任务，用 `gpt-4o-mini` 甚至更小的模型即可，没必要和主链用同一个贵模型。
+2. **`temperature: 0`**。修复要的是忠实还原，不是创作。
+3. **修复不是万能的**。如果原始输出**语义上就缺了必填字段**（比如模型压根没提取到 `age`），修复模型只能瞎编一个填进去。这种「修好了但是错的」比直接报错更危险，所以最终仍要用 Zod `.safeParse` 校验业务合理性。
+</Answer>
 </Callout>
 
 ## 小结

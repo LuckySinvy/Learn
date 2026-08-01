@@ -92,6 +92,71 @@ kubectl describe node <node>                  # 看节点资源与压力
 
 <Callout type="exercise" title="练习">
 故意把镜像版本写成不存在的 `nginx:9.99`，apply 后依次用 `get pods`、`describe pod`、`logs` 复现"ImagePullBackOff"的完整排查过程，再改回正确版本。
+
+<Answer>
+**参考答案：**
+
+先创建带错误镜像的 Deployment（保存为 `bad.yaml`）：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:9.99     # 故意写不存在的版本
+```
+
+按顺序复现完整排查链：
+
+```bash
+# 1. apply 后先看整体状态：发现 ImagePullBackOff / ErrImagePull
+kubectl apply -f bad.yaml
+kubectl get pods
+# NAME                   READY   STATUS             RESTARTS   AGE
+# nginx-xxxxx-yyyy       0/1     ImagePullBackOff   0          30s
+
+# 2. describe 看 Events，找到根因（这一步最关键）
+kubectl describe pod nginx-xxxxx-yyyy
+# Events 里会出现：
+#   Failed to pull image "nginx:9.99": rpc error: ... manifest unknown
+#   或 ... not found
+#   Error: ErrImagePull
+#   Back-off pulling image "nginx:9.99"
+
+# 3. logs：此时容器从未启动成功，logs 通常拿不到应用日志
+kubectl logs nginx-xxxxx-yyyy
+# 没有输出（容器因拉不到镜像从未运行）
+# 若想确认，可加 --previous 看是否残留历史日志（本例无）
+
+# 4. 修复：把镜像改回存在的版本
+kubectl set image deployment/nginx nginx=nginx:1.27
+# 或直接改 YAML 后 apply：
+#   image: nginx:9.99  →  image: nginx:1.27
+#   kubectl apply -f bad.yaml
+
+# 5. 确认恢复 Running
+kubectl get pods
+# READY 变为 1/1，STATUS 为 Running
+kubectl rollout status deployment/nginx
+
+# 清理
+kubectl delete -f bad.yaml
+```
+
+**要点回顾：** `get pods` 暴露症状（ImagePullBackOff）→ `describe pod` 的 Events 段给出根因（镜像不存在）→ 修复回到 YAML/`set image` 改版本再 `apply`，而不是进容器"打补丁"。这就是标准排障思路。
+</Answer>
 </Callout>
 
 ## 小结

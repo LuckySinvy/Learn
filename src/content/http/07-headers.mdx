@@ -219,4 +219,68 @@ curl -s http://127.0.0.1:8000/ -F "name=Ada" -F "avatar=@up.txt"`}
 2. 修改 Playground 2：给 /as-html 响应加上 X-Content-Type-Options: nosniff 头，用 curl -I 验证。
 3. 在 Playground 3 中用 -F 同时上传两个文件，观察 multipart 体中 boundary 如何分隔多个部分。
 4. 后端收到 POST 报 "Unsupported Media Type (415)"，列出你会检查的三个头字段。
+
+<Answer>
+**参考答案：**
+
+**1. curl 默认发送的头 + 改 User-Agent**
+
+在 Playground 1 的回显服务器上 `curl -s http://127.0.0.1:8000/` 不加任何 `-H`，会看到 curl 自动带上：
+
+```text
+Host: 127.0.0.1:8000
+User-Agent: curl/8.x.x
+Accept: */*
+```
+
+Host 是 HTTP/1.1 强制必需；User-Agent 标识客户端；Accept 默认 `*/*`（什么都接受）。用 `-A` 参数可覆盖 UA：
+
+```bash
+curl -s http://127.0.0.1:8000/ -A "Mozilla/5.0 (Macintosh) MyBrowser/1.0"
+```
+
+服务器收到的 `User-Agent` 就变成了你指定的字符串——UA 同样可伪造，不能用于精确识别。
+
+**2. 加 X-Content-Type-Options: nosniff**
+
+在 Playground 2 的 `/as-html` 路由里加一个响应头：
+
+```python
+self.send_header("X-Content-Type-Options", "nosniff")
+```
+
+用 `curl -I http://127.0.0.1:8000/as-html` 验证响应头里出现该字段。作用：**禁止浏览器猜测（嗅探）Content-Type**。否则"图片"内容里藏 HTML/JS 时，老浏览器可能按 HTML 执行，造成存储型 XSS。加上后浏览器严格按声明的 Content-Type 处理。
+
+**3. 两个文件的 multipart**
+
+```bash
+echo one > a.txt
+echo two > b.txt
+curl -s http://127.0.0.1:8000/ -F "file1=@a.txt" -F "file2=@b.txt"
+```
+
+回显服务器打印的 multipart 体里能看到：`Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryXXXX`，每个字段用 `--boundary` 行分隔，格式为：
+
+```http
+------WebKitFormBoundaryXXXX
+Content-Disposition: form-data; name="file1"; filename="a.txt"
+Content-Type: text/plain
+
+one
+------WebKitFormBoundaryXXXX
+...第二个文件...
+```
+
+boundary 把多个部分隔开，每个部分自带自己的 Content-Disposition（含 name 与 filename）和 Content-Type。
+
+**4. 检查 415 的三个头字段**
+
+后端报 415（不支持的媒体类型）时，按顺序检查：
+
+1. **Content-Type**：请求体声明的是什么类型？后端是否支持？比如后端只支持 `application/json`，而你发了 `application/x-www-form-urlencoded`（用 `-d` 的默认类型）就会 415；
+2. **Content-Length**：是否与体实际字节数一致？长度错误会导致解析失败，某些框架表现为 415/400；
+3. **Transfer-Encoding / Content-Encoding**：如果体是 gzip 压缩的，`Content-Encoding: gzip` 有没有声明？请求体被压缩后没声明，后端按原文解析就失败（服务器通常不处理压缩的请求体）。
+
+其中 **Content-Type 是 415 的头号嫌疑**——先确认它和后端期望的类型完全一致。
+</Answer>
 </Callout>

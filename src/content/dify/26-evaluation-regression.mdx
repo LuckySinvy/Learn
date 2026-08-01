@@ -63,6 +63,366 @@ compare v_old.json v_new.json
 
 <Callout type="exercise" title="动手做">
 整理 10 条你应用最常见的问题及期望答案，跑一次评估，记录当前 gpt_score 与 recall，作为后续改动的对比基线。
+
+<Answer>
+**参考答案：**
+
+**第一步：评测集的配比（决定了评估是否可信）**
+
+10 条不能全是理想样本，否则你测出来的分数是虚高的。建议按这个配比：
+
+| 类型 | 条数 | 作用 |
+|---|---|---|
+| 高频典型问题 | 4 | 反映日常主要体验 |
+| 需要多片段整合的问题 | 2 | 检验检索与整合能力 |
+| 知识库外问题（应拒答） | 2 | 检验幻觉率——**最容易被省略但最重要** |
+| 长输入 / 口语化表述 | 1 | 检验鲁棒性 |
+| 多轮指代 | 1 | 检验会话记忆 |
+
+正文那条 tip 说「只测理想样本会高估效果」，具体就体现在拒答那两条上。很多团队的评测集全是「用户问了知识库里有的问题」，分数很好看，上线后被幻觉问题打脸。
+
+**第二步：评测集文件**
+
+```yaml
+version: v1
+created_at: "2026-08-01"
+app: 产品小助手 v3
+cases:
+  - id: E01
+    type: typical
+    query: "如何申请退款？"
+    expected: "在订单详情页点击退款，审核通过后 3 个工作日内原路退回"
+    expected_contains: ["订单", "退款", "3 个工作日"]
+    must_not_contain: ["无法确定", "请联系客服了解"]
+    golden_retrieval: ["售后政策#第2节"]
+
+  - id: E02
+    type: typical
+    query: "忘记密码怎么办？"
+    expected_contains: ["重置密码", "企业邮箱", "验证"]
+    golden_retrieval: ["账号手册#登录"]
+
+  - id: E05
+    type: multi_hop
+    query: "会员和非会员的退款时效分别是多久？"
+    expected_contains: ["会员", "3 个工作日", "非会员", "7 个工作日"]
+    golden_retrieval: ["售后政策#第2节", "会员权益#第4节"]
+
+  - id: E07
+    type: out_of_scope        # 关键用例
+    query: "你们支持比特币支付吗？"
+    expected_contains: ["未找到", "联系人工客服"]
+    must_not_contain: ["支持", "可以使用", "暂不支持"]
+    golden_retrieval: []      # 期望无召回
+
+  - id: E08
+    type: out_of_scope
+    query: "你们 CEO 年薪多少？"
+    must_not_contain: ["万", "元", "薪资"]
+
+  - id: E09
+    type: robustness
+    query: "那个啥我上周买的东西不太行想退了大概要多久能拿到钱啊"
+    expected_contains: ["3 个工作日"]
+
+  - id: E10
+    type: multi_turn
+    turns:
+      - "我买了企业版"
+      - "那可以退吗？"        # 「那」需要上文才能理解
+    expected_contains: ["企业版", "退款"]
+```
+
+**注意 E08 的 `must_not_contain` 里包含了「暂不支持」**——因为知识库里如果没写支付方式，模型说「暂不支持比特币」同样是编造（它并不知道）。正确回答应该是「资料中未提及」。这个区分很细，但正是幻觉评估的关键。
+
+**第三步：评估脚本**
+
+```python
+#!/usr/bin/env python3
+"""对评测集跑一遍应用，计算 recall / contains / gpt_score。"""
+
+import json
+import os
+import re
+import statistics
+import sys
+import time
+
+import requests
+import yaml
+
+BASE = os.environ["DIFY_BASE_URL"].rstrip("/")
+APP_KEY = os.environ["DIFY_API_KEY"]      # 被测应用
+JUDGE_KEY = os.environ["JUDGE_API_KEY"]   # 裁判应用（另建一个）
+
+
+def call_app(query: str, conversation_id: str = "") -> dict:
+    r = requests.post(
+        f"{BASE}/v1/chat-messages",
+        headers={"Authorization": f"Bearer {APP_KEY}"},
+        json={
+            "inputs": {},
+            "query": query,
+            "response_mode": "blocking",
+            "user": "evaluator",
+            "conversation_id": conversation_id,
+        },
+        timeout=120,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+JUDGE_PROMPT = """你是严格的答案评审员。请对比【期望要点】与【实际回答】打分。
+
+评分标准（1-5 分）：
+5 = 期望要点全部覆盖，无任何未经证实的信息
+4 = 要点全覆盖，措辞或结构有小瑕疵
+3 = 覆盖主要要点，遗漏次要信息
+2 = 只覆盖一部分，用户仍需追问
+1 = 基本未答对，但未编造事实
+0 = 包含编造的具体事实（数字、路径、政策），无论其他部分多好
+
+特别注意：若期望是「应当拒答」，而实际回答给出了肯定或否定的具体结论，
+一律判 0 分。
+
+只输出 JSON：{"score": 数字, "reason": "一句话理由", "hallucination": true/false}
+
+【期望要点】%s
+【实际回答】%s"""
+
+
+def judge(expected, answer: str) -> dict:
+    r = requests.post(
+        f"{BASE}/v1/chat-messages",
+        headers={"Authorization": f"Bearer {JUDGE_KEY}"},
+        json={
+            "inputs": {},
+            "query": JUDGE_PROMPT % (expected, answer),
+            "response_mode": "blocking",
+            "user": "judge",
+        },
+        timeout=120,
+    )
+    text = r.json().get("answer", "")
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return {"score": 0, "reason": "裁判输出无法解析", "hallucination": None}
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {"score": 0, "reason": "裁判 JSON 非法", "hallucination": None}
+
+
+def eval_case(case: dict) -> dict:
+    # 多轮用例
+    if "turns" in case:
+        cid = ""
+        for q in case["turns"]:
+            resp = call_app(q, cid)
+            cid = resp.get("conversation_id", "")
+    else:
+        resp = call_app(case["query"])
+
+    answer = resp.get("answer", "")
+    resources = resp.get("metadata", {}).get("retriever_resources", [])
+    retrieved = [
+        f"{x.get('document_name', '')}#{x.get('segment_position', '')}"
+        for x in resources
+    ]
+
+    # 指标 1：contains —— 关键事实覆盖率
+    want = case.get("expected_contains", [])
+    hits = [w for w in want if w in answer]
+    contains = len(hits) / len(want) if want else None
+
+    # 指标 2：违禁词
+    banned = [w for w in case.get("must_not_contain", []) if w in answer]
+
+    # 指标 3：recall —— 该召回的片段是否召回
+    golden = case.get("golden_retrieval")
+    if golden is None:
+        recall = None
+    elif not golden:
+        recall = 1.0 if not resources else 0.0   # 期望无召回
+    else:
+        got = sum(
+            1 for g in golden
+            if any(g.split("#")[0] in r for r in retrieved)
+        )
+        recall = got / len(golden)
+
+    # 指标 4：LLM 裁判
+    j = judge(case.get("expected") or want, answer)
+
+    return {
+        "id": case["id"],
+        "type": case.get("type", ""),
+        "answer": answer,
+        "contains": contains,
+        "banned_hit": banned,
+        "recall": recall,
+        "gpt_score": j.get("score", 0),
+        "judge_reason": j.get("reason", ""),
+        "hallucination": j.get("hallucination"),
+        "tokens": resp.get("metadata", {}).get("usage", {}).get("total_tokens", 0),
+    }
+
+
+def main(path: str) -> None:
+    ds = yaml.safe_load(open(path, encoding="utf-8"))
+    results = []
+    for case in ds["cases"]:
+        r = eval_case(case)
+        results.append(r)
+        flag = "!!" if r["banned_hit"] or r["gpt_score"] <= 1 else "  "
+        print(f"{flag}[{r['id']}] score={r['gpt_score']} "
+              f"contains={r['contains']} recall={r['recall']} "
+              f"{r['judge_reason']}")
+        time.sleep(0.5)
+
+    scored = [r["gpt_score"] for r in results]
+    recalls = [r["recall"] for r in results if r["recall"] is not None]
+    contains = [r["contains"] for r in results if r["contains"] is not None]
+    halluc = sum(1 for r in results if r["gpt_score"] == 0)
+
+    summary = {
+        "version": ds.get("version"),
+        "date": time.strftime("%F"),
+        "cases": len(results),
+        "gpt_score_avg": round(statistics.mean(scored), 2),
+        "recall_avg": round(statistics.mean(recalls), 2) if recalls else None,
+        "contains_avg": round(statistics.mean(contains), 2) if contains else None,
+        "hallucination_count": halluc,
+        "total_tokens": sum(r["tokens"] for r in results),
+    }
+
+    print("\n=== 基线 ===")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    out = f"eval_{ds.get('version')}_{time.strftime('%F')}.json"
+    json.dump({"summary": summary, "details": results},
+              open(out, "w", encoding="utf-8"),
+              ensure_ascii=False, indent=2)
+    print(f"→ {out}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else "dataset.yaml")
+```
+
+**第四步：记录基线**
+
+```json
+{
+  "version": "v1",
+  "date": "2026-08-01",
+  "cases": 10,
+  "gpt_score_avg": 3.6,
+  "recall_avg": 0.75,
+  "contains_avg": 0.68,
+  "hallucination_count": 2,
+  "total_tokens": 12480
+}
+```
+
+**基线不是「分数」，是「问题清单」**。上面这组数字要这样读：
+
+- `hallucination_count: 2` —— **最严重的问题**。两条本该拒答的问题被编造了答案，这是必须优先修的。
+- `recall_avg: 0.75` —— 四分之一的题没召回到正确片段，检索层有优化空间。
+- `contains 0.68 < gpt_score 3.6/5=0.72` —— 两个指标接近，说明模型基本忠实于召回内容，问题主要在检索而非生成。
+
+**关于 LLM-as-a-Judge 的三个注意事项**
+
+1. **裁判模型必须比被测模型强**。用 `gpt-4o-mini` 去评判 `gpt-4o` 的输出，判不准。
+2. **裁判也要被校验**。第一次跑完，人工复核全部 10 条的裁判打分，看是否与你的判断一致。不一致就调 rubric。之后可以只抽查。
+3. **裁判有偏好**。LLM 裁判普遍偏爱长回答、结构化回答。如果你的两个版本一个啰嗦一个精炼，裁判可能给啰嗦的更高分——这未必符合用户真实偏好。所以正文那条 warn 说「别当终审」。
+
+**回归对比怎么用**
+
+```bash
+python3 eval.py dataset.yaml           # 改动前 → eval_v1_2026-08-01.json
+# ... 改提示词 / 调检索 ...
+python3 eval.py dataset.yaml           # 改动后 → eval_v1_2026-08-05.json
+python3 compare.py eval_v1_2026-08-01.json eval_v1_2026-08-05.json
+```
+
+```python
+def compare(old_path: str, new_path: str) -> int:
+    old = json.load(open(old_path))
+    new = json.load(open(new_path))
+    o, n = old["summary"], new["summary"]
+
+    print(f"gpt_score  {o['gpt_score_avg']} → {n['gpt_score_avg']} "
+          f"({n['gpt_score_avg'] - o['gpt_score_avg']:+.2f})")
+    print(f"recall     {o['recall_avg']} → {n['recall_avg']}")
+    print(f"幻觉数     {o['hallucination_count']} → {n['hallucination_count']}")
+
+    # 逐条找出退步的用例——比看均分重要得多
+    om = {d["id"]: d for d in old["details"]}
+    for d in new["details"]:
+        prev = om.get(d["id"])
+        if prev and d["gpt_score"] < prev["gpt_score"]:
+            print(f"  ⚠ {d['id']} 退步 {prev['gpt_score']} → {d['gpt_score']}"
+                  f"：{d['judge_reason']}")
+
+    # 阻断规则
+    if n["gpt_score_avg"] < o["gpt_score_avg"] - 0.3:
+        print("❌ 均分下降超阈值，阻断发布")
+        return 1
+    if n["hallucination_count"] > o["hallucination_count"]:
+        print("❌ 幻觉数增加，阻断发布")
+        return 1
+    print("✅ 通过")
+    return 0
+```
+
+**「逐条找退步用例」比看均分更重要**：均分可能从 3.6 涨到 4.0，看起来是进步，但其中可能有 2 条从 5 分掉到 2 分，被其他题的提升掩盖了。这种「按下葫芦浮起瓢」的情况，只看均分永远发现不了。
+
+**两条阻断规则的设计**
+
+```text
+规则 1：均分下降 > 0.3   → 整体退步
+规则 2：幻觉数增加       → 一票否决，不管均分涨了多少
+```
+
+规则 2 是硬性的。幻觉的危害是非线性的——一次错误的退款金额承诺可能引发投诉甚至纠纷，这不是「平均分涨了 0.5」能补偿的。
+
+**接入 CI**
+
+```yaml
+# .github/workflows/dify-eval.yml
+name: Dify Regression
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"      # 每日凌晨跑，及时发现知识库变更的影响
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests pyyaml
+      - run: python3 eval.py dataset.yaml
+        env:
+          DIFY_BASE_URL: ${{ secrets.DIFY_BASE_URL }}
+          DIFY_API_KEY: ${{ secrets.DIFY_API_KEY }}
+          JUDGE_API_KEY: ${{ secrets.JUDGE_API_KEY }}
+      - run: python3 compare.py baseline.json eval_latest.json
+```
+
+定时跑而不只在发布时跑，是因为**知识库内容变更、模型供应商静默升级**都可能让效果变化，而这些改动不经过你的发布流程。
+
+**评测集的演进**
+
+```text
+10 条  → 起步基线，能发现明显问题
+30 条  → 能覆盖主要业务场景，指标开始稳定
+100 条 → 均分波动小于 0.1，可作为发布门禁
+```
+
+增长方式：每次线上发现新的失败模式（第 15 章从日志里挖），就补一条进评测集。**评测集只增不减**——已修复的问题保留在集里，就是防止它复发的回归测试。
+</Answer>
 </Callout>
 
 ## 小结

@@ -372,6 +372,102 @@ const b: Anything = "hello";   // 合法！
 1. 定义 `interface Book`，包含 `readonly isbn: string`、`title: string`、`author: string`、可选的 `pages?: number`；写一个 `summary(b: Book): string`，页数缺失时显示「页数未知」。
 2. 定义 `type Inventory = Record<string, number>` 表示库存，写一个 `restock(inv: Inventory, item: string, n: number): Inventory` 返回**新对象**（用展开运算符），不修改原对象。
 3. 试着用 `interface` 继承一个属性类型冲突的接口，再用交叉类型做同样的事，对比两者报错的时机与信息。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：Book 接口**
+
+```ts
+interface Book {
+  readonly isbn: string;
+  title: string;
+  author: string;
+  pages?: number;
+}
+
+function summary(b: Book): string {
+  const pages = b.pages !== undefined ? b.pages + " 页" : "页数未知";
+  return "《" + b.title + "》 " + b.author + " · " + pages + " · ISBN " + b.isbn;
+}
+
+const a: Book = { isbn: "978-7", title: "深入理解计算机系统", author: "Bryant" };
+const b: Book = { isbn: "978-8", title: "TypeScript 入门", author: "阮一峰", pages: 320 };
+
+console.log(summary(a));  // 《深入理解计算机系统》 Bryant · 页数未知 · ISBN 978-7
+console.log(summary(b));  // 《TypeScript 入门》 阮一峰 · 320 页 · ISBN 978-8
+
+// a.isbn = "x";   // 错误：无法分配到 isbn，因为它是只读属性
+```
+
+这里用 `b.pages !== undefined` 而不是 `b.pages ? ... : ...`：如果某本书真的记录为 0 页（或用真值判断的其它场景里值为 0），真值判断会错误地落进「未知」分支。同理，写成 `const pages = (b.pages ?? "未知")` 也可以，但 `??` 只挡 null/undefined，语义正好合适。
+
+**第 2 题：不可变的 restock**
+
+```ts
+type Inventory = Record<string, number>;
+
+function restock(inv: Inventory, item: string, n: number): Inventory {
+  return { ...inv, [item]: (inv[item] ?? 0) + n };
+}
+
+const day0: Inventory = { apple: 3, pear: 5 };
+const day1 = restock(day0, "apple", 2);
+const day2 = restock(day1, "banana", 10);   // 新键也能加
+
+console.log(JSON.stringify(day0));  // {"apple":3,"pear":5}   原对象没变
+console.log(JSON.stringify(day1));  // {"apple":5,"pear":5}
+console.log(JSON.stringify(day2));  // {"apple":5,"pear":5,"banana":10}
+```
+
+要点：
+
+- 展开运算符 `...inv` 先复制所有旧键，随后的计算属性键 `[item]` 覆盖或新增，**顺序不能反**，否则新值会被旧值盖掉。
+- `inv[item] ?? 0` 处理「这个商品还不存在」的情况。注意索引签名的读取类型是 `number`（不带 `undefined`），编译器不会强制你判空，但运行时确实可能是 `undefined`——这正是本章提到的索引签名不安全之处。开启 `noUncheckedIndexedAccess` 后类型会变成 `number | undefined`，编译器就会督促你写这个 `??`。
+- 想让「不修改原对象」也被类型系统保证，可以把参数声明为 `Readonly<Inventory>`。
+
+**第 3 题：继承冲突 vs 交叉冲突**
+
+写法 A —— `interface extends`，**在定义处立刻报错**：
+
+```ts
+interface Base {
+  id: string;
+}
+
+interface Sub extends Base {
+  id: number;
+}
+// 错误 TS2430（就在 interface Sub 这一行）：
+// 接口“Sub”错误扩展接口“Base”。
+//   属性“id”的类型不兼容。
+//     不能将类型“number”分配给类型“string”。
+```
+
+写法 B —— 交叉类型，**定义处静默通过**：
+
+```ts
+type Sub2 = Base & { id: number };
+// 这一行不报错。此时 Sub2 的 id 类型是 string & number，也就是 never
+
+const x: Sub2 = { id: 1 };
+// 错误 TS2322（延迟到这里才出现）：
+// 不能将类型“number”分配给类型“never”。
+
+const y: Sub2 = { id: "a" };
+// 同样报错：不能将类型“string”分配给类型“never”。
+```
+
+**对比结论：**
+
+| | interface extends | 交叉类型 `&` |
+|---|---|---|
+| 报错时机 | 定义处，立即 | 使用处（构造对象时） |
+| 报错信息 | 指名道姓说「哪个接口、哪个属性、什么类型冲突」 | 只说「不能赋给 never」，看不出冲突来源 |
+| 排查难度 | 低 | 高，尤其类型经过多层组合后 |
+
+这就是本章建议「描述对象契约优先用 `interface`」的实际理由之一：它在定义阶段就替你把冲突拦下来了。交叉类型产生的 `never` 属性是个**沉默的陷阱**——类型定义看起来完全正常，直到某个同事试图构造它时才收到一条令人费解的报错。
+</Answer>
 </Callout>
 
 ## 小结

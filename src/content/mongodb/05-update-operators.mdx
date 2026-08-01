@@ -400,6 +400,76 @@ db.users.bulkWrite([
 
 <Callout type="exercise" title="练习">
 用本章的 `_id: 100` 文档完成：一、给帖子追加三个标签，并保证不重复；二、把评论按点赞数倒序排列并只保留前 2 条；三、用 arrayFilters 把所有 `likes` 小于 1 且作者不是 alice 的评论 `status` 改成 hidden，然后解释为什么这里不能用 `$` 定位符；四、写一个 upsert，实现「每天每篇帖子的 PV 计数」，要求 `createdAt` 只在首次写入；五、用管道形式的更新，给每篇帖子加一个 `tagCount` 字段等于 tags 数组的长度。
+
+<Answer>
+**参考答案：**
+
+**一、追加三个标签并保证不重复**
+
+```js
+db.posts.updateOne(
+  { _id: 100 },
+  { $addToSet: { tags: { $each: ["mongodb", "index", "tutorial"] } } }
+)
+```
+
+`$addToSet` 本身去重，加上 `$each` 才能一次追加多个。即使 `tags` 里已有 `mongodb`，也不会重复添加（`modifiedCount` 可能为 0）。
+
+**二、评论按点赞数倒序并只保留前 2 条**
+
+```js
+db.posts.updateOne(
+  { _id: 100 },
+  { $push: { comments: { $each: [], $sort: { likes: -1 }, $slice: 2 } } }
+)
+```
+
+`$each` 传空数组表示「本次不追加任何新元素」，但 `$sort` 和 `$slice` 仍会对现有数组生效：先按 `likes` 倒序，再截断只留前 2 条。这是维护定长有序列表的标准手法。
+
+**三、用 arrayFilters 把「likes < 1 且作者不是 alice」的评论设为 hidden**
+
+```js
+db.posts.updateOne(
+  { _id: 100 },
+  { $set: { "comments.$[elem].status": "hidden" } },
+  { arrayFilters: [ { "elem.likes": { $lt: 1 }, "elem.author": { $ne: "alice" } } ] }
+)
+```
+
+`arrayFilters` 里的条件可以引用同一个 `elem`，实现「同一元素同时满足两个条件」。本例会把 bob 和 carol 的评论（likes 0，作者非 alice）改成 hidden，alice 的评论不受影响。
+
+**为什么不能用 `$` 定位符？** `$` 只匹配 filter 中命中的**第一个**数组元素。`_id: 100` 的文档里有两条满足条件的评论（bob、carol），`$` 只会改第一条；而且 `$` 的匹配条件必须写在查询 filter 里，filter 中数组条件是「任意元素满足」的宽松语义，无法表达「同一元素同时满足 likes < 1 且 author ≠ alice」。要批量、精准地改多个元素，必须用 `$[elem]` + arrayFilters。
+
+**四、「每天每篇帖子」的 PV 计数 upsert**
+
+```js
+db.posts_stats.updateOne(
+  { postId: 100, date: "2024-06-01" },
+  { $inc: { pv: 1 }, $setOnInsert: { createdAt: new Date() } },
+  { upsert: true }
+)
+```
+
+`$setOnInsert` 只在真正插入新文档时生效，因此 `createdAt` 记录的是该「帖子 + 日期」组合首次出现的时间，之后每天的累加都不会覆盖它。注意：高并发下应给 `{ postId: 1, date: 1 }` 建唯一索引，防止同时 upsert 出两条记录。
+
+**五、管道形式更新，加 `tagCount` 字段**
+
+```js
+db.posts.updateMany(
+  {},
+  [ { $set: { tagCount: { $size: "$tags" } } } ]
+)
+```
+
+管道形式的 `$set` 可以引用文档自身的字段：`$size: "$tags"` 实时计算数组长度并写入 `tagCount`。注意 `_id: 100` 之外的文档若没有 `tags` 字段，`$size` 会报错——可以先用 `$ifNull` 兜底：
+
+```js
+db.posts.updateMany(
+  {},
+  [ { $set: { tagCount: { $size: { $ifNull: ["$tags", []] } } } } ]
+)
+```
+</Answer>
 </Callout>
 
 ## 小结

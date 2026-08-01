@@ -488,6 +488,112 @@ db.posts.aggregate(pipeline, {
 
 <Callout type="exercise" title="练习">
 一、写一个聚合，统计每个作者的帖子数、总浏览数、平均点赞数，按总浏览数倒序取前 10；二、统计 `posts` 中每个标签的使用次数（提示：需要 `$unwind`）；三、统计每个月每个城市的新增用户数（需要 `$lookup` 吗？想想为什么不需要）；四、故意把 `$match` 写在 `$group` 之后，用 `explain` 对比两种写法的执行时间；五、写一个聚合把 `posts` 按浏览数分成 S/A/B/C 四档并统计各档数量，然后加上每档的平均点赞数；六、用 `$group` 加 `$count` 统计有多少个不同的标签。
+
+<Answer>
+**参考答案：**
+
+**一、每个作者的帖子数、总浏览、平均点赞，取 Top 10**
+
+```js
+db.posts.aggregate([
+  { $match: { status: "published" } },
+  { $group: {
+      _id: "$authorId",
+      totalPosts: { $sum: 1 },
+      totalViews: { $sum: "$stats.views" },
+      avgLikes: { $avg: "$stats.likes" }
+  } },
+  { $set: { avgLikes: { $round: ["$avgLikes", 1] } } },
+  { $sort: { totalViews: -1 } },
+  { $limit: 10 }
+])
+```
+
+注意 `$group` 输出顺序不确定，排序必须显式做；`$match` 放最前让它能走索引。
+
+**二、每个标签的使用次数**
+
+```js
+db.posts.aggregate([
+  { $unwind: "$tags" },
+  { $group: { _id: "$tags", count: { $sum: 1 } } },
+  { $sort: { count: -1 } }
+])
+```
+
+`$unwind` 把含 N 个标签的帖子拆成 N 条、每条一个标签，之后按标签分组计数即可。
+
+**三、统计每月每城市的新增用户数**
+
+```js
+db.users.aggregate([
+  { $group: {
+      _id: {
+        city: "$profile.city",
+        month: { $dateToString: { date: "$createdAt", format: "%Y-%m", timezone: "Asia/Shanghai" } }
+      },
+      count: { $sum: 1 }
+  } },
+  { $sort: { _id: 1 } }
+])
+```
+
+**不需要 `$lookup`。** `$lookup` 是跨集合关联用的，而「用户的城市」和「用户的创建时间」都在 `users` 集合的同一个文档里，只对 `users` 单集合做复合分组即可。
+
+**四、对比 `$match` 在 `$group` 前后的执行时间**
+
+```js
+// 写法 A：$match 在后（慢）
+db.posts.aggregate([
+  { $group: { _id: "$authorId", views: { $sum: "$stats.views" } } },
+  { $match: { _id: "alice" } }
+]).explain("executionStats")   // 注意要放在 aggregate 调用上
+
+// 写法 B：$match 在前（快）
+db.posts.aggregate([
+  { $match: { authorId: "alice" } },
+  { $group: { _id: "$authorId", views: { $sum: "$stats.views" } } }
+]).explain("executionStats")
+```
+
+用 `explain("executionStats")` 看 `executionTimeMillis` 与各阶段处理的文档数：写法 A 先对全集合分组（`$group` 无法用索引且消耗大量内存），再过滤掉绝大部分组；写法 B 先用 `$match` 把集合缩小到 alice 一个人的帖子（可走 `authorId` 索引），再分组。数据量越大差距越明显。只有位于管道最前面的 `$match` 才能用索引。
+
+**五、浏览数分档 S/A/B/C 并加每档平均点赞**
+
+```js
+db.posts.aggregate([
+  { $set: {
+      level: { $switch: {
+        branches: [
+          { case: { $gte: ["$stats.views", 10000] }, then: "S" },
+          { case: { $gte: ["$stats.views", 1000] },  then: "A" },
+          { case: { $gte: ["$stats.views", 100] },   then: "B" }
+        ],
+        default: "C"
+      } }
+  } },
+  { $group: {
+      _id: "$level",
+      count: { $sum: 1 },
+      avgLikes: { $avg: "$stats.likes" }
+  } },
+  { $set: { avgLikes: { $round: ["$avgLikes", 1] } } },
+  { $sort: { _id: 1 } }
+])
+```
+
+**六、统计不同的标签数量**
+
+```js
+db.posts.aggregate([
+  { $unwind: "$tags" },
+  { $group: { _id: "$tags" } },
+  { $count: "distinctTags" }
+])
+```
+
+先 `$unwind` 展开、按标签分组去重（`_id: "$tags"` 使每个不同标签成为一组），最后 `$count` 统计组数，结果形如 `[ { "distinctTags": 128 } ]`。
+</Answer>
 </Callout>
 
 ## 小结

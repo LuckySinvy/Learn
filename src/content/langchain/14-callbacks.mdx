@@ -90,6 +90,171 @@ LangSmith 帮你可视化「提示词 → 模型 → 工具 → 检索」的完�
 
 <Callout type="exercise" title="练习">
 写一个回调，统计一次 `ragChain.invoke` 中「检索」与「模型生成」各自耗时，并打印总 Token 消耗。
+
+<Answer>
+**参考答案：**
+
+**完整实现**
+
+关键点：回调的每个事件都会带一个 `runId`，用它作为 key 记录开始时间，在对应的 `end` 事件里相减，就能正确处理并发调用。
+
+```ts
+// timing-handler.ts
+import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
+
+export class TimingHandler extends BaseCallbackHandler {
+  name = "TimingHandler";
+
+  // runId → 开始时间戳
+  private starts = new Map<string, number>();
+
+  // 汇总数据
+  retrieverMs = 0;
+  llmMs = 0;
+  retrieverCalls = 0;
+  llmCalls = 0;
+  docsRetrieved = 0;
+  promptTokens = 0;
+  completionTokens = 0;
+  totalTokens = 0;
+
+  // ---------- 检索 ----------
+  async handleRetrieverStart(_retriever: any, _query: string, runId: string) {
+    this.starts.set(runId, Date.now());
+  }
+
+  async handleRetrieverEnd(documents: any[], runId: string) {
+    const t0 = this.starts.get(runId);
+    if (t0 !== undefined) {
+      this.retrieverMs += Date.now() - t0;
+      this.starts.delete(runId);
+    }
+    this.retrieverCalls += 1;
+    this.docsRetrieved += documents.length;
+  }
+
+  async handleRetrieverError(_err: Error, runId: string) {
+    this.starts.delete(runId);
+  }
+
+  // ---------- 模型 ----------
+  async handleLLMStart(_llm: any, _prompts: string[], runId: string) {
+    this.starts.set(runId, Date.now());
+  }
+
+  async handleLLMEnd(output: any, runId: string) {
+    const t0 = this.starts.get(runId);
+    if (t0 !== undefined) {
+      this.llmMs += Date.now() - t0;
+      this.starts.delete(runId);
+    }
+    this.llmCalls += 1;
+
+    // Token 用量在不同厂商下字段名不同，做兼容取值
+    const usage =
+      output.llmOutput?.tokenUsage ??          // OpenAI 常见
+      output.llmOutput?.usage ??               // 部分厂商
+      output.generations?.[0]?.[0]?.message?.usage_metadata;  // 新版 AIMessage
+
+    if (usage) {
+      this.promptTokens += usage.promptTokens ?? usage.input_tokens ?? 0;
+      this.completionTokens += usage.completionTokens ?? usage.output_tokens ?? 0;
+      this.totalTokens +=
+        usage.totalTokens ??
+        usage.total_tokens ??
+        (usage.promptTokens ?? usage.input_tokens ?? 0) +
+          (usage.completionTokens ?? usage.output_tokens ?? 0);
+    }
+  }
+
+  async handleLLMError(_err: Error, runId: string) {
+    this.starts.delete(runId);
+  }
+
+  report() {
+    console.log("\n===== 本次调用统计 =====");
+    console.log(`检索：${this.retrieverCalls} 次，共 ${this.retrieverMs} ms，取回 ${this.docsRetrieved} 块`);
+    console.log(`生成：${this.llmCalls} 次，共 ${this.llmMs} ms`);
+    console.log(`Token：输入 ${this.promptTokens} + 输出 ${this.completionTokens} = 共 ${this.totalTokens}`);
+
+    const known = this.retrieverMs + this.llmMs;
+    console.log(`其中检索占 ${((this.retrieverMs / known) * 100).toFixed(1)}%，生成占 ${((this.llmMs / known) * 100).toFixed(1)}%`);
+  }
+}
+```
+
+**使用**
+
+```ts
+import { TimingHandler } from "./timing-handler";
+
+const handler = new TimingHandler();
+
+const t0 = Date.now();
+const answer = await ragChain.invoke(
+  { question: "如何申请测试环境？" },
+  { callbacks: [handler] }        // 局部挂载，只对本次生效
+);
+const wallMs = Date.now() - t0;
+
+console.log("回答：", answer);
+console.log("端到端总耗时：", wallMs, "ms");
+handler.report();
+```
+
+**典型输出**
+
+```
+回答： 在内网工单系统提交「测试环境申请」……
+端到端总耗时： 3180 ms
+
+===== 本次调用统计 =====
+检索：1 次，共 420 ms，取回 4 块
+生成：1 次，共 2680 ms
+Token：输入 1245 + 输出 186 = 共 1431
+其中检索占 13.5%，生成占 86.5%
+```
+
+一眼就能看出瓶颈在生成而非检索——这正是这类回调的价值：**优化前先量一量**，别凭感觉去调。
+
+**几个关键细节**
+
+| 细节 | 说明 |
+|---|---|
+| 必须用 `runId` 配对 | 若用单个 `this.startTime` 变量，一旦有并行检索（如 `RunnableMap`）或多次 LLM 调用，时间就会互相覆盖，算出负数或离谱值 |
+| Token 字段要兼容取值 | OpenAI 在 `llmOutput.tokenUsage`，Anthropic 和新版消息在 `usage_metadata`，写死一个字段换厂商就拿不到 |
+| 流式下拿不到 Token | `streaming: true` 时多数厂商不在流末尾返回用量。需要在模型上设 `streamUsage: true`（OpenAI），否则 Token 统计恒为 0 |
+| 各段耗时之和 < 端到端 | 差值是提示词拼装、解析、网络等开销。差得太多说明有隐藏瓶颈值得查 |
+| 别在回调里做重活 | 课文警告过。这里只做内存累加，若要落库请 `void writeAsync()` 不阻塞主链路 |
+
+**扩展一：按 Token 估算成本**
+
+```ts
+const PRICE = { in: 0.15 / 1_000_000, out: 0.6 / 1_000_000 };  // gpt-4o-mini 每 token 美元价
+const cost = handler.promptTokens * PRICE.in + handler.completionTokens * PRICE.out;
+console.log(`本次成本约 $${cost.toFixed(6)}`);
+```
+
+**扩展二：用 `streamEvents` 达到同样效果（无需写类）**
+
+如果只是临时排查，不想定义 handler 类，`streamEvents` 更轻便：
+
+```ts
+const timers = new Map<string, number>();
+
+for await (const ev of ragChain.streamEvents({ question: "..." }, { version: "v2" })) {
+  if (ev.event.endsWith("_start")) timers.set(ev.run_id, Date.now());
+  if (ev.event.endsWith("_end")) {
+    const t0 = timers.get(ev.run_id);
+    if (t0) console.log(`${ev.name} 耗时 ${Date.now() - t0} ms`);
+  }
+}
+```
+
+**扩展三：交给 LangSmith**
+
+配好 `LANGCHAIN_TRACING_V2=true` 后，上面这些数据会自动以瀑布图呈现，还能跨次对比。自己写 handler 的价值在于**把指标接进你自己的监控系统**（Prometheus、日志平台），两者并不冲突，可以同时开。
+</Answer>
 </Callout>
 
 ## 小结

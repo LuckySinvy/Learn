@@ -184,4 +184,110 @@ CASE 是 SQL 里的 if/else，在行转列、条件聚合（第 8 章）里是�
 1. 查询所有「在售且价格在 100 到 9000 之间」、名称以 iPhone 或 Mac 开头的商品。
 2. 给 users 表插入一行 phone 为 NULL 的数据，然后分别执行 `phone != '13800000001'` 和补上 `OR phone IS NULL` 的两个查询，对比行数差异。
 3. 用 CASE 给 products 写一个查询：输出商品名和库存等级（0 为无货、小于 50 为紧张、其余为充足）。
+
+<Answer>
+**参考答案：**
+
+**1. 多条件组合查询**
+
+```sql
+SELECT id, name, price, stock, status
+FROM products
+WHERE status = 1
+  AND price BETWEEN 100 AND 9000
+  AND (name LIKE 'iPhone%' OR name LIKE 'Mac%');
+```
+
+三个必须注意的点：
+
+- **AND / OR 混用必须加括号**。如果写成 `... AND name LIKE 'iPhone%' OR name LIKE 'Mac%'`，因为 AND 优先级高于 OR，实际语义变成 `(status=1 AND price... AND name LIKE 'iPhone%') OR (name LIKE 'Mac%')`——所有 Mac 开头的商品都会被返回，无视价格和状态条件。
+- `BETWEEN 100 AND 9000` 是**闭区间**，等价于 `price >= 100 AND price <= 9000`。用于数值没问题，但用于日期时要警惕右端点截断问题。
+- `LIKE 'iPhone%'` 是**前缀匹配，能走索引**；若写成 `LIKE '%iPhone%'` 则索引失效退化为全表扫描。
+
+默认排序规则 `utf8mb4_0900_ai_ci` 不区分大小写，所以 `'iphone 15'` 也会被 `LIKE 'iPhone%'` 匹配到。若要严格区分大小写：
+
+```sql
+WHERE name LIKE 'iPhone%' COLLATE utf8mb4_0900_as_cs
+```
+
+**2. NULL 在否定条件下的陷阱**
+
+```sql
+-- 造一行 phone 为 NULL 的数据（本课程 users.phone 是 NOT NULL，
+-- 需要先放开约束才能插 NULL）
+ALTER TABLE users MODIFY COLUMN phone VARCHAR(20) NULL;
+INSERT INTO users (username, email, phone)
+  VALUES ('nobody', 'nobody@demo.com', NULL);
+
+-- 查询 A：不含 NULL 行
+SELECT COUNT(*) FROM users WHERE phone != '13800000001';
+
+-- 查询 B：显式把 NULL 行捞回来
+SELECT COUNT(*) FROM users WHERE phone != '13800000001' OR phone IS NULL;
+```
+
+结果 B 比 A 多 1 行。
+
+**原因**：SQL 是**三值逻辑**（TRUE / FALSE / UNKNOWN）。`NULL != '13800000001'` 的结果既不是 TRUE 也不是 FALSE，而是 **UNKNOWN**；WHERE 只保留结果为 TRUE 的行，UNKNOWN 和 FALSE 一样被丢弃。所以「phone 不等于某个值」这个看似应该包含「phone 没填」的语义，实际把它排除了。
+
+同一个坑的其他变体：
+
+```sql
+SELECT * FROM users WHERE phone NOT IN ('138...', NULL);
+-- 永远返回 0 行！只要 NOT IN 的列表里含 NULL，整个表达式恒为 UNKNOWN
+
+SELECT * FROM users WHERE phone = NULL;      -- 恒为空，必须写 IS NULL
+```
+
+更简洁的写法是用 NULL 安全等值运算符 `<=>` 取反：
+
+```sql
+SELECT COUNT(*) FROM users WHERE NOT (phone <=> '13800000001');
+```
+
+这也正好印证了第 3 章的建议：**能 NOT NULL 就 NOT NULL，配合 DEFAULT `''`**，从源头上避免这类逻辑坑。记得把约束改回去：
+
+```sql
+UPDATE users SET phone = '' WHERE phone IS NULL;
+ALTER TABLE users MODIFY COLUMN phone VARCHAR(20) NOT NULL DEFAULT '';
+```
+
+**3. CASE 输出库存等级**
+
+```sql
+SELECT id,
+       name,
+       stock,
+       CASE
+         WHEN stock = 0  THEN '无货'
+         WHEN stock < 50 THEN '紧张'
+         ELSE '充足'
+       END AS stock_level
+FROM products
+ORDER BY stock;
+```
+
+关键点：**搜索型 CASE（`CASE WHEN 条件`）的分支是自上而下短路求值的**，第一个为 TRUE 的分支胜出。所以 `stock = 0` 必须写在 `stock < 50` 前面——否则 0 也满足 `< 50`，会被判成「紧张」，「无货」分支永远走不到。
+
+两种 CASE 的区别：
+
+```sql
+-- 简单 CASE：只能做等值匹配
+CASE status WHEN 1 THEN '在售' WHEN 2 THEN '下架' ELSE '未知' END
+
+-- 搜索 CASE：可写任意布尔条件（范围、AND/OR、IS NULL）
+CASE WHEN stock = 0 THEN '无货' WHEN stock < 50 THEN '紧张' ELSE '充足' END
+```
+
+不写 `ELSE` 时，所有分支都不匹配会返回 **NULL**，实战中容易造成下游空指针，建议总是补上 ELSE。
+
+进一步：CASE 配合聚合就是第 8 章的「条件聚合」，可以一条 SQL 统计各等级的商品数：
+
+```sql
+SELECT SUM(stock = 0)              AS 无货,
+       SUM(stock > 0 AND stock < 50) AS 紧张,
+       SUM(stock >= 50)            AS 充足
+FROM products;
+```
+</Answer>
 </Callout>

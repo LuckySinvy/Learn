@@ -100,6 +100,110 @@ Rust 不允许返回指向局部变量的引用：
 
 <Callout type="exercise" title="练习">
 写一个 `fn longest(a: &String, b: &String) -> &String` 返回较长字符串的引用（先别管生命周期标注，体会借用）。再故意在持有 `&mut` 的同时又读 `&`，观察编译器的拒绝信息。
+
+<Answer>
+**参考答案：**
+
+**第一部分：longest 函数**
+
+先按题目原样写，你会发现它**编译不过**：
+
+```rust
+fn longest(a: &String, b: &String) -> &String {
+    if a.len() >= b.len() { a } else { b }
+}
+```
+
+```text
+error[E0106]: missing lifetime specifier
+ --> src/main.rs:1:39
+  |
+1 | fn longest(a: &String, b: &String) -> &String {
+  |               -------     -------     ^ expected named lifetime parameter
+  |
+  = help: this function's return type contains a borrowed value, but the
+          signature does not say whether it is borrowed from `a` or `b`
+```
+
+**为什么？** 返回的引用可能来自 `a`，也可能来自 `b`，编译器无法自动推断它该活多久。加上生命周期标注即可（第 15 章会详讲）：
+
+```rust
+fn longest<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if a.len() >= b.len() { a } else { b }
+}
+
+fn main() {
+    let s1 = String::from("hello");
+    let s2 = String::from("hi");
+
+    let result = longest(&s1, &s2);
+    println!("较长的是：{}", result);   // hello
+
+    // s1、s2 的所有权始终没变，依然可用
+    println!("{} / {}", s1, s2);
+}
+```
+
+`<'a>` 的含义是：「返回的引用，其有效期不超过 `a` 和 `b` 中较短的那个」。这里用 `&str` 而非 `&String`，接口更通用。
+
+**第二部分：制造借用冲突**
+
+```rust
+fn main() {
+    let mut s = String::from("hello");
+
+    let r1 = &s;          // 不可变借用
+    let r2 = &mut s;      // ❌ 可变借用 —— 与 r1 冲突
+
+    println!("{} {}", r1, r2);   // r1 在这里仍被使用，所以冲突真实存在
+}
+```
+
+**编译器的拒绝信息：**
+
+```text
+error[E0502]: cannot borrow `s` as mutable because it is also borrowed as immutable
+ --> src/main.rs:5:14
+  |
+4 |     let r1 = &s;
+  |              -- immutable borrow occurs here
+5 |     let r2 = &mut s;
+  |              ^^^^^^ mutable borrow occurs here
+6 |
+7 |     println!("{} {}", r1, r2);
+  |                       -- immutable borrow later used here
+```
+
+**两个可变借用同时存在也不行：**
+
+```rust
+let mut s = String::from("hello");
+let r1 = &mut s;
+let r2 = &mut s;      // ❌ error[E0499]: cannot borrow `s` as mutable more than once
+println!("{} {}", r1, r2);
+```
+
+**关键洞察：NLL 让借用「用完即止」**
+
+把 `println!` 调整一下顺序，同样的代码就合法了：
+
+```rust
+fn main() {
+    let mut s = String::from("hello");
+
+    let r1 = &s;
+    println!("{}", r1);   // r1 最后一次使用 → 不可变借用到此结束
+
+    let r2 = &mut s;      // ✅ 现在可以可变借用了
+    r2.push_str(" world");
+    println!("{}", r2);
+}
+```
+
+这就是**非词法生命周期（NLL）**：借用的存活期到「最后一次使用」为止，而不是到作用域结尾。所以判断会不会冲突，要看的是**引用的实际使用范围是否重叠**，而不是它们声明在哪个花括号里。
+
+**这条规则的意义：** 「同时只能有一个可变借用，或任意多个不可变借用」在编译期就杜绝了数据竞争——不会有人在别人读的时候偷偷改，也不会两处同时改。等到第 19、20 章讲多线程时你会发现，正是这同一套规则让 Rust 敢自称「无畏并发」。
+</Answer>
 </Callout>
 
 ## 小结

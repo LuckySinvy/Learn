@@ -97,6 +97,58 @@ sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
 
 <Callout type="exercise" title="练习">
 为你的服务创建一块仪表盘，包含：①Time series 显示 QPS；②Stat 显示当前错误率并设阈值变红；③Table 显示 Top 5 慢接口。把 JSON 导出保存。
+
+<Answer>
+**参考答案：**
+
+按「三个面板 + 一个导出」来做。指标名以你服务实际埋点为准，这里用最常见的 `http_requests_total` 演示。
+
+**① Time series 显示 QPS**
+
+可视化选 **Time series**，查询：
+
+```promql
+sum by (method) (rate(http_requests_total[5m]))
+```
+
+按 `method` 分组，能看到各接口方法各自的变化趋势。
+
+**② Stat 显示错误率 + 阈值变红**
+
+可视化选 **Stat**，查询：
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+在 **Thresholds** 里设两档：
+
+- 绿色：`Base`（默认，≤5%）
+- 红色：`0.05` 以上
+
+Unit 设 `percentunit`（或直接显示小数）。打开 Sparkline，数字下方能看到小走势线。
+
+**③ Table 显示 Top 5 慢接口**
+
+可视化选 **Table**，查询（按接口分组的 P95 延迟，取前 5）：
+
+```promql
+topk(5, histogram_quantile(0.95, sum by (le, path) (rate(http_request_duration_seconds_bucket[5m]))))
+```
+
+如果直方图的标签叫 `handler` / `route`，把 `path` 换成对应标签即可。
+
+**④ 导出 JSON 保存**
+
+1. 点仪表盘右上角 **Share（分享）** 图标
+2. 切到 **Export** 标签页
+3. 点 **Save to file** 下载 JSON
+4. 把 JSON 存进仓库（如 `dashboards/qps.json`），后续可用 Provisioning 自动加载，纳入版本管理
+
+**检查清单：** QPS 有曲线；Stat 错误率超过 5% 时变红；Table 只出现 5 行最慢接口；JSON 文件已落盘。
+</Answer>
 </Callout>
 
 ## 小结

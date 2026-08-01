@@ -111,6 +111,48 @@ Transform 链：
 
 <Callout type="exercise" title="练习">
 把「各实例 CPU」「各实例内存」「各实例磁盘」三个查询用 Merge + Organize fields 拼成一张 Table，并按磁盘使用率降序排列。
+
+<Answer>
+**参考答案：**
+
+三个查询（查询 A / B / C，node-exporter 指标，按 `instance` 对齐）：
+
+**查询 A — 各实例 CPU**
+
+```promql
+100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+```
+
+**查询 B — 各实例内存**
+
+```promql
+(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100
+```
+
+**查询 C — 各实例磁盘**
+
+只统计根分区，避免 tmpfs 等干扰：
+
+```promql
+(node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_free_bytes{mountpoint="/"}) / node_filesystem_size_bytes{mountpoint="/"} * 100
+```
+
+**Transform 链（按顺序）：**
+
+1. **Merge**：把三个查询结果按 `instance` 拼成一张宽表
+2. **Organize fields**：重命名、调顺序、隐藏无用列，例如：
+   - `Value #A` → `CPU 使用率`
+   - `Value #B` → `内存使用率`
+   - `Value #C` → `磁盘使用率`
+   - 隐藏 `Time`、`__name__` 等列
+3. **Sort by**：选字段 `磁盘使用率`，方向 **Descending（降序）**
+
+**易错点：**
+
+- CPU 查询里必须保留 `instance` 标签（用 `by (instance)`），Merge 才有共同的关联字段
+- 若查询返回的是多个时间点的序列，先加一步 **Reduce**（Mode 选 `Last`）把每实例压成一行，再 Merge，效果更干净
+- 结果里磁盘占用最高的实例排最上面，配合 Table 的阈值着色能一眼看到危险实例
+</Answer>
 </Callout>
 
 ## 小结

@@ -177,4 +177,199 @@ Kafka 的 EOS（exactly-once semantics）指的是 **"消费-处理-再生产" �
 1. 建一个 3 副本 topic 并设 min.insync.replicas=2，停掉两个 broker 后用 acks=all 发消息，观察 NotEnoughReplicasException。
 2. 写一个事务 Producer，在两条 send 之间抛异常触发 abortTransaction，用 read_committed 与 read_uncommitted 两种消费者分别验证可见性差异。
 3. 启动两个使用相同 transactional.id 的 Producer，观察第一个实例的 ProducerFencedException。
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · 触发 NotEnoughReplicasException**
+
+```bash
+# 1) 建 3 副本 topic，并把 min.insync.replicas 设为 2
+bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic isr-demo --partitions 1 --replication-factor 3 \
+  --config min.insync.replicas=2
+
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic isr-demo
+# Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3
+
+# 2) 先确认正常情况能写成功
+echo "before" | bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic isr-demo --request-required-acks all
+
+# 3) 停掉两个 follower（保留 leader 所在的 broker）
+docker stop kafka2 kafka3
+sleep 15
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic isr-demo
+# Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1     <- ISR 只剩 1 个
+
+# 4) 再用 acks=all 发送
+echo "after" | bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic isr-demo --request-required-acks all
+```
+
+报错：
+
+```text
+ERROR Error when sending message to topic isr-demo with key: null, value: 5 bytes
+org.apache.kafka.common.errors.NotEnoughReplicasException: Messages are rejected
+since there are fewer in-sync replicas than required.
+```
+
+**发生了什么**：`min.insync.replicas=2` 是一个**服务端强制的写入门槛**。当 `acks=all` 时，leader 在接收写入前会先检查"当前 ISR 大小是否 ≥ min.insync.replicas"，不满足就直接拒绝，连数据都不会落盘。
+
+这套机制的设计意图值得细品：
+
+- 只剩 1 个副本时如果还允许写入，这台机器一旦挂掉，刚写进去的数据就**永久丢失**且无法恢复。
+- Kafka 在这里选择了**牺牲可用性来保证不丢数据**（CAP 里偏 CP）。宁可让写入失败让上游感知到，也不要静默地把数据写进一个随时会消失的地方。
+
+**由此得出本章最重要的一条结论**：`acks=all` 单独用是**不完整**的。`acks=all` 的语义只是"等 ISR 中所有副本确认"，如果 ISR 已经缩水到只剩 leader 一个，那 `acks=all` 就退化成了 `acks=1`——**表面上你配了最高可靠性，实际上一台机器宕机就丢数据，而且毫无报错**。只有配上 `min.insync.replicas=2`，才能把这种静默退化变成显式失败。
+
+`min.insync.replicas` 也可以在 broker 级别配默认值，或对已有 topic 动态修改：
+
+```bash
+bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --entity-type topics --entity-name isr-demo \
+  --add-config min.insync.replicas=2
+```
+
+**为什么推荐 3 副本 + min.insync=2 而不是 3 副本 + min.insync=3**：后者要求三个副本全在 ISR 才能写，任意一台机器重启（哪怕是滚动升级）都会让整个 topic 不可写。`3 + 2` 的组合允许挂掉一台仍可正常写入，是可用性和可靠性的最佳平衡点。
+
+**注意**：客户端侧还要确认 `acks` 真的是 `all`。如果 Producer 配的是 `acks=1`，即使 ISR 只剩 1 个也**不会报错**——`min.insync.replicas` 只对 `acks=all` 生效，这是个常见误解。
+
+**第 2 题 · 事务回滚与两种隔离级别的可见性**
+
+```java
+Properties props = new Properties();
+props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "tx-demo-01");
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+producer.initTransactions();
+
+// --- 事务 A: 正常提交 ---
+producer.beginTransaction();
+producer.send(new ProducerRecord<>("tx-demo", "k1", "COMMITTED-1"));
+producer.send(new ProducerRecord<>("tx-demo", "k1", "COMMITTED-2"));
+producer.commitTransaction();
+
+// --- 事务 B: 中途异常 -> 回滚 ---
+try {
+    producer.beginTransaction();
+    producer.send(new ProducerRecord<>("tx-demo", "k2", "ABORTED-1")).get();
+    if (true) throw new RuntimeException("业务异常");   // 模拟处理失败
+    producer.send(new ProducerRecord<>("tx-demo", "k2", "ABORTED-2"));
+    producer.commitTransaction();
+} catch (Exception e) {
+    System.out.println("回滚: " + e.getMessage());
+    producer.abortTransaction();
+}
+producer.close();
+```
+
+两种消费者对比：
+
+```bash
+# read_uncommitted（默认）—— 能看到被回滚的消息
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic tx-demo --from-beginning --timeout-ms 5000 \
+  --isolation-level read_uncommitted
+
+# read_committed —— 只能看到已提交的消息
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic tx-demo --from-beginning --timeout-ms 5000 \
+  --isolation-level read_committed
+```
+
+结果对照：
+
+| 隔离级别 | 读到的消息 |
+|---|---|
+| `read_uncommitted`（默认） | `COMMITTED-1`、`COMMITTED-2`、`ABORTED-1` |
+| `read_committed` | `COMMITTED-1`、`COMMITTED-2` |
+
+**关键认知一：回滚不是删除。** `ABORTED-1` 这条消息**确实已经物理写进了日志文件**，`abortTransaction()` 做的只是追加一条 **abort 类型的控制记录（control record）**。数据还在磁盘上，只是被打上了"这批不算数"的标记。
+
+**关键认知二：过滤发生在消费端。** 配置 `isolation.level=read_committed` 的消费者会：
+
+1. 只读到 **LSO（Last Stable Offset）** 为止的数据。LSO 是"最早的那个仍未决的事务的起始位置"，未决事务之后的消息即使已提交也读不到，必须等前面的事务尘埃落定。
+2. 在客户端根据控制记录**过滤掉被 abort 的批次**，同时也不把控制记录本身返回给业务代码。
+
+**关键认知三：事务 Producer 的默认值会被强制修改。** 一旦设置 `transactional.id`，Kafka 会自动把 `enable.idempotence` 设为 `true`、`acks` 设为 `all`、`retries` 设为 `Integer.MAX_VALUE`。如果你显式配了冲突的值（比如 `acks=1`），启动时会直接抛 `ConfigException`。
+
+**两个实践要点**：
+
+- **只用事务 Producer 而消费端仍是默认的 `read_uncommitted`，事务就白做了**——被回滚的消息照样被下游消费。事务是"生产端 + 消费端"两侧配合才成立的。
+- `read_committed` 会引入额外延迟：消费者必须等事务提交后才能读到消息，所以延迟至少是"事务时长"级别。对延迟敏感的链路要权衡，或者把事务做小做短。
+
+**第 3 题 · ProducerFencedException（僵尸实例隔离）**
+
+用同一份代码启动两个进程，`transactional.id` 都写死为 `tx-fence-01`：
+
+```java
+Properties props = new Properties();
+props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "tx-fence-01");  // 两个进程完全相同
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+producer.initTransactions();
+System.out.println("initTransactions 完成，开始循环发送");
+
+for (int i = 0; ; i++) {
+    try {
+        producer.beginTransaction();
+        producer.send(new ProducerRecord<>("fence-demo", "msg-" + i)).get();
+        producer.commitTransaction();
+        System.out.println("已提交 #" + i);
+        Thread.sleep(2000);
+    } catch (ProducerFencedException e) {
+        System.out.println("!!! 被 fence 了: " + e.getMessage());
+        producer.close();      // 只能关闭退出，不能 abort 也不能继续用
+        return;
+    }
+}
+```
+
+操作顺序与现象：
+
+```text
+[进程 A] 先启动，正常循环
+  已提交 #0
+  已提交 #1
+  已提交 #2
+
+[进程 B] 此时启动，也用 tx-fence-01
+  initTransactions 完成，开始循环发送
+  已提交 #0
+
+[进程 A] 下一次 commit 时立刻挂掉
+  !!! 被 fence 了: Producer attempted an operation with an old epoch.
+      Either there is a newer producer with the same transactionalId,
+      or the producer's transaction has been expired by the broker.
+```
+
+**原理**：事务协调器为每个 `transactional.id` 维护一个单调递增的 **epoch**。新 Producer 调用 `initTransactions()` 时，协调器会把 epoch 加一，并**主动 abort 掉旧 epoch 遗留的未决事务**。之后任何携带旧 epoch 的请求都会被拒绝，抛出 `ProducerFencedException`。
+
+**这个机制解决的真实问题**是"僵尸实例"：假设服务实例 A 发生长时间 GC 或网络分区，被编排系统判定为死亡并拉起了实例 B；结果 A 又活了过来，继续往 Kafka 写数据 —— 这时 A 和 B 会写出重复甚至互相冲突的数据。epoch fencing 保证**同一个 `transactional.id` 在任意时刻只有最新的那个实例能写入**，老实例被彻底封死。
+
+**因此 `transactional.id` 的命名规则至关重要**，必须同时满足两个看似矛盾的要求：
+
+| 要求 | 原因 |
+|---|---|
+| **实例之间唯一** | 否则多个正常运行的实例会互相 fence，形成"你踢我我踢你"的死循环，谁都写不进去 |
+| **同一实例重启后保持不变** | 协调器靠这个 ID 找到上次的事务状态并完成恢复（提交或回滚未决事务）；每次随机生成的话，遗留的未决事务永远悬在那里，会一直阻塞 `read_committed` 消费者的 LSO |
+
+常见的正确取值：
+
+- Kafka Streams 场景：框架自动生成 `应用ID-任务ID`；
+- 自研消费-处理-生产链路：用 `服务名-输入分区号`（分区归属稳定，重启后仍能拿回同一个 ID）；
+- K8s StatefulSet：用 `服务名-有序序号`（Pod 名天然稳定）。
+
+**反面教材**：用 `UUID.randomUUID()` 或 `服务名 + 时间戳`。这样虽然不会误 fence，但每次重启都会在协调器里留下一个再也不会被清理的事务状态，日积月累拖垮 `__transaction_state`，同时未决事务会卡住 LSO 让下游 `read_committed` 消费者永久积压。
+
+**最后注意异常处理姿势**：捕获 `ProducerFencedException` 后**只能 `close()` 退出**，不能调 `abortTransaction()`（会再抛异常），也不能重新 `initTransactions()` 继续用（那等于把对方 fence 回去，形成拉锯）。正确做法是让进程退出，交给编排系统处理。这也是为什么章节示例代码里 `ProducerFencedException` 和普通 `KafkaException` 要**分开两个 catch 块**——前者退出，后者回滚重试。
+</Answer>
 </Callout>

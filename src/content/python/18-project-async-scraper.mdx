@@ -330,6 +330,45 @@ asyncio.run(main())`}
 - `async def one(url): async with sem: return await asyncio.wait_for(raw_fetch(url), timeout)`
 - `results = await asyncio.gather(*(one(u) for u in urls), return_exceptions=True)`
 - 分类：成功 = `isinstance(r, dict)`；超时 = `isinstance(r, asyncio.TimeoutError)`；其他 = `isinstance(r, BaseException)`
+
+<Answer>
+
+**参考答案：**
+
+```python
+import asyncio
+
+async def fetch_many(urls, concurrency=5, timeout=0.2):
+    sem = asyncio.Semaphore(concurrency)   # 同时最多 concurrency 个在跑
+
+    async def one(url):
+        async with sem:                    # 抢到信号量才执行
+            return await asyncio.wait_for(raw_fetch(url), timeout=timeout)
+
+    results = await asyncio.gather(
+        *(one(u) for u in urls),
+        return_exceptions=True,            # 单个失败不拖垮其他任务
+    )
+
+    success = timeout = fail = 0
+    for r in results:
+        if isinstance(r, dict):
+            success += 1
+        elif isinstance(r, asyncio.TimeoutError):
+            timeout += 1
+        elif isinstance(r, BaseException):
+            fail += 1
+
+    return {"success": success, "fail": fail, "timeout": timeout}
+```
+
+要点：
+
+- `Semaphore(concurrency)` 把并发上限压到 5，即使 `urls` 有 20 个，同一时刻最多 5 个在跑。
+- `asyncio.wait_for(..., timeout)` 给每个请求加超时，超时抛 `asyncio.TimeoutError`。
+- `return_exceptions=True` 让失败的协程把异常作为结果返回，而不是中断 `gather`。
+- 分类时 `asyncio.TimeoutError` 必须先于 `BaseException` 判断，否则超时会被误算进普通失败里。
+</Answer>
 </Callout>
 
 ## 小结

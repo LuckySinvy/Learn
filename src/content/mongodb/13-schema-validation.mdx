@@ -472,6 +472,158 @@ db.runCommand({
 
 <Callout type="exercise" title="练习">
 一、给 `users` 集合写一份完整的 `$jsonSchema`，要求用户名唯一格式、邮箱格式、年龄范围、`profile.city` 必填；二、故意插入三条各违反不同规则的文档，把错误信息里的 `schemaRulesNotSatisfied` 读懂；三、用 `$nor` 加 schema 反查出集合里所有不合规的存量文档并统计数量；四、写一个 `$expr` 校验规则，要求「已发布的帖子必须有 publishedAt 且不能早于 createdAt」；五、设计一个 schema 从 v1 到 v2 的演进方案（v1 用 `authorId`，v2 用内嵌 `author` 对象），写出惰性迁移和后台批量脚本；六、解释为什么顶层不建议设 `additionalProperties: false`。
+
+<Answer>
+**参考答案：**
+
+**一、`users` 集合的完整 `$jsonSchema`**
+
+```js
+db.createCollection("users", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["username", "email", "profile", "createdAt"],
+      properties: {
+        username: {
+          bsonType: "string",
+          minLength: 3,
+          maxLength: 32,
+          pattern: "^[a-zA-Z0-9_]+$"      // 用户名格式：字母数字下划线
+        },
+        email: {
+          bsonType: "string",
+          pattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"   // 邮箱格式
+        },
+        age: {
+          bsonType: "int",                // 注意：mongosh 数字字面量是 double，插入要用 NumberInt
+          minimum: 0,
+          maximum: 150
+        },
+        profile: {
+          bsonType: "object",
+          required: ["city"],             // profile.city 必填
+          properties: {
+            city: { bsonType: "string", minLength: 1 },
+            bio: { bsonType: "string", maxLength: 500 }
+          }
+        },
+        createdAt: { bsonType: "date" }
+      }
+    }
+  },
+  validationLevel: "strict",
+  validationAction: "error"
+})
+```
+
+注意：「用户名唯一」这个约束 `$jsonSchema` 表达不了（它是单文档结构约束），需要配合唯一索引：`db.users.createIndex({ username: 1 }, { unique: true })`。二者互补。
+
+**二、插入三条违规文档，读懂错误信息**
+
+```js
+// 违规 1：用户名只有 2 个字符（违反 minLength）
+db.users.insertOne({ username: "ab", email: "a@b.com", profile: { city: "Beijing" }, createdAt: new Date() })
+
+// 违规 2：邮箱格式错误
+db.users.insertOne({ username: "validuser", email: "not-an-email", profile: { city: "Beijing" }, createdAt: new Date() })
+
+// 违规 3：age 超出范围（且类型是 double 而非 int）
+db.users.insertOne({ username: "validuser2", email: "a2@b.com", profile: { city: "Beijing" }, age: 200, createdAt: new Date() })
+```
+
+每次都会返回 `code: 121, codeName: "DocumentValidationFailure"`。在 `errInfo.details.schemaRulesNotSatisfied` 里，依次是「哪条大规则不满足 → 哪个字段不满足 → 哪条具体规则（如 `minLength` / `pattern` / `maximum`）→ `consideredValue` 是被拒绝的实际值」。用这个信息就能精确定位修复点，不用猜。
+
+**三、用 `$nor` 反查所有不合规存量文档**
+
+```js
+const schema = db.getCollectionInfos({ name: "users" })[0].options.validator
+
+db.users.countDocuments({ $nor: [schema] })   // 不合规总数
+db.users.find({ $nor: [schema] }).limit(10)   // 抽样查看
+```
+
+`$nor` 对每条文档「不满足 schema 才算命中」，天然构成「不合规」的查询。注意此查询不利用索引（schema 条件通常无法走索引），小集合没问题，大集合应分批。
+
+**四、`$expr` 校验：已发布帖子必须带 publishedAt 且不早于 createdAt**
+
+```js
+db.runCommand({
+  collMod: "posts",
+  validator: {
+    $and: [
+      { $jsonSchema: { bsonType: "object", required: ["status", "createdAt"] } },
+      { $or: [
+          { status: { $ne: "published" } },                 // 非发布态：不要求
+          { $and: [
+              { publishedAt: { $exists: true } },           // 发布态：必须有 publishedAt
+              { $expr: { $gte: ["$publishedAt", "$createdAt"] } }   // 且不早于 createdAt
+          ] }
+      ] }
+    ]
+  }
+})
+```
+
+逻辑拆解：`$or` 的两支是「要么不是 published（豁免），要么满足发布要求」。发布要求由 `$exists` 和 `$expr` 共同保证，其中 `$expr` 完成字段间比较——这是 `$jsonSchema` 表达不了的。
+
+**五、schema v1 → v2 演进（authorId → 内嵌 author）**
+
+```js
+// v1 文档形态
+{ _id: ..., title: "...", authorId: ObjectId("...101"), createdAt: ... }
+// v2 文档形态
+{ _id: ..., title: "...", author: { _id: ObjectId("...101"), username: "alice" }, schemaVersion: 2, ... }
+```
+
+**惰性迁移（应用层，读取时兼容）：**
+
+```js
+function getPost(id) {
+  const post = db.posts.findOne({ _id: id })
+  if (!post.schemaVersion || post.schemaVersion < 2) {
+    return migrateV1ToV2(post)      // 读时转换，并可异步回写
+  }
+  return post
+}
+
+function migrateV1ToV2(post) {
+  const user = db.users.findOne({ _id: post.authorId })
+  const v2 = {
+    ...post,
+    author: { _id: post.authorId, username: user.username },
+    schemaVersion: 2
+  }
+  db.posts.replaceOne({ _id: post._id }, v2)   // 回写，下次不再走老分支
+  return v2
+}
+```
+
+**后台批量脚本（按 `_id` 分批推进）：**
+
+```js
+let lastId = null
+while (true) {
+  const batch = db.posts.find({
+    $or: [ { schemaVersion: { $exists: false } }, { schemaVersion: { $lt: 2 } } ],
+    ...(lastId ? { _id: { $gt: lastId } } : {})
+  }).sort({ _id: 1 }).limit(10000).toArray()
+
+  if (batch.length === 0) break
+  for (const post of batch) migrateV1ToV2(post)
+  lastId = batch[batch.length - 1]._id
+  sleep(1000)   // 观察复制延迟后再继续
+}
+// 进度检查
+db.posts.countDocuments({ $or: [ { schemaVersion: { $exists: false } }, { schemaVersion: { $lt: 2 } } ] })
+```
+
+核心要点：应用层先兼容双版本，后台脚本推进时所有文档都能被安全读写；等 v1 数量归零，再删掉 `migrateV1ToV2` 兼容代码。
+
+**六、为什么顶层不建议 `additionalProperties: false`**
+
+顶层设 `false` 后，任何 schema 未声明的字段都会被拒绝写入。这样做的坏处：**加新字段必须先改 schema 再发版**——灰度上线新功能时，新版本代码已写入新字段、旧 schema 还拦着，顺序稍错就是线上事故。顶层保留默认 `true`，只在字段高度稳定的内嵌结构上设 `false`（防止拼写错误），同时保留演进空间，是最稳妥的取舍。
+</Answer>
 </Callout>
 
 ## 小结

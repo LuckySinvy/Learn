@@ -453,6 +453,114 @@ db.posts.watch([
 
 <Callout type="exercise" title="练习">
 一、在一个 mongosh 窗口开 `db.posts.watch()`，另一个窗口做增删改，观察三种 `operationType` 的事件结构差异；二、开启 `fullDocument: "updateLookup"` 后重做一遍，对比 update 事件的变化；三、写一个带 resume token 持久化的消费者（token 存到一个 `_cdcState` 集合里），中途 kill 掉再重启，验证不丢事件；四、写一个只监听「用户名或头像变更」的过滤管道；五、用 `rs.printReplicationInfo()` 查看你的 oplog 窗口有多长，计算消费者最多能停机多久；六、实现第 7.1 节的用户名同步，并思考如果同一用户在 1 秒内改名 3 次会发生什么。
+
+<Answer>
+**参考答案：**
+
+**一、观察三种 operationType 的事件结构差异**
+
+终端 1（订阅）：
+
+```js
+const cs = db.posts.watch()
+while (cs.hasNext()) {
+  printjson(cs.next())
+}
+```
+
+终端 2（依次执行）：
+
+```js
+db.posts.insertOne({ _id: 600, title: "测试", authorId: "alice" })
+db.posts.updateOne({ _id: 600 }, { $set: { title: "改名" } })
+db.posts.deleteOne({ _id: 600 })
+```
+
+对照收到的事件：
+
+- **insert**：带 `fullDocument`（完整新文档），`documentKey` 是 `{ _id: 600 }`。
+- **update**：**没有** `fullDocument`，只有 `updateDescription.updatedFields`（`{ title: "改名" }`）；`documentKey` 仍在。
+- **delete**：最精简，只有 `operationType`、`ns`、`documentKey`，连 `updateDescription` 都没有。
+
+三者共同点：都带 `_id`（resume token）和 `clusterTime`。
+
+**二、开启 `fullDocument: "updateLookup"` 对比**
+
+```js
+const cs = db.posts.watch([], { fullDocument: "updateLookup" })
+```
+
+同样执行上面的 update 后，update 事件现在多了一个 `fullDocument` 字段，内容是**查询那一刻**文档的完整状态（含 title 等所有字段）。注意它不一定等于「变更后立即的状态」——如果同一文档被连续改了几次，多个事件的 fullDocument 可能都是最终态。而 delete 事件即使开启 `updateLookup` 也不带 fullDocument（文档已不存在）。
+
+**三、带 resume token 持久化的消费者**
+
+```js
+// _cdcState 集合存 token
+function loadToken() {
+  const s = db._cdcState.findOne({ _id: "posts" })
+  return s ? s.token : null
+}
+function saveToken(token) {
+  db._cdcState.updateOne(
+    { _id: "posts" },
+    { $set: { token, updatedAt: new Date() } },
+    { upsert: true }
+  )
+}
+
+let resumeToken = loadToken()
+const options = { fullDocument: "updateLookup" }
+if (resumeToken) options.resumeAfter = resumeToken
+
+const cs = db.posts.watch([], options)
+while (cs.hasNext()) {
+  const change = cs.next()
+  processChange(change)          // 业务处理
+  saveToken(change._id)          // 先处理再存 token → at-least-once
+}
+```
+
+验证不丢事件：插入几条文档让消费者处理，**在 `saveToken` 执行前用 `Ctrl+C` 杀掉 mongosh**，重启后再跑上面的代码。因为 `resumeAfter` 指向旧 token，重启后会**重放**那些未保存 token 的事件——事件可能重复，但不会丢失（at-least-once）。配合幂等处理逻辑即可。
+
+**四、只监听「用户名或头像变更」的过滤管道**
+
+```js
+const cs = db.users.watch([
+  { $match: {
+      operationType: "update",
+      $or: [
+        { "updateDescription.updatedFields.username": { $exists: true } },
+        { "updateDescription.updatedFields.profile.avatar": { $exists: true } }
+      ]
+  } }
+])
+```
+
+只有这两个字段被 `$set` / `$inc` 等修改时才会推送；改其他字段（比如密码哈希）不会触发。注意管道里**不要 project 掉 `_id`**，否则流无法恢复。
+
+**五、查看 oplog 窗口并估算最大停机时间**
+
+```js
+rs.printReplicationInfo()
+```
+
+```text
+configured oplog size:   51200MB
+log length start to end: 86400secs (24hrs)
+oplog first event time:  Mon Jun 03 2024 09:00:00
+oplog last event time:   Tue Jun 04 2024 09:00:00
+```
+
+`log length start to end: 86400secs` 就是窗口长度——**消费者最多只能停机 24 小时**。超过后 resume token 指向的 oplog 位置已被覆盖，恢复时报 `ChangeStreamHistoryLost`，只能全量重同步。所以监控指标应该是「消费延迟」和「oplog 窗口剩余时间」，告警阈值要远小于 24 小时。
+
+**六、用户名同步，以及 1 秒内改名 3 次的问题**
+
+参考 7.1 节的实现：监听 `username` 变更 → 取新名字 → `updateMany` 更新 posts / comments 里的 `author.username` → `saveToken`。
+
+**如果同一用户在 1 秒内改名 3 次会发生什么？** 会产生 3 个 update 变更事件，消费者按顺序逐个处理，每次把冗余字段改成当时的最新值，最终 `author.username` 收敛到最后一次的名字。只要消费者按 token 顺序处理、且处理逻辑只依赖事件里的值（不依赖「读出来的旧值」），就不会出错。但如果开启 `fullDocument: "updateLookup"`，多次事件的 fullDocument 可能都指向同一个最终态，此时以处理完的最后一个事件为准即可。
+
+风险点：如果消费者并行处理同一用户的事件，顺序可能颠倒。**同一 `documentKey` 的事件必须路由到同一个消费者串行处理**（见第 8 节），这是并行消费场景下的关键约束。
+</Answer>
 </Callout>
 
 ## 小结

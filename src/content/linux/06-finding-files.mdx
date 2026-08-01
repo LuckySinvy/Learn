@@ -202,4 +202,64 @@ sudo updatedb            # 手动重建索引（通常由 cron 每天自动跑�
 2. 用 `truncate -s` 制造 500K、2M、20M 三个文件，写出找出"大于 1M 且小于 10M"文件的 find 命令并验证。
 3. 用 `touch -d '40 days ago'` 制造旧文件，实现运维经典需求："找出 30 天以前的 .log 并删除"——要求先打印确认列表，再执行删除，最后验证结果。
 4. 分别运行 `type cd`、`type ls`、`which cd`，解释为什么 which 找不到 cd。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：找出所有 .py 或 .md 文件**
+
+```bash
+mkdir -p proj/src proj/docs
+touch proj/src/a.py proj/src/b.py proj/docs/README.md proj/docs/todo.md proj/x.tmp
+
+find proj \( -name '*.py' -o -name '*.md' \)
+```
+
+括号在 Shell 里需要转义（`\(` 与 `\)`）或者加引号，否则会被当成分组语法；`-o` 表示 OR。也可以写 `find proj -name '*.py' -o -name '*.md'`，但这样 `.tmp` 文件也会被列出来（OR 的优先级会破坏默认的 AND 语义），所以练习里特意强调用括号分组。
+
+**第 2 题：大于 1M 且小于 10M**
+
+```bash
+truncate -s 500K  small.bin
+truncate -s 2M    medium.bin
+truncate -s 20M   big.bin
+
+find . -maxdepth 1 -type f -size +1M -size -10M
+# 输出 ./medium.bin
+```
+
+多个条件并列默认是 AND：`+1M` 排除 small.bin，`-10M` 排除 big.bin，只剩 2M 的 medium.bin。
+
+**第 3 题：找出 30 天前的 .log 并删除（先预演再删）**
+
+```bash
+# 构造演示文件
+touch -d '40 days ago' old1.log
+touch -d '5 days ago'  recent.log
+touch new.log
+
+# 第一步：先打印确认列表（不带 -delete）
+find . -name '*.log' -mtime +30
+# 预期只输出 ./old1.log
+
+# 第二步：确认无误后执行删除
+find . -name '*.log' -mtime +30 -delete
+
+# 第三步：验证
+find . -name '*.log'
+# 只剩 recent.log 和 new.log
+```
+
+`-mtime +30` 表示"超过 30 天未修改"，`-delete` 必须放在所有条件**之后**。
+
+**第 4 题：为什么 which 找不到 cd**
+
+```bash
+type cd    # cd is a shell builtin（Shell 内建命令）
+type ls    # ls is /bin/ls（外部程序）
+which cd   # 无输出，或报错 not found
+```
+
+`cd` 是 **Shell 内建命令**——它要改变当前 Shell 进程自己的工作目录，必须内建在 Shell 里，根本没有独立的可执行文件。`which` 只负责在 `PATH` 目录里找**外部程序文件**，所以找不到 cd。`ls` 是外部程序，`type ls` 会显示它的绝对路径，`which ls` 也能找到。
+</Answer>
 </Callout>

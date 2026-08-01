@@ -280,6 +280,142 @@ console.log("合并后仍能访问 PI:", Geometry.PI);`}
 1. 在项目里建一个 `types/shims.d.ts`，给一个虚构的包 `tiny-cache` 补上 `get`／`set` 两个函数的类型声明，并在业务文件里 import 它验证补全生效。
 2. 打开 `verbatimModuleSyntax`，把项目里所有只用于类型的 import 改成 `import type`，观察产物体积和编译错误的变化。
 3. 用 `declare global` 给全局加一个 `__BUILD_TIME__: string`，并解释为什么必须先写 `export {}`。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：给 tiny-cache 补声明**
+
+新建 `types/shims.d.ts`：
+
+```ts
+declare module "tiny-cache" {
+  export interface CacheOptions {
+    /** 过期时间（毫秒），不传表示永不过期 */
+    ttl?: number;
+    maxSize?: number;
+  }
+
+  export function get<T = unknown>(key: string): T | undefined;
+  export function set<T>(key: string, value: T, options?: CacheOptions): void;
+
+  const _default: {
+    get: typeof get;
+    set: typeof set;
+  };
+  export default _default;
+}
+```
+
+业务文件里就能正常使用并获得补全：
+
+```ts
+import { get, set } from "tiny-cache";
+import type { CacheOptions } from "tiny-cache";
+
+const opts: CacheOptions = { ttl: 60_000 };
+set<{ id: number; name: string }>("user:1", { id: 1, name: "Ada" }, opts);
+
+const user = get<{ id: number; name: string }>("user:1");
+console.log(user?.name);   // 编辑器能正确补全 .name
+```
+
+要点：
+
+- 确保 `types/` 目录被 tsconfig 的 `include` 覆盖（或显式加进 `typeRoots`），否则声明不会生效。
+- `declare module "tiny-cache"` 这种「整包声明」必须写在一个**全局脚本**里，也就是这个 `.d.ts` **不能有顶层 `import` / `export`**。一旦加了，它就变成模块，`declare module` 的含义会从「声明一个新模块」变成「增强已有模块」——这正是第 3 题要讨论的区别。
+- 给函数加泛型参数 `<T = unknown>` 而不是直接返回 `any`，能把类型安全一路传递给调用方。默认值设为 `unknown` 而非 `any`，逼迫调用方要么显式指定类型、要么先做收窄。
+- 这是「都没有类型」情况下的兜底方案。动手写之前先确认一下 `npm i -D @types/tiny-cache` 是否存在，社区已有的类型总比自己手搓的完整。
+
+**第 2 题：verbatimModuleSyntax 与 import type**
+
+```json
+{
+  "compilerOptions": {
+    "verbatimModuleSyntax": true
+  }
+}
+```
+
+开启后，任何只用于类型的导入若没写 `type` 关键字，都会报错：
+
+```text
+TS1484: “User”是一个类型，在启用 "verbatimModuleSyntax" 时必须使用仅类型导入进行导入。
+```
+
+改法有两种风格，二选一在团队里统一即可：
+
+```ts
+// 风格 A：整句类型导入
+import type { User, Role } from "./models.js";
+import { createUser } from "./models.js";
+
+// 风格 B：内联 type（一句搞定，减少 import 行数）
+import { type User, type Role, createUser } from "./models.js";
+```
+
+**能观察到的变化：**
+
+1. **产物更干净。** `verbatimModuleSyntax` 的核心语义是「**import / export 语句原样保留，不做任何智能删除**」。没有 `type` 标记的导入一律保留在产物里，带 `type` 的整句消失。这消除了旧版编译器「猜测哪些 import 可以删」带来的不确定性——各种打包器、`isolatedModules` 转译器对这件事的判断并不一致。
+
+2. **可能暴露出真实的循环依赖。** 之前编译器帮你把某个只用于类型的 import 删掉了，循环恰好被消解；现在它被保留，运行时就真的循环了。这类问题被提前暴露是好事。
+
+3. **副作用模块不再被意外引入。** 如果 `models.ts` 顶层有副作用代码，仅为类型而 import 它却触发了执行，是很隐蔽的 bug。
+
+4. **体积变化因项目而异。** 现代打包器的 tree-shaking 大多已能处理这类情况，所以体积收益通常不大；真正的收益是**行为确定、可预测**。
+
+新项目建议直接打开这个选项。老项目迁移时，编译器会一次性列出所有需要修改的位置，逐个加 `type` 即可，是机械且安全的改动。
+
+**第 3 题：declare global 与 export {}**
+
+```ts
+// types/globals.d.ts
+export {};
+
+declare global {
+  const __BUILD_TIME__: string;
+
+  interface Window {
+    __BUILD_TIME__: string;
+  }
+}
+```
+
+使用：
+
+```ts
+console.log("构建于 " + __BUILD_TIME__);
+```
+
+配合构建工具注入真实值（以 Vite 为例）：
+
+```ts
+// vite.config.ts
+export default {
+  define: {
+    __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+  },
+};
+```
+
+**为什么必须先写 `export {}`：**
+
+关键在于本章第 1 节那条规则——**一个 `.d.ts` 文件有没有顶层 `import` / `export`，决定了它是「模块」还是「全局脚本」**，而 `declare global` 的语义完全依赖于这个身份：
+
+| 文件身份 | `declare global` 的行为 |
+|---|---|
+| **模块**（有顶层 import/export） | 合法。表示「从模块内部**向外**扩充全局作用域」 |
+| **全局脚本**（无 import/export） | **报错**：`TS2669: 仅当在外部上下文中声明扩大全局范围时，才能进行此扩大` |
+
+逻辑是这样的：全局脚本里的声明**本来就已经是全局的**了，再套一层 `declare global` 是同义反复，没有意义，所以编译器直接禁止。`declare global` 存在的意义就是给**模块**一个「逃逸到全局」的出口。
+
+`export {}` 是一个**空导出**——不导出任何东西，纯粹用来把文件标记成模块。它是达成这一目的最轻量的写法。
+
+顺带说明两个细节：
+
+- 如果文件里已经有了别的 `import` 或 `export`（比如 `import type { Foo } from "./foo.js"`），那它已经是模块了，`export {}` 就可以省略。
+- 声明 `const __BUILD_TIME__` 与在 `interface Window` 里加同名字段是两件事：前者让你能直接写裸标识符 `__BUILD_TIME__`，后者让你能写 `window.__BUILD_TIME__`。按实际用法二选一或都写。注意如果要用 `var` 声明（而非 `const`），它会自动成为 `globalThis` 的属性，这是老代码里常见的写法。
+</Answer>
 </Callout>
 
 ## 小结

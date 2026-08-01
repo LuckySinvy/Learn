@@ -84,6 +84,135 @@ const chain = prompt.pipe(robust).pipe(new StringOutputParser());
 
 <Callout type="exercise" title="练习">
 写一个并行链：同时用「中文解释」和「英文解释」两个子链处理同一问题，最后用一个总结链合并两份答案。
+
+<Answer>
+**参考答案：**
+
+**完整实现**
+
+核心思路：用 `RunnableMap`（即 `RunnableParallel`）把输入**同时**分发给两个子链，它们并发跑；两个结果自动合并成一个对象，键名正好对上总结提示词里的占位符。
+
+```ts
+import "dotenv/config";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import { RunnableMap, RunnableSequence } from "@langchain/core/runnables";
+
+const llm = new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0.3 });
+const parser = new StringOutputParser();
+
+// 子链 1：中文解释
+const zhChain = ChatPromptTemplate.fromTemplate(
+  "用简洁的中文解释这个概念，控制在 150 字内：{question}"
+)
+  .pipe(llm)
+  .pipe(parser);
+
+// 子链 2：英文解释
+const enChain = ChatPromptTemplate.fromTemplate(
+  "Explain this concept in clear English, under 150 words: {question}"
+)
+  .pipe(llm)
+  .pipe(parser);
+
+// 总结链：合并两份答案
+const summaryPrompt = ChatPromptTemplate.fromTemplate(
+  `下面是同一个概念的中英文两版解释。请对比它们，输出一份融合版说明：
+
+【中文版】
+{zh}
+
+【英文版】
+{en}
+
+要求：
+1. 先给出一段中文融合解释（覆盖两版各自提到但对方遗漏的要点）
+2. 再列出「两版说法不一致或侧重不同」的地方，没有就写“无明显差异”`
+);
+
+// 组装：并行 → 总结
+const chain = RunnableSequence.from([
+  RunnableMap.from({
+    zh: zhChain,
+    en: enChain,
+    // 原始问题也带下去，总结链需要时可用
+    question: (input: { question: string }) => input.question,
+  }),
+  summaryPrompt,
+  llm,
+  parser,
+]);
+
+const result = await chain.invoke({ question: "什么是向量数据库？" });
+console.log(result);
+```
+
+**关键点：`RunnableMap` 的分支收到的是什么？**
+
+这是最容易搞混的地方。`RunnableMap` 会把**同一份输入原样**交给每个分支：
+
+- `zhChain` 收到 `{ question: "..." }`，它的提示模板需要 `{question}`，正好匹配 ✅
+- 如果某个子链的提示模板用的是别的变量名（比如 `{topic}`），就要先加一层转换：
+
+```ts
+RunnableMap.from({
+  zh: RunnableLambda.from((i: { question: string }) => ({ topic: i.question })).pipe(zhChain),
+  en: enChain,
+});
+```
+
+**验证它是真并行**
+
+加个计时就能看出来——两个子链各耗时约 2 秒，但总耗时只有约 2 秒而不是 4 秒：
+
+```ts
+console.time("parallel");
+await chain.invoke({ question: "什么是向量数据库？" });
+console.timeEnd("parallel");   // 比串行执行快接近一倍
+```
+
+**流式输出**
+
+最后一环是 `StringOutputParser`，所以 `.stream()` 直接吐融合版的文字。注意前面的并行阶段必须**全部完成**才会开始流：
+
+```ts
+for await (const chunk of await chain.stream({ question: "什么是 RAG？" })) {
+  process.stdout.write(chunk);
+}
+```
+
+想在等待期间给用户反馈，用 `streamEvents` 监听中间事件（第 16 章）：
+
+```ts
+for await (const ev of chain.streamEvents({ question: "什么是 RAG？" }, { version: "v2" })) {
+  if (ev.event === "on_chain_end" && ev.name === "RunnableMap") {
+    console.log("[两路解释已就绪，开始融合]");
+  }
+}
+```
+
+**扩展：加容错，一路挂了不影响整体**
+
+默认情况下任一分支抛错，整个 `RunnableMap` 就失败。给子链加回退可以提高健壮性：
+
+```ts
+const safeEnChain = enChain.withFallbacks({
+  fallbacks: [
+    RunnableLambda.from(() => "(英文解释生成失败，已跳过)"),
+  ],
+});
+```
+
+**小结**
+
+| 组件 | 作用 |
+|---|---|
+| `RunnableMap.from({ a, b })` | 并发执行多分支，结果合并成 `{ a, b }` 对象 |
+| 分支里写普通函数 | 用于透传或改写输入，如 `(i) => i.question` |
+| 下游提示模板 | 占位符名必须与 `RunnableMap` 的键名一致 |
+| 总耗时 | 约等于**最慢**的那个分支，而非各分支之和 |
+</Answer>
 </Callout>
 
 ## 小结

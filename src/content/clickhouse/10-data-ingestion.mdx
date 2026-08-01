@@ -510,6 +510,105 @@ FROM demo.events;
 2. 写一个循环脚本，每次 INSERT 100 行、连续 500 次，观察 `system.parts` 的数量增长。然后加上 `async_insert = 1` 重跑，对比最终 part 数。
 3. 如果你手边有 MySQL，用 `mysql()` 表函数读一张表并导入 ClickHouse，用 `EXPLAIN` 或 MySQL 的 general_log 观察 WHERE 是否被下推。
 4. 用 Docker 起一个单节点 Kafka，按第 4 节配置 Kafka 引擎表 + MV，向 topic 灌 JSON 消息，验证数据自动进入 `events` 表。然后 `DETACH` MV，继续灌消息，再 `ATTACH`，验证 offset 没丢。
+
+<Answer>
+**参考答案：**
+
+1. generateRandom → CSV → file() 往返：
+
+```sql
+-- 1) 生成 10 万行并导出成 CSV
+SELECT * FROM generateRandom(
+    'event_time DateTime, user_id UInt32, event_type String, country String, duration_ms UInt16',
+    1, 20, 4
+)
+LIMIT 100000
+INTO OUTFILE '/var/lib/clickhouse/user_files/roundtrip.csv'
+FORMAT CSVWithNames;
+
+-- 2) 用 file() 表函数读回来
+SELECT count(), uniqExact(user_id), countIf(duration_ms = 0)
+FROM file('roundtrip.csv', 'CSVWithNames',
+    'event_time DateTime, user_id UInt32, event_type String, country String, duration_ms UInt16');
+```
+
+验证往返一致：读回来的行数应为 100000，`countIf(duration_ms = 0)` 应为 0（CSV 里没有空值）。`INTO OUTFILE` 是客户端侧写文件，文件落在执行客户端的机器上；如果用 `clickhouse-client` 在容器内执行，先确认 `user_files_path` 对应的目录。
+
+2. 小批量高频 vs async_insert：
+
+```bash
+# 每次 100 行、连插 500 次
+for i in $(seq 1 500); do
+  clickhouse-client --query "INSERT INTO events SELECT
+      toDateTime('2024-07-01') + number, number, 'view', '/p/1', 'CN', 'web', 100
+      FROM numbers(100)"
+done
+# 期间 part 数量快速增长，后台 merge 追不上
+```
+
+```bash
+# 改用 async_insert 重跑（先清空或换一张表）
+clickhouse-client --query "TRUNCATE TABLE events"
+for i in $(seq 1 500); do
+  clickhouse-client --query "INSERT INTO events SETTINGS async_insert = 1, wait_for_async_insert = 1
+      SELECT toDateTime('2024-07-01') + number, number, 'view', '/p/1', 'CN', 'web', 100
+      FROM numbers(100)"
+done
+
+SELECT count() AS parts FROM system.parts WHERE table = 'events' AND active;
+```
+
+对比两种方式的最终 part 数量：前者可能有几百个 part，后者只有个位数——`async_insert` 让服务端在内存里把 100 行的碎块攒成 5 万行左右的大块再落盘。
+
+3. `mysql()` 表函数与下推（有 MySQL 时）：
+
+```sql
+-- 全量导入
+INSERT INTO demo.orders
+SELECT order_id, user_id, order_time, toDecimal64(amount, 2), status, country, now()
+FROM mysql('mysql-host:3306', 'shop_db', 'orders', 'ch_reader', 'password');
+
+-- 带 WHERE 的增量导入
+INSERT INTO demo.orders
+SELECT order_id, user_id, order_time, toDecimal64(amount, 2), status, country, now()
+FROM mysql('mysql-host:3306', 'shop_db', 'orders', 'ch_reader', 'password')
+WHERE order_time >= '2024-07-01' AND order_time < '2024-07-02';
+```
+
+验证下推：在 MySQL 端打开 `general_log`，观察 ClickHouse 发过来的 SQL 是否含 `WHERE` 条件。简单等值/范围条件会下推；`GROUP BY`、`JOIN` 不会下推（ClickHouse 会整表拉回再聚合）。所以大表导入务必按时间或 ID 切片。
+
+4. 单节点 Kafka 接入：
+
+```bash
+docker run -d --name kafka -p 9092:9092 \
+  -e KAFKA_CFG_NODE_ID=0 \
+  -e KAFKA_CFG_PROCESS_ROLES=controller,broker \
+  -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093 \
+  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  bitnami/kafka:3.6
+```
+
+在 ClickHouse 里按第 4 节建 `events_queue`（Kafka 引擎）+ `events`（MergeTree）+ 搬运 MV，然后往 topic 灌 JSON：
+
+```bash
+docker exec -it kafka kafka-console-producer.sh --bootstrap-server localhost:9092 --topic web_events
+{"event_time":"2024-07-01 10:00:00","user_id":1001,"event_type":"view","page":"/p/1","country":"CN","device":"web","duration_ms":1200}
+{"event_time":"2024-07-01 10:00:05","user_id":1002,"event_type":"click","page":"/p/2","country":"US","device":"ios","duration_ms":340}
+```
+
+验证数据自动进入 `events` 表。然后验证 offset 不丢：
+
+```sql
+DETACH TABLE demo.events_consumer;      -- 停止搬运
+-- 继续往 topic 灌几条消息
+ATTACH TABLE demo.events_consumer;      -- 恢复
+```
+
+`DETACH` 期间 Kafka 表停止消费，Kafka 侧的 offset 不被推进；`ATTACH` 后会从上次的位点继续读，之前积压的消息会补齐进 `events`。注意：**不要直接 `SELECT * FROM events_queue` 调试**，那会真的消费掉消息。
+</Answer>
 </Callout>
 
 ## 小结

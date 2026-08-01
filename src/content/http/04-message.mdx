@@ -191,4 +191,45 @@ curl 用 `-v` 展示了它成功解析出的状态行、每个头、以及正好
 2. 在 Playground 2 中把 curl 的 -d 参数换成 --data-binary @- 并配合 echo 管道，验证报文体的字节与你输入完全一致。
 3. 用 Playground 1 的回显服务器对比 curl 加与不加 -H "Accept: application/json" 时请求头的差异。
 4. 手工写一个 302 响应（含 Location 头），用 curl -v 观察，再加 -L 让 curl 跟随跳转（可跳到同一服务器的另一路径）。
+
+<Answer>
+**参考答案：**
+
+**1. Content-Length 不匹配的后果**
+
+把手工响应里的 `Content-Length: 22` 改成 `10`：curl 只收到前 10 字节，输出被截断成 `hand-craft`，且会提示"传输被截断"（`transfer closed with outstanding read data remaining`）。
+
+改成 `100`：curl 按 Content-Length 等待剩余字节，而服务器早已关连接，curl 等待后报错（`Connection reset` / 提前关闭）。这正是第 4 章警告的：**Content-Length 必须精确，短了截断、长了挂起**。
+
+**2. `--data-binary @-` 与 echo 管道**
+
+```bash
+echo -n 'hello
+world' | curl -s -X POST --data-binary @- http://127.0.0.1:8001/login
+```
+
+`--data-binary @-` 表示从 stdin 原样读取字节，不丢换行、不做任何转换。对比 `-d` 会做 urlencoded（空格变 `+`、换行处理），`--data-binary` 保证报文体的字节与你输入完全一致。回显服务器打印的原始字节应逐字节等于输入。
+
+**3. Accept 头对请求的影响**
+
+在 Playground 1 的回显服务器上对比：
+
+```bash
+curl -s http://127.0.0.1:8000/books        # 默认 Accept: */*
+curl -s http://127.0.0.1:8000/books -H "Accept: application/json"
+```
+
+差异只在请求头里多了一行 `Accept: application/json`（以及可能变化的 `Accept-Encoding` 等）。回显服务器不看 Accept 直接回 200，所以响应体一样——Accept 只是"期望"，服务器可以协商后返回默认版本（第 10 章）。真正的区别要到支持内容协商的服务器上才体现。
+
+**4. 手写 302 + 跟随跳转**
+
+```python
+RESP = (b"HTTP/1.1 302 Found\r\n"
+        b"Location: /ok\r\n"
+        b"Content-Length: 0\r\n"
+        b"\r\n")
+```
+
+`curl -v` 会打印 `HTTP/1.1 302 Found` 和 `Location: /ok`，但**默认不跟随**（不会访问 /ok）。加上 `-L` 后 curl 自动重发 GET 到 `/ok`，输出该路径的响应。注意 302 属于"允许把方法降级为 GET"的重定向（第 6 章）；这里手工响应只有 GET 场景，`-L` 会直接跳到新路径。
+</Answer>
 </Callout>

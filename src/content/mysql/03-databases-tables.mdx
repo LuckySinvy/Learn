@@ -194,4 +194,129 @@ ALTER TABLE products
 1. 为 `shop` 库设计 `users` 表：主键、用户名、邮箱（唯一）、手机号、状态、余额、创建/更新时间，写出完整 CREATE TABLE 并说明每列类型的选择理由。
 2. 建一张测试表分别用 FLOAT 和 DECIMAL 存 `0.1`，各累加 100 次，对比 SUM 的结果。
 3. 给 products 表的 JSON 列加一个基于 `$.storage_gb` 的生成列并建索引，用 EXPLAIN 验证查询能走索引（EXPLAIN 详见第 14 章，先照猫画虎）。
+
+<Answer>
+**参考答案：**
+
+**1. users 表设计**
+
+```sql
+CREATE TABLE users (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '用户ID',
+  username   VARCHAR(50)     NOT NULL DEFAULT ''      COMMENT '用户名',
+  email      VARCHAR(100)    NOT NULL                 COMMENT '邮箱',
+  phone      VARCHAR(20)     NOT NULL DEFAULT ''      COMMENT '手机号',
+  status     TINYINT         NOT NULL DEFAULT 1       COMMENT '1正常 2冻结 3注销',
+  balance    DECIMAL(12,2)   NOT NULL DEFAULT 0.00    COMMENT '账户余额(元)',
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_email (email),
+  KEY idx_phone (phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COLLATE=utf8mb4_0900_ai_ci COMMENT='用户表';
+```
+
+逐列理由：
+
+| 列 | 类型 | 理由 |
+|---|---|---|
+| `id` | `BIGINT UNSIGNED AUTO_INCREMENT` | 无业务含义的代理主键；自增保证顺序写入、避免页分裂。用 INT 上限 21 亿，回滚/失败插入也会消耗自增值，用满是真实事故 |
+| `username` | `VARCHAR(50)` | 变长；50 足够且不虚高（内存临时表按最大长度分配） |
+| `email` | `VARCHAR(100)` + `UNIQUE` | 邮箱最长可到 254，100 覆盖绝大多数场景；唯一索引是并发下防重复注册的**唯一可靠手段**，「先查后插」在并发下必然出重 |
+| `phone` | `VARCHAR(20)` | **必须用字符串**：手机号有前导 0（座机/国际区号 +86），数值类型会丢掉；也不做算术运算 |
+| `status` | `TINYINT` | 枚举状态只需 1 字节；不用 `ENUM` 是因为改枚举值要 DDL |
+| `balance` | `DECIMAL(12,2)` | **钱绝不用 FLOAT**，二进制浮点无法精确表示十进制小数，累加对账必然差几分钱。也可选 `balance_cents BIGINT` 以分为单位存整数 |
+| `created_at` | `DATETIME DEFAULT CURRENT_TIMESTAMP` | 用 DATETIME 而非 TIMESTAMP，规避 2038 年溢出问题 |
+| `updated_at` | `... ON UPDATE CURRENT_TIMESTAMP` | 行被更新时自动刷新，是「最后修改时间」的标准实现 |
+
+其他设计要点：所有列 **NOT NULL + DEFAULT**（NULL 会让 `col = NULL` 恒不成立、聚合跳过、索引逻辑复杂化）；`email` 唯一键，`phone` 普通索引（手机号可能重复注册场景下不设唯一，若业务要求唯一则改成 `uk_phone`，但要注意默认值 `''` 会冲突——那时应改为允许 NULL，因为唯一索引允许多个 NULL）。
+
+**2. FLOAT vs DECIMAL 累加对比**
+
+```sql
+CREATE TABLE t_money (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  f  FLOAT,
+  d  DECIMAL(10,2)
+);
+
+-- 用递归 CTE 插入 100 行 0.1（8.0 特性）
+INSERT INTO t_money (f, d)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 100
+)
+SELECT 0.1, 0.1 FROM seq;
+
+SELECT SUM(f)  AS sum_float,
+       SUM(d)  AS sum_decimal,
+       SUM(f) = 10 AS float_eq_10,
+       SUM(d) = 10 AS decimal_eq_10
+FROM t_money;
+```
+
+典型结果：
+
+```text
++--------------------+-------------+-------------+---------------+
+| sum_float          | sum_decimal | float_eq_10 | decimal_eq_10 |
++--------------------+-------------+-------------+---------------+
+| 10.000000149011612 |       10.00 |           0 |             1 |
++--------------------+-------------+-------------+---------------+
+```
+
+结论：FLOAT 的和**不等于** 10，误差在小数点后第 8 位。100 次就有误差，百万级流水累加后误差会放大到肉眼可见的分/角，财务对账直接崩。
+
+**3. JSON 生成列 + 索引 + EXPLAIN**
+
+```sql
+-- 准备带 JSON 列的表
+CREATE TABLE p_json (
+  id    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name  VARCHAR(100) NOT NULL,
+  attrs JSON
+) ENGINE=InnoDB;
+
+INSERT INTO p_json (name, attrs) VALUES
+  ('iPhone 15',     '{"color":"black","storage_gb":256}'),
+  ('iPhone 15 Pro', '{"color":"white","storage_gb":512}'),
+  ('iPad Air',      '{"color":"blue","storage_gb":128}');
+
+-- 生成列 + 索引
+ALTER TABLE p_json
+  ADD COLUMN storage_gb INT UNSIGNED
+    GENERATED ALWAYS AS (attrs->>'$.storage_gb') STORED,
+  ADD INDEX idx_storage (storage_gb);
+```
+
+验证走索引，**注意两种写法都能命中**：
+
+```sql
+-- 写法 A：直接查生成列
+EXPLAIN SELECT id, name FROM p_json WHERE storage_gb = 256;
+
+-- 写法 B：查原始 JSON 表达式，优化器会自动改写到生成列上
+EXPLAIN SELECT id, name FROM p_json WHERE attrs->>'$.storage_gb' = 256;
+```
+
+关注 EXPLAIN 输出的两列：
+
+```text
+key: idx_storage      ← 用上了索引（不是 NULL）
+type: ref             ← 等值查找（不是 ALL 全表扫描）
+```
+
+如果 `key` 是 `NULL`、`type` 是 `ALL`，说明没走索引，常见原因：
+
+- 数据量太小，优化器认为全表扫描更划算（可用 `FORCE INDEX` 对照验证）；
+- 生成列声明成了 `VIRTUAL` 且写法 B 的类型不匹配——`->>` 返回的是字符串，若生成列声明为 `INT` 而比较值写成 `'256'`（字符串），可能触发隐式转换导致索引失效。保持生成列类型和比较值类型一致最稳妥。
+
+另一种等价方案是**函数索引**（8.0.13+），不新增列：
+
+```sql
+ALTER TABLE p_json
+  ADD INDEX idx_storage2 ((CAST(attrs->>'$.storage_gb' AS UNSIGNED)));
+```
+</Answer>
 </Callout>

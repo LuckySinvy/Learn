@@ -99,6 +99,98 @@ fn largest(nums: &[i32]) -> i32 {
 
 <Callout type="exercise" title="练习">
 写一个 `fn second_word(s: &str) -> &str` 返回第二个单词（按空格切分）。对 `"the quick brown"` 调用，验证返回 `"quick"`。注意处理不足两个词时的边界。
+
+<Answer>
+**参考答案：**
+
+**写法一：手动遍历字节（贴近本章的 `first_word` 思路）**
+
+```rust
+fn second_word(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut start = None;   // 第二个单词的起始下标
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b' ' {
+            if start.is_none() {
+                start = Some(i + 1);   // 第一个空格之后 = 第二个单词开头
+            } else {
+                // 第二个空格：第二个单词到此结束
+                return &s[start.unwrap()..i];
+            }
+        }
+    }
+
+    match start {
+        Some(i) => &s[i..],   // 只有两个单词，取到结尾
+        None => "",           // 不足两个单词，返回空串
+    }
+}
+
+fn main() {
+    println!("[{}]", second_word("the quick brown"));  // [quick]
+    println!("[{}]", second_word("the quick"));        // [quick]
+    println!("[{}]", second_word("single"));           // []
+    println!("[{}]", second_word(""));                 // []
+}
+```
+
+**写法二：用迭代器（更简洁、更地道，强烈推荐）**
+
+```rust
+fn second_word(s: &str) -> &str {
+    s.split_whitespace().nth(1).unwrap_or("")
+}
+```
+
+一行搞定，而且比写法一更健壮：`split_whitespace()` 会自动忽略连续空格、制表符和换行，`nth(1)` 取第二项，`unwrap_or("")` 处理不存在的情况。
+
+**写法三：返回 `Option`（接口更诚实）**
+
+```rust
+fn second_word(s: &str) -> Option<&str> {
+    s.split_whitespace().nth(1)
+}
+
+fn main() {
+    match second_word("the quick brown") {
+        Some(w) => println!("第二个单词：{}", w),
+        None => println!("不足两个单词"),
+    }
+}
+```
+
+用 `Option` 明确区分了「第二个单词是空串」和「根本没有第二个单词」，调用方无法忽略边界情况。在真实项目里这通常是最好的选择。
+
+**边界情况一览：**
+
+| 输入 | 写法一/二返回 | 写法三返回 |
+|---|---|---|
+| `"the quick brown"` | `"quick"` | `Some("quick")` |
+| `"the quick"` | `"quick"` | `Some("quick")` |
+| `"single"` | `""` | `None` |
+| `""` | `""` | `None` |
+| `"a  b"`（连续空格） | 写法一返回 `""`，写法二返回 `"b"` | `Some("b")` |
+
+**为什么返回值不用标注生命周期？**
+
+因为触发了**生命周期省略规则**：函数只有一个引用参数时，返回的引用被自动认为借用自它，等价于：
+
+```rust
+fn second_word<'a>(s: &'a str) -> &'a str
+```
+
+这也说明了返回值和输入的关系——切片只是**借用**了原字符串的一段，没有复制任何数据。所以原字符串必须活得比返回的切片久：
+
+```rust
+let word;
+{
+    let s = String::from("the quick brown");
+    word = second_word(&s);   // ❌ s 马上就要 drop 了
+}
+println!("{}", word);         // 编译器会拒绝：borrowed value does not live long enough
+```
+</Answer>
 </Callout>
 
 ## 小结

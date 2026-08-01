@@ -86,6 +86,183 @@ async function ask(topic: string) {
 
 <Callout type="exercise" title="练习">
 新建一个 Next.js App Router 项目，写 `/api/summary` 接口，接收 `{ text }` 返回摘要；前端放一个 textarea 调用它。
+
+<Answer>
+**参考答案：**
+
+**1) 初始化项目**
+
+```bash
+npx create-next-app@latest summary-app --ts --app --tailwind
+cd summary-app
+npm install @langchain/core @langchain/openai zod server-only
+```
+
+```bash
+# .env.local（Next.js 自动加载，且默认已在 .gitignore 中）
+OPENAI_API_KEY=sk-xxxxxxxx
+```
+
+注意：Next.js 会自动加载 `.env.local`，**不需要** `dotenv`，也不要给这个变量加 `NEXT_PUBLIC_` 前缀——加了就会被打进前端包。
+
+**2) 把链抽成单例模块 `lib/summary-chain.ts`**
+
+```ts
+import "server-only";                     // 一旦被客户端组件 import，构建直接报错
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import type { Runnable } from "@langchain/core/runnables";
+
+let cached: Runnable | null = null;
+
+export function getSummaryChain() {
+  if (cached) return cached;
+
+  const prompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      "你是一个中文摘要助手。请把用户提供的文本压缩成 3 条要点，" +
+      "每条不超过 30 字，用「- 」开头。只输出要点，不要任何前言或总结。",
+    ],
+    ["human", "{text}"],
+  ]);
+
+  cached = prompt
+    .pipe(new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0.2 }))
+    .pipe(new StringOutputParser());
+
+  return cached;
+}
+```
+
+**3) API Route `app/api/summary/route.ts`**
+
+```ts
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { getSummaryChain } from "@/lib/summary-chain";
+
+export const runtime = "nodejs";      // 必须 nodejs，edge 下部分依赖不可用
+export const maxDuration = 30;        // 摘要长文本可能超过默认超时
+
+// 输入校验：这是系统边界，必须验
+const bodySchema = z.object({
+  text: z.string().trim().min(10, "文本太短").max(8000, "文本过长，请控制在 8000 字以内"),
+});
+
+export async function POST(req: NextRequest) {
+  let json: unknown;
+  try {
+    json = await req.json();
+  } catch {
+    return NextResponse.json({ error: "请求体不是合法 JSON" }, { status: 400 });
+  }
+
+  const parsed = bodySchema.safeParse(json);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: parsed.error.issues[0].message },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const summary = await getSummaryChain().invoke({ text: parsed.data.text });
+    return NextResponse.json({ summary });
+  } catch (err) {
+    // 关键：不要把原始错误抛给前端，可能含有 Key 片段或内部路径
+    console.error("[/api/summary]", err);
+    return NextResponse.json({ error: "摘要生成失败，请稍后重试" }, { status: 500 });
+  }
+}
+```
+
+**4) 前端页面 `app/page.tsx`**
+
+```tsx
+"use client";
+
+import { useState } from "react";
+
+export default function Home() {
+  const [text, setText] = useState("");
+  const [summary, setSummary] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function handleSubmit() {
+    setLoading(true);
+    setError("");
+    setSummary("");
+
+    try {
+      const res = await fetch("/api/summary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        setError(data.error ?? "请求失败");
+        return;
+      }
+      setSummary(data.summary);
+    } catch {
+      setError("网络错误，请检查连接");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="mx-auto max-w-2xl space-y-4 p-8">
+      <h1 className="text-2xl font-bold">文本摘要</h1>
+
+      <textarea
+        className="h-64 w-full rounded border p-3"
+        placeholder="粘贴一段文本（至少 10 字）…"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+      />
+
+      <div className="flex items-center gap-3">
+        <button
+          className="rounded bg-black px-4 py-2 text-white disabled:opacity-40"
+          onClick={handleSubmit}
+          disabled={loading || text.trim().length < 10}
+        >
+          {loading ? "生成中…" : "生成摘要"}
+        </button>
+        <span className="text-sm text-gray-500">{text.length} 字</span>
+      </div>
+
+      {error && <p className="text-red-600">{error}</p>}
+
+      {summary && (
+        <pre className="whitespace-pre-wrap rounded bg-gray-50 p-4">{summary}</pre>
+      )}
+    </main>
+  );
+}
+```
+
+**安全检查清单**
+
+| 检查项 | 做法 | 验证方式 |
+|---|---|---|
+| Key 不进前端 | 只在 `lib/` 和 `app/api/` 中 import 模型包，加 `server-only` | 构建后 `grep -r "sk-" .next/static/` 应无结果 |
+| 输入校验 | Zod 限制长度，防止超长文本烧 Token | 发个 100 万字的请求应返回 400 |
+| 错误不泄露 | catch 后返回通用文案，详情只 `console.error` | 前端看到的永远是「请稍后重试」 |
+| 运行时 | `export const runtime = "nodejs"` | 少了它在 Vercel 上可能被判为 edge 而报错 |
+| 超时 | `export const maxDuration = 30` | 长文本摘要不会被默认 10 秒切断 |
+
+**为什么要做单例？** Next.js 的 Route Handler 每次请求都会执行模块顶层以外的代码。若把 `new ChatOpenAI()` 写在 `POST` 函数里，每个请求都会重建一次 HTTP 客户端和 tokenizer，在高并发下开销可观。`getSummaryChain()` 的缓存让它在一个 Node 实例的生命周期内只构建一次。
+
+**下一步优化**：目前用户要盯着「生成中…」等好几秒。第 16 章会把这个接口改成流式，摘要逐字出现，体感快得多。另外生产环境还应加**限流**（如按 IP 用 `@upstash/ratelimit`），否则接口会被人当免费 GPT 代理刷爆。
+</Answer>
 </Callout>
 
 ## 小结

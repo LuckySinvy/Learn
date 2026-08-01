@@ -392,6 +392,66 @@ const user = useAuth();
 第二次渲染时 flag 变成 false，依次调用：useState("a")、useState("c")。
 
 第二次渲染时，第二个变量拿到的是什么？为什么真实 React 可能不报错？
+
+<Answer>
+**参考答案：第二个变量拿到的是 `"b"`，不是 `"c"`。**
+
+**第一次渲染（flag 为 true）—— 建立槽位：**
+
+| 调用顺序 | 代码 | 游标 | 槽位内容 | 返回 |
+|---|---|---|---|---|
+| 1 | `useState("a")` | 0 | 槽位 0 写入 `"a"` | `"a"` |
+| 2 | `useState("b")` | 1 | 槽位 1 写入 `"b"` | `"b"` |
+| 3 | `useState("c")` | 2 | 槽位 2 写入 `"c"` | `"c"` |
+
+此时 `hookStates` 是 `["a", "b", "c"]`。
+
+**第二次渲染（flag 为 false）—— 错位发生：**
+
+| 调用顺序 | 代码 | 游标 | 槽位已存在？ | 返回 |
+|---|---|---|---|---|
+| 1 | `useState("a")` | 0 | 是，忽略初始值 | `"a"` ✅ |
+| 2 | `useState("c")` | 1 | 是，忽略初始值 | **`"b"`** ❌ |
+
+关键在迷你实现的这一行：
+
+```ts
+if (!(index in hookStates)) {
+  hookStates[index] = initial;   // 只有首次渲染用得上初始值
+}
+return [hookStates[index] as T, setState];
+```
+
+**初始值 `"c"` 被彻底忽略了**——槽位 1 早就有内容了，`useState` 只负责「把第 1 个格子里的东西拿出来」，它根本不知道调用方期待的是什么。而槽位 2 里的 `"c"` 成了没人认领的孤儿。
+
+**为什么真实 React 可能不报错：**
+
+React 在开发模式下确实做了两道检查，但两道都有盲区：
+
+**盲区一：数量检查只在「变少」时触发**
+
+React 会记录上次的 Hook 数量，如果这次渲染调用的 Hook **变少了**，就抛出 `Rendered fewer hooks than expected`。本题正好触发这个（3 个变 2 个），所以真实 React 会报错。
+
+但把条件改成「两个分支各调一个 Hook」，数量不变，这道检查就完全失效：
+
+```tsx
+// 数量恒为 2，React 数不出问题
+const [a] = useState("a");
+if (flag) {
+  const [b] = useState("b");
+} else {
+  const [z] = useState(0);     // flag 切换后，这里拿到的是 "b"
+}
+```
+
+**盲区二：类型检查只比较 Hook 的种类**
+
+React 在 dev 下还会记录每个位置调用的是哪一种 Hook（`useState` / `useEffect` / `useRef`…），顺序变了会警告 `React has detected a change in the order of Hooks`。但它只区分**种类**，不区分**是哪一个 `useState`**。上面例子里两个分支都是 `useState`，检查照样通过。
+
+**所以最坏的情况是：程序不报任何错，只是值悄悄错了。** 而且类型系统也帮不上忙——`useState<number>(0)` 返回的运行时值是字符串 `"b"`，TS 在编译期看到的是 `number`，直到某处调用 `.toFixed()` 才崩，那时离出错点已经很远了。
+
+**这就是为什么这条规则必须靠 lint 静态保证**（`eslint-plugin-react-hooks`），而不能指望运行时检查。运行时能发现的只是冰山一角。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 2：写一个 useInterval">
@@ -402,6 +462,106 @@ const user = useAuth();
 - 组件卸载时清理
 
 提示：先写一个 effect 把 callback 写进 ref，再写一个 effect 建立计时器，计时器里调用 `ref.current()`。
+
+<Answer>
+**参考答案：**
+
+```tsx
+function useInterval(callback: () => void, delay: number | null): void {
+  const savedCallback = useRef(callback);
+
+  // ① 每次渲染后把最新的 callback 存进 ref
+  //    ref 的写入不会触发重渲染，所以这里非常廉价
+  useEffect(() => {
+    savedCallback.current = callback;
+  }, [callback]);
+
+  // ② 只有 delay 变化时才重建计时器
+  useEffect(() => {
+    if (delay === null) return;   // null 表示暂停，直接不建立
+
+    const id = setInterval(() => {
+      savedCallback.current();    // 触发时才读，读到的一定是最新的
+    }, delay);
+
+    return () => clearInterval(id);   // 卸载 / delay 变化时清理
+  }, [delay]);
+}
+```
+
+**使用示例：**
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0);
+  const [running, setRunning] = useState(true);
+  const [speed, setSpeed] = useState(1000);
+
+  // running 为 false 时传 null → 暂停
+  useInterval(() => {
+    setCount(count + 1);   // 注意：这里可以直接用 count，不会过期！
+  }, running ? speed : null);
+
+  return (
+    <div>
+      <p>{count}</p>
+      <button onClick={() => setRunning((r) => !r)}>
+        {running ? "暂停" : "继续"}
+      </button>
+      <button onClick={() => setSpeed(500)}>加速</button>
+    </div>
+  );
+}
+```
+
+**逐条对照需求：**
+
+| 需求 | 由哪部分实现 |
+|---|---|
+| `delay` 为 `null` 时暂停 | effect ② 里的 `if (delay === null) return`。注意 return 在建立计时器**之前**，所以根本不会有计时器存在 |
+| callback 更新时不重建计时器 | callback 没有出现在 effect ② 的依赖里，只通过 ref 间接读取 |
+| 卸载时清理 | effect ② 返回 `clearInterval` |
+| `delay` 变化时按新间隔走 | `delay` 在依赖里，会先清理旧的再建新的——这正是我们想要的 |
+
+**三个容易踩的坑：**
+
+**坑一：把 `callback` 直接放进依赖数组**
+
+```tsx
+// ❌ 调用方通常传的是箭头函数字面量，每次渲染都是新引用
+useEffect(() => {
+  const id = setInterval(callback, delay);
+  return () => clearInterval(id);
+}, [callback, delay]);
+```
+
+结果是**每次父组件重渲染都会销毁重建计时器**，计时永远走不满一个周期。这就是第 5 章「对象/函数字面量做依赖等于没写依赖」的翻版。
+
+**坑二：不用 ref，直接省略 callback 依赖**
+
+```tsx
+// ❌ 能骗过 lint，但 callback 被冻结在首次渲染
+useEffect(() => {
+  const id = setInterval(callback, delay);
+  return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [delay]);
+```
+
+这就是第 5 章的闭包陷阱，`callback` 里读到的 state 永远是初始值。
+
+**坑三：把 `savedCallback.current` 提前解构出来**
+
+```tsx
+// ❌ 等于在 effect 创建时就固定了函数，ref 白用了
+const fn = savedCallback.current;
+const id = setInterval(fn, delay);
+```
+
+**必须在定时器触发的那一刻才读 `.current`**——这是整个模式的关键。写成 `setInterval(() => savedCallback.current(), delay)`，多包一层箭头函数，读取被推迟到了触发时。
+
+**这个模式的名字：** 它源自 Dan Abramov 的经典文章 *Making setInterval Declarative with React Hooks*，也是 React 官方 `useEffectEvent` 提案要内置的东西。**「这个值我要读最新的，但它变化时我不想重建副作用」** —— 一旦遇到这个需求，ref 就是答案。
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 3：判断是否该抽 Hook">
@@ -411,6 +571,112 @@ const user = useAuth();
 2. 一个组件里有 8 个 useState，都是表单字段
 3. 弹窗打开时锁定 body 滚动，关闭时恢复
 4. 某个页面需要同时用到用户信息、权限判断和路由参数
+
+<Answer>
+**参考答案：**
+
+**1. 三个页面都需要「监听滚动到底部然后加载下一页」 —— ✅ 该抽**
+
+命中最明显的信号：**同样的 Hook 组合在两处以上出现**。而且这段逻辑还带着必须正确清理的订阅（`IntersectionObserver` 或 scroll 监听），复制三份意味着三份潜在的内存泄漏。
+
+建议拆成两层：
+
+```tsx
+// 底层：纯粹的「元素进入视口了吗」，与业务无关，可复用于图片懒加载、曝光埋点
+function useIntersection(ref: RefObject<Element>, options?: IntersectionObserverInit): boolean
+
+// 上层：组合底层 Hook + 分页状态
+function useInfiniteScroll<T>(fetchPage: (page: number) => Promise<T[]>): {
+  items: T[];
+  loading: boolean;
+  hasMore: boolean;
+  sentinelRef: RefObject<HTMLDivElement>;
+}
+```
+
+这就是 3.5 节说的「Hook 调用 Hook」——底层抽象通用能力，上层组合出业务语义。
+
+**2. 一个组件里有 8 个 `useState`，都是表单字段 —— ❌ 不该抽（至少不该这样抽）**
+
+抽一个 `useXxxPageForm` 出来只是把 8 行代码搬了个位置，组件是短了，但没有产生任何抽象——正好命中 3.4 节说的「只是为了让组件短一点」这个坏味道。
+
+真正的问题是**这 8 个 state 本来就不该是 8 个**。它们总是一起变化、一起提交、一起校验，应该合并：
+
+```tsx
+// 方案 A：合并成一个对象
+const [form, setForm] = useState({ name: "", email: "", age: 0 /* ... */ });
+
+// 方案 B：字段多、校验逻辑复杂时用 useReducer（第 10 章）
+const [state, dispatch] = useReducer(formReducer, initialForm);
+```
+
+**只有当「表单管理」这套模式在多个表单间复用时**，才值得抽一个通用的 `useForm<T>(initialValues, validate)`——注意它的抽象对象是「表单」这个概念，而不是「某个页面的那 8 个字段」。
+
+**3. 弹窗打开时锁定 body 滚动，关闭时恢复 —— ✅ 该抽（即使只用一次）**
+
+命中另一个信号：**有清晰的语义名字，且正确性依赖于清理逻辑**。
+
+```tsx
+function useLockBodyScroll(locked: boolean): void {
+  useEffect(() => {
+    if (!locked) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [locked]);
+}
+```
+
+抽出来的价值不在「复用」，而在**把一个容易写错的边界（异常卸载时必须恢复，见第 5 章练习 1）封装进一个经过验证的单元**。名字 `useLockBodyScroll` 也让组件的意图一目了然。
+
+**4. 某个页面需要同时用到用户信息、权限判断和路由参数 —— ❌ 不该打包抽**
+
+这是最典型的**假抽象**。如果抽成：
+
+```tsx
+// ❌ 和页面绑死了，不是抽象，只是搬运
+function useOrderDetailPageData() {
+  const user = useUser();
+  const perm = usePermission();
+  const params = useParams();
+  return { user, perm, params };
+}
+```
+
+它完全命中了本章 `<Callout type="tip">` 说的坏味道：**用一句话说清它负责什么时，句子里必须出现具体的页面名**。而且它没有解决任何问题——三个 Hook 平铺调用本来就只有三行，还更清楚：
+
+```tsx
+const user = useUser();
+const perm = usePermission();
+const { orderId } = useParams();
+```
+
+这正是 Hooks 相对 HOC 的核心优势：**平铺调用，数据来源一目了然**。硬包一层反而退化回了「这个值是哪来的？」的 HOC 时代。
+
+**但有一种情况值得抽：** 如果「用户 + 权限」的**组合判断逻辑**在多处重复，那就抽出那个判断本身——它有独立语义：
+
+```tsx
+// ✅ 一句话说得清，且不含页面名
+function useCanEdit(resource: Resource): boolean {
+  const user = useUser();
+  const perm = usePermission();
+  return perm.has("edit") && (resource.ownerId === user.id || user.isAdmin);
+}
+```
+
+---
+
+**归纳成判断标准：**
+
+| | 该抽 | 不该抽 |
+|---|---|---|
+| 动机 | 复用逻辑 / 封装易错边界 | 让组件行数变少 |
+| 命名 | 能用不含组件名的一句话说清 | 名字里带页面名或叫 `useXxxLogic` |
+| 接口 | 参数少、返回值语义明确 | 传五六个参数、返回七八个值 |
+| 内容 | Hook 之间有真实的协作关系 | 只是把几个独立 Hook 打包转发 |
+</Answer>
 </Callout>
 
 <Callout type="exercise" title="练习 4：扩展迷你实现">
@@ -421,6 +687,161 @@ const user = useAuth();
 - 依赖变化时先执行上次的清理函数
 
 然后在 Form 里同时使用 useStateMini 和 useEffectMini，验证游标依然能正确对应。
+
+<Answer>
+**参考答案：**
+
+```ts
+// ——— 迷你 React 运行时 ———
+const hookStates: unknown[] = [];
+let cursor = 0;
+let renderFn: () => void = function () {};
+
+function useStateMini<T>(initial: T): [T, (next: T) => void] {
+  const index = cursor;
+  cursor++;
+
+  if (!(index in hookStates)) {
+    hookStates[index] = initial;
+  }
+
+  function setState(next: T): void {
+    hookStates[index] = next;
+    renderFn();
+  }
+
+  return [hookStates[index] as T, setState];
+}
+
+// ——— 新增：useEffectMini ———
+type Deps = readonly unknown[] | null;
+type Cleanup = (() => void) | null;
+
+interface EffectSlot {
+  kind: "effect";
+  deps: Deps;
+  cleanup: Cleanup;
+}
+
+function depsChanged(prev: Deps, next: Deps): boolean {
+  if (prev === null || next === null) return true;
+  if (prev.length !== next.length) return true;
+  for (let i = 0; i < prev.length; i++) {
+    if (!Object.is(prev[i], next[i])) return true;
+  }
+  return false;
+}
+
+function useEffectMini(name: string, fn: () => Cleanup, deps: Deps): void {
+  const index = cursor;   // ★ 关键：和 useStateMini 共用同一个游标和同一个数组
+  cursor++;
+
+  const slot = hookStates[index] as EffectSlot | undefined;
+
+  if (slot === undefined) {
+    console.log("  [" + name + "] 挂载");
+    hookStates[index] = { kind: "effect", deps: deps, cleanup: fn() };
+    return;
+  }
+
+  if (!depsChanged(slot.deps, deps)) {
+    console.log("  [" + name + "] 依赖未变，跳过");
+    return;
+  }
+
+  console.log("  [" + name + "] 依赖变了，先清理再执行");
+  if (slot.cleanup !== null) slot.cleanup();
+  slot.deps = deps;
+  slot.cleanup = fn();
+}
+
+function mount(component: () => void): () => void {
+  renderFn = function () {
+    cursor = 0;
+    component();
+  };
+  renderFn();
+  return renderFn;
+}
+
+// ——— 组件：state 和 effect 交错调用 ———
+function Form(): void {
+  const nameSlot = useStateMini("Ada");            // 槽位 0：state
+
+  useEffectMini("title", function () {             // 槽位 1：effect
+    console.log("      document.title = " + nameSlot[0]);
+    return null;
+  }, [nameSlot[0]]);
+
+  const ageSlot = useStateMini(36);                // 槽位 2：state
+
+  useEffectMini("age", function () {               // 槽位 3：effect
+    console.log("      上报年龄 " + ageSlot[0]);
+    return null;
+  }, [ageSlot[0]]);
+
+  console.log("  渲染结果: " + nameSlot[0] + " / " + ageSlot[0]);
+
+  const kinds = hookStates.map(function (s) {
+    return typeof s === "object" && s !== null ? "effect" : "state";
+  });
+  console.log("  槽位类型: " + kinds.join(","));
+}
+
+console.log("第 1 次渲染");
+const rerender = mount(Form);
+
+console.log("第 2 次渲染（什么都没改）");
+rerender();
+
+console.log("第 3 次渲染（把名字改成 Grace）");
+hookStates[0] = "Grace";   // 模拟 setName("Grace") 写入槽位 0
+rerender();
+```
+
+**预期输出：**
+
+```text
+第 1 次渲染
+  [title] 挂载
+      document.title = Ada
+  [age] 挂载
+      上报年龄 36
+  渲染结果: Ada / 36
+  槽位类型: state,effect,state,effect
+第 2 次渲染（什么都没改）
+  [title] 依赖未变，跳过
+  [age] 依赖未变，跳过
+  渲染结果: Ada / 36
+  槽位类型: state,effect,state,effect
+第 3 次渲染（把名字改成 Grace）
+  [title] 依赖变了，先清理再执行
+      document.title = Grace
+  [age] 依赖未变，跳过
+  渲染结果: Grace / 36
+  槽位类型: state,effect,state,effect
+```
+
+**这个实验验证了三件事：**
+
+**① 所有 Hook 共用一条链，槽位按调用顺序交错分布**
+
+看 `槽位类型: state,effect,state,effect` 这一行——`useState` 和 `useEffect` 完全平等地排在同一个数组里，没有各自的存储区。真实 React 也是如此：一个 fiber 上只有一条 Hook 单链表，`useState`、`useEffect`、`useRef`、`useMemo` 全都串在上面。
+
+**② 「不能条件调用」对所有 Hook 一视同仁**
+
+既然共用一条链，那么**条件调用一个 `useEffect`，会让它后面所有 `useState` 一起错位**。这也是为什么规则说的是「Hook」而不是「useState」。
+
+**③ 依赖比较和状态存储互不干扰**
+
+槽位 1 存的是一个 `EffectSlot` 对象（`deps` + `cleanup`），槽位 0 存的是裸值 `"Ada"`。每种 Hook 决定自己那个格子里放什么，运行时只负责「按游标发格子」。
+
+**和真实 React 的三点差距：**
+
+1. **执行时机**：这里 effect 是在渲染函数里**同步**执行的，真实 React 会把 effect 收集进队列，等 DOM 提交完成后才批量执行。所以真实场景里 effect 内能读到已更新的 DOM。
+2. **卸载清理**：这个迷你版没有卸载概念。完整版需要一个 `unmount()` 遍历所有槽位、对 `kind === "effect"` 的调用 `cleanup`。
+3. **每个组件实例一套**：这里只有一个全局 `hookStates`，所以只能挂一个组件。真实 React 的这套数据挂在每个 fiber 节点上，这正是「自定义 Hook 复用的是逻辑不是状态」的实现层解释——`useToggle` 里的 `useState` 落在**调用它的那个组件**的链上。
+</Answer>
 </Callout>
 
 ## 小结

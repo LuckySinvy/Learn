@@ -68,6 +68,147 @@ const retriever = new ContextualCompressionRetriever({
 
 <Callout type="exercise" title="练习">
 对同一问题，分别用基础 `VectorStoreRetriever` 与 `MultiQueryRetriever` 取文档，对比命中块数与最终回答完整性。
+
+<Answer>
+**参考答案：**
+
+**完整对比脚本**
+
+```ts
+// compare-multiquery.ts
+import "dotenv/config";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings, ChatOpenAI } from "@langchain/openai";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { TextLoader } from "langchain/document_loaders/fs/text";
+import { MultiQueryRetriever } from "langchain/retrievers/multi_query";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import type { Document } from "@langchain/core/documents";
+
+const raw = await new TextLoader("./docs/handbook.md").load();
+const splits = await new RecursiveCharacterTextSplitter({
+  chunkSize: 400,
+  chunkOverlap: 40,
+}).splitDocuments(raw);
+
+const store = await MemoryVectorStore.fromDocuments(splits, new OpenAIEmbeddings());
+const llm = new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 });
+
+// ---------- A：基础检索器 ----------
+const base = store.asRetriever({ k: 3 });
+
+// ---------- B：多查询检索器 ----------
+const multi = MultiQueryRetriever.fromLLM({
+  llm,
+  retriever: store.asRetriever({ k: 3 }),
+  verbose: true,        // 打开后能看到 LLM 改写出的几个问法
+  queryCount: 3,        // 改写成 3 个变体
+});
+
+// 选一个「表述与文档用词不一致」的问题，最能体现差异
+const question = "密码忘了怎么办？";
+
+const baseDocs = await base.invoke(question);
+const multiDocs = await multi.invoke(question);
+
+// ---------- 量化对比 ----------
+function key(d: Document) {
+  return d.pageContent.slice(0, 80);
+}
+
+const baseKeys = new Set(baseDocs.map(key));
+const newOnes = multiDocs.filter((d) => !baseKeys.has(key(d)));
+
+console.log("=== 命中块数 ===");
+console.log("基础检索：", baseDocs.length);
+console.log("多查询检索：", multiDocs.length, `（其中 ${newOnes.length} 块是基础检索没找到的）`);
+
+console.log("\n=== 多查询新增的内容 ===");
+newOnes.forEach((d, i) =>
+  console.log(`[新增 ${i + 1}] ${d.pageContent.slice(0, 70).replace(/\n/g, " ")}…`)
+);
+
+console.log("\n=== 上下文总长度 ===");
+console.log("基础：", baseDocs.reduce((s, d) => s + d.pageContent.length, 0), "字符");
+console.log("多查询：", multiDocs.reduce((s, d) => s + d.pageContent.length, 0), "字符");
+```
+
+**接上生成，对比回答完整性**
+
+```ts
+const prompt = ChatPromptTemplate.fromTemplate(
+  "只根据下面的上下文回答，若没写就说不知道。\n上下文：\n{context}\n\n问题：{question}"
+);
+
+async function answer(docs: Document[]) {
+  return prompt
+    .pipe(llm)
+    .pipe(new StringOutputParser())
+    .invoke({
+      context: docs.map((d) => d.pageContent).join("\n---\n"),
+      question,
+    });
+}
+
+console.log("\n【基础检索的回答】\n" + (await answer(baseDocs)));
+console.log("\n【多查询检索的回答】\n" + (await answer(multiDocs)));
+```
+
+**典型结果**
+
+`verbose: true` 会先打印出 LLM 生成的改写：
+
+```
+生成的查询变体：
+1. 如何重置账户密码？
+2. 登录密码丢失的找回流程是什么？
+3. 忘记密码后怎样恢复账号访问权限？
+```
+
+然后：
+
+| 指标 | 基础检索 | 多查询检索 |
+|---|---|---|
+| 命中块数 | 3 | 6（去重后） |
+| 上下文长度 | 约 1200 字符 | 约 2400 字符 |
+| 检索耗时 | 约 300 ms | 约 1800 ms（含一次改写 LLM 调用 + 3 次并行检索） |
+| 回答内容 | 只说了「在登录页点『忘记密码』」 | 完整覆盖了自助重置、绑定手机验证、以及**联系管理员人工重置**这条基础检索漏掉的路径 |
+
+**差异从何而来？** 文档里那段讲人工重置的内容用的措辞是「**账号无法访问时的人工恢复**」，和用户说的「密码忘了」字面差距很大，单一查询的向量相似度不够高，排在第 5 名进不了 top-3。而改写出的第 3 个变体「恢复账号访问权限」几乎是原文用词，一下就命中了。
+
+**这也说明了 MultiQuery 的适用边界：**
+
+| 什么时候有效 | 什么时候是浪费 |
+|---|---|
+| 用户口语表述 vs 文档书面语差异大 | 用户问法和文档用词高度一致 |
+| 问题涉及多个方面（「怎么用，有什么坑」） | 单点事实型问题（「端口号是多少」） |
+| 语料规模大、同一主题分散在多处 | 语料就几十个块，`k` 调大即可 |
+| 召回不足（答案明显不完整） | 已经召回充分，只是噪声多 → 该上压缩而非多查询 |
+
+**成本必须算清楚**
+
+多查询的开销是**一次改写 LLM 调用 + N 倍的向量检索 + N 倍的上下文 Token**。上面的例子里延迟涨了 6 倍、生成阶段的输入 Token 翻倍。所以课文才强调「先实测收益再保留」。
+
+**判断收益的实用方法**：准备 10–20 个真实问题，人工标注每题的「标准答案应覆盖哪几个要点」，然后统计两种检索下的**要点覆盖率**：
+
+```ts
+const cases = [
+  { q: "密码忘了怎么办？", points: ["自助重置", "手机验证", "联系管理员"] },
+  // …更多用例
+];
+
+for (const c of cases) {
+  const ans = await answer(await multi.invoke(c.q));
+  const hit = c.points.filter((p) => ans.includes(p)).length;
+  console.log(`${c.q}  覆盖 ${hit}/${c.points.length}`);
+}
+```
+
+覆盖率提升明显才值得为它付出延迟和成本。这套用例集稍加整理，就是第 24 章 LangSmith 数据集评估的雏形。
+
+**组合技**：如果多查询让上下文变得又长又杂，可以在它外面再套一层 `ContextualCompressionRetriever`——先扩大召回，再提纯压缩，两者互补（见课文第 3 节）。
+</Answer>
 </Callout>
 
 ## 小结

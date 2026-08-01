@@ -194,4 +194,153 @@ FROM orders o JOIN users u USING (id);  -- 仅当列名都叫 id 才对，此例
 1. 查询每个分类（含无商品的分类）的商品数量，注意 COUNT 的写法。
 2. 找出「有待支付订单」的用户及其待支付金额合计；再改成「所有用户 + 待支付金额（无则 0）」，体会条件放 ON 与 WHERE 的差别。
 3. 用 EXPLAIN 观察 orders JOIN users 的执行计划，确认谁是驱动表、被驱动表用了什么索引；把 users 表的主键换成普通列模拟无索引 JOIN，看是否出现 hash join。
+
+<Answer>
+**参考答案：**
+
+**1. 每个分类的商品数（含无商品分类）**
+
+```sql
+SELECT c.id,
+       c.name,
+       COUNT(p.id) AS product_count
+FROM categories c
+LEFT JOIN products p ON p.category_id = c.id
+GROUP BY c.id, c.name
+ORDER BY product_count DESC, c.id;
+```
+
+**COUNT 的写法是本题的考点**：
+
+- `COUNT(p.id)` —— 正确。没有商品的分类，LEFT JOIN 补出的 `p.id` 是 NULL，COUNT 跳过 NULL，结果为 **0**。
+- `COUNT(*)` —— 错误。它数的是「行数」，没有商品的分类也占一行（右表全 NULL），会被数成 **1**。
+
+对比一下就一目了然：
+
+```sql
+SELECT c.id, c.name,
+       COUNT(p.id) AS right_count,
+       COUNT(*)    AS wrong_count
+FROM categories c
+LEFT JOIN products p ON p.category_id = c.id
+GROUP BY c.id, c.name;
+-- 「图书」这类没有直属商品的分类：right_count = 0，wrong_count = 1
+```
+
+规则可以记成：**LEFT JOIN 后统计右表数量，一律 `COUNT(右表的非空列)`**，通常用右表主键。同理 `SUM(p.price)` 对空组返回 NULL，需要 `IFNULL(SUM(p.price), 0)`。
+
+**2. 待支付金额统计：ON 与 WHERE 的差别**
+
+第一问，只要「有待支付订单」的用户（内连接语义）：
+
+```sql
+SELECT u.id, u.username,
+       COUNT(o.id)            AS pending_count,
+       SUM(o.total_amount)    AS pending_amount
+FROM users u
+JOIN orders o ON o.user_id = u.id
+WHERE o.status = 0
+GROUP BY u.id, u.username;
+```
+
+第二问，所有用户都要（无待支付则为 0）——**条件必须放进 ON**：
+
+```sql
+SELECT u.id, u.username,
+       COUNT(o.id)                       AS pending_count,
+       IFNULL(SUM(o.total_amount), 0)    AS pending_amount
+FROM users u
+LEFT JOIN orders o
+       ON o.user_id = u.id AND o.status = 0    -- 条件在 ON 里
+GROUP BY u.id, u.username
+ORDER BY pending_amount DESC;
+```
+
+**如果把 `o.status = 0` 挪到 WHERE**：
+
+```sql
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id
+WHERE o.status = 0     -- ← LEFT JOIN 悄悄退化成 INNER JOIN
+```
+
+对没有待支付订单的用户，LEFT JOIN 补出的 `o.status` 是 NULL，而 `NULL = 0` 的结果是 UNKNOWN，WHERE 只保留 TRUE，于是这些用户**整行被过滤掉**了，回到了第一问的语义。
+
+一句话总结这个高频陷阱：
+
+| 位置 | 作用时机 | 效果 |
+|---|---|---|
+| `ON` 里的右表条件 | 拼接**时**决定「哪些右表行算匹配」 | 左表行全保留，不匹配的右表列补 NULL |
+| `WHERE` 里的右表条件 | 拼接**后**过滤结果行 | 补 NULL 的行被删掉，LEFT JOIN 退化为 INNER JOIN |
+
+唯一的例外是 `WHERE o.id IS NULL`——它恰恰是**利用**这个机制来做反连接（找「没有」的行）。
+
+INNER JOIN 里则没有这个区别，条件放 ON 或 WHERE 结果完全一样（优化器也会等价改写）。
+
+**3. EXPLAIN 观察 JOIN 执行计划**
+
+```sql
+EXPLAIN SELECT o.order_no, u.username
+FROM orders o
+JOIN users u ON u.id = o.user_id
+WHERE o.status = 1;
+```
+
+典型输出：
+
+```text
++----+-------+------+---------+---------+-------------+------+-------------+
+| id | table | type | key     | ref     | rows | Extra              |
++----+-------+------+---------+---------+------+--------------------+
+|  1 | o     | ALL  | NULL    | NULL    |    4 | Using where        |
+|  1 | u     | eq_ref | PRIMARY | shop.o.user_id | 1 | NULL        |
++----+-------+------+---------+---------+------+--------------------+
+```
+
+怎么读：
+
+- **`id` 相同的行，从上往下就是 JOIN 顺序**——第一行 `o` 是**驱动表**（外层循环），第二行 `u` 是**被驱动表**（内层查找）。
+- 被驱动表 `u` 的 `key = PRIMARY`、`type = eq_ref`，说明每次拿 `o.user_id` 去 users 的**主键索引**做一次等值查找，命中唯一一行——这是 NLJ 的最优形态。`eq_ref` 比 `ref` 更好，表示走的是主键或唯一索引。
+- `ref` 列的 `shop.o.user_id` 明确告诉你「用驱动表的哪个值去探测」。
+- 驱动表 `o` 是 `ALL`（全表扫描）是因为示例数据太少，优化器认为扫 4 行比走索引便宜；数据量大时给 `status` 加索引后会变成 `ref`。
+
+看得更清楚可以用树形输出：
+
+```sql
+EXPLAIN FORMAT=TREE SELECT o.order_no, u.username
+FROM orders o JOIN users u ON u.id = o.user_id WHERE o.status = 1;
+-- -> Nested loop inner join
+--     -> Filter: (o.status = 1)  (cost=... rows=...)
+--         -> Table scan on o
+--     -> Single-row index lookup on u using PRIMARY (id = o.user_id)
+```
+
+**模拟无索引 JOIN 触发 Hash Join**：不要真去动 users 的主键，复制一张无索引的表更安全：
+
+```sql
+CREATE TABLE users_noidx AS SELECT * FROM users;   -- CREATE TABLE AS 不会复制索引
+
+EXPLAIN FORMAT=TREE
+SELECT o.order_no, u.username
+FROM orders o
+JOIN users_noidx u ON u.id = o.user_id;
+```
+
+```text
+-> Inner hash join (u.id = o.user_id)
+    -> Table scan on o
+    -> Hash
+        -> Table scan on u
+```
+
+出现 `Inner hash join` 就说明走了 **Hash Join**（8.0.18+ 默认开启）：先把小表按连接列构建成哈希表放进 join buffer，再全表扫描另一张表逐行探测，两边各扫一遍即可。这比 8.0.18 之前的 BNL（被驱动表要被反复全表扫描）快得多。
+
+注意 `EXPLAIN`（传统表格格式）里看不到 `hash join` 字样，只会在 Extra 显示 `Using join buffer (hash join)`，所以**要看 JOIN 算法务必用 `FORMAT=TREE`**。
+
+清理：
+
+```sql
+DROP TABLE users_noidx;
+```
+</Answer>
 </Callout>

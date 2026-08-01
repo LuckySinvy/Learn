@@ -1583,6 +1583,142 @@ CMD ["node", "dist/main.js"]
 2. **给迷你容器加请求作用域**：修改 `ts-23-di-container` 的 `Container`，支持第三种 scope `"request"`——新增 `createRequestScope()` 返回一个子容器，其中 request 作用域的 provider 在子容器内是单例、跨子容器互不共享。再验证一下：依赖 request provider 的 singleton provider 会不会拿到过期实例？（这正是真实 Nest 里"请求作用域会传染"的原因。）
 3. **把洋葱模型接回第 22 章的 CLI**：把 `ts-23-interceptor-onion` 里的 `compose` 搬到第 22 章的 `Cli.dispatch` 上，实现日志中间件（打印命令与耗时）、权限中间件（`rm` 命令需要确认）和错误中间件（把抛出的异常转成 `Result`）。注意类型参数要从 `Req`/`Res` 换成 `string[]`/`Result<string[]>`。
 4. **进阶**：为 Tasks API 加上基于 `AsyncLocalStorage` 的请求 ID 透传——中间件生成 ID，日志拦截器和 Service 里的 Logger 都能读到它，且**不使用请求作用域 provider**。
+
+<Answer>
+**参考答案：**
+
+**第 1 题**——`PATCH /tasks/:id/done` 三件套：
+
+```ts
+// dto/toggle-done.dto.ts
+export class ToggleDoneDto {} // 无需字段，仅占位以走 ValidationPipe
+
+// tasks.service.ts
+async toggleDone(id: number): Promise<Task> {
+  const task = await this.findOne(id); // 找不到会抛 NotFoundException
+  if (task.done) {
+    throw new ConflictException("任务 " + id + " 已经完成过了");
+  }
+  task.done = true;
+  return this.repo.save(task);
+}
+
+// tasks.controller.ts
+@Patch(":id/done")
+@HttpCode(HttpStatus.OK)
+toggleDone(@Param("id", ParseIntPipe) id: number): Promise<Task> {
+  return this.tasksService.toggleDone(id);
+}
+```
+
+单元测试覆盖「已完成时抛 `ConflictException`」这一分支：
+
+```ts
+it("toggleDone 已完成时抛 ConflictException", async () => {
+  repo.findOne.mockResolvedValue({ id: 1, title: "x", done: true } as Task);
+  await expect(service.toggleDone(1)).rejects.toBeInstanceOf(ConflictException);
+});
+```
+
+**第 2 题**——给迷你容器加 `request` 作用域：
+
+```ts
+class Container {
+  private readonly providers = new Map<Token, Provider>();
+  private readonly singletons = new Map<Token, unknown>();
+  private readonly requestScoped = new Map<Token, unknown>(); // 仅子容器持有
+
+  createRequestScope(): Container {
+    const child = new Container();
+    child.providers = this.providers;            // 共享注册表
+    child.singletons = this.singletons;          // 共享父级单例缓存
+    // requestScoped 不继承：每个子容器独立
+    return child;
+  }
+
+  resolve<T>(token: Token, chain: readonly Token[] = []): T {
+    // ... 循环依赖、value、singleton 处理同上 ...
+    if (provider.scope === "request") {
+      const hit = this.requestScoped.get(token);
+      if (hit !== undefined) return hit as T;     // 子容器内单例
+      const instance = provider.factory(args);
+      this.requestScoped.set(token, instance);    // 只写进当前子容器
+      return instance as T;
+    }
+    // singleton / transient 同上
+  }
+}
+```
+
+**「传染」验证**：若某个 `singleton` 的 `deps` 里包含 `request` 作用域的 provider，它会在**父容器**里被解析一次，从而把第一个请求子容器的实例「焊死」在内部。后续请求通过同一个单例拿到的就是过期实例——这正是真实 Nest 里「请求作用域会传染」的根源：Nest 索性把整条依赖链都提升为请求作用域来避免这种隐蔽的错误共享。
+
+**第 3 题**——把洋葱模型接回 CLI（类型参数换成 `string[]` / `Result<string[]>`）：
+
+```ts
+type Next = () => Result<string[]>;
+type Middleware = (line: string, next: Next) => Result<string[]>;
+
+function compose(chain: readonly Middleware[], handler: Middleware): Middleware {
+  return chain.reduceRight<Middleware>(
+    (n, mw) => (line, next) => mw(line, () => n(line, next)),
+    handler,
+  );
+}
+
+// 日志中间件
+const logger: Middleware = (line, next) => {
+  const started = Date.now();
+  const res = next();
+  console.log(line + " 用时 " + (Date.now() - started) + "ms");
+  return res;
+};
+
+// 权限中间件：rm 需要确认
+const guard: Middleware = (line, next) => {
+  if (line.startsWith("rm")) return err("rm 需要二次确认，请用 rm! ");
+  return next();
+};
+
+// 错误中间件：把异常转成 Result
+const catcher: Middleware = (line, next) => {
+  try {
+    return next();
+  } catch (e) {
+    return err(e instanceof Error ? e.message : String(e));
+  }
+};
+
+// 处理器就是原来的 dispatch 逻辑，签名 (line, next) => Result<string[]>
+const pipeline = compose([catcher, logger, guard], (line) => cli.dispatch(line));
+```
+
+**第 4 题**——`AsyncLocalStorage` 透传请求 ID（不用请求作用域 provider）：
+
+```ts
+import { AsyncLocalStorage } from "node:async_hooks";
+
+type Ctx = { requestId: string };
+const als = new AsyncLocalStorage<Ctx>();
+
+// 中间件：每次请求生成并绑定 ID
+const requestIdMiddleware: Middleware = (line, next) => {
+  const id = "req-" + Math.random().toString(36).slice(2, 8);
+  return als.run({ requestId: id }, () => next());
+};
+
+// Logger 在任意深处读取，无需注入
+class Logger {
+  log(msg: string): void {
+    const rid = als.getStore()?.requestId ?? "-";
+    console.log("[" + rid + "] " + msg);
+  }
+}
+
+// 拦截器 / Service 里的 Logger 都能读到同一个 requestId
+```
+
+`AsyncLocalStorage` 把上下文绑在调用栈上，跨异步边界自动传递，因此 Logger 和拦截器无需通过构造器注入就能拿到请求 ID——这正是它比「请求作用域 provider」更轻量的地方。
+</Answer>
 </Callout>
 
 到这里，TypeScript 课程真正结束了。从第 1 章的 `tsc --init` 到现在的分层服务，你已经走完了一条完整的路：类型是用来描述约束的，而框架是用来把这些约束**自动兑现**的。接下来最好的练习，是拿一个你手上的 Express 项目，用这一章的分层方式重写它 🎉

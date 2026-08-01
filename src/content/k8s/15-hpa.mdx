@@ -98,6 +98,96 @@ kubectl exec -it <pod> -- sh -c "yes > /dev/null &"
 
 <Callout type="exercise" title="练习">
 为 nginx Deployment 配一个 HPA（目标 CPU 50%，2–10 副本），用上面的 `yes` 命令制造负载，观察 `kubectl get hpa` 中 REPLICAS 上升；停止负载后看它是否自动缩回。
+
+<Answer>
+**参考答案：**
+
+前提：集群已装 metrics-server（HPA 依赖它取 CPU 指标）；目标 Deployment 必须设置 `resources.requests`。
+
+先准备 Deployment（保存为 `nginx.yaml`）：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          resources:
+            requests: { cpu: "100m" }   # HPA 计算利用率的分子/分母都依赖它
+            limits:   { cpu: "500m" }
+```
+
+创建 HPA（保存为 `hpa.yaml`）：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+```
+
+按顺序执行：
+
+```bash
+kubectl apply -f nginx.yaml
+kubectl apply -f hpa.yaml
+
+# 初始状态：无负载，REPLICAS 应保持 2
+kubectl get hpa
+# NAME        REFERENCE          TARGETS   MINPODS  MAXPODS  REPLICAS
+# nginx-hpa   Deployment/nginx   0%/50%    2        10       2
+
+# 制造 CPU 负载（yes > /dev/null 会空转烧满一个核）
+kubectl exec -it deploy/nginx -- sh -c "yes > /dev/null &"
+
+# 等待几十秒（HPA 默认 15s 采样一次，利用率要过几个周期），再观察：
+kubectl get hpa
+# TARGETS 升到 100%+/50%，REPLICAS 开始上升
+# 持续压测直到 REPLICAS 爬到上限或足够高（可多开几个 yes 进程）
+kubectl get pods -l app=nginx   # 副本数在增长
+
+# 停止负载：杀掉容器内空转进程（或重启 Deployment）
+kubectl exec -it deploy/nginx -- pkill yes
+# 缩容有冷却时间（约 5 分钟），等待后：
+kubectl get hpa
+# TARGETS 回落到 0%/50%，REPLICAS 逐步缩回 2
+
+# 观察伸缩事件
+kubectl describe hpa nginx-hpa
+
+# 清理
+kubectl delete -f hpa.yaml
+kubectl delete -f nginx.yaml
+```
+
+**要点回顾：** HPA 以 `requests.cpu` 为分母算平均利用率，超过目标 50% 就扩容、低于就缩容；`minReplicas`/`maxReplicas` 是兜底边界。缩容比扩容保守（约 5 分钟冷却），所以停止负载后不会立刻缩回，耐心等待即可。
+</Answer>
 </Callout>
 
 ## 小结

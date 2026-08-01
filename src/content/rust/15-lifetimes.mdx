@@ -100,6 +100,122 @@ fn first_word(s: &str) -> &str { ... }   // 规则2：输入唯一，输出同�
 
 <Callout type="exercise" title="练习">
 实现 `fn longest_with_default<'a>(x: &'a str, y: &'a str, ann: &str) -> &'a str`，先打印 `ann`，再比较长度返回较长者。去掉标注看编译器如何提示你补上。
+
+<Answer>
+**参考答案：**
+
+```rust
+fn longest_with_default<'a>(x: &'a str, y: &'a str, ann: &str) -> &'a str {
+    println!("公告：{}", ann);
+    if x.len() > y.len() { x } else { y }
+}
+
+fn main() {
+    let a = String::from("hello world");
+    let b = String::from("hi");
+
+    let result = longest_with_default(&a, &b, "正在比较两个字符串");
+    println!("较长的是：{}", result);
+
+    // ann 是字面量还是 String 都无所谓，它的生命周期与返回值无关
+    let note = String::from("第二次比较");
+    println!("较长的是：{}", longest_with_default("abc", "abcdef", &note));
+}
+```
+
+**输出：**
+
+```text
+公告：正在比较两个字符串
+较长的是：hello world
+公告：第二次比较
+较长的是：abcdef
+```
+
+**注意 `ann` 没有标注 `'a`**
+
+这是本题的精髓。`ann` 只是被打印一下，**它的引用不会出现在返回值里**，所以它的生命周期和返回值毫无关系。编译器会按省略规则给它分配一个独立的匿名生命周期。
+
+如果强行给它也标上 `'a`，程序仍能编译，但**约束被不必要地收紧了**——调用方会被要求 `ann` 也得活得和返回值一样久，这在某些场景下会导致本该合法的代码被拒绝。**生命周期标注要尽可能宽松**，只在真正相关的参数间建立联系。
+
+**去掉标注会怎样？**
+
+```rust
+fn longest_with_default(x: &str, y: &str, ann: &str) -> &str {
+    println!("公告：{}", ann);
+    if x.len() > y.len() { x } else { y }
+}
+```
+
+```text
+error[E0106]: missing lifetime specifier
+ --> src/main.rs:1:56
+  |
+1 | fn longest_with_default(x: &str, y: &str, ann: &str) -> &str {
+  |                            ----     ----       ----     ^ expected named lifetime parameter
+  |
+  = help: this function's return type contains a borrowed value, but the
+          signature does not say whether it is borrowed from `x`, `y`, or `ann`
+help: consider introducing a named lifetime parameter
+  |
+1 | fn longest_with_default<'a>(x: &'a str, y: &'a str, ann: &'a str) -> &'a str {
+  |                        ++++     ++          ++            ++          ++
+```
+
+**为什么省略规则在这里失效？** 回顾三条规则：
+
+1. 每个引用参数各得一个独立生命周期 → 这里有三个：`'1`、`'2`、`'3`
+2. **只有一个**输入生命周期时，赋给所有输出 → 有三个，不适用
+3. 有 `&self` 时，把 self 的生命周期赋给输出 → 这不是方法，不适用
+
+三条规则都用不上，编译器只能求助于你。注意编译器的建议是「三个参数都标 `'a`」——这是最保守的方案，能编译但过度收紧。**你自己写的版本（只标 `x` 和 `y`）更精确。**
+
+**验证生命周期检查真的在工作：**
+
+```rust
+fn main() {
+    let a = String::from("hello world");
+    let result;
+    {
+        let b = String::from("hi");
+        result = longest_with_default(&a, &b, "test");
+    }   // b 在这里被 drop
+    println!("{}", result);   // ❌ 编译错误
+}
+```
+
+```text
+error[E0597]: `b` does not live long enough
+  --> src/main.rs:6:47
+   |
+5  |         let b = String::from("hi");
+   |             - binding `b` declared here
+6  |         result = longest_with_default(&a, &b, "test");
+   |                                           ^^ borrowed value does not live long enough
+7  |     }
+   |     - `b` dropped here while still borrowed
+8  |     println!("{}", result);
+   |                    ------ borrow later used here
+```
+
+有意思的是，**即便运行时返回的其实是 `a`**（因为 `"hello world"` 更长），编译器依然拒绝。因为生命周期是**静态分析**——`'a` 被推导为 `a` 和 `b` 中较短的那个，编译器不会去推演运行时的分支走向。这就是「宁可保守也不放过」的取舍。
+
+**换个角度理解 `'a` 的含义：**
+
+`'a` 不是「让 x 和 y 活一样久」，而是**在两者存活期的交集里取一个区间**，返回值只能在这个区间内使用。你可以把它读成一句承诺：
+
+> 「我返回的引用，其数据来自 x 或 y，所以你在用它的时候，必须保证 x 和 y 都还活着。」
+
+**如果返回值其实和输入无关，就不需要标注：**
+
+```rust
+fn always_greeting(_x: &str, _y: &str) -> &'static str {
+    "你好"   // 字面量是 'static，不借用任何参数
+}
+```
+
+这里返回的是程序二进制中的静态数据，跟参数没有任何借用关系，所以标 `'static` 即可，不用引入 `'a`。
+</Answer>
 </Callout>
 
 ## 小结

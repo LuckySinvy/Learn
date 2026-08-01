@@ -217,4 +217,164 @@ docker exec -it <容器名> /opt/kafka/bin/kafka-topics.sh \
 1. 用 Docker Compose 启动三节点集群，创建一个 3 分区 3 副本的 topic，用 describe 确认 leader 分布在三个不同 broker 上。
 2. `docker stop` 掉其中一个 broker，再次 describe，观察 Leader 和 Isr 列的变化；重新启动后再看 Isr 是否恢复。
 3. 故意把 advertised.listeners 改成错误主机名，体验一下客户端"能 bootstrap 却发不了消息"的经典故障。
+
+<Answer>
+**参考答案：**
+
+**第 1 题 · 三节点集群 + 3 分区 3 副本**
+
+完整的 compose 文件（三份服务只差 `KAFKA_NODE_ID` 和监听地址）：
+
+```yaml
+# docker-compose.yml
+services:
+  kafka1:
+    image: apache/kafka:3.7.1
+    hostname: kafka1
+    ports: ["9092:9092"]
+    environment: &base
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:19092,EXTERNAL://localhost:9092
+  kafka2:
+    image: apache/kafka:3.7.1
+    hostname: kafka2
+    ports: ["9094:9094"]
+    environment:
+      <<: *base
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:19092,EXTERNAL://localhost:9094
+  kafka3:
+    image: apache/kafka:3.7.1
+    hostname: kafka3
+    ports: ["9096:9096"]
+    environment:
+      <<: *base
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9096
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:19092,EXTERNAL://localhost:9096
+```
+
+注意 `KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR` 必须从单机版的 1 改成 3，否则内部 topic `__consumer_offsets` 只有单副本，一台挂掉就丢消费位点。
+
+```bash
+docker compose up -d
+docker compose ps    # 三个都 running 后再操作
+
+docker exec -it kafka1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:19092 \
+  --create --topic orders --partitions 3 --replication-factor 3
+
+docker exec -it kafka1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:19092 --describe --topic orders
+```
+
+期望输出（leader 均匀打散在 1/2/3 上，Isr 三个都齐）：
+
+```text
+Topic: orders  PartitionCount: 3  ReplicationFactor: 3
+  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3
+  Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1
+  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1,2
+```
+
+Kafka 建 topic 时会按 round-robin 轮流指定 leader，所以三个分区的 leader 自然分散——这正是"分区是并行单位"的体现：三台机器同时承担写入压力。
+
+**第 2 题 · 停掉一个 broker 观察 Leader / Isr**
+
+```bash
+docker stop kafka2
+# 等几秒让 controller 检测到失联（受 zk-less 模式下的 broker session 超时控制）
+docker exec -it kafka1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:19092 --describe --topic orders
+```
+
+现象：
+
+```text
+  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,3      <- 2 掉出 ISR
+  Partition: 1  Leader: 3  Replicas: 2,3,1  Isr: 3,1      <- leader 从 2 切到 3
+  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1
+```
+
+要观察到的三件事：
+
+1. **Replicas 列不变**：副本分配是静态元数据，机器挂了副本"名单"还在。
+2. **Isr 列少了 2**：ISR 是"当前追得上 leader 的副本集合"，是动态的。
+3. **原本 leader 在 2 的分区自动切主**：controller 从 ISR 里选一个新 leader，这就是自动故障转移。整个过程客户端只会短暂报 `NotLeaderOrFollowerException` 然后自动刷新元数据重试。
+
+重启后：
+
+```bash
+docker start kafka2
+sleep 15
+docker exec -it kafka1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:19092 --describe --topic orders
+```
+
+- **Isr 会恢复成 1,2,3**：broker 2 重启后作为 follower 从 leader 拉取落后的数据，追平（进入 `replica.lag.time.max.ms` 阈值内）后重新加入 ISR。
+- 但 **Leader 不会自动切回去**，分区 1 的 leader 仍留在 3。这会导致 leader 分布不均。如果 `auto.leader.rebalance.enable=true`（默认开启），后台线程会在 `leader.imbalance.check.interval.seconds`（默认 300 秒）后自动平衡回来；也可以手动触发：
+
+```bash
+docker exec -it kafka1 /opt/kafka/bin/kafka-leader-election.sh \
+  --bootstrap-server localhost:19092 --election-type PREFERRED --all-topic-partitions
+```
+
+"preferred leader"就是 Replicas 列表里的第一个副本。
+
+**第 3 题 · advertised.listeners 配错的经典故障**
+
+把 kafka1 的配置改成一个根本不存在的主机名：
+
+```yaml
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:19092,EXTERNAL://wrong-host:9092
+```
+
+重启后从宿主机连 `localhost:9092`，你会看到：
+
+```text
+# 元数据能拿到（bootstrap 成功）
+$ bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+orders
+
+# 但生产/消费卡住直至超时
+$ bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic orders
+> hello
+ERROR Error when sending message to topic orders with key: null, value: 5 bytes
+org.apache.kafka.common.errors.TimeoutException: Topic orders not present in
+metadata after 60000 ms.
+WARN [Producer clientId=console-producer] Error connecting to node
+wrong-host:9092 (id: 1 rack: null) java.net.UnknownHostException: wrong-host
+```
+
+**故障原理**（这是 Kafka 排障必须刻进肌肉记忆的一条）：
+
+```text
+1. 客户端拿 bootstrap.servers 里的地址 → 连上任意一个 broker
+2. 该 broker 返回集群元数据，里面写的是每个 broker 的 advertised.listeners
+3. 客户端【丢弃】bootstrap 地址，改用元数据里的地址去连真正的分区 leader
+   ↑ 第 3 步用的是 advertised.listeners，配错就连不上
+```
+
+所以 `bootstrap.servers` 只是"问路的入口"，真正干活用的是 broker 自报的地址。判断标志很明确：**`--list` 能成功但收发消息超时，且日志里出现的主机名不是你填的那个** —— 100% 是 `advertised.listeners` 的问题。
+
+排查手段：
+
+```bash
+# 这个命令会打印客户端实际解析到的 broker 地址
+bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 | head -5
+```
+
+Docker / K8s / 云主机场景下最容易踩：容器内外、内网外网需要不同地址，正确做法是**配置多个 listener**（如示例中的 `PLAINTEXT` 给容器间通信、`EXTERNAL` 给宿主机），而不是试图用一个地址糊弄两边。
+</Answer>
 </Callout>

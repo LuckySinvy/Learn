@@ -102,6 +102,153 @@ Rust 保证：被 `move` 进线程的数据，别的线程/原作用域都无法
 
 <Callout type="exercise" title="练习">
 创建两个子线程，通过单个 `mpsc` 通道（用 `tx.clone()`）各发送一条消息，主线程用 `for received in rx` 循环接收并打印两条。注意 `tx` 在生成完线程后无需再持有。
+
+<Answer>
+**参考答案：**
+
+```rust
+use std::sync::mpsc;
+use std::thread;
+
+fn main() {
+    let (tx, rx) = mpsc::channel();
+
+    // 线程 1：使用克隆的发送端
+    let tx1 = tx.clone();
+    thread::spawn(move || {
+        tx1.send(String::from("来自线程 1")).unwrap();
+    });   // tx1 在这里被 drop
+
+    // 线程 2：使用原始发送端
+    thread::spawn(move || {
+        tx.send(String::from("来自线程 2")).unwrap();
+    });   // tx 在这里被 drop
+
+    // 所有发送端都已 drop，rx 迭代完两条消息后会自然结束
+    for received in rx {
+        println!("收到：{}", received);
+    }
+
+    println!("通道已关闭，全部接收完毕");
+}
+```
+
+**可能的输出（两条消息的顺序不确定）：**
+
+```text
+收到：来自线程 1
+收到：来自线程 2
+通道已关闭，全部接收完毕
+```
+
+**最关键的一点：为什么 `tx` 必须被 move 进线程？**
+
+`for received in rx` 是一个**阻塞循环**，它会一直等待新消息，直到**所有发送端都被 drop** 才结束。如果主线程还持有一个 `tx`，通道永远不会关闭，程序就会永久挂起。
+
+```rust
+// ❌ 会死锁的写法
+let (tx, rx) = mpsc::channel();
+
+let tx1 = tx.clone();
+thread::spawn(move || { tx1.send("a".to_string()).unwrap(); });
+
+let tx2 = tx.clone();       // 又克隆了一个
+thread::spawn(move || { tx2.send("b".to_string()).unwrap(); });
+
+// 主线程仍然持有原始的 tx！
+for received in rx {
+    println!("{}", received);
+}   // 💥 收完两条后继续等待，永远不返回
+```
+
+**两种修复方式：**
+
+```rust
+// 方案一：把最后一个 tx 也 move 进线程（本题答案的做法）
+
+// 方案二：显式 drop
+let tx2 = tx.clone();
+thread::spawn(move || { tx2.send("b".to_string()).unwrap(); });
+drop(tx);   // 手动丢弃主线程持有的发送端
+for received in rx { println!("{}", received); }
+```
+
+这是初学 channel 时**最容易踩的坑**，务必记牢：**通道的关闭由「最后一个 Sender 被 drop」触发。**
+
+**为什么消息顺序不确定？**
+
+两个线程是并发执行的，谁先抢到 CPU 就谁先 `send`。通道本身保证**同一个发送端**发出的消息按序到达，但不同发送端之间没有顺序保证。需要确定顺序就得靠 `join()` 或在消息里带序号。
+
+**进阶版：多条消息 + 收集结果 + 等待线程结束**
+
+```rust
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::new();
+
+    for id in 0..3 {
+        let tx = tx.clone();
+        let handle = thread::spawn(move || {
+            for i in 1..=2 {
+                tx.send(format!("线程{} 的第{}条消息", id, i)).unwrap();
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        handles.push(handle);
+    }
+
+    drop(tx);   // 关键：丢弃主线程的发送端
+
+    let mut messages: Vec<String> = rx.iter().collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    messages.sort();   // 排序后输出，保证结果稳定
+    for m in &messages {
+        println!("{}", m);
+    }
+    println!("共收到 {} 条", messages.len());
+}
+```
+
+**输出：**
+
+```text
+线程0 的第1条消息
+线程0 的第2条消息
+线程1 的第1条消息
+线程1 的第2条消息
+线程2 的第1条消息
+线程2 的第2条消息
+共收到 6 条
+```
+
+**`recv()` vs `try_recv()` vs `for ... in rx`**
+
+| 方式 | 行为 |
+|---|---|
+| `rx.recv()` | 阻塞等待一条；所有 Sender 关闭后返回 `Err` |
+| `rx.try_recv()` | 立即返回，没有消息就给 `Err`，适合轮询 |
+| `for x in rx` | 阻塞迭代，Sender 全关闭时自动结束循环 |
+
+**为什么 channel 天然没有数据竞争？**
+
+`send` 会把值的**所有权**转移进通道，发送方之后就无法再访问它了：
+
+```rust
+let data = String::from("hello");
+tx.send(data).unwrap();
+// println!("{}", data);   // ❌ 编译错误：value moved
+```
+
+同一份数据在任一时刻只被一个线程持有——这就是「不用共享内存来通信，用通信来共享内存」在类型系统层面的落实。相比之下，下一章的 `Mutex` 方案需要靠加锁来协调，channel 则从根本上避免了这个问题。
+</Answer>
 </Callout>
 
 ## 小结

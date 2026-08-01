@@ -203,4 +203,229 @@ ZSet 是所有结构里单元素内存开销最大的（skiplist 节点 + hashta
 1. 构建一个 10 人游戏排行榜，实现：加分、取 Top 3、查询某玩家名次、只保留前 5 名。
 2. 用 ZSet 实现延时队列：加入 3 个不同到期时间的任务，模拟消费者取出"当前已到期"的任务并删除。
 3. 向 ZSet 写入 130 个成员，用 OBJECT ENCODING 验证 listpack 到 skiplist 的转换。
+
+<Answer>
+**参考答案：**
+
+**1. 10 人游戏排行榜**
+
+```bash
+# ---- 初始化 10 名玩家 ----
+127.0.0.1:6379> ZADD rank:game 1200 alice 980 bob 1500 carol 760 dave 1340 eve \
+                               1100 frank 890 grace 1620 henry 1050 ivy 1420 jack
+(integer) 10
+
+# ---- 加分：ZINCRBY 原子累加，返回加完后的新分数 ----
+127.0.0.1:6379> ZINCRBY rank:game 300 bob
+"1280"
+127.0.0.1:6379> ZINCRBY rank:game -50 henry      # 扣分传负数
+"1570"
+
+# ---- 取 Top 3（分数从高到低，带分数）----
+127.0.0.1:6379> ZREVRANGE rank:game 0 2 WITHSCORES
+1) "henry"
+2) "1570"
+3) "carol"
+4) "1500"
+5) "jack"
+6) "1420"
+
+# Redis 6.2+ 推荐用统一的 ZRANGE + REV
+127.0.0.1:6379> ZRANGE rank:game 0 2 REV WITHSCORES
+1) "henry"
+2) "1570"
+...
+
+# ---- 查询某玩家名次 ----
+127.0.0.1:6379> ZREVRANK rank:game bob
+(integer) 4               # 下标从 0 开始，所以是第 5 名
+127.0.0.1:6379> ZSCORE rank:game bob
+"1280"
+
+# Redis 7.2+ 可以一次拿到名次和分数
+127.0.0.1:6379> ZREVRANK rank:game bob WITHSCORE
+1) (integer) 4
+2) "1280"
+
+# 玩家不存在时返回 nil
+127.0.0.1:6379> ZREVRANK rank:game nobody
+(nil)
+
+# ---- 只保留前 5 名 ----
+# ZREMRANGEBYRANK 按"升序排名"删除，所以要删掉低分的那批
+127.0.0.1:6379> ZCARD rank:game
+(integer) 10
+127.0.0.1:6379> ZREMRANGEBYRANK rank:game 0 -6    # 删掉倒数第 6 名到最后一名
+(integer) 5
+127.0.0.1:6379> ZCARD rank:game
+(integer) 5
+127.0.0.1:6379> ZRANGE rank:game 0 -1 REV WITHSCORES
+ 1) "henry"
+ 2) "1570"
+ 3) "carol"
+ 4) "1500"
+ 5) "jack"
+ 6) "1420"
+ 7) "eve"
+ 8) "1340"
+ 9) "bob"
+10) "1280"
+```
+
+**`ZREMRANGEBYRANK key 0 -(N+1)` 是保留 Top N 的固定写法**，推导过程：
+
+```bash
+# 排名是升序的（0 = 最低分），要保留分数最高的 5 个
+# 就是要删掉最低的那些，即下标 0 到 (总数 - 5 - 1)
+# 用负数下标表达就与总数无关了：-1 是最后一个，-5 是倒数第 5 个
+# 保留最高的 5 个 = 删除 [0, -6]
+ZREMRANGEBYRANK rank:game 0 -6
+```
+
+这条命令建议在每次写入后调用，或者用定时任务周期执行，防止排行榜无限膨胀成大 key。
+
+**名次显示的常见需求补充**：
+
+```bash
+# "第 N 名"要给排名加 1（ZREVRANK 从 0 开始）
+# 显示"我的排名及前后各 2 名"（假设我排第 4，下标 3）
+127.0.0.1:6379> ZRANGE rank:game 1 5 REV WITHSCORES
+
+# 同分时怎么排？ZSet 分数相同时按成员名字典序排列
+# 想要"同分先到先得"，可以把时间戳编进分数：
+# score = 真实分数 * 10000000000 + (9999999999 - 时间戳)
+# 这样分数高的在前，同分时早提交的在前
+```
+
+**2. ZSet 实现延时队列**
+
+核心思路：**score = 任务的执行时间戳**，消费者轮询取出所有 score ≤ 当前时间的任务。
+
+```bash
+# ---- 加入 3 个不同到期时间的任务 ----
+# 假设当前时间戳为 1785000000
+127.0.0.1:6379> ZADD delay:queue 1785000010 "order:1001:cancel"   # 10 秒后
+(integer) 1
+127.0.0.1:6379> ZADD delay:queue 1785000060 "order:1002:cancel"   # 60 秒后
+(integer) 1
+127.0.0.1:6379> ZADD delay:queue 1785000300 "coupon:88:expire"    # 5 分钟后
+(integer) 1
+
+127.0.0.1:6379> ZRANGE delay:queue 0 -1 WITHSCORES
+1) "order:1001:cancel"
+2) "1785000010"
+3) "order:1002:cancel"
+4) "1785000060"
+5) "coupon:88:expire"
+6) "1785000300"
+
+# ---- 消费者：取出"当前已到期"的任务 ----
+# 假设现在时间走到了 1785000070
+127.0.0.1:6379> ZRANGEBYSCORE delay:queue 0 1785000070 LIMIT 0 10
+1) "order:1001:cancel"
+2) "order:1002:cancel"
+
+# 逐个删除（删除成功才处理，靠返回值抢占）
+127.0.0.1:6379> ZREM delay:queue "order:1001:cancel"
+(integer) 1               # 返回 1 = 我抢到了这个任务，可以处理
+127.0.0.1:6379> ZREM delay:queue "order:1002:cancel"
+(integer) 1
+
+127.0.0.1:6379> ZCARD delay:queue
+(integer) 1               # 只剩未到期的那个
+```
+
+**多消费者下必须保证原子性**，否则"查询 + 删除"两步之间会被别的消费者插入，导致同一任务被重复处理：
+
+```bash
+# 方式一：Lua 脚本，取出并删除做成一步
+127.0.0.1:6379> EVAL "local t = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, tonumber(ARGV[2])); if #t > 0 then redis.call('ZREM', KEYS[1], unpack(t)) end; return t" 1 delay:queue 1785000070 10
+1) "order:1001:cancel"
+2) "order:1002:cancel"
+
+# 方式二：Redis 5.0+ 的 ZPOPMIN，原子弹出最小分数的成员
+127.0.0.1:6379> ZPOPMIN delay:queue 1
+1) "coupon:88:expire"
+2) "1785000300"
+# 但 ZPOPMIN 不管有没有到期都会弹出，需要业务侧判断 score
+# 如果没到期，得再 ZADD 放回去，有竞态风险，所以延时队列还是推荐 Lua
+
+# 方式三：靠 ZREM 返回值抢占（简单但会多一次网络往返）
+# 查到任务后，谁 ZREM 返回 1 谁处理，返回 0 说明被别人抢走了
+```
+
+**消费者的典型循环**（伪代码）：
+
+```bash
+# while true:
+#   now = 当前秒级时间戳
+#   tasks = EVAL(上面的Lua脚本, delay:queue, now, 100)
+#   if tasks 为空:
+#       sleep(1)          # 空转时休眠，避免打爆 Redis
+#   else:
+#       for t in tasks: 处理任务(t)
+```
+
+**和 List 队列的区别**：List 只能 FIFO，先进先出；ZSet 延时队列可以**按时间乱序插入、按时间顺序取出**，天然支持"30 分钟后取消未支付订单""7 天后自动确认收货"这类需求。
+
+**生产注意事项**：
+
+- **必须处理失败重试**：任务取出后如果处理失败，应该重新 `ZADD` 回队列（score 设为"当前时间 + 退避间隔"），否则任务就丢了。更稳妥的做法是先移到一个"处理中"的 ZSet，处理成功后再删，超时未完成的自动捞回
+- **轮询间隔是延迟下限**：sleep 1 秒意味着任务最多晚 1 秒执行，对精度敏感的场景要缩短间隔
+- **注意时间单位统一**：秒和毫秒混用是这个模式最常见的 bug，建议全用毫秒时间戳
+- **ZSet 会无限增长**：如果生产快于消费，队列积压会变成大 key，要做监控告警
+
+**3. 验证 listpack 到 skiplist 的转换**
+
+```bash
+127.0.0.1:6379> DEL z
+(integer) 1
+
+# 先写 120 个成员（未超过 zset-max-listpack-entries 128）
+for i in $(seq 1 120); do redis-cli zadd z $i "m$i"; done
+127.0.0.1:6379> ZCARD z
+(integer) 120
+127.0.0.1:6379> OBJECT ENCODING z
+"listpack"
+
+# 加到 130 个，突破 128
+for i in $(seq 121 130); do redis-cli zadd z $i "m$i"; done
+127.0.0.1:6379> ZCARD z
+(integer) 130
+127.0.0.1:6379> OBJECT ENCODING z
+"skiplist"
+
+# 验证不可逆
+127.0.0.1:6379> ZREMRANGEBYRANK z 0 -11
+(integer) 120
+127.0.0.1:6379> ZCARD z
+(integer) 10
+127.0.0.1:6379> OBJECT ENCODING z
+"skiplist"                # 只剩 10 个也不会转回 listpack
+
+# 另一条触发路径：单个成员名超过 zset-max-listpack-value（默认 64 字节）
+127.0.0.1:6379> DEL z2
+127.0.0.1:6379> ZADD z2 1 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+(integer) 1
+127.0.0.1:6379> OBJECT ENCODING z2
+"skiplist"                # 只有 1 个成员，但名字太长
+```
+
+相关配置：
+
+```bash
+# redis.conf
+zset-max-listpack-entries 128    # 成员数上限
+zset-max-listpack-value 64       # 单个成员名的字节数上限
+```
+
+**两种编码的差异**：
+
+- **listpack**：连续内存，成员和分数交替存放，按分数排序。查找靠**线性扫描** O(N)，但因为元素少（≤128）且缓存友好，实际比 skiplist 更快，内存也省得多
+- **skiplist**：实际是 **skiplist + hashtable 双结构**。skiplist 负责按分数排序、范围查询、排名计算（O(log N)）；hashtable 负责"给成员查分数"（O(1)）。两份结构存同一批数据，所以 ZSet 是所有类型里单元素内存开销最大的
+
+这也解释了为什么 `ZSCORE` 是 O(1) 而 `ZRANK` 是 O(log N)——前者走 hashtable，后者要在 skiplist 上边走边累加跨度。
+
+排行榜场景要控制 ZSet 规模：只保留 Top N（用上面的 `ZREMRANGEBYRANK`），历史全量数据落到数据库里，Redis 只做热榜。
+</Answer>
 </Callout>

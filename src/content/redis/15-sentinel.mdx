@@ -179,4 +179,401 @@ try (Jedis jedis = pool.getResource()) {
 1. 用 Docker Compose 搭 1 主 2 从 + 3 哨兵，kill 掉主库，观察哨兵日志中 sdown、odown、vote-for-leader、switch-master 事件序列。
 2. 故障转移完成后重启旧主库，用 INFO replication 确认它自动变成了新主库的从库。
 3. 解释：为什么 quorum=1 很危险？为什么 2 个哨兵无法构成可靠的故障转移系统？
+
+<Answer>
+**参考答案：**
+
+**1. Docker Compose 搭建 1 主 2 从 + 3 哨兵并观察事件序列**
+
+`docker-compose.yml`：
+
+```bash
+# version: "3"
+# services:
+#   master:
+#     image: redis:7-alpine
+#     command: redis-server --port 6379
+#   replica1:
+#     image: redis:7-alpine
+#     command: redis-server --port 6379 --replicaof master 6379
+#   replica2:
+#     image: redis:7-alpine
+#     command: redis-server --port 6379 --replicaof master 6379
+#   sentinel1:
+#     image: redis:7-alpine
+#     command: redis-sentinel /etc/redis/sentinel.conf
+#     volumes: ["./sentinel1.conf:/etc/redis/sentinel.conf"]
+#   sentinel2:
+#     image: redis:7-alpine
+#     command: redis-sentinel /etc/redis/sentinel.conf
+#     volumes: ["./sentinel2.conf:/etc/redis/sentinel.conf"]
+#   sentinel3:
+#     image: redis:7-alpine
+#     command: redis-sentinel /etc/redis/sentinel.conf
+#     volumes: ["./sentinel3.conf:/etc/redis/sentinel.conf"]
+```
+
+`sentinel.conf`（三份内容相同）：
+
+```bash
+port 26379
+sentinel monitor mymaster master 6379 2
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 60000
+sentinel parallel-syncs mymaster 1
+sentinel resolve-hostnames yes
+```
+
+**注意**：哨兵配置文件会被 Redis **自动改写**（写入发现的从库、其他哨兵、当前 epoch），所以必须用可写的挂载，且不能多个哨兵共用同一个文件。
+
+```bash
+# ---- 启动并确认拓扑 ----
+$ docker compose up -d
+
+$ docker compose exec sentinel1 redis-cli -p 26379 SENTINEL master mymaster
+ 1) "name"
+ 2) "mymaster"
+ 3) "ip"
+ 4) "172.20.0.2"
+ 5) "port"
+ 6) "6379"
+ 7) "flags"
+ 8) "master"
+...
+33) "num-slaves"
+34) "2"
+35) "num-other-sentinels"
+36) "2"                        # 发现了另外 2 个哨兵
+37) "quorum"
+38) "2"
+
+# 查看从库和其他哨兵
+$ docker compose exec sentinel1 redis-cli -p 26379 SENTINEL replicas mymaster
+$ docker compose exec sentinel1 redis-cli -p 26379 SENTINEL sentinels mymaster
+
+# 客户端应该通过这个命令获取主库地址，而不是硬编码
+$ docker compose exec sentinel1 redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+1) "172.20.0.2"
+2) "6379"
+```
+
+**订阅哨兵事件（观察切换过程的最佳方式）**：
+
+```bash
+# 开一个终端专门订阅所有哨兵事件
+$ docker compose exec sentinel1 redis-cli -p 26379 PSUBSCRIBE '*'
+```
+
+**杀掉主库，观察完整事件序列**：
+
+```bash
+$ docker compose kill master
+
+$ docker compose logs -f sentinel1
+```
+
+日志会依次出现以下事件：
+
+```bash
+# ---- 阶段 1：SDOWN（主观下线）----
+# 单个哨兵在 down-after-milliseconds(5秒) 内 PING 不通主库
++sdown master mymaster 172.20.0.2 6379
+
+# ---- 阶段 2：ODOWN（客观下线）----
+# 哨兵之间通过 SENTINEL is-master-down-by-addr 互相询问
+# 确认下线的哨兵数达到 quorum(2) → 判定客观下线
++odown master mymaster 172.20.0.2 6379 #quorum 2/2
+
+# ---- 阶段 3：领导者选举（Raft 式）----
++new-epoch 1                                    # 纪元 +1
++try-failover master mymaster 172.20.0.2 6379   # 尝试发起故障转移
++vote-for-leader 4f8c2a1e... 1                  # 投票给某个哨兵
+# 其他哨兵的投票也会到达
++elected-leader master mymaster 172.20.0.2 6379 # 当选为领导者
+
+# ---- 阶段 4：选择新主库 ----
++failover-state-select-slave master mymaster 172.20.0.2 6379
++selected-slave slave 172.20.0.3:6379 ...       # 选中 replica1
++failover-state-send-slaveof-noone slave 172.20.0.3:6379 ...
++failover-state-wait-promotion slave 172.20.0.3:6379 ...
++promoted-slave slave 172.20.0.3:6379 ...       # 提升为主库
+
+# ---- 阶段 5：重新配置其他从库 ----
++failover-state-reconf-slaves master mymaster 172.20.0.2 6379
++slave-reconf-sent slave 172.20.0.4:6379 ...    # 通知 replica2
++slave-reconf-inprog slave 172.20.0.4:6379 ...
++slave-reconf-done slave 172.20.0.4:6379 ...
+
+# ---- 阶段 6：切换完成 ----
++failover-end master mymaster 172.20.0.2 6379
++switch-master mymaster 172.20.0.2 6379 172.20.0.3 6379
+#              ^^^^^^^^ 旧主库地址        ^^^^^^^^ 新主库地址
+
+# ---- 阶段 7：旧主库被标记为从库（仍处于 sdown 状态）----
++slave slave 172.20.0.2:6379 ... @ mymaster 172.20.0.3 6379
++sdown slave 172.20.0.2:6379 ...
+```
+
+**`+switch-master` 是最关键的事件**——客户端库正是订阅这个频道来感知主库变更并重连的。
+
+```bash
+# 验证新主库
+$ docker compose exec replica1 redis-cli INFO replication
+role:master
+connected_slaves:1
+slave0:ip=172.20.0.4,port=6379,state=online,offset=15420,lag=0
+```
+
+**SDOWN 与 ODOWN 的区别（面试高频）**：
+
+| | SDOWN（主观下线） | ODOWN（客观下线） |
+|---|---|---|
+| 判定者 | **单个**哨兵独立判断 | **多个**哨兵达成共识 |
+| 依据 | 自己 PING 超时 | 认同 SDOWN 的哨兵数 ≥ quorum |
+| 后果 | 仅内部标记，**不触发切换** | 触发领导者选举和故障转移 |
+| 适用对象 | 主库和从库都可能 | **只对主库有意义** |
+
+这个两阶段设计是为了防止**单个哨兵的网络问题**误判主库宕机。如果只有哨兵 A 到主库的网络断了，A 会标记 SDOWN，但 B 和 C 说"主库好好的"，达不到 quorum，就不会有 ODOWN，也就不会误切换。
+
+**2. 旧主库重启后自动降级为从库**
+
+```bash
+# ---- 重启旧主库 ----
+$ docker compose start master
+
+# ---- 等几秒后查看它的角色 ----
+$ docker compose exec master redis-cli INFO replication
+# Replication
+role:slave                       # 已经自动变成从库了
+master_host:172.20.0.3           # 指向新主库（原 replica1）
+master_port:6379
+master_link_status:up
+slave_read_only:1
+slave_repl_offset:15680
+
+# ---- 哨兵日志 ----
+$ docker compose logs sentinel1 --tail 10
+-sdown slave 172.20.0.2:6379 ...                # 恢复在线
+* Sending SLAVEOF command to a replica ...      # 哨兵下发 REPLICAOF
++convert-to-slave slave 172.20.0.2:6379 ...     # 转为从库
+
+# ---- 现在的拓扑：新主库 + 2 从库 ----
+$ docker compose exec sentinel1 redis-cli -p 26379 SENTINEL master mymaster | head -6
+1) "name"
+2) "mymaster"
+3) "ip"
+4) "172.20.0.3"                  # 主库已是新地址
+```
+
+**这个自动降级是哨兵最重要的能力之一**。哨兵持续监控所有节点，一旦发现某个节点声称自己是 master 但和当前记录的主库不符，就会给它发 `REPLICAOF <新主库>` 命令，强制它归位。
+
+**这里隐藏着数据丢失风险（必须理解）**：
+
+```bash
+# 时间线：
+#   T1: 客户端向旧主库写入 x=100，主库返回 OK
+#   T2: 复制是【异步】的，x=100 还没发给从库
+#   T3: 旧主库宕机
+#   T4: 哨兵切换，replica1 升为新主库（它没有 x=100）
+#   T5: 旧主库重启，变成从库
+#   T6: 从库执行全量或部分重同步，【x=100 被覆盖丢失】
+#
+# 结果：客户端收到过 OK，但数据永久消失
+```
+
+这是**异步复制的固有代价，无法通过配置完全消除**。缓解手段：
+
+```bash
+# 主库配置：从库不足时拒绝写入
+127.0.0.1:6379> CONFIG SET min-replicas-to-write 1      # 至少 1 个从库在线
+OK
+127.0.0.1:6379> CONFIG SET min-replicas-max-lag 10      # 且延迟不超过 10 秒
+OK
+
+# 效果：不满足条件时主库直接报错，宁可写失败也不"假装成功"
+127.0.0.1:6379> SET k v
+(error) NOREPLICAS Not enough good replicas to write.
+```
+
+这个配置也是**防脑裂的核心手段**：网络分区时，被隔离的旧主库因为看不到足够的从库而拒绝写入，避免产生"两个主库各自接收写入"的分叉数据。
+
+**要真正的零丢失只能上 WAIT 或换方案**：
+
+```bash
+# WAIT 让写入等待从库确认（牺牲延迟换安全）
+127.0.0.1:6379> SET important "value"
+OK
+127.0.0.1:6379> WAIT 1 500
+(integer) 1
+# 但 WAIT 只保证"从库收到"不保证"从库落盘"，且超时后仍会返回，不是强一致
+```
+
+**运维提醒**：`+switch-master` 之后，`sentinel monitor` 的配置会被哨兵自动改写到配置文件里。如果你用配置管理工具（Ansible/Puppet）强制覆盖 sentinel.conf，会把哨兵的状态搞乱——**哨兵配置文件必须排除在配置管理之外**。
+
+**3. 为什么 quorum=1 危险，2 个哨兵为什么不可靠**
+
+**先厘清两个容易混淆的概念**：
+
+| 概念 | 作用 | 取值 |
+|---|---|---|
+| **quorum** | 判定 ODOWN 需要多少个哨兵同意 | 配置项，可自定义 |
+| **majority** | 执行故障转移需要多少票当选领导者 | **固定为 `哨兵总数/2 + 1`，不可配置** |
+
+关键点：**这是两道独立的门槛，必须同时通过。** 很多人只调 quorum 就以为控制了整个流程，其实 majority 这一关是硬编码的。
+
+```bash
+# 3 个哨兵：quorum 可配 1~3，majority 固定为 2
+# 5 个哨兵：quorum 可配 1~5，majority 固定为 3
+```
+
+**为什么 quorum=1 很危险？**
+
+`quorum=1` 意味着**任何单个哨兵都能独自判定主库客观下线**，两阶段判定退化成一阶段。
+
+```bash
+# 危险场景：哨兵 A 到主库的网络出问题（主库本身完全健康）
+#
+#   T1: 哨兵 A ping 主库超时 → 标记 SDOWN
+#   T2: quorum=1，A 自己就够了 → 立刻判定 ODOWN
+#   T3: A 发起选举，向 B、C 拉票
+#   T4: B、C 虽然认为主库是健康的，但【投票阶段不校验主库状态】，
+#       它们只判断"这个 epoch 我还没投过票"，于是投给了 A
+#   T5: A 获得 2 票（含自己），达到 majority=2，当选领导者
+#   T6: A 执行故障转移，把一个健康的主库换掉了
+```
+
+**后果**：
+
+- **无谓的服务抖动**：切换过程中主库地址变更，所有客户端要重连，期间写入失败
+- **可能丢数据**：切换瞬间未同步的写入全部丢失
+- **可能真脑裂**：旧主库网络恢复后，如果客户端还连着它（未及时收到切换通知），就会出现两个主库同时接收写入
+- **反复横跳**：如果网络问题持续存在，哨兵可能不断触发切换，系统永无宁日
+
+**根本问题**：`quorum` 的设计初衷就是**用多数派共识过滤单点误判**。设成 1 等于主动放弃这个保护机制，把整个集群的稳定性押在"每个哨兵的网络都不会出问题"这个不成立的假设上。
+
+**正确配置**：
+
+```bash
+# 3 个哨兵 → quorum = 2
+sentinel monitor mymaster 127.0.0.1 6379 2
+
+# 5 个哨兵 → quorum = 3
+sentinel monitor mymaster 127.0.0.1 6379 3
+
+# 通用原则：quorum = 哨兵总数 / 2 + 1（即 majority）
+```
+
+**为什么 2 个哨兵不可靠？**
+
+2 个哨兵时：`majority = 2/2 + 1 = 2`，即**必须两个哨兵都活着并互相投票才能完成故障转移**。
+
+**场景一：哨兵和主库同机部署，机器整体宕机**
+
+```bash
+# 部署：机器1 = 主库 + 哨兵A，机器2 = 从库 + 哨兵B
+#
+# 机器1 整机宕机（这恰恰是最需要故障转移的场景）：
+#   - 主库挂了
+#   - 哨兵 A 也挂了
+#   - 只剩哨兵 B
+#   - B 标记 SDOWN，quorum=2 但只有 B 一个 → 【永远达不到 ODOWN】
+#   - 故障转移完全无法触发
+#
+# 结果：高可用系统在最关键的时刻失效了
+```
+
+即使把 quorum 调成 1 让 B 能判定 ODOWN，它也拿不到 `majority=2` 的票数，选举失败，照样无法切换。
+
+**场景二：两个哨兵之间网络分区**
+
+```bash
+# 主库和从库都健康，只是哨兵 A 和 B 互相看不见对方
+#
+#   A 认为 B 挂了，B 认为 A 挂了
+#   假设主库此时也真的挂了：
+#     - A 想切换，但拿不到 B 的票，只有自票 1 张 < majority 2 → 失败
+#     - B 同理 → 失败
+#   两边都在无限重试，谁也切不成
+#
+# 更糟的情况（如果 quorum=1）：
+#   A 和 B 各自认为对方挂了，可能在不同 epoch 中反复尝试，
+#   系统陷入选举风暴，日志刷屏，始终无法收敛
+```
+
+**核心矛盾**：分布式共识需要**奇数个节点**才能在任意单点故障下仍然形成多数派。
+
+```bash
+# 容错能力对照表（N = 哨兵总数，majority = N/2 + 1）
+#
+# N=1: majority=1, 容忍 0 个故障   → 单点，无意义
+# N=2: majority=2, 容忍 0 个故障   → 【比 1 个还差：多了一个故障源，容错却没提升】
+# N=3: majority=2, 容忍 1 个故障   → ✓ 最小可用配置
+# N=4: majority=3, 容忍 1 个故障   → 和 3 个一样，白白多花一台机器
+# N=5: majority=3, 容忍 2 个故障   → ✓ 更高可靠性
+# N=6: majority=4, 容忍 2 个故障   → 和 5 个一样，浪费
+# N=7: majority=4, 容忍 3 个故障   → ✓
+```
+
+**"2 个比 1 个还差"这个反直觉的结论值得强调**：单哨兵至少在自己健康时能完成切换（majority=1，自己投自己就够了）；而 2 个哨兵一旦挂掉任意一个，剩下那个**什么都做不了**。多部署一个节点反而降低了可用性——因为故障源变多了，容错能力却纹丝不动。
+
+**偶数节点全都浪费**：4 个的容错能力等于 3 个，6 个等于 5 个。多出来的那台机器只增加了成本和故障概率，对可靠性零贡献。所以**哨兵数量必须是奇数**。
+
+**生产部署清单**：
+
+```bash
+# 1. 至少 3 个哨兵，奇数个
+# 2. 分散在【不同的物理机】上（虚拟机要确认不在同一宿主机）
+# 3. 不要和 Redis 主库同机 —— 主库所在机器宕机会同时带走哨兵
+# 4. 跨机架 / 跨可用区部署，避免机架级、机房级单点
+
+# 三机房部署示例（推荐）：
+#   机房 A：主库    + 哨兵1
+#   机房 B：从库1   + 哨兵2
+#   机房 C：从库2   + 哨兵3
+#
+# 任意一个机房整体失联，剩下两个机房的 2 个哨兵仍能形成多数派
+
+# 双机房部署的问题（不推荐）：
+#   机房 A：主库 + 从库1 + 哨兵1 + 哨兵2
+#   机房 B：从库2 + 哨兵3
+#
+#   机房 A 整体故障 → 只剩哨兵3，majority=2 达不到 → 无法切换
+#   这就是为什么高可用需要【三个】故障域，两个是不够的
+```
+
+**其他关键配置**：
+
+```bash
+# down-after-milliseconds：判定 SDOWN 的超时
+# 太小 → 网络抖动误判，频繁切换
+# 太大 → 故障发现慢，服务中断时间长
+# 建议 5000 ~ 30000，必须【大于最坏 fork 耗时】（否则 BGSAVE 会被误判为宕机）
+sentinel down-after-milliseconds mymaster 30000
+
+# parallel-syncs：切换后同时向新主库同步的从库数
+# 设为 1：从库逐个同步，任一时刻只有 1 个从库不可用（推荐）
+# 设大：切换快，但多个从库同时全量同步会打爆新主库带宽
+sentinel parallel-syncs mymaster 1
+
+# failover-timeout：故障转移各阶段的超时，超时后允许其他哨兵重新尝试
+sentinel failover-timeout mymaster 180000
+```
+
+**最后一条最重要的建议**：**定期做故障演练**。
+
+```bash
+# 手动触发故障转移（不需要真的杀主库）
+$ redis-cli -p 26379 SENTINEL failover mymaster
+OK
+
+# 演练时要验证的事项：
+#   1. 切换是否在预期时间内完成
+#   2. 应用日志里有多少请求失败，业务是否有感知
+#   3. 客户端是否自动重连到新主库（有些客户端配置不对会一直连旧地址）
+#   4. 监控告警是否正常触发
+#   5. 旧主库恢复后是否自动降级
+```
+
+配置得再完美，**没演练过的高可用等于没有高可用**。生产上最常见的翻车不是哨兵不工作，而是**客户端没配 Sentinel 模式**——业务代码里硬编码了主库 IP，切换后哨兵这边一切正常，应用却全线连不上。这种问题只有演练才能提前暴露。
+</Answer>
 </Callout>

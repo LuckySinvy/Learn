@@ -89,6 +89,112 @@ const out = await chain.invoke({ text: "这家店服务太差了" });
 
 <Callout type="exercise" title="练习">
 用 `StructuredOutputParser` + Zod，写一个「从用户评价里抽取 商品、评分、是否推荐」的链。
+
+<Answer>
+**参考答案：**
+
+**完整实现**
+
+```ts
+import "dotenv/config";
+import { z } from "zod";
+import { StructuredOutputParser } from "@langchain/core/output_parsers";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { ChatOpenAI } from "@langchain/openai";
+
+// 1) 用 Zod 定义目标结构，describe() 的文字会进入格式说明，等于给模型的字段级提示
+const reviewSchema = z.object({
+  product: z.string().describe("评价中提到的商品名称，找不到则填“未提及”"),
+  rating: z.number().int().min(1).max(5).describe("综合评分，1-5 的整数"),
+  recommended: z.boolean().describe("用户是否推荐该商品"),
+});
+
+const parser = StructuredOutputParser.fromZodSchema(reviewSchema);
+
+// 2) 提示词里必须留一个位置注入 format_instructions
+const prompt = ChatPromptTemplate.fromTemplate(
+  `你是电商评价分析助手。请从下面这条用户评价中抽取结构化信息。
+
+{format_instructions}
+
+用户评价：
+{review}`
+);
+
+const model = new ChatOpenAI({ model: "gpt-4o-mini", temperature: 0 });
+
+// 3) 组链
+const chain = prompt.pipe(model).pipe(parser);
+
+// 4) 调用：把格式说明作为一个普通变量传进去
+const result = await chain.invoke({
+  review: "这款小米空气净化器 4 用了两周，噪音比想象中小，滤芯更换也方便，五星好评，推荐给有娃家庭。",
+  format_instructions: parser.getFormatInstructions(),
+});
+
+console.log(result);
+// { product: "小米空气净化器 4", rating: 5, recommended: true }
+```
+
+**用 `partial` 让调用更干净（推荐）**
+
+每次 `invoke` 都手动传 `format_instructions` 很啰嗦，而且容易漏。用 `partial` 一次固定住：
+
+```ts
+const boundPrompt = await prompt.partial({
+  format_instructions: parser.getFormatInstructions(),
+});
+
+const chain = boundPrompt.pipe(model).pipe(parser);
+
+// 现在只需要传 review
+const r = await chain.invoke({ review: "包装破损，客服还爱答不理，一分都不想给。" });
+// { product: "未提及", rating: 1, recommended: false }
+```
+
+**生产加固：容错 + 二次校验**
+
+课文提醒过「别完全信任模型 JSON」。`StructuredOutputParser` 解析失败会直接抛异常，批量处理时一条脏数据就能中断整个任务。实用做法是包一层安全调用：
+
+```ts
+type Review = z.infer<typeof reviewSchema>;
+
+async function safeExtract(review: string): Promise<Review | null> {
+  try {
+    const raw = await chain.invoke({ review });
+    // 双保险：即使解析器放过了，Zod 再校验一次范围与类型
+    const checked = reviewSchema.safeParse(raw);
+    if (!checked.success) {
+      console.warn("字段校验未通过:", checked.error.issues);
+      return null;
+    }
+    return checked.data;
+  } catch (err) {
+    console.warn("解析失败，原始评价:", review, (err as Error).message);
+    return null;
+  }
+}
+
+// 批量抽取，失败的自动过滤掉
+const reviews = [
+  "耳机音质不错，就是续航一般，给个四星。",
+  "??????",                                  // 无意义输入，模型可能乱答
+];
+const parsed = (await Promise.all(reviews.map(safeExtract))).filter(Boolean);
+```
+
+**要点小结**
+
+| 要点 | 说明 |
+|---|---|
+| `describe()` 不是注释 | 它会被写进 `getFormatInstructions()` 的输出，直接影响模型理解字段含义，务必写清楚 |
+| `format_instructions` 必须注入 | 忘了留占位符，模型不知道要输出什么形状，解析几乎必失败 |
+| `temperature: 0` | 抽取任务要确定性，不要让模型自由发挥 |
+| `z.infer` 白拿类型 | `z.infer<typeof reviewSchema>` 直接得到 TS 类型，schema 改了类型自动跟着变，不用手写 interface |
+| `.safeParse` 兜底 | 解析器只保证「是合法 JSON 且大致符合结构」，边界值（如 rating 超出 1-5）仍需 Zod 再校验一次 |
+
+**进阶方向**：如果模型经常输出非法 JSON，可以套一层 `OutputFixingParser` 自动修复（第 19 章）；如果用的是支持 function calling 的模型，`model.withStructuredOutput(reviewSchema)` 由模型侧保证结构，成功率比纯提示词约束更高。
+</Answer>
 </Callout>
 
 ## 小结

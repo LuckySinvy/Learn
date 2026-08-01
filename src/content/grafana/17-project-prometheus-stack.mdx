@@ -148,6 +148,56 @@ groups:
 
 <Callout type="exercise" title="动手">
 克隆本项目，跑起 `docker compose up -d`，打开 Grafana 确认数据源连通；导入一块 node 仪表盘；触发一次 `up == 0` 告警验证通知链路。
+
+<Answer>
+**参考答案（操作步骤与验证清单）：**
+
+**① 克隆项目并启动**
+
+```bash
+git clone <项目地址>
+cd monitoring
+docker compose up -d
+docker compose ps        # 全部 Up 即正常
+```
+
+**② 确认数据源连通**
+
+1. 浏览器打开 `http://localhost:3000`，默认账号 `admin` / `changeme`
+2. 进入 **Connections → Data sources**，找到 `Prometheus`，点 **Save & test**，应提示「Successfully queried the Prometheus API」
+3. 也可以去 **Explore** 里查一条 `up`，能看到 prometheus / node / app 三个 job 的序列
+
+**③ 导入 node 仪表盘**
+
+1. **Dashboards → New → Import**
+2. 输入官方 ID **1860**（Node Exporter Full），点 Load，数据源选 Prometheus
+3. Import 后应看到 CPU / 内存 / 磁盘 / 网络等一排面板都有数据
+
+**④ 触发一次 `up == 0` 告警验证通知链路**
+
+最直接的办法是把 node-exporter 停掉：
+
+```bash
+docker stop node-exporter
+```
+
+1. 去 **Alerting → Alert rules** 看相关规则进入 `Pending`，满 `For` 后变 `Alerting`
+2. 在 **Alerting → Notification policies** 确认路由到了你的 Contact point
+3. 确认邮件 / Slack / Webhook 收到了告警
+4. 验证完恢复：
+
+```bash
+docker start node-exporter
+```
+
+**⑤ 常见坑**
+
+- `docker stop node-exporter` 报错时，用 `docker compose stop node-exporter`（容器名由 compose 自动生成）
+- 数据源 URL 写 `http://prometheus:9090`（容器内主机名），不是 `localhost`
+- 若仪表盘无数据，先确认 Prometheus 的 Targets 是否全是 `UP`（`http://localhost:9090/targets`）
+
+跑通这一步，说明「采集 → 展示 → 告警 → 通知」链路已全通，可以进入项目二。
+</Answer>
 </Callout>
 
 ## 小结

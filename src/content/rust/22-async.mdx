@@ -79,6 +79,184 @@ let (a, b) = tokio::join!(task_a(), task_b());   // 并发等待两者
 
 <Callout type="exercise" title="练习">
 用 tokio 起两个 `async` 任务，分别 `sleep` 不同毫秒数后返回字符串，用 `tokio::join!` 并发等待并打印。观察总耗时接近较慢者而非两者之和。
+
+<Answer>
+**参考答案：**
+
+先在 `Cargo.toml` 加依赖：
+
+```toml
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+```
+
+`src/main.rs`：
+
+```rust
+use std::time::Instant;
+use tokio::time::{sleep, Duration};
+
+async fn task_a() -> String {
+    sleep(Duration::from_millis(300)).await;
+    String::from("任务 A 完成（300ms）")
+}
+
+async fn task_b() -> String {
+    sleep(Duration::from_millis(500)).await;
+    String::from("任务 B 完成（500ms）")
+}
+
+#[tokio::main]
+async fn main() {
+    // ===== 并发执行 =====
+    let start = Instant::now();
+    let (a, b) = tokio::join!(task_a(), task_b());
+    println!("{}", a);
+    println!("{}", b);
+    println!("并发耗时：{:?}\n", start.elapsed());
+
+    // ===== 对比：串行执行 =====
+    let start = Instant::now();
+    let a = task_a().await;
+    let b = task_b().await;
+    println!("{}", a);
+    println!("{}", b);
+    println!("串行耗时：{:?}", start.elapsed());
+}
+```
+
+**输出：**
+
+```text
+任务 A 完成（300ms）
+任务 B 完成（500ms）
+并发耗时：500.8ms
+
+任务 A 完成（300ms）
+任务 B 完成（500ms）
+串行耗时：801.2ms
+```
+
+**并发 ≈ 500ms（较慢者），串行 ≈ 800ms（两者之和）。**
+
+**为什么会有这个差异？**
+
+关键在于 **`Future` 是惰性的**——`task_a()` 只是创建了一个 Future，不会立刻开始执行。
+
+- **`join!`**：把两个 Future 交给同一个任务，交替 poll 它们。A 的 `.await` 挂起时，执行器立刻转去推进 B，两者的等待时间**重叠**了
+- **连续 `.await`**：第一个 `.await` 完全结束后才创建并推进第二个 Future，等待时间**串行叠加**
+
+**常见误区：`join!` 不等于多线程**
+
+`join!` 里的任务默认跑在**同一个线程**上。它省下的是「等待 I/O 的时间」，而不是「计算的时间」。把 sleep 换成 CPU 密集的循环，`join!` 不会带来任何加速：
+
+```rust
+async fn cpu_heavy() -> u64 {
+    (0..1_000_000_000u64).sum()   // 纯计算，没有 .await 让出点
+}
+
+// join! 这种任务不会变快，反而会阻塞整个执行器线程
+```
+
+CPU 密集的活儿要用 `spawn_blocking` 挪到专门的阻塞线程池：
+
+```rust
+let result = tokio::task::spawn_blocking(|| {
+    (0..1_000_000_000u64).sum::<u64>()
+}).await.unwrap();
+```
+
+**`tokio::spawn`：真正的并行任务**
+
+`join!` 在当前任务内并发；`spawn` 则把任务交给调度器，可能被分配到线程池的**其他线程**上：
+
+```rust
+#[tokio::main]
+async fn main() {
+    let start = Instant::now();
+
+    let h1 = tokio::spawn(task_a());
+    let h2 = tokio::spawn(task_b());
+
+    // spawn 返回 JoinHandle，await 它得到 Result
+    let a = h1.await.unwrap();
+    let b = h2.await.unwrap();
+
+    println!("{}\n{}", a, b);
+    println!("耗时：{:?}", start.elapsed());   // 同样约 500ms
+}
+```
+
+**`join!` 与 `spawn` 怎么选？**
+
+| | `tokio::join!` | `tokio::spawn` |
+|---|---|---|
+| 任务数量 | 编译期固定 | 任意，可动态创建 |
+| 执行线程 | 当前任务所在线程 | 可能被调度到其他线程 |
+| 生命周期 | 可借用外部变量 | 要求 `'static`，通常得 `move` |
+| 取消行为 | 整体一起取消 | 独立，句柄丢弃后仍继续跑 |
+| 开销 | 极小 | 有任务注册开销 |
+
+**处理动态数量的任务：`join_all`**
+
+任务数量在运行时才确定时，用 `futures` crate：
+
+```rust
+use futures::future::join_all;
+
+#[tokio::main]
+async fn main() {
+    let tasks: Vec<_> = (1..=5)
+        .map(|i| async move {
+            sleep(Duration::from_millis(i * 100)).await;
+            format!("任务 {} 完成", i)
+        })
+        .collect();
+
+    for r in join_all(tasks).await {
+        println!("{}", r);
+    }
+    // 总耗时约 500ms，而非 1500ms
+}
+```
+
+**`try_join!`：任一失败就提前返回**
+
+任务返回 `Result` 时，`try_join!` 会在第一个 `Err` 出现时立刻放弃其余任务：
+
+```rust
+async fn may_fail(ok: bool) -> Result<String, String> {
+    sleep(Duration::from_millis(100)).await;
+    if ok { Ok("成功".into()) } else { Err("失败".into()) }
+}
+
+#[tokio::main]
+async fn main() {
+    match tokio::try_join!(may_fail(true), may_fail(false)) {
+        Ok((a, b)) => println!("都成功：{} {}", a, b),
+        Err(e) => println!("有失败：{}", e),
+    }
+}
+```
+
+**最重要的一条纪律：绝不在 async 里做阻塞调用**
+
+```rust
+// ❌ 灾难性写法：卡死整个执行器线程，该线程上所有任务都停摆
+async fn bad() {
+    std::thread::sleep(Duration::from_secs(1));   // 阻塞！
+    let content = std::fs::read_to_string("f.txt").unwrap();   // 阻塞！
+}
+
+// ✅ 正确：用异步版本
+async fn good() {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let content = tokio::fs::read_to_string("f.txt").await.unwrap();
+}
+```
+
+异步执行器的线程数通常等于 CPU 核数。一个线程被阻塞，就意味着调度到它上面的**所有**任务都被连累——这是异步编程中后果最严重、也最常见的错误。
+</Answer>
 </Callout>
 
 ## 小结

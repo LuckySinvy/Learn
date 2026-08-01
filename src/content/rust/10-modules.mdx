@@ -121,6 +121,137 @@ workspace 内所有成员共用一份 `Cargo.lock` 与依赖解析，避免版�
 
 <Callout type="exercise" title="练习">
 把上一章的 `Shape` 与 `area` 放进一个 `mod geometry { pub enum Shape {...} pub fn area(...) }`，在 `main` 里用 `use` 引入并调用。再给内部 helper 函数设为私有，验证外部无法访问。
+
+<Answer>
+**参考答案：**
+
+```rust
+mod geometry {
+    use std::f64::consts::PI;
+
+    // pub 让枚举本身对外可见
+    // 注意：枚举的变体会自动继承 pub，不需要逐个标注
+    #[derive(Debug)]
+    pub enum Shape {
+        Circle(f64),
+        Rectangle(f64, f64),
+        Triangle(f64, f64),
+    }
+
+    // 公开 API
+    pub fn area(s: &Shape) -> f64 {
+        match s {
+            Shape::Circle(r) => circle_area(*r),
+            Shape::Rectangle(w, h) => w * h,
+            Shape::Triangle(b, h) => 0.5 * b * h,
+        }
+    }
+
+    pub fn describe(s: &Shape) -> String {
+        // 模块内部可以自由调用私有 helper
+        format!("{}：面积 {:.2}", type_name(s), area(s))
+    }
+
+    // ---- 以下是私有 helper，外部访问不到 ----
+
+    fn circle_area(r: f64) -> f64 {
+        PI * r * r
+    }
+
+    fn type_name(s: &Shape) -> &'static str {
+        match s {
+            Shape::Circle(_) => "圆形",
+            Shape::Rectangle(..) => "矩形",
+            Shape::Triangle(..) => "三角形",
+        }
+    }
+}
+
+// 用 use 引入，之后不必写全路径
+use geometry::{area, describe, Shape};
+
+fn main() {
+    let shapes = vec![
+        Shape::Circle(2.0),
+        Shape::Rectangle(3.0, 4.0),
+        Shape::Triangle(6.0, 5.0),
+    ];
+
+    for s in &shapes {
+        println!("{}", describe(s));
+    }
+
+    let total: f64 = shapes.iter().map(area).sum();
+    println!("总面积 = {:.2}", total);
+
+    // ❌ 下面两行都无法编译：
+    // geometry::circle_area(2.0);
+    // geometry::type_name(&shapes[0]);
+}
+```
+
+**输出：**
+
+```text
+圆形：面积 12.57
+矩形：面积 12.00
+三角形：面积 15.00
+总面积 = 39.57
+```
+
+**验证私有性：** 取消注释 `geometry::circle_area(2.0);`，编译器报错：
+
+```text
+error[E0603]: function `circle_area` is private
+  --> src/main.rs:52:15
+   |
+52 |     geometry::circle_area(2.0);
+   |               ^^^^^^^^^^^ private function
+   |
+note: the function `circle_area` is defined here
+  --> src/main.rs:31:5
+   |
+31 |     fn circle_area(r: f64) -> f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+```
+
+**关键知识点：**
+
+- **默认私有**：模块内的项不加 `pub` 就只有本模块及其**子模块**能访问。父模块也访问不到子模块的私有项
+- **枚举变体自动继承可见性**：`pub enum Shape` 一旦公开，`Circle`、`Rectangle` 等变体全部自动公开。这和结构体不同——`pub struct` 的**字段仍需逐个加 `pub`**
+- **私有不代表不能用**：`area` 和 `describe` 是公开的，它们内部照样能调用私有的 `circle_area`。这正是模块化的意义：**对外暴露稳定接口，把实现细节藏起来**，将来重构 helper 不会破坏调用方
+- **`use` 的批量引入**：`use geometry::{area, describe, Shape};` 用花括号一次引入多项
+
+**进阶：拆成多文件**
+
+真实项目会把模块放进独立文件：
+
+```text
+src/
+  main.rs        // 写 mod geometry;
+  geometry.rs    // 模块内容（去掉外层 mod 包裹）
+```
+
+`main.rs`：
+
+```rust
+mod geometry;
+use geometry::{area, Shape};
+
+fn main() {
+    println!("{:.2}", area(&Shape::Circle(2.0)));
+}
+```
+
+**可见性的中间档位：**
+
+```rust
+pub(crate) fn internal_helper() {}   // 整个 crate 内可见，对外部使用者隐藏
+pub(super) fn parent_only() {}       // 仅父模块可见
+```
+
+写库时 `pub(crate)` 特别有用：多个内部模块要共享，但不想让它成为公开 API 的一部分（因为公开 API 一旦发布就要考虑向后兼容）。
+</Answer>
 </Callout>
 
 ## 小结

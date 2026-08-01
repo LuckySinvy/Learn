@@ -308,4 +308,71 @@ pull --rebase:
 2. 制造一次 rebase 冲突，在冲突现场用 `git show :2:` 和 `git show :3:` 确认 ours/theirs 分别是谁的内容，写一句话解释原因。
 3. 用 `git rebase --onto` 把一个三层分支（main → feature → feature-sub）中最上层的两个提交搬到 main 上，验证中间层的提交没有被带过去。
 4. 情景题：你的 feature 分支已经推到远程并提了 PR，reviewer 要求"把 5 个 WIP 提交合成 1 个"。写出你的完整命令序列，并说明为什么这里可以强推、要用哪个强推参数。
+
+<Answer>
+**参考答案：**
+
+**1. merge vs rebase 对照**
+
+构造分叉历史（在一个仓库里跑两遍，分别进 `r-merge` 和 `r-rebase`）：
+
+```bash
+build() {
+  git init -q $1 && cd $1
+  echo base > app.txt && git add . && git commit -q -m "A"
+  git switch -qc feature
+  echo f1 > f1.txt && git add . && git commit -q -m "D"
+  echo f2 > f2.txt && git add . && git commit -q -m "E"
+  git switch -q main
+  echo m1 > m1.txt && git add . && git commit -q -m "B"
+  echo m2 > m2.txt && git add . && git commit -q -m "C"
+  cd ..
+}
+build r-merge && build r-rebase
+```
+
+- merge 副本：`cd r-merge && git switch -q feature && git merge main --no-edit`，`git log --graph --all` 里历史保留分叉形状，多了一个合并提交，**原有提交的哈希一个都没变**。
+- rebase 副本：`cd r-rebase && git switch -q feature && git rebase main`，历史变成一条直线（无合并提交），`git log --format='%h %s' main..feature` 对比 rebase 前后，feature 独有的 D、E **哈希全部变了**（变成 D'、E'），因为父提交从 A 变成了 C，内容重放生成了全新提交。
+
+**2. rebase 冲突里的 ours/theirs**
+
+```bash
+git init -q
+echo v0 > app.txt && git add . && git commit -q -m "init"
+git switch -qc feature && echo feature-version > app.txt && git commit -qam "feat"
+git switch -q main && echo main-version > app.txt && git commit -qam "main"
+git switch -q feature && git rebase main
+git show :2:app.txt   # ours    = main 的内容
+git show :3:app.txt   # theirs  = feature 的内容
+```
+
+一句话解释：**rebase 先把 HEAD 临时挪到目标基底（main）上再逐个重放你的补丁**，所以此刻"我们（ours）"是 main，被重放进来的"他们（theirs）"才是你自己的提交——和 merge 时完全相反。
+
+**3. `rebase --onto` 精确搬运**
+
+```bash
+git init -q
+echo base > a.txt && git add . && git commit -q -m "A"
+git switch -qc feature && echo f > f.txt && git add . && git commit -q -m "B"
+git switch -qc feature-sub && echo s1 > s1.txt && git add . && git commit -q -m "C"
+echo s2 > s2.txt && git add . && git commit -q -m "D"
+git switch -q main && echo m > m.txt && git add . && git commit -q -m "E"
+git switch -q feature-sub
+git rebase --onto main feature feature-sub
+git log --oneline --graph --all
+```
+
+命令格式是 `git rebase --onto <新基底> <旧基底> <分支>`：把 feature-sub 上**位于 feature 之后**的提交（C、D）搬到 main 顶端，结果是 `A → E → C' → D'`。`git log` 里能看到 B（feature 的提交）仍然挂在 feature 分支上，**没有被带过去**。
+
+**4. 整理已推送的 WIP 提交**
+
+```bash
+git switch feature
+git rebase -i main          # 打开编辑器，把前 4 行改成 squash，只留第 1 行 pick
+git push --force-with-lease
+```
+
+- 为什么可以强推：这个分支**只有你一个人在用**（reviewer 只是看，不会基于它提交），rebase 改写的是你私有的、未合并到共享主线的提交，不违反黄金法则。
+- 为什么用 `--force-with-lease`：它会在强推前检查远程分支是否仍是"你上次看到的状态"；如果期间别人推了东西（或远程被改过），它会拒绝而非无脑覆盖，保护别人和自己。绝不用裸 `--force`。
+</Answer>
 </Callout>

@@ -190,4 +190,67 @@ rm -r tests                         # 改主意了，删掉
 2. 把上题的 shop 目录完整备份为 shop.bak，删除 shop 里的 db 子目录，再对比 `tree shop shop.bak` 验证备份未受影响。
 3. 创建文件 `a1.txt a2.txt b1.txt b2.txt`，只用一条 `mv` 配合通配符把 a 开头的两个移动到新目录 `group-a/` 中。
 4. 思考题：`rm -rf $TMPDIR/cache` 在 `TMPDIR` 未定义时会删除什么？如何写才安全？（提示：引号 + 判空，或改用 `rm -rf "./tmp/cache"` 这类相对路径）
+
+<Answer>
+**参考答案：**
+
+**第 1 题：创建目录结构与 `?` 与 `*` 的区别**
+
+```bash
+mkdir -p shop/{api,web,db}
+touch shop/api/v1.py shop/api/v2.py shop/api/v10.py
+
+ls shop/api/v?.py    # 匹配 v + 恰好一个字符 + .py
+# 输出：v1.py v2.py
+
+ls shop/api/v*.py    # 匹配 v + 任意长度任意字符 + .py
+# 输出：v1.py v2.py v10.py
+```
+
+`?` 恰好匹配**一个**字符，所以 `v10.py` 不满足 `v?.py`；`*` 匹配任意长度（含空），`v10.py` 也能匹配上。
+
+**第 2 题：备份目录后删除子目录**
+
+```bash
+cp -r shop shop.bak   # 复制目录必须加 -r
+rm -r shop/db         # 删除 shop 里的 db
+tree shop shop.bak    # shop 只剩 api 和 web；shop.bak 保留完整备份
+```
+
+复制发生在删除之前，所以 `shop.bak` 里的 `db` 还在，备份未受影响。
+
+**第 3 题：一条 mv 移动 a 开头的文件**
+
+```bash
+touch a1.txt a2.txt b1.txt b2.txt
+mkdir group-a
+mv a?.txt group-a/    # 或 mv a*.txt group-a/
+ls group-a            # a1.txt a2.txt
+```
+
+通配符由 Shell 先展开成 `a1.txt a2.txt`，再作为参数传给 `mv`。
+
+**第 4 题：危险的未定义变量**
+
+`TMPDIR` 未定义时，`rm -rf $TMPDIR/cache` 中 `$TMPDIR` 被展开成空字符串，命令实际变成：
+
+```bash
+rm -rf /cache
+```
+
+也就是删除根目录下的 `cache` 目录——如果系统里恰好存在 `/cache`，就会被整个删掉。安全写法：
+
+```bash
+# 写法一：加引号 + 判空（推荐）
+[ -n "$TMPDIR" ] && rm -rf "$TMPDIR/cache"
+
+# 写法二：改用不会变成根路径的相对路径
+rm -rf "./tmp/cache"
+
+# 写法三：Bash 参数展开提供默认值
+rm -rf "${TMPDIR:-/tmp}/cache"
+```
+
+核心原则：任何会被 `rm -rf` 删除的变量路径，都必须**先判空**、**加引号**，避免空变量导致命令退化成删根路径。
+</Answer>
 </Callout>

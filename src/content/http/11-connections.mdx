@@ -181,4 +181,58 @@ Nginx 默认用 HTTP/1.0 + Connection: close 连上游！做反向代理时必�
 2. 在 Playground 3 中把请求顺序换成先 /fast 后 /slow，方案 A 的总耗时变成多少？这说明队头阻塞的影响与什么有关？
 3. 用 curl 的 --parallel 参数改写方案 B，对比行为。
 4. 你接手一个 HTTP/1.1 时代的老项目，里面有 4 个分片域名和巨型雪碧图。升级到 HTTP/2 后，列出你会逐步回退的优化项及理由。
+
+<Answer>
+**参考答案：**
+
+**1. 加 Connection: close 破坏复用**
+
+在 Playground 1 的 `do_GET` 响应里加一个头：
+
+```python
+self.send_header("Connection", "close")
+```
+
+curl 第二次请求时就不会再出现 `Re-using existing connection`，而是重新 `Connected to`。因为 `Connection: close` 明确告诉客户端"本响应完我就断"，curl 收到后知道连接不可复用。注意 HTTP/1.1 默认是 keep-alive，只有显式声明 close 才关闭——这也解释了第 3 章"谁主动关谁 TIME_WAIT"：这里是服务器主动关，所以服务器侧堆 TIME_WAIT。
+
+**2. 先 /fast 后 /slow 的耗时**
+
+把方案 A 的请求顺序换成：
+
+```bash
+curl -s http://127.0.0.1:8000/fast http://127.0.0.1:8000/slow
+```
+
+同一条连接上 /fast 立即返回，然后 /slow 要等 2 秒，总耗时仍是 **约 2 秒**（串行累加）。而反过来先 /slow 后 /fast 也是约 2 秒——**顺序不影响总耗时**，因为一条连接串行，总时间等于各请求耗时之和。
+
+这说明：队头阻塞影响的不是"总耗时"（反正要串行），而是**单个请求的等待时间（延迟）**——排在慢请求后面的快请求，即使自己 1ms 能完成，也要陪等。影响大小取决于"慢请求的数量和位置"以及"请求总数"：慢请求越多、越靠前，排队惩罚越大。
+
+**3. curl --parallel 改写方案 B**
+
+```bash
+curl -s http://127.0.0.1:8000/slow --parallel \
+     http://127.0.0.1:8000/fast --parallel -o /dev/null -w "fast %{http_code}\n"
+```
+
+更标准的写法是：
+
+```bash
+curl -s --parallel --parallel-immediate \
+  http://127.0.0.1:8000/slow -o /work/slow.out \
+  http://127.0.0.1:8000/fast -w "fast 用时 %{time_total}s\n"
+```
+
+`--parallel` 让 curl 同时发起多个传输（行为与方案 B 类似），/fast 立即返回、/slow 后台跑。对比方案 A 的单连接串行，可以看出"并发连接绕开队头阻塞"的效果。
+
+**4. HTTP/2 升级后回退哪些优化**
+
+按收益递减、代价递增的顺序逐步回退：
+
+1. **去掉域名分片（4 个分片域名合并成 1 个）**：HTTP/2 同一连接可多路复用，分片反而会拆散连接，破坏 HPACK 动态表共享与流优先级，DNS 查询和握手次数也能省下来——**最该先回退**；
+2. **拆开雪碧图（CSS Sprite）为独立小图**：HTTP/2 多路复用让"多个小请求"成本极低，不再需要把图拼成一张大图；拆开后缓存粒度更细（改一张图只失效一张），配合 CDN 加载更高效；
+3. **适度拆包 JS/CSS**：HTTP/1.1 时代为了减少请求数把代码全打进一个 bundle，HTTP/2 下按路由/模块拆包，用动态 import 按需加载，首屏更快、缓存利用率更高；
+4. **回退 base64 内联小图**：内联到 CSS 的小图无法独立缓存，HTTP/2 下改为独立文件请求成本很低，应优先用独立文件。
+
+原则：HTTP/2 后"请求数"不再是主要矛盾，**缓存粒度和加载路径**才是。域名分片与过度合并属于协议缺陷时代的绕路，要往回拆。
+</Answer>
 </Callout>

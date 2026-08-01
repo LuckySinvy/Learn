@@ -191,4 +191,194 @@ SISMEMBER like:post:42 u9`}
 1. 构造两个各含 10 个成员的关注集合，分别求共同关注、全部关注、独有关注，并用 SINTERSTORE 把结果缓存 60 秒。
 2. 实现一个抽奖流程：100 人报名（防重复），先抽 1 个一等奖（不放回），再从剩余人中抽 5 个参与奖。
 3. 向一个纯数字 Set 依次加入 500 个小整数和 1 个字符串，观察 OBJECT ENCODING 的两次状态。
+
+<Answer>
+**参考答案：**
+
+**1. 关注集合的交并差运算**
+
+```bash
+# 构造两个各含 10 个成员的关注集合
+127.0.0.1:6379> SADD follow:alice u1 u2 u3 u4 u5 u6 u7 u8 u9 u10
+(integer) 10
+127.0.0.1:6379> SADD follow:bob u5 u6 u7 u8 u11 u12 u13 u14 u15 u16
+(integer) 10
+
+# ---- 共同关注（交集）----
+127.0.0.1:6379> SINTER follow:alice follow:bob
+1) "u5"
+2) "u6"
+3) "u7"
+4) "u8"
+
+# ---- 全部关注（并集，自动去重）----
+127.0.0.1:6379> SUNION follow:alice follow:bob
+ 1) "u1"
+ 2) "u2"
+ ...                      # 共 16 个，u5~u8 不重复
+127.0.0.1:6379> SCARD follow:alice
+(integer) 10
+
+# ---- alice 独有的关注（差集，注意顺序敏感）----
+127.0.0.1:6379> SDIFF follow:alice follow:bob
+1) "u1"
+2) "u2"
+3) "u3"
+4) "u4"
+5) "u9"
+6) "u10"
+
+# ---- bob 独有的关注：交换顺序 ----
+127.0.0.1:6379> SDIFF follow:bob follow:alice
+1) "u11"
+...                       # u11~u16
+
+# ---- 用 SINTERSTORE 缓存交集结果 60 秒 ----
+127.0.0.1:6379> SINTERSTORE cache:common:alice:bob 2 follow:alice follow:bob
+(error) ERR value is not an integer or out of range
+# 注意：SINTERSTORE 不需要 numkeys 参数，直接跟 key 列表
+127.0.0.1:6379> SINTERSTORE cache:common:alice:bob follow:alice follow:bob
+(integer) 4               # 返回结果集的元素个数
+127.0.0.1:6379> EXPIRE cache:common:alice:bob 60
+(integer) 1
+127.0.0.1:6379> SMEMBERS cache:common:alice:bob
+1) "u5"
+2) "u6"
+3) "u7"
+4) "u8"
+127.0.0.1:6379> TTL cache:common:alice:bob
+(integer) 57
+```
+
+几个要点：
+
+- **`SDIFF` 顺序敏感**：`SDIFF A B` 是"A 有 B 没有"，交换顺序结果完全不同。`SINTER` 和 `SUNION` 则与顺序无关
+- **STORE 版本返回的是元素个数，不是集合内容**：想看内容要再 `SMEMBERS`
+- **STORE 会覆盖目标 key**，且**不保留目标 key 原有的 TTL**，所以 `EXPIRE` 必须在 `SINTERSTORE` 之后执行。这个顺序搞反是缓存不过期的常见原因
+- **结果为空时目标 key 会被删除**：如果交集为空，`SINTERSTORE` 返回 0 且不会创建 key，此时 `EXPIRE` 返回 0
+- **STORE 的价值**：把"共同关注"这种昂贵计算的结果落成一个 key，60 秒内的重复请求直接 `SMEMBERS` 读缓存。但要警惕两个大集合求交会在主线程做大量计算，`SINTERCARD`（Redis 7.0+）可以在只需要数量时提前终止：`SINTERCARD 2 follow:alice follow:bob LIMIT 10`
+
+**2. 抽奖流程**
+
+```bash
+# ---- 1. 100 人报名，SADD 天然防重复 ----
+for i in $(seq 1 100); do redis-cli sadd lottery:2026:signup "u$i"; done
+127.0.0.1:6379> SCARD lottery:2026:signup
+(integer) 100
+
+# 重复报名不会增加人数
+127.0.0.1:6379> SADD lottery:2026:signup u50
+(integer) 0               # 返回 0 = 已报名，业务侧可提示"你已参与"
+
+# ---- 2. 抽 1 个一等奖：SPOP 不放回 ----
+127.0.0.1:6379> SPOP lottery:2026:signup 1
+1) "u73"
+127.0.0.1:6379> SCARD lottery:2026:signup
+(integer) 99              # 人数减少，u73 不会再被抽到
+
+# 记录中奖名单
+127.0.0.1:6379> SADD lottery:2026:winner:first u73
+(integer) 1
+
+# ---- 3. 从剩余 99 人中抽 5 个参与奖 ----
+127.0.0.1:6379> SPOP lottery:2026:signup 5
+1) "u12"
+2) "u88"
+3) "u41"
+4) "u5"
+5) "u60"
+127.0.0.1:6379> SCARD lottery:2026:signup
+(integer) 94
+
+127.0.0.1:6379> SADD lottery:2026:winner:join u12 u88 u41 u5 u60
+(integer) 5
+
+# ---- 验证：一等奖不在参与奖名单里 ----
+127.0.0.1:6379> SISMEMBER lottery:2026:winner:join u73
+(integer) 0
+127.0.0.1:6379> SINTER lottery:2026:winner:first lottery:2026:winner:join
+(empty array)             # 交集为空，证明没有重复中奖
+```
+
+**为什么用 `SPOP` 而不是 `SRANDMEMBER`？**
+
+| 命令 | 是否移除 | 是否可能重复 | 适用场景 |
+|---|---|---|---|
+| `SPOP key N` | 是（不放回） | 不会 | 抽奖、发号、任务分配 |
+| `SRANDMEMBER key N` | 否（只读） | N 为正数时不重复；**N 为负数时可重复** | 随机推荐、随机展示 |
+
+抽奖必须用 `SPOP`：它把"随机选取"和"移除"做成了一个原子操作。如果用"`SRANDMEMBER` 选人 + `SREM` 移除"两步，并发抽奖时两个请求可能选中同一个人。
+
+`SRANDMEMBER key -5` 传负数会返回 5 个**可能重复**的成员（且个数一定是 5，即使集合里只有 2 个人），这个特性在"随机展示 N 个广告位"时有用，但抽奖场景绝对不能用。
+
+**注意抽奖的原子性边界**：上面 `SPOP` + `SADD` 记录名单是两条命令，如果中间宕机会丢失中奖记录。严格场景应该用 Lua 把两步合成原子操作。
+
+**3. 观察 intset 到 hashtable 的两次编码状态**
+
+```bash
+127.0.0.1:6379> DEL nums
+(integer) 1
+
+# ---- 状态一：加入 500 个小整数 ----
+for i in $(seq 1 500); do redis-cli sadd nums $i; done
+127.0.0.1:6379> SCARD nums
+(integer) 500
+127.0.0.1:6379> OBJECT ENCODING nums
+"intset"                  # 全是整数 → intset
+
+# ---- 状态二：加入 1 个字符串 ----
+127.0.0.1:6379> SADD nums "hello"
+(integer) 1
+127.0.0.1:6379> OBJECT ENCODING nums
+"hashtable"               # 出现非整数 → 直接跳到 hashtable
+
+# ---- 验证不可逆 ----
+127.0.0.1:6379> SREM nums "hello"
+(integer) 1
+127.0.0.1:6379> OBJECT ENCODING nums
+"hashtable"               # 即使又变回纯整数，也不会转回 intset
+```
+
+**为什么是 hashtable 而不是 listpack？** Set 有三种编码，选择逻辑是：
+
+```bash
+# 决策顺序：
+# 1. 全是整数 且 元素数 <= set-max-intset-entries(512)  → intset
+# 2. 有非整数 且 元素数 <= set-max-listpack-entries(128)
+#    且 每个元素 <= set-max-listpack-value(64)          → listpack
+# 3. 其他所有情况                                        → hashtable
+```
+
+本题因为已经有 500 个元素（远超 listpack 的 128 上限），加入字符串后第 2 条不满足，所以**跳过 listpack 直接变成 hashtable**。
+
+对比实验，如果元素少就会落到 listpack：
+
+```bash
+127.0.0.1:6379> DEL small
+127.0.0.1:6379> SADD small 1 2 3
+(integer) 3
+127.0.0.1:6379> OBJECT ENCODING small
+"intset"
+127.0.0.1:6379> SADD small "hello"
+(integer) 1
+127.0.0.1:6379> OBJECT ENCODING small
+"listpack"                # 元素少 → 中间态 listpack
+
+# 再加到超过 128 个元素
+for i in $(seq 1 200); do redis-cli sadd small "s$i"; done
+127.0.0.1:6379> OBJECT ENCODING small
+"hashtable"
+```
+
+另一条触发路径：纯整数但数量超过 512，也会转（Redis 7 会转成 listpack 或 hashtable，取决于是否同时满足 listpack 条件）：
+
+```bash
+127.0.0.1:6379> DEL bignums
+for i in $(seq 1 600); do redis-cli sadd bignums $i; done
+127.0.0.1:6379> OBJECT ENCODING bignums
+"hashtable"               # 600 > 512，且 600 > 128，所以是 hashtable
+```
+
+**intset 的特点**：底层是一个**有序的整数数组**，用二分查找定位，所以 `SISMEMBER` 是 O(log N) 而不是 O(1)。它还会根据最大值自动升级编码宽度（int16 → int32 → int64），且升级同样不可逆——存入一个大整数后，即使删掉它，数组也不会降回 int16。这也是为什么 intset 极省内存：500 个小整数用 int16 只要约 1 KB，换成 hashtable 至少要几十 KB。
+</Answer>
 </Callout>

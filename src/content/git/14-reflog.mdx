@@ -155,4 +155,74 @@ cd ..`}
 2. 新建分支 `feature/temp`，在上面提交一次，切回 main 后 `git branch -D feature/temp`。用 `git reflog` 找出那次提交的哈希，重建 `feature/temp`，验证文件存在。
 3. 做两次提交后 `git reset --hard HEAD~1`，然后用 `git fsck --lost-found` 找出悬空 commit，把它恢复成分支。对比 `git reflog` 和 `git fsck` 两种找法。
 4. 为什么 `git reflog` 在刚克隆（clone）下来的仓库里是空的？这说明了 reflog 的哪一特性？（提示：它是否随仓库传输？）
+
+<Answer>
+**参考答案：**
+
+**1. 救回被 reset 掉的提交**
+
+```bash
+git init -q -b main demo && cd demo
+echo v1 > a.txt && git add . && git commit -q -m "v1"
+echo v2 > a.txt && git add . && git commit -q -m "v2"
+echo v3 > a.txt && git add . && git commit -q -m "v3"
+git reset --hard HEAD~2
+git reflog | head -5
+```
+
+`git reflog` 顶部能看到 `v3`、`v2` 那两条被"丢掉"的记录，最左边就是它们的哈希。取 v2 或 v3 的哈希：
+
+```bash
+LOST=$(git reflog --format='%H %gs' | grep 'v3' | head -1 | awk '{print $1}')
+git branch rescue $LOST
+git log rescue --oneline
+```
+
+`git branch rescue <哈希>` 新建一个指向该提交的救援分支（比直接 `reset --hard` 更安全，不动当前分支），`git log rescue` 能看到 v1、v2、v3 完整历史，内容还在。
+
+**2. 重建误删的分支**
+
+```bash
+git init -q -b main demo && cd demo
+echo base > a.txt && git add . && git commit -q -m "init"
+git switch -c feature/temp && echo work > temp.txt && git add . && git commit -q -m "feat: temp 的工作"
+git switch main
+git branch -D feature/temp
+git reflog --oneline | grep 'temp'
+```
+
+`git branch -D` 删掉的是分支引用文件，**那次提交本身还在对象库里**，而且因为删除前 HEAD 正停在这个分支上，它出现在 HEAD 的 reflog 里。拿到那行开头的哈希后：
+
+```bash
+TIP=$(git reflog --format='%H %gs' | grep 'temp' | head -1 | awk '{print $1}')
+git branch feature/temp $TIP
+git switch feature/temp && cat temp.txt
+```
+
+`temp.txt` 原样回来了——重建分支只是重新挂一个引用指向那个提交。
+
+**3. fsck 找悬空提交 + 两种找法对比**
+
+```bash
+git init -q -b main demo && cd demo
+echo v1 > a.txt && git add . && git commit -q -m "v1"
+echo v2 > a.txt && git add . && git commit -q -m "v2 悬空"
+git reset --hard HEAD~1
+git fsck --lost-found 2>/dev/null | grep 'dangling commit'
+```
+
+`git fsck` 扫描对象库，输出 `dangling commit <哈希> ...`（v2 的提交），悬空对象的哈希还会被写进 `.git/lost-found/commit/`。确认哈希后 `git branch recovered <哈希>` 恢复。
+
+两种找法的对比：
+
+| | reflog | git fsck |
+|---|---|---|
+| 依据 | 记录过 HEAD 的每次移动 | 扫描对象库找不可达对象 |
+| 优点 | 快、自带操作历史（`reset: moving to ...`） | reflog 过期/丢失后仍可用 |
+| 缺点 | 本地记录，90 天后过期；clone 的仓库没有 | 不知道"什么时候丢的"，需要逐个确认内容 |
+
+**4. 刚 clone 的仓库 reflog 为什么是空的**
+
+因为 **reflog 是纯本地记录，不会随仓库传输**。`clone` 只传输对象、分支、标签等数据，`refs` 下的日志（`.git/logs/`）属于本机使用痕迹，从不打包进传输内容。所以新克隆的仓库里只有你自己的本地操作记录，没有原仓库曾经的 `reset`/`rebase`/`checkout` 历史。这也意味着 reflog 救不了"别人机器上丢的数据"——它只属于产生它的那台机器。
+</Answer>
 </Callout>

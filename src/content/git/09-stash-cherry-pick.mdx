@@ -336,4 +336,76 @@ git cherry -v main feature
 2. 连续做三次 stash，用 `git stash list` 观察编号顺序。然后 `apply stash@{1}`，再 `git stash list`，说明为什么条目还在。
 3. 用 `git log --oneline refs/stash` 证明 stash 条目本身就是提交对象。
 4. 造两条分支，在 dev 上做三个提交（feat / fix / feat），只把 fix 那个 cherry-pick 到 main，用 `git log --graph --all` 观察结果，并对比两个提交的哈希是否相同、内容是否相同。
+
+<Answer>
+**参考答案：**
+
+**1. `stash` vs `stash -u` 的差别**
+
+```bash
+git init -q
+echo tracked > t.txt && git add . && git commit -q -m "init"
+echo modified >> t.txt                 # 已跟踪文件的修改
+echo brand-new > new.txt               # 未跟踪的新文件
+git stash
+ls
+```
+
+`git stash`（不带 `-u`）只收起已跟踪文件的改动，`new.txt` **仍然留在工作区**。先 `git stash pop` 还原现场，再试：
+
+```bash
+git stash push -u
+ls
+```
+
+这次 `new.txt` 也被收走，工作区完全干净。差别一句话：**默认 stash 不管未跟踪文件，加 `-u` 才会一起收**——这也是课上强调永远用 `git stash push -u -m "说明"` 的原因。
+
+**2. stash 栈的编号与 apply**
+
+```bash
+git init -q
+echo v1 > a.txt && git add . && git commit -q -m "init"
+echo A >> a.txt && git stash push -m "改动A"
+echo B >> a.txt && git stash push -m "改动B"
+echo C >> a.txt && git stash push -m "改动C"
+git stash list
+```
+
+`git stash list` 显示三条，最新的是 `stash@{0}`（改动C）、最旧的是 `stash@{2}`（改动A）——后进先出，**编号会随新 stash 而变**。执行 `git stash apply stash@{1}` 后：
+
+```bash
+git stash list
+```
+
+改动B 被应用到了工作区，但 `stash@{1}` **依然在列表里**。因为 `apply` 只应用、不删除；只有 `pop`（= apply + drop）才会在成功后移除条目。需要保留"底稿"或想在多个分支上应用同一份改动时就用 `apply`。
+
+**3. stash 本质是提交**
+
+```bash
+git stash push -m "测试条目"
+git log --oneline refs/stash
+```
+
+`refs/stash` 也是 `git log` 能接受的引用，能看到它指向一个正常的提交对象（常带两个父提交，分别对应 stash 前的工作区和暂存区状态）。这证明 stash 条目**就是提交**，只是挂在一个特殊引用下——所以它的内容安全躺在对象库里，`drop` 后还能靠 `git fsck --unreachable` 找回。
+
+**4. cherry-pick 只摘 fix 提交**
+
+```bash
+git init -q
+echo base > base.txt && git add . && git commit -q -m "init"
+git switch -qc dev
+echo f1 > f1.py && git add . && git commit -q -m "feat: 功能1"
+echo fix > fix.py && git add . && git commit -q -m "fix: 紧急修复"
+echo f2 > f2.py && git add . && git commit -q -m "feat: 功能2"
+git switch -q main
+FIX=$(git log dev --format=%H --grep='紧急修复')
+git cherry-pick $FIX
+git log --oneline --graph --all
+git log dev  --format='%H %s' --grep='紧急修复'
+git log main --format='%H %s' --grep='紧急修复'
+diff <(git show $FIX:fix.py) <(git show HEAD:fix.py)
+```
+
+`--graph --all` 里 dev 的三个提交原样保留，main 上多出一个新的提交，且**只有 fix.py 跟了过来**，两个 feat 没有。对比可知：两个 fix 提交的**哈希不同**（父提交不同、提交时间不同），但 `fix.py` 的**内容完全一样**——cherry-pick 就是"把改动复制过来生成新提交"，这正是它"内容相同、哈希不同"的本质。
+</Answer>
 </Callout>

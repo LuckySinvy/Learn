@@ -384,6 +384,72 @@ WHERE table = 'merge_demo' ORDER BY name;
 2. 对比合并前后的总磁盘占用（`sum(bytes_on_disk) WHERE active`），计算压缩率提升了多少。
 3. 写一个循环脚本，每次只插入 1 行、连续插入 500 次，观察 part 数量增长和后台合并的追赶过程。再改用 `async_insert = 1` 重跑，对比最终 part 数量。
 4. 用 `SHOW CREATE TABLE events` 看看 ClickHouse 补全了哪些你没写的默认 SETTINGS。
+
+<Answer>
+**参考答案：**
+
+1. 重现 merge 过程：
+
+```sql
+CREATE TABLE merge_demo (id UInt64, v String) ENGINE = MergeTree ORDER BY id;
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(0, 200000);
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(200000, 200000);
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(400000, 200000);
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(600000, 200000);
+INSERT INTO merge_demo SELECT number, toString(number) FROM numbers(800000, 200000);
+```
+
+用 `watch -n1` 反复查看 part 数量：
+
+```bash
+watch -n1 "clickhouse-client --query \"SELECT name, rows, level, active FROM system.parts WHERE table = 'merge_demo' AND database = 'default' ORDER BY name\""
+```
+
+刚插完是 5 个 `level=0` 的 active part，几秒内被后台合并成 1 个 `all_1_5_1`（level=1），旧 part 变 `active=0`，约 8 分钟后被物理删除。
+
+2. 对比合并前后的磁盘占用：
+
+```sql
+-- 合并前（动作要快，趁 5 个 part 还没被合掉）
+SELECT formatReadableSize(sum(bytes_on_disk)) AS before_size FROM system.parts
+WHERE table = 'merge_demo' AND active;
+
+-- 合并后
+SELECT formatReadableSize(sum(bytes_on_disk)) AS after_size FROM system.parts
+WHERE table = 'merge_demo' AND active;
+```
+
+合并后 `bytes_on_disk` 明显变小（本章示例中 13.98 MiB → 11.4 MiB，约节省 18%）。原因是更大的 part 里相同前缀的数据聚集更多，LZ4 等通用压缩的效果更好。压缩率提升 = `1 - after/before`。
+
+3. 单行循环插入 vs async_insert：
+
+```bash
+# 每次插 1 行，连插 500 次
+for i in $(seq 1 500); do
+  clickhouse-client --query "INSERT INTO merge_demo VALUES ($i, 'x')"
+done
+# 期间反复查 system.parts，会看到 part 数量先快速涨到几百，
+# 后台合并线程追不上（可能触发 Too many parts 警告），随后慢慢回落
+```
+
+```bash
+# 改用 async_insert 重跑：服务端先把小插入攒在内存缓冲区，
+# 攒够 10 MB 或 1 秒再落盘成一个 part，最终 part 数量会少一个数量级以上
+for i in $(seq 1 500); do
+  clickhouse-client --query "INSERT INTO merge_demo SETTINGS async_insert = 1 VALUES ($i, 'y')"
+done
+```
+
+对比两种方式的最终 part 数量，体会「批量写入 + 服务端攒批」对 part 数量（进而对 merge 压力）的决定性影响。做完后可以 `DROP TABLE merge_demo` 清理。
+
+4. 查看补全的默认配置：
+
+```sql
+SHOW CREATE TABLE demo.events;
+```
+
+你会看到 ClickHouse 自动补齐了 `index_granularity = 8192`、`index_granularity_bytes = 10485760`（自适应粒度）、`min_rows_for_wide_part`、`ttl_only_drop_parts`、`storage_policy` 等一堆默认 SETTINGS 和默认分区、TTL 表达式（`TTL event_time + toIntervalMonth(12)` 之类，取决于版本）。这说明引擎会把你没写的关键参数用合理默认值补全——这也是为什么「建表时想清楚排序键、分区键」特别重要，因为默认参数不会替你弥补设计问题。
+</Answer>
 </Callout>
 
 ## 小结

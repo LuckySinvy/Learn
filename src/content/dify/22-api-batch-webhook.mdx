@@ -66,6 +66,297 @@ curl -X POST https://your-dify.example.com/v1/workflows/run \
 
 <Callout type="exercise" title="动手做">
 写一个小脚本，读取一个包含 5 条问题的文本文件，逐条调用 Dify API 并打印每条回答，给脚本加上并发上限与失败重试。
+
+<Answer>
+**参考答案：**
+
+**输入文件 `questions.txt`**
+
+```text
+如何申请报销？
+退款一般几天到账？
+企业版和专业版有什么区别？
+忘记密码怎么办？
+支持导出 Excel 吗？
+```
+
+**完整脚本（Python + 标准库线程池）**
+
+```python
+#!/usr/bin/env python3
+"""批量调用 Dify Chat API：并发上限 + 指数退避重试 + 结果落盘。"""
+
+import json
+import os
+import random
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Semaphore
+
+import requests
+
+BASE_URL = os.environ["DIFY_BASE_URL"].rstrip("/")
+API_KEY = os.environ["DIFY_API_KEY"]          # 从环境变量读，别写死在代码里
+CONCURRENCY = 5                                # 并发上限
+MAX_ATTEMPTS = 3
+TIMEOUT = 120
+
+_sem = Semaphore(CONCURRENCY)
+_session = requests.Session()
+_session.headers.update({
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json",
+})
+
+
+def ask(index: int, question: str) -> dict:
+    """调用一次 Dify，带指数退避重试。"""
+    payload = {
+        "inputs": {},
+        "query": question,
+        "response_mode": "blocking",
+        "user": f"batch-{index:04d}",   # 每条独立 user → 会话互相隔离
+        "conversation_id": "",
+        "auto_generate_name": False,    # 省掉一次生成标题的模型调用
+    }
+
+    last_err = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            with _sem:                        # 信号量控制并发
+                resp = _session.post(
+                    f"{BASE_URL}/v1/chat-messages",
+                    json=payload,
+                    timeout=TIMEOUT,
+                )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                usage = data.get("metadata", {}).get("usage", {})
+                return {
+                    "index": index,
+                    "question": question,
+                    "answer": data.get("answer", ""),
+                    "conversation_id": data.get("conversation_id"),
+                    "tokens": usage.get("total_tokens", 0),
+                    "ok": True,
+                    "attempts": attempt,
+                }
+
+            # 429 限流、5xx 服务端错误 → 可重试
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                raise RuntimeError(last_err)
+
+            # 4xx 客户端错误（401 密钥错、404 应用未发布）→ 重试也没用
+            return {
+                "index": index,
+                "question": question,
+                "ok": False,
+                "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
+                "attempts": attempt,
+            }
+
+        except (requests.RequestException, RuntimeError) as e:
+            last_err = str(e)
+            if attempt == MAX_ATTEMPTS:
+                break
+            # 指数退避 + 随机抖动，避免所有失败请求同时重试
+            delay = (2 ** (attempt - 1)) + random.uniform(0, 1)
+            print(f"[{index}] 第 {attempt} 次失败，{delay:.1f}s 后重试：{last_err}",
+                  file=sys.stderr)
+            time.sleep(delay)
+
+    return {
+        "index": index,
+        "question": question,
+        "ok": False,
+        "error": last_err,
+        "attempts": MAX_ATTEMPTS,
+    }
+
+
+def main(path: str) -> None:
+    with open(path, encoding="utf-8") as f:
+        questions = [line.strip() for line in f if line.strip()]
+
+    print(f"共 {len(questions)} 条，并发 {CONCURRENCY}\n")
+    started = time.time()
+    results = []
+
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = {
+            pool.submit(ask, i, q): i
+            for i, q in enumerate(questions, start=1)
+        }
+        for fut in as_completed(futures):
+            r = fut.result()
+            results.append(r)
+            if r["ok"]:
+                print(f"[{r['index']}] Q: {r['question']}")
+                print(f"     A: {r['answer'][:200]}")
+                print(f"     tokens={r['tokens']} attempts={r['attempts']}\n")
+            else:
+                print(f"[{r['index']}] 失败: {r['error']}\n", file=sys.stderr)
+
+    results.sort(key=lambda x: x["index"])
+    with open("results.jsonl", "w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    ok = sum(1 for r in results if r["ok"])
+    total_tokens = sum(r.get("tokens", 0) for r in results)
+    print(f"完成 {ok}/{len(results)}，"
+          f"总 token {total_tokens}，"
+          f"耗时 {time.time() - started:.1f}s → results.jsonl")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else "questions.txt")
+```
+
+运行：
+
+```bash
+export DIFY_BASE_URL="https://your-dify.example.com"
+export DIFY_API_KEY="app-xxxxxxxxxxxx"
+python3 batch_ask.py questions.txt
+```
+
+**设计要点逐条对应正文**
+
+| 要求 | 实现方式 | 为什么这么做 |
+|---|---|---|
+| 并发上限 | `ThreadPoolExecutor(max_workers=5)` + `Semaphore(5)` | 正文 warn：不限并发会撞 429 |
+| 失败重试 | 最多 3 次，指数退避 `1s → 2s → 4s` | 瞬时故障能自愈 |
+| 抖动（jitter） | `+ random.uniform(0, 1)` | 防止所有请求同时重试形成二次冲击 |
+| 会话隔离 | 每条独立 `user` | 正文第 2 节：`per_item_unique` 策略 |
+| 区分错误类型 | 4xx 立即放弃，429/5xx 才重试 | 密钥错误重试 100 次也没用，白烧时间 |
+| 密钥安全 | 从环境变量读取 | 第 14 章：Key 绝不进代码库 |
+| 连接复用 | `requests.Session()` | 复用 TCP 连接，批量场景明显更快 |
+| 结果可追溯 | 落盘 `results.jsonl` | 便于失败重跑与后续分析 |
+
+**双保险为什么用了两层并发控制**
+
+`ThreadPoolExecutor` 的 `max_workers` 已经限制了并发，为什么还要 `Semaphore`？因为线程池限制的是**线程数**，而信号量限制的是**同时在途的 HTTP 请求数**。当前代码里两者等价，但如果之后在 `ask()` 里加了非网络的耗时处理（如结果后处理），信号量能确保网络请求数不超标，线程可以去干别的。这是一个防御性设计。
+
+**如果要做真正的 QPS 限流**
+
+上面控制的是「并发数」不是「每秒请求数」。模型供应商的配额通常按 QPS 或 TPM 计。需要精确限流时加一个令牌桶：
+
+```python
+import threading
+import time
+
+
+class RateLimiter:
+    """简单令牌桶：限制每秒最多 rate 次请求。"""
+
+    def __init__(self, rate: float):
+        self.rate = rate
+        self.tokens = rate
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.tokens = min(
+                    self.rate, self.tokens + (now - self.last) * self.rate
+                )
+                self.last = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                wait = (1 - self.tokens) / self.rate
+            time.sleep(wait)
+
+
+_limiter = RateLimiter(rate=10)   # 每秒 10 次
+# 在 ask() 内的 with _sem 之前调用 _limiter.acquire()
+```
+
+**异步版本（数据量大时更省资源）**
+
+5 条用线程池完全够。上千条时，`asyncio` + `aiohttp` 的内存占用和上下文切换开销都更低：
+
+```python
+import asyncio
+import aiohttp
+
+
+async def ask_async(session, sem, index, question):
+    async with sem:
+        payload = {
+            "inputs": {},
+            "query": question,
+            "response_mode": "blocking",
+            "user": f"batch-{index:04d}",
+        }
+        for attempt in range(3):
+            try:
+                async with session.post(
+                    f"{BASE_URL}/v1/chat-messages", json=payload
+                ) as r:
+                    if r.status == 200:
+                        return await r.json()
+                    if r.status < 500 and r.status != 429:
+                        return {"error": f"HTTP {r.status}"}
+            except aiohttp.ClientError:
+                pass
+            await asyncio.sleep(2 ** attempt)
+        return {"error": "max retries"}
+
+
+async def main_async(questions):
+    sem = asyncio.Semaphore(8)
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        tasks = [
+            ask_async(session, sem, i, q)
+            for i, q in enumerate(questions, start=1)
+        ]
+        return await asyncio.gather(*tasks)
+```
+
+**另一种思路：用工作流的迭代节点代替脚本**
+
+如果批量逻辑不复杂，可以完全不写脚本——把问题数组作为工作流的输入，用第 21 章的**迭代节点**在 Dify 内部批处理，一次 API 调用搞定：
+
+```bash
+curl -X POST "$DIFY_BASE_URL/v1/workflows/run" \
+  -H "Authorization: Bearer $DIFY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": { "questions": ["问题1", "问题2", "问题3"] },
+    "response_mode": "blocking",
+    "user": "batch-runner"
+  }'
+```
+
+两种方案的取舍：
+
+| | 外部脚本批量 | 工作流迭代节点 |
+|---|---|---|
+| 并发与限流控制 | 完全自己掌握 | 受平台迭代节点配置限制 |
+| 失败重试粒度 | 单条精确重试 | 整个工作流重跑 |
+| 结果落盘与分析 | 灵活 | 需要额外用 HTTP 节点回写 |
+| 开发成本 | 要写代码 | 拖拽即可 |
+| 适合场景 | 大批量、要精细控制 | 几十条以内、逻辑简单 |
+
+**生产环境还要补的东西**
+
+```text
+□ 断点续跑：记录已完成的 index，中断后跳过（大批量必备）
+□ 结果去重：同一问题多次调用可加缓存层
+□ 成本上限：累计 token 超阈值时主动中止，防账单失控
+□ 监控告警：失败率超过阈值时发通知
+□ 日志脱敏：问题内容可能含隐私，落盘前处理
+□ 优雅退出：捕获 SIGINT，把已完成结果先落盘再退出
+```
+</Answer>
 </Callout>
 
 ## 小结

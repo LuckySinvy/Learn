@@ -268,6 +268,78 @@ M0 不支持分片、不支持自定义角色、连接数上限 500，而且**14
 
 <Callout type="exercise" title="练习">
 用 Docker 起一个 7.0 的单成员复制集，插入本章的 3 个用户，然后完成三件事：一、用 `db.hello()` 确认当前节点是 primary；二、写一段 mongosh 循环，往 `posts` 集合插入 50 条帖子，每条随机挑一个已有用户的 `_id` 作为 `authorId`；三、写出一条**同时带认证库、写关注 majority 和 5 秒服务选择超时**的完整连接 URI。
+
+<Answer>
+**参考答案：**
+
+**一、启动单成员复制集并插入 3 个用户**
+
+```bash
+docker run -d --name mongo7 \
+  -p 27017:27017 \
+  -v mongo7-data:/data/db \
+  mongo:7.0 \
+  --replSet rs0 --bind_ip_all
+
+docker exec -it mongo7 mongosh --eval 'rs.initiate({
+  _id: "rs0",
+  members: [{ _id: 0, host: "localhost:27017" }]
+})'
+```
+
+等提示符变成 `rs0 [direct: primary] test>` 后，插入本章的 3 个用户（任意至少一个即可，三个都插也无妨）：
+
+```js
+use community
+
+db.users.insertMany([
+  { username: "alice", email: "alice@example.com", age: 28,
+    profile: { city: "Beijing", bio: "后端工程师" },
+    tags: ["mongodb", "go"], createdAt: new Date("2024-01-05") },
+  { username: "bob", email: "bob@example.com", age: 34,
+    profile: { city: "Shanghai", bio: "架构师" },
+    tags: ["kafka", "java"], createdAt: new Date("2024-02-11") },
+  { username: "carol", email: "carol@example.com", age: 23,
+    profile: { city: "Beijing", bio: "前端" },
+    tags: ["react"], createdAt: new Date("2024-03-20") }
+])
+```
+
+**二、用 `db.hello()` 确认当前节点是 primary**
+
+```js
+db.hello()
+```
+
+返回结果里的 `isWritablePrimary: true`（7.0 及其后版本）或 `ismaster: true`（旧版本字段名）即代表当前节点是 primary。顺带也能看到 `topologyVersion` 和 `lastWrite` 等信息。
+
+**三、mongosh 循环插入 50 条帖子，随机指定作者**
+
+```js
+const users = db.users.find({}, { _id: 1 }).toArray()
+
+for (let i = 0; i < 50; i++) {
+  db.posts.insertOne({
+    title: "帖子-" + i,
+    authorId: users[Math.floor(Math.random() * users.length)]._id,
+    views: Math.floor(Math.random() * 1000),
+    createdAt: new Date()
+  })
+}
+
+db.posts.countDocuments()
+```
+
+关键点：先用 `find().toArray()` 把用户的 `_id` 全部取出来，再用 `Math.floor(Math.random() * users.length)` 随机取下标，避免出现 `authorId` 指向不存在的用户。
+
+**四、完整连接 URI**
+
+```text
+mongodb://app:s3cr3t@localhost:27017/community?replicaSet=rs0&authSource=admin&w=majority&serverSelectionTimeoutMS=5000
+```
+
+逐段解释：`app:s3cr3t@` 是用户名密码（密码含特殊字符需 URL 编码）；`/community` 是默认库；`replicaSet=rs0` 告诉驱动按复制集拓扑连接；`authSource=admin` 指定认证库；`w=majority` 要求写操作复制到大多数节点后才确认；`serverSelectionTimeoutMS=5000` 表示 5 秒内找不到可用节点就报错。
+</Answer>
 </Callout>
 
 ## 小结

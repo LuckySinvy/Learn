@@ -165,4 +165,59 @@ cd ..`}
 2. 新建 `b.txt` 写入与 `a.txt` **完全相同**的内容并提交，比较两者 `git rev-parse HEAD:a.txt` 与 `HEAD:b.txt` 的哈希，验证共享 blob。
 3. 查看 `.git/HEAD` 的内容，然后用 `git branch` 新建一个分支，观察 `.git/refs/heads/` 下是否多出一个同名文件、其内容与 HEAD 指向的 commit 是否一致。
 4. `git cat-file -p HEAD`（commit）和 `git cat-file -p HEAD^{tree}`（tree）的输出分别是什么结构？各列出哪些信息？
+
+<Answer>
+**参考答案：**
+
+**1. 用 rev-parse / cat-file 看 blob**
+
+```bash
+git init -q -b main obj && cd obj
+echo hello > a.txt && git add a.txt && git commit -q -m "init"
+BLOB=$(git rev-parse HEAD:a.txt)
+echo "$BLOB"
+git cat-file -p $BLOB    # 打印 blob 内容：hello
+git cat-file -t $BLOB    # 打印对象类型：blob
+```
+
+`git rev-parse HEAD:a.txt` 返回 a.txt 这个 blob 的哈希；`git cat-file -p` 按类型解析对象并打印内容（blob 就是文件内容本身）；`git cat-file -t` 确认类型是 `blob`。
+
+**2. 相同内容共享 blob**
+
+```bash
+echo hello > b.txt
+git add b.txt && git commit -q -m "add b"
+git rev-parse HEAD:a.txt
+git rev-parse HEAD:b.txt
+```
+
+两个哈希**完全相同**。因为 blob 的 SHA-1 只由文件内容计算，`a.txt` 和 `b.txt` 内容都是 `hello`，指向同一个 blob 对象；文件名和路径只记录在 tree 对象里，不参与 blob 哈希。
+
+**3. HEAD 与新建分支的文件**
+
+```bash
+cat .git/HEAD
+git rev-parse HEAD
+git branch feature
+ls .git/refs/heads/
+cat .git/refs/heads/feature
+git rev-parse feature
+```
+
+`.git/HEAD` 内容是 `ref: refs/heads/main`（HEAD 指向当前分支，不直接指向提交）。`git branch feature` 之后 `.git/refs/heads/` 下多出 `feature` 文件，其内容等于 `git rev-parse feature` 的哈希，也等于创建时的 `HEAD` 指向的提交——**创建分支就是复制一个指向当前提交的引用文件**。
+
+**4. commit 与 tree 的输出结构**
+
+```bash
+git cat-file -p HEAD
+```
+
+输出是键值对：`tree <哈希>`（本次快照的目录树）、`parent <哈希>`（父提交，第一个提交没有这一行）、`author`（作者名、邮箱、时间戳+时区）、`committer`（提交者，可和 author 不同）、空行、提交信息。它描述的是一次"快照 + 血缘关系 + 元信息"。
+
+```bash
+git cat-file -p HEAD^{tree}
+```
+
+输出是目录清单，每行：`<模式> <对象类型> <哈希>\t<文件名>`，例如 `100644 blob <哈希> a.txt` 和 `040000 tree <哈希> sub/`。它描述目录结构：每个文件名、权限、以及它对应的 blob/tree 对象。目录里再有子目录时，tree 里就会出现类型为 `tree` 的行。
+</Answer>
 </Callout>

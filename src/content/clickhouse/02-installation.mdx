@@ -389,6 +389,82 @@ SELECT count(), min(event_time), max(event_time) FROM events;
 1. 用 Docker 启动 ClickHouse，创建 `demo` 库并执行上面的建表与灌数据脚本。
 2. 分别用 `clickhouse-client`、`curl` HTTP 接口、浏览器 Play UI 三种方式执行 `SELECT count() FROM demo.events`，确认三条路都通。
 3. 在 `config.d/` 下新建一个 XML 把日志级别改成 `debug`，重启后用 `SELECT * FROM system.settings WHERE name LIKE '%log%'` 或查看日志文件确认生效，然后改回 `information`。
+
+<Answer>
+**参考答案：**
+
+1. 启动容器（带数据卷和账号，方便后续章节复用）：
+
+```bash
+docker run -d --name ch \
+  --ulimit nofile=262144:262144 \
+  -p 8123:8123 -p 9000:9000 \
+  -v ch_data:/var/lib/clickhouse \
+  -e CLICKHOUSE_DB=demo \
+  -e CLICKHOUSE_USER=analyst \
+  -e CLICKHOUSE_PASSWORD=analyst123 \
+  clickhouse/clickhouse-server:24.8
+
+docker exec -it ch clickhouse-client --user analyst --password analyst123 --database demo
+```
+
+进入客户端后执行第 6 节的建表与灌数据脚本（`CREATE TABLE events ...` 和 `INSERT INTO events SELECT ... FROM numbers(1000000)`），最后用下面这条验证 100 万行已入库：
+
+```sql
+SELECT count(), min(event_time), max(event_time) FROM events;
+```
+
+2. 三种方式执行同一个查询：
+
+```bash
+# 方式一：clickhouse-client（9000 端口，Native 协议）
+docker exec -it ch clickhouse-client --user analyst --password analyst123 \
+  --query "SELECT count() FROM demo.events"
+
+# 方式二：curl HTTP 接口（8123 端口）
+curl -X POST 'http://localhost:8123/?database=demo' \
+  -H 'X-ClickHouse-User: analyst' \
+  -H 'X-ClickHouse-Key: analyst123' \
+  -d 'SELECT count() FROM demo.events'
+
+# 方式三：浏览器打开 http://localhost:8123/play ，在编辑区输入
+# SELECT count() FROM demo.events 后点 Run
+```
+
+三条路的结果应一致（都是 1000000）。方式一与方式二分别对应 9000 / 8123 两个端口，Play UI 底层也是 HTTP。
+
+3. 修改日志级别：
+
+```xml
+<!-- /etc/clickhouse-server/config.d/log.xml -->
+<clickhouse>
+    <logger>
+        <level>debug</level>
+    </logger>
+</clickhouse>
+```
+
+```bash
+docker exec -it ch bash -c 'cat > /etc/clickhouse-server/config.d/log.xml <<EOF
+<clickhouse>
+    <logger>
+        <level>debug</level>
+    </logger>
+</clickhouse>
+EOF'
+docker restart ch
+```
+
+重启后验证生效：
+
+```sql
+-- 服务端日志级别属于 logger 配置，system.settings 里看不到；
+-- 更直接的办法是看日志文件（默认 /var/log/clickhouse-server/clickhouse-server.log），
+-- 出现大量 "Debug" 级别的行即生效。若容器未挂载日志目录，可用 docker logs ch 查看。
+```
+
+验证完把 `log.xml` 里的 `debug` 改回 `information`（或直接删除该文件）再重启一次。注意 `config.d/` 的覆盖语义是按 XML 路径替换，所以只要改 `level` 节点即可，不会影响主配置里的其他内容。
+</Answer>
 </Callout>
 
 ## 小结

@@ -186,4 +186,444 @@ $ redis-cli --cluster rebalance 10.0.0.1:7001    # 自动均衡槽分布
 1. 本机用 6 个端口搭一个 3 主 3 从集群，分别用带 -c 和不带 -c 的 redis-cli 访问同一个 key，观察 MOVED 行为差异。
 2. 用 CLUSTER KEYSLOT 验证：`user:1001` 与 `{user:1001}:name` 的槽是否相同？`{user:1001}:cart` 呢？
 3. 演练扩容：加入第 4 个主节点并 reshard 4096 个槽过去，迁移期间持续读写，验证业务无感。
+
+<Answer>
+**参考答案：**
+
+**1. 搭建 3 主 3 从集群，对比 `-c` 与非 `-c` 的行为**
+
+```bash
+# ---- 准备 6 个节点的配置与目录 ----
+for port in 7001 7002 7003 7004 7005 7006; do
+  mkdir -p /tmp/redis-cluster/$port
+  cat > /tmp/redis-cluster/$port/redis.conf <<EOF
+port $port
+cluster-enabled yes
+cluster-config-file nodes-$port.conf
+cluster-node-timeout 5000
+appendonly yes
+dir /tmp/redis-cluster/$port
+daemonize yes
+EOF
+  redis-server /tmp/redis-cluster/$port/redis.conf
+done
+
+# ---- 一条命令创建集群（--cluster-replicas 1 表示每主 1 从）----
+redis-cli --cluster create \
+  127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 \
+  127.0.0.1:7004 127.0.0.1:7005 127.0.0.1:7006 \
+  --cluster-replicas 1
+
+# 输出会展示分配方案，输入 yes 确认
+>>> Performing hash slots allocation on 6 nodes...
+Master[0] -> Slots 0 - 5460
+Master[1] -> Slots 5461 - 10922
+Master[2] -> Slots 10923 - 16383
+Adding replica 127.0.0.1:7005 to 127.0.0.1:7001
+Adding replica 127.0.0.1:7006 to 127.0.0.1:7002
+Adding replica 127.0.0.1:7004 to 127.0.0.1:7003
+Can I set the above configuration? (type 'yes' to accept): yes
+...
+[OK] All 16384 slots covered.
+```
+
+```bash
+# ---- 查看集群状态 ----
+$ redis-cli -p 7001 CLUSTER INFO
+cluster_enabled:1
+cluster_state:ok
+cluster_slots_assigned:16384
+cluster_slots_ok:16384
+cluster_known_nodes:6
+cluster_size:3                    # 3 个负责槽的主节点
+
+$ redis-cli -p 7001 CLUSTER NODES
+a1b2... 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-5460
+c3d4... 127.0.0.1:7002@17002 master - 0 ... 2 connected 5461-10922
+e5f6... 127.0.0.1:7003@17003 master - 0 ... 3 connected 10923-16383
+...
+```
+
+**不带 `-c`：收到 MOVED 错误，命令失败**
+
+```bash
+$ redis-cli -p 7001
+127.0.0.1:7001> SET foo "bar"
+(error) MOVED 12182 127.0.0.1:7003
+#              ^^^^^ 槽号        ^^^^^^^^^^^^^^ 应该去的节点
+# 命令【没有执行】，只是告诉你去哪儿
+
+127.0.0.1:7001> GET foo
+(error) MOVED 12182 127.0.0.1:7003
+
+# 手动去 7003 才能成功
+$ redis-cli -p 7003
+127.0.0.1:7003> SET foo "bar"
+OK
+
+# 恰好落在本节点槽范围内的 key 可以直接操作
+127.0.0.1:7001> SET k1 "v1"
+(error) MOVED 12706 127.0.0.1:7003
+127.0.0.1:7001> SET abc "v"
+OK                                # abc 的槽正好在 0-5460 内
+```
+
+**带 `-c`：客户端自动跟随重定向**
+
+```bash
+$ redis-cli -c -p 7001
+127.0.0.1:7001> SET foo "bar"
+-> Redirected to slot [12182] located at 127.0.0.1:7003
+OK
+127.0.0.1:7003>                   # 【注意】提示符变了，连接已切到 7003
+
+127.0.0.1:7003> GET foo
+"bar"                             # 已经在 7003 上，无需重定向
+
+127.0.0.1:7003> SET abc "v"
+-> Redirected to slot [7638] located at 127.0.0.1:7001
+OK
+127.0.0.1:7001>                   # 又切回 7001
+```
+
+**核心区别**：
+
+| | 不带 `-c` | 带 `-c` |
+|---|---|---|
+| 收到 MOVED | 原样打印错误，**命令失败** | 自动连到目标节点重试 |
+| 连接行为 | 始终连着原节点 | **切换到目标节点**（提示符会变） |
+| 使用场景 | 运维排查、只操作本节点数据 | 日常使用 |
+
+**重要认知：MOVED 不是"服务端帮你转发"，而是"服务端告诉你走错了"。** Redis Cluster 采用**客户端直连 + 重定向纠错**的架构，没有代理层。真正的重定向工作由客户端完成。
+
+**redis-cli 的 `-c` 是"笨"实现**：每次收到 MOVED 才重连一次，多一个 RTT。而生产级客户端（JedisCluster、Lettuce、go-redis 的 ClusterClient）会**在启动时拉取完整的槽映射表并缓存在本地**，之后直接把命令发到正确的节点，**零重定向开销**。只有在集群拓扑变更（扩缩容、故障转移）时才会收到 MOVED，此时客户端顺便刷新本地路由表。
+
+```bash
+# 客户端启动时会执行这个命令获取路由表
+$ redis-cli -p 7001 CLUSTER SLOTS
+1) 1) (integer) 0
+   2) (integer) 5460
+   3) 1) "127.0.0.1"
+      2) (integer) 7001
+   4) 1) "127.0.0.1"          # 从节点信息
+      2) (integer) 7005
+...
+
+# Redis 7 推荐用信息更丰富的 CLUSTER SHARDS
+$ redis-cli -p 7001 CLUSTER SHARDS
+```
+
+**MOVED 与 ASK 的区别（面试高频）**：
+
+| | MOVED | ASK |
+|---|---|---|
+| 含义 | 槽**已经**归属别的节点 | 槽**正在迁移中**，这个 key 已经过去了 |
+| 持续性 | **永久** | **临时**，仅针对这一次请求 |
+| 客户端动作 | **更新本地路由表** | **不更新**路由表，只这一次跳过去 |
+| 前置命令 | 无 | 必须先发 `ASKING` |
+
+```bash
+# 迁移中访问某个 key 的完整流程：
+#   1. 客户端 → 源节点：GET foo
+#   2. 源节点检查：槽在迁移中，且 foo 已经不在本地了
+#   3. 源节点 → 客户端：ASK 12182 127.0.0.1:7004
+#   4. 客户端 → 目标节点：ASKING
+#   5. 客户端 → 目标节点：GET foo
+#   6. 目标节点返回结果
+#
+# 为什么需要 ASKING？
+#   目标节点还没正式拥有这个槽，直接请求会被它用 MOVED 打回去，
+#   造成客户端在两个节点之间无限跳转。ASKING 相当于说
+#   "我知道你还没接管，但源节点让我来的，这一次请你破例处理"
+```
+
+**2. CLUSTER KEYSLOT 验证 hash tag**
+
+```bash
+$ redis-cli -p 7001 CLUSTER KEYSLOT "user:1001"
+(integer) 5474
+
+$ redis-cli -p 7001 CLUSTER KEYSLOT "{user:1001}:name"
+(integer) 5474                    # 与上面【相同】
+
+$ redis-cli -p 7001 CLUSTER KEYSLOT "{user:1001}:cart"
+(integer) 5474                    # 也【相同】
+
+# 对照：不加 hash tag 的话会散开
+$ redis-cli -p 7001 CLUSTER KEYSLOT "user:1001:name"
+(integer) 14039                   # 完全不同的槽
+$ redis-cli -p 7001 CLUSTER KEYSLOT "user:1001:cart"
+(integer) 2887                    # 又是另一个槽
+```
+
+（具体槽号以你本机执行结果为准，关键在于**前三者相同、后两者各不相同**。）
+
+**回答三个问题**：
+
+- **`user:1001` 与 `{user:1001}:name`：槽相同。** 前者不含花括号，对整个 key 算 CRC16；后者含花括号，只对花括号内的 `user:1001` 算 CRC16。两次计算的输入字符串完全一致，结果自然相同。
+- **`{user:1001}:cart`：槽同样相同。** 理由一样——花括号内的内容还是 `user:1001`。
+
+**槽计算规则**：
+
+```bash
+# slot = CRC16(hash_key) mod 16384
+#
+# hash_key 的确定规则（按顺序判断）：
+#   1. 找第一个 '{'
+#   2. 从它之后找第一个 '}'
+#   3. 如果两者都存在，且【中间内容非空】
+#        → hash_key = 花括号之间的内容
+#      否则
+#        → hash_key = 整个 key
+```
+
+**边界情况**：
+
+```bash
+$ redis-cli -p 7001 CLUSTER KEYSLOT "{}user:1001"
+# 花括号内为空 → 规则不生效，对整个字符串 "{}user:1001" 计算
+
+$ redis-cli -p 7001 CLUSTER KEYSLOT "{user}:{1001}"
+# 只认【第一对】有效花括号 → hash_key = "user"，第二对被当普通字符
+
+$ redis-cli -p 7001 CLUSTER KEYSLOT "{user:1001"
+# 只有左括号没有右括号 → 规则不生效，对整个字符串计算
+
+$ redis-cli -p 7001 CLUSTER KEYSLOT "a{b}c{d}e"
+# hash_key = "b"
+```
+
+**hash tag 的用途：让相关的 key 落在同一节点，从而支持多 key 操作。**
+
+```bash
+# ---- 不加 hash tag：多 key 命令报错 ----
+127.0.0.1:7001> MGET user:1001:name user:1001:age
+(error) CROSSSLOT Keys in request don't hash to the same slot
+
+127.0.0.1:7001> SINTERSTORE dst user:1001:tags user:1002:tags
+(error) CROSSSLOT Keys in request don't hash to the same slot
+
+# ---- 加了 hash tag：正常工作 ----
+127.0.0.1:7001> MSET {user:1001}:name "Tom" {user:1001}:age "28"
+-> Redirected to slot [5474] located at 127.0.0.1:7002
+OK
+127.0.0.1:7002> MGET {user:1001}:name {user:1001}:age
+1) "Tom"
+2) "28"
+
+# ---- 事务和 Lua 同样受此约束 ----
+127.0.0.1:7002> EVAL "return redis.call('GET', KEYS[1]) .. redis.call('GET', KEYS[2])" 2 {user:1001}:name {user:1001}:age
+"Tom28"
+```
+
+**必须警惕数据倾斜（hash tag 的最大陷阱）**：
+
+```bash
+# 灾难性用法：把所有 key 塞进同一个 tag
+# {global}:user:1  {global}:user:2  ...  {global}:user:10000000
+#
+# 后果：
+#   - 全部落在同一个槽 → 同一个节点
+#   - 该节点内存爆掉，其他节点闲置
+#   - 分片完全失效，集群退化成单机
+#   - 这个槽无法拆分，扩容也救不了
+```
+
+**正确用法：tag 的粒度要小、数量要多。**
+
+```bash
+# ✓ 按用户 ID：几百万个不同的 tag，天然分散
+{user:1001}:profile   {user:1001}:cart   {user:1001}:orders
+
+# ✓ 按订单 ID
+{order:20260802001}:items   {order:20260802001}:payment
+
+# ✗ 按业务模块：只有几个 tag，严重倾斜
+{cart}:u1001   {cart}:u1002   ...   # 全部挤在一个槽
+
+# ✗ 按城市：城市数量有限，且大城市数据量远超小城市
+{beijing}:shop:1   {beijing}:shop:2  ...
+```
+
+**检查倾斜情况**：
+
+```bash
+# 查看各节点的 key 数量分布
+$ redis-cli --cluster call 127.0.0.1:7001 DBSIZE
+
+# 找出最大的槽（Redis 7 的 --cluster-only-masters 更方便）
+$ redis-cli -p 7001 --cluster check 127.0.0.1:7001
+
+# 查看某个槽有多少 key
+$ redis-cli -p 7002 CLUSTER COUNTKEYSINSLOT 5474
+(integer) 3
+
+# 列出某个槽里的 key
+$ redis-cli -p 7002 CLUSTER GETKEYSINSLOT 5474 10
+1) "user:1001"
+2) "{user:1001}:name"
+3) "{user:1001}:age"
+```
+
+**3. 扩容演练：加入第 4 个主节点并迁移 4096 个槽**
+
+```bash
+# ---- 准备新节点 ----
+mkdir -p /tmp/redis-cluster/7007
+cat > /tmp/redis-cluster/7007/redis.conf <<EOF
+port 7007
+cluster-enabled yes
+cluster-config-file nodes-7007.conf
+cluster-node-timeout 5000
+appendonly yes
+dir /tmp/redis-cluster/7007
+daemonize yes
+EOF
+redis-server /tmp/redis-cluster/7007/redis.conf
+
+# ---- 加入集群（作为主节点）----
+$ redis-cli --cluster add-node 127.0.0.1:7007 127.0.0.1:7001
+#                              ^^^^^^^^^^^^^^ 新节点  ^^^^^^^^^^^^^^ 集群中任一已有节点
+>>> Adding node 127.0.0.1:7007 to cluster 127.0.0.1:7001
+[OK] New node added correctly.
+
+# ---- 确认：已加入但【还没有任何槽】 ----
+$ redis-cli -p 7001 CLUSTER NODES | grep 7007
+f7g8... 127.0.0.1:7007@17007 master - 0 ... connected
+#                                                    ^ 后面没有槽范围
+
+$ redis-cli -p 7001 CLUSTER INFO | grep cluster_size
+cluster_size:3                    # 仍然是 3，因为新节点没槽
+```
+
+**在另一个终端启动持续读写，用于验证业务无感**：
+
+```bash
+# 持续写入并校验（迁移期间一直跑着）
+while true; do
+  n=$((RANDOM % 100000))
+  redis-cli -c -p 7001 SET "mig:test:$n" "value-$n" > /dev/null
+  v=$(redis-cli -c -p 7001 GET "mig:test:$n")
+  if [ "$v" != "value-$n" ]; then
+    echo "$(date +%T) 数据不一致! key=mig:test:$n got=$v"
+  fi
+  sleep 0.01
+done
+
+# 或者用 redis-benchmark 施加持续压力
+redis-benchmark --cluster -h 127.0.0.1 -p 7001 -t set,get -n 1000000 -c 50
+```
+
+**执行 reshard 迁移 4096 个槽**：
+
+```bash
+# ---- 交互式 ----
+$ redis-cli --cluster reshard 127.0.0.1:7001
+How many slots do you want to move (from 1 to 16384)? 4096
+What is the receiving node ID? f7g8...            # 新节点 7007 的 ID
+Please enter all the source node IDs.
+  Type 'all' to use all the nodes as source nodes.
+Source node #1: all                                # 从所有现有主节点均摊
+Do you want to proceed with the proposed reshard plan (yes/no)? yes
+
+# ---- 非交互式（适合写进自动化脚本）----
+$ redis-cli --cluster reshard 127.0.0.1:7001 \
+  --cluster-from a1b2...,c3d4...,e5f6... \
+  --cluster-to f7g8... \
+  --cluster-slots 4096 \
+  --cluster-yes \
+  --cluster-pipeline 100        # 每批迁移的 key 数，默认 10，调大加速
+```
+
+**迁移过程中的输出**：
+
+```bash
+Moving slot 0 from 127.0.0.1:7001 to 127.0.0.1:7007: ..
+Moving slot 1 from 127.0.0.1:7001 to 127.0.0.1:7007: .
+Moving slot 2 from 127.0.0.1:7001 to 127.0.0.1:7007:
+...
+Moving slot 12288 from 127.0.0.1:7003 to 127.0.0.1:7007: ...
+```
+
+**验证结果**：
+
+```bash
+$ redis-cli -p 7001 CLUSTER NODES | grep master
+a1b2... 127.0.0.1:7001 master - ... connected 1365-5460          # 原 0-5460，少了 1365 个
+c3d4... 127.0.0.1:7002 master - ... connected 6827-10922
+e5f6... 127.0.0.1:7003 master - ... connected 12288-16383
+f7g8... 127.0.0.1:7007 master - ... connected 0-1364 5461-6826 10923-12287
+#                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 共 4096 个槽
+
+$ redis-cli -p 7001 CLUSTER INFO | grep -E "cluster_size|cluster_state"
+cluster_state:ok
+cluster_size:4                    # 变成 4 了
+
+# 完整性检查
+$ redis-cli --cluster check 127.0.0.1:7001
+[OK] All nodes agree about slots configuration.
+[OK] All 16384 slots covered.
+```
+
+**为什么业务无感？** 上面那个 while 循环全程不会打印任何"数据不一致"。原因是**每个槽的迁移都是原子切换**的，Redis 用一套精细的协议保证了迁移期间的正确性：
+
+```bash
+# 单个槽的迁移流程：
+#   1. 目标节点：CLUSTER SETSLOT <slot> IMPORTING <源节点ID>
+#   2. 源节点：  CLUSTER SETSLOT <slot> MIGRATING <目标节点ID>
+#   3. 循环：源节点 CLUSTER GETKEYSINSLOT 取一批 key
+#            → MIGRATE 命令逐批搬到目标节点（原子的"删源+写目标"）
+#   4. 搬完后，两个节点都执行：CLUSTER SETSLOT <slot> NODE <目标节点ID>
+#   5. 通过 gossip 协议扩散给全集群
+#
+# 迁移期间访问这个槽的 key：
+#   - key 还在源节点 → 源节点【正常处理】，客户端毫无感知
+#   - key 已搬走     → 源节点返回 ASK，客户端跳到目标节点，多一个 RTT
+#   - 新写入的 key   → 源节点仍然接收（它还是槽的所有者），后续会被搬过去
+```
+
+**关键点：任何时刻这个槽都有明确的负责人，不存在"两边都不管"或"数据丢失"的窗口。** 客户端最坏只是多一次网络往返。
+
+**扩容的运维注意事项**：
+
+```bash
+# 1. 给新主节点配从库，否则它是单点
+$ redis-cli --cluster add-node 127.0.0.1:7008 127.0.0.1:7001 \
+    --cluster-slave --cluster-master-id f7g8...
+
+# 2. 迁移速度与 key 数量、value 大小相关，避开业务高峰
+#    大 key 迁移时 MIGRATE 会【阻塞双方主线程】—— 这是最大的风险点
+#    迁移前务必先用 --bigkeys 排查并拆分大 key
+$ redis-cli -p 7001 --bigkeys
+
+# 3. 迁移超时（大 key 可能需要调大）
+$ redis-cli --cluster reshard ... --cluster-timeout 60000
+
+# 4. 中断后可以恢复
+$ redis-cli --cluster fix 127.0.0.1:7001      # 修复处于中间态的槽
+
+# 5. 用 rebalance 自动均衡（比手动算槽数方便）
+$ redis-cli --cluster rebalance 127.0.0.1:7001 --cluster-use-empty-masters
+```
+
+**缩容的顺序正好相反（容易搞反导致数据丢失）**：
+
+```bash
+# 1. 先把槽全部迁走
+$ redis-cli --cluster reshard 127.0.0.1:7001 \
+    --cluster-from <要删除的节点ID> --cluster-to <接收节点ID> \
+    --cluster-slots <该节点的槽数> --cluster-yes
+
+# 2. 确认该节点槽数为 0
+$ redis-cli -p 7001 CLUSTER NODES | grep <要删除的节点ID>
+
+# 3. 再删除节点（先删从库，再删主库）
+$ redis-cli --cluster del-node 127.0.0.1:7001 <节点ID>
+
+# ⚠️ 顺序反了会怎样：直接 del-node 一个还持有槽的节点，
+#    这些槽会变成【无人负责】，cluster_state 变成 fail，整个集群拒绝服务
+```
+
+**最后提醒一个 Cluster 的常见误区**：Cluster 模式下**只能使用 0 号数据库**，`SELECT 1` 会直接报错。如果你的代码里用了多 DB 做业务隔离，迁移到 Cluster 前必须先改造成用 key 前缀区分。
+</Answer>
 </Callout>

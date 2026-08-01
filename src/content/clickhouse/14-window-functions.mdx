@@ -566,6 +566,118 @@ ORDER BY overall_conv DESC;
 3. 分别用 `strict_order` 和默认模式跑同一个漏斗，解释两者数字差异的原因。
 4. 用 `groupBitmapState` 预计算每日活跃用户 bitmap，存进一张 AggregatingMergeTree 表，然后基于它算出完整的 7 日留存矩阵。对比直接从明细算的耗时。
 5. 用 `sequenceMatch('(?1)(?t<=300)(?2)')` 找出「浏览后 5 分钟内购买」的快速转化用户，统计他们占全部购买用户的比例。
+
+<Answer>
+**参考答案：**
+
+1. ROWS vs RANGE 的差异：
+
+```sql
+SELECT
+    day,
+    pv,
+    round(avg(pv) OVER (ORDER BY day ROWS  BETWEEN 6 PRECEDING AND CURRENT ROW), 1) AS ma7_rows,
+    round(avg(pv) OVER (ORDER BY day RANGE BETWEEN 6 PRECEDING AND CURRENT ROW), 1) AS ma7_range
+FROM (SELECT toDate(event_time) AS day, count() AS pv FROM events GROUP BY day)
+ORDER BY day;
+```
+
+- `ROWS`：固定取「前 6 行 + 当前行」，**不管行与行之间隔了几天**。若某天缺数据，窗口会包含更早的日期，滑动平均被「拉长」。
+- `RANGE`：按排序列的值取「日期在 `[当前日-6, 当前日]` 内的所有行」，**严格按日期跨度**。缺数据时窗口里的行更少（平均基于的天数更少），但语义更符合「7 个自然日」。
+
+做时间序列平滑时，`RANGE` 更贴合「近 7 天」的业务语义；但要小心 `RANGE` 在排序值存在重复时可能包含意外多行。
+
+2. 时间窗口对漏斗的影响：
+
+```sql
+SELECT
+    countIf(level >= 1) AS viewed,
+    countIf(level >= 2) AS clicked,
+    countIf(level >= 3) AS purchased
+FROM (
+    SELECT user_id,
+           windowFunnel(3600)(event_time,
+               event_type = 'view', event_type = 'click', event_type = 'purchase') AS level
+    FROM events
+    WHERE event_time >= '2024-06-01' AND event_time < '2024-06-08'
+    GROUP BY user_id
+);
+-- 把 3600 改成 60 再跑一遍
+```
+
+窗口从 1 小时缩到 60 秒后，完成 2、3 步的人数会明显下降——因为「从第一步开始算，1 分钟内走完 view→click→purchase」的要求苛刻得多。这解释了：时间窗口必须匹配业务真实转化节奏（比如电商转化通常跨分钟级，用 60 秒就会严重低估）。
+
+3. strict_order vs 默认模式：
+
+```sql
+-- 默认：view 之后任意时刻、中间可以有其他事件，再 click、purchase
+windowFunnel(3600)(event_time, event_type='view', event_type='click', event_type='purchase')
+
+-- strict_order：view 后必须**紧接着**就是 click、purchase，中间不能插入任何其他事件
+windowFunnel(3600, 'strict_order')(event_time, event_type='view', event_type='click', event_type='purchase')
+```
+
+差异原因：默认模式允许「view → 浏览其它页面 → click → purchase」，而 `strict_order` 要求事件严格连续。因此 `strict_order` 的各级人数会小于等于默认模式，尤其步骤多、事件类型杂的时候差距更大。
+
+4. 基于 bitmap 的 7 日留存矩阵：
+
+```sql
+-- 1) 预计算每日活跃用户 bitmap
+CREATE TABLE retention_bitmap
+(
+    day    Date,
+    active AggregateFunction(groupBitmap, UInt64)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY day;
+
+INSERT INTO retention_bitmap
+SELECT toDate(event_time) AS day, groupBitmapState(toUInt32(user_id)) AS active
+FROM events
+WHERE event_time >= '2024-06-01' AND event_time < '2024-06-08'
+GROUP BY day;
+
+-- 2) 自连接算留存矩阵（D0 为基准日）
+WITH daily AS (
+    SELECT day, bitmapMerge(active) AS users FROM retention_bitmap
+)
+SELECT
+    a.day                            AS cohort_day,
+    dateDiff('day', a.day, b.day)    AS day_offset,
+    bitmapCardinality(a.users)       AS cohort_size,
+    bitmapAndCardinality(a.users, b.users) AS retained,
+    round(bitmapAndCardinality(a.users, b.users) / bitmapCardinality(a.users) * 100, 2) AS pct
+FROM daily AS a
+CROSS JOIN daily AS b
+WHERE b.day >= a.day
+ORDER BY cohort_day, day_offset;
+```
+
+对比直接从明细 `WHERE toDate(event_time) = ...` 逐日算：位图交集是纯内存位运算，毫秒级；明细每次都要重新扫描。生产上把日级 bitmap 存进 AggregatingMergeTree 后，任意日期组合的留存都是秒回。
+
+5. 快速转化用户占比：
+
+```sql
+WITH all_buyers AS (
+    SELECT DISTINCT user_id FROM events WHERE event_type = 'purchase'
+),
+fast_buyers AS (
+    SELECT user_id
+    FROM events
+    GROUP BY user_id
+    HAVING sequenceMatch('(?1)(?t<=300)(?2)')(
+        event_time, event_type = 'view', event_type = 'purchase'
+    ) = 1
+)
+SELECT
+    (SELECT count() FROM all_buyers)          AS total_buyers,
+    (SELECT count() FROM fast_buyers)         AS fast_buyers,
+    round((SELECT count() FROM fast_buyers) / (SELECT count() FROM all_buyers) * 100, 2) AS fast_pct
+```
+
+`sequenceMatch` 判断该用户是否存在「view 后 300 秒内 purchase」的序列；两个 CTE 取差集就能算出「买过但超过 5 分钟」的慢转化用户。若 `fast_pct` 很低，说明大多数购买决策耗时较长，做「限时营销」时要慎重。
+</Answer>
 </Callout>
 
 ## 小结

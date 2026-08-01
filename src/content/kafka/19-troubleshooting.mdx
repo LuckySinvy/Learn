@@ -168,4 +168,57 @@ bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 | grep "id:"
 1. 制造一次积压（停消费者灌 10 万条），练习用 consumer-groups 命令估算追平所需时间，再扩容消费者验证估算。
 2. 在消费逻辑里对特定消息抛异常且不捕获，复现"毒消息卡住"，然后实现 try-catch + 死信 topic 的修复版。
 3. 在测试集群把某 topic retention.ms 调到 60 秒，验证数据按时被清理，理解"积压超过保留期=丢数据"的时间线。
+
+<Answer>
+**参考答案：**
+
+**第 1 题：积压与追平时间估算**
+
+停掉消费者，用 perf-test 灌 10 万条到 `lag-topic`：
+
+```bash
+# 制造积压
+kafka-producer-perf-test --topic lag-topic --num-records 100000 --record-size 1024 \
+  --throughput -1 --producer-props bootstrap.servers=localhost:9092
+# 查看 LAG
+kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group lag-grp
+```
+
+假设看到 `LAG=100000`，再单开一个消费者测出它的处理速率（如 console consumer 跑 10 秒消费了 2 万条 → ~2000 条/秒）。估算追平时间 ≈ `100000 / 2000 = 50 秒`。然后**扩容消费者**（增加实例到分区数上限以内，或提高单实例并发度）重新跑，实际追平时间应随消费力提升而缩短，验证估算逻辑。
+
+注意：若积压分布不均（某分区 LAG 远高于其他），说明热 key 或某消费者卡死，单纯扩容无效，要先解决倾斜。
+
+**第 2 题：毒消息卡住 → 死信兜底**
+
+复现：消费逻辑对特定 key 的消息抛 `RuntimeException` 且不捕获 → 该消息反复拉取、反复失败、offset 永不提交 → 该分区"卡死"，后续消息全堵住（LAG 不降）。
+
+修复版（try-catch + 死信 topic）：
+
+```java
+try {
+  process(record);
+  consumer.commitSync();           // 成功才提交
+} catch (PoisonException e) {
+  // 发到死信 topic，带上原始 headers/key
+  dlqProducer.send(new ProducerRecord<>("lag-topic-dlq", record.key(),
+      record.value(), record.headers()));
+  consumer.commitSync();           // 即使主流程失败也提交，避免卡住
+}
+```
+
+这样毒消息被"摘出来"进 DLQ，主流程继续推进；DLQ 消息后续人工/定时修复后回灌。关键是**失败也要提交 offset**，否则永远卡在同一消息。
+
+**第 3 题：retention 与"积压=丢数据"时间线**
+
+```bash
+kafka-configs --bootstrap-server localhost:9092 --alter \
+  --add-config retention.ms=60000 --topic lag-topic
+```
+
+写入一批带时间戳的消息后等待 60 秒以上，再用 consumer 从最早读（`--from-beginning`），会发现 60 秒前的消息已被清理（读不到），60 秒内的还在。由此理解关键时间线：
+
+> 若消费组 LAG 持续不降，且积压的消息年龄超过 `retention.ms`，那么这些消息会被 Kafka 按保留期**物理删除**——此时"追平"也无意义，因为数据已不在，等于**静默丢数据**。
+
+所以积压告警要早于 retention 触发；遇到大积压，应急手段之一是临时调大 `retention.ms` 给消费方争取时间，而非让数据自己过期消失。
+</Answer>
 </Callout>
