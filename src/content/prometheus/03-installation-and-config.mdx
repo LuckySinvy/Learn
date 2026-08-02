@@ -1,0 +1,906 @@
+---
+title: 安装与基础配置
+order: 3
+description: 二进制与 Docker 安装、prometheus.yml 结构、启动与常用参数
+---
+
+# 安装与基础配置
+
+理论讲完了，这一章动手把 Prometheus 跑起来。好消息是：Prometheus 是一个**静态编译的单二进制文件**，没有任何运行时依赖——不需要 JVM、不需要 Python、不需要装数据库。下载解压就能跑。
+
+<Callout type="info" title="本章目标">
+跑起一个 Prometheus，让它抓取自己和一台主机的指标，然后在 Web UI 里看到第一张图。全程不超过 10 分钟。
+</Callout>
+
+## 1. 方式一：二进制安装
+
+### 1.1 下载与解压
+
+从 [官方 Release 页面](https://prometheus.io/download/) 获取对应平台的压缩包：
+
+```bash
+# 以 Linux amd64 为例（版本号请替换为最新稳定版）
+VERSION=2.53.0
+wget https://github.com/prometheus/prometheus/releases/download/v${VERSION}/prometheus-${VERSION}.linux-amd64.tar.gz
+
+tar xzf prometheus-${VERSION}.linux-amd64.tar.gz
+cd prometheus-${VERSION}.linux-amd64
+ls -l
+```
+
+解压后的目录内容很干净：
+
+```text
+prometheus            # 主程序（Server）
+promtool              # 配置校验 / 规则测试 / TSDB 工具
+prometheus.yml        # 默认配置文件
+consoles/             # 老式内置控制台模板（基本用不到）
+console_libraries/    # 同上
+LICENSE  NOTICE
+```
+
+### 1.2 直接启动
+
+```bash
+./prometheus --config.file=prometheus.yml
+```
+
+看到类似这行日志就说明起来了：
+
+```text
+level=info msg="Server is ready to receive web requests."
+```
+
+浏览器打开 `http://localhost:9090` 即可看到 Web UI。
+
+### 1.3 生产环境：装成 systemd 服务
+
+前台运行只适合试玩。生产环境要用专用用户 + systemd 托管：
+
+```bash
+# 创建无登录权限的专用用户
+sudo useradd --no-create-home --shell /sbin/nologin prometheus
+
+# 放置二进制
+sudo cp prometheus promtool /usr/local/bin/
+
+# 准备配置与数据目录
+sudo mkdir -p /etc/prometheus /var/lib/prometheus
+sudo cp prometheus.yml /etc/prometheus/
+sudo chown -R prometheus:prometheus /etc/prometheus /var/lib/prometheus
+```
+
+写入 `/etc/systemd/system/prometheus.service`：
+
+```text
+[Unit]
+Description=Prometheus Monitoring System
+Documentation=https://prometheus.io/docs/
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+Restart=on-failure
+RestartSec=5s
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --web.listen-address=0.0.0.0:9090 \
+  --web.enable-lifecycle
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now prometheus
+sudo systemctl status prometheus
+journalctl -u prometheus -f     # 跟踪日志
+```
+
+<Callout type="warn" title="数据目录权限是最常见的启动失败原因">
+如果日志里出现 `opening storage failed: ... permission denied`，多半是 `/var/lib/prometheus` 的属主不对。Prometheus 以 `prometheus` 用户运行，必须对数据目录有读写权限。用 `sudo chown -R prometheus:prometheus /var/lib/prometheus` 修复。
+</Callout>
+
+## 2. 方式二：Docker 启动
+
+本地试玩或容器化环境，Docker 更方便：
+
+```bash
+# 最简：用镜像自带的默认配置，只抓自己
+docker run -d \
+  --name prometheus \
+  -p 9090:9090 \
+  prom/prometheus:v2.53.0
+```
+
+访问 `http://localhost:9090` 就有了。但默认配置只抓 Prometheus 自己，实际使用要挂载自己的配置：
+
+```bash
+# 挂载配置文件 + 持久化数据卷（推荐写法）
+docker run -d \
+  --name prometheus \
+  -p 9090:9090 \
+  -v /opt/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+  -v /opt/prometheus/rules:/etc/prometheus/rules:ro \
+  -v prometheus-data:/prometheus \
+  prom/prometheus:v2.53.0 \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --web.enable-lifecycle
+```
+
+几个要点：
+
+- **端口 9090**：`-p 9090:9090` 把容器内的 9090 映射到宿主机。
+- **配置只读挂载**：加 `:ro` 防止容器意外改写宿主机文件。
+- **数据必须用卷**：`-v prometheus-data:/prometheus` 使用命名卷。**不挂载的话容器一删数据就没了。**
+- **镜像里默认数据目录是 `/prometheus`**，不是 `/var/lib/prometheus`，别搞混。
+- **覆盖启动参数**：镜像有默认 `ENTRYPOINT`，在镜像名后面写的参数会追加给 `prometheus` 命令。注意一旦自己写了参数，就要把需要的参数**写全**。
+
+<Callout type="warn" title="容器里访问宿主机服务">
+如果 Prometheus 跑在容器里，要抓宿主机上的 node_exporter，配置里**不能写 `localhost`**——那指向的是容器自己。
+
+- Docker Desktop（Mac/Windows）：用 `host.docker.internal:9100`
+- Linux：用宿主机的实际 IP，或启动时加 `--add-host=host.docker.internal:host-gateway`
+- 更好的做法：把 Prometheus 和各 Exporter 放进同一个 Docker 网络，直接用容器名互访
+</Callout>
+
+### 2.1 用 docker compose 一次拉起
+
+实际使用中通常搭配 node_exporter 一起跑：
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - '--path.rootfs=/host'
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+```
+
+```bash
+docker compose up -d
+docker compose logs -f prometheus
+```
+
+因为在同一个 compose 网络里，配置文件中可以直接用服务名 `node-exporter:9100` 作为目标。
+
+## 3. prometheus.yml 的顶层结构
+
+配置文件是 YAML，顶层只有几个关键块：
+
+```yaml
+global:            # 全局默认值，所有 job 继承
+scrape_configs:    # 抓谁、怎么抓（最核心）
+rule_files:        # 从哪些文件加载记录规则与告警规则
+alerting:          # 告警发给哪些 Alertmanager
+remote_write:      # （可选）把数据同时写到远端长期存储
+remote_read:       # （可选）从远端读取历史数据
+storage:           # （可选）存储相关的少量选项
+```
+
+一份包含全部常用块的完整示例：
+
+```yaml
+# ============ 全局默认 ============
+global:
+  scrape_interval: 15s          # 默认多久抓一次
+  scrape_timeout: 10s           # 单次抓取超时（必须 < scrape_interval）
+  evaluation_interval: 15s      # 多久求值一次规则
+  external_labels:              # 本实例的身份标识
+    cluster: prod-bj
+    replica: A
+
+# ============ 规则文件 ============
+rule_files:
+  - "rules/*.yml"               # 支持 glob 通配
+
+# ============ Alertmanager ============
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager:9093'
+
+# ============ 抓取目标 ============
+scrape_configs:
+  # 1) 自监控：Prometheus 抓自己
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # 2) 主机监控
+  - job_name: 'node'
+    scrape_interval: 30s        # 覆盖 global 的 15s
+    static_configs:
+      - targets:
+          - '10.0.0.11:9100'
+          - '10.0.0.12:9100'
+        labels:
+          env: prod
+          region: bj
+
+  # 3) 应用：自定义指标路径与协议
+  - job_name: 'order-service'
+    metrics_path: '/actuator/prometheus'   # Spring Boot 的默认路径
+    scheme: http
+    static_configs:
+      - targets: ['10.0.1.5:8080', '10.0.1.6:8080']
+
+  # 4) 带认证的目标
+  - job_name: 'secured-app'
+    basic_auth:
+      username: 'prom'
+      password_file: '/etc/prometheus/secrets/app_password'
+    static_configs:
+      - targets: ['10.0.2.7:8443']
+    scheme: https
+    tls_config:
+      insecure_skip_verify: false
+```
+
+### 3.1 global 三个关键项
+
+**`scrape_interval`（默认 1m，通常设 15s）**
+
+抓取频率。这是**成本与精度的直接权衡**：
+
+```text
+15s → 一天 5760 个样本/序列 —— 社区最常用，能捕捉到分钟级波动
+30s → 一天 2880 个样本/序列 —— 序列很多时的折中
+60s → 一天 1440 个样本/序列 —— 省资源，但会抹平短暂尖峰
+```
+
+<Callout type="warn" title="别为了「更精确」把间隔调到 5s">
+抓取间隔减半，样本量、内存和磁盘全部翻倍，抓取本身的 CPU 开销也翻倍。而绝大多数监控场景（发现问题 + 定位趋势）15s 完全够用。真正需要秒级精度的场景（如交易系统的毛刺分析），应该用专门的高频采样方案，而不是全局调低间隔。
+
+另外记住：`rate()` 的时间窗口至少要是抓取间隔的 **4 倍**才稳定。15s 抓取对应 `[1m]` 是下限，实践中常用 `[5m]`。
+</Callout>
+
+**`evaluation_interval`（默认 1m，通常设 15s）**
+
+规则求值频率。它决定了告警的**最快发现速度**——如果设为 1m，那么故障发生后最坏要 1 分钟才被规则「看见」。通常设成和 `scrape_interval` 相同即可。
+
+**`external_labels`**
+
+给**这个 Prometheus 实例本身**打的标签，只在数据「离开」本实例时才附加：推送给 Alertmanager 时、`remote_write` 到远端时、被 Federation 抓取时。本地查询看不到它。
+
+```yaml
+global:
+  external_labels:
+    cluster: prod-bj      # 区分是哪个集群/机房发来的告警
+    replica: A            # 区分 HA 副本，供 Thanos/Alertmanager 去重
+```
+
+<Callout type="info" title="external_labels 为什么重要">
+设想两个机房各跑一套 Prometheus，都监控着名为 `api` 的服务。如果不加 `cluster` 标签，Alertmanager 收到两条 `InstanceDown` 告警时无法分辨来自哪个机房。加上 `external_labels` 后，告警自带 `cluster="prod-bj"`，路由和排查都清晰了。
+
+同理，HA 双副本要靠 `replica` 标签让 Thanos 识别并去重，但**告警去重恰恰相反**——Alertmanager 需要两个副本的告警标签完全一致才能去重，所以推给 Alertmanager 时通常要把 `replica` 标签剥掉（由 Thanos Ruler 或 relabel 处理）。
+</Callout>
+
+## 4. 常用命令行参数
+
+配置文件管「监控什么」，命令行参数管「进程本身怎么跑」。这是刻意的划分：命令行参数**不能热加载**，改了必须重启。
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--config.file` | `prometheus.yml` | 配置文件路径 |
+| `--storage.tsdb.path` | `data/` | 数据存储目录 |
+| `--storage.tsdb.retention.time` | `15d` | 数据保留时长 |
+| `--storage.tsdb.retention.size` | 无 | 数据大小上限，如 `50GB`（与时间条件先到先删） |
+| `--web.listen-address` | `0.0.0.0:9090` | 监听地址与端口 |
+| `--web.external-url` | 无 | 对外访问 URL，反向代理后必须设置 |
+| `--web.route-prefix` | 同上 | 子路径前缀，配合反代 |
+| `--web.enable-lifecycle` | `false` | 允许通过 HTTP 热加载配置和关闭进程 |
+| `--web.enable-admin-api` | `false` | 允许删除数据等管理 API（危险，慎开） |
+| `--log.level` | `info` | 日志级别：`debug`/`info`/`warn`/`error` |
+| `--query.max-samples` | `50000000` | 单次查询最多加载的样本数，防止 OOM |
+| `--query.timeout` | `2m` | 查询超时 |
+
+一个典型的生产启动命令：
+
+```bash
+/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --storage.tsdb.retention.size=100GB \
+  --web.listen-address=0.0.0.0:9090 \
+  --web.external-url=https://prom.example.com \
+  --web.enable-lifecycle \
+  --log.level=info
+```
+
+### 4.1 只绑定本地
+
+如果 Prometheus 前面有 Nginx 反向代理（做认证、TLS），应该让它只监听回环地址，避免 9090 直接暴露到公网：
+
+```bash
+--web.listen-address=127.0.0.1:9090
+```
+
+<Callout type="warn" title="Prometheus 自身没有认证">
+原生 Prometheus **默认完全没有用户名密码**，任何能访问 9090 的人都能查询你的全部监控数据。生产环境必须：① 用 `--web.listen-address` 绑定内网/回环；② 前置 Nginx 或 OAuth2 Proxy 做认证；③ 或使用 2.24+ 支持的 `--web.config.file` 配置 basic auth 和 TLS。
+
+尤其注意：**绝对不要开着 `--web.enable-admin-api` 还暴露在公网**——那个 API 可以删库。
+</Callout>
+
+### 4.2 配置校验与热加载
+
+改配置前先校验，能省下大量「改完重启发现起不来」的时间：
+
+```bash
+# 校验主配置（会顺带校验 rule_files 里引用的文件）
+promtool check config /etc/prometheus/prometheus.yml
+
+# 单独校验规则文件
+promtool check rules /etc/prometheus/rules/*.yml
+
+# 检查某个目标的 /metrics 格式是否合法
+curl -s http://localhost:9100/metrics | promtool check metrics
+```
+
+校验通过后热加载，无需重启进程、不中断抓取：
+
+```bash
+# 方式一：HTTP（需启动时带 --web.enable-lifecycle）
+curl -X POST http://localhost:9090/-/reload
+
+# 方式二：发信号（systemd 部署时更常用）
+sudo systemctl reload prometheus
+# 或
+kill -HUP $(pidof prometheus)
+```
+
+<Callout type="tip" title="把校验做成提交前的钩子">
+`promtool check config` 是纯静态校验，几毫秒就能跑完。把它加进 CI 或 git pre-commit 钩子，可以拦下 99% 的低级错误（缩进错、字段拼错、正则非法）。监控配置本身也应该纳入版本管理。
+</Callout>
+
+## 5. 启动后的第一轮验证
+
+### 5.1 确认自身指标
+
+Prometheus 自己也暴露 `/metrics`，这是最快的连通性检查：
+
+```bash
+curl -s http://localhost:9090/metrics | head -20
+
+# 看几个关键的自监控指标
+curl -s http://localhost:9090/metrics | grep -E '^prometheus_(tsdb_head_series|target|rule_group)'
+```
+
+几个值得记住的自监控指标：
+
+```promql
+prometheus_tsdb_head_series              # 当前内存中的活跃序列数（基数监控的核心）
+prometheus_tsdb_head_samples_appended_total  # 累计写入的样本数
+prometheus_target_interval_length_seconds    # 实际抓取间隔（偏离配置值说明过载）
+prometheus_rule_group_last_duration_seconds  # 规则组求值耗时
+prometheus_notifications_dropped_total       # 发给 Alertmanager 失败的告警数
+```
+
+### 5.2 Web UI：Status → Targets
+
+这是**排查抓取问题的第一站**。浏览器打开 `http://localhost:9090/targets`，你会看到每个目标的：
+
+| 列 | 含义 |
+|---|---|
+| **Endpoint** | 实际抓取的完整 URL |
+| **State** | `UP`（绿）/ `DOWN`（红）/ `UNKNOWN`（还没抓过） |
+| **Labels** | 这个目标最终生效的标签（relabel 之后的结果） |
+| **Last Scrape** | 距上次抓取过了多久 |
+| **Scrape Duration** | 上次抓取耗时 |
+| **Error** | DOWN 时的具体错误信息 |
+
+常见错误信息与含义：
+
+```text
+connection refused              → 目标端口没监听（服务没起 / 端口写错）
+context deadline exceeded       → 抓取超时（目标太慢 或 scrape_timeout 太短）
+no such host                    → DNS 解析失败（主机名拼错 / 容器内解析不到）
+server returned HTTP status 404 → metrics_path 配错了（比如 Spring Boot 要用 /actuator/prometheus）
+server returned HTTP status 401 → 需要认证，配置里缺 basic_auth / bearer_token
+i/o timeout                     → 网络不通（防火墙 / 安全组挡了）
+```
+
+<Callout type="tip" title="Targets 页面 DOWN 了怎么办">
+按这个顺序排查，几乎不会失手：
+
+1. 在 **Prometheus 所在机器**上手动 curl 一下 Targets 页面显示的那个完整 URL——注意是在 Prometheus 机器上，不是你的笔记本上。
+2. curl 通了但 Prometheus 抓不到 → 检查 `scrape_timeout`、认证配置、`metrics_path`。
+3. curl 也不通 → 是网络/防火墙/服务本身的问题，跟 Prometheus 无关。
+
+这一步能把问题范围从「整个监控系统」缩小到「一次 HTTP 请求」。
+</Callout>
+
+### 5.3 Web UI：Graph
+
+打开 `http://localhost:9090/graph`，在输入框里试几个查询：
+
+```promql
+# 1) 所有目标的健康状态（最该先看的）
+up
+
+# 2) Prometheus 自己的活跃序列数
+prometheus_tsdb_head_series
+
+# 3) 主机 1 分钟负载（需要 node_exporter）
+node_load1
+
+# 4) 各实例内存使用率
+100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+# 5) Prometheus 自身的样本写入速率
+rate(prometheus_tsdb_head_samples_appended_total[5m])
+```
+
+界面上有两个标签页：**Table** 显示当前瞬时值（适合确认数据有没有进来），**Graph** 画出时间曲线（适合看趋势）。
+
+<Callout type="info" title="刚启动时图是空的，别慌">
+`rate()` 这类函数需要区间内至少两个样本才能计算。刚启动的 Prometheus 只有 1-2 个数据点，`rate(x[5m])` 会返回空。等两三分钟再看即可。
+</Callout>
+
+### 5.4 其他有用的页面
+
+```text
+/targets      抓取目标状态（最常用）
+/rules        已加载的规则及其上次求值结果
+/alerts       当前 Pending / Firing 的告警
+/config       当前生效的完整配置（确认热加载是否真的生效了）
+/service-discovery  服务发现的原始结果与 relabel 前后对比
+/tsdb-status  TSDB 状态：序列数、基数 Top10（排查基数问题的利器）
+/flags        当前生效的命令行参数
+```
+
+<Callout type="tip" title="/tsdb-status 是基数排查神器">
+这个页面会列出「序列数最多的指标名 Top10」和「取值最多的标签 Top10」。当发现内存暴涨时，第一时间打开它，通常一眼就能看出是哪个指标或哪个标签失控了。
+</Callout>
+
+## 6. 数据目录结构
+
+看一眼 `--storage.tsdb.path` 指向的目录：
+
+```bash
+ls -l /var/lib/prometheus/
+```
+
+```text
+/var/lib/prometheus/
+├── 01HQXYZ8K3MNPQRSTVWXYZ0123/    ← 持久化 block（ULID 命名，按时间排序）
+│   ├── chunks/
+│   │   └── 000001                 ← 压缩后的样本数据（每个文件最大 512MB）
+│   ├── index                      ← 倒排索引：标签 → 序列 ID
+│   ├── meta.json                  ← 元信息：时间范围、样本数、压实层级
+│   └── tombstones                 ← 删除标记（删数据不改原文件，只记标记）
+├── 01HQXYZ9M4NPQRSTVWXYZ4567/    ← 另一个 block
+│   └── ...
+├── chunks_head/                    ← Head block 中已切分但尚未持久化的 chunk
+│   └── 000001
+├── wal/                            ← 预写日志：崩溃恢复的保障
+│   ├── 00000042
+│   ├── 00000043
+│   └── checkpoint.00000041/        ← 检查点，压缩已过期的 WAL 段
+├── queries.active                  ← 正在执行的查询（崩溃后可查是谁压垮了它）
+└── lock                            ← 目录锁，防止两个进程同时写
+```
+
+一句话记住每个部分：
+
+- **`wal/`**：预写日志。所有新样本先顺序写这里再进内存，进程崩溃重启时靠重放它恢复最近 2 小时的数据。这是「不丢数据」的唯一保障。
+- **`chunks_head/`**：Head block（内存中最近约 2 小时的数据）里已经写满并切分好、但还没被压实成正式 block 的 chunk 文件，起到减少内存占用的作用。
+- **`<ULID>/`（block 目录）**：每 2 小时生成一个的不可变数据块，内含 `chunks/`（实际样本）、`index`（倒排索引）和 `meta.json`（元信息）。后台压实会把小块合并成大块。
+- **`tombstones`**：删除标记文件。因为 block 不可变，删除数据时只写标记，真正的清理发生在下次压实。
+
+<Callout type="warn" title="关于数据目录的三条铁律">
+1. **不要手动删除 block 目录**。要清理数据请用 `--storage.tsdb.retention.time/size`，或通过 Admin API 删除。手动删可能破坏一致性。
+2. **不要多个 Prometheus 进程共用一个数据目录**。`lock` 文件会阻止，但如果强行绕过，数据必然损坏。
+3. **WAL 重放需要时间**。序列很多时，重启后可能要几分钟甚至几十分钟才能开始服务，这段时间监控是「瞎」的。这也是为什么生产要跑 HA 双副本。
+</Callout>
+
+### 6.1 容量估算
+
+```text
+磁盘用量 ≈ 序列数 × (保留天数 × 86400 / 抓取间隔秒数) × 每样本字节数
+```
+
+以 10 万条序列、15s 抓取、保留 30 天、每样本 1.5 字节估算：
+
+```text
+100,000 × (30 × 86400 / 15) × 1.5 B
+= 100,000 × 172,800 × 1.5 B
+≈ 25.9 GB
+```
+
+内存则主要由**活跃序列数**决定，经验值约 **1–3 KB/序列**，10 万序列大约需要 1–3 GB，再加上查询和压实的开销，规划时建议留 2 倍余量。
+
+---
+
+<Callout type="exercise" title="练习 1：写一份完整的 prometheus.yml">
+按以下要求写出配置文件：
+
+- 全局抓取间隔 30 秒，规则求值间隔 30 秒
+- 打上集群标识 `cluster: test-cluster`
+- 抓取三类目标：
+  1. Prometheus 自己（`localhost:9090`）
+  2. 两台主机的 node_exporter：`192.168.1.10:9100`、`192.168.1.11:9100`，都打上标签 `env: prod`
+  3. 一个 Spring Boot 应用 `192.168.1.20:8080`，指标路径是 `/actuator/prometheus`，这个应用要求 15 秒抓一次
+- 从 `/etc/prometheus/rules/` 目录加载所有 `.yml` 规则文件
+- 告警发给 `192.168.1.30:9093` 上的 Alertmanager
+
+<Answer>
+**参考答案：**
+
+```yaml
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    cluster: test-cluster
+
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - '192.168.1.30:9093'
+
+scrape_configs:
+  # 1) 自监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # 2) 主机监控
+  - job_name: 'node'
+    static_configs:
+      - targets:
+          - '192.168.1.10:9100'
+          - '192.168.1.11:9100'
+        labels:
+          env: prod
+
+  # 3) Spring Boot 应用（覆盖全局间隔为 15s）
+  - job_name: 'spring-app'
+    scrape_interval: 15s
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['192.168.1.20:8080']
+```
+
+**几个易错点：**
+
+1. **`metrics_path` 是 job 级别的配置**，不能写在 `static_configs` 里面。Spring Boot Actuator 默认路径是 `/actuator/prometheus`，不是 `/metrics`——这是新手最常踩的坑，表现为 Targets 页面报 `404`。
+
+2. **job 级别的 `scrape_interval` 会覆盖 global**。第三个 job 写了 `scrape_interval: 15s`，它就按 15s 抓，其余两个继承全局的 30s。
+
+3. **`labels` 的层级**。它属于 `static_configs` 数组的某一项，与 `targets` 平级，作用于该项下的所有 target。写错缩进（比如放到 `job_name` 下面）会导致配置解析失败。
+
+4. **`rule_files` 支持 glob 通配**，`*.yml` 会匹配目录下所有 yml 文件。注意如果目录里同时有 `.yaml` 后缀的文件，不会被这个模式匹配到。
+
+5. **`external_labels` 属于 `global` 块**，不是顶层字段。
+
+写完先校验再加载：
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml
+curl -X POST http://localhost:9090/-/reload
+```
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：用 Docker 跑起来">
+用一条 `docker run` 命令启动 Prometheus，要求：
+
+- 映射端口 9090
+- 挂载宿主机的 `/opt/prom/prometheus.yml` 作为配置（只读）
+- 数据持久化到名为 `promdata` 的 Docker 卷
+- 数据保留 7 天
+- 支持热加载配置
+
+写出命令，并说明如果不挂载数据卷会发生什么。
+
+<Answer>
+**参考答案：**
+
+```bash
+docker run -d \
+  --name prometheus \
+  -p 9090:9090 \
+  -v /opt/prom/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+  -v promdata:/prometheus \
+  prom/prometheus:v2.53.0 \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/prometheus \
+  --storage.tsdb.retention.time=7d \
+  --web.enable-lifecycle
+```
+
+**逐项说明：**
+
+- `-d`：后台运行。
+- `-p 9090:9090`：宿主机 9090 → 容器 9090，这样浏览器能访问 Web UI。
+- `:ro`：配置文件只读挂载，防止容器内进程意外修改宿主机文件。
+- `-v promdata:/prometheus`：使用**命名卷**（named volume）。`/prometheus` 是官方镜像的默认数据目录。
+- **镜像名之后的参数**会追加到镜像 `ENTRYPOINT` 的 `prometheus` 命令上。注意：一旦你自己指定了参数，就要把 `--config.file` 和 `--storage.tsdb.path` 都写全，因为镜像默认的 `CMD` 被完全覆盖了。
+- `--web.enable-lifecycle`：开启后才能用 `curl -X POST http://localhost:9090/-/reload` 热加载。
+
+**不挂载数据卷会怎样？**
+
+数据会写在容器的**可写层**里。后果是：
+
+1. **容器删除即数据丢失**。执行 `docker rm prometheus` 之后所有历史监控数据消失，无法找回。
+2. **升级镜像就丢数据**。想从 v2.53.0 升级到新版本，标准做法是删掉旧容器用新镜像重建——数据直接归零。
+3. **性能变差**。容器可写层走的是 overlay2 联合文件系统，对 TSDB 这种高频随机写入的负载，性能明显低于直接写卷或 bind mount。
+4. **磁盘占用不透明**。数据混在 Docker 的存储目录里，`docker system df` 之外很难观察，容易撑爆系统盘。
+
+**验证卷确实挂上了：**
+
+```bash
+docker volume inspect promdata
+docker exec prometheus ls -l /prometheus
+```
+
+能看到 `wal/`、`chunks_head/` 等目录就说明正常。
+
+**如果需要抓宿主机上的 node_exporter**，配置里不能写 `localhost:9100`（那是容器自己）。Linux 下加 `--add-host=host.docker.internal:host-gateway`，然后配置里写 `host.docker.internal:9100`；或者干脆用 docker compose 把两者放进同一网络，直接用服务名。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：排查一个 DOWN 的目标">
+你在 Targets 页面看到某个目标是红色 DOWN，Error 列显示：
+
+```text
+server returned HTTP status 404 Not Found
+```
+
+请给出：这个错误说明了什么？完整的排查步骤是什么？还有哪些常见的 Error 分别对应什么原因？
+
+<Answer>
+**参考答案：**
+
+**这个错误说明了什么？**
+
+`404 Not Found` 意味着：**网络是通的，TCP 连上了，HTTP 请求也发出去并收到了响应——但请求的那个路径不存在。**
+
+这一点非常关键：它排除了防火墙、服务未启动、DNS 等所有网络层问题。问题 100% 出在 `metrics_path` 上。
+
+**排查步骤：**
+
+1. **看 Targets 页面的 Endpoint 列**，它显示了 Prometheus 实际请求的完整 URL，比如：
+
+   ```text
+   http://192.168.1.20:8080/metrics
+   ```
+
+2. **在 Prometheus 所在机器上手动 curl 这个 URL**，确认复现：
+
+   ```bash
+   curl -i http://192.168.1.20:8080/metrics
+   # HTTP/1.1 404 Not Found
+   ```
+
+3. **找到正确的路径**。不同框架的默认路径不同：
+
+   | 应用类型 | 正确路径 |
+   |---|---|
+   | 标准 Exporter / Go 客户端 | `/metrics` |
+   | Spring Boot Actuator | `/actuator/prometheus` |
+   | Spring Boot 1.x + 旧依赖 | `/prometheus` |
+   | 应用挂在子路径下 | `/myapp/metrics` |
+   | Nginx VTS 模块 | `/status/format/prometheus` |
+
+   试一下：
+
+   ```bash
+   curl -s http://192.168.1.20:8080/actuator/prometheus | head
+   ```
+
+   如果输出了 `# HELP ...` 开头的文本，就找到了。
+
+4. **修改配置并热加载**：
+
+   ```yaml
+   - job_name: 'spring-app'
+     metrics_path: '/actuator/prometheus'
+     static_configs:
+       - targets: ['192.168.1.20:8080']
+   ```
+
+   ```bash
+   promtool check config /etc/prometheus/prometheus.yml
+   curl -X POST http://localhost:9090/-/reload
+   ```
+
+5. **等一个抓取周期后刷新 Targets 页面**，确认变绿。
+
+**其他常见 Error 对照表：**
+
+| Error 信息 | 原因 | 排查方向 |
+|---|---|---|
+| `connection refused` | 端口没有进程监听 | 服务是否启动？端口号写对了吗？`ss -lntp \| grep 9100` |
+| `no such host` | DNS 解析失败 | 主机名拼写；容器内能否解析；`nslookup` 验证 |
+| `i/o timeout` | 网络不通 | 防火墙、安全组、路由；`telnet host port` 验证 |
+| `context deadline exceeded` | 抓取超时 | 目标响应太慢（序列太多），或 `scrape_timeout` 太短 |
+| `401 Unauthorized` | 需要认证 | 补 `basic_auth` 或 `bearer_token` 配置 |
+| `403 Forbidden` | 认证过了但无权限 | 检查账号权限或 IP 白名单 |
+| `x509: certificate signed by unknown authority` | HTTPS 证书不受信 | 配 `tls_config.ca_file`，或临时 `insecure_skip_verify: true` |
+| `invalid metric type` / 解析错误 | 目标返回的不是合法指标格式 | 用 `curl ... \| promtool check metrics` 校验格式 |
+
+**通用排查心法**：先在 Prometheus 所在机器上手动 curl 一次。curl 通了就是 Prometheus 配置问题，curl 不通就是网络/服务问题。这一刀能把排查范围砍掉一半。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 4：容量规划">
+你要为一个环境规划 Prometheus 的资源：
+
+- 200 台主机，每台 node_exporter 暴露约 800 条序列
+- 30 个应用实例，每个约 1500 条序列
+- 抓取间隔 15 秒，数据保留 30 天
+
+请估算：总序列数、磁盘用量、内存需求。并说明如果磁盘不够，有哪些调整手段（按推荐顺序）。
+
+<Answer>
+**参考答案：**
+
+**一、总序列数**
+
+```text
+主机：200 × 800  = 160,000
+应用： 30 × 1500 =  45,000
+合计            = 205,000 条活跃序列
+```
+
+**二、磁盘用量**
+
+每条序列 30 天的样本数：
+
+```text
+30 天 × 86400 秒/天 ÷ 15 秒 = 172,800 个样本
+```
+
+按每样本 1.5 字节（Prometheus 压缩后的经验值，实际在 1–2 字节之间）：
+
+```text
+205,000 × 172,800 × 1.5 B
+= 5.31 × 10^10 B
+≈ 49.5 GB
+```
+
+再加上索引（约占样本数据的 10–20%）和压实过程的临时空间（压实时需要同时存在新旧两份，峰值可能多占 30%）：
+
+```text
+建议磁盘容量 ≥ 49.5 × 1.2 × 1.3 ≈ 77 GB
+实际规划留 2 倍余量：150 GB
+```
+
+**三、内存需求**
+
+内存主要由**活跃序列数**决定，经验值 1–3 KB/序列（取决于标签数量和长度）：
+
+```text
+205,000 × 2 KB ≈ 410 MB   （仅 Head block 的序列元数据）
+```
+
+但这只是基础开销，实际还要算上：
+
+- Head block 里每条序列的当前 chunk（约 每序列 1-2 KB）
+- 查询时加载的样本（一个跨 7 天、涉及 1 万条序列的查询可能吃掉几 GB）
+- 压实过程的临时内存
+- Go 运行时的 GC 余量
+
+**综合建议：8 GB 内存起步，16 GB 更从容。** 上线后重点监控 `prometheus_tsdb_head_series` 和进程 RSS。
+
+**四、磁盘不够时的调整手段（按推荐顺序）**
+
+**1. 先做 metric_relabel_configs 过滤（最推荐，零副作用）**
+
+绝大多数环境有 30%–50% 的序列从来没被查询过。node_exporter 默认就暴露了大量冷门指标：
+
+```yaml
+scrape_configs:
+  - job_name: 'node'
+    metric_relabel_configs:
+      # 丢弃从来不看的 mdadm / nfs / infiniband 相关指标
+      - source_labels: [__name__]
+        regex: 'node_(scrape_collector|mountstats|nfsd|infiniband)_.*'
+        action: drop
+      # 丢弃容器文件系统等噪声挂载点
+      - source_labels: [mountpoint]
+        regex: '/(var/lib/docker|run/docker).*'
+        action: drop
+```
+
+**为什么排第一**：直接减少序列数，同时降低磁盘**和**内存，且不损失任何你真正在看的数据。先用 `/tsdb-status` 页面看序列数 Top10 的指标，逐个确认是否有人用。
+
+**2. 关闭 node_exporter 的无用 collector（同理，从源头减）**
+
+```bash
+node_exporter --no-collector.mdadm --no-collector.nfs --no-collector.infiniband
+```
+
+**3. 调大抓取间隔（有损，但可接受）**
+
+主机指标从 15s 改为 30s，磁盘立刻减半：
+
+```yaml
+- job_name: 'node'
+  scrape_interval: 30s
+```
+
+**权衡**：主机指标（CPU、内存）变化相对平缓，30s 通常够用；但核心应用的延迟和错误率建议保持 15s，因为它们需要更快的告警响应。可以按 job 区别对待。
+
+**4. 缩短保留时间（有损）**
+
+```bash
+--storage.tsdb.retention.time=15d
+```
+
+**权衡**：大多数排查只看最近几天，30 天以上的数据主要用于容量规划和同比分析。如果确实需要长期数据，正确的做法是第 6 条。
+
+**5. 设置磁盘大小硬上限（兜底保护）**
+
+```bash
+--storage.tsdb.retention.size=100GB
+```
+
+时间和大小两个条件**先到先删**。这是防止磁盘被写满导致 Prometheus 崩溃的最后一道保险，建议无论如何都配上。
+
+**6. 上远程长期存储（治本，但引入复杂度）**
+
+```yaml
+remote_write:
+  - url: http://thanos-receive:19291/api/v1/receive
+```
+
+本地只留 7 天用于快速查询，长期数据交给 Thanos / Mimir / VictoriaMetrics，它们会做降采样（downsampling）并存到对象存储，成本低一个数量级。
+
+**顺序原则**：先做无损优化（1、2），再做有损妥协（3、4），兜底保护（5）始终要配，规模真的上来了再上架构方案（6）。
+</Answer>
+</Callout>
+
+## 小结
+
+- Prometheus 是**单个静态二进制**，无外部依赖。二进制部署配 systemd，容器部署用 Docker/compose，注意映射 **9090** 和持久化数据卷。
+- `prometheus.yml` 顶层四块：`global`（默认值）、`scrape_configs`（抓谁）、`rule_files`（规则）、`alerting`（告警发给谁）。
+- `scrape_interval` 是成本与精度的权衡，15s 是社区默认甜点；`external_labels` 用于标识实例身份，只在数据外发时附加。
+- 命令行参数管进程本身，**不能热加载**；配置文件改完先 `promtool check config` 再 `POST /-/reload`。
+- 验证三步：curl `/metrics` → Status → Targets 看状态 → Graph 里查 `up`。
+- 数据目录：`wal/` 保崩溃不丢，`chunks_head/` 是内存块的落盘部分，`<ULID>/` 是每 2 小时的不可变 block。
+- 下一章深入数据模型，搞清楚「一条时序到底由什么构成」→

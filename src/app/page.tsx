@@ -176,6 +176,14 @@ export default function HomePage() {
           accent="from-orange-400 to-fuchsia-500"
           chapters={count('grafana')}
         />
+        <LanguageCard
+          href="/prometheus"
+          title="Prometheus"
+          description="云原生监控系统：时序数据库、PromQL、抓取与 relabel、记录/告警规则与 Alertmanager。"
+          icon={<Flame className="w-8 h-8" />}
+          accent="from-fuchsia-400 to-rose-500"
+          chapters={count('prometheus')}
+        />
       </Category>
 
       <Category

@@ -1,0 +1,1695 @@
+---
+title: PromQL 运算符
+order: 7
+description: 算术/比较/逻辑运算与向量匹配
+---
+
+# PromQL 运算符
+
+上一章我们学会了「把想要的序列挑出来」。这一章解决下一个问题：**怎么把两组序列组合起来做运算**。
+
+错误率 = 错误数 ÷ 总数。内存使用率 = 已用 ÷ 总量。这些查询都需要让两个向量「配对」相除。听起来简单，但 PromQL 的运算规则和普通编程语言完全不同——它运算的对象不是两个数字，而是**两组带标签的序列**。
+
+理解「向量匹配」是从 PromQL 入门到熟练的分水岭。
+
+## 1. 运算符全景
+
+| 分类 | 运算符 | 作用对象 |
+|---|---|---|
+| 算术 | `+` `-` `*` `/` `%` `^` | 标量↔标量、向量↔标量、向量↔向量 |
+| 比较 | `==` `!=` `>` `<` `>=` `<=` | 同上，默认「过滤」，加 `bool` 变「求值」 |
+| 逻辑/集合 | `and` `or` `unless` | 只能向量↔向量 |
+| 聚合 | `sum` `avg` `max` `min` `count` 等 | 向量（下一章细讲，本章会用到） |
+
+优先级从高到低（同级从左到右，`^` 例外是右结合）：
+
+```text
+1. ^
+2. * / % atan2
+3. + -
+4. == != > < >= <=
+5. and unless
+6. or
+```
+
+不确定优先级时，**加括号**。PromQL 的括号是免费的，可读性收益巨大。
+
+## 2. 算术运算符
+
+### 2.1 向量 ↔ 标量：最简单的情况
+
+标量会作用到向量的**每一条序列**上：
+
+```promql
+# 字节转 GB
+node_memory_MemAvailable_bytes / 1024 / 1024 / 1024
+
+# 秒转毫秒
+rate(http_request_duration_seconds_sum[5m]) * 1000
+
+# 比率转百分比
+(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100
+
+# 取模：找出奇数编号的分片
+kafka_partition_id % 2
+```
+
+<Callout type="info" title="向量 ↔ 标量运算会保留所有标签">
+```text
+输入: node_memory_MemAvailable_bytes{instance="a", job="node"}  8589934592
+表达式: node_memory_MemAvailable_bytes / 1024 / 1024 / 1024
+输出: {instance="a", job="node"}  8
+```
+
+注意输出**丢掉了指标名**（`__name__` 被删除），但**保留了所有其他标签**。这是 PromQL 的普遍规则：**任何运算都会丢弃指标名**，因为运算结果已经不是原来那个指标了。
+</Callout>
+
+### 2.2 向量 ↔ 向量：标签必须完全一致
+
+这是关键规则：
+
+> **两个向量做运算时，只有「标签集完全相同」的序列才会配对；配不上的序列直接从结果中消失。**
+
+看一个成功的例子：
+
+```text
+左侧: node_memory_MemAvailable_bytes{instance="a", job="node"}  8589934592
+      node_memory_MemAvailable_bytes{instance="b", job="node"}  4294967296
+
+右侧: node_memory_MemTotal_bytes{instance="a", job="node"}     17179869184
+      node_memory_MemTotal_bytes{instance="b", job="node"}     17179869184
+
+表达式: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+
+结果: {instance="a", job="node"}  0.5
+      {instance="b", job="node"}  0.25
+```
+
+两边除了指标名之外标签完全一致，所以 `a` 配 `a`、`b` 配 `b`，各自相除。
+
+再看一个失败的例子：
+
+```text
+左侧: http_requests_total{job="api", status="500", method="GET"}   47
+右侧: http_requests_total{job="api"}                             98260
+
+表达式: 左 / 右
+结果: 空！
+```
+
+因为左侧多了 `status` 和 `method` 两个标签，右侧没有，标签集不相同 → 无法配对 → 返回空。
+
+**这是新手最常遇到的「查询返回空」的原因。** 解决办法有两个方向：用 `sum` 抹平标签差异，或者用 `on` / `ignoring` 显式指定匹配规则（见第 5 节）。
+
+### 2.3 实战：几个常用的算术查询
+
+```promql
+# 内存使用率（%）
+100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+# 磁盘使用率（%）
+100 * (
+  1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+      / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+)
+
+# CPU 使用率（%）：100 减去 idle 的占比
+100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# 平均请求耗时（毫秒）
+1000 *
+  rate(http_request_duration_seconds_sum[5m])
+  / rate(http_request_duration_seconds_count[5m])
+
+# 每个请求平均消耗多少 CPU 秒
+rate(process_cpu_seconds_total[5m]) / rate(http_requests_total[5m])
+```
+
+最后一个查询很有意思——它把两个完全不同的指标结合起来，得到一个「单位成本」指标。当代码引入性能退化时，这个数字会先于 CPU 使用率发出信号（因为 CPU 使用率还受流量影响，而单位成本不受）。
+
+## 3. 比较运算符
+
+### 3.1 默认行为是「过滤」，不是「求值」
+
+这是 PromQL 和普通编程语言最不一样的地方：
+
+```promql
+up == 0
+```
+
+在 Python 里 `x == 0` 返回 `True` 或 `False`。在 PromQL 里，它返回的是：
+
+```text
+输入: up{job="api", instance="a"}  1
+      up{job="api", instance="b"}  0
+      up{job="web", instance="c"}  1
+
+表达式: up == 0
+
+输出: up{job="api", instance="b"}  0     ← 只剩满足条件的序列，值保持原样
+```
+
+**比较运算符是一个过滤器**：满足条件的序列**原样保留**（值不变、标签不变，包括指标名也保留），不满足的直接**丢弃**。
+
+这个设计非常适合告警——告警规则的语义就是「表达式有结果就告警，没结果就不告警」：
+
+```yaml
+- alert: InstanceDown
+  expr: up == 0          # 有序列返回 = 有实例挂了 = 触发告警
+  for: 5m
+```
+
+```promql
+# 更多过滤示例
+node_load1 > 4                                    # 负载超过 4 的机器
+rate(http_requests_total[5m]) > 100               # QPS 超过 100 的序列
+node_filesystem_avail_bytes < 10 * 1024^3         # 剩余空间不足 10GB
+kafka_consumergroup_lag > 10000                   # 堆积超过 1 万条的分区
+```
+
+### 3.2 bool 修饰符：变成 0/1
+
+加上 `bool` 关键字，语义就变成了「求值」——**不过滤，把每条序列的值换成 0 或 1**：
+
+```text
+输入: up{instance="a"}  1
+      up{instance="b"}  0
+
+up == 0         →  {instance="b"} 0                     （过滤，1 条）
+up == bool 0    →  {instance="a"} 0, {instance="b"} 1   （求值，2 条）
+```
+
+注意 `bool` 版本还会**删除指标名**（因为结果已经不是 `up` 了）。
+
+**bool 的典型用途一：算比例。**
+
+```promql
+# 有多少比例的实例是健康的
+avg(up == bool 1)
+
+# 有多少比例的请求耗时超过 1 秒（配合 Summary 时有用）
+avg(rpc_duration_seconds{quantile="0.5"} > bool 1)
+```
+
+**bool 的典型用途二：画一条「状态线」。**
+
+不加 `bool` 的话，条件不满足时序列直接消失，Grafana 上会出现断线。加了 `bool` 就永远有值（0 或 1），能画出完整的状态阶梯图。
+
+**bool 的典型用途三：组合多个条件打分。**
+
+```promql
+# 一个简单的健康评分：三个条件各占 1 分
+  (up == bool 1)
++ (node_load1 < bool 4)
++ (node_memory_MemAvailable_bytes > bool 1024^3)
+```
+
+<Callout type="warn" title="标量之间比较必须加 bool">
+```promql
+2 > 1          # ❌ 报错：comparisons between scalars must use BOOL modifier
+2 > bool 1     # ✅ 返回标量 1
+```
+
+原因是「过滤」对标量没有意义——一个标量要么留下要么消失，而 PromQL 的表达式必须有确定的返回类型。所以标量比较强制要求 `bool`。
+</Callout>
+
+### 3.3 向量之间的比较
+
+两个向量比较时，同样遵循「标签必须一致才配对」的规则：
+
+```promql
+# 找出「可用内存 < 总内存的 10%」的实例
+node_memory_MemAvailable_bytes < node_memory_MemTotal_bytes * 0.1
+```
+
+结果保留的是**左侧**的序列（值和标签都来自左侧）。
+
+```promql
+# 找出当前 QPS 低于 1 小时前一半的服务（流量骤降）
+sum by (job) (rate(http_requests_total[5m]))
+  < 0.5 * sum by (job) (rate(http_requests_total[5m] offset 1h))
+```
+
+### 3.4 链式比较的陷阱
+
+```promql
+# ❌ 想表达「1 < x < 5」，但结果不对
+1 < node_load1 < 5
+```
+
+PromQL 从左到右求值：先算 `1 < node_load1`——注意左边是**标量**、右边是**向量**，这在语法上合法但语义混乱（结果保留右侧向量中大于 1 的序列）。然后再和 5 比较。
+
+**正确写法是用 `and` 连接两个独立条件：**
+
+```promql
+node_load1 > 1 and node_load1 < 5
+```
+
+## 4. 逻辑与集合运算符
+
+三个运算符：`and`（交集）、`or`（并集）、`unless`（差集）。它们**只能用于向量与向量之间**，且**只看标签，不看值**。
+
+### 4.1 and：交集
+
+```text
+返回：左侧向量中，「标签集在右侧也存在」的那些序列。
+值和标签都来自左侧。
+```
+
+```text
+左侧: node_load1{instance="a"}  5.2
+      node_load1{instance="b"}  0.3
+      node_load1{instance="c"}  8.1
+
+右侧: node_memory_low{instance="a"}  1
+      node_memory_low{instance="c"}  1
+
+node_load1 and node_memory_low
+→ {instance="a"} 5.2
+  {instance="c"} 8.1
+```
+
+**最重要的用途：给告警加「附加条件」。**
+
+```promql
+# 磁盘使用率 > 85% 且 剩余空间 < 50GB（避免大盘误报）
+(100 * (1 - node_filesystem_avail_bytes / node_filesystem_size_bytes) > 85)
+and
+(node_filesystem_avail_bytes < 50 * 1024^3)
+```
+
+```promql
+# 错误率 > 5% 且 QPS > 10（避免低流量误报）
+(
+  sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+  / sum by (job) (rate(http_requests_total[5m]))
+) > 0.05
+and
+sum by (job) (rate(http_requests_total[5m])) > 10
+```
+
+这就是上一章反复强调的「比值型告警必须配绝对量下限」的实现方式。
+
+### 4.2 or：并集
+
+```text
+返回：左侧的全部序列 + 右侧中「标签集在左侧不存在」的序列。
+左侧优先。
+```
+
+```text
+左侧: metric_a{instance="a"}  1
+      metric_a{instance="b"}  2
+
+右侧: metric_b{instance="b"}  99      ← 标签和左侧的 b 相同，被忽略
+      metric_b{instance="c"}  3       ← 左侧没有 c，被纳入
+
+metric_a or metric_b
+→ {instance="a"} 1
+  {instance="b"} 2      ← 来自左侧，右侧的 99 被丢弃
+  {instance="c"} 3      ← 来自右侧
+```
+
+**用途一：兜底默认值。**
+
+```promql
+# 如果 my_metric 没有数据，返回 0 而不是空
+my_metric or vector(0)
+```
+
+这在 Grafana 单值面板上特别有用——没有数据时显示「No data」很难看，显示 0 更友好。
+
+**用途二：合并多个来源的同类指标。**
+
+```promql
+# 新旧两套埋点并存的过渡期
+sum(rate(http_requests_total[5m])) or sum(rate(legacy_http_requests_total[5m]))
+```
+
+**用途三：让告警在指标消失时也能触发。**
+
+```promql
+# 服务挂了（up == 0）或者根本没有 up 指标（目标被删了）
+up == 0 or absent(up{job="critical-api"})
+```
+
+### 4.3 unless：差集
+
+```text
+返回：左侧向量中，「标签集在右侧不存在」的那些序列。
+```
+
+```text
+左侧: node_load1{instance="a"}  5.2
+      node_load1{instance="b"}  0.3
+      node_load1{instance="c"}  8.1
+
+右侧: maintenance_mode{instance="c"}  1
+
+node_load1 > 4 unless maintenance_mode
+→ {instance="a"} 5.2       ← c 在维护中，被排除
+```
+
+**核心用途：排除例外。**
+
+```promql
+# 磁盘告警，但排除正在维护的机器
+(node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.1)
+unless on(instance)
+node_maintenance_mode == 1
+```
+
+```promql
+# Pod 不健康告警，但排除正在滚动更新的 Deployment
+kube_pod_status_ready{condition="false"} == 1
+unless on(namespace, deployment)
+kube_deployment_status_condition{condition="Progressing", status="true"} == 1
+```
+
+<Callout type="tip" title="用一个「开关指标」做优雅的告警静默">
+比起在 Alertmanager 里配 silence，用 `unless` 在查询层就排除掉，有几个好处：
+
+- 静默状态本身是一个指标，可以被查询、被审计、被展示在大盘上
+- 可以做细粒度控制（按 instance、按 namespace）
+- 静默生效和失效都是自动的，不会忘记取消
+
+实现方式：用一个 Pushgateway 指标或者一个简单的 exporter 暴露维护状态：
+
+```text
+node_maintenance_mode{instance="10.0.1.5:9100", reason="kernel_upgrade"} 1
+```
+
+然后所有相关告警都加上 `unless on(instance) node_maintenance_mode == 1`。
+</Callout>
+
+### 4.4 三者对比
+
+```text
+左侧 L: {a} {b} {c}        右侧 R: {b} {c} {d}
+
+L and    R  →  {b} {c}               交集（值取左侧）
+L or     R  →  {a} {b} {c} {d}       并集（重叠部分取左侧）
+L unless R  →  {a}                   差集
+```
+
+用集合论的语言：`and` 是 ∩，`or` 是 ∪，`unless` 是 L − R。
+
+## 5. 向量匹配：on / ignoring / group_left / group_right
+
+现在进入本章的核心难点。
+
+### 5.1 问题：标签不一致怎么办
+
+回到第 2.2 节那个失败的例子：
+
+```promql
+# ❌ 返回空
+  sum by (job, status) (rate(http_requests_total{status=~"5.."}[5m]))
+/ sum by (job)         (rate(http_requests_total[5m]))
+```
+
+左侧序列带 `job` 和 `status` 两个标签，右侧只带 `job`。标签集不同 → 配不上 → 空。
+
+PromQL 提供了两个关键字来解决这个问题：
+
+| 关键字 | 含义 |
+|---|---|
+| `on(l1, l2)` | **只用**列出的这些标签做匹配，其余标签忽略 |
+| `ignoring(l1, l2)` | 匹配时**忽略**列出的这些标签，其余标签都要一致 |
+
+修正上面的查询：
+
+```promql
+# ✅ 只用 job 做匹配
+  sum by (job, status) (rate(http_requests_total{status=~"5.."}[5m]))
+/ on(job)
+  sum by (job)         (rate(http_requests_total[5m]))
+```
+
+或者等价地：
+
+```promql
+# ✅ 忽略 status 标签
+  sum by (job, status) (rate(http_requests_total{status=~"5.."}[5m]))
+/ ignoring(status)
+  sum by (job)         (rate(http_requests_total[5m]))
+```
+
+**`on` 还是 `ignoring`？** 经验：
+
+- 两边标签差异很大、只有少数几个共同标签 → 用 `on`（明确列出用哪些配对）
+- 两边标签基本一致、只差一两个 → 用 `ignoring`（明确列出忽略哪些）
+
+`on` 更常用，因为它的行为不会因为新增标签而意外改变。
+
+### 5.2 三种基数关系
+
+PromQL 的向量匹配有三种「基数」（cardinality），这是理解 `group_left` 的前提：
+
+```text
+一对一 (one-to-one)：
+    左侧每条序列 ↔ 右侧恰好一条序列
+    → 默认行为，不需要任何额外关键字
+
+多对一 (many-to-one)：
+    左侧多条序列 → 右侧同一条序列
+    → 需要 group_left
+
+一对多 (one-to-many)：
+    左侧一条序列 → 右侧多条序列
+    → 需要 group_right
+```
+
+### 5.3 一对一：默认行为
+
+```promql
+node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+```
+
+每个 instance 的可用内存对应它自己的总内存，一一对应。这是最常见的情况，什么都不用写。
+
+如果一对一匹配中出现了「一个左侧序列匹配到多个右侧序列」，Prometheus 会报错：
+
+```text
+Error: found duplicate series for the match group {job="api"} on the right hand-side
+of the operation: [...]; many-to-many matching not allowed:
+matching labels must be unique on one side
+```
+
+**看到这个报错，说明你需要的是多对一（或一对多），要加 `group_left` / `group_right`。**
+
+### 5.4 多对一：group_left
+
+**场景：一个「细粒度」向量除以一个「粗粒度」向量。**
+
+```text
+左侧（细）: 每个 (job, status) 一条序列
+    {job="api", status="500"}  3.2
+    {job="api", status="502"}  0.8
+    {job="api", status="503"}  0.1
+
+右侧（粗）: 每个 job 一条序列
+    {job="api"}  120.5
+```
+
+左侧 3 条序列都要除以右侧那 1 条 → **多对一** → 用 `group_left`：
+
+```promql
+  sum by (job, status) (rate(http_requests_total{status=~"5.."}[5m]))
+/ on(job) group_left
+  sum by (job)         (rate(http_requests_total[5m]))
+```
+
+结果：
+
+```text
+{job="api", status="500"}  0.0266
+{job="api", status="502"}  0.0066
+{job="api", status="503"}  0.0008
+```
+
+**记忆方法：`group_left` 中的 "left" 指的是「多的那一侧在左边」。**
+
+```text
+group_left   →  左侧是「多」，右侧是「一」    左 N : 1 右
+group_right  →  左侧是「一」，右侧是「多」    左 1 : N 右
+```
+
+### 5.5 group_left 的第二个能力：把右侧的标签「贴」过来
+
+`group_left` 后面可以跟一个标签列表，表示**从右侧向量额外复制这些标签到结果里**：
+
+```promql
+group_left(label1, label2)
+```
+
+这是 PromQL 里极其实用的一个技巧，叫做**「info 指标关联」**。
+
+**场景：给指标补充元数据。**
+
+假设你有一个 info 指标记录了每个实例的版本、机房、负责团队：
+
+```text
+myapp_build_info{instance="10.0.1.5:8080", version="2.3.1", region="bj", team="order"} 1
+myapp_build_info{instance="10.0.1.6:8080", version="2.3.0", region="sh", team="order"} 1
+```
+
+而 QPS 指标上只有 `instance`：
+
+```text
+http_requests_total{instance="10.0.1.5:8080", job="api"}  ...
+```
+
+想按版本看 QPS，就用 `group_left` 把 `version` 标签贴过来：
+
+```promql
+sum by (version) (
+    sum by (instance) (rate(http_requests_total[5m]))
+  * on(instance) group_left(version)
+    myapp_build_info
+)
+```
+
+**逐层解释：**
+
+```text
+1. sum by (instance) (rate(...))     每个实例的 QPS
+2. * on(instance) group_left(version) 用 instance 配对，从右侧带上 version 标签
+   （乘以 1 —— info 指标的值恒为 1，所以数值不变，只是为了「借」标签）
+3. sum by (version) (...)             按版本聚合
+```
+
+结果：
+
+```text
+{version="2.3.1"}  85.2
+{version="2.3.0"}  42.7
+```
+
+<Callout type="info" title="为什么是「乘以 1」这么奇怪的写法">
+info 指标的值恒为 1，所以 `x * 1 = x`，数值完全不变。这个乘法的**唯一目的**是触发一次向量匹配，从而把右侧的标签复制过来。
+
+这是 PromQL 社区的一个惯用法（idiom）。看起来别扭，但因为 PromQL 没有 SQL 那样的 JOIN 语法，这就是标准做法。
+
+同样的技巧可以用在很多地方：
+
+```promql
+# 按 Kubernetes Deployment 看 Pod 的 CPU 使用
+sum by (deployment) (
+    rate(container_cpu_usage_seconds_total[5m])
+  * on(pod) group_left(deployment) kube_pod_owner
+)
+
+# 按机房看错误率
+sum by (region) (rate(http_requests_total{status=~"5.."}[5m]))
+```
+</Callout>
+
+### 5.6 一对多：group_right
+
+`group_right` 是 `group_left` 的镜像——用于「一的那侧在左边」的情况：
+
+```promql
+# 左侧一条（粗），右侧多条（细）
+  sum by (job) (rate(http_requests_total[5m]))
+/ on(job) group_right
+  sum by (job, status) (rate(http_requests_total{status=~"5.."}[5m]))
+```
+
+**实践中 `group_right` 用得少得多**，因为你总可以把表达式左右调换，改用 `group_left`。而 `group_left` 更符合「左侧是主体，右侧是补充信息」的直觉。
+
+**建议：优先写成 `group_left` 的形式。** 如果发现需要 `group_right`，先想想能不能把两边换个位置。
+
+### 5.7 常见报错与排查
+
+**报错一：`many-to-many matching not allowed`**
+
+```text
+found duplicate series for the match group {job="api"} on the right hand-side
+```
+
+原因：右侧在匹配标签上不唯一。可能是：
+
+- 忘了写 `group_left`（本来就是多对一）
+- `on()` 里列的标签不够，导致右侧有多条序列落在同一个匹配组
+
+**排查方法**：单独执行右侧表达式，看在 `on()` 指定的标签下是否唯一：
+
+```promql
+# 检查右侧是否每个 job 只有一条
+count by (job) (你的右侧表达式)
+# 如果结果 > 1，就是这里的问题
+```
+
+**报错二：结果为空（不报错）**
+
+原因：两边在匹配标签上没有交集。
+
+**排查方法**：分别执行两侧，对比标签值。
+
+```promql
+# 左侧有哪些 job
+count by (job) (左侧表达式)
+# 右侧有哪些 job
+count by (job) (右侧表达式)
+# 如果一个是 "api" 一个是 "api-server"，那就找到原因了
+```
+
+**报错三：`multiple matches for labels`（group_left 之后仍报错）**
+
+原因：加了 `group_left` 但**两边都多**，是真正的「多对多」。PromQL 不支持多对多。
+
+**解决**：先用聚合把其中一侧变成一对一。
+
+<Callout type="warn" title="向量匹配的调试黄金法则">
+遇到向量匹配问题，**永远先把表达式拆成两半单独执行**：
+
+```promql
+# 第 1 步：单独跑左侧，记下返回的标签
+sum by (job, status) (rate(http_requests_total{status=~"5.."}[5m]))
+
+# 第 2 步：单独跑右侧，记下返回的标签
+sum by (job) (rate(http_requests_total[5m]))
+
+# 第 3 步：对比标签集
+#   完全相同        → 直接运算，不需要 on/ignoring
+#   左多右少        → on(共同标签) group_left
+#   左少右多        → on(共同标签) group_right
+#   有标签名不一致  → 先用 label_replace 改名
+```
+
+90% 的向量匹配问题在第 3 步就能定位。
+</Callout>
+
+## 6. 综合实战
+
+### 6.1 完整的错误率查询
+
+```promql
+# 版本 1：全局错误率（最简单，不需要向量匹配）
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+```promql
+# 版本 2：按服务分组（两边标签一致，仍不需要 on）
+sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum by (job) (rate(http_requests_total[5m]))
+```
+
+```promql
+# 版本 3：按服务分组，同时展开状态码明细（需要 group_left）
+  sum by (job, status) (rate(http_requests_total{status=~"5.."}[5m]))
+/ on(job) group_left
+  sum by (job)         (rate(http_requests_total[5m]))
+```
+
+```promql
+# 版本 4：加上防误报条件和百分比转换
+100 * (
+    sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+  / sum by (job) (rate(http_requests_total[5m]))
+)
+and
+sum by (job) (rate(http_requests_total[5m])) > 10
+```
+
+<Callout type="warn" title="版本 2 有一个隐蔽的坑">
+```promql
+sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+/ sum by (job) (rate(http_requests_total[5m]))
+```
+
+如果某个 job **完全没有 5xx**（这是好事！），那么分子里就没有这个 job 的序列，除法配对失败，**结果里这个 job 直接消失**——而不是显示 0。
+
+在 Grafana 大盘上的表现是：健康的服务反而不显示，只有出过错的服务才有线。很反直觉。
+
+**修正**：给分子加一个 `or` 兜底。
+
+```promql
+(
+  sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+  or
+  sum by (job) (rate(http_requests_total[5m])) * 0
+)
+/
+sum by (job) (rate(http_requests_total[5m]))
+```
+
+`* 0` 那一项构造出了「所有 job 的 0 值序列」，`or` 让它只在分子缺失时生效。
+</Callout>
+
+### 6.2 rate 比值：计算平均值和单位成本
+
+```promql
+# 平均请求耗时（Histogram 的 sum / count）
+rate(http_request_duration_seconds_sum[5m])
+/
+rate(http_request_duration_seconds_count[5m])
+```
+
+这两个序列的标签完全一致（只有指标名不同），所以是标准的一对一匹配，不需要 `on`。
+
+```promql
+# 每个请求平均消耗的 CPU 时间
+rate(process_cpu_seconds_total[5m])
+/ on(instance, job)
+rate(http_requests_total[5m])
+```
+
+这里需要 `on`，因为 `http_requests_total` 上还有 `method`、`status` 等标签。更好的写法是先聚合：
+
+```promql
+  sum by (instance) (rate(process_cpu_seconds_total[5m]))
+/ sum by (instance) (rate(http_requests_total[5m]))
+```
+
+### 6.3 缓存命中率
+
+```promql
+sum by (cache) (rate(cache_operations_total{result="hit"}[5m]))
+/
+sum by (cache) (rate(cache_operations_total{op="get"}[5m]))
+```
+
+注意分子分母来自**同一个指标**的不同切片，标签在 `by (cache)` 之后完全一致，一对一匹配成功。
+
+### 6.4 Apdex 分数
+
+Apdex（Application Performance Index）是一个业界标准的满意度指标：
+
+```text
+Apdex = (满意数 + 容忍数 / 2) / 总数
+
+满意：耗时 ≤ T
+容忍：T < 耗时 ≤ 4T
+不满意：耗时 > 4T
+```
+
+设 T = 0.3 秒（那么 4T = 1.2 秒，取最近的桶 1 秒）：
+
+```promql
+(
+    sum(rate(http_request_duration_seconds_bucket{le="0.3"}[5m]))
+  + sum(rate(http_request_duration_seconds_bucket{le="1"}[5m]))
+) / 2
+/
+sum(rate(http_request_duration_seconds_count[5m]))
+```
+
+推导：满意数 = `le="0.3"` 的桶；满意+容忍 = `le="1"` 的桶。
+
+```text
+(满意 + 容忍/2) = (满意 + (le1 - 满意)/2) = (满意 + le1) / 2
+```
+
+所以直接把两个桶相加除以 2 即可，非常优雅。
+
+---
+
+<Callout type="exercise" title="练习 1：预测运算结果">
+给定以下数据：
+
+```text
+向量 A:
+  cpu_usage{instance="web-1", region="bj"}  85
+  cpu_usage{instance="web-2", region="bj"}  30
+  cpu_usage{instance="web-3", region="sh"}  92
+
+向量 B:
+  cpu_limit{instance="web-1", region="bj"}  100
+  cpu_limit{instance="web-2", region="bj"}  100
+  cpu_limit{instance="web-4", region="sh"}  100
+
+向量 C:
+  in_maintenance{instance="web-3"}  1
+```
+
+写出以下每个表达式的完整结果（含标签和值）：
+
+```text
+1.  cpu_usage / cpu_limit
+2.  cpu_usage > 80
+3.  cpu_usage > bool 80
+4.  cpu_usage and cpu_limit
+5.  cpu_usage or cpu_limit
+6.  cpu_usage unless on(instance) in_maintenance
+7.  cpu_usage > 80 unless on(instance) in_maintenance
+8.  cpu_usage * 2
+```
+
+<Answer>
+**参考答案：**
+
+---
+
+**1. `cpu_usage / cpu_limit`**
+
+```text
+{instance="web-1", region="bj"}  0.85
+{instance="web-2", region="bj"}  0.30
+```
+
+**解释**：一对一匹配，要求标签集完全一致（指标名除外）。
+
+- `web-1`：两边都有，标签 `{instance, region}` 完全一致 → 85/100 = 0.85 ✅
+- `web-2`：同上 → 30/100 = 0.30 ✅
+- `web-3`：只在 A 中有（B 里是 web-4）→ 配不上，**消失**
+- `web-4`：只在 B 中有 → 配不上，消失
+
+**注意结果丢掉了指标名**——任何运算都会删除 `__name__`。
+
+---
+
+**2. `cpu_usage > 80`**
+
+```text
+cpu_usage{instance="web-1", region="bj"}  85
+cpu_usage{instance="web-3", region="sh"}  92
+```
+
+**解释**：比较运算符默认是**过滤器**。
+
+- 满足条件的序列**原样保留**：值不变（85 还是 85，不是 1），标签不变，**指标名也保留**
+- 不满足的（web-2 的 30）被丢弃
+
+**这就是告警规则的工作方式**：`expr` 返回非空 = 触发告警。
+
+---
+
+**3. `cpu_usage > bool 80`**
+
+```text
+{instance="web-1", region="bj"}  1
+{instance="web-2", region="bj"}  0
+{instance="web-3", region="sh"}  1
+```
+
+**解释**：加了 `bool` 后语义从「过滤」变成「求值」。
+
+- **所有 3 条序列都保留**（不过滤）
+- 值变成 0 或 1
+- **指标名被删除**（因为结果已经不是 cpu_usage 了）
+
+用途：算比例。`avg(cpu_usage > bool 80)` = 0.667，表示 66.7% 的实例 CPU 超过 80。
+
+---
+
+**4. `cpu_usage and cpu_limit`**
+
+```text
+cpu_usage{instance="web-1", region="bj"}  85
+cpu_usage{instance="web-2", region="bj"}  30
+```
+
+**解释**：`and` 是交集，返回「标签集在右侧也存在」的左侧序列。
+
+- 值和标签**都来自左侧**（所以是 85 和 30，不是 100）
+- **指标名保留**（逻辑运算不删除指标名）
+- `web-3` 在 B 中不存在 → 被排除
+
+`and` **只看标签，完全不看值**。即使 B 里的值是 0 或 -999，结果也一样。
+
+---
+
+**5. `cpu_usage or cpu_limit`**
+
+```text
+cpu_usage{instance="web-1", region="bj"}  85
+cpu_usage{instance="web-2", region="bj"}  30
+cpu_usage{instance="web-3", region="sh"}  92
+cpu_limit{instance="web-4", region="sh"}  100
+```
+
+**解释**：`or` 是并集，**左侧优先**。
+
+- 左侧全部 3 条保留
+- 右侧只有标签集在左侧**不存在**的才纳入 → 只有 `web-4`
+- `web-1`、`web-2` 在右侧也有，但被左侧「盖住」了
+
+---
+
+**6. `cpu_usage unless on(instance) in_maintenance`**
+
+```text
+cpu_usage{instance="web-1", region="bj"}  85
+cpu_usage{instance="web-2", region="bj"}  30
+```
+
+**解释**：`unless` 是差集，排除掉「在右侧存在」的序列。
+
+`web-3` 在维护中 → 被排除。
+
+**为什么必须写 `on(instance)`？** 因为两边的标签集不同：
+
+```text
+左侧: {instance, region}
+右侧: {instance}          ← 少一个 region
+```
+
+不加 `on(instance)` 的话，默认要求标签集完全一致，`{instance="web-3", region="sh"}` 和 `{instance="web-3"}` 不相等 → 匹配不上 → `unless` 什么都不排除，返回全部 3 条。
+
+**这是一个非常隐蔽的 bug**：不加 `on` 不会报错，只是静默地失效。写维护静默逻辑时一定要验证它真的生效了。
+
+---
+
+**7. `cpu_usage > 80 unless on(instance) in_maintenance`**
+
+```text
+cpu_usage{instance="web-1", region="bj"}  85
+```
+
+**解释**：先算 `cpu_usage > 80` 得到 web-1（85）和 web-3（92），再用 `unless` 排除维护中的 web-3，只剩 web-1。
+
+**这就是「带维护窗口的告警」的标准写法**：
+
+```yaml
+- alert: HighCPU
+  expr: cpu_usage > 80 unless on(instance) in_maintenance
+  for: 10m
+```
+
+注意运算符优先级：`>` 的优先级高于 `unless`，所以这个表达式等价于 `(cpu_usage > 80) unless on(instance) in_maintenance`，符合预期。但**为了可读性，建议还是加括号**。
+
+---
+
+**8. `cpu_usage * 2`**
+
+```text
+{instance="web-1", region="bj"}  170
+{instance="web-2", region="bj"}   60
+{instance="web-3", region="sh"}  184
+```
+
+**解释**：向量 ↔ 标量运算，标量作用到每一条序列。
+
+- 所有序列都保留
+- 所有标签保留
+- **指标名被删除**（算术运算的通例）
+
+---
+
+## 规律总结
+
+| 运算类型 | 保留指标名？ | 保留不满足条件的序列？ |
+|---|---|---|
+| 算术（`+ - * /`） | ❌ 删除 | 只保留能配对的 |
+| 比较（不带 bool） | ✅ 保留 | ❌ 过滤掉 |
+| 比较（带 bool） | ❌ 删除 | ✅ 全保留，值变 0/1 |
+| 逻辑（`and or unless`） | ✅ 保留 | 按集合运算 |
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：修复失败的向量匹配">
+下面 4 个查询都无法得到预期结果，请诊断并修正：
+
+```promql
+# 1. 想算：每个状态码占总请求的比例
+sum by (status) (rate(http_requests_total[5m]))
+/
+sum(rate(http_requests_total[5m]))
+
+# 2. 想算：每个 Pod 的内存使用率
+container_memory_usage_bytes / container_spec_memory_limit_bytes
+
+# 3. 想算：按 K8s Deployment 汇总的 CPU 使用量
+sum by (deployment) (rate(container_cpu_usage_seconds_total[5m]))
+
+# 4. 想算：排除测试环境后的错误率
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+unless
+http_requests_total{env="test"}
+```
+
+<Answer>
+**参考答案：**
+
+---
+
+## 1. 状态码占比 —— 缺 group_left
+
+**问题**：左侧带 `status` 标签，右侧无标签（`sum()` 把所有标签都聚合掉了）。
+
+```text
+左侧: {status="200"} 118.5
+      {status="404"}   2.1
+      {status="500"}   0.8
+右侧: {}             121.4      ← 没有任何标签
+```
+
+标签集不同 → 配对失败 → 返回空。
+
+**修正方案 A：用 `on()` 空匹配 + group_left**
+
+```promql
+  sum by (status) (rate(http_requests_total[5m]))
+/ on() group_left
+  sum(rate(http_requests_total[5m]))
+```
+
+`on()` 里不写任何标签，表示「不用任何标签做匹配」——右侧那唯一一条序列会和左侧所有序列配对。`group_left` 声明这是多对一。
+
+**修正方案 B：用 `ignoring(status)`**
+
+```promql
+  sum by (status) (rate(http_requests_total[5m]))
+/ ignoring(status) group_left
+  sum(rate(http_requests_total[5m]))
+```
+
+**修正方案 C：用 scalar()（最简洁）**
+
+```promql
+  sum by (status) (rate(http_requests_total[5m]))
+/ scalar(sum(rate(http_requests_total[5m])))
+```
+
+`scalar()` 把「只有一条序列的向量」转成标量，然后走「向量 ÷ 标量」的路径，完全绕过向量匹配。
+
+⚠️ **注意**：`scalar()` 要求输入**恰好只有一条序列**，否则返回 `NaN`。这里 `sum()` 保证了这一点，所以安全。
+
+**方案对比**：C 最简洁易读；A/B 更通用（右侧有多条序列时也能用）。日常推荐 C，需要按 job 等维度分组时用 A。
+
+---
+
+## 2. Pod 内存使用率 —— 标签不匹配
+
+**问题**：这两个 cAdvisor 指标的标签集通常不同。
+
+```text
+container_memory_usage_bytes{pod="x", container="app", namespace="prod", id="/kubepods/...", image="...", name="..."}
+container_spec_memory_limit_bytes{pod="x", container="app", namespace="prod", id="/kubepods/..."}
+```
+
+`container_memory_usage_bytes` 往往多出 `image`、`name` 等标签，导致标签集不完全一致。
+
+而且还有一个更隐蔽的问题：cAdvisor 会同时暴露「POD 沙箱容器」（`container=""`）和各个业务容器的指标，如果不过滤，会出现重复匹配。
+
+**修正**：
+
+```promql
+  container_memory_usage_bytes{container!="", container!="POD"}
+/ on(namespace, pod, container)
+  container_spec_memory_limit_bytes{container!="", container!="POD"}
+```
+
+**关键点：**
+
+1. **用 `on()` 明确指定匹配维度**：`(namespace, pod, container)` 三元组唯一确定一个容器，这是 K8s 环境的标准匹配键。
+2. **过滤掉 `container=""` 和 `container="POD"`**：前者是 Pod 级别的汇总（cgroup 根），后者是 pause 容器。不过滤会导致重复序列，触发 `duplicate series` 报错。
+
+**还要考虑「没设 limit」的情况**：没配 `resources.limits.memory` 的容器，`container_spec_memory_limit_bytes` 为 0，除法得到 `+Inf`。加个过滤：
+
+```promql
+  container_memory_usage_bytes{container!="", container!="POD"}
+/ on(namespace, pod, container)
+  (container_spec_memory_limit_bytes{container!="", container!="POD"} > 0)
+```
+
+`> 0` 的过滤作用会把 limit 为 0 的序列从右侧剔除，那些容器自然也就不会出现在结果里。
+
+---
+
+## 3. 按 Deployment 汇总 CPU —— 标签根本不存在
+
+**问题**：`container_cpu_usage_seconds_total` 是 cAdvisor 采集的，它**没有 `deployment` 标签**。cAdvisor 只知道容器和 Pod，不知道 Pod 属于哪个 Deployment。
+
+结果：`sum by (deployment)` 会把所有序列归到一个 `{deployment=""}` 的组里，得到一个毫无意义的总和。
+
+**修正**：用 kube-state-metrics 的 `kube_pod_owner` 做关联。
+
+```promql
+sum by (owner_name) (
+    sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{container!=""}[5m]))
+  * on(namespace, pod) group_left(owner_name)
+    kube_pod_owner{owner_kind="ReplicaSet"}
+)
+```
+
+**逐层解释：**
+
+```text
+第 1 层：sum by (namespace, pod) (rate(...))
+        每个 Pod 的 CPU 使用速率（核）
+
+第 2 层：* on(namespace, pod) group_left(owner_name) kube_pod_owner
+        用 (namespace, pod) 配对，从 kube_pod_owner 借来 owner_name 标签
+        kube_pod_owner 的值恒为 1，乘法不改变数值
+
+第 3 层：sum by (owner_name)
+        按 owner 聚合
+```
+
+**还有一个坑**：Deployment 创建的是 ReplicaSet，ReplicaSet 才创建 Pod。所以 `kube_pod_owner` 里的 `owner_name` 是 ReplicaSet 名字（形如 `myapp-7d9f8b6c5`），不是 Deployment 名字。
+
+要拿到真正的 Deployment 名，需要去掉那个 hash 后缀：
+
+```promql
+sum by (deployment) (
+  label_replace(
+    sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{container!=""}[5m]))
+      * on(namespace, pod) group_left(owner_name)
+        kube_pod_owner{owner_kind="ReplicaSet"},
+    "deployment", "$1", "owner_name", "(.*)-[a-f0-9]+"
+  )
+)
+```
+
+`label_replace` 用正则从 `owner_name` 里提取出 Deployment 名字（下一章会详细讲这个函数）。
+
+**更省事的做法**：如果你的 Prometheus 用了 kube-prometheus-stack，它已经提供了现成的记录规则：
+
+```promql
+namespace_workload_pod:kube_pod_owner:relabel
+```
+
+直接用它做关联，不用自己拼。
+
+---
+
+## 4. 排除测试环境 —— unless 用错了位置
+
+**问题**有三个：
+
+**（a）运算优先级错误。** `/` 的优先级高于 `unless`，所以实际执行的是：
+
+```promql
+(A / B) unless C
+```
+
+`A / B` 的结果是一条无标签的序列 `{}`，而 `C` 带一堆标签，`unless` 匹配不上 → 什么都排除不掉 → `unless` 完全没起作用。
+
+**（b）`unless` 用错了工具。** `unless` 是**集合运算**，用于「排除某些序列」。而这里想做的是「在选择数据时就不要 test 环境的数据」——这应该用**标签匹配器**。
+
+**（c）即使语法对了，逻辑也不对。** `unless` 排除的是「整条序列」，但 `sum()` 之后已经没有 env 维度了，无从排除。
+
+**修正：直接在选择器里过滤（最简单也最正确）**
+
+```promql
+sum(rate(http_requests_total{status=~"5..", env!="test"}[5m]))
+/
+sum(rate(http_requests_total{env!="test"}[5m]))
+```
+
+**为什么这样最好：**
+
+1. **性能最优**：过滤发生在 TSDB 索引查询阶段，根本不会加载 test 环境的数据。而 `unless` 要先把所有数据读出来再做集合运算。
+2. **语义最清晰**：一眼就能看出「不包含 test 环境」。
+3. **不会踩优先级的坑**。
+
+**什么时候才真的需要 `unless`？**
+
+当排除条件来自**另一个指标**、而不是当前指标的标签时：
+
+```promql
+# 排除正在维护的实例（维护状态在另一个指标里）
+(
+  sum by (instance) (rate(http_requests_total{status=~"5.."}[5m]))
+  / sum by (instance) (rate(http_requests_total[5m]))
+) > 0.05
+unless on(instance)
+  node_maintenance_mode == 1
+```
+
+**判断标准**：排除条件能用标签匹配器表达 → 用匹配器；必须查另一个指标才知道 → 用 `unless`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：用 group_left 关联元数据">
+你的环境中有以下指标：
+
+```text
+# 应用 QPS（只有 instance 和 job 标签）
+http_requests_total{job="api", instance="10.0.1.5:8080", status="200"}
+
+# 构建信息（info 指标，值恒为 1）
+app_build_info{job="api", instance="10.0.1.5:8080", version="2.3.1", commit="a1b2c3", team="order"} 1
+
+# 实例元数据
+instance_meta{instance="10.0.1.5:8080", region="bj", az="bj-a", machine_type="c6.xlarge"} 1
+```
+
+完成以下需求：
+
+1. 按 `version` 分组统计 QPS，用于观察灰度发布的流量分配。
+2. 按 `region` 分组统计 5xx 错误率。
+3. 找出「运行着 2.3.0 旧版本」且「QPS 大于 10」的实例。
+4. 解释为什么 `group_left` 里的标签列表不能省略。
+
+<Answer>
+**参考答案：**
+
+---
+
+## 1. 按 version 分组统计 QPS
+
+```promql
+sum by (version) (
+    sum by (instance, job) (rate(http_requests_total[5m]))
+  * on(instance, job) group_left(version)
+    app_build_info
+)
+```
+
+**逐层拆解：**
+
+```text
+① sum by (instance, job) (rate(http_requests_total[5m]))
+   把 status 等维度聚合掉，得到「每个实例的总 QPS」
+   → {job="api", instance="10.0.1.5:8080"}  42.3
+
+② * on(instance, job) group_left(version) app_build_info
+   用 (instance, job) 做配对键
+   group_left：左侧是「多」（其实这里是 1:1，但因为要借标签，必须写 group_left）
+   (version)：从右侧额外复制 version 标签过来
+   乘以 1（info 指标的值），数值不变
+   → {job="api", instance="10.0.1.5:8080", version="2.3.1"}  42.3
+
+③ sum by (version)
+   按版本聚合
+   → {version="2.3.1"}  85.2
+     {version="2.3.0"}  42.7
+```
+
+**灰度发布时这个查询非常有用**——可以直观看到流量在新旧版本之间的分配比例，验证灰度策略是否按预期生效。
+
+配合起来看错误率对比更有价值：
+
+```promql
+# 各版本的错误率，一眼看出新版本是否引入了问题
+sum by (version) (
+    sum by (instance, job) (rate(http_requests_total{status=~"5.."}[5m]))
+  * on(instance, job) group_left(version) app_build_info
+)
+/ on(version)
+sum by (version) (
+    sum by (instance, job) (rate(http_requests_total[5m]))
+  * on(instance, job) group_left(version) app_build_info
+)
+```
+
+---
+
+## 2. 按 region 分组统计 5xx 错误率
+
+```promql
+# 分子：各机房的 5xx 速率
+sum by (region) (
+    sum by (instance) (rate(http_requests_total{status=~"5.."}[5m]))
+  * on(instance) group_left(region) instance_meta
+)
+/ on(region)
+# 分母：各机房的总请求速率
+sum by (region) (
+    sum by (instance) (rate(http_requests_total[5m]))
+  * on(instance) group_left(region) instance_meta
+)
+```
+
+分子分母都做同样的标签关联，最后两个 `by (region)` 的结果标签一致，一对一匹配成功。
+
+**更优雅的做法：用记录规则预先算好。**
+
+这个查询每次执行都要做两次向量匹配，成本不低。而且写起来很啰嗦。用 recording rule 把「带 region 标签的 QPS」固化下来：
+
+```yaml
+groups:
+  - name: qps-with-meta
+    interval: 30s
+    rules:
+      - record: instance:http_requests:rate5m
+        expr: |
+          sum by (instance, status) (rate(http_requests_total[5m]))
+            * on(instance) group_left(region, az) instance_meta
+
+      - record: region:http_requests:rate5m
+        expr: sum by (region, status) (instance:http_requests:rate5m)
+```
+
+之后查询就简单了：
+
+```promql
+  sum by (region) (region:http_requests:rate5m{status=~"5.."})
+/ sum by (region) (region:http_requests:rate5m)
+```
+
+**更根本的解决方案**：在 Prometheus 的 relabel 配置里就把 `region` 打到所有指标上，从源头避免关联：
+
+```yaml
+scrape_configs:
+  - job_name: 'api'
+    consul_sd_configs:
+      - server: 'consul:8500'
+        services: ['api']
+    relabel_configs:
+      - source_labels: [__meta_consul_dc]
+        target_label: region
+```
+
+**这才是最佳实践**——能在采集时打上的标签，就不要在查询时关联。查询时关联既慢又容易写错。
+
+---
+
+## 3. 找出运行旧版本且 QPS > 10 的实例
+
+```promql
+(
+    sum by (instance, job) (rate(http_requests_total[5m]))
+  * on(instance, job) group_left(version)
+    app_build_info{version="2.3.0"}
+) > 10
+```
+
+**关键点：把版本过滤放在 `app_build_info` 的选择器里。**
+
+因为 `group_left` 的匹配是「左侧必须在右侧找到配对」，右侧只保留 2.3.0 的实例后，左侧只有那些实例能配上，其余的自动被过滤掉。
+
+**另一种写法（用 and）：**
+
+```promql
+sum by (instance, job) (rate(http_requests_total[5m])) > 10
+and on(instance, job)
+app_build_info{version="2.3.0"}
+```
+
+这个写法更简洁，但**结果里不会带上 version 标签**（`and` 只做过滤，不复制标签）。
+
+**选择哪个？**
+
+- 只需要过滤 → 用 `and`，更清晰
+- 还需要在结果里显示版本号 → 用 `group_left(version)`
+
+---
+
+## 4. 为什么 group_left 的标签列表不能省略
+
+**先看省略会怎样：**
+
+```promql
+# 写法 A：省略标签列表
+  sum by (instance) (rate(http_requests_total[5m]))
+* on(instance) group_left
+  app_build_info
+
+# 结果：{instance="10.0.1.5:8080"}  42.3
+#       ↑ 没有 version 标签！
+```
+
+```promql
+# 写法 B：指定标签列表
+  sum by (instance) (rate(http_requests_total[5m]))
+* on(instance) group_left(version)
+  app_build_info
+
+# 结果：{instance="10.0.1.5:8080", version="2.3.1"}  42.3
+#       ↑ version 被复制过来了
+```
+
+**原因：向量匹配的默认规则是「结果只保留左侧的标签」。**
+
+这个规则是必要的——如果自动把右侧所有标签都带过来，很容易产生标签冲突（两边有同名但不同值的标签，比如 `job`），或者引入一堆你不想要的标签（`commit`、`build_time` 等），导致序列意外膨胀。
+
+`group_left(...)` 里的列表就是在说：**「这些右侧标签，我明确要」**。
+
+**几个细节：**
+
+**（1）可以一次带多个标签：**
+
+```promql
+* on(instance) group_left(version, team, commit) app_build_info
+```
+
+**（2）带过来的标签如果和左侧同名，会覆盖左侧的值。** 所以要小心：
+
+```promql
+# 如果左右两边都有 job 标签，group_left(job) 会用右侧的值覆盖左侧
+```
+
+**（3）`group_right` 的语义是镜像的**——它复制的是**左侧**的标签到结果里：
+
+```promql
+  app_build_info
+/ on(instance) group_right(version)
+  sum by (instance) (rate(http_requests_total[5m]))
+```
+
+这里 `group_right(version)` 是从**左侧**（app_build_info）复制 version。记忆方法：**`group_X` 里的标签总是来自「一」的那一侧**（也就是 X 的反方向）。
+
+**（4）即使是一对一匹配，只要想借标签就必须写 `group_left`。**
+
+这一点容易被忽视。上面第 1 题里，每个 instance 只有一条 QPS 和一条 build_info，是标准的一对一。但因为要复制 `version` 标签，仍然必须写 `group_left(version)`——**`group_left` 有两个独立的作用：声明基数关系 + 声明要复制的标签**，用其中任何一个功能都得写它。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 4：设计一套带静默机制的告警">
+为一个微服务集群设计告警，要求：
+
+1. 服务 5xx 错误率超过 2% 时告警，但要避免低流量误报。
+2. 正在进行滚动发布的服务不告警（发布状态由 `deploy_in_progress` 指标表示，值为 1）。
+3. 标记为 `tier="experimental"` 的服务用更宽松的阈值（10%）。
+4. 告警信息里要带上服务的负责团队（来自 `service_meta` 指标的 `team` 标签）。
+
+已有指标：
+
+```text
+http_requests_total{job, instance, status}
+deploy_in_progress{job}  1
+service_meta{job, team, tier}  1
+```
+
+写出完整的告警规则，并解释每个部分的设计考量。
+
+<Answer>
+**参考答案：**
+
+## 完整规则
+
+```yaml
+groups:
+  - name: service-error-rate
+    interval: 30s
+    rules:
+      # ── 记录规则：预计算错误率并附加元数据 ──────────────
+      - record: job:http_errors:ratio5m
+        expr: |
+          (
+            sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+            or
+            sum by (job) (rate(http_requests_total[5m])) * 0
+          )
+          / on(job)
+          sum by (job) (rate(http_requests_total[5m]))
+
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+
+      # ── 告警 1：普通服务，阈值 2% ──────────────────────
+      - alert: ServiceHighErrorRate
+        expr: |
+          (
+            job:http_errors:ratio5m
+            * on(job) group_left(team, tier) service_meta{tier!="experimental"}
+          ) > 0.02
+          and on(job)
+            job:http_requests:rate5m > 1
+          unless on(job)
+            deploy_in_progress == 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "服务 {{ $labels.job }} 错误率超过 2%"
+          description: >-
+            当前错误率 {{ $value | humanizePercentage }}，
+            负责团队 {{ $labels.team }}，已持续 10 分钟
+          runbook_url: "https://wiki.internal/runbooks/high-error-rate"
+
+      # ── 告警 2：实验性服务，阈值 10% ────────────────────
+      - alert: ExperimentalServiceHighErrorRate
+        expr: |
+          (
+            job:http_errors:ratio5m
+            * on(job) group_left(team, tier) service_meta{tier="experimental"}
+          ) > 0.10
+          and on(job)
+            job:http_requests:rate5m > 1
+          unless on(job)
+            deploy_in_progress == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "实验性服务 {{ $labels.job }} 错误率超过 10%"
+          description: >-
+            当前错误率 {{ $value | humanizePercentage }}，
+            负责团队 {{ $labels.team }}
+```
+
+---
+
+## 设计考量逐条解释
+
+### （1）为什么先写记录规则
+
+三个理由：
+
+**性能**：错误率的计算涉及两次 `rate` 和一次向量匹配。两条告警规则都要用它，每 30 秒各算一遍就是浪费。记录规则算一次，两边共享。
+
+**可读性**：`job:http_errors:ratio5m` 这个名字自解释，告警规则的 `expr` 短了一半。
+
+**可复用**：Grafana 大盘也能直接用这个记录规则，保证「告警看到的数字」和「大盘看到的数字」完全一致——这一点在事故复盘时非常重要。
+
+记录规则的命名遵循社区惯例：`聚合级别:指标名:操作`。
+
+### （2）分子里的 `or ... * 0` 是干什么的
+
+```promql
+sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+or
+sum by (job) (rate(http_requests_total[5m])) * 0
+```
+
+**问题**：如果某个服务完全没有 5xx（好事），分子里就没有这个 job 的序列，除法配对失败，这个 job **在结果里彻底消失**。
+
+在告警里这不致命（本来就不该告警）。但在 Grafana 大盘上，「健康的服务不显示」是很反直觉的——你会以为是数据丢了。
+
+**解法**：`sum by (job) (rate(http_requests_total[5m])) * 0` 构造出「所有 job 的 0 值序列」。`or` 的语义是「左侧优先，左侧没有的才取右侧」，所以：
+
+- 有 5xx 的 job → 用真实的 5xx 速率
+- 没有 5xx 的 job → 用 0
+
+### （3）阈值分级：为什么用 group_left 而不是两套指标
+
+```promql
+job:http_errors:ratio5m
+* on(job) group_left(team, tier) service_meta{tier!="experimental"}
+```
+
+这一行同时做了**三件事**：
+
+1. **筛选**：`service_meta{tier!="experimental"}` 只保留非实验性服务，配不上的 job 自动被排除。
+2. **借标签**：`group_left(team, tier)` 把 `team` 和 `tier` 复制到结果里，供告警模板使用。
+3. **不改变数值**：`service_meta` 的值恒为 1，乘法不影响错误率。
+
+**替代方案对比：**
+
+| 方案 | 优点 | 缺点 |
+|---|---|---|
+| 两条规则 + tier 过滤（本方案） | 阈值清晰可见 | 规则重复 |
+| 用 `service_tier_threshold` 指标存阈值 | 阈值可动态调整 | 需要额外维护一个指标源 |
+| Alertmanager 侧按 tier 路由 | 告警规则统一 | 阈值无法分级（只能分级路由） |
+
+**如果服务层级更多（5 个 tier 各有不同阈值）**，第二种方案更好：
+
+```text
+# 用一个指标存每个 tier 的阈值
+service_error_threshold{tier="critical"}     0.005
+service_error_threshold{tier="standard"}     0.02
+service_error_threshold{tier="experimental"} 0.10
+```
+
+```promql
+job:http_errors:ratio5m
+  * on(job) group_left(tier, team) service_meta
+> on(tier) group_left
+  service_error_threshold
+```
+
+一条规则搞定所有层级，阈值改配置不改规则。
+
+### （4）防误报条件：`and on(job) ... > 1`
+
+```promql
+and on(job) job:http_requests:rate5m > 1
+```
+
+**场景**：凌晨 3 点某服务 5 分钟内只有 2 个请求，1 个失败 → 错误率 50% → 半夜被叫醒 → 发现是个爬虫的畸形请求。
+
+**为什么必须写 `on(job)`？** 因为 `and` 左侧经过 `group_left` 后带上了 `team` 和 `tier` 标签，右侧只有 `job`。标签集不同，不加 `on(job)` 会匹配失败，导致**整条告警永远不触发**。
+
+⚠️ **这是最危险的一类错误**：告警规则语法正确、能保存、`promtool` 检查通过，但永远不会触发。**必须实际验证**。
+
+**验证方法**：把 `> 0.02` 临时改成 `> 0`，看是否有结果返回。如果连这样都是空的，说明匹配逻辑坏了。
+
+### （5）发布静默：`unless on(job) deploy_in_progress == 1`
+
+**为什么用 `unless` 而不是 Alertmanager 的 silence？**
+
+| | Alertmanager silence | `unless` 查询层排除 |
+|---|---|---|
+| 触发方式 | 手动创建，或 CI 调 API | 自动（发布系统写指标） |
+| 忘记取消 | 会（silence 有过期时间但可能设太长） | 不会（发布完指标就变 0） |
+| 可观测性 | 要去 Alertmanager UI 查 | 是个指标，可以画在大盘上 |
+| 审计 | 有，但分散 | 有历史时序，可回溯 |
+
+**实现**：CI/CD 流水线在发布开始时向 Pushgateway 写 `deploy_in_progress{job="api"} 1`，发布结束写 0（或删除）。
+
+```bash
+# 发布开始
+echo "deploy_in_progress 1" | curl --data-binary @- \
+  http://pushgateway:9091/metrics/job/deploy/service/api
+
+# 发布结束
+curl -X DELETE http://pushgateway:9091/metrics/job/deploy/service/api
+```
+
+**注意 `on(job)`**：同样因为左侧带了额外标签，必须显式指定匹配键。
+
+**一个改进**：给静默加超时保护，防止发布任务崩溃导致 `deploy_in_progress` 永远是 1：
+
+```promql
+unless on(job)
+  (deploy_in_progress == 1 and (time() - deploy_start_timestamp_seconds) < 1800)
+```
+
+超过 30 分钟的「发布中」状态不再被信任，告警恢复生效。
+
+### （6）for 的取值
+
+```yaml
+for: 10m     # 普通服务
+for: 15m     # 实验性服务
+```
+
+`for` 表示「条件持续满足多久才真正告警」。它过滤掉瞬时抖动。
+
+**为什么实验性服务用更长的 `for`？** 因为它们本来就不稳定，短暂抖动是常态，值班人员不需要为此立即响应。
+
+**`for` 和 `rate` 窗口的关系**：`rate(...[5m])` 本身已经有 5 分钟的平滑，再加 `for: 10m`，实际的告警延迟约 12–15 分钟。对「错误率 2%」这类非致命问题是合适的；对「服务完全挂掉」应该用更短的窗口和 `for`。
+
+### （7）annotations 里的模板函数
+
+```text
+{{ $value | humanizePercentage }}      0.0234 → 2.34%
+{{ $value | humanize }}                1234567 → 1.235M
+{{ $value | humanizeDuration }}        3661 → 1h 1m 1s
+{{ $value | humanize1024 }}            1536 → 1.5Ki
+{{ $labels.job }}                      访问告警序列的标签
+```
+
+`$labels.team` 能用，正是因为前面 `group_left(team, tier)` 把它复制到结果序列上了。**这是 `group_left` 借标签的一个非常实际的价值**——没有它，告警里就没法显示负责团队。
+
+---
+
+## 上线前的验证清单
+
+```bash
+# 1. 语法检查
+promtool check rules /etc/prometheus/rules/service-alerts.yml
+
+# 2. 单元测试（强烈推荐，promtool 支持）
+promtool test rules /etc/prometheus/tests/service-alerts-test.yml
+
+# 3. 在 Web UI 里手动跑 expr，确认返回非空
+#    技巧：把阈值临时调到 0，验证匹配逻辑是通的
+
+# 4. 逐段验证向量匹配
+#    去掉 unless 那段 → 有结果吗？
+#    去掉 and 那段   → 有结果吗？
+#    只留最内层      → 有结果吗？
+
+# 5. 热加载
+curl -X POST http://localhost:9090/-/reload
+
+# 6. 检查规则状态（有没有 evaluation error）
+curl -s http://localhost:9090/api/v1/rules | jq '.data.groups[].rules[] | {name, health, lastError}'
+```
+
+**第 6 步经常被跳过，但很关键**——如果规则里有向量匹配错误（比如 `duplicate series`），Prometheus 不会崩溃，只会在这里记录一个 `lastError`，规则静静地失效。定期检查 `health != "ok"` 的规则应该纳入巡检。
+</Answer>
+</Callout>
+
+## 小结
+
+- **算术运算**（`+ - * / % ^`）：向量↔标量作用于每条序列；向量↔向量要求**标签集完全一致**才能配对，配不上的序列消失。所有算术运算都会**删除指标名**。
+- **比较运算**默认是**过滤器**（保留满足条件的序列，值和标签原样不变）；加 `bool` 变成求值（全部保留，值变 0/1，删除指标名）。标量之间比较必须加 `bool`。
+- **逻辑运算** `and`（交集）/ `or`（并集，左侧优先）/ `unless`（差集）**只看标签不看值**，是告警加条件、加静默的主力工具。
+- **向量匹配**是难点：用 `on(...)` 指定匹配用的标签，或 `ignoring(...)` 指定忽略的标签。
+- **`group_left` / `group_right`** 声明「多」在哪一侧；`group_left(labels)` 还能把右侧的标签**复制到结果里**，这是关联 info 指标（版本、团队、机房）的标准手法。
+- 遇到匹配问题，**把表达式拆成两半单独执行，对比标签集**——90% 的问题在这一步就能定位。
+- 「比值型」表达式在分子为空时整条序列会消失，用 `or ... * 0` 兜底。
+- 告警上线后要检查 `/api/v1/rules` 里的 `health`，向量匹配错误不会让 Prometheus 崩溃，只会让规则静静失效。

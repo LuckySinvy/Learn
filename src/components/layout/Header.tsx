@@ -9,7 +9,7 @@ const CATEGORIES: { label: string; items: Language[] }[] = [
   { label: '编程语言', items: ['python', 'go', 'java', 'rust', 'typescript'] },
   { label: '前端', items: ['react'] },
   { label: '数据库', items: ['mysql', 'redis', 'mongodb', 'clickhouse'] },
-  { label: '中间件', items: ['kafka', 'grafana'] },
+  { label: '中间件', items: ['kafka', 'grafana', 'prometheus'] },
   { label: '工程基础', items: ['linux', 'git', 'http'] },
   { label: 'AI 工程', items: ['rag', 'langchain', 'dify'] },
   { label: '云原生', items: ['k8s'] },

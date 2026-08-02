@@ -1,0 +1,1360 @@
+---
+title: Alertmanager 告警治理
+order: 12
+description: route 路由树、分组去重、抑制与静默、各类 receiver 配置与告警生命周期
+---
+
+# Alertmanager 告警治理
+
+上一章我们让 Prometheus 学会了「发现问题」。但发现之后呢？如果一台交换机故障导致 50 台机器同时失联，Prometheus 会老老实实产生 50 条 `InstanceDown` 告警，加上级联的 200 条业务告警——**250 条通知在 30 秒内涌进值班群**。值班人打开手机，看到的是一片红色刷屏，反而找不到根因。
+
+这就是为什么 Prometheus 把「发现告警」和「处理告警」拆成了两个组件。Prometheus 只负责判断「异常发生了」，剩下的**分组、去重、抑制、静默、路由、发送**，全部交给 Alertmanager。
+
+读完本章你会掌握：
+
+- Alertmanager 的职责边界，以及它为什么必须是独立组件
+- `route` 路由树的匹配算法：`receiver`、`match` / `match_re` / `matchers`、`continue`、子路由继承
+- 四个时间参数 `group_by`、`group_wait`、`group_interval`、`repeat_interval` 各自解决什么问题
+- `inhibit_rules` 抑制规则：让根因告警自动压掉衍生告警
+- `silence` 静默：发布/维护窗口期怎么优雅地闭嘴
+- 四类 receiver：`email`、`webhook`（含完整 JSON 体结构）、`slack`、`pagerduty`
+- 一条告警从 Prometheus 产生到手机响起，中间经过的完整生命周期
+
+## 一、Alertmanager 到底做什么
+
+先划清边界。**Prometheus 只做一件事：按规则求值，把「现在有哪些告警在烧」这个列表反复推送给 Alertmanager。** 它不关心发给谁、发几次、要不要合并。
+
+Alertmanager 拿到告警之后，依次做这几件事：
+
+```text
+接收告警（HTTP POST /api/v2/alerts）
+        到
+去重（Deduplication）—— 多个 Prometheus 副本推来的同一条告警合并成一条
+        到
+静默检查（Silencing）—— 命中静默规则的直接丢弃，不通知
+        到
+抑制检查（Inhibition）—— 被更严重告警压制的，暂时不通知
+        到
+路由（Routing）—— 沿着 route 树找到该由谁接收
+        到
+分组（Grouping）—— 同一组的告警攒在一起，合并成一条通知
+        到
+等待与节流（group_wait / group_interval / repeat_interval）
+        到
+发送（Notification）—— email / webhook / slack / pagerduty ...
+```
+
+<Callout type="info" title="为什么要拆成独立组件">
+三个理由：
+
+1. **高可用不同**。Prometheus 的 HA 是「双副本各存各的」，两个副本会产生两份一模一样的告警；如果通知逻辑在 Prometheus 内部，你会收到两条通知。Alertmanager 通过集群化的去重解决了这个问题——两份告警的标签集完全一致，会被合并成一条。
+2. **状态生命周期不同**。抑制、静默、分组这些都是**跨告警、跨时间**的状态，和「求值某个表达式」是完全不同的关注点。
+3. **可以给多个 Prometheus 共用**。一套 Alertmanager 可以同时服务多个机房、多个团队的 Prometheus，路由和抑制规则统一维护。
+</Callout>
+
+## 二、配置文件总览
+
+```yaml
+# alertmanager.yml
+global:
+  resolve_timeout: 5m                          # 没有 EndsAt 的告警多久后视为已恢复
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alert@example.com'
+  smtp_auth_username: 'alert@example.com'
+  smtp_auth_password_file: '/etc/alertmanager/smtp_pass'
+  smtp_require_tls: true
+  slack_api_url_file: '/etc/alertmanager/slack_url'
+
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'       # 自定义通知模板
+
+route:                                          # 路由树的根节点（必须存在）
+  receiver: 'default-email'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes: []                                    # 子路由
+
+inhibit_rules: []                               # 抑制规则
+
+receivers:                                      # 接收器定义
+  - name: 'default-email'
+    email_configs:
+      - to: 'ops@example.com'
+```
+
+启动：
+
+```bash
+./alertmanager \
+  --config.file=/etc/alertmanager/alertmanager.yml \
+  --storage.path=/var/lib/alertmanager \
+  --web.listen-address=0.0.0.0:9093 \
+  --web.external-url=https://am.example.com
+```
+
+Prometheus 侧要告诉它往哪推：
+
+```yaml
+# prometheus.yml
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'am-1.internal:9093'
+            - 'am-2.internal:9093'
+            - 'am-3.internal:9093'
+```
+
+<Callout type="warn" title="Alertmanager 集群不能放在负载均衡后面">
+一定要把**所有** Alertmanager 实例都列在 `alertmanagers` 里，让 Prometheus 给每一个都推一份。
+
+原因是 Alertmanager 的高可用靠的是实例之间的 **gossip 集群**：每个实例都要收到全量告警，然后通过内部的通知日志（nflog）互相同步「这条通知已经有人发过了」，从而实现去重。如果你在前面放一个负载均衡器，每条告警只有随机一个实例收到，集群状态就残缺了，去重和分组都会出错。
+
+集群通过 `--cluster.peer` 组建：
+
+```bash
+./alertmanager \
+  --cluster.listen-address=0.0.0.0:9094 \
+  --cluster.peer=am-2.internal:9094 \
+  --cluster.peer=am-3.internal:9094
+```
+
+集群内每个实例有一个「位置序号」，位置为 N 的实例会在发送前多等 `N × 15 秒`，等待期间如果收到别人已经发送的同步消息，自己就不发了。这就是去重的实现原理——也解释了为什么集群里的告警通知会比单机稍慢一点。
+</Callout>
+
+## 三、route：路由树
+
+`route` 是一棵树。根节点必须有 `receiver`（兜底接收器），子节点通过 `routes` 嵌套。
+
+### 匹配算法
+
+这是最需要精确理解的部分，一共三条规则：
+
+1. 告警从**根节点**进入，按顺序检查 `routes` 里的每个子节点。
+2. **第一个匹配上的子节点获胜**，告警进入该子节点，然后在它的子节点里递归重复这个过程。匹配上之后，**后面的兄弟节点不再检查**——除非该节点设置了 `continue: true`。
+3. 如果一个节点的所有子节点都不匹配，**就用这个节点自身的配置**处理。
+
+```yaml
+route:
+  receiver: 'default'                    # 兜底：什么都没匹配上时用它
+  group_by: ['alertname', 'cluster']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # 1) 监控系统自身的告警，单独一个通道
+    - receiver: 'monitoring-team'
+      matchers:
+        - job =~ "prometheus|alertmanager"
+
+    # 2) 所有 critical 级别，先抄送一份到值班电话
+    - receiver: 'pagerduty'
+      matchers:
+        - severity = "critical"
+      group_wait: 10s                    # 紧急，少等一会儿
+      continue: true                     # 关键：继续往下匹配
+
+    # 3) 按团队分流
+    - receiver: 'team-backend'
+      matchers:
+        - team = "backend"
+      routes:
+        # 后端团队内部，数据库相关的再细分
+        - receiver: 'dba-group'
+          matchers:
+            - component =~ "mysql|redis|postgres"
+
+    - receiver: 'team-frontend'
+      matchers:
+        - team = "frontend"
+```
+
+用一条 `severity="critical", team="backend", component="mysql"` 的告警走一遍：
+
+```text
+根节点 → 检查子节点 1：job 不匹配，跳过
+       → 检查子节点 2：severity=critical 匹配！
+                       进入 pagerduty，且 continue: true
+       → 因为 continue，继续检查子节点 3：team=backend 匹配！
+                       进入 team-backend，检查它的子节点：
+                       component=mysql 匹配 → 最终落在 dba-group
+       → 子节点 3 没有 continue，停止
+
+结果：这条告警会同时发给 pagerduty 和 dba-group 两个接收器
+```
+
+<Callout type="tip" title="continue 是实现「一条告警多处送达」的唯一手段">
+默认 `continue: false`，即「first match wins」。想让同一条告警既打电话又进群，就必须在前面那个节点上加 `continue: true`。
+
+常见模式：把「critical 全部抄送 PagerDuty」这条规则放在**最前面**并设 `continue: true`，后面再按团队分流。这样既保证了紧急告警不会因为团队路由配错而漏掉，又保留了正常的分流逻辑。
+</Callout>
+
+### matchers vs match / match_re
+
+Alertmanager 有新旧两套匹配语法：
+
+```yaml
+# 旧写法（0.22 起标记为废弃，但仍可用）
+- receiver: 'team-backend'
+  match:                          # 精确相等，键值对形式
+    team: backend
+    severity: critical
+  match_re:                       # 正则匹配
+    service: '^(api|worker)$'
+
+# 新写法（推荐）
+- receiver: 'team-backend'
+  matchers:
+    - team = "backend"
+    - severity = "critical"
+    - service =~ "api|worker"
+```
+
+新语法 `matchers` 是一个字符串**列表**，每一项用类似 PromQL 选择器的语法，支持四种操作符：
+
+| 操作符 | 含义 |
+| --- | --- |
+| `=` | 等于 |
+| `!=` | 不等于 |
+| `=~` | 正则匹配 |
+| `!~` | 正则不匹配 |
+
+同一个节点上的多个 matcher 是「**与**」的关系，全部满足才算匹配。
+
+<Callout type="warn" title="matchers 里的正则同样是全串锚定的">
+和 relabel 一样，`service =~ "api"` **匹配不上** `api-gateway`。要写成 `service =~ "api.*"`。
+
+另外注意值必须加引号：`severity = "critical"` 才是标准写法。虽然某些简单值不加引号也能解析，但含有空格、逗号、正则特殊字符时不加引号一定会出错，统一加上最省心。
+</Callout>
+
+### 子路由继承
+
+子路由会**继承父节点所有未显式设置的字段**，包括 `group_by`、`group_wait`、`group_interval`、`repeat_interval`。这让配置可以很简洁：根节点定好默认值，子节点只覆盖需要不同的那几项。
+
+```yaml
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'cluster']
+  group_wait: 30s
+  repeat_interval: 4h
+  routes:
+    - receiver: 'pagerduty'
+      matchers: [ 'severity = "critical"' ]
+      group_wait: 10s              # 只覆盖这一项
+      repeat_interval: 30m         # 和这一项
+      # group_by 和 group_interval 继承自根节点
+```
+
+<Callout type="tip" title="用 amtool 验证路由，别靠脑补">
+路由树一复杂就很难在脑子里推演。Alertmanager 自带的 `amtool` 可以直接告诉你某组标签会落到哪个接收器：
+
+```bash
+# 查看路由树的可视化结构
+amtool config routes --config.file=alertmanager.yml
+
+# 测试一组标签会命中哪些 receiver
+amtool config routes test \
+  --config.file=alertmanager.yml \
+  severity=critical team=backend component=mysql
+```
+
+输出会直接列出匹配到的接收器名字。改完路由配置务必跑一遍，尤其是有 `continue` 的时候。
+</Callout>
+
+<Callout type="exercise" title="练习 1：设计一棵路由树">
+按下面的需求设计 `route` 配置：
+
+- 默认所有告警发到 `#alerts-general` Slack 频道。
+- 所有 `severity=critical` 的告警，**无论属于哪个团队**，都要额外发一份到 PagerDuty（不影响它继续按团队分流）。
+- `team=payment` 的告警发到 `#pay-alerts`，其中 `component=database` 的再单独发给 DBA 邮件组。
+- `team=infra` 的告警发到 `#infra-alerts`。
+- 监控系统自身的告警（`job` 是 `prometheus` 或 `alertmanager`）发给 `#monitoring`，且不要走团队分流。
+- critical 级别希望 10 秒内就发出，且每 30 分钟重复提醒一次；其余告警按默认的 30 秒 / 4 小时。
+
+<Answer>
+```yaml
+route:
+  receiver: 'slack-general'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # ---- 1) 监控系统自身：最优先，且不 continue ----
+    - receiver: 'slack-monitoring'
+      matchers:
+        - job =~ "prometheus|alertmanager|pushgateway"
+
+    # ---- 2) critical 抄送 PagerDuty，然后继续分流 ----
+    - receiver: 'pagerduty-oncall'
+      matchers:
+        - severity = "critical"
+      group_wait: 10s
+      repeat_interval: 30m
+      continue: true
+
+    # ---- 3) 支付团队 ----
+    - receiver: 'slack-payment'
+      matchers:
+        - team = "payment"
+      routes:
+        - receiver: 'email-dba'
+          matchers:
+            - component = "database"
+
+    # ---- 4) 基础设施团队 ----
+    - receiver: 'slack-infra'
+      matchers:
+        - team = "infra"
+```
+
+**关键设计点：**
+
+**① 顺序决定一切**
+
+监控系统自身的告警放在**最前面**且不加 `continue`。这是刻意的：如果它排在 critical 规则后面，一条 `severity=critical` 的 Prometheus 自身告警会先被 PagerDuty 规则命中并 `continue`，然后继续往下——但它没有 `team` 标签，最终会落回根节点的 `slack-general`，而不是我们期望的 `#monitoring`。
+
+需求里明确说「不要走团队分流」，所以它必须排第一且 `continue: false`。
+
+**② continue: true 只加在 PagerDuty 那一条上**
+
+这是「一条告警多处送达」的唯一实现方式。加了之后，一条 `severity=critical, team=payment, component=database` 的告警会：
+
+```text
+子节点 1（job 匹配）→ 不匹配，跳过
+子节点 2（critical）→ 匹配！进入 pagerduty-oncall
+                     因为 continue: true，继续检查兄弟节点
+子节点 3（payment） → 匹配！进入 slack-payment
+                     检查其子节点：component=database 匹配
+                     最终落在 email-dba
+子节点 3 无 continue → 停止
+
+结果：pagerduty-oncall + email-dba
+```
+
+注意最后落的是 `email-dba` 而**不是** `slack-payment`——因为子节点匹配上了，就由子节点接管。如果希望支付团队的 Slack 也收到一份，要在 `email-dba` 那条上也加 `continue: true`：
+
+```yaml
+      routes:
+        - receiver: 'email-dba'
+          matchers:
+            - component = "database"
+          continue: true
+```
+
+但这样写有个陷阱：`continue: true` 之后会继续检查**兄弟节点**，而 `email-dba` 没有兄弟节点，所以继续检查的结果是「都不匹配」，于是回落到**父节点** `slack-payment` 自身。效果恰好是我们想要的：DBA 邮件 + 支付团队 Slack 都收到。
+
+**③ 嵌套路由的层级**
+
+DBA 那条是写在 `slack-payment` 的 `routes` 里面，而不是和它平级。这样它天然继承了「必须先是 payment 团队」这个前提，不需要重复写 `team = "payment"`。
+
+如果写成平级：
+
+```yaml
+# 不推荐
+- receiver: 'email-dba'
+  matchers:
+    - team = "payment"
+    - component = "database"
+- receiver: 'slack-payment'
+  matchers:
+    - team = "payment"
+```
+
+功能上等价，但顺序变得极其重要（DBA 那条必须在前面，否则永远匹配不到），而且条件重复，改起来容易漏。**能嵌套就嵌套。**
+
+**④ 时间参数只覆盖需要的**
+
+PagerDuty 那条只写了 `group_wait: 10s` 和 `repeat_interval: 30m`，`group_by` 和 `group_interval` 继承自根节点。
+
+**验证：**
+
+```bash
+amtool config routes --config.file=alertmanager.yml
+
+amtool config routes test --config.file=alertmanager.yml \
+  severity=critical team=payment component=database
+# 期望输出：pagerduty-oncall, email-dba
+
+amtool config routes test --config.file=alertmanager.yml \
+  job=prometheus severity=critical
+# 期望输出：slack-monitoring（只有这一个）
+```
+</Answer>
+</Callout>
+
+## 四、分组与四个时间参数
+
+### group_by：怎么把告警攒成一堆
+
+回到开头那个场景：交换机故障导致 50 台机器失联。如果 `group_by: ['alertname', 'cluster']`，这 50 条 `InstanceDown` 会被合并成**一条通知**，正文里列出 50 个实例。
+
+```yaml
+group_by: ['alertname', 'cluster', 'service']
+```
+
+含义：`alertname`、`cluster`、`service` 这三个标签值**完全相同**的告警归为一组，一组只发一条通知。
+
+两个特殊取值：
+
+- `group_by: []`（空数组，也是不写时的默认行为）：**所有告警归为一个大组**。适合告警量极少的小环境，量一大就会把不相干的东西混在一起。
+- `group_by: ['...']`（字面上的三个点，注意是字符串）：**完全关闭分组**，每条告警都是独立的一组、独立发一条通知。适合下游系统需要逐条处理的场景（比如对接工单系统）。
+
+<Callout type="warn" title="group_by 里必须包含你想「分开看」的维度">
+如果 `group_by: ['alertname']`，那么 A 集群和 B 集群的 `InstanceDown` 会被塞进同一条通知里。收到通知的人得自己从正文里分辨哪些是自己负责的。
+
+反过来，如果 `group_by` 写得太细（比如把 `instance` 也加进去），50 台机器就是 50 个组、50 条通知——分组等于没做。
+
+**经验法则**：`group_by` 应该包含「决定这条通知该由谁看、是同一件事」的那些标签，通常是 `alertname` + 环境/集群维度 + 服务维度。**绝对不要包含 `instance`**，那是最需要被聚合掉的维度。
+</Callout>
+
+### 三个时间参数
+
+| 参数 | 默认值 | 回答的问题 |
+| --- | --- | --- |
+| `group_wait` | 30s | 一个**新组**第一次出现，等多久再发第一条通知？ |
+| `group_interval` | 5m | 一个**已发过通知**的组里来了新告警，等多久再发？ |
+| `repeat_interval` | 4h | 组的内容**没有变化**，多久重复提醒一次？ |
+
+用时间轴理解：
+
+```text
+10:00:00  第一条 InstanceDown 到达 → 新组建立，开始等 group_wait
+10:00:05  又来了 30 条同组告警 → 一起攒着
+10:00:30  group_wait 到期 → 发出第 1 条通知，包含 31 条告警
+10:01:00  又来了 19 条同组告警 → 组内容变了，但要等 group_interval
+10:05:30  group_interval 到期 → 发出第 2 条通知，包含全部 50 条
+10:05:30  之后组内容不再变化
+14:05:30  repeat_interval 到期 → 发出第 3 条通知（提醒「还没解决」）
+```
+
+<Callout type="info" title="group_wait 的意义：给「同时发生的事」一点汇合时间">
+交换机故障导致的 50 条告警不会在同一毫秒到达——Prometheus 每 15 秒求值一次，不同 job 的求值时刻也不一致，所以它们会在几十秒内陆续抵达。
+
+`group_wait` 就是那个「等一等，看还有没有同伙」的缓冲。设 0 秒的话，第一条告警立刻发出去，剩下 49 条要等到 `group_interval`（默认 5 分钟）之后才发第二条——反而更慢、更碎。
+
+设太长（比如 5 分钟）则会延误响应。**30 秒是官方默认值，也是绝大多数场景的合理值**；紧急通道可以缩到 10 秒。
+</Callout>
+
+<Callout type="warn" title="repeat_interval 实际生效的粒度是 group_interval 的整数倍">
+Alertmanager 是按 `group_interval` 的节奏「巡检」每个组的。所以你设 `repeat_interval: 3h`、`group_interval: 5m`，实际重复提醒的时刻会落在 3 小时之后最近的那个 5 分钟刻度上，可能是 3 小时 2 分。
+
+一个更要命的配错是把 `repeat_interval` 设得比 `group_interval` 还小（比如 `repeat_interval: 1m`、`group_interval: 5m`）——重复间隔被 `group_interval` 卡住，最快也只能 5 分钟一次，你以为的「1 分钟催一次」根本不会发生。
+
+另外，`repeat_interval` 设得太短是**告警疲劳**的头号原因。critical 用 30 分钟到 1 小时，warning 用 4 到 12 小时，是比较健康的区间。
+</Callout>
+
+## 五、inhibit_rules：让根因压掉衍生告警
+
+分组解决的是「同一类告警太多」，抑制解决的是「**不同类但有因果关系**的告警同时响」。
+
+经典场景：整个机房断网。此时会同时触发：
+
+- `DatacenterDown`（severity: critical）
+- 50 条 `InstanceDown`（severity: critical）
+- 200 条 `ServiceUnavailable`（severity: warning）
+
+你只想收到第一条。
+
+```yaml
+inhibit_rules:
+  # 规则 1：机房级故障压掉实例级故障
+  - source_matchers:
+      - alertname = "DatacenterDown"
+    target_matchers:
+      - alertname = "InstanceDown"
+    equal: ['cluster']
+
+  # 规则 2：同一个服务上，critical 压掉 warning
+  - source_matchers:
+      - severity = "critical"
+    target_matchers:
+      - severity = "warning"
+    equal: ['alertname', 'cluster', 'service']
+
+  # 规则 3：实例宕机时，不用再报它上面的服务不可用
+  - source_matchers:
+      - alertname = "InstanceDown"
+    target_matchers:
+      - alertname = "ServiceUnavailable"
+    equal: ['instance']
+```
+
+语义拆解：**当存在一条处于 firing 状态的、匹配 `source_matchers` 的告警，并且它与某条匹配 `target_matchers` 的告警在 `equal` 列出的所有标签上取值完全相同时，后者被静音（不发通知）。**
+
+`equal` 是这里的灵魂。没有它，规则 2 会变成「任何一条 critical 压掉全世界所有 warning」，那显然不对。加上 `equal: ['alertname', 'cluster', 'service']` 之后，只有「同一个集群、同一个服务、同一个告警名」的 critical 才会压掉对应的 warning。
+
+<Callout type="warn" title="告警不会抑制自己">
+规则 2 有个看起来很危险的地方：一条同时匹配 `source_matchers` 和 `target_matchers` 的告警会不会把自己压掉？
+
+不会。Alertmanager 明确做了处理：**如果一条告警同时匹配 source 和 target，且 `equal` 的标签值完全相同（也就是它和自己），它不会抑制自己。**
+
+但要小心另一种情况：如果 `equal` 列表**遗漏了区分性标签**，两条本来不同的告警可能被误判成「同一件事」而互相抑制。比如规则 2 如果只写 `equal: ['alertname']`，那么 A 服务的 critical 会压掉 B 服务的 warning——只要它们碰巧同名。
+
+**原则：`equal` 里要列全所有「表明这是同一个故障对象」的标签。宁可多列，不要少列。**
+</Callout>
+
+<Callout type="info" title="旧语法 source_match / target_match">
+和 route 一样，抑制规则也有旧语法：
+
+```yaml
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    source_match_re:
+      service: '^(api|web)$'
+    equal: ['alertname', 'cluster']
+```
+
+`source_match` / `target_match` 是精确匹配的键值对，`source_match_re` / `target_match_re` 是正则版。0.22 之后推荐统一用 `source_matchers` / `target_matchers` 列表语法，表达力更强也更一致。老配置能继续跑，但新写的建议用新语法。
+</Callout>
+
+<Callout type="exercise" title="练习 2：分组与抑制的综合配置">
+你的环境里有这些告警：
+
+- `NodeDown`（severity: critical，标签 `cluster`、`instance`）
+- `NodeDiskFull`（severity: critical，标签 `cluster`、`instance`、`mountpoint`）
+- `NodeDiskWarning`（severity: warning，标签 `cluster`、`instance`、`mountpoint`）
+- `AppUnavailable`（severity: critical，标签 `cluster`、`instance`、`app`）
+- `AppHighLatency`（severity: warning，标签 `cluster`、`instance`、`app`）
+
+现在的问题是：一台机器宕机，会同时收到 `NodeDown` + 3 条 `AppUnavailable` + 5 条 `AppHighLatency`，共 9 条通知。磁盘快满时会同时收到 `NodeDiskFull` 和 `NodeDiskWarning` 两条。
+
+请配置 `group_by` 和 `inhibit_rules` 解决这两个问题，并说明为什么 `equal` 要那样写。
+
+<Answer>
+```yaml
+route:
+  receiver: 'default'
+  # 按「告警名 + 集群」分组：同一集群同一类告警合并成一条通知
+  group_by: ['alertname', 'cluster']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+inhibit_rules:
+  # ---- 规则 1：节点宕机，压掉这台机器上的所有应用告警 ----
+  - source_matchers:
+      - alertname = "NodeDown"
+    target_matchers:
+      - alertname =~ "AppUnavailable|AppHighLatency"
+    equal: ['cluster', 'instance']
+
+  # ---- 规则 2：节点宕机，也压掉这台机器上的磁盘告警 ----
+  - source_matchers:
+      - alertname = "NodeDown"
+    target_matchers:
+      - alertname =~ "NodeDisk.*"
+    equal: ['cluster', 'instance']
+
+  # ---- 规则 3：磁盘 Full 压掉同一挂载点的 Warning ----
+  - source_matchers:
+      - alertname = "NodeDiskFull"
+    target_matchers:
+      - alertname = "NodeDiskWarning"
+    equal: ['cluster', 'instance', 'mountpoint']
+
+  # ---- 规则 4：应用不可用压掉同一应用的延迟告警 ----
+  - source_matchers:
+      - alertname = "AppUnavailable"
+    target_matchers:
+      - alertname = "AppHighLatency"
+    equal: ['cluster', 'instance', 'app']
+```
+
+**效果验证：**
+
+场景一，`10.0.0.5` 这台机器宕机：
+
+```text
+产生：NodeDown × 1 + AppUnavailable × 3 + AppHighLatency × 5 = 9 条
+
+规则 1 生效：NodeDown 与 3 条 AppUnavailable 的 cluster、instance 相同
+            → 3 条被抑制
+            NodeDown 与 5 条 AppHighLatency 的 cluster、instance 相同
+            → 5 条被抑制
+
+最终通知：1 条（NodeDown）
+```
+
+场景二，`/data` 分区快满：
+
+```text
+产生：NodeDiskFull × 1 + NodeDiskWarning × 1
+
+规则 3 生效：两者 cluster、instance、mountpoint 全部相同
+            → NodeDiskWarning 被抑制
+
+最终通知：1 条（NodeDiskFull）
+```
+
+**为什么 equal 要这样写 —— 逐条分析：**
+
+**规则 1 用 `['cluster', 'instance']`**
+
+必须有 `instance`：这是「同一台机器」的判据。如果省略它，只写 `equal: ['cluster']`，后果是**集群里任何一台机器宕机，都会压掉整个集群所有机器上的应用告警**——真出大故障时你什么都收不到，这是灾难性的误配。
+
+必须有 `cluster`：不同集群可能出现相同的 `instance` 值（比如两个机房都有 `10.0.0.5` 这个内网 IP）。少了 `cluster`，A 机房的宕机会误压 B 机房的告警。
+
+不能有 `app`：`NodeDown` 这条告警上**根本没有 `app` 标签**。`equal` 要求两边该标签的值相等——而「都不存在」在 Alertmanager 的语义里也算相等（都是空值），所以加上去虽然不会直接报错，但会让匹配行为变得难以推理。**`equal` 里应该只放两边都确实存在的标签。**
+
+**规则 3 用 `['cluster', 'instance', 'mountpoint']`**
+
+`mountpoint` 是关键。一台机器可能有多个分区：`/` 满了（Full），`/data` 只是偏高（Warning）。如果 `equal` 里没有 `mountpoint`，`/` 的 Full 会把 `/data` 的 Warning 一起压掉——而那是两个独立的问题，压掉之后 `/data` 真的满了你也不会知道。
+
+**规则 4 用 `['cluster', 'instance', 'app']`**
+
+同理，一台机器上跑多个应用。A 应用挂了不应该掩盖 B 应用的延迟问题。
+
+**规则 2 的存在意义：**
+
+机器宕机时，磁盘指标也会停止上报。如果磁盘告警是基于 `for` 的，可能在机器彻底失联前的最后一刻触发并保持 firing 一段时间。加上规则 2 能让通知更干净。
+
+---
+
+**为什么 group_by 选 `['alertname', 'cluster']`：**
+
+- 包含 `alertname`：不同类型的问题分开通知，否则「磁盘满」和「应用挂」混在一条消息里，可读性极差。
+- 包含 `cluster`：不同集群通常由不同的人负责，且是排障时的第一层定位维度。
+- **不包含 `instance`**：这正是要被聚合掉的维度。如果加进去，10 台机器同时磁盘满就是 10 条通知，分组完全失去意义。加了 `instance` 之后再配抑制规则也救不回来——抑制只对有因果关系的告警起作用，10 台机器各自磁盘满之间没有因果关系。
+- 不包含 `mountpoint` / `app`：同理，这些细节应该在通知**正文**里列出，而不是拿来切分通知。
+
+---
+
+**抑制规则的调试方法：**
+
+Alertmanager 的 Web UI（`http://alertmanager:9093`）会把被抑制的告警显示为灰色/带 "inhibited" 标记，不会直接消失。这非常重要——它让你能确认「是被正确抑制了」还是「压根没触发」。
+
+命令行同样能查：
+
+```bash
+# 列出所有告警，含被抑制的
+amtool alert query --alertmanager.url=http://localhost:9093
+
+# 只看被抑制的
+amtool alert query --alertmanager.url=http://localhost:9093 --inhibited
+
+# 校验配置文件
+amtool check-config alertmanager.yml
+```
+
+**上线抑制规则前的自检**：想清楚「如果 `equal` 里少写一个标签，最坏会误压掉什么」。抑制配错的后果是**该响的告警静默失效**，比多收几条通知严重得多。
+</Answer>
+</Callout>
+
+## 六、silence：临时闭嘴
+
+抑制是**基于规则的自动静音**，静默（silence）是**基于时间窗口的手动静音**。典型场景：计划内的发布、机房搬迁、数据库维护。
+
+静默由一组 matcher 加一个时间区间定义。在这个窗口内，命中 matcher 的告警**依然会被 Alertmanager 接收和展示，但不发送任何通知**。
+
+### Web UI
+
+打开 `http://alertmanager:9093`，点 "Silences" → "New Silence"，填写：
+
+- **Matchers**：比如 `service = payment`、`cluster = prod-bj`
+- **Start / End**：起止时间，或直接填 Duration
+- **Creator**：谁创建的（必填，方便追责）
+- **Comment**：为什么静默（必填，写清楚原因和关联的变更单号）
+
+更省事的做法：在 UI 的告警列表里点某条告警右边的 "Silence" 按钮，它会自动用这条告警的全部标签预填 matcher，你只要改一改、缩小范围就行。
+
+### amtool 命令行
+
+```bash
+# 创建静默：支付服务静默 2 小时
+amtool silence add \
+  --alertmanager.url=http://localhost:9093 \
+  --duration=2h \
+  --author="zhangsan" \
+  --comment="发布 v2.3.1，变更单 CHG-1024" \
+  service=payment cluster=prod-bj
+
+# 用正则匹配
+amtool silence add 'alertname=~"NodeDisk.*"' --duration=6h --comment="磁盘扩容中"
+
+# 查询当前生效的静默
+amtool silence query
+
+# 查询即将过期的
+amtool silence query --within=1h
+
+# 提前结束一个静默
+amtool silence expire <SILENCE_ID>
+
+# 批量结束所有静默（慎用）
+amtool silence expire $(amtool silence query -q)
+```
+
+<Callout type="warn" title="静默的三个纪律">
+1. **永远设置结束时间，不要创建「永久静默」**。人会忘记，忘记之后那个服务就永远处于监控盲区。真需要长期屏蔽，说明这条告警规则本身有问题，应该去改规则而不是靠静默盖住。
+2. **matcher 要尽可能精确**。为了发布一个服务而静默 `cluster=prod`，等于把整个生产环境的监控关了两小时。只静默确实会受影响的那部分。
+3. **comment 必须写清原因和关联单号**。半夜有人发现某个告警没响，第一件事就是去查有没有静默；一个写着「测试」的静默会让排查陷入僵局。
+
+进阶做法：把静默的创建/删除接入发布流水线。发布开始时用 `amtool` 自动创建静默，发布结束自动 expire，既不会忘记关，范围也天然精确。
+</Callout>
+
+<Callout type="info" title="静默 vs 抑制 vs 关闭规则">
+三者容易混淆，一句话区分：
+
+- **静默（silence）**：临时的、手动的、有明确时间窗口的。用于「我知道这段时间会响，别烦我」。
+- **抑制（inhibit）**：长期的、自动的、基于因果关系的。用于「有更严重的告警在了，这条是衍生的」。
+- **删规则**：永久的。用于「这条告警本身就不该存在」。
+
+如果你发现自己反复给同一条告警创建静默，那说明它属于第三类——去改规则或调阈值，别在 Alertmanager 上打补丁。
+</Callout>
+
+## 七、receivers：把通知送出去
+
+一个 receiver 有一个 `name` 和若干具体渠道配置。**同一个 receiver 里可以配多个渠道，也可以同一渠道配多份**（比如发给两个邮件组）。
+
+### email
+
+```yaml
+receivers:
+  - name: 'ops-email'
+    email_configs:
+      - to: 'ops@example.com, sre@example.com'
+        from: 'alert@example.com'
+        smarthost: 'smtp.example.com:587'
+        auth_username: 'alert@example.com'
+        auth_password_file: '/etc/alertmanager/smtp_pass'
+        require_tls: true
+        send_resolved: true            # 默认 false！恢复时也发一封
+        headers:
+          Subject: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .Alerts | len }} 条)'
+        html: '{{ template "email.default.html" . }}'
+```
+
+如果 `global` 里已经配了 `smtp_*`，这里就只需要写 `to`。
+
+### webhook：最通用的出口
+
+对接企业微信、钉钉、飞书、自研工单系统，全靠它。
+
+```yaml
+receivers:
+  - name: 'webhook-dingtalk'
+    webhook_configs:
+      - url: 'http://dingtalk-webhook:8060/dingtalk/ops/send'
+        send_resolved: true            # webhook 默认就是 true
+        max_alerts: 0                  # 单次最多带多少条告警，0 表示不限
+        http_config:
+          authorization:
+            credentials_file: '/etc/alertmanager/webhook_token'
+```
+
+Alertmanager POST 出去的 JSON 体结构是固定的（`version` 目前是 `"4"`）：
+
+```json
+{
+  "version": "4",
+  "groupKey": "{}:{alertname=\"HighErrorRate\", cluster=\"prod-bj\"}",
+  "truncatedAlerts": 0,
+  "status": "firing",
+  "receiver": "webhook-dingtalk",
+  "groupLabels": {
+    "alertname": "HighErrorRate",
+    "cluster": "prod-bj"
+  },
+  "commonLabels": {
+    "alertname": "HighErrorRate",
+    "cluster": "prod-bj",
+    "severity": "critical",
+    "team": "backend"
+  },
+  "commonAnnotations": {
+    "runbook_url": "https://wiki.internal/runbooks/high-error-rate"
+  },
+  "externalURL": "https://am.example.com",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "HighErrorRate",
+        "cluster": "prod-bj",
+        "service": "order-api",
+        "severity": "critical",
+        "team": "backend"
+      },
+      "annotations": {
+        "summary": "order-api 错误率超过 5%",
+        "description": "当前错误率 7.32%，已持续 5 分钟以上。"
+      },
+      "startsAt": "2026-08-02T10:15:30.123Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "https://prom.example.com/graph?g0.expr=...",
+      "fingerprint": "a1b2c3d4e5f67890"
+    }
+  ]
+}
+```
+
+字段含义速查：
+
+| 字段 | 含义 |
+| --- | --- |
+| `status` | 整组的状态，`firing` 或 `resolved` |
+| `groupKey` | 这个组的唯一标识，可用于幂等处理 |
+| `truncatedAlerts` | 因 `max_alerts` 被截断掉的告警条数 |
+| `groupLabels` | `group_by` 里那些标签的取值 |
+| `commonLabels` | 组内**所有**告警都共有的标签 |
+| `commonAnnotations` | 组内所有告警都共有的注解 |
+| `alerts` | 告警数组，每条是一个独立告警 |
+| `alerts[].status` | 单条告警的状态，可能与组的 `status` 不同 |
+| `alerts[].endsAt` | 未恢复时是零值时间 `0001-01-01T00:00:00Z` |
+| `alerts[].fingerprint` | 标签集的哈希，同一条告警的稳定 ID |
+
+<Callout type="warn" title="写 webhook 接收端时的三个必备处理">
+1. **必须幂等**。Alertmanager 会因为 `repeat_interval`、网络重试等原因重复投递同一条告警。用 `fingerprint` 加 `startsAt` 做去重键。
+2. **必须处理 resolved**。整组的 `status` 是 `firing` 时，`alerts` 数组里也**可能混有** `status` 为 `resolved` 的单条告警（组里一部分恢复了一部分还烧着）。要按每条的 `status` 分别处理，而不是只看外层。
+3. **必须快速返回 2xx**。Alertmanager 有超时，接收端处理慢会导致重试和堆积。正确做法是收到后立刻入队返回 200，异步处理。
+</Callout>
+
+### slack
+
+```yaml
+receivers:
+  - name: 'slack-critical'
+    slack_configs:
+      - api_url_file: '/etc/alertmanager/slack_webhook_url'
+        channel: '#alerts-critical'
+        send_resolved: true            # 默认 false
+        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+        text: >-
+          {{ range .Alerts }}
+          *{{ .Labels.service }}*: {{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end }}
+        actions:
+          - type: button
+            text: '查看 Runbook'
+            url: '{{ .CommonAnnotations.runbook_url }}'
+```
+
+### pagerduty
+
+```yaml
+receivers:
+  - name: 'pagerduty-oncall'
+    pagerduty_configs:
+      - routing_key_file: '/etc/alertmanager/pd_routing_key'   # Events API v2
+        severity: '{{ if eq .CommonLabels.severity "critical" }}critical{{ else }}warning{{ end }}'
+        description: '{{ .CommonLabels.alertname }} - {{ .CommonLabels.cluster }}'
+        send_resolved: true            # 默认 true
+        details:
+          service: '{{ .CommonLabels.service }}'
+          runbook: '{{ .CommonAnnotations.runbook_url }}'
+```
+
+PagerDuty 会自动处理告警的 trigger / resolve 配对，所以 `send_resolved` 保持默认的 `true` 很重要——否则事件永远不会自动关闭。
+
+<Callout type="info" title="send_resolved 的默认值各不相同，别想当然">
+这是一个非常容易踩的坑，不同渠道的默认值不一致：
+
+| 渠道 | `send_resolved` 默认值 |
+| --- | --- |
+| `email_configs` | `false` |
+| `slack_configs` | `false` |
+| `webhook_configs` | `true` |
+| `pagerduty_configs` | `true` |
+| `wechat_configs` | `false` |
+
+如果你发现「告警响了但恢复了没通知」，第一件事就是检查这个字段。反过来，如果嫌恢复通知太吵，也是改这里。**建议所有渠道都显式写出来，不要依赖默认值。**
+</Callout>
+
+<Callout type="exercise" title="练习 3：解读一次 webhook 投递">
+你的 webhook 接收端收到了下面这个请求体。请回答：(1) 这一组包含几条告警，各是什么状态？(2) 通知系统该发几条消息、内容怎么组织？(3) 从 `groupLabels` 能反推出 Alertmanager 的 `group_by` 是怎么配的吗？(4) 如果接收端把这次投递处理失败了，会发生什么？
+
+```json
+{
+  "version": "4",
+  "groupKey": "{}:{alertname=\"DiskSpaceLow\", cluster=\"prod-sh\"}",
+  "truncatedAlerts": 0,
+  "status": "firing",
+  "receiver": "webhook-ops",
+  "groupLabels": { "alertname": "DiskSpaceLow", "cluster": "prod-sh" },
+  "commonLabels": { "alertname": "DiskSpaceLow", "cluster": "prod-sh", "severity": "warning" },
+  "commonAnnotations": {},
+  "externalURL": "https://am.example.com",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": { "alertname": "DiskSpaceLow", "cluster": "prod-sh", "instance": "10.1.0.7:9100", "mountpoint": "/data", "severity": "warning" },
+      "annotations": { "summary": "10.1.0.7:9100 磁盘空间不足", "description": "挂载点 /data 剩余 12.3%" },
+      "startsAt": "2026-08-02T09:40:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "fingerprint": "aaa111"
+    },
+    {
+      "status": "firing",
+      "labels": { "alertname": "DiskSpaceLow", "cluster": "prod-sh", "instance": "10.1.0.8:9100", "mountpoint": "/", "severity": "warning" },
+      "annotations": { "summary": "10.1.0.8:9100 磁盘空间不足", "description": "挂载点 / 剩余 8.1%" },
+      "startsAt": "2026-08-02T09:42:30Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "fingerprint": "bbb222"
+    },
+    {
+      "status": "resolved",
+      "labels": { "alertname": "DiskSpaceLow", "cluster": "prod-sh", "instance": "10.1.0.9:9100", "mountpoint": "/var", "severity": "warning" },
+      "annotations": { "summary": "10.1.0.9:9100 磁盘空间不足", "description": "挂载点 /var 剩余 14.8%" },
+      "startsAt": "2026-08-02T09:10:00Z",
+      "endsAt": "2026-08-02T09:55:00Z",
+      "fingerprint": "ccc333"
+    }
+  ]
+}
+```
+
+<Answer>
+**(1) 三条告警，两条 firing 一条 resolved**
+
+| 实例 | 挂载点 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| `10.1.0.7:9100` | `/data` | firing | `endsAt` 是零值时间，表示尚未恢复 |
+| `10.1.0.8:9100` | `/` | firing | 同上 |
+| `10.1.0.9:9100` | `/var` | resolved | `endsAt` 有真实时间 `09:55:00Z`，已恢复 |
+
+**关键点：外层 `status` 是 `"firing"`，但组里混着一条 `resolved`。**
+
+外层 `status` 的规则是：只要组内**还有任何一条**告警处于 firing，整组就是 firing；只有全部恢复时才是 resolved。所以**绝对不能只看外层 status 就认为所有告警都在烧**，必须遍历 `alerts` 数组逐条判断。这是写 webhook 接收端最常见的 bug。
+
+**(2) 发一条消息，正文里分区展示**
+
+按 Alertmanager 的设计意图，一次 webhook 投递 = 一条通知。硬拆成三条消息就白白浪费了分组能力。合理的消息组织：
+
+```text
+【告警】DiskSpaceLow - prod-sh          （2 个触发，1 个恢复）
+
+🔴 触发中（2）
+  • 10.1.0.7:9100  /data   剩余 12.3%   持续 20 分钟
+  • 10.1.0.8:9100  /       剩余 8.1%    持续 18 分钟
+
+✅ 已恢复（1）
+  • 10.1.0.9:9100  /var    剩余 14.8%
+
+严重级别：warning
+详情：https://am.example.com
+```
+
+生成逻辑：
+
+```text
+标题     ← groupLabels（alertname + cluster）
+统计     ← 遍历 alerts 按 status 计数
+明细     ← 每条的 labels.instance / labels.mountpoint / annotations.description
+持续时长 ← 当前时间 - startsAt
+公共信息 ← commonLabels（避免每条都重复打印 severity）
+```
+
+注意 `commonAnnotations` 是空的 —— 因为三条告警的 `description` 各不相同，没有公共部分。而 `commonLabels` 里有 `severity: warning`，说明三条都是 warning，可以只在头部显示一次。
+
+**(3) 能反推，`group_by` 就是 `['alertname', 'cluster']`**
+
+`groupLabels` 的定义就是「`group_by` 里列出的那些标签及其取值」。这里它包含且仅包含 `alertname` 和 `cluster` 两个键，所以配置一定是：
+
+```yaml
+group_by: ['alertname', 'cluster']
+```
+
+进一步验证：如果 `group_by` 里包含了 `instance`，那么三个不同实例就会分成三个组、三次独立投递，不可能出现在同一个请求体里。这也从侧面印证了「`group_by` 不要放 `instance`」这条经验的价值。
+
+顺带一提，`groupKey` 字段 `{}:{alertname="DiskSpaceLow", cluster="prod-sh"}` 也编码了同样的信息，冒号前的部分是路由路径，后面是分组标签。它是这个组的稳定唯一标识，可以拿来做幂等键。
+
+**(4) 处理失败会触发重试，且下一个周期还会再来**
+
+Alertmanager 的行为：
+
+1. **立即重试**。webhook 返回非 2xx 或超时，Alertmanager 会按退避策略重试，直到成功或超过重试窗口。重试期间日志里会出现 `Notify for alerts failed`。
+2. **状态未标记为已发送**。这一组的通知没有被记入通知日志（nflog），所以下一个 `group_interval` 周期到来时会**再次尝试发送同样的内容**。
+3. **可以被监控到**。Alertmanager 自身暴露了失败计数：
+
+```promql
+# 各接收器的通知失败速率
+rate(alertmanager_notifications_failed_total[5m])
+
+# 通知发送耗时分位数
+histogram_quantile(0.99,
+  rate(alertmanager_notification_latency_seconds_bucket[5m]))
+
+# 当前积压
+alertmanager_nflog_queries_total
+```
+
+**必须为 `alertmanager_notifications_failed_total` 配一条告警**——这是「监控的监控」。如果 webhook 端挂了而你不知道，整个告警链路是断的，但表面上一切正常：Prometheus 在正常求值、Alertmanager 在正常接收，只是没人收到通知。
+
+```yaml
+- alert: AlertmanagerNotificationsFailing
+  expr: rate(alertmanager_notifications_failed_total[5m]) > 0
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: 'Alertmanager 无法发送通知到 {{ $labels.integration }}'
+```
+
+注意这条告警本身也要能送达——所以它应该路由到一个**不同的、独立的**渠道（比如 webhook 挂了就走邮件），否则就是死循环。
+
+**接收端的正确实现骨架：**
+
+```text
+1. 立刻校验签名/token，非法直接 401
+2. 读取 body，用 groupKey + 每条的 fingerprint + startsAt 做幂等键
+3. 已处理过的跳过，未处理的入队
+4. 立刻返回 200
+5. 异步 worker 消费队列，渲染消息、调用 IM API、失败自行重试
+```
+
+关键是第 4 步：**不要在 HTTP 请求里同步调用下游 IM 接口**。IM 接口一慢，Alertmanager 就超时重试，队列越堆越长，最后整个通知链路雪崩。
+</Answer>
+</Callout>
+
+## 八、告警的完整生命周期
+
+把前面所有环节串起来，一条告警从产生到消失的全程：
+
+```text
+【Prometheus 侧】
+
+T+0     规则求值，expr 首次返回结果 → 状态 pending
+        写入 ALERTS 序列，alertstate="pending"
+        此时不会推送给 Alertmanager
+
+T+for   持续满足 for 时长 → 状态 firing
+        ALERTS 的 alertstate 变为 "firing"
+
+T+for   POST 到所有 Alertmanager 的 /api/v2/alerts
+        每条告警带 StartsAt 和一个未来的 EndsAt
+
+之后    只要还在 firing，就周期性重发（至少每 resend-delay 一次，默认 1m）
+        每次都把 EndsAt 往后推
+
+恢复时  expr 返回空 → 状态回到 inactive
+        Prometheus 会继续推送这条告警约 15 分钟，
+        但把 EndsAt 设成「实际恢复时刻」，明确告知已解决
+
+【Alertmanager 侧】
+
+接收    按标签集的指纹（fingerprint）去重，
+        多个 Prometheus 副本推来的同一条会被合并
+
+静默    命中 silence 的 matcher → 记录状态，不通知
+
+抑制    命中 inhibit_rules 的 target 且存在活跃 source → 不通知
+
+路由    沿 route 树找到接收器（可能多个，靠 continue）
+
+分组    按 group_by 归组
+
+等待    新组等 group_wait（默认 30s）
+        老组有变化等 group_interval（默认 5m）
+        无变化每 repeat_interval 重发（默认 4h）
+
+发送    调用 receiver 配置的渠道
+
+恢复    收到 EndsAt 已过期或明确标记 resolved 的告警
+        → 该告警移出组
+        → 若整组全部恢复且 send_resolved 为 true，发一条恢复通知
+```
+
+<Callout type="info" title="EndsAt 与 resolve_timeout：Alertmanager 怎么知道告警没了">
+Prometheus 推送的每条告警都带一个 `EndsAt`，通常是「当前时间 + 约 4 倍重发间隔」。只要告警还在烧，Prometheus 每分钟推一次，`EndsAt` 就一直被往后推。
+
+一旦 Prometheus 挂了或网络断了，推送停止，`EndsAt` 到期，Alertmanager 就会认为「这条告警已经解决了」并发出恢复通知——**哪怕故障其实还在。** 这是 Pull 架构下的固有权衡。
+
+`global.resolve_timeout`（默认 5m）用于那些**不带 `EndsAt`** 的告警（比如通过 API 手工塞进来的），表示「多久没再收到就认为已恢复」。它不影响 Prometheus 推来的告警，因为那些都自带 `EndsAt`。
+
+这也是为什么必须监控 Prometheus 到 Alertmanager 这条链路本身：
+
+```promql
+# Prometheus 侧：发给 Alertmanager 失败的告警数
+rate(prometheus_notifications_dropped_total[5m]) > 0
+
+# Prometheus 侧：发送队列积压
+prometheus_notifications_queue_length
+  / prometheus_notifications_queue_capacity > 0.5
+
+# Alertmanager 侧：集群成员数是否符合预期
+alertmanager_cluster_members < 3
+```
+</Callout>
+
+<Callout type="tip" title="Watchdog：永远在响的那条告警">
+成熟的监控体系里都有一条叫 `Watchdog`（或 `DeadMansSwitch`）的特殊告警：
+
+```yaml
+- alert: Watchdog
+  expr: vector(1)
+  labels:
+    severity: none
+  annotations:
+    summary: '这条告警永远处于触发状态，用于验证告警链路畅通。'
+```
+
+`vector(1)` 恒定返回一条值为 1 的序列，所以这条告警**永远在 firing**。把它路由到一个专门的 webhook，接入外部的「心跳监控」服务（Dead Man's Snitch、Healthchecks.io 或自建的一个小服务）。
+
+逻辑是反的：外部服务期待每隔几分钟收到一次心跳，**一旦超时没收到就报警**。这样一来，Prometheus 挂了、Alertmanager 挂了、网络断了、配置写错了——任何一环出问题，你都会立刻知道。
+
+没有 Watchdog 的监控体系有个致命盲区：**整套系统安静地死掉，而所有人都以为「今天真太平」。**
+</Callout>
+
+<Callout type="exercise" title="练习 4：排查「告警没收到」">
+线上出了一次故障，事后复盘发现：Prometheus 的 `/alerts` 页面上 `HighErrorRate` 确实处于 firing 状态且持续了 40 分钟，但值班群里一条通知都没有。
+
+请给出一套系统的排查流程，覆盖从 Prometheus 到最终通知渠道的每个环节，并说明每一步该看什么、怎么判断。
+
+<Answer>
+按数据流的顺序逐段排查，每一段都有明确的观测点。
+
+---
+
+**第 1 段：Prometheus 有没有把告警推出去？**
+
+Prometheus 页面显示 firing 只说明规则求值正确，不代表推送成功。
+
+```bash
+# 看 Prometheus 认为的 Alertmanager 是谁、健康不健康
+curl -s http://prometheus:9090/api/v1/alertmanagers | jq
+# 关注 activeAlertmanagers 是否为空、droppedAlertmanagers 里有没有东西
+```
+
+```promql
+# 推送失败的告警数（不为 0 就是这一段的问题）
+rate(prometheus_notifications_dropped_total[10m])
+
+# 发送队列是否积压
+prometheus_notifications_queue_length
+
+# 最近一次推送的耗时
+prometheus_notifications_latency_seconds
+```
+
+**常见原因**：`prometheus.yml` 里的 `alerting.alertmanagers` 地址写错、网络不通、Alertmanager 端口没开。
+
+**顺带确认**：`for` 是不是设得太长？如果写了 `for: 1h`，那 40 分钟的故障根本还没转成 firing——不过题目说页面上已经是 firing，这一条可以排除。
+
+---
+
+**第 2 段：Alertmanager 有没有收到？**
+
+```bash
+# 直接查 Alertmanager 收到的告警
+amtool alert query --alertmanager.url=http://am:9093 alertname=HighErrorRate
+
+# 或者用 API
+curl -s 'http://am:9093/api/v2/alerts?filter=alertname="HighErrorRate"' | jq
+```
+
+也可以直接开 Web UI 的 Alerts 页面看。
+
+**如果这里查不到** → 问题在第 1 段，回去查网络和配置。
+
+**如果查到了**，注意看告警条目上的状态标记，Web UI 会区分显示：`active` / `suppressed`（被静默或抑制）。
+
+---
+
+**第 3 段：是不是被静默了？**
+
+这是最常见的原因，尤其是「某人上周为了发布建了个静默，忘了设结束时间」。
+
+```bash
+# 列出所有生效中的静默
+amtool silence query --alertmanager.url=http://am:9093
+
+# 看某条告警具体被哪个静默命中
+curl -s 'http://am:9093/api/v2/alerts?silenced=true' | jq '.[].status'
+```
+
+Web UI 上被静默的告警会显示成灰色，点进去能看到是哪条 silence 命中的、谁建的、什么时候到期。
+
+**修复**：`amtool silence expire <ID>`，并追问创建者为什么没设过期时间。
+
+---
+
+**第 4 段：是不是被抑制了？**
+
+```bash
+amtool alert query --alertmanager.url=http://am:9093 --inhibited
+```
+
+重点检查 `inhibit_rules` 里 `equal` 是否写漏了标签。典型误配：
+
+```yaml
+# 危险：只要有任何一条 critical，全世界的 warning 都被压掉
+- source_matchers: [ 'severity = "critical"' ]
+  target_matchers: [ 'severity = "warning"' ]
+  equal: []            # ← 空的 equal 意味着「无条件抑制」
+```
+
+如果当时恰好有一条不相干的 critical 在烧，`HighErrorRate`（假设是 warning）就被无辜压掉了。
+
+**修复**：把 `equal` 补全成 `['alertname', 'cluster', 'service']` 这类能表明「是同一个故障对象」的标签集。
+
+---
+
+**第 5 段：路由匹配对了吗？**
+
+这是第二常见的原因——告警落到了一个没人看的接收器，或者根本没匹配上任何子路由，掉进了兜底的 `default`。
+
+```bash
+# 用告警的真实标签测试路由
+amtool config routes test --config.file=alertmanager.yml \
+  alertname=HighErrorRate severity=critical team=backend cluster=prod-bj
+
+# 打印整棵路由树
+amtool config routes --config.file=alertmanager.yml
+```
+
+**常见坑：**
+
+- matcher 正则忘了全串锚定：`team =~ "back"` 匹配不上 `backend`。
+- 告警规则里的标签名和路由里写的对不上（比如规则写 `severity: critical`，路由里匹配 `level = "critical"`）。
+- 前面某个带 `continue: false` 的节点先匹配上了，把告警截胡到别的接收器去了。
+
+**核对方法**：拿 Alertmanager UI 上那条告警的**完整标签集**（不要凭记忆），逐字喂给 `amtool config routes test`。
+
+---
+
+**第 6 段：分组和时间参数把通知拖住了？**
+
+```yaml
+# 如果配成这样，第一条通知要等 10 分钟
+group_wait: 10m
+```
+
+或者更隐蔽的情况：这个组**之前已经发过通知了**，本次新增的告警要等 `group_interval` 才会发。如果 `group_interval: 30m`，就会有半小时的延迟。
+
+```bash
+# 看某个组当前的状态
+curl -s http://am:9093/api/v2/alerts/groups | jq
+```
+
+**判断依据**：如果 40 分钟一条都没有，光靠 `group_wait` / `group_interval` 解释不通（它们最多延迟几分钟），更可能是前面几段的问题。但如果是「延迟了 20 分钟才收到」，那就要查这里。
+
+---
+
+**第 7 段：通知发送失败了？**
+
+```promql
+# 按接收器类型看失败率
+rate(alertmanager_notifications_failed_total[10m])
+
+# 总发送量（如果这个也是 0，说明压根没尝试发，问题在前面几段）
+rate(alertmanager_notifications_total[10m])
+
+# 发送耗时
+histogram_quantile(0.99,
+  rate(alertmanager_notification_latency_seconds_bucket[10m]))
+```
+
+同时看 Alertmanager 日志：
+
+```bash
+journalctl -u alertmanager -n 200 | grep -i "notify\|error"
+# 典型报错：
+#   Notify for alerts failed  integration=webhook  err="context deadline exceeded"
+#   Notify for alerts failed  integration=email    err="dial tcp: connection refused"
+```
+
+**常见原因**：Slack webhook URL 过期、SMTP 密码改了、企业微信 token 失效、接收端服务挂了、出网被防火墙拦了。
+
+---
+
+**第 8 段：发出去了但没人看到？**
+
+最尴尬也真实存在的一类：
+
+- 通知发到了一个**已归档或没人的群/频道**。
+- 邮件进了垃圾箱（SPF/DKIM 没配）。
+- 值班表配错，通知发给了已离职的人。
+- 接收端（比如自研的钉钉转发服务）返回了 200 但内部处理失败，静默丢弃。
+
+**验证方法**：手动往同一个渠道发一条测试消息。
+
+```bash
+# 直接调 Alertmanager API 塞一条假告警，走完整链路
+curl -X POST http://am:9093/api/v2/alerts -H 'Content-Type: application/json' -d '[{
+  "labels": {"alertname":"TestAlert","severity":"critical","team":"backend"},
+  "annotations": {"summary":"链路测试，请忽略"},
+  "startsAt": "2026-08-02T10:00:00Z"
+}]'
+```
+
+这一招非常好用：它绕过 Prometheus，直接测试 Alertmanager 之后的全部环节。
+
+---
+
+**排查顺序速查表**
+
+```text
+1. Prometheus /alerts 是 firing 吗？          → 否：规则或 for 的问题
+2. prometheus_notifications_dropped_total？    → 不为 0：推送链路断了
+3. Alertmanager 里查得到这条告警吗？           → 否：网络或配置
+4. 它是不是 suppressed 状态？                  → 是：查 silence 和 inhibit
+5. amtool config routes test 命中对了吗？      → 否：改路由 matcher
+6. group_wait / group_interval 是否过长？      → 是：调参数
+7. alertmanager_notifications_failed_total？   → 不为 0：查渠道凭据和网络
+8. 手动塞一条测试告警走完整链路                 → 定位最后一公里
+```
+
+---
+
+**根本性的预防措施：**
+
+这次事故暴露的真正问题不是「某个配置写错了」，而是**告警链路本身没有被监控**。三件事必须补上：
+
+**① 部署 Watchdog 心跳告警**
+
+```yaml
+- alert: Watchdog
+  expr: vector(1)
+  labels:
+    severity: none
+```
+
+路由到一个独立 webhook，接外部心跳监控服务。链路任何一环断掉，外部服务超时未收到心跳就会报警。这是唯一能发现「整套告警系统静默死亡」的手段。
+
+**② 为告警链路本身配告警**
+
+```yaml
+- alert: AlertmanagerNotificationsFailing
+  expr: rate(alertmanager_notifications_failed_total[5m]) > 0
+  for: 5m
+
+- alert: PrometheusNotificationsDropped
+  expr: rate(prometheus_notifications_dropped_total[5m]) > 0
+  for: 5m
+
+- alert: AlertmanagerClusterDegraded
+  expr: alertmanager_cluster_members < 3
+  for: 10m
+```
+
+注意这几条必须走**独立于主链路的通知渠道**，否则主链路断了它们自己也发不出去。
+
+**③ 静默必须强制过期 + CI 校验配置**
+
+- 禁止创建无过期时间的静默；定期跑 `amtool silence query --within=720h` 巡检长期静默。
+- 把 `amtool check-config alertmanager.yml` 和 `amtool config routes test`（用几组典型标签）加进 CI，路由改动必须通过测试才能合并。
+</Answer>
+</Callout>
+
+## 小结
+
+- Prometheus 只负责「判断异常」，Alertmanager 负责**去重、静默、抑制、路由、分组、发送**这一整条后半程。
+- Alertmanager 集群靠 gossip 同步，**必须把所有实例都配进 Prometheus，不能放在负载均衡后面**。
+- `route` 是一棵树：第一个匹配的子节点获胜，除非 `continue: true`；子节点继承父节点未设置的参数；都不匹配时用当前节点自己的配置。
+- `matchers` 列表语法（`=`、`!=`、`=~`、`!~`）已取代旧的 `match` / `match_re`，正则同样**全串锚定**。
+- 四个参数各司其职：`group_by` 决定怎么归组（**别放 `instance`**），`group_wait` 等同伙汇合，`group_interval` 控制组内变化的通知节奏，`repeat_interval` 控制未解决时的重复提醒。
+- `inhibit_rules` 让根因压掉衍生告警，**`equal` 必须列全能表明「同一故障对象」的标签**，写少了会误伤，写空了是灾难。
+- `silence` 是手动的、有时间窗口的静音，三条纪律：必须设过期、matcher 要精确、comment 写清原因。
+- receiver 的 `send_resolved` 默认值各不相同（email 和 slack 是 `false`，webhook 和 pagerduty 是 `true`），建议一律显式声明。
+- webhook 的 JSON 体里，**外层 `status` 和每条告警的 `status` 可能不一致**，接收端必须逐条判断，并做幂等、快速返回 2xx。
+- 生命周期的关键点：Prometheus 周期性重推并不断延后 `EndsAt`；一旦推送中断，Alertmanager 会误判为「已恢复」。
+- **每套监控都要有 Watchdog**，以及针对 `alertmanager_notifications_failed_total` 和 `prometheus_notifications_dropped_total` 的元告警——它们是唯一能发现「监控系统自己死了」的手段。

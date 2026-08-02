@@ -1,0 +1,1357 @@
+---
+title: 黑盒监控与 blackbox_exporter
+order: 16
+description: 用 probe 探测 http/icmp/tcp/dns，配合 relabel 把抓取重定向到 blackbox
+---
+
+# 黑盒监控与 blackbox_exporter
+
+前面十五章里，我们所有的指标都来自同一个地方：**被监控对象自己暴露的 `/metrics` 接口**。node_exporter 读 `/proc` 告诉你 CPU 使用率，应用用客户端库告诉你自己处理了多少请求。这种「让系统自己汇报内部状态」的方式叫**白盒监控**。
+
+白盒监控很强大，但它有一个根本性的盲区：**它只能反映系统「认为」自己是什么状态**。想象这些场景——
+
+- 应用进程活得好好的，`up` 是 1，所有内部指标都正常，但它前面的负载均衡器配置错了，用户根本访问不到。
+- 服务本身没问题，但 DNS 解析出了故障，域名解析到了一个已经下线的 IP。
+- HTTPS 证书今天凌晨过期了，浏览器全部报警，而你的应用完全不知情。
+- 跨国专线抖动，北京访问正常，新加坡的用户超时，但服务端看到的延迟指标一切正常。
+
+这些故障有一个共同点：**问题不在系统内部，而在用户到系统之间的那条路径上**。要发现它们，你必须站到系统外面，像一个真实用户那样去访问它。这就是**黑盒监控**。
+
+Prometheus 生态里做这件事的官方工具叫 `blackbox_exporter`。
+
+读完本章你会掌握：
+
+- 白盒与黑盒的本质区别，以及它们各自能发现什么、发现不了什么
+- `blackbox_exporter` 作为 **multi-target exporter** 的工作方式，以及 `/probe` 端点的用法
+- `blackbox.yml` 里 `http_2xx`、`tcp_connect`、`icmp`、`dns` 等 module 的配置写法
+- Prometheus 侧那段经典的 `relabel_configs` 三段式，逐条搞懂 `__param_target` 与 `__address__` 的关系
+- `probe_success`、`probe_ssl_earliest_cert_expiry`、`probe_http_duration_seconds` 等指标的含义与告警写法
+- 与服务发现结合、多点探测、以及 ICMP 权限、超时配置这些实战坑
+
+## 一、白盒 vs 黑盒
+
+<Callout type="info" title="一句话区分">
+**白盒监控问的是「你怎么样？」，黑盒监控问的是「我能用吗？」**
+
+白盒的数据来自系统内部的自我观察，能告诉你「为什么」出问题；黑盒的数据来自外部的实际访问，能告诉你「是不是」出了问题。**两者不是替代关系，而是必须同时存在。**
+</Callout>
+
+| 维度 | 白盒（node_exporter / 应用埋点） | 黑盒（blackbox_exporter） |
+| --- | --- | --- |
+| 数据来源 | 系统内部自我上报 | 外部主动探测 |
+| 回答的问题 | 内部状态如何、为什么慢 | 从外面能不能访问、快不快 |
+| 典型指标 | CPU、内存、GC、队列长度、内部 QPS | 探测成功与否、端到端延迟、证书有效期 |
+| 覆盖范围 | 只覆盖被埋点的系统 | 覆盖整条访问链路（DNS、网络、LB、TLS、应用） |
+| 发现不了 | 链路故障、DNS 错误、证书过期、LB 配错 | 内部原因、根因定位 |
+| 告警定位 | 精确，能直接指出组件 | 模糊，只知道「不通」 |
+
+排障时两者的配合是这样的：黑盒告警先响（「用户访问不了」），然后你去看白盒指标定位根因（「哦，数据库连接池满了」）。**只有白盒会漏掉真实故障，只有黑盒则无法定位问题。**
+
+<Callout type="tip" title="黑盒告警应该是「用户视角」的告警">
+Google SRE 那套「基于症状告警而非基于原因告警」的原则，在这里非常适用。
+
+「CPU 使用率 90%」是一个原因，用户可能毫无感知；「首页探测连续 3 分钟失败」是一个症状，用户一定在骂人。**症状类告警应该是 Critical 并且叫醒人的，原因类告警大多可以是 Warning 并且只进工单。** 黑盒监控天然产出的就是症状类告警，这是它最大的价值。
+</Callout>
+
+## 二、blackbox_exporter 的工作方式
+
+### 它和普通 exporter 不一样
+
+一般的 exporter（比如 node_exporter）是「一对一」的：你在机器上装一个，Prometheus 抓它的 `/metrics`，拿到的就是这台机器的指标。
+
+blackbox_exporter 完全不同，它是一个 **multi-target exporter**（多目标 exporter）：**你部署一个实例，它可以探测成千上万个不同的目标**。目标不是在它的配置文件里写死的，而是在**每次请求时通过 URL 参数告诉它的**。
+
+它的核心端点是 `/probe`，接受两个关键参数：
+
+- `target`：要探测的目标（一个 URL、一个 IP、一个域名，取决于 module 类型）
+- `module`：使用哪个探测模块（在 `blackbox.yml` 里定义）
+
+收到请求后，blackbox_exporter 会**实时发起一次探测**，把探测结果作为 Prometheus 格式的指标返回。整个过程是同步的：请求进来 → 发起探测 → 等待结果 → 返回指标。
+
+<Callout type="warn" title="blackbox_exporter 自己的 /metrics 不是探测结果">
+`http://blackbox:9115/metrics` 返回的是 **blackbox_exporter 这个进程自身**的运行指标（处理了多少次探测、Go runtime 状态等），**不包含任何探测结果**。
+
+新手最常见的错误就是把 `blackbox:9115` 直接写进 `static_configs` 然后纳闷「为什么看不到 `probe_success`」。探测结果只能通过 `/probe?target=...&module=...` 拿到。
+
+这也意味着你需要**两个 job**：一个抓 `/probe` 拿探测结果，一个抓 `/metrics` 监控 exporter 自身健康。
+</Callout>
+
+### 安装与手动测试
+
+```bash
+# 下载并解压
+VERSION=0.25.0
+wget https://github.com/prometheus/blackbox_exporter/releases/download/v${VERSION}/blackbox_exporter-${VERSION}.linux-amd64.tar.gz
+tar xzf blackbox_exporter-${VERSION}.linux-amd64.tar.gz
+cd blackbox_exporter-${VERSION}.linux-amd64
+
+# 启动，默认监听 9115
+./blackbox_exporter --config.file=blackbox.yml
+```
+
+Docker 方式：
+
+```bash
+docker run -d \
+  --name blackbox_exporter \
+  -p 9115:9115 \
+  -v /etc/blackbox/blackbox.yml:/config/blackbox.yml \
+  prom/blackbox-exporter:latest \
+  --config.file=/config/blackbox.yml
+```
+
+启动后立刻手动试一次探测：
+
+```bash
+curl 'http://localhost:9115/probe?target=https://example.com&module=http_2xx'
+```
+
+返回大致是这样：
+
+```text
+# HELP probe_dns_lookup_time_seconds Returns the time taken for probe dns lookup in seconds
+# TYPE probe_dns_lookup_time_seconds gauge
+probe_dns_lookup_time_seconds 0.012
+# HELP probe_duration_seconds Returns how long the probe took to complete in seconds
+# TYPE probe_duration_seconds gauge
+probe_duration_seconds 0.284
+# HELP probe_http_status_code Response HTTP status code
+# TYPE probe_http_status_code gauge
+probe_http_status_code 200
+# HELP probe_ssl_earliest_cert_expiry Returns last SSL chain expiry in unixtime
+# TYPE probe_ssl_earliest_cert_expiry gauge
+probe_ssl_earliest_cert_expiry 1.7514432e+09
+# HELP probe_success Displays whether or not the probe was a success
+# TYPE probe_success gauge
+probe_success 1
+```
+
+<Callout type="tip" title="debug=true 是排障神器">
+探测失败但不知道为什么时，在 URL 后面加 `&debug=true`：
+
+```bash
+curl 'http://localhost:9115/probe?target=https://example.com&module=http_2xx&debug=true'
+```
+
+它会返回一份**完整的探测日志**，包括 DNS 解析结果、TCP 连接过程、TLS 握手细节、HTTP 请求和响应头、每一步耗时、以及失败的确切原因。90% 的 blackbox 配置问题都能靠这一招在一分钟内定位。
+
+blackbox_exporter 的 Web 首页（`http://blackbox:9115`）还提供了一个探测历史列表，可以直接点进去看每次探测的 debug 输出。
+</Callout>
+
+## 三、blackbox.yml 的 module 配置
+
+`blackbox.yml` 的结构就是一个 `modules` 字典，每个 key 是模块名，value 描述「怎么探测」。
+
+```yaml
+modules:
+  # ---------- HTTP 系列 ----------
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: []          # 空表示接受 2xx
+      valid_http_versions: ['HTTP/1.1', 'HTTP/2.0']
+      follow_redirects: true
+      preferred_ip_protocol: 'ip4'
+      ip_protocol_fallback: true
+
+  # 检查页面内容是否包含关键字
+  http_2xx_with_body:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      fail_if_body_not_matches_regexp:
+        - '"status"\s*:\s*"ok"'
+
+  # POST 一个 JSON 上去
+  http_post_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: POST
+      headers:
+        Content-Type: 'application/json'
+      body: '{"health": "check"}'
+      valid_status_codes: [200, 201]
+
+  # 只接受 401，用于验证鉴权确实生效了
+  http_401:
+    prober: http
+    timeout: 5s
+    http:
+      valid_status_codes: [401]
+
+  # 内部服务用自签证书
+  http_2xx_insecure_tls:
+    prober: http
+    timeout: 5s
+    http:
+      tls_config:
+        insecure_skip_verify: true
+
+  # ---------- TCP ----------
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+
+  # 检查 SSH banner
+  ssh_banner:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      query_response:
+        - expect: '^SSH-2.0-'
+
+  # 检查 Redis 是否响应 PING
+  redis_ping:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      query_response:
+        - send: 'PING'
+        - expect: 'PONG'
+
+  # ---------- ICMP ----------
+  icmp:
+    prober: icmp
+    timeout: 5s
+    icmp:
+      preferred_ip_protocol: 'ip4'
+
+  # ---------- DNS ----------
+  dns_a_record:
+    prober: dns
+    timeout: 5s
+    dns:
+      query_name: 'www.example.com'
+      query_type: 'A'
+      validate_answer_rrs:
+        fail_if_not_matches_regexp:
+          - 'www\.example\.com\.\t.*\tIN\tA\t.*'
+
+  dns_soa:
+    prober: dns
+    timeout: 5s
+    dns:
+      query_name: 'example.com'
+      query_type: 'SOA'
+```
+
+### 四种 prober 的语义与 target 格式
+
+这一点必须搞清楚，因为不同 prober 对 `target` 的格式要求完全不同：
+
+| prober | target 格式 | 探测行为 | 典型用途 |
+| --- | --- | --- | --- |
+| `http` | 完整 URL，如 `https://a.com/health` | 发起 HTTP 请求，检查状态码/内容/证书 | 网站、API、健康检查端点 |
+| `tcp` | `host:port`，如 `db.internal:3306` | 建立 TCP 连接，可选地收发数据 | 数据库、消息队列、任意 TCP 服务 |
+| `icmp` | 主机名或 IP，如 `10.0.1.1` | 发送 ICMP echo 请求 | 网络设备、主机连通性 |
+| `dns` | **DNS 服务器地址**，如 `8.8.8.8:53` | 向该服务器查询 module 里配置的域名 | DNS 服务器可用性、解析正确性 |
+
+<Callout type="warn" title="DNS prober 的 target 是「DNS 服务器」不是「域名」">
+这是最反直觉的一个点。DNS 模块里，**要查询的域名写在 module 的 `query_name` 里**，而 `target` 参数填的是**用哪台 DNS 服务器去查**。
+
+所以「检查 `www.example.com` 在两台内网 DNS 上解析是否正常」的配置是：module 里写 `query_name: 'www.example.com'`，targets 里写两台 DNS 服务器的地址 `10.0.0.53:53` 和 `10.0.0.54:53`。
+
+这个设计其实很合理——它让你能对比同一个域名在不同 DNS 服务器上的解析结果，正好是排查 DNS 不一致问题需要的能力。代价是每个要检查的域名都得单独定义一个 module。
+</Callout>
+
+### 几个高频配置项
+
+**`preferred_ip_protocol` 与 `ip_protocol_fallback`。** blackbox_exporter 默认优先用 IPv6（`ip6`）。如果你的环境只有 IPv4，或者 IPv6 配置不完整，探测会莫名其妙地慢或者失败。建议**显式设置 `preferred_ip_protocol: 'ip4'`**，这能省掉很多玄学问题。`ip_protocol_fallback: true`（默认）表示首选协议不通时回落到另一个。
+
+**`fail_if_body_matches_regexp` 与 `fail_if_body_not_matches_regexp`。** 只检查 HTTP 状态码是不够的——很多故障下服务依然返回 200，但页面内容是错误提示。用正则检查响应体能大幅提升探测的有效性：
+
+```yaml
+  api_health:
+    prober: http
+    http:
+      # 响应体里必须包含 "status":"UP"
+      fail_if_body_not_matches_regexp:
+        - '"status"\s*:\s*"UP"'
+      # 响应体里不能出现这些错误字样
+      fail_if_body_matches_regexp:
+        - 'Internal Server Error'
+        - 'Database connection failed'
+```
+
+**`follow_redirects`。** 默认 `true`，会跟随 3xx 跳转。如果你想验证「HTTP 是否正确 301 到 HTTPS」，就要关掉它并把 301 加进合法状态码：
+
+```yaml
+  http_redirect_to_https:
+    prober: http
+    http:
+      follow_redirects: false
+      valid_status_codes: [301, 308]
+```
+
+注意较老版本用的配置项名是 `no_follow_redirects`（语义相反），新版已改为 `follow_redirects`，写老名字会有废弃警告。
+
+**`timeout`。** 每个 module 都应该显式设置。它和 Prometheus 的 `scrape_timeout` 有联动关系，下一节详说。
+
+<Callout type="exercise" title="练习 1：写出四个 module 配置">
+请为下面四个需求各写一个 module：
+
+1. 检查一个内部 API，它用自签 TLS 证书，需要带一个 `Authorization` 请求头，返回体里必须包含 `"healthy":true`，超时 3 秒。
+2. 检查 MySQL 端口是否可连（不需要真的登录）。
+3. 检查一批交换机是否 ping 得通，只走 IPv4。
+4. 检查内网 DNS 服务器能否正确把 `api.internal.com` 解析到 `10.0.` 开头的地址。
+
+<Answer>
+```yaml
+modules:
+  # 1. 内部 API 健康检查
+  internal_api_health:
+    prober: http
+    timeout: 3s
+    http:
+      method: GET
+      preferred_ip_protocol: 'ip4'
+      headers:
+        Authorization: 'Bearer <token>'
+        Accept: 'application/json'
+      tls_config:
+        # 自签证书，跳过校验
+        insecure_skip_verify: true
+      valid_status_codes: [200]
+      fail_if_body_not_matches_regexp:
+        - '"healthy"\s*:\s*true'
+
+  # 2. MySQL 端口连通性
+  mysql_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: 'ip4'
+
+  # 3. 交换机 ICMP 探测
+  icmp_ip4:
+    prober: icmp
+    timeout: 5s
+    icmp:
+      preferred_ip_protocol: 'ip4'
+      ip_protocol_fallback: false
+
+  # 4. 内网 DNS 解析正确性
+  dns_api_internal:
+    prober: dns
+    timeout: 5s
+    dns:
+      query_name: 'api.internal.com'
+      query_type: 'A'
+      preferred_ip_protocol: 'ip4'
+      validate_answer_rrs:
+        fail_if_not_matches_regexp:
+          - 'api\.internal\.com\.\s+\d+\s+IN\s+A\s+10\.0\.\d+\.\d+'
+```
+
+几个要点：
+
+- **第 1 题**用 `insecure_skip_verify: true` 处理自签证书。更严谨的做法是提供 CA 证书：`tls_config` 里写 `ca_file: '/etc/blackbox/internal-ca.pem'`，这样既能验证证书又不会因为自签而失败。另外 Token 直接写在配置里不理想，生产环境应考虑用 `bearer_token_file` 指向一个文件。
+- **第 2 题**只需要 `prober: tcp` 而不配 `query_response`，这样只做 TCP 三次握手就断开，不会在 MySQL 的错误日志里留下「Got an error reading communication packets」之外的东西。想更进一步验证 MySQL 真的活着，可以 `expect` 它返回的握手包里的版本号，但通常没必要——那属于白盒监控该管的事。
+- **第 3 题**把 `ip_protocol_fallback` 设为 `false`。因为交换机管理口通常只有 IPv4，关掉回落可以让配置错误更快暴露，而不是悄悄地用 IPv6 去试然后超时。
+- **第 4 题**用 `validate_answer_rrs.fail_if_not_matches_regexp` 校验解析结果。这里同时检查了「能解析」和「解析到正确网段」两件事——如果 DNS 被污染或者配置错误指向了公网 IP，探测会失败。正则里的 `\s+` 比 `\t` 更宽容，因为不同版本的 DNS 记录文本格式可能用空格或制表符。
+</Answer>
+</Callout>
+
+## 四、Prometheus 侧的 relabel 三段式
+
+现在到了最关键的部分：**怎么让 Prometheus 去抓 blackbox 的 `/probe` 端点**。
+
+### 先理解困境
+
+我们想要的效果是：
+
+- Prometheus 实际发起的 HTTP 请求是 `http://blackbox:9115/probe?module=http_2xx&target=https://example.com`
+- 但产出的指标上，`instance` 标签应该是 `https://example.com`（被探测的目标），而不是 `blackbox:9115`
+
+这两个需求是矛盾的：Prometheus 的 `__address__` 决定了「往哪发请求」，同时也决定了默认的 `instance` 标签。我们需要把它们**拆开**。
+
+解决办法就是那段几乎所有 blackbox 教程里都会出现的 relabel 三段式。
+
+### 完整配置
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox-http'
+    metrics_path: '/probe'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+    params:
+      module: ['http_2xx']
+
+    static_configs:
+      - targets:
+          - 'https://example.com'
+          - 'https://api.example.com/health'
+          - 'https://shop.example.com'
+        labels:
+          probe_type: 'http'
+
+    relabel_configs:
+      # 第一段：把目标地址交给 target 参数
+      - source_labels: [__address__]
+        target_label: '__param_target'
+
+      # 第二段：让 instance 标签显示被探测的目标
+      - source_labels: [__param_target]
+        target_label: 'instance'
+
+      # 第三段：把实际请求地址改成 blackbox_exporter
+      - target_label: '__address__'
+        replacement: 'blackbox:9115'
+```
+
+### 逐条拆解
+
+这三条规则的执行是**有严格顺序**的，理解它们的关键是记住「每条规则都作用在前一条规则的结果上」。
+
+假设 `targets` 里有一项是 `https://example.com`。
+
+**初始状态：** `__address__ = "https://example.com"`。此时如果不做任何 relabel，Prometheus 会试图去请求 `https://example.com/probe`——显然是错的。
+
+**第一条规则执行后：** 新增了 `__param_target = "https://example.com"`。`__param_<name>` 是一个特殊标签，Prometheus 在构造抓取 URL 时会把它变成查询参数 `?target=...`。此时 `__address__` 还没变。
+
+**第二条规则执行后：** 新增了 `instance = "https://example.com"`。因为显式设置了 `instance`，Prometheus 就不会再用 `__address__` 去生成它了。这一步必须在第三条之前，否则 `instance` 会变成 `blackbox:9115`。
+
+**第三条规则执行后：** `__address__` 被改写成 `"blackbox:9115"`。注意这条规则**没有 `source_labels`**——不写源标签时，`replacement` 的值会被原样写入 `target_label`，相当于一个「无条件赋值」。
+
+**最终结果：** Prometheus 发起的请求是
+
+```text
+GET http://blackbox:9115/probe?module=http_2xx&target=https%3A%2F%2Fexample.com
+```
+
+产出的指标是
+
+```text
+probe_success{instance="https://example.com",job="blackbox-http",probe_type="http"} 1
+```
+
+<Callout type="tip" title="记忆口诀">
+**「地址变参数，参数变 instance，地址换 blackbox」** —— 顺序不能乱，第二步必须夹在中间。
+
+再多记一条：`params` 里配的 `module` 也可以用同样的方式动态化。`params.module` 是**整个 job 固定**的模块，如果不同目标要用不同模块，就用 `__param_module` 标签配合 relabel 来设置（下一节有例子）。
+</Callout>
+
+### 一个 job 多种 module
+
+如果你有几十个探测目标，分别要用不同的 module，为每个 module 建一个 job 会很啰嗦。更好的做法是用 `file_sd_configs` 把 module 写进目标文件的标签里：
+
+`/etc/prometheus/targets/blackbox/web.json`：
+
+```json
+[
+  {
+    "targets": ["https://example.com", "https://shop.example.com"],
+    "labels": { "module": "http_2xx", "team": "frontend" }
+  },
+  {
+    "targets": ["https://api.example.com/health"],
+    "labels": { "module": "api_health", "team": "backend" }
+  },
+  {
+    "targets": ["db-master.internal:3306", "db-slave.internal:3306"],
+    "labels": { "module": "mysql_connect", "team": "dba" }
+  }
+]
+```
+
+对应的 job：
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox'
+    metrics_path: '/probe'
+    scrape_interval: 30s
+    scrape_timeout: 15s
+
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/blackbox/*.json']
+        refresh_interval: 1m
+
+    relabel_configs:
+      # 用目标文件里的 module 标签设置探测模块
+      - source_labels: [module]
+        target_label: '__param_module'
+
+      # 三段式
+      - source_labels: [__address__]
+        target_label: '__param_target'
+      - source_labels: [__param_target]
+        target_label: 'instance'
+      - target_label: '__address__'
+        replacement: 'blackbox:9115'
+
+      # module 这个标签已经用完了，从最终指标上去掉（可选）
+      - regex: 'module'
+        action: labeldrop
+```
+
+这样新增探测目标只需要往 JSON 里加一行，完全不用碰 `prometheus.yml`。这是把第 13 章的服务发现和本章结合起来的典型用法。
+
+<Callout type="exercise" title="练习 2：修复一段错误的 blackbox 配置">
+下面这段配置上线后，`probe_success` 一条都没有，Targets 页面显示所有目标的错误是 `server returned HTTP status 400 Bad Request`。
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox'
+    metrics_path: '/probe'
+    params:
+      module: ['http_2xx']
+    static_configs:
+      - targets:
+          - 'https://example.com'
+          - 'https://api.example.com'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: 'instance'
+      - target_label: '__address__'
+        replacement: 'blackbox:9115'
+```
+
+另外该团队还有一个疑问：他们想同时监控 blackbox_exporter 自己是否健康，直接在这个 job 的 targets 里加了 `blackbox:9115`，结果它也返回 400。
+
+请修复配置并解答疑问。
+
+<Answer>
+**问题一：漏掉了 `__param_target`。**
+
+配置里只做了「地址变 instance」和「地址换 blackbox」两步，**唯独漏了最关键的第一步**——把目标地址写进 `__param_target`。
+
+结果就是 Prometheus 请求的 URL 变成了：
+
+```text
+GET http://blackbox:9115/probe?module=http_2xx
+```
+
+没有 `target` 参数。blackbox_exporter 收到缺少必需参数的请求，直接返回 `400 Bad Request`，错误信息是 `Target parameter is missing`。
+
+而且顺序也有隐患：这里是先把 `__address__` 存进了 `instance`，虽然结果碰巧对了（因为第二条不改 `instance`），但正规写法应该走 `__param_target` 中转，保证语义清晰。
+
+**修复后：**
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox-http'
+    metrics_path: '/probe'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    params:
+      module: ['http_2xx']
+    static_configs:
+      - targets:
+          - 'https://example.com'
+          - 'https://api.example.com'
+    relabel_configs:
+      # 1. 地址 → target 参数（原先漏掉的就是这条）
+      - source_labels: [__address__]
+        target_label: '__param_target'
+      # 2. target 参数 → instance
+      - source_labels: [__param_target]
+        target_label: 'instance'
+      # 3. 地址 → blackbox 自身
+      - target_label: '__address__'
+        replacement: 'blackbox:9115'
+```
+
+**问题二：不能把 `blackbox:9115` 塞进探测 job。**
+
+原因在第二节讲过：这个 job 的 `metrics_path` 是 `/probe`，所有目标都会被当成「要探测的对象」。把 `blackbox:9115` 加进去，Prometheus 会请求 `http://blackbox:9115/probe?module=http_2xx&target=blackbox:9115`——它在让 blackbox 用 HTTP prober 去探测自己，而 `blackbox:9115` 不是一个合法的 URL（缺少 scheme），所以报错。
+
+**监控 exporter 自身必须用一个独立的 job**，抓它的 `/metrics`：
+
+```yaml
+  - job_name: 'blackbox-exporter'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['blackbox:9115']
+```
+
+这个 job 能拿到的有用指标包括：
+
+```promql
+# exporter 进程存活
+up{job="blackbox-exporter"}
+
+# 各模块的探测总次数（可以看出探测负载）
+blackbox_module_unknown_total
+
+# Go 进程指标，用于发现内存泄漏或 goroutine 泄漏
+process_resident_memory_bytes{job="blackbox-exporter"}
+go_goroutines{job="blackbox-exporter"}
+```
+
+对应的告警：
+
+```yaml
+- alert: BlackboxExporterDown
+  expr: 'up{job="blackbox-exporter"} == 0'
+  for: 3m
+  labels:
+    severity: 'critical'
+  annotations:
+    summary: 'blackbox_exporter 宕机，所有黑盒探测已失效'
+```
+
+这条告警特别重要——**blackbox_exporter 挂掉时，所有 `probe_success` 序列都会消失而不是变成 0**。如果你的告警规则写的是 `probe_success == 0`，序列消失后这条规则不会触发任何告警，你会误以为一切正常。这是黑盒监控最危险的静默失败模式，下一节会讲怎么防。
+</Answer>
+</Callout>
+
+## 五、blackbox 暴露的指标
+
+每次探测都会返回一组指标。哪些指标出现取决于 prober 类型和探测是否走到了那一步。
+
+### 通用指标（所有 prober 都有）
+
+| 指标 | 含义 |
+| --- | --- |
+| `probe_success` | 探测是否成功，`1` 成功 `0` 失败。**最重要的一个** |
+| `probe_duration_seconds` | 整次探测耗时 |
+| `probe_ip_protocol` | 实际使用的 IP 协议，`4` 或 `6` |
+| `probe_dns_lookup_time_seconds` | DNS 解析耗时 |
+| `probe_ip_addr_hash` | 解析到的 IP 地址的哈希，IP 变化时这个值会变 |
+
+### HTTP prober 特有
+
+| 指标 | 含义 |
+| --- | --- |
+| `probe_http_status_code` | 响应状态码 |
+| `probe_http_duration_seconds` | 按阶段拆分的耗时，带 `phase` 标签 |
+| `probe_http_content_length` | 响应体长度，`-1` 表示未知 |
+| `probe_http_uncompressed_body_length` | 解压后的响应体长度 |
+| `probe_http_redirects` | 经历的重定向次数 |
+| `probe_http_version` | HTTP 协议版本 |
+| `probe_http_ssl` | 是否使用了 TLS |
+| `probe_ssl_earliest_cert_expiry` | 证书链中最早的过期时间（Unix 时间戳） |
+| `probe_ssl_last_chain_expiry_timestamp_seconds` | 最后一条验证通过的证书链的过期时间 |
+| `probe_tls_version_info` | TLS 版本，值恒为 1，版本在 `version` 标签里 |
+| `probe_failed_due_to_regex` | 是否因为正则校验不通过而失败 |
+
+`probe_http_duration_seconds` 的 `phase` 标签值得单独说，它把一次 HTTP 请求拆成了五个阶段：
+
+```promql
+probe_http_duration_seconds{phase="resolve"}     # DNS 解析
+probe_http_duration_seconds{phase="connect"}     # TCP 连接建立
+probe_http_duration_seconds{phase="tls"}         # TLS 握手
+probe_http_duration_seconds{phase="processing"}  # 服务端处理（首字节到达前）
+probe_http_duration_seconds{phase="transfer"}    # 响应体传输
+```
+
+这五个阶段的拆分极其有用。当探测延迟上升时，看一眼各 phase 的占比就能大致判断问题在哪：`resolve` 涨了是 DNS 慢，`connect` 涨了是网络或后端积压，`tls` 涨了是证书链或加密协商问题，`processing` 涨了是服务端真的慢，`transfer` 涨了是带宽或响应体变大。
+
+```promql
+# 按阶段看延迟构成
+probe_http_duration_seconds{instance="https://example.com"}
+
+# 找出 TLS 握手异常慢的目标
+probe_http_duration_seconds{phase="tls"} > 0.5
+```
+
+### ICMP / TCP / DNS 特有
+
+```promql
+# ICMP：按阶段的耗时（setup / rtt）
+probe_icmp_duration_seconds
+
+# DNS：解析耗时、返回的各类记录数
+probe_dns_lookup_time_seconds
+probe_dns_answer_rrs
+probe_dns_authority_rrs
+probe_dns_additional_rrs
+```
+
+## 六、用 probe_success 写告警
+
+### 基础可用性告警
+
+```yaml
+groups:
+  - name: blackbox
+    rules:
+      # 探测失败
+      - alert: ProbeFailed
+        expr: 'probe_success == 0'
+        for: 3m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '探测失败：{{ $labels.instance }}'
+          description: '{{ $labels.instance }} 已连续 3 分钟无法访问'
+```
+
+`for: 3m` 是必要的——单次探测失败可能只是网络抖动，连续 3 分钟失败才说明真的出事了。但也别设太长，黑盒告警的价值就在于快。30 秒探测间隔配 `for: 3m` 意味着大约 6 次连续失败才告警，这是个合理的平衡点。
+
+### 更细致的几条
+
+```yaml
+      # HTTP 状态码异常（即使 probe_success 是 1，也可能返回了非预期状态码）
+      - alert: ProbeHttpStatusUnexpected
+        expr: 'probe_http_status_code >= 400'
+        for: 3m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} 返回 {{ $value }}'
+
+      # 探测延迟过高
+      - alert: ProbeSlow
+        expr: 'probe_duration_seconds > 2'
+        for: 10m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} 探测耗时 {{ $value }} 秒'
+
+      # SSL 证书 15 天内过期
+      - alert: SSLCertExpiringSoon
+        expr: '(probe_ssl_earliest_cert_expiry - time()) / 86400 < 15'
+        for: 1h
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} 证书还有 {{ $value }} 天过期'
+
+      # SSL 证书 3 天内过期，升级为 critical
+      - alert: SSLCertExpiringCritical
+        expr: '(probe_ssl_earliest_cert_expiry - time()) / 86400 < 3'
+        for: 10m
+        labels:
+          severity: 'critical'
+
+      # SSL 证书已经过期
+      - alert: SSLCertExpired
+        expr: 'probe_ssl_earliest_cert_expiry - time() <= 0'
+        for: 5m
+        labels:
+          severity: 'critical'
+
+      # 因为内容校验不通过而失败（区别于网络不通）
+      - alert: ProbeContentCheckFailed
+        expr: 'probe_failed_due_to_regex == 1'
+        for: 5m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '{{ $labels.instance }} 返回内容不符合预期'
+```
+
+证书过期告警是黑盒监控的「杀手级应用」。`probe_ssl_earliest_cert_expiry` 是一个 Unix 时间戳，减去 `time()` 得到剩余秒数，再除以 86400 换算成天。**分级告警很重要**：15 天时 warning 进工单让人从容处理，3 天时 critical 直接叫醒人。
+
+<Callout type="warn" title="别忘了防「序列消失」">
+上一节的练习里提到过：`probe_success == 0` 这条规则有一个致命盲区——**如果序列本身消失了，规则不会触发**。
+
+序列消失的情况包括：blackbox_exporter 挂了、Prometheus 到 blackbox 的网络断了、有人不小心删了目标配置。这些恰恰是最需要被发现的故障。
+
+防御方法有两个，建议都用上：
+
+```yaml
+      # 方法一：用 absent 检测特定关键目标的序列是否消失
+      - alert: CriticalProbeMissing
+        expr: 'absent(probe_success{instance="https://example.com"})'
+        for: 5m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '首页探测序列消失，黑盒监控可能已失效'
+
+      # 方法二：监控 blackbox 抓取任务本身
+      - alert: BlackboxScrapeFailing
+        expr: 'up{job=~"blackbox.*"} == 0'
+        for: 3m
+        labels:
+          severity: 'critical'
+```
+
+`up` 指标是 Prometheus 自己生成的，只要目标还在配置里，它就一定存在——这让它成为检测「抓取链路断了」的可靠信号。
+</Callout>
+
+<Callout type="exercise" title="练习 3：设计一套完整的黑盒告警">
+你负责一个电商网站，需要黑盒监控覆盖：
+
+- 官网首页 `https://shop.example.com`（对用户最关键）
+- 下单 API `https://api.example.com/v1/order/health`（需要带鉴权头，返回体含 `"ok":true`）
+- MySQL 主库端口 `db-master.internal:3306`
+- 三台核心交换机的 ICMP 连通性
+
+请写出：blackbox 的 module 配置、Prometheus 的 job 配置、以及一套分级的告警规则。特别注意告警的严重级别划分和防止静默失败。
+
+<Answer>
+**第一部分：blackbox.yml**
+
+```yaml
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: 'ip4'
+      valid_status_codes: []
+      follow_redirects: true
+
+  order_api_health:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: 'ip4'
+      bearer_token_file: '/etc/blackbox/api_token'
+      valid_status_codes: [200]
+      fail_if_body_not_matches_regexp:
+        - '"ok"\s*:\s*true'
+
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: 'ip4'
+
+  icmp_ip4:
+    prober: icmp
+    timeout: 5s
+    icmp:
+      preferred_ip_protocol: 'ip4'
+      ip_protocol_fallback: false
+```
+
+**第二部分：目标文件与 job 配置**
+
+`/etc/prometheus/targets/blackbox/shop.json`：
+
+```json
+[
+  {
+    "targets": ["https://shop.example.com"],
+    "labels": { "module": "http_2xx", "tier": "user-facing", "team": "frontend" }
+  },
+  {
+    "targets": ["https://api.example.com/v1/order/health"],
+    "labels": { "module": "order_api_health", "tier": "user-facing", "team": "order" }
+  },
+  {
+    "targets": ["db-master.internal:3306"],
+    "labels": { "module": "tcp_connect", "tier": "infra", "team": "dba" }
+  },
+  {
+    "targets": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+    "labels": { "module": "icmp_ip4", "tier": "infra", "team": "network" }
+  }
+]
+```
+
+用 `tier` 标签区分「面向用户」和「基础设施」，后面告警分级会用到；`team` 标签让 Alertmanager 能直接路由到对应团队。
+
+```yaml
+scrape_configs:
+  # 探测 job
+  - job_name: 'blackbox'
+    metrics_path: '/probe'
+    scrape_interval: 30s
+    scrape_timeout: 15s
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/blackbox/*.json']
+        refresh_interval: 1m
+    relabel_configs:
+      - source_labels: [module]
+        target_label: '__param_module'
+      - source_labels: [__address__]
+        target_label: '__param_target'
+      - source_labels: [__param_target]
+        target_label: 'instance'
+      - target_label: '__address__'
+        replacement: 'blackbox:9115'
+
+  # exporter 自身监控（独立 job）
+  - job_name: 'blackbox-exporter'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['blackbox:9115']
+```
+
+注意这里保留了 `module` 标签没有 `labeldrop`——它在排障时很有用（能看出是哪种探测失败了）。
+
+**第三部分：分级告警规则**
+
+```yaml
+groups:
+  - name: blackbox-user-facing
+    rules:
+      # 面向用户的服务不可用 —— 最高级别，立即叫醒
+      - alert: UserFacingProbeDown
+        expr: 'probe_success{tier="user-facing"} == 0'
+        for: 2m
+        labels:
+          severity: 'critical'
+          page: 'true'
+        annotations:
+          summary: '用户侧服务不可用：{{ $labels.instance }}'
+          description: '{{ $labels.instance }}（{{ $labels.team }}）已连续 2 分钟探测失败，用户可能无法访问'
+
+      # 下单 API 内容校验失败 —— 服务通但业务不正常，同样紧急
+      - alert: OrderApiUnhealthy
+        expr: 'probe_failed_due_to_regex{module="order_api_health"} == 1'
+        for: 2m
+        labels:
+          severity: 'critical'
+          page: 'true'
+        annotations:
+          summary: '下单 API 健康检查内容不符合预期'
+          description: 'HTTP 通了但返回体里没有 "ok":true，服务可能处于半死状态'
+
+      # 用户侧延迟劣化 —— 未故障但体验下降
+      - alert: UserFacingProbeSlow
+        expr: 'probe_duration_seconds{tier="user-facing"} > 3'
+        for: 10m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} 探测耗时 {{ $value }} 秒'
+
+      # 定位延迟来源：服务端处理慢
+      - alert: BackendProcessingSlow
+        expr: 'probe_http_duration_seconds{phase="processing"} > 2'
+        for: 10m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} 服务端处理阶段耗时过长'
+
+  - name: blackbox-infra
+    rules:
+      # 基础设施探测失败 —— 重要但通常有冗余，级别降一档
+      - alert: InfraProbeDown
+        expr: 'probe_success{tier="infra"} == 0'
+        for: 5m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '基础设施探测失败：{{ $labels.instance }}'
+
+      # 主库连不上 —— 单点，升级为 critical
+      - alert: MySQLMasterUnreachable
+        expr: 'probe_success{instance="db-master.internal:3306"} == 0'
+        for: 2m
+        labels:
+          severity: 'critical'
+          page: 'true'
+
+      # 多台交换机同时不通 —— 说明是网络面故障而非单机故障
+      - alert: MultipleSwitchesDown
+        expr: 'count(probe_success{module="icmp_ip4"} == 0) >= 2'
+        for: 2m
+        labels:
+          severity: 'critical'
+          page: 'true'
+        annotations:
+          summary: '{{ $value }} 台交换机同时不可达，疑似网络面故障'
+
+  - name: blackbox-ssl
+    rules:
+      - alert: SSLCertExpiringSoon
+        expr: '(probe_ssl_earliest_cert_expiry - time()) / 86400 < 15'
+        for: 1h
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} 证书剩余 {{ $value }} 天'
+
+      - alert: SSLCertExpiringCritical
+        expr: '(probe_ssl_earliest_cert_expiry - time()) / 86400 < 3'
+        for: 10m
+        labels:
+          severity: 'critical'
+          page: 'true'
+
+  - name: blackbox-meta
+    rules:
+      # 防静默失败之一：exporter 挂了
+      - alert: BlackboxExporterDown
+        expr: 'up{job="blackbox-exporter"} == 0'
+        for: 3m
+        labels:
+          severity: 'critical'
+          page: 'true'
+        annotations:
+          summary: 'blackbox_exporter 宕机，全部黑盒探测已失效'
+
+      # 防静默失败之二：抓取链路断了
+      - alert: BlackboxScrapeFailing
+        expr: 'up{job="blackbox"} == 0'
+        for: 3m
+        labels:
+          severity: 'critical'
+
+      # 防静默失败之三：关键目标的序列消失
+      - alert: CriticalProbeSeriesMissing
+        expr: |
+          absent(probe_success{instance="https://shop.example.com"})
+          or
+          absent(probe_success{instance="https://api.example.com/v1/order/health"})
+        for: 5m
+        labels:
+          severity: 'critical'
+          page: 'true'
+        annotations:
+          summary: '关键探测序列消失，黑盒监控可能已失效'
+```
+
+**设计要点说明：**
+
+1. **按 `tier` 分级。** 面向用户的探测失败 2 分钟就叫醒人（`page: 'true'`），基础设施探测失败给 5 分钟且只是 warning——因为交换机通常有冗余，单台不通不影响业务。但 MySQL 主库是单点，单独提级为 critical。
+
+2. **区分「不通」和「内容不对」。** `probe_success == 0` 覆盖网络层故障，`probe_failed_due_to_regex == 1` 覆盖「HTTP 200 但业务异常」这种半死状态。后者其实更隐蔽也更危险，因为负载均衡器的健康检查通常发现不了。
+
+3. **用 `count` 做聚合判断。** `count(probe_success{module="icmp_ip4"} == 0) >= 2` 这条规则把「单台交换机不通」和「网络面故障」区分开了，避免了单机维护时误报，同时对真正的网络故障响应更快。
+
+4. **三重防静默失败。** exporter 存活、抓取成功、关键序列存在——三条规则覆盖了黑盒监控链路可能断裂的所有位置。这是黑盒监控最容易被忽略但最不能省的部分。
+
+5. **延迟告警拆到 phase 级别。** `probe_duration_seconds > 3` 告诉你「慢了」，`probe_http_duration_seconds{phase="processing"} > 2` 直接告诉你「慢在服务端」，省掉一轮排查。
+</Answer>
+</Callout>
+
+## 七、进阶实践与常见坑
+
+### 坑一：ICMP 需要特权
+
+ICMP 探测要发送原始网络包，普通用户跑不了。三种解决办法：
+
+```bash
+# 方法一（推荐）：给二进制加 capability
+sudo setcap cap_net_raw+ep /usr/local/bin/blackbox_exporter
+
+# 方法二：Docker 里加 capability
+docker run --cap-add=NET_RAW -p 9115:9115 prom/blackbox-exporter
+
+# 方法三（不推荐）：用 root 跑
+```
+
+Kubernetes 里则要在 Pod 的 securityContext 里声明：
+
+```yaml
+securityContext:
+  capabilities:
+    add: ['NET_RAW']
+```
+
+不加权限的表现是所有 ICMP 探测都失败，`debug=true` 会显示 `socket: operation not permitted`。
+
+### 坑二：超时配置的三层关系
+
+这里有三个超时会互相影响，搞错了会出现「探测明明能成功但 Prometheus 报超时」：
+
+1. **Prometheus 的 `scrape_timeout`**：Prometheus 等待响应的最长时间。
+2. **blackbox module 的 `timeout`**：单次探测的最长时间。
+3. **blackbox 的 `--timeout-offset`**（默认 0.5 秒）：一个安全余量。
+
+blackbox_exporter 的实际行为是：Prometheus 抓取时会带一个 `X-Prometheus-Scrape-Timeout-Seconds` 请求头告诉 blackbox 「你还有多少秒」。blackbox 拿这个值**减去 `--timeout-offset`**，再和 module 里配的 `timeout` 取**较小者**，作为本次探测的实际超时。
+
+所以正确的配置关系是：
+
+```text
+module.timeout  <  scrape_timeout - timeout_offset  <=  scrape_interval
+```
+
+举例：`scrape_interval: 30s`、`scrape_timeout: 15s`、`timeout-offset: 0.5s`，那么 module 的 `timeout` 应该小于 14.5 秒，设成 10 秒比较稳妥。
+
+<Callout type="warn" title="最常见的超时错误">
+把 module 的 `timeout` 设成 30 秒，但 `scrape_timeout` 保持默认的 10 秒。结果是 blackbox 只会得到大约 9.5 秒的实际超时，那些需要 15 秒才能响应的慢目标永远探测失败，而你盯着 `timeout: 30s` 的配置百思不得其解。
+
+**记住：真正生效的超时由 Prometheus 的 `scrape_timeout` 决定，module 的 `timeout` 只能让它更短，不能让它更长。**
+</Callout>
+
+### 坑三：blackbox_exporter 自己是单点
+
+所有探测都从一个 blackbox 实例发出，这意味着：
+
+- 这个实例挂了，全部黑盒监控失效（所以前面反复强调要监控它）。
+- 这个实例所在的网络位置决定了你「从哪里看服务」。它和被探测服务在同一个机房内网时，你测的是内网可达性，用户实际走的公网链路完全没被覆盖。
+
+**解决办法是多点探测**：在不同地域、不同网络环境各部署一个 blackbox_exporter，用 `external_labels` 或 relabel 打上探测点标识。
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox-from-beijing'
+    metrics_path: '/probe'
+    params:
+      module: ['http_2xx']
+    static_configs:
+      - targets: ['https://shop.example.com']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: '__param_target'
+      - source_labels: [__param_target]
+        target_label: 'instance'
+      - target_label: '__address__'
+        replacement: 'blackbox-bj:9115'
+      - target_label: 'probe_from'
+        replacement: 'beijing'
+
+  - job_name: 'blackbox-from-shanghai'
+    metrics_path: '/probe'
+    params:
+      module: ['http_2xx']
+    static_configs:
+      - targets: ['https://shop.example.com']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: '__param_target'
+      - source_labels: [__param_target]
+        target_label: 'instance'
+      - target_label: '__address__'
+        replacement: 'blackbox-sh:9115'
+      - target_label: 'probe_from'
+        replacement: 'shanghai'
+```
+
+有了 `probe_from` 标签，就能写出更聪明的告警：
+
+```promql
+# 所有探测点都失败 = 服务真的挂了
+min by (instance) (probe_success) == 0 and count by (instance) (probe_success) >= 2
+
+# 只有部分探测点失败 = 区域性网络问题
+count by (instance) (probe_success == 0) > 0
+  and count by (instance) (probe_success == 1) > 0
+```
+
+第一条对应「服务故障」，第二条对应「某地区用户访问异常」——这两种情况的处置流程完全不同，能自动区分开非常有价值。
+
+### 坑四：和 Kubernetes 服务发现结合
+
+在 K8s 里，可以用 `role: ingress` 自动探测所有对外入口，或者用 `role: service` 探测所有 Service：
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox-k8s-ingress'
+    metrics_path: '/probe'
+    params:
+      module: ['http_2xx']
+
+    kubernetes_sd_configs:
+      - role: ingress
+
+    relabel_configs:
+      # 只探测标注了开关的 Ingress
+      - source_labels:
+          - '__meta_kubernetes_ingress_annotation_prometheus_io_probe'
+        action: keep
+        regex: 'true'
+
+      # 用 scheme + host + path 拼出完整 URL
+      - source_labels:
+          - '__meta_kubernetes_ingress_scheme'
+          - '__address__'
+          - '__meta_kubernetes_ingress_path'
+        regex: '(.+);(.+);(.+)'
+        replacement: '${1}://${2}${3}'
+        target_label: '__param_target'
+
+      - source_labels: [__param_target]
+        target_label: 'instance'
+      - target_label: '__address__'
+        replacement: 'blackbox:9115'
+
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: 'namespace'
+      - source_labels: [__meta_kubernetes_ingress_name]
+        target_label: 'ingress'
+```
+
+第二条规则是这里的核心：`role: ingress` 提供了 `__meta_kubernetes_ingress_scheme`（`http` 或 `https`）、`__address__`（host）和 `__meta_kubernetes_ingress_path`（路径）三个部分，用分号连接后再用正则拆成三个捕获组，最后拼成完整 URL。这里用了 `${1}` 这种带花括号的捕获组写法，是因为紧跟着的 `://` 里的冒号可能让解析产生歧义，加花括号更明确。
+
+<Callout type="tip" title="别把黑盒探测铺得太开">
+一个常见的过度设计是「把所有 Service 都探测一遍」。这会带来两个问题：探测目标数量膨胀（一个中等集群可能有几百个 Service），以及**大量无意义的告警**——很多内部 Service 本来就不该有 HTTP 健康检查端点。
+
+正确的做法是**用 annotation 做白名单**（上面配置里的第一条规则），让服务负责人主动声明「我需要被黑盒探测」。黑盒监控的目标应该是**用户真正会访问的那些入口**，不是所有网络端点。
+</Callout>
+
+<Callout type="exercise" title="练习 4：综合排障">
+线上出现一个诡异现象：`https://api.example.com/health` 的黑盒探测每天早上 9 点到 10 点之间会间歇性失败（`probe_success` 在 0 和 1 之间跳动），但同一时段的白盒指标显示：应用的 `up` 一直是 1，`http_requests_total` 的 5xx 速率为 0，P99 延迟约 800ms（平时 200ms）。
+
+当前配置：
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox'
+    metrics_path: '/probe'
+    scrape_interval: 15s
+    params:
+      module: ['http_2xx']
+    static_configs:
+      - targets: ['https://api.example.com/health']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: '__param_target'
+      - source_labels: [__param_target]
+        target_label: 'instance'
+      - target_label: '__address__'
+        replacement: 'blackbox:9115'
+```
+
+```yaml
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+```
+
+请给出排查思路、最可能的原因，以及改进方案（配置 + 告警）。
+
+<Answer>
+**第一步：确认「探测失败」的具体形态**
+
+白盒说服务是好的，黑盒说不通，这种矛盾有三种可能：（a）真的是链路问题（DNS/网络/LB/TLS）；（b）探测配置本身有问题（比如超时太短）；（c）白盒的观测范围没有覆盖到出问题的那一层。
+
+先看指标区分：
+
+```promql
+# 失败时状态码是多少？如果序列存在且是 200，说明不是应用返回错误
+probe_http_status_code{instance="https://api.example.com/health"}
+
+# 失败时是不是耗时特别长？
+probe_duration_seconds{instance="https://api.example.com/health"}
+
+# 拆到阶段，看是哪一步慢
+probe_http_duration_seconds{instance="https://api.example.com/health"}
+
+# 是不是解析到了不同的 IP？
+probe_ip_addr_hash{instance="https://api.example.com/health"}
+```
+
+同时抓一次现场：
+
+```bash
+curl 'http://blackbox:9115/probe?target=https://api.example.com/health&module=http_2xx&debug=true'
+```
+
+**第二步：最可能的原因**
+
+线索是 P99 从 200ms 涨到了 800ms，而 module 的 `timeout` 是 5 秒——看起来 800ms 远没到超时。但注意两点：
+
+1. **P99 是 800ms 意味着有 1% 的请求更慢**，可能达到几秒。黑盒探测每 15 秒一次，样本量很小，恰好命中长尾慢请求的概率不低。
+2. **更关键的是 `scrape_timeout` 没有显式配置**。`scrape_interval` 是 15 秒，`scrape_timeout` 未设置时**默认是 10 秒**——但这里有个陷阱：如果 `scrape_interval` 小于 10 秒，`scrape_timeout` 会取 `scrape_interval` 的值。本例中 15 秒大于 10 秒，所以 `scrape_timeout` 是 10 秒，module 的 5 秒是实际生效值。
+
+所以实际超时是 5 秒。**如果 9 点到 10 点的早高峰期间，长尾请求偶尔超过 5 秒，探测就会失败。** 而应用侧的 P99 只统计**成功返回**的请求，那些被客户端（blackbox）主动断开的超时请求根本不会被计入应用的 `http_requests_total`——这就解释了为什么白盒看不到任何异常。**这正是白盒的观测盲区：客户端超时断开的请求，服务端往往统计不到。**
+
+另外两个需要排除的可能：
+
+- **TLS 握手在高峰期变慢。** 看 `probe_http_duration_seconds{phase="tls"}`，如果 LB 的 TLS 卸载能力不足，握手会在高峰期显著劣化。
+- **LB 后端摘除。** 如果 `phase="connect"` 偶发飙高，可能是 LB 把某个后端摘了又加回来。
+
+**第三步：改进方案**
+
+**改进 1：让探测配置暴露真相而不是掩盖它。**
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox'
+    metrics_path: '/probe'
+    scrape_interval: 15s
+    scrape_timeout: 10s        # 显式声明
+    params:
+      module: ['http_2xx']
+    static_configs:
+      - targets: ['https://api.example.com/health']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: '__param_target'
+      - source_labels: [__param_target]
+        target_label: 'instance'
+      - target_label: '__address__'
+        replacement: 'blackbox:9115'
+```
+
+```yaml
+modules:
+  http_2xx:
+    prober: http
+    timeout: 9s                # 小于 scrape_timeout 减去 timeout-offset(0.5s)
+    http:
+      method: GET
+      preferred_ip_protocol: 'ip4'
+      valid_status_codes: []
+```
+
+把 module timeout 从 5 秒放宽到 9 秒。**注意这不是「把问题藏起来」**——超时放宽后，如果探测变成成功但 `probe_duration_seconds` 达到 6 到 8 秒，那就明确证实了「服务在高峰期确实很慢」，问题从「间歇性不通」变成了「延迟劣化」，性质更清楚，也更容易推动优化。同时增加一条延迟告警把这个事实暴露出来。
+
+**改进 2：把探测频率提上去，增加样本量。**
+
+```yaml
+    scrape_interval: 10s
+    scrape_timeout: 9s
+```
+
+15 秒一次的探测，一小时只有 240 个样本，很难判断「失败率」到底是 1% 还是 10%。提到 10 秒能改善统计精度。（注意此时 `scrape_timeout` 必须小于等于 `scrape_interval`，module timeout 要相应降到 8 秒左右。）
+
+**改进 3：告警要能区分「不通」和「慢」。**
+
+```yaml
+groups:
+  - name: blackbox-api
+    rules:
+      # 真正的不可用：连续失败
+      - alert: ApiProbeDown
+        expr: 'probe_success{instance="https://api.example.com/health"} == 0'
+        for: 2m
+        labels:
+          severity: 'critical'
+
+      # 间歇性失败：5 分钟内成功率低于 95%
+      # 这条能抓住「跳动」这种 for 抓不到的模式
+      - alert: ApiProbeFlapping
+        expr: 'avg_over_time(probe_success{instance="https://api.example.com/health"}[5m]) < 0.95'
+        for: 5m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: 'API 探测成功率 {{ $value }}，出现间歇性失败'
+
+      # 延迟劣化
+      - alert: ApiProbeSlow
+        expr: 'probe_duration_seconds{instance="https://api.example.com/health"} > 3'
+        for: 5m
+        labels:
+          severity: 'warning'
+
+      # 定位：服务端处理慢
+      - alert: ApiBackendSlow
+        expr: 'probe_http_duration_seconds{phase="processing",instance="https://api.example.com/health"} > 2'
+        for: 5m
+        labels:
+          severity: 'warning'
+
+      # 定位：TLS 握手慢
+      - alert: ApiTlsSlow
+        expr: 'probe_http_duration_seconds{phase="tls",instance="https://api.example.com/health"} > 0.5'
+        for: 10m
+        labels:
+          severity: 'warning'
+```
+
+`avg_over_time(probe_success[5m]) < 0.95` 这条特别重要。原来的 `probe_success == 0` 配 `for: 3m` 完全抓不住「在 0 和 1 之间跳动」的模式——因为每次失败都不足 3 分钟，`for` 的计时会被中间的成功打断而重置。用滑动窗口的成功率就能准确捕捉这种间歇性故障。**这是黑盒告警里非常值得掌握的一个模式。**
+
+**改进 4：补上白盒的观测盲区。**
+
+既然发现应用侧统计不到超时断开的请求，就应该推动在 LB / Nginx 层增加监控：Nginx 的 `upstream_response_time` 直方图、499 状态码（客户端主动断开）计数。这才是根治——**黑盒发现了白盒的盲区，正确的反应是去补白盒，而不是只依赖黑盒。**
+
+**总结这道题的思维方式：** 黑盒和白盒矛盾时，第一反应不该是「黑盒误报了」，而是「**它们的观测口径有什么不同**」。本例里的差异就是「客户端超时断开的请求，服务端不计入统计」，这个盲区恰恰是黑盒监控存在的意义。
+</Answer>
+</Callout>
+
+## 小结
+
+- **黑盒监控回答的是「用户能不能用」**，它覆盖了 DNS、网络、LB、TLS、应用这整条链路，能发现白盒监控结构性看不到的故障。它和白盒是互补关系，不是替代关系。
+- **blackbox_exporter 是 multi-target exporter**：一个实例服务成千上万个目标，探测参数通过 `/probe?target=...&module=...` 在请求时传入。它自己的 `/metrics` 不包含探测结果，需要单独的 job 去抓。
+- **module 定义「怎么探测」**，支持 `http` / `tcp` / `icmp` / `dns` 四种 prober。注意 DNS prober 的 `target` 是 DNS 服务器地址而不是域名。`preferred_ip_protocol: 'ip4'` 建议显式设置。
+- **relabel 三段式**：地址变 `__param_target`、`__param_target` 变 `instance`、地址换成 blackbox 地址。顺序不能乱。配合 `file_sd_configs` 把 module 写进目标文件，能做到新增探测零配置改动。
+- **告警的核心是 `probe_success`**，但一定要防「序列消失」这种静默失败——用 `up` 和 `absent` 双重保险。证书过期告警要分级；间歇性失败要用 `avg_over_time` 而不是 `for`。
+- **超时有三层关系**：真正生效的是 `scrape_timeout` 减去 `--timeout-offset` 与 module `timeout` 中的较小者。module 的 `timeout` 只能让超时更短。
+- **多点探测**能区分「服务挂了」和「某地区网络故障」，这两种情况的处置流程完全不同，值得投入。
+
+黑盒监控是整个 Prometheus 监控体系里投入产出比最高的一环之一——几十行配置就能覆盖那些最容易被忽略、又最直接影响用户的故障。把它和前面十五章的内容组合起来，你已经拥有了一套相当完整的可观测性能力。

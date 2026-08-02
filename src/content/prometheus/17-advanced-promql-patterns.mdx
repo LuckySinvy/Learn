@@ -1,0 +1,1951 @@
+---
+title: 进阶 PromQL 模式
+order: 17
+description: 子查询、absent 告警、聚合模式、SLO 错误预算与燃烧率、histogram_quantile 进阶与长尾分析
+---
+
+# 进阶 PromQL 模式
+
+到目前为止，你写的 PromQL 大概都长这样：选一批序列、算个 `rate`、`sum` 一下、和阈值比一比。这已经能解决八成的日常问题了。
+
+但剩下那两成，往往是最难也最有价值的：
+
+- 「过去 24 小时里，这个服务的**峰值 QPS** 是多少？」——`max(rate(...))` 给的是「当前这一刻各实例中的最大值」，不是「时间维度上的峰值」。
+- 「批处理任务昨晚没跑，我怎么知道？」——它没跑，序列就不存在，所有基于比较的告警都是哑的。
+- 「我们承诺 99.9% 可用性，现在这个月的错误预算烧掉多少了？还剩几分钟？」
+- 「P99 从 300ms 涨到 800ms，是所有实例都慢了，还是某一台在拖后腿？」
+- 「这个进程的内存到底是在正常波动，还是在缓慢泄漏？」
+
+这些问题的共同点是：**它们关心的不是「此刻的值」，而是「值在时间维度上的形状」**。本章讲的就是描述这种形状的工具。
+
+读完本章你会掌握：
+
+- 子查询（subquery）的 `[range:resolution]` 语法、对齐规则、代价，以及什么时候该换成记录规则
+- `absent()` 与 `absent_over_time()` 的确切返回语义，用它们捕获「序列消失」这类静默故障
+- 聚合模式的进阶用法：`by` 与 `without` 的取舍、`topk` 为什么不能直接写进告警、`quantile` 与 `histogram_quantile` 的本质区别
+- SLO、错误预算、燃烧率（burn rate）的完整推导，以及多窗口多燃烧率告警的工程实现
+- `histogram_quantile` 的边界行为、跨实例聚合的正确姿势、以及原生直方图（native histogram）带来的变化
+- 用 `deriv`、`predict_linear`、`changes`、`resets` 做泄漏检测与长尾分析
+
+## 一、子查询：给瞬时向量加上时间维度
+
+### 为什么需要它
+
+先看一个具体的困境。你想知道「过去 1 小时内，QPS 的峰值是多少」。
+
+自然的第一反应是这样写：
+
+```promql
+max_over_time(rate(http_requests_total[5m])[1h])
+```
+
+这条查询**会直接报语法错误**：`ranges only allowed for vector selectors`。
+
+原因在于 PromQL 的类型系统。`[1h]` 这种区间选择器**只能加在时间序列选择器（vector selector）后面**，比如 `http_requests_total[1h]`。而 `rate(...)` 的返回值是一个**瞬时向量（instant vector）**，你没法直接在它后面加区间——PromQL 里不存在「对一个函数结果取区间」这种操作。
+
+这个限制很要命，因为「先算速率，再看这个速率在一段时间里的最大值」是极其常见的需求。Prometheus 2.7 引入的**子查询**就是为了解决它。
+
+### 语法
+
+```promql
+<瞬时向量表达式>[<range>:<resolution>]
+```
+
+正确的写法是：
+
+```promql
+max_over_time(rate(http_requests_total[5m])[1h:1m])
+```
+
+读作：**「把 `rate(http_requests_total[5m])` 这个查询，在过去 1 小时里每隔 1 分钟执行一次，把这 60 次的结果拼成一个区间向量，然后取最大值。」**
+
+拆开来说：
+
+- `[1h` 是**外层区间**：往回看多久。
+- `:1m]` 是**分辨率（resolution）**：每隔多久求值一次内层表达式。
+- 冒号是子查询的标志。`[1h]` 是区间选择器，`[1h:1m]` 是子查询，**只差一个冒号，语义完全不同**。
+- `[5m]` 是**内层区间**：每次求值时 `rate` 自己往回看多久。
+
+分辨率可以省略，写成 `[1h:]`。省略时使用 Prometheus 全局配置里的 `evaluation_interval`（默认 1 分钟）作为步长。**不建议省略**——它会让查询结果依赖服务端配置，换个环境结果就变了。
+
+子查询还支持 `offset` 和 `@` 修饰符，写在方括号后面：
+
+```promql
+# 上一小时（不含最近一小时）的峰值 QPS
+max_over_time(rate(http_requests_total[5m])[1h:1m] offset 1h)
+
+# 固定看某个绝对时间点之前 1 小时的峰值
+max_over_time(rate(http_requests_total[5m])[1h:1m] @ 1700000000)
+```
+
+<Callout type="info" title="内层区间和分辨率的关系">
+一个常见困惑是：`[1h:1m]` 里每分钟求一次 `rate(...[5m])`，相邻两次的 5 分钟窗口是**重叠**的（第 1 分钟看 0 到 5 分钟，第 2 分钟看 1 到 6 分钟）。这没问题，这正是想要的效果——重叠让结果平滑，避免因为窗口切分位置不同而抖动。
+
+真正要避免的是**内层区间小于分辨率**，比如 `rate(x[1m])[1h:5m]`。这样每 5 分钟才求一次值，每次只看最近 1 分钟，中间 4 分钟的数据完全被跳过了，结果会失真。
+
+**经验法则：内层区间 ≥ 分辨率，且内层区间 ≥ 4 倍抓取间隔。** 15 秒抓取间隔下，`rate(x[5m])[1h:1m]` 是一个很稳妥的组合。
+</Callout>
+
+### 对齐规则：一个容易踩的坑
+
+子查询的取样点**不是从查询时刻往回推的**，而是按分辨率**对齐到绝对时间**（Unix 纪元时间的整数倍）。
+
+举例：你在 `10:00:37` 执行 `max_over_time(rate(x[5m])[1h:1m])`，取样点不是 `10:00:37`、`09:59:37`、`09:58:37`……，而是 `10:00:00`、`09:59:00`、`09:58:00`……
+
+带来两个实际影响：
+
+1. **最后一个取样点可能落后于查询时刻**。上例中最近的取样点是 `10:00:00`，比查询时刻早了 37 秒。如果你用子查询做告警，要意识到这个延迟。
+2. **同一条子查询在不同时刻执行，取样点集合是稳定的**。这是好事——它让结果可复现，也让缓存更有效。
+
+### 五个真正有用的子查询模式
+
+**模式一：时间维度上的峰值/谷值。**
+
+```promql
+# 过去 24 小时的峰值 QPS（用于容量规划）
+max_over_time(
+  sum(rate(http_requests_total{job="api"}[5m]))[24h:1m]
+)
+
+# 过去 7 天里，连接池使用率的最低点
+min_over_time(
+  (db_connections_in_use / db_connections_max)[7d:5m]
+)
+```
+
+注意 `sum(...)` 外面要加括号再跟 `[24h:1m]`，否则语法解析会出问题。**养成给子查询的内层表达式加括号的习惯**，可以省掉很多莫名其妙的报错。
+
+**模式二：统计「异常状态持续了多久」。**
+
+```promql
+# 过去 24 小时里，实例处于宕机状态的分钟数
+count_over_time((up{job="api"} == 0)[24h:1m])
+
+# 过去 30 天的可用率（按分钟采样）
+avg_over_time((up{job="api"})[30d:1m])
+```
+
+`up == 0` 是一个过滤操作：只有值为 0 的序列会被保留。所以 `count_over_time` 数的就是「有多少个采样点上它是 0」，每个点代表 1 分钟。
+
+**模式三：分位数的分位数（谨慎使用）。**
+
+```promql
+# 过去 7 天里，P99 延迟本身的 P95 是多少
+# 回答：「我们的 P99 在绝大多数时候都在什么水平以下」
+quantile_over_time(0.95,
+  histogram_quantile(0.99,
+    sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+  )[7d:5m]
+)
+```
+
+这个模式在做 SLO 报告时很有用，但要清楚它算的是**「P99 这条曲线的 P95」**，不是「P99.95 的延迟」。两者完全不同，别在汇报时说错。
+
+**模式四：平滑后再求导（泄漏检测）。**
+
+```promql
+# 先用 10 分钟平均抹平毛刺，再看 1 小时的增长趋势
+deriv(
+  avg_over_time(process_resident_memory_bytes[10m])[1h:2m]
+)
+```
+
+直接 `deriv(process_resident_memory_bytes[1h])` 会被 GC 造成的锯齿严重干扰。先平滑再求导，得到的趋势线干净得多。
+
+**模式五：找出「抖动」的目标。**
+
+```promql
+# 过去 1 小时里 probe_success 变化了多少次（越大越抖）
+changes((probe_success)[1h:1m])
+
+# 成功率介于 0 和 1 之间 = 间歇性失败
+avg_over_time(probe_success[1h]) < 1 and avg_over_time(probe_success[1h]) > 0
+```
+
+### 子查询很贵，非常贵
+
+<Callout type="warn" title="一条子查询可能扫掉几千万个样本">
+估算一下 `max_over_time(sum(rate(http_requests_total[5m]))[7d:1m])` 的代价：
+
+- 外层：7 天 ÷ 1 分钟 = **10080 次求值**
+- 每次求值：内层 `rate(...[5m])` 要读取所有匹配序列在 5 分钟内的样本
+- 假设 `http_requests_total` 有 500 条序列，抓取间隔 15 秒，5 分钟就是 20 个点
+- 总样本数 ≈ 10080 × 500 × 20 = **1 亿个样本**
+
+Prometheus 默认的 `--query.max-samples` 是 5000 万，这条查询会直接被拒绝，报 `query processing would load too many samples into memory`。
+
+即使没超限，这样一条查询也会把 CPU 打满好几秒，如果放在 Grafana 看板上自动刷新，等于给自己安排了一场慢性 DDoS。
+</Callout>
+
+正确的做法是**用记录规则把内层结果预先算好**：
+
+```yaml
+groups:
+  - name: api-recording
+    interval: 30s
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+```
+
+然后子查询就变成了：
+
+```promql
+max_over_time(job:http_requests:rate5m[7d:1m])
+```
+
+现在内层只有一条序列，`max_over_time` 直接在一个已经算好的低基数序列上滑窗，代价降了三个数量级。
+
+<Callout type="tip" title="子查询的判断标准">
+**探索性分析、临时排障** → 随便用子查询，窗口开小一点（`[1h:1m]` 一般都很快）。
+
+**看板、告警规则、长窗口（超过 6 小时）** → 一律先做成记录规则。看板的查询会被无数人无数次触发，告警规则每个 `evaluation_interval` 就跑一次，这两个地方绝不能放昂贵的子查询。
+</Callout>
+
+<Callout type="exercise" title="练习 1：用子查询回答四个业务问题">
+你负责一个 API 服务，指标是 `http_requests_total`（Counter，带 `job`、`instance`、`status`、`path` 标签）和 `http_request_duration_seconds_bucket`（Histogram）。抓取间隔 15 秒。
+
+请为下面四个问题各写一条 PromQL，并说明为什么不能用更简单的写法：
+
+1. 过去 7 天里，整个服务的**峰值 QPS** 是多少？（用于扩容评估）
+2. 过去 24 小时里，**每个实例**各自的峰值 QPS，取最高的 3 个实例。
+3. 过去 30 天里，5xx 错误率**超过 1%** 的时间累计有多少分钟？
+4. 过去 6 小时里，P99 延迟是**一直很高**，还是**只有几个尖峰**？给出一个能量化区分的表达式。
+
+对第 1、3 题，还要给出对应的记录规则版本。
+
+<Answer>
+**第 1 题：全服务峰值 QPS**
+
+```promql
+max_over_time(
+  (sum(rate(http_requests_total[5m])))[7d:1m]
+)
+```
+
+**为什么不能写 `max(sum(rate(...)))`：** `max` 是一个**聚合算子**，它在「同一时刻的多条序列之间」取最大值。而 `sum(rate(...))` 已经把所有序列聚合成了一条，`max` 作用在一条序列上等于什么都没做——返回的还是当前这一刻的值。
+
+「峰值」这个词在这里指的是**时间维度上的最大值**，只有 `max_over_time` 能做到，而 `max_over_time` 需要区间向量，所以必须用子查询。
+
+**记录规则版本：**
+
+```yaml
+groups:
+  - name: api-recording
+    interval: 30s
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+```
+
+```promql
+max_over_time(job:http_requests:rate5m{job="api"}[7d:1m])
+```
+
+7 天窗口如果不走记录规则，样本量会直接顶爆 `--query.max-samples`。
+
+---
+
+**第 2 题：Top 3 实例峰值 QPS**
+
+```promql
+topk(3,
+  max_over_time(
+    (sum by (instance) (rate(http_requests_total[5m])))[24h:1m]
+  )
+)
+```
+
+关键在于 `sum by (instance)` 要写在**子查询内层**。如果写成外面：
+
+```promql
+# 错误
+topk(3, sum by (instance) (max_over_time((rate(http_requests_total[5m]))[24h:1m])))
+```
+
+这条算的是「每条 `(instance, status, path)` 序列各自的 24 小时峰值，再把这些峰值按实例加起来」。不同 path 的峰值发生在不同时刻，把它们相加没有物理意义——结果会明显大于该实例真实的峰值 QPS。
+
+**顺序原则：先在内层聚合到你关心的粒度，再在外层做时间聚合。**
+
+---
+
+**第 3 题：错误率超过 1% 的累计分钟数**
+
+```promql
+count_over_time(
+  (
+    sum(rate(http_requests_total{status=~"5.."}[5m]))
+    /
+    sum(rate(http_requests_total[5m]))
+    > 0.01
+  )[30d:1m]
+)
+```
+
+原理：`> 0.01` 是一个**过滤器**（不是布尔运算，除非加 `bool`），错误率不超过 1% 时表达式返回空，`count_over_time` 就不会计入这个点。分辨率是 1 分钟，所以计数值直接就是分钟数。
+
+**一个陷阱：** 如果整个 30 天里错误率从来没超过 1%，这条查询返回**空结果**而不是 0。做看板时要用 `or vector(0)` 兜底：
+
+```promql
+count_over_time((...)[30d:1m]) or vector(0)
+```
+
+**记录规则版本（强烈建议）：**
+
+```yaml
+      - record: job:http_errors:ratio_rate5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum by (job) (rate(http_requests_total[5m]))
+```
+
+```promql
+count_over_time((job:http_errors:ratio_rate5m{job="api"} > 0.01)[30d:1m]) or vector(0)
+```
+
+30 天 × 1440 分钟 = 43200 次内层求值，不走记录规则几乎必然超限。
+
+---
+
+**第 4 题：区分「持续高」和「偶发尖峰」**
+
+思路是比较 **P99 延迟的均值** 和 **P99 延迟的最大值**：
+
+```promql
+# 尖峰系数：峰值 / 均值。越大说明越像尖峰
+max_over_time((
+  histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+)[6h:1m])
+/
+avg_over_time((
+  histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+)[6h:1m])
+```
+
+解读：
+
+- 结果接近 **1** → P99 一直稳定在那个水平，是**系统性劣化**，要去查容量、慢查询、依赖服务。
+- 结果 **大于 3** → 平时正常，偶尔飙高，是**尖峰型问题**，方向是 GC 停顿、缓存击穿、定时任务、锁竞争、上游重试风暴。
+
+另一个更直接的量化方式是数「超标的时间占比」：
+
+```promql
+# 过去 6 小时里 P99 超过 500ms 的时间占比
+count_over_time((
+  histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 0.5
+)[6h:1m])
+/
+count_over_time((
+  histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+)[6h:1m])
+```
+
+接近 1 是持续劣化，0.05 左右就是偶发尖峰。这个表达式同样应该拆成记录规则——它把同一个昂贵的内层表达式算了两遍。
+</Answer>
+</Callout>
+
+## 二、absent 与 absent_over_time：捕获「什么都没有」
+
+### 静默失败是监控系统最大的敌人
+
+前面章节反复提到一个陷阱：**基于比较的告警，在序列消失时不会触发**。
+
+```promql
+up{job="batch-etl"} == 0
+```
+
+如果有人误删了这个 job 的配置，或者服务发现挂了，`up{job="batch-etl"}` 这条序列会直接消失。表达式返回空，告警规则安安静静地什么也不做。你的监控面板一片绿，实际上这个服务已经完全脱离监控。
+
+`absent()` 就是专门用来堵这个洞的。
+
+### absent 的确切语义
+
+```promql
+absent(v instant-vector)
+```
+
+- 如果 `v` **有任何元素** → 返回**空向量**（什么都没有）。
+- 如果 `v` **是空的** → 返回**一条序列，值为 1**。
+
+关键在于返回的那条序列**带什么标签**。规则是：**从选择器里的等值匹配器（`=`）中提取标签**。
+
+```promql
+absent(up{job="batch-etl", env="prod"})
+# 序列不存在时返回：{job="batch-etl", env="prod"}  值 1
+```
+
+```promql
+absent(up{job=~"batch.*"})
+# 正则匹配器不会被提取，返回：{}  值 1（一条没有任何标签的序列）
+```
+
+```promql
+absent(sum(rate(http_requests_total[5m])))
+# 内层是函数调用，无法提取标签，返回：{}  值 1
+```
+
+<Callout type="warn" title="absent 只能告诉你「有没有」，不能告诉你「哪一个没有」">
+这是 `absent` 最大的局限，也是最常见的误用来源。
+
+假设你有 50 个实例，`absent(up{job="api"})` **只有在 50 个全部消失时才会触发**。挂 1 个、挂 49 个，它都返回空。
+
+想检测「某个特定实例消失了」，就必须把实例写死在等值匹配器里：
+
+```promql
+absent(up{job="api", instance="10.0.1.5:8080"})
+```
+
+这在实例是动态伸缩的环境里完全不可行。**动态环境下检测实例数量下降，应该用计数比较而不是 absent：**
+
+```promql
+# 实例数少于预期
+count(up{job="api"}) < 3
+
+# 和一天前比，实例数掉了一半以上
+count(up{job="api"}) < 0.5 * count(up{job="api"} offset 1d)
+```
+</Callout>
+
+### absent_over_time：给「消失」加上时间维度
+
+```promql
+absent_over_time(v range-vector)
+```
+
+如果**整个区间内**该序列一个样本都没有，返回值为 1 的序列；只要区间内有任何一个样本，返回空。
+
+这个函数解决了 `absent` 的一个实际问题：**抓取偶尔失败一次不该告警**。
+
+```promql
+# 差：一次抓取失败就可能触发（虽然 for 能缓解，但语义不清晰）
+absent(up{job="api"})
+
+# 好：过去 10 分钟内一个样本都没有，才算真的消失了
+absent_over_time(up{job="api"}[10m])
+```
+
+对于**低频任务**，`absent_over_time` 更是唯一选择：
+
+```promql
+# 每天凌晨跑的备份任务，24 小时内没有任何成功记录
+absent_over_time(backup_last_success_timestamp_seconds{job="db-backup"}[25h])
+
+# 每小时跑的 ETL，2 小时没上报过
+absent_over_time(etl_batch_processed_total[2h])
+```
+
+注意 `[25h]` 而不是 `[24h]`——留一点余量，避免任务稍微晚跑几分钟就误报。
+
+### 实战：三层防护
+
+一套完整的「静默失败防护」通常包含三层，缺一不可：
+
+```yaml
+groups:
+  - name: silent-failure-guard
+    rules:
+      # 第一层：抓取本身失败（目标还在配置里，但抓不通）
+      - alert: TargetDown
+        expr: 'up{job="payment-api"} == 0'
+        for: 3m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '{{ $labels.instance }} 抓取失败'
+
+      # 第二层：整个 job 从配置里消失了
+      - alert: JobDisappeared
+        expr: 'absent(up{job="payment-api"})'
+        for: 5m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: 'payment-api 这个 job 已完全从监控中消失'
+          description: '可能原因：配置被误删、服务发现故障、整个集群下线'
+
+      # 第三层：关键业务指标消失（服务活着但不再上报关键指标）
+      - alert: KeyMetricMissing
+        expr: 'absent_over_time(payment_transactions_total[15m])'
+        for: 5m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '支付交易指标已 15 分钟无上报'
+          description: '服务可能已被降级、埋点代码被删除、或指标名被改动'
+
+      # 补充：实例数量异常下降
+      - alert: InstanceCountDropped
+        expr: 'count(up{job="payment-api"}) < 3'
+        for: 10m
+        labels:
+          severity: 'warning'
+```
+
+<Callout type="tip" title="给 absent 告警补上标签">
+`absent()` 返回的序列标签很贫瘠，Alertmanager 路由时可能匹配不到规则。用告警规则的 `labels` 字段手动补齐：
+
+```yaml
+      - alert: JobDisappeared
+        expr: 'absent(up{job="payment-api"})'
+        for: 5m
+        labels:
+          severity: 'critical'
+          team: 'payment'
+          service: 'payment-api'
+```
+
+或者在表达式层面用向量拼接的技巧构造标签（进阶写法）：
+
+```promql
+absent(up{job="payment-api"}) * on() group_left(team) (vector(1) and on() vector(1))
+```
+
+后者太绕了，实际工程中直接在 `labels` 里写死是最可读的方案。
+</Callout>
+
+## 三、聚合模式的进阶用法
+
+### by 与 without：不只是「反过来」
+
+```promql
+sum by (job, status) (rate(http_requests_total[5m]))
+sum without (instance, path) (rate(http_requests_total[5m]))
+```
+
+两者的核心差异是**对未来的容忍度**：
+
+- `by` 是**白名单**。以后有人给指标加了新标签（比如 `region`），`by (job, status)` 的结果**不会变**，新标签被自动丢弃。
+- `without` 是**黑名单**。加了 `region` 之后，`without (instance, path)` 的结果会**突然多出 `region` 这个维度**，序列数量翻倍，看板和告警可能双双出问题。
+
+<Callout type="info" title="选择原则">
+**给告警和记录规则用 `by`**——你要的是确定性，输出的标签集必须是可预期的。
+
+**给临时排障用 `without`**——你要的是「保留尽可能多的上下文」，多出来的标签正好帮你定位。
+
+顺便记住一点：**所有聚合算子都会丢弃 `__name__`**，包括 `sum without ()`。这就是为什么记录规则必须显式给结果起名字。
+</Callout>
+
+### topk / bottomk：能看，但别拿来告警
+
+`topk(k, v)` 返回 `v` 中值最大的 k 个元素，**保留原始的值和全部标签**（包括 `__name__`）。这一点和 `sum`/`avg` 完全不同——它不是「聚合」，而是「筛选」。
+
+```promql
+# QPS 最高的 5 个接口
+topk(5, sum by (path) (rate(http_requests_total[5m])))
+
+# 每个 job 内部各自取 Top 3（分组 topk）
+topk by (job) (3, sum by (job, path) (rate(http_requests_total[5m])))
+```
+
+PromQL 的聚合修饰符可以写在**函数名之后**也可以写在**括号之后**，两种都合法：
+
+```promql
+# 前置写法（推荐，一眼看出分组维度）
+topk by (job) (3, sum by (job, path) (rate(http_requests_total[5m])))
+
+# 后置写法，等价
+topk(3, sum by (job, path) (rate(http_requests_total[5m]))) by (job)
+```
+
+带参数的聚合算子（`topk`、`bottomk`、`quantile`、`count_values`、`limitk`）用前置写法更清晰——否则 `by (job)` 离 `3` 太远，容易看错分组维度。
+
+<Callout type="warn" title="topk 绝对不能直接写进告警表达式">
+```yaml
+# 千万别这么写
+- alert: SlowEndpoint
+  expr: 'topk(5, endpoint_p99_seconds) > 1'
+  for: 5m
+```
+
+`topk` **永远返回 k 条序列**（除非总数不足 k）。这意味着：
+
+1. **告警会不停地 firing 和 resolved 抖动。** Top 5 的成员随时在换，某个接口这一轮进了前五、下一轮掉出去，Alertmanager 就会收到一次 resolved 再收到一次 firing，制造大量噪音。
+2. **它掩盖真实规模。** 如果有 50 个接口都超过 1 秒，`topk(5, ...)` 只告诉你 5 个，你会严重低估故障范围。
+3. **它在一切正常时也可能触发。** 只要有任何 5 个接口的值大于阈值就报，即使这是业务正常水位。
+
+**告警要用绝对阈值，让所有超标的都报出来**，再靠 Alertmanager 的 `group_by` 收拢成一条通知：
+
+```yaml
+- alert: SlowEndpoint
+  expr: 'endpoint_p99_seconds > 1'
+  for: 5m
+```
+
+`topk` 的正确用武之地是**看板、排障、以及告警的 annotation**（可以在 annotation 里嵌一段 `topk` 查询链接，让人点进去看）。
+</Callout>
+
+### quantile 不是 histogram_quantile
+
+这两个函数名字很像，含义天差地别，混淆的代价是给出完全错误的结论。
+
+```promql
+# quantile：在「多条序列的值」之间取分位数
+quantile(0.9, node_memory_MemAvailable_bytes)
+```
+
+这条查询的意思是：**「把所有机器当前的可用内存值排成一列，取第 90 百分位」**。也就是「10% 的机器可用内存比这个值还低」。它衡量的是**实例之间的分布**。
+
+```promql
+# histogram_quantile：在「一次观测的分布」中取分位数
+histogram_quantile(0.9, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+这条的意思是：**「所有请求的耗时排成一列，取第 90 百分位」**。它衡量的是**观测值之间的分布**，数据来自 Histogram 的桶。
+
+```promql
+# quantile_over_time：在「一条序列的历史值」中取分位数
+quantile_over_time(0.9, node_load1[1h])
+```
+
+这条是「过去 1 小时里，这台机器的 load 有 90% 的时间低于多少」。它衡量的是**时间上的分布**。
+
+| 函数 | 分布在哪个维度上 | 输入 | 典型问题 |
+| --- | --- | --- | --- |
+| `quantile(φ, v)` | 序列之间（空间） | 瞬时向量 | 「最差的 10% 机器是什么水平」 |
+| `histogram_quantile(φ, v)` | 观测值之间 | 带 `le` 的瞬时向量 | 「P99 请求延迟是多少」 |
+| `quantile_over_time(φ, v[d])` | 时间之间 | 区间向量 | 「这个值有 90% 的时间低于多少」 |
+
+### 其他值得记住的聚合算子
+
+```promql
+# count_values：按「值」分组统计，把值变成标签
+count_values("version", app_build_info)
+# 结果类似：{version="1.4.2"} 37   {version="1.4.1"} 3
+# 用途：看灰度发布的进度、发现没升级的实例
+
+# group：只关心「存在性」，把所有值统一成 1
+group by (namespace) (kube_pod_info)
+# 用途：做 unless / and 时右侧的干净集合，避免值参与运算
+
+# stddev / stdvar：离散程度，用于发现「不均衡」
+stddev by (job) (rate(http_requests_total[5m]))
+# 某个实例流量远高于其他实例时这个值会飙升，是负载均衡失效的信号
+
+# 变异系数：标准差 / 均值，无量纲，可跨服务比较
+stddev by (job) (rate(http_requests_total[5m]))
+  / avg by (job) (rate(http_requests_total[5m]))
+```
+
+`limitk` 和 `limit_ratio` 是 Prometheus 2.50 引入的实验性聚合算子，用于**采样式地取 k 条或一定比例的序列**（不看值大小，只是限量），需要启动时加 `--enable-feature=promql-experimental-functions`。它们在探索超高基数指标时很有用，但不要写进生产告警。
+
+<Callout type="exercise" title="练习 2：诊断三条有问题的聚合查询">
+下面三条查询都在生产环境用了几个月，各自有严重问题。请指出问题、说明后果、并给出修正。
+
+```promql
+# 查询 A：看板上的「集群 P99 延迟」
+avg(histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])))
+```
+
+```promql
+# 查询 B：告警「有实例 CPU 过载」
+- alert: HighCPU
+  expr: 'topk(3, 100 - (avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 80'
+  for: 5m
+```
+
+```promql
+# 查询 C：记录规则，「按服务统计错误率」
+- record: service:error_ratio
+  expr: |
+    sum without (instance, pod) (rate(http_requests_total{status=~"5.."}[5m]))
+    /
+    sum without (instance, pod) (rate(http_requests_total[5m]))
+```
+
+<Answer>
+**查询 A：分位数不能求平均**
+
+**问题：** `rate(...bucket[5m])` 保留了 `instance`、`path` 等所有标签，所以 `histogram_quantile` 是**对每个实例、每个接口分别算了一个 P99**，然后 `avg` 把这些 P99 平均了。
+
+**为什么是错的：** 分位数在数学上**不可加也不可平均**。三台机器的 P99 分别是 100ms、100ms、3000ms，平均得到 1067ms。但如果第三台只承载了 1% 的流量，真实的全局 P99 可能只有 150ms。反过来，如果三台流量相当，真实全局 P99 会接近 3000ms 而不是 1067ms。**平均分位数给出的数字，既不是上界也不是下界，它没有任何统计意义。**
+
+**修正：先聚合桶，再算分位数。**
+
+```promql
+histogram_quantile(0.99,
+  sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+)
+```
+
+桶是**可加的**（每个桶都是「耗时小于等于 `le` 的请求计数」，把各实例的计数相加得到全局计数，物理意义完全正确）。在合并后的全局桶上算分位数，才是真正的集群 P99。
+
+**必须注意：`sum by (le)` 里的 `le` 不能丢**，丢了 `histogram_quantile` 会返回空。如果想按接口分别看，就写 `sum by (le, path)`。
+
+---
+
+**查询 B：topk 写进告警**
+
+**问题：** 前面详细讲过的三宗罪，这里全占了。
+
+1. **抖动。** `topk(3, ...)` 每轮返回 CPU 最高的 3 台。集群里如果有 10 台机器 CPU 都在 80% 附近波动，Top 3 的成员每轮都在换，告警会疯狂 firing/resolved，`for: 5m` 也拦不住——因为每次成员变化都相当于一条新告警重新开始计时。
+2. **漏报规模。** 如果 20 台机器全部 CPU 过载（这才是真正的大事故），告警里只会出现 3 台，值班人员会严重误判故障范围。
+3. **执行顺序问题。** `topk(3, ...) > 80` 是**先取 Top 3，再过滤大于 80**。如果集群整体空闲，Top 3 是 5%、4%、3%，过滤后为空，不告警——这部分行为碰巧是对的。但如果反过来写成 `topk(3, ... > 80)`，就是「先筛出所有超标的，再取前 3」，同样漏报。
+
+**修正：**
+
+```yaml
+- alert: HighCPU
+  expr: |
+    100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+  for: 10m
+  labels:
+    severity: 'warning'
+  annotations:
+    summary: '{{ $labels.instance }} CPU 使用率 {{ printf "%.1f" $value }}%'
+```
+
+然后在 Alertmanager 里用 `group_by: ['alertname', 'cluster']` 把同一批告警收成一条通知，通知里自然会列出所有受影响实例。
+
+如果还想额外知道「是不是全集群都在烧」，加一条聚合告警：
+
+```yaml
+- alert: ClusterWideCPUSaturation
+  expr: |
+    count(100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80)
+      / count(up{job="node"}) > 0.5
+  for: 10m
+  labels:
+    severity: 'critical'
+  annotations:
+    summary: '超过一半的节点 CPU 过载，疑似容量不足或流量异常'
+```
+
+---
+
+**查询 C：without 在记录规则里的隐患 + 分母为零**
+
+**问题一：`without` 的脆弱性。** 这条规则的输出标签是「原指标标签减去 `instance` 和 `pod`」，也就是 `job`、`status`、`path`、`method`……全都保留了。
+
+首先，`status` 保留下来就是个 bug——分子筛选了 `status=~"5.."`，分母没筛。做除法时按标签匹配，分子只有 `status="500"`、`status="503"` 这些，分母有全部状态码，**只有 `status` 值相同的才能配对上**。结果是：分子的 `status="500"` 序列会去找分母里 `status="500"` 的序列相除，得到的永远是 1（500 的量除以 500 的量）。**这条规则算出来的错误率恒等于 1。**
+
+其次，将来只要给指标加一个新标签，输出的序列数就会成倍增长，记录规则本身变成基数炸弹。
+
+**问题二：分母为零。** 服务没有流量时分母是 0，PromQL 里 `0 / 0` 结果是 `NaN`。`NaN` 会被写进 TSDB，看板上显示为断线，基于它的告警比较（`> 0.01`）永远为假——**恰好在服务完全无流量这种严重故障时，错误率告警是哑的**。
+
+**修正：**
+
+```yaml
+- record: job:http_requests:rate5m
+  expr: sum by (job) (rate(http_requests_total[5m]))
+
+- record: job:http_errors:rate5m
+  expr: sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+
+- record: job:http_errors:ratio_rate5m
+  expr: |
+    job:http_errors:rate5m
+      /
+    job:http_requests:rate5m
+```
+
+要点：
+
+1. **改用 `by (job)`**，显式声明输出维度，分子分母的标签集完全一致，能正确配对，也不会随新标签膨胀。
+2. **拆成三条规则。** 分子分母各自落成一条序列，除法在第三条里做。这样看板上既能看错误率，也能直接看错误绝对量（错误率 100% 但只有 1 QPS，和错误率 5% 但有 10000 QPS，紧急程度完全不同）。
+3. **同一个 group 内的规则是按顺序执行的**，所以第三条能引用前两条的结果。跨 group 引用则不保证顺序，会读到上一轮的旧值。
+
+如果不想让无流量时产生 `NaN`，可以给分母兜底：
+
+```yaml
+- record: job:http_errors:ratio_rate5m
+  expr: |
+    job:http_errors:rate5m
+      /
+    clamp_min(job:http_requests:rate5m, 0.0001)
+```
+
+不过更推荐的做法是**保留 `NaN`，另外加一条「无流量」告警**——把「没错误」和「没流量」当成两件事来监控，语义更清晰。
+</Answer>
+</Callout>
+
+## 四、SLO 与错误预算：让告警回归业务
+
+### 从「阈值告警」到「预算告警」
+
+传统告警是这样的：「错误率超过 1% 就告警」。它有两个根本缺陷：
+
+- **阈值是拍脑袋定的。** 为什么是 1% 不是 2%？没人说得清。
+- **它不区分严重程度。** 错误率 1.1% 持续 5 分钟，和错误率 50% 持续 5 分钟，触发的是同一条告警。
+
+SLO 的思路完全不同。先定义**服务等级目标（SLO）**：
+
+> 「在滚动的 30 天窗口内，99.9% 的 HTTP 请求应该成功。」
+
+这句话隐含了一个额度：**允许 0.1% 的请求失败**。这个额度就是**错误预算（error budget）**。
+
+30 天 = 43200 分钟。0.1% 就是 **43.2 分钟**的完全不可用时间（或等价的部分失败）。这是你可以「花」的。
+
+### 三个核心量的推导
+
+**1. 可用率（availability）**
+
+```promql
+sum(rate(http_requests_total{status!~"5.."}[30d]))
+  /
+sum(rate(http_requests_total[30d]))
+```
+
+**2. 错误率（error ratio）** —— 就是 `1 - 可用率`：
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[30d]))
+  /
+sum(rate(http_requests_total[30d]))
+```
+
+直接算错误率比算「1 减去可用率」更好：分子的序列数少得多，查询更快，而且避免了浮点数减法的精度损失。
+
+**3. 燃烧率（burn rate）**
+
+这是整套方法论的核心概念：
+
+```text
+burn_rate = 实际错误率 / 允许的错误率
+          = error_ratio / (1 - SLO)
+```
+
+对 99.9% 的 SLO，允许错误率是 `0.001`：
+
+```promql
+(
+  sum(rate(http_requests_total{status=~"5.."}[1h]))
+    /
+  sum(rate(http_requests_total[1h]))
+) / 0.001
+```
+
+**燃烧率的物理意义非常直观：**
+
+- `burn_rate = 1` → 正好按预算速度在烧，30 天末尾刚好把预算用完。这是「贴着 SLO 线走」。
+- `burn_rate = 2` → 烧得比预算快一倍，15 天就会耗尽 30 天的预算。
+- `burn_rate = 720` → 1 小时就烧完 30 天的预算（因为 30 天 = 720 小时）。
+- `burn_rate = 0` → 完全没有错误，预算原封不动。
+
+**剩余预算**：
+
+```promql
+1 - (
+  sum(rate(http_requests_total{status=~"5.."}[30d]))
+    /
+  sum(rate(http_requests_total[30d]))
+) / 0.001
+```
+
+结果是 `0.65` 就表示「还剩 65% 的错误预算」，`-0.2` 表示「已经超支 20%」——是的，这个值可以是负数，而且负数正是推动团队停下来做稳定性建设的最有力论据。
+
+### 多窗口多燃烧率告警
+
+只用一个窗口告警会陷入两难：
+
+- **窗口短（5 分钟）** → 反应快，但抖动一下就报，噪音大；而且短窗口烧掉的绝对预算很少，可能不值得叫醒人。
+- **窗口长（24 小时）** → 稳定，但一次严重故障要等好几个小时才触发，黄花菜都凉了。
+
+Google SRE Workbook 给出的方案是**多窗口多燃烧率**：**用不同的燃烧率阈值配不同的窗口，同时用一个短窗口做「确认」，保证故障恢复后告警能快速消除。**
+
+标准配置表（针对 99.9% SLO、30 天预算周期）：
+
+| 级别 | 长窗口 | 短窗口 | 燃烧率阈值 | 触发时消耗的预算 | 含义 |
+| --- | --- | --- | --- | --- | --- |
+| Page | 1h | 5m | 14.4 | 2% | 灾难性故障，立刻叫人 |
+| Page | 6h | 30m | 6 | 5% | 严重故障，叫人 |
+| Ticket | 1d | 2h | 3 | 10% | 明显劣化，进工单 |
+| Ticket | 3d | 6h | 1 | 10% | 慢性问题，进工单 |
+
+**这些数字是怎么来的？** 公式是：
+
+```text
+消耗的预算比例 = burn_rate × (窗口长度 / 预算周期)
+```
+
+验算一下：
+
+- `14.4 × (1h / 720h) = 0.02` → 2% ✓
+- `6 × (6h / 720h) = 0.05` → 5% ✓
+- `3 × (24h / 720h) = 0.10` → 10% ✓
+- `1 × (72h / 720h) = 0.10` → 10% ✓
+
+反过来说，如果你想定义「1 小时内烧掉 2% 预算就叫人」，那么燃烧率阈值就是 `0.02 × 720 / 1 = 14.4`。**这些看起来奇怪的数字，其实都是从「多久内烧掉多少预算」这个业务决策倒推出来的。**
+
+**短窗口的作用**是「确认当前仍在燃烧」。如果只看长窗口，故障恢复后长窗口里还残留着错误数据，告警会拖很久才消除。加上短窗口的 `and` 条件后，故障一停短窗口立刻降下来，告警随即 resolved。
+
+### 完整的工程实现
+
+第一步，用记录规则把各个窗口的错误率预先算好：
+
+```yaml
+groups:
+  - name: slo-error-ratio
+    interval: 30s
+    rules:
+      - record: job:slo_errors:ratio_rate5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum by (job) (rate(http_requests_total[5m]))
+
+      - record: job:slo_errors:ratio_rate30m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[30m]))
+            /
+          sum by (job) (rate(http_requests_total[30m]))
+
+      - record: job:slo_errors:ratio_rate1h
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[1h]))
+            /
+          sum by (job) (rate(http_requests_total[1h]))
+
+      - record: job:slo_errors:ratio_rate2h
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[2h]))
+            /
+          sum by (job) (rate(http_requests_total[2h]))
+
+      - record: job:slo_errors:ratio_rate6h
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[6h]))
+            /
+          sum by (job) (rate(http_requests_total[6h]))
+
+      - record: job:slo_errors:ratio_rate1d
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[1d]))
+            /
+          sum by (job) (rate(http_requests_total[1d]))
+
+      - record: job:slo_errors:ratio_rate3d
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[3d]))
+            /
+          sum by (job) (rate(http_requests_total[3d]))
+
+      # 30 天剩余预算，用于看板
+      - record: job:slo_error_budget:remaining_ratio
+        expr: |
+          1 - (
+            sum by (job) (rate(http_requests_total{status=~"5.."}[30d]))
+              /
+            sum by (job) (rate(http_requests_total[30d]))
+          ) / 0.001
+```
+
+第二步，四条燃烧率告警：
+
+```yaml
+groups:
+  - name: slo-burn-rate
+    rules:
+      - alert: ErrorBudgetBurnFast
+        expr: |
+          (
+            job:slo_errors:ratio_rate1h{job="api"} > (14.4 * 0.001)
+            and
+            job:slo_errors:ratio_rate5m{job="api"} > (14.4 * 0.001)
+          )
+        for: 2m
+        labels:
+          severity: 'critical'
+          slo: 'availability'
+          long_window: '1h'
+        annotations:
+          summary: 'API 错误预算正在以 14.4 倍速度燃烧'
+          description: '按当前速度，2 小时内会烧完 30 天预算的 4%。当前 1h 错误率 {{ humanizePercentage $value }}'
+
+      - alert: ErrorBudgetBurnHigh
+        expr: |
+          (
+            job:slo_errors:ratio_rate6h{job="api"} > (6 * 0.001)
+            and
+            job:slo_errors:ratio_rate30m{job="api"} > (6 * 0.001)
+          )
+        for: 5m
+        labels:
+          severity: 'critical'
+          slo: 'availability'
+          long_window: '6h'
+
+      - alert: ErrorBudgetBurnMedium
+        expr: |
+          (
+            job:slo_errors:ratio_rate1d{job="api"} > (3 * 0.001)
+            and
+            job:slo_errors:ratio_rate2h{job="api"} > (3 * 0.001)
+          )
+        for: 15m
+        labels:
+          severity: 'warning'
+          slo: 'availability'
+          long_window: '1d'
+
+      - alert: ErrorBudgetBurnSlow
+        expr: |
+          (
+            job:slo_errors:ratio_rate3d{job="api"} > (1 * 0.001)
+            and
+            job:slo_errors:ratio_rate6h{job="api"} > (1 * 0.001)
+          )
+        for: 1h
+        labels:
+          severity: 'warning'
+          slo: 'availability'
+          long_window: '3d'
+
+      # 预算耗尽：不是紧急故障，但应该冻结变更
+      - alert: ErrorBudgetExhausted
+        expr: 'job:slo_error_budget:remaining_ratio{job="api"} <= 0'
+        for: 30m
+        labels:
+          severity: 'warning'
+          slo: 'availability'
+        annotations:
+          summary: 'API 30 天错误预算已耗尽，建议冻结非必要发布'
+```
+
+<Callout type="tip" title="别忘了延迟 SLO">
+可用性只是 SLO 的一半。「请求成功了但花了 10 秒」在用户看来跟失败没区别。
+
+延迟 SLO 的标准写法是**基于桶的比例**，而不是分位数：
+
+```yaml
+      # 延迟 SLO：99% 的请求应在 300ms 内完成
+      - record: job:slo_latency:bad_ratio_rate1h
+        expr: |
+          1 - (
+            sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[1h]))
+              /
+            sum by (job) (rate(http_request_duration_seconds_count[1h]))
+          )
+```
+
+用 `le="0.3"` 桶的计数除以总计数，得到的是**精确的比例**，没有 `histogram_quantile` 的插值误差。代价是 `0.3` 必须**恰好是一个桶边界**——所以定 SLO 时要先看看现有的桶配置，或者反过来按 SLO 目标值去设计桶边界。
+
+有了 `bad_ratio` 之后，燃烧率的计算方式和可用性完全一样（分母换成 `1 - 0.99 = 0.01`）。
+
+一个更完整的延迟 SLO 还会把失败请求也算成「坏」：失败的请求既不该算「快」，也不该被排除在分母外。
+</Callout>
+
+<Callout type="exercise" title="练习 3：为一个新服务设计完整的 SLO 告警">
+你接手一个订单服务，业务方给出的承诺是：
+
+- **可用性**：滚动 28 天内，99.95% 的下单请求成功（`status` 不以 5 开头）
+- **延迟**：滚动 28 天内，99% 的下单请求在 500ms 内完成
+- 健康检查路径 `/healthz` 和监控路径 `/metrics` 不计入 SLO
+
+现有指标：`order_http_requests_total`（Counter，标签 `path`、`status`、`instance`）和 `order_http_duration_seconds_bucket`（Histogram，桶边界是 `0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, +Inf`）。
+
+请完成：
+
+1. 计算可用性 SLO 的错误预算（分钟数）和四档燃烧率阈值。
+2. 写出记录规则（可用性 + 延迟）。
+3. 写出至少三条燃烧率告警。
+4. 写一条能在看板上显示「剩余预算百分比」的查询。
+5. 说明为什么延迟 SLO 定 500ms 是「运气好」。
+
+<Answer>
+**第 1 步：预算与阈值计算**
+
+- 预算周期：28 天 = `28 × 24 = 672` 小时 = `40320` 分钟
+- SLO = 99.95% → 允许错误率 `1 - 0.9995 = 0.0005`
+- **错误预算 = 40320 × 0.0005 = 20.16 分钟**
+
+四档燃烧率阈值按「窗口内消耗多少预算」倒推，公式 `burn_rate = 消耗比例 × 周期 / 窗口`：
+
+| 级别 | 长窗口 | 短窗口 | 目标消耗 | 燃烧率 | 错误率阈值 |
+| --- | --- | --- | --- | --- | --- |
+| Page | 1h | 5m | 2% | `0.02 × 672 / 1 = 13.44` | `13.44 × 0.0005 = 0.00672` |
+| Page | 6h | 30m | 5% | `0.05 × 672 / 6 = 5.6` | `0.0028` |
+| Ticket | 1d | 2h | 10% | `0.10 × 672 / 24 = 2.8` | `0.0014` |
+| Ticket | 3d | 6h | 10% | `0.10 × 672 / 72 = 0.933` | `0.000467` |
+
+注意这些数字和 30 天周期的经典值（14.4 / 6 / 3 / 1）**不一样**，因为周期从 720 小时变成了 672 小时。**直接抄 SRE Workbook 的 14.4 而不重算，会让告警比预期敏感约 7%。** 数值差得不多，但既然要写就写对。
+
+---
+
+**第 2 步：记录规则**
+
+```yaml
+groups:
+  - name: order-slo-recording
+    interval: 30s
+    rules:
+      # ---------- 可用性：坏请求比例 ----------
+      - record: order:slo_availability:bad_ratio_rate5m
+        expr: |
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[5m]))
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[5m]))
+
+      - record: order:slo_availability:bad_ratio_rate30m
+        expr: |
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[30m]))
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[30m]))
+
+      - record: order:slo_availability:bad_ratio_rate1h
+        expr: |
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[1h]))
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[1h]))
+
+      - record: order:slo_availability:bad_ratio_rate2h
+        expr: |
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[2h]))
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[2h]))
+
+      - record: order:slo_availability:bad_ratio_rate6h
+        expr: |
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[6h]))
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[6h]))
+
+      - record: order:slo_availability:bad_ratio_rate1d
+        expr: |
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[1d]))
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[1d]))
+
+      - record: order:slo_availability:bad_ratio_rate3d
+        expr: |
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[3d]))
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[3d]))
+
+      # ---------- 延迟：超过 500ms 或失败，都算坏 ----------
+      - record: order:slo_latency:bad_ratio_rate1h
+        expr: |
+          (
+            sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[1h]))
+            -
+            sum(rate(order_http_duration_seconds_bucket{path!~"/healthz|/metrics",le="0.5",status!~"5.."}[1h]))
+          )
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[1h]))
+
+      - record: order:slo_latency:bad_ratio_rate5m
+        expr: |
+          (
+            sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[5m]))
+            -
+            sum(rate(order_http_duration_seconds_bucket{path!~"/healthz|/metrics",le="0.5",status!~"5.."}[5m]))
+          )
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[5m]))
+
+      - record: order:slo_latency:bad_ratio_rate6h
+        expr: |
+          (
+            sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[6h]))
+            -
+            sum(rate(order_http_duration_seconds_bucket{path!~"/healthz|/metrics",le="0.5",status!~"5.."}[6h]))
+          )
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[6h]))
+
+      - record: order:slo_latency:bad_ratio_rate30m
+        expr: |
+          (
+            sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[30m]))
+            -
+            sum(rate(order_http_duration_seconds_bucket{path!~"/healthz|/metrics",le="0.5",status!~"5.."}[30m]))
+          )
+            /
+          sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[30m]))
+
+      # ---------- 28 天剩余预算 ----------
+      - record: order:slo_availability:budget_remaining_ratio
+        expr: |
+          1 - (
+            sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[28d]))
+              /
+            sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[28d]))
+          ) / 0.0005
+
+      - record: order:slo_latency:budget_remaining_ratio
+        expr: |
+          1 - (
+            (
+              sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[28d]))
+              -
+              sum(rate(order_http_duration_seconds_bucket{path!~"/healthz|/metrics",le="0.5",status!~"5.."}[28d]))
+            )
+              /
+            sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[28d]))
+          ) / 0.01
+```
+
+延迟规则的写法值得解释一下：**「坏请求 = 总请求 - 成功且在 500ms 内完成的请求」**。这样定义把三种情况都算成坏——超时的、失败的、以及「失败得很快的」。如果只用 `1 - bucket/count`，那些 50ms 就返回 500 的请求会被算成「好」，显然不合理。
+
+---
+
+**第 3 步：燃烧率告警**
+
+```yaml
+groups:
+  - name: order-slo-burn
+    rules:
+      - alert: OrderAvailabilityBurnFast
+        expr: |
+          order:slo_availability:bad_ratio_rate1h > 0.00672
+          and
+          order:slo_availability:bad_ratio_rate5m > 0.00672
+        for: 2m
+        labels:
+          severity: 'critical'
+          slo: 'order-availability'
+          burn_rate: '13.44'
+        annotations:
+          summary: '订单服务可用性预算以 13.4 倍速燃烧'
+          description: '1 小时错误率 {{ printf "%.4f" $value }}，照此速度 1.5 小时烧掉 3% 的 28 天预算'
+          runbook_url: 'https://wiki.internal/runbook/order-availability'
+
+      - alert: OrderAvailabilityBurnHigh
+        expr: |
+          order:slo_availability:bad_ratio_rate6h > 0.0028
+          and
+          order:slo_availability:bad_ratio_rate30m > 0.0028
+        for: 5m
+        labels:
+          severity: 'critical'
+          slo: 'order-availability'
+          burn_rate: '5.6'
+
+      - alert: OrderAvailabilityBurnMedium
+        expr: |
+          order:slo_availability:bad_ratio_rate1d > 0.0014
+          and
+          order:slo_availability:bad_ratio_rate2h > 0.0014
+        for: 15m
+        labels:
+          severity: 'warning'
+          slo: 'order-availability'
+          burn_rate: '2.8'
+
+      - alert: OrderAvailabilityBurnSlow
+        expr: |
+          order:slo_availability:bad_ratio_rate3d > 0.000467
+          and
+          order:slo_availability:bad_ratio_rate6h > 0.000467
+        for: 1h
+        labels:
+          severity: 'warning'
+          slo: 'order-availability'
+          burn_rate: '0.93'
+
+      # 延迟 SLO（允许错误率 0.01，阈值 = burn_rate × 0.01）
+      - alert: OrderLatencyBurnFast
+        expr: |
+          order:slo_latency:bad_ratio_rate1h > 0.1344
+          and
+          order:slo_latency:bad_ratio_rate5m > 0.1344
+        for: 2m
+        labels:
+          severity: 'critical'
+          slo: 'order-latency'
+
+      - alert: OrderLatencyBurnHigh
+        expr: |
+          order:slo_latency:bad_ratio_rate6h > 0.056
+          and
+          order:slo_latency:bad_ratio_rate30m > 0.056
+        for: 5m
+        labels:
+          severity: 'critical'
+          slo: 'order-latency'
+
+      # 预算耗尽 → 冻结发布
+      - alert: OrderErrorBudgetExhausted
+        expr: |
+          order:slo_availability:budget_remaining_ratio <= 0
+          or
+          order:slo_latency:budget_remaining_ratio <= 0
+        for: 30m
+        labels:
+          severity: 'warning'
+          slo: 'order'
+        annotations:
+          summary: '订单服务错误预算已耗尽，按约定应冻结非紧急发布'
+```
+
+---
+
+**第 4 步：看板查询**
+
+```promql
+# 剩余预算百分比（Stat 面板，单位设为 percentunit）
+order:slo_availability:budget_remaining_ratio
+
+# 剩余预算换算成分钟（更直观）
+order:slo_availability:budget_remaining_ratio * 20.16
+
+# 当前燃烧率（Gauge 面板，红线画在 1）
+order:slo_availability:bad_ratio_rate1h / 0.0005
+
+# 28 天可用性（Stat 面板）
+1 - (
+  sum(rate(order_http_requests_total{path!~"/healthz|/metrics",status=~"5.."}[28d]))
+    /
+  sum(rate(order_http_requests_total{path!~"/healthz|/metrics"}[28d]))
+)
+
+# 预算消耗趋势（时序图，看斜率）
+1 - order:slo_availability:budget_remaining_ratio
+```
+
+---
+
+**第 5 步：为什么 500ms 是「运气好」**
+
+因为题目给出的桶边界里**恰好有 `0.5`**。
+
+`order_http_duration_seconds_bucket{le="0.5"}` 是一个真实存在的序列，它精确地记录了「耗时小于等于 500ms 的请求数」。用它算比例，**误差为零**。
+
+如果业务方定的是 **400ms**，桶里没有 `0.4`，你就只有三个都不太好的选择：
+
+1. **用 `histogram_quantile` 反推**——引入插值误差。桶 `0.25` 到 `0.5` 之间是线性插值，但真实分布在这个区间里通常是右偏的，插值会系统性地高估或低估，误差可能达到几十毫秒。SLO 是要拿去跟业务方对账的数字，带着不可控误差不合适。
+2. **用 `le="0.5"` 凑合**——等于偷偷把 SLO 放宽到 500ms。
+3. **改桶边界重新埋点**——正确但要改代码、重新发布，而且历史数据无法回溯（旧数据里没有 `le="0.4"` 这个桶，SLO 报表会断层）。
+
+**结论与实践建议：定 SLO 和设计 Histogram 桶必须是同一件事。** 埋点时就应该问清楚「业务承诺的延迟目标是多少」，把那个数字（以及它的两侧，比如 `0.2, 0.4, 0.8`）设成桶边界。这是第 19 章会详细展开的话题。
+
+顺便一提，**原生直方图（native histogram）能从根本上消除这个问题**——它的桶是按指数自动划分的，分辨率高得多，任意阈值的比例都能算得相当准。下一节会讲。
+</Answer>
+</Callout>
+
+## 五、histogram_quantile 进阶
+
+### 边界行为：那些返回奇怪值的情况
+
+`histogram_quantile` 的内部逻辑是：找到累计计数达到 `φ × total` 的那个桶，然后在桶内做**线性插值**。这个「线性插值」的假设在桶的边缘会产生一些需要知道的行为：
+
+| 情况 | 返回值 |
+| --- | --- |
+| 分位数落在最高的有限桶之上（即落进 `+Inf` 桶） | 返回**最大有限桶的上界**，不会返回 `+Inf` |
+| 分位数落在最低桶内，且该桶上界大于 0 | 假设下界为 0，在 0 到上界之间线性插值 |
+| 最高桶不是 `+Inf` | 返回 `NaN` |
+| 桶数量少于 2 个 | 返回 `NaN` |
+| `φ` 小于 0 | 返回 `-Inf` |
+| `φ` 大于 1 | 返回 `+Inf` |
+| `φ` 是 `NaN` | 返回 `NaN` |
+| 观测总数为 0 | 返回 `NaN` |
+
+<Callout type="warn" title="P99 长期贴着某个固定值 = 桶设计有问题">
+如果你的 P99 图表是一条平直的横线，值恰好等于某个桶边界（比如永远是 `10`），几乎可以断定：**99% 分位落进了 `+Inf` 桶**，`histogram_quantile` 返回的是最大有限桶的上界。
+
+真实的 P99 可能是 15 秒，也可能是 300 秒，你完全看不出来。这时候 P99 这个指标已经失去意义了。
+
+**排查方法：**
+
+```promql
+# +Inf 桶和最大有限桶的计数差 = 超出所有桶的请求数
+sum(rate(http_request_duration_seconds_bucket{le="+Inf"}[5m]))
+  -
+sum(rate(http_request_duration_seconds_bucket{le="10"}[5m]))
+
+# 超出最大桶的请求占比，超过 1% 就说明桶不够用了
+1 - (
+  sum(rate(http_request_duration_seconds_bucket{le="10"}[5m]))
+    /
+  sum(rate(http_request_duration_seconds_count[5m]))
+)
+```
+
+**解决办法**是往上加桶。但注意加桶要重新发布，而且新桶的历史数据是空的，需要一段时间才能用。**所以桶边界应该在埋点时就留足上限**——宁可多一两个基本用不到的大桶，也不要让 P99 变成瞎子。
+</Callout>
+
+### 多实例聚合的正确姿势
+
+这一点前面练习里讲过，这里系统化一下：
+
+```promql
+# ✅ 集群整体 P99
+histogram_quantile(0.99,
+  sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+)
+
+# ✅ 按接口分别看 P99
+histogram_quantile(0.99,
+  sum by (le, path) (rate(http_request_duration_seconds_bucket[5m]))
+)
+
+# ✅ 每个实例各自的 P99（用于找出拖后腿的实例）
+histogram_quantile(0.99,
+  sum by (le, instance) (rate(http_request_duration_seconds_bucket[5m]))
+)
+
+# ✅ 找出 P99 最差的 3 个实例
+topk(3,
+  histogram_quantile(0.99,
+    sum by (le, instance) (rate(http_request_duration_seconds_bucket[5m]))
+  )
+)
+
+# ❌ 平均分位数：数学上无意义
+avg(histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])))
+
+# ❌ 忘了 rate：算的是进程启动以来全部历史的分位数，几乎是常量
+histogram_quantile(0.99, sum by (le) (http_request_duration_seconds_bucket))
+
+# ❌ 丢了 le：返回空结果
+histogram_quantile(0.99, sum by (path) (rate(http_request_duration_seconds_bucket[5m])))
+
+# ❌ 分位数写成百分数：φ 大于 1，返回 +Inf
+histogram_quantile(99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+### 一个实用技巧：定位「谁在拖后腿」
+
+集群 P99 涨了，怎么快速判断是「所有实例都慢」还是「个别实例拖累」？
+
+```promql
+# 各实例 P99 与集群中位数实例 P99 的比值
+histogram_quantile(0.99, sum by (le, instance) (rate(http_request_duration_seconds_bucket[5m])))
+  /
+scalar(
+  quantile(0.5,
+    histogram_quantile(0.99, sum by (le, instance) (rate(http_request_duration_seconds_bucket[5m])))
+  )
+)
+```
+
+结果大于 3 的实例就是明显的离群点。所有实例的比值都接近 1，说明是系统性问题（下游依赖、共享资源、流量整体上涨）。
+
+`scalar()` 在这里是必需的——它把只有一个元素的瞬时向量转成标量，这样除法就不需要标签匹配了。
+
+### 原生直方图（native histogram）
+
+Prometheus 2.40 引入、在 3.x 中日趋成熟的**原生直方图**，是对经典桶式 Histogram 的一次重构。核心变化：
+
+- **桶边界不再手工指定**，而是按指数规律自动生成，由一个 `schema` 参数控制精度。
+- **桶是稀疏存储的**，只有有数据的桶才占空间。
+- **一个原生直方图只占一条序列**，而不是「桶数 + 2」条。
+
+对使用者最直接的影响是：**基数问题基本消失了**。经典 Histogram 加一个 `path` 标签（假设 20 个值）、12 个桶，就是 `20 × 14 = 280` 条序列；原生直方图只有 20 条。
+
+查询语法上，原生直方图**不需要 `by (le)`**：
+
+```promql
+# 原生直方图：直接对整个直方图求分位数
+histogram_quantile(0.99, rate(http_request_duration_seconds[5m]))
+
+# 聚合也很自然
+histogram_quantile(0.99, sum by (job) (rate(http_request_duration_seconds[5m])))
+```
+
+配套函数：
+
+```promql
+histogram_count(rate(http_request_duration_seconds[5m]))   # 观测次数
+histogram_sum(rate(http_request_duration_seconds[5m]))     # 观测值总和
+histogram_avg(rate(http_request_duration_seconds[5m]))     # 平均值
+histogram_stddev(rate(http_request_duration_seconds[5m]))  # 标准差
+histogram_fraction(0, 0.3, rate(http_request_duration_seconds[5m]))  # 落在 [0, 0.3) 的比例
+```
+
+`histogram_fraction` 特别值得注意——**它让「任意阈值的 SLO 比例」变得精确可算**，彻底解决了上一节练习里「500ms 恰好是桶边界才走运」的问题。
+
+启用需要在 Prometheus 启动时加 `--enable-feature=native-histograms`，客户端库也要相应支持（Go 客户端用 `NativeHistogramBucketFactor` 配置）。
+
+<Callout type="info" title="Prometheus 3.x 的一个兼容性变化">
+Prometheus 3.0 开始，**经典 Histogram 的 `le` 标签值和 Summary 的 `quantile` 标签值会在写入时被规范化成标准浮点格式**。也就是说，客户端上报 `le="1.0"` 和 `le="1"`，在 TSDB 里都会变成 `le="1"`。
+
+这解决了一个长期存在的痛点：不同语言的客户端库对浮点数的格式化方式不一致，导致同一个逻辑桶在不同实例上有不同的 `le` 字符串，`sum by (le)` 聚合出来会莫名其妙地多出一倍的桶。
+
+**升级到 3.x 时要注意：** 如果你的告警或看板里写死了 `le="1.0"` 这种字面量，升级后会匹配不到，需要改成 `le="1"`。查一下有没有这类硬编码：
+
+```promql
+count by (le) (http_request_duration_seconds_bucket)
+```
+
+看一眼实际的 `le` 取值格式，再去改查询。
+</Callout>
+
+## 六、泄漏与长尾分析
+
+### 内存/句柄泄漏检测
+
+泄漏的特征是**单调上升的趋势**，但被短期波动掩盖。三种检测手段，敏感度递增：
+
+```promql
+# 手段一：直接看长窗口的斜率（每秒增长多少字节）
+deriv(process_resident_memory_bytes{job="api"}[6h]) > 1024
+
+# 手段二：先平滑再求导，抗 GC 锯齿（推荐）
+deriv(
+  avg_over_time(process_resident_memory_bytes{job="api"}[15m])[6h:5m]
+) > 1024
+
+# 手段三：看「谷底」是否在抬升 —— 最可靠的泄漏信号
+min_over_time(process_resident_memory_bytes{job="api"}[1h])
+  >
+min_over_time(process_resident_memory_bytes{job="api"}[1h] offset 6h) * 1.2
+```
+
+<Callout type="tip" title="为什么「谷底抬升」是最可靠的信号">
+一个健康的服务，内存曲线是**锯齿状**的：申请上升、GC 回落，反复循环。峰值会随着流量波动，但**每次 GC 之后的谷底应该回到大致相同的水平**。
+
+如果谷底在持续抬升，说明每轮 GC 都有一部分内存回收不掉——这就是泄漏的定义。
+
+峰值和均值都会被流量影响（流量涨了内存自然涨，这不是泄漏），只有谷底是相对干净的信号。同样的思路适用于：连接数、goroutine 数、文件句柄数、线程数、缓存条目数。
+</Callout>
+
+配套的告警：
+
+```yaml
+      - alert: MemoryLeakSuspected
+        expr: |
+          min_over_time(process_resident_memory_bytes[1h])
+            >
+          min_over_time(process_resident_memory_bytes[1h] offset 6h) * 1.3
+        for: 1h
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} 内存谷底 6 小时内抬升超过 30%，疑似泄漏'
+
+      - alert: GoroutineLeak
+        expr: |
+          go_goroutines > 10000
+          and
+          deriv(go_goroutines[1h]) > 0.1
+        for: 30m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} goroutine 数 {{ $value }} 且持续增长'
+
+      - alert: FileDescriptorLeak
+        expr: |
+          process_open_fds / process_max_fds > 0.7
+          and
+          deriv(process_open_fds[1h]) > 0
+        for: 30m
+        labels:
+          severity: 'warning'
+```
+
+注意 goroutine 泄漏告警用了 `and` 组合两个条件：**绝对值高**且**在增长**。只看绝对值会误报（某些服务天生 goroutine 就多），只看增长率会误报（流量上涨时增长是正常的）。
+
+### predict_linear：容量的提前量
+
+```promql
+# 按过去 6 小时的趋势，24 小时后磁盘会不会满
+predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[6h], 24 * 3600) < 0
+
+# 按过去 1 小时的趋势，4 小时后内存会不会超过 limit
+predict_linear(container_memory_working_set_bytes[1h], 4 * 3600)
+  > on (pod) group_left kube_pod_container_resource_limits{resource="memory"}
+```
+
+`predict_linear(v, t)` 用**最小二乘法**对区间内的样本拟合一条直线，然后外推 `t` 秒。它的假设是「趋势是线性的」——所以：
+
+- **区间要够长**。用 `[1h]` 预测 24 小时后，任何一点抖动都会被放大 24 倍，误报满天飞。经验值：**预测时长不超过观察区间的 4 倍**。
+- **对周期性数据不适用**。如果磁盘每天凌晨清理一次日志，白天用 `[6h]` 观察到的上升趋势外推 24 小时，会得到「明天肯定爆盘」的荒谬结论。这种情况用 `[24h]` 或者 `[7d]` 观察窗口更合适。
+
+### 长尾分析：P99 与 P50 的比值
+
+```promql
+# 尾部离散度：P99 / P50
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+  /
+histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+这个比值（有时叫 tail latency ratio）比单看 P99 更有诊断价值：
+
+- **比值稳定在 3 到 5，且 P99 上涨** → 整体变慢，P50 也在涨。方向是容量、依赖、资源竞争。
+- **比值突然从 4 涨到 20，P50 没动** → 大部分请求还是快的，只有少数极慢。方向是：GC 停顿、锁竞争、慢查询、缓存未命中、重试、某个特定实例故障。
+- **比值大于 50** → 几乎可以确定有「某类请求」走了完全不同的代码路径。按 `path`、`status`、`method` 拆开看，通常能立刻找到。
+
+配合按维度拆分：
+
+```promql
+# 按接口看谁的尾部最重
+topk(5,
+  histogram_quantile(0.99, sum by (le, path) (rate(http_request_duration_seconds_bucket[5m])))
+    /
+  histogram_quantile(0.50, sum by (le, path) (rate(http_request_duration_seconds_bucket[5m])))
+)
+```
+
+### changes 与 resets：抖动和重启
+
+```promql
+# 过去 1 小时值变化了多少次（Gauge 用）
+changes(kube_pod_container_status_restarts_total[1h])
+
+# Counter 归零了多少次 ≈ 进程重启次数
+resets(process_start_time_seconds[1h])
+
+# 更直接的重启检测
+changes(process_start_time_seconds[1h]) > 3
+```
+
+`changes` 数的是「相邻样本值不同」的次数。对于本该恒定的值（版本号、配置哈希、主从角色标识），`changes` 大于 0 就意味着发生了切换：
+
+```promql
+# 主从角色发生了切换
+changes(mysql_slave_status_slave_io_running[1h]) > 0
+
+# 配置在过去一天里被改过
+changes(app_config_hash[1d]) > 0
+
+# leader 选举抖动
+changes(etcd_server_leader_changes_seen_total[1h]) > 3
+```
+
+<Callout type="exercise" title="练习 4：一次真实的性能劣化排查">
+周一早上，值班群里报告：订单服务的 P99 延迟从上周的 200ms 涨到了 1.2 秒，但**错误率没有变化**，`up` 一直是 1。
+
+你手上有这些指标：
+
+- `order_http_duration_seconds_bucket`（桶：`0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, +Inf`，标签 `instance`、`path`、`method`）
+- `order_http_requests_total`（标签 `instance`、`path`、`status`）
+- `order_db_query_duration_seconds_bucket`（标签 `instance`、`query_type`）
+- `order_cache_hits_total` / `order_cache_misses_total`
+- `go_gc_duration_seconds`、`go_goroutines`、`process_resident_memory_bytes`
+- `node_cpu_seconds_total`、`node_load1`
+
+请写出一套完整的排查查询序列（至少 8 条），每条说明「它能排除或确认什么假设」。最后给出你认为最可能的三个根因方向，以及为了下次能更快定位应该补哪些指标或告警。
+
+<Answer>
+排查的核心思路是**逐层收窄**：先确认现象真实、再判断是全局还是局部、再拆维度、最后定位到具体资源。
+
+---
+
+**第 0 步：确认 P99 是真的，不是桶溢出造成的假象**
+
+```promql
+# 超出最大桶（10s）的请求占比
+1 - (
+  sum(rate(order_http_duration_seconds_bucket{le="10"}[5m]))
+    /
+  sum(rate(order_http_duration_seconds_count[5m]))
+)
+```
+
+**排除的假设：** 如果这个值大于 1%，说明 P99 已经落进 `+Inf` 桶，`histogram_quantile` 返回的 `10` 是天花板值，真实延迟可能远不止 1.2 秒。本例中 P99 显示 1.2 秒（落在 `1` 到 `2.5` 桶之间），说明桶还够用，数字可信。
+
+---
+
+**第 1 步：是所有实例都慢，还是个别实例拖后腿**
+
+```promql
+# 各实例各自的 P99
+histogram_quantile(0.99,
+  sum by (le, instance) (rate(order_http_duration_seconds_bucket[5m]))
+)
+
+# 量化离群程度：各实例 P99 除以中位数实例的 P99
+histogram_quantile(0.99, sum by (le, instance) (rate(order_http_duration_seconds_bucket[5m])))
+  /
+scalar(quantile(0.5,
+  histogram_quantile(0.99, sum by (le, instance) (rate(order_http_duration_seconds_bucket[5m])))
+))
+```
+
+**判断：**
+
+- 有 1 到 2 个实例的比值大于 3 → **局部问题**，直接上那台机器看，方向是硬件、邻居干扰、本地磁盘、网卡、以及「这台机器是不是被负载均衡分到了更多流量」。
+- 所有实例比值都接近 1 → **系统性问题**，继续往下查。
+
+---
+
+**第 2 步：是所有接口都慢，还是某个接口**
+
+```promql
+# 按接口看 P99
+histogram_quantile(0.99,
+  sum by (le, path) (rate(order_http_duration_seconds_bucket[5m]))
+)
+
+# 和一周前对比，看谁劣化最严重（劣化倍数）
+histogram_quantile(0.99, sum by (le, path) (rate(order_http_duration_seconds_bucket[5m])))
+  /
+histogram_quantile(0.99, sum by (le, path) (rate(order_http_duration_seconds_bucket[5m] offset 7d)))
+```
+
+**这条对比查询是本次排查最关键的一条。** 「和一周前同一时刻对比」能自动消除星期几、时段带来的正常波动。劣化倍数排前面的接口就是突破口。
+
+---
+
+**第 3 步：是「整体变慢」还是「长尾变重」**
+
+```promql
+# P50 也涨了吗
+histogram_quantile(0.50, sum by (le) (rate(order_http_duration_seconds_bucket[5m])))
+
+# 尾部离散度
+histogram_quantile(0.99, sum by (le) (rate(order_http_duration_seconds_bucket[5m])))
+  /
+histogram_quantile(0.50, sum by (le) (rate(order_http_duration_seconds_bucket[5m])))
+
+# 和一周前的离散度对比
+(
+  histogram_quantile(0.99, sum by (le) (rate(order_http_duration_seconds_bucket[5m])))
+    /
+  histogram_quantile(0.50, sum by (le) (rate(order_http_duration_seconds_bucket[5m])))
+)
+  /
+(
+  histogram_quantile(0.99, sum by (le) (rate(order_http_duration_seconds_bucket[5m] offset 7d)))
+    /
+  histogram_quantile(0.50, sum by (le) (rate(order_http_duration_seconds_bucket[5m] offset 7d)))
+)
+```
+
+**判断：**
+
+- P50 也从 50ms 涨到 300ms，离散度没变 → **整体变慢**。方向：容量不足、下游依赖整体劣化、资源竞争。
+- P50 纹丝不动，离散度从 4 涨到 24 → **长尾问题**。方向：GC、锁、慢查询、缓存击穿、重试。
+
+---
+
+**第 4 步：流量是不是涨了**
+
+```promql
+# 当前 QPS vs 一周前
+sum(rate(order_http_requests_total[5m]))
+  /
+sum(rate(order_http_requests_total[5m] offset 7d))
+
+# 按接口看流量变化
+sum by (path) (rate(order_http_requests_total[5m]))
+  /
+sum by (path) (rate(order_http_requests_total[5m] offset 7d))
+
+# 流量分布是否均匀（负载均衡是否失效）
+stddev by (path) (rate(order_http_requests_total[5m]))
+  / avg by (path) (rate(order_http_requests_total[5m]))
+```
+
+**排除的假设：** 如果 QPS 涨了 3 倍，那 P99 涨 6 倍就是纯粹的容量问题，不用再找什么「疑难杂症」了。如果 QPS 完全没变而延迟涨了 6 倍，那就是系统内部出了状况。
+
+---
+
+**第 5 步：数据库层**
+
+```promql
+# 数据库查询 P99，按 query_type 拆
+histogram_quantile(0.99,
+  sum by (le, query_type) (rate(order_db_query_duration_seconds_bucket[5m]))
+)
+
+# 数据库延迟占请求总延迟的比例（粗略估算）
+histogram_quantile(0.99, sum by (le) (rate(order_db_query_duration_seconds_bucket[5m])))
+  /
+histogram_quantile(0.99, sum by (le) (rate(order_http_duration_seconds_bucket[5m])))
+
+# 每个请求平均查了几次库 —— 这条能抓出 N+1 查询
+sum(rate(order_db_query_duration_seconds_count[5m]))
+  /
+sum(rate(order_http_requests_total[5m]))
+
+# 和一周前对比每请求查询次数
+(sum(rate(order_db_query_duration_seconds_count[5m])) / sum(rate(order_http_requests_total[5m])))
+  /
+(sum(rate(order_db_query_duration_seconds_count[5m] offset 7d)) / sum(rate(order_http_requests_total[5m] offset 7d)))
+```
+
+**「每请求查询次数」这个派生指标极其有用。** 如果它从 3 涨到 27，那基本就锁定了：上周的某次发布引入了 N+1 查询，或者关掉了某个批量加载优化。数据库单次查询可能一点都不慢，慢的是查了太多次。
+
+---
+
+**第 6 步：缓存层**
+
+```promql
+# 缓存命中率
+sum(rate(order_cache_hits_total[5m]))
+  /
+(sum(rate(order_cache_hits_total[5m])) + sum(rate(order_cache_misses_total[5m])))
+
+# 和一周前对比
+(
+  sum(rate(order_cache_hits_total[5m]))
+    /
+  (sum(rate(order_cache_hits_total[5m])) + sum(rate(order_cache_misses_total[5m])))
+)
+  -
+(
+  sum(rate(order_cache_hits_total[5m] offset 7d))
+    /
+  (sum(rate(order_cache_hits_total[5m] offset 7d)) + sum(rate(order_cache_misses_total[5m] offset 7d)))
+)
+
+# 用子查询看命中率在这一周里是「渐变」还是「突降」
+min_over_time((
+  sum(rate(order_cache_hits_total[5m]))
+    /
+  (sum(rate(order_cache_hits_total[5m])) + sum(rate(order_cache_misses_total[5m])))
+)[7d:10m])
+```
+
+**判断：** 命中率从 95% 掉到 60%，直接解释了数据库压力上涨和长尾变重。子查询版本能告诉你是「上周三某个时刻突然掉的」（对应一次发布或配置变更）还是「一周内缓慢下滑的」（对应数据量增长导致缓存容量不足、或 key 设计导致的碎片化）。
+
+---
+
+**第 7 步：GC 与运行时**
+
+```promql
+# GC 停顿的 P99（go_gc_duration_seconds 是 Summary）
+go_gc_duration_seconds{quantile="1"}
+
+# GC 时间占比 —— 超过 5% 就说明 GC 压力大
+rate(go_gc_duration_seconds_sum[5m])
+
+# goroutine 数量趋势
+go_goroutines
+deriv(go_goroutines[1h])
+
+# 内存趋势与谷底抬升
+min_over_time(process_resident_memory_bytes[1h])
+  /
+min_over_time(process_resident_memory_bytes[1h] offset 7d)
+```
+
+**判断：** GC 停顿的 P99 如果达到几百毫秒，且 `rate(go_gc_duration_seconds_sum[5m])` 超过 0.05（即 5% 的时间在 GC），那长尾变重就有了直接解释。内存谷底一周涨了 2 倍则指向泄漏。
+
+---
+
+**第 8 步：宿主机资源**
+
+```promql
+# CPU 使用率
+100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# CPU 被抢占/等待（steal 和 iowait 是两个常被忽略的杀手）
+avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[5m])) * 100
+avg by (instance) (rate(node_cpu_seconds_total{mode="iowait"}[5m])) * 100
+
+# 负载与核数的比值
+node_load1 / count by (instance) (node_cpu_seconds_total{mode="idle"})
+
+# 过去一周 CPU 峰值的变化（用子查询）
+max_over_time((
+  100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+)[7d:5m])
+```
+
+`steal` 时间在云主机上特别值得看——它表示「宿主机把 CPU 给了别的虚拟机」，是典型的「你什么都没做错但就是变慢了」。
+
+---
+
+**三个最可能的根因方向**
+
+按经验，「延迟涨 6 倍、错误率不变、`up` 正常」这个组合，最常见的三个原因依次是：
+
+1. **缓存命中率下降**（最常见）。可能是缓存容量不足被动淘汰、某次发布改了 key 的生成规则导致旧缓存全部失效、Redis 实例发生过主从切换后数据丢失、或者缓存 TTL 被误改短。特征是：命中率明显下降 + 数据库 QPS 同步上涨 + P50 和 P99 一起涨。
+
+2. **数据库查询模式恶化**（N+1 或索引失效）。特征是：每请求查询次数上涨，或单次查询 P99 上涨。索引失效通常是数据量跨过某个阈值后查询计划变了，会表现为「某天开始突然变慢且不可逆」。
+
+3. **资源竞争 / GC 压力**。特征是：P50 不动而 P99 暴涨（长尾），GC 时间占比上升，或宿主机 `steal` / `iowait` 升高。这类问题往往是「邻居」造成的，本机指标全都正常。
+
+---
+
+**应该补的指标与告警**
+
+**补指标：**
+
+- **下游依赖的调用耗时 Histogram**，按依赖名和方法拆（`order_downstream_duration_seconds_bucket{dep, method}`）。本次排查最大的盲区就是：除了数据库，其他 RPC 依赖完全没有数据。
+- **连接池指标**：`order_db_pool_in_use`、`order_db_pool_idle`、`order_db_pool_wait_duration_seconds`。「等连接」造成的延迟在现有指标里完全看不见，而它是高并发下最常见的隐形瓶颈。
+- **队列/信号量等待时间**：如果服务内部有限流或工作池，等待时间必须单独埋点。
+- **按 `status` 拆分的延迟**：现在的 Histogram 没有 `status` 标签，无法回答「慢的是成功请求还是失败请求」。加这个标签要评估基数，但只保留 `2xx/4xx/5xx` 三个值是可接受的。
+- **每请求的下游调用次数**（可以用两个 Counter 相除派生，不用新埋点）。
+
+**补记录规则：**
+
+```yaml
+- record: order:duration_seconds:p99_5m
+  expr: histogram_quantile(0.99, sum by (le) (rate(order_http_duration_seconds_bucket[5m])))
+
+- record: order:duration_seconds:p50_5m
+  expr: histogram_quantile(0.50, sum by (le) (rate(order_http_duration_seconds_bucket[5m])))
+
+- record: order:duration_seconds:tail_ratio_5m
+  expr: order:duration_seconds:p99_5m / order:duration_seconds:p50_5m
+
+- record: order:cache:hit_ratio_5m
+  expr: |
+    sum(rate(order_cache_hits_total[5m]))
+      /
+    (sum(rate(order_cache_hits_total[5m])) + sum(rate(order_cache_misses_total[5m])))
+
+- record: order:db_queries_per_request:5m
+  expr: |
+    sum(rate(order_db_query_duration_seconds_count[5m]))
+      /
+    sum(rate(order_http_requests_total[5m]))
+```
+
+**补告警（关键是「和上周同期对比」而不是绝对阈值）：**
+
+```yaml
+- alert: LatencyRegressionWeekOverWeek
+  expr: |
+    order:duration_seconds:p99_5m
+      /
+    (order:duration_seconds:p99_5m offset 7d) > 2
+  for: 30m
+  labels:
+    severity: 'warning'
+  annotations:
+    summary: '订单 P99 相比上周同期劣化 {{ printf "%.1f" $value }} 倍'
+
+- alert: TailLatencyDegraded
+  expr: 'order:duration_seconds:tail_ratio_5m > 15'
+  for: 15m
+  labels:
+    severity: 'warning'
+  annotations:
+    summary: 'P99/P50 达到 {{ printf "%.1f" $value }}，长尾显著变重'
+
+- alert: CacheHitRatioDropped
+  expr: 'order:cache:hit_ratio_5m < 0.85'
+  for: 15m
+  labels:
+    severity: 'warning'
+
+- alert: DbQueriesPerRequestSpike
+  expr: |
+    order:db_queries_per_request:5m
+      /
+    (order:db_queries_per_request:5m offset 1d) > 1.5
+  for: 30m
+  labels:
+    severity: 'warning'
+  annotations:
+    summary: '每请求数据库查询次数比昨天增加 50%，疑似引入 N+1'
+
+- alert: HistogramBucketOverflow
+  expr: |
+    1 - (
+      sum(rate(order_http_duration_seconds_bucket{le="10"}[5m]))
+        /
+      sum(rate(order_http_duration_seconds_count[5m]))
+    ) > 0.01
+  for: 30m
+  labels:
+    severity: 'warning'
+  annotations:
+    summary: '超过 1% 的请求耗时超出最大桶，P99 数据已失真'
+```
+
+最后这条 `HistogramBucketOverflow` 是很多团队都没有但非常值得加的——**它监控的是「你的监控本身还准不准」**。P99 变成天花板值这种事，如果没人主动检查，可能几个月都发现不了。
+</Answer>
+</Callout>
+
+## 小结
+
+- **子查询 `[range:resolution]`** 让你能对函数结果做时间维度的聚合，语法上和区间选择器只差一个冒号。取样点按分辨率对齐到绝对时间。它非常昂贵——长窗口子查询必须先做成记录规则。
+- **`absent()`** 在序列不存在时返回值为 1 的序列，标签从等值匹配器提取。它只能判断「全都没了」，不能判断「哪一个没了」。**`absent_over_time()`** 加上了时间维度，更适合低频任务和容忍偶发抓取失败的场景。
+- **静默失败需要三层防护**：`up == 0`（抓取失败）、`absent(up{...})`（job 消失）、`absent_over_time(关键指标)`（指标消失）。
+- **`by` 用于告警和记录规则**（白名单，输出稳定），**`without` 用于排障**（保留上下文）。**`topk` 绝不能进告警表达式**——它会抖动、会掩盖故障规模。
+- **`quantile` / `histogram_quantile` / `quantile_over_time`** 分别在序列之间、观测值之间、时间之间求分位数，三者不可混用。
+- **SLO 的核心是错误预算和燃烧率**：`burn_rate = 错误率 / (1 - SLO)`，燃烧率为 1 表示正好按预算速度消耗。多窗口多燃烧率告警用长窗口定严重程度、短窗口保证快速恢复。燃烧率阈值必须按你自己的预算周期重新计算，不能照抄。
+- **`histogram_quantile` 的桶必须先聚合再算分位数**，`sum by (le)` 里的 `le` 一个都不能丢。P99 长期贴着某个固定值意味着桶溢出，这时候 P99 已经失真了。
+- **原生直方图**消除了桶带来的基数问题，不需要 `by (le)`，还提供了 `histogram_fraction` 这种能精确计算任意阈值比例的函数。
+- **泄漏检测看谷底而不是峰值**：`min_over_time` 的抬升是最干净的信号。**长尾分析看 P99/P50 的比值**，它比单看 P99 更能指出问题方向。
+- **排障时「和上周同期对比」比「和绝对阈值对比」有用得多**——`offset 7d` 自动消除了周期性波动，也自动适应了业务的自然增长。
+
+这一章的所有模式，本质上都在做同一件事：**把「此刻的值」变成「值的形状」**。阈值告警看的是点，这些模式看的是线和面。当你的监控从「点」升级到「面」，才算真正具备了预判和归因的能力。

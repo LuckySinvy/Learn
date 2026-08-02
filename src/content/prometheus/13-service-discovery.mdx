@@ -1,0 +1,821 @@
+---
+title: 服务发现
+order: 13
+description: 从 static_configs 到 file_sd、DNS、Consul、Kubernetes，让 Prometheus 自动找到抓取目标
+---
+
+# 服务发现
+
+到目前为止，我们配置抓取目标的方式一直是「把 IP 和端口手写进 `prometheus.yml`」。这在你只有三五台机器时完全够用，但一旦机器数量上百、一旦服务跑在会随时被重建的容器里、一旦扩缩容成了每天都会发生的事，手写清单就会变成一场灾难：你永远不知道现在这份列表是不是最新的，也永远无法保证新上线的实例真的被监控到了。
+
+Prometheus 的答案叫**服务发现**（Service Discovery，简称 SD）。它的思路非常直接：既然「有哪些实例在跑」这件事已经被别的系统（Kubernetes 的 API Server、Consul 的服务注册中心、你自己的 CMDB、甚至一台 DNS 服务器）记录着了，那 Prometheus 就不该再维护第二份副本，而应该主动去问这些系统要答案。服务发现负责「问出目标清单」，重新打标（relabel）负责「把清单加工成 Prometheus 想要的样子」，两者组合起来，就是 Prometheus 在动态环境里生存下来的全部秘密。
+
+读完本章你会掌握：
+
+- 为什么手写 `static_configs` 在动态环境里必然失效，以及服务发现解决的到底是什么问题
+- 所有服务发现机制共享的统一心智模型：产出目标地址 + 一堆 `__meta_` 开头的元标签
+- `file_sd_configs` 的文件格式、热加载机制，以及它为什么是最被低估的一种服务发现
+- `dns_sd_configs` 用 SRV 与 A 记录发现目标，`consul_sd_configs` 对接注册中心
+- `kubernetes_sd_configs` 的六种 `role`，以及从 K8s 元数据里提取 `namespace`、`pod` 标签的实战 relabel
+- `relabel_configs` 的各种 `action`（`keep` / `drop` / `replace` / `labelmap` / `hashmod`）与调试方法
+
+## 一、手写 static_configs 会死在哪里
+
+先把痛点摆清楚，后面的方案才有意义。假设你在维护一个有 200 个节点的集群，配置文件里躺着这样一段：
+
+```yaml
+scrape_configs:
+  - job_name: 'node'
+    static_configs:
+      - targets:
+          - '10.0.1.11:9100'
+          - '10.0.1.12:9100'
+          - '10.0.1.13:9100'
+          # ... 还有 197 行
+```
+
+这段配置有四个致命问题。
+
+**第一，它一定会过期。** 运维同学扩容加了 10 台机器，如果没人记得改这个文件，这 10 台机器就是监控盲区。更糟的是，监控系统「没有告警」和「监控本身瞎了」在表现上一模一样，你不会收到任何提示。
+
+**第二，缩容会制造噪音。** 下线了 5 台机器但配置没删，Prometheus 会持续抓取失败，`up` 指标变成 0，然后触发一堆「实例宕机」告警。告警多了，值班的人就开始习惯性忽略，真正的故障也就跟着被淹没了。
+
+**第三，它丢失了所有上下文。** `10.0.1.11:9100` 这个字符串本身不携带任何信息——它属于哪个业务线？在哪个可用区？是生产还是预发？这些信息在 CMDB 里明明都有，但手写清单把它们全丢掉了。结果就是你在 Grafana 里没办法按机房、按业务、按环境筛选。
+
+**第四，在容器环境里它根本无法成立。** Kubernetes 里的 Pod IP 是临时的，一次滚动发布之后所有 IP 都变了。你不可能靠人肉去追一个生命周期只有几分钟的 Pod。
+
+服务发现要解决的正是这四件事：**清单自动同步、上下文自动携带、生命周期自动跟随**。
+
+<Callout type="info" title="static_configs 并没有被淘汰">
+即便在最现代的环境里，`static_configs` 也依然有它的位置：抓取 Prometheus 自己、抓取 Alertmanager、抓取一两个固定的中间件——这些目标本来就不会动，用服务发现反而是过度设计。判断标准很简单：**目标清单会不会自己变？** 不会变的就写死，会变的才交给 SD。
+</Callout>
+
+## 二、服务发现的统一心智模型
+
+Prometheus 内置了几十种服务发现机制（EC2、Azure、GCE、OpenStack、Docker Swarm、Nomad、Eureka、Zookeeper……），但你不需要一个个背下来，因为它们的工作方式完全一致。理解了下面这个模型，任何一种 SD 你都能在十分钟内配出来。
+
+**第一步，SD 产出「目标 + 元标签」。** 每一种服务发现机制，本质上都是一个定时（或者监听式）向外部系统查询的插件。它返回的不是一个简单的字符串列表，而是一组**带标签的目标**。其中有几个特殊标签决定了 Prometheus 怎么去抓：
+
+| 标签 | 含义 | 默认值 |
+| --- | --- | --- |
+| `__address__` | 抓取的主机和端口 | 由 SD 提供，必填 |
+| `__scheme__` | 使用 http 还是 https | `http` |
+| `__metrics_path__` | 指标路径 | `/metrics` |
+| `__param_<name>` | 附加到请求上的 URL 查询参数 | 无 |
+| `__meta_*` | SD 附带的元信息，只读，供 relabel 使用 | 由各 SD 定义 |
+
+这里的关键是 `__meta_` 系列。**服务发现真正的价值不在于「发现了地址」，而在于「顺手把外部系统里的元数据全带过来了」。** Kubernetes SD 会把 Pod 的所有 label、annotation、namespace、node 名字都变成 `__meta_kubernetes_pod_*` 标签；Consul SD 会把服务的 tag、datacenter、健康状态都带过来。这些元数据就是你在第一节里丢失的「上下文」。
+
+**第二步，`relabel_configs` 加工这些标签。** SD 给的元标签名字又长又丑，不能直接当业务标签用。`relabel_configs` 就是一条流水线，按顺序把元标签筛选（哪些目标要抓）、改写（把 `__meta_kubernetes_namespace` 变成 `namespace`）、拼接（把 IP 和自定义端口组合成新的 `__address__`）。
+
+**第三步，所有以双下划线开头的标签在抓取前被丢弃。** 这一点非常重要：`__address__`、`__meta_*` 这些标签只在「配置抓取行为」的阶段存在，抓取真正开始之后它们就消失了，不会出现在最终的时间序列上。唯一的例外是 `__address__` 会被用来生成 `instance` 标签（如果你没有显式设置 `instance` 的话）。
+
+<Callout type="tip" title="记住这句话">
+**服务发现负责「有哪些目标、它们长什么样」，relabel 负责「要不要抓、怎么抓、打什么标签」。** 两者是严格分工的，任何一个 SD 配置看不懂的时候，回到这句话就能理清。
+</Callout>
+
+## 三、static_configs：一切的基线
+
+在讲动态发现之前，先把静态配置的完整能力说清楚——它其实也能带标签：
+
+```yaml
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          env: 'prod'
+          team: 'infra'
+
+  - job_name: 'node-bj'
+    static_configs:
+      - targets: ['10.0.1.11:9100', '10.0.1.12:9100']
+        labels:
+          datacenter: 'beijing'
+      - targets: ['10.1.1.11:9100']
+        labels:
+          datacenter: 'shanghai'
+```
+
+注意 `static_configs` 是一个**列表**，每一项可以有自己的 `targets` 和 `labels`。这种「按组打标签」的写法在小规模场景下相当实用。抓到的每一条序列上都会带上对应的 `datacenter` 标签。
+
+即便是静态配置，你也可以对它做 relabel——因为 relabel 作用的是「SD 产出的目标」，而 `static_configs` 也是一种 SD（只不过它的数据源是配置文件本身）。
+
+## 四、file_sd_configs：最被低估的服务发现
+
+如果说有哪一种服务发现被严重低估了，那一定是**文件服务发现**。它的原理简单到近乎朴素：Prometheus 监视一批文件，文件里写着目标清单，文件变了目标就跟着变。
+
+```yaml
+scrape_configs:
+  - job_name: 'node'
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/targets/node/*.json'
+          - '/etc/prometheus/targets/node/*.yml'
+        refresh_interval: 5m
+```
+
+`files` 支持通配符，但**只支持文件名一层的通配**（也就是 `*.json` 可以，`**/*.json` 这种递归匹配不行）。文件扩展名必须是 `.json`、`.yml` 或 `.yaml`。
+
+JSON 格式的目标文件长这样：
+
+```json
+[
+  {
+    "targets": ["10.0.1.11:9100", "10.0.1.12:9100"],
+    "labels": {
+      "env": "prod",
+      "datacenter": "beijing",
+      "team": "payment"
+    }
+  },
+  {
+    "targets": ["10.1.1.11:9100"],
+    "labels": {
+      "env": "staging",
+      "datacenter": "shanghai",
+      "team": "payment"
+    }
+  }
+]
+```
+
+等价的 YAML 写法：
+
+```yaml
+- targets:
+    - '10.0.1.11:9100'
+    - '10.0.1.12:9100'
+  labels:
+    env: 'prod'
+    datacenter: 'beijing'
+    team: 'payment'
+```
+
+### 热加载是怎么实现的
+
+这是 file_sd 最讨人喜欢的地方：**修改目标文件不需要重启 Prometheus，也不需要发 reload 请求。**
+
+Prometheus 用了双保险机制。一方面它通过操作系统的文件监听接口（Linux 上是 inotify）监视这些文件，文件一被写入就立刻重新加载，延迟在毫秒级。另一方面，考虑到文件监听在某些场景下会失效（比如通过网络文件系统挂载、比如文件被整个目录替换、比如新建了一个之前不匹配通配符的文件），它还会按 `refresh_interval` 定期做一次全量扫描兜底。`refresh_interval` 的默认值是 **5 分钟**。
+
+<Callout type="warn" title="写文件要用原子替换">
+不要用「打开文件、清空、逐行写入」的方式更新目标文件。Prometheus 可能在你写到一半的时候读到一个残缺的 JSON，从而认为目标清单是空的，导致所有目标瞬间消失、告警狂响。
+
+正确做法是**先写临时文件，再用 `mv` 原子替换**：
+
+```bash
+# 生成到临时文件
+generate_targets.py > /etc/prometheus/targets/node/.node.json.tmp
+
+# 原子替换（同一文件系统内的 mv 是原子操作）
+mv /etc/prometheus/targets/node/.node.json.tmp \
+   /etc/prometheus/targets/node/node.json
+```
+
+注意临时文件名要以点开头或者用别的扩展名，避免它自己被通配符匹配到。
+</Callout>
+
+### 元标签与典型用法
+
+file_sd 只提供一个元标签：`__meta_filepath`，值是该目标来源的文件路径。这个标签配合 relabel 可以做出很巧妙的事情——比如按文件名自动打业务线标签：
+
+```yaml
+relabel_configs:
+  # 从 /etc/prometheus/targets/node/payment.json 提取出 payment
+  - source_labels: [__meta_filepath]
+    regex: '.*/([^/]+)\.json'
+    target_label: 'service'
+    replacement: '$1'
+```
+
+file_sd 的真正威力在于**它把「谁来维护目标清单」这个问题外包了出去**。你可以让 Ansible 在部署完成后顺手生成一个 JSON，让 Terraform 在创建云主机后输出一份清单，让一个定时脚本从 CMDB 数据库里导出目标，甚至让 CI 流水线在服务上线时提交一个文件。Prometheus 完全不需要知道这些系统的存在，它只认那个文件。
+
+<Callout type="exercise" title="练习 1：设计一套 file_sd 目录结构">
+你们公司有三条业务线（payment、search、feed），每条业务线各有生产和预发两套环境，每套环境里都有若干台机器需要抓 node_exporter（端口 9100）和一个业务 exporter（端口 8080）。
+
+请设计目标文件的目录结构和 `prometheus.yml` 里的 `file_sd_configs` 配置，要求：新增一条业务线时不需要改 `prometheus.yml`，并且抓到的指标上要自动带 `service` 和 `env` 标签。
+
+<Answer>
+思路是**按 job（也就是端口/exporter 类型）分目录，业务线和环境写进文件内容的 `labels` 里**。这样新增业务线只是往目录里丢一个新文件，主配置不用动。
+
+目录结构：
+
+```text
+/etc/prometheus/targets/
+├── node/
+│   ├── payment.json
+│   ├── search.json
+│   └── feed.json
+└── app/
+    ├── payment.json
+    ├── search.json
+    └── feed.json
+```
+
+`node/payment.json` 内容：
+
+```json
+[
+  {
+    "targets": ["10.0.1.11:9100", "10.0.1.12:9100"],
+    "labels": { "service": "payment", "env": "prod" }
+  },
+  {
+    "targets": ["10.9.1.11:9100"],
+    "labels": { "service": "payment", "env": "staging" }
+  }
+]
+```
+
+`prometheus.yml`：
+
+```yaml
+scrape_configs:
+  - job_name: 'node'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/node/*.json']
+        refresh_interval: 5m
+
+  - job_name: 'app'
+    metrics_path: '/actuator/prometheus'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/app/*.json']
+        refresh_interval: 5m
+```
+
+进阶做法：如果不想在每个 JSON 里重复写 `service`，可以让文件名承担这个信息，用 relabel 从 `__meta_filepath` 里提取：
+
+```yaml
+    relabel_configs:
+      - source_labels: [__meta_filepath]
+        regex: '.*/([^/]+)\.json'
+        target_label: 'service'
+        replacement: '$1'
+```
+
+这样 JSON 里就只剩 `targets` 和 `env` 了，维护成本更低。
+</Answer>
+</Callout>
+
+## 五、dns_sd_configs：让 DNS 当注册中心
+
+DNS 服务发现适合那些「已经把服务信息写进 DNS」的环境，最典型的就是用 SRV 记录做服务注册的老牌架构，以及 Kubernetes 里的 Headless Service（它会为每个后端 Pod 生成 A 记录）。
+
+```yaml
+scrape_configs:
+  # 用 SRV 记录发现，端口由记录本身提供
+  - job_name: 'node-srv'
+    dns_sd_configs:
+      - names:
+          - '_node-exporter._tcp.example.com'
+        type: 'SRV'
+        refresh_interval: 30s
+
+  # 用 A 记录发现，必须显式指定端口
+  - job_name: 'node-a'
+    dns_sd_configs:
+      - names:
+          - 'nodes.internal.example.com'
+        type: 'A'
+        port: 9100
+        refresh_interval: 30s
+```
+
+几个必须记住的规则：
+
+- `type` 支持 `SRV`、`A`、`AAAA`、`MX`、`NS`。默认值是 `SRV`。
+- **用 `SRV` 时不需要写 `port`**，因为 SRV 记录本身就包含端口号。用 `A` / `AAAA` / `MX` 时 `port` 是**必填**的，因为这些记录只返回地址。
+- `refresh_interval` 默认 **30 秒**，这是所有 SD 里比较激进的一个默认值，符合 DNS 变更相对频繁的特点。
+- 一个 `names` 里可以写多个域名，结果取并集。
+
+DNS SD 提供的元标签：
+
+| 元标签 | 含义 |
+| --- | --- |
+| `__meta_dns_name` | 产生这个目标的那条查询记录名 |
+| `__meta_dns_srv_record_target` | SRV 记录指向的目标主机名 |
+| `__meta_dns_srv_record_port` | SRV 记录里的端口 |
+| `__meta_dns_mx_record_target` | MX 记录的目标 |
+| `__meta_dns_ns_record_target` | NS 记录的目标 |
+
+<Callout type="warn" title="DNS SD 的两个坑">
+**坑一：缓存。** Prometheus 走的是系统解析器（或者配置的 DNS 服务器），中间任何一层的 TTL 缓存都会让「实例已经下线但 Prometheus 还在抓」的窗口变长。如果你的实例生命周期比 DNS TTL 还短，DNS SD 就不合适。
+
+**坑二：元数据贫瘠。** DNS 记录只能告诉你「地址和端口」，带不出环境、业务线、可用区这些信息。这意味着你还是得靠命名规范（比如把机房编码进域名）配合正则来提取标签，本质上是在用 DNS 名字当字符串数据库，很脆弱。
+</Callout>
+
+## 六、consul_sd_configs：对接服务注册中心
+
+Consul 是最经典的服务注册中心之一，也是很多非 Kubernetes 微服务体系的基础设施。它天然存着「服务名、实例地址、端口、tag、健康状态」，正好是 Prometheus 想要的全部信息。
+
+```yaml
+scrape_configs:
+  - job_name: 'consul-services'
+    consul_sd_configs:
+      - server: 'consul.internal:8500'
+        # 不填 services 表示发现所有服务
+        services: []
+        # 只要打了这些 tag 的实例
+        tags: ['prometheus']
+        datacenter: 'dc1'
+        refresh_interval: 30s
+        # 生产环境记得配 token
+        # token: '<your-acl-token>'
+
+    relabel_configs:
+      # 只保留健康的实例
+      - source_labels: [__meta_consul_health]
+        regex: 'passing'
+        action: keep
+
+      # 服务名当 job 名
+      - source_labels: [__meta_consul_service]
+        target_label: 'job'
+
+      # 从 tag 里提取环境（tag 之间用逗号分隔且首尾也有逗号）
+      - source_labels: [__meta_consul_tags]
+        regex: '.*,env=([^,]+),.*'
+        target_label: 'env'
+        replacement: '$1'
+
+      # Consul 节点名当 node 标签
+      - source_labels: [__meta_consul_node]
+        target_label: 'node'
+```
+
+常用元标签：
+
+| 元标签 | 含义 |
+| --- | --- |
+| `__meta_consul_service` | 服务名 |
+| `__meta_consul_service_id` | 服务实例 ID |
+| `__meta_consul_service_address` | 服务注册的地址 |
+| `__meta_consul_service_port` | 服务注册的端口 |
+| `__meta_consul_address` | 所在 Consul 节点的地址 |
+| `__meta_consul_node` | 所在 Consul 节点名 |
+| `__meta_consul_dc` | 数据中心 |
+| `__meta_consul_health` | 健康状态，取值 `passing` / `warning` / `critical` |
+| `__meta_consul_tags` | 所有 tag，用分隔符连接 |
+| `__meta_consul_service_metadata_<key>` | 服务级别的自定义元数据 |
+
+<Callout type="info" title="tags 为什么首尾也有分隔符">
+`__meta_consul_tags` 的值形如 `,prod,web,v2,`——首尾各多一个逗号。这是**故意设计的**，目的是让正则匹配变得可靠：要判断「有没有 `web` 这个 tag」，你只需要匹配 `,web,`，就不会误伤 `webhook` 这种前缀相同的 tag。分隔符可以用 `tag_separator` 配置项修改，默认是逗号。
+</Callout>
+
+<Callout type="exercise" title="练习 2：从 Consul 里挑出该抓的实例">
+你的 Consul 里注册了几百个服务实例，其中只有一部分暴露了 Prometheus 指标。约定是：暴露指标的实例会打一个 `metrics` tag，并且在服务元数据里放一个 `metrics_path` 键指明路径（可能是 `/metrics`，也可能是 `/actuator/prometheus`）。
+
+请写出 `relabel_configs`，要求：只抓打了 `metrics` tag 且健康状态为 `passing` 的实例；抓取路径按元数据里的 `metrics_path` 设置；把服务名写进 `service` 标签。
+
+<Answer>
+```yaml
+scrape_configs:
+  - job_name: 'consul-metrics'
+    consul_sd_configs:
+      - server: 'consul.internal:8500'
+        refresh_interval: 30s
+
+    relabel_configs:
+      # 1. 只保留带 metrics tag 的实例
+      #    首尾分隔符保证不会匹配到 metrics-agent 之类的 tag
+      - source_labels: [__meta_consul_tags]
+        regex: '.*,metrics,.*'
+        action: keep
+
+      # 2. 只保留健康实例
+      - source_labels: [__meta_consul_health]
+        regex: 'passing'
+        action: keep
+
+      # 3. 按元数据设置抓取路径
+      #    regex 加 (.+) 保证元数据缺失时不会把路径覆盖成空串
+      - source_labels: [__meta_consul_service_metadata_metrics_path]
+        regex: '(.+)'
+        target_label: '__metrics_path__'
+        replacement: '$1'
+
+      # 4. 服务名 → service 标签
+      - source_labels: [__meta_consul_service]
+        target_label: 'service'
+```
+
+三个关键点：
+
+1. 第 1 条里 `action: keep` 表示「正则匹配上的**保留**，匹配不上的丢弃」。`regex` 是**完全锚定**的（相当于两端自动加了 `^` 和 `$`），所以必须写 `.*,metrics,.*` 而不能只写 `,metrics,`。
+2. 第 3 条的 `regex: '(.+)'` 非常关键。如果不写，默认 `regex` 是 `(.*)`，当元数据不存在时源标签是空串，也能匹配上，结果会把 `__metrics_path__` 覆盖成空字符串，抓取直接失败。加上 `(.+)` 后空值不匹配，这条规则被跳过，`__metrics_path__` 保持默认的 `/metrics`。**这是 relabel 里最常见的一个 bug。**
+3. 第 4 条省略了 `action`，因为 `replace` 是默认值；也省略了 `regex` 和 `replacement`，默认的 `(.*)` 加 `$1` 恰好实现「原样复制」。
+</Answer>
+</Callout>
+
+## 七、kubernetes_sd_configs：容器时代的标配
+
+Kubernetes 服务发现是今天用得最多的一种。它直接连 API Server，用 watch 机制实时感知资源变化——不是轮询，所以延迟极低，Pod 一创建几乎立刻就能被发现。
+
+### 六种 role
+
+`role` 决定了「发现什么类型的对象」，这是整个配置里最重要的一个决策。
+
+| role | 发现什么 | 默认目标地址 | 典型用途 |
+| --- | --- | --- | --- |
+| `node` | 集群里的每个 Node | 节点 IP 加 Kubelet 端口 10250 | 抓 kubelet、cAdvisor、node_exporter |
+| `pod` | 每个 Pod 的每个声明了端口的容器 | Pod IP 加容器端口 | 抓业务应用自己暴露的指标 |
+| `service` | 每个 Service 的每个端口 | Service 的 DNS 名加端口 | 一般配合黑盒探测做可用性检查 |
+| `endpoints` | Service 背后的每个 Endpoint | Endpoint 地址加端口 | 抓「有 Service 的应用」，最常用 |
+| `endpointslice` | 同上，但走 EndpointSlice API | 同上 | 大集群下比 endpoints 更高效 |
+| `ingress` | 每条 Ingress 规则的路径 | Ingress 的 host 加 path | 配合黑盒探测检查对外入口 |
+
+<Callout type="tip" title="pod 还是 endpoints">
+两者都能抓到业务 Pod，区别在于**语义**：
+
+- `role: pod` 抓的是「所有 Pod」，不管它有没有被 Service 暴露。适合 DaemonSet、Job 这类没有 Service 的负载。
+- `role: endpoints` 抓的是「Service 背后就绪的 Pod」，天然带上了 Service 的名字和标签，而且未就绪的 Pod 会被 Endpoint 控制器摘掉。做「服务级别」的监控时它更合适。
+
+大集群（Endpoint 对象很大、变更频繁）建议改用 `endpointslice`，可以显著降低 API Server 的压力。
+</Callout>
+
+### 元标签速查
+
+`role: pod` 提供的元标签（挑常用的）：
+
+| 元标签 | 含义 |
+| --- | --- |
+| `__meta_kubernetes_namespace` | 所在命名空间 |
+| `__meta_kubernetes_pod_name` | Pod 名 |
+| `__meta_kubernetes_pod_ip` | Pod IP |
+| `__meta_kubernetes_pod_node_name` | 所在节点名 |
+| `__meta_kubernetes_pod_label_<name>` | Pod 的每个 label |
+| `__meta_kubernetes_pod_annotation_<name>` | Pod 的每个 annotation |
+| `__meta_kubernetes_pod_container_name` | 容器名 |
+| `__meta_kubernetes_pod_container_port_number` | 容器声明的端口号 |
+| `__meta_kubernetes_pod_phase` | 生命周期阶段，如 `Running` |
+| `__meta_kubernetes_pod_ready` | 是否就绪，`true` 或 `false` |
+| `__meta_kubernetes_pod_controller_kind` | 控制器类型，如 `ReplicaSet` |
+
+`role: endpoints` 除了上面这些（当 Endpoint 后面是 Pod 时），还会额外提供 `__meta_kubernetes_service_name`、`__meta_kubernetes_service_label_<name>`、`__meta_kubernetes_endpoint_port_name`、`__meta_kubernetes_endpoint_ready` 等。
+
+<Callout type="warn" title="标签名会被改写">
+Kubernetes 的 label 和 annotation 允许出现点号、斜杠、横杠，但 Prometheus 的标签名只允许字母、数字和下划线。所以**所有不合法字符都会被替换成下划线**。
+
+举例：annotation `prometheus.io/scrape` 对应的元标签是 `__meta_kubernetes_pod_annotation_prometheus_io_scrape`；label `app.kubernetes.io/name` 对应 `__meta_kubernetes_pod_label_app_kubernetes_io_name`。
+
+第一次写 K8s relabel 的人几乎都会在这里卡住，记住这条规则能省掉半小时的调试。
+</Callout>
+
+### 实战一：抓所有节点的 node_exporter
+
+假设 node_exporter 以 DaemonSet + hostNetwork 部署在 9100 端口：
+
+```yaml
+scrape_configs:
+  - job_name: 'node-exporter'
+    kubernetes_sd_configs:
+      - role: node
+
+    relabel_configs:
+      # role: node 默认地址是 <nodeIP>:10250，需要改成 9100
+      - source_labels: [__address__]
+        regex: '([^:]+)(?::\d+)?'
+        target_label: '__address__'
+        replacement: '$1:9100'
+
+      # 把节点的所有 label 平铺成 Prometheus 标签
+      - action: labelmap
+        regex: '__meta_kubernetes_node_label_(.+)'
+
+      # 节点名 → node 标签
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: 'node'
+```
+
+### 实战二：基于 annotation 的自动发现（最经典的一段配置）
+
+这段配置几乎出现在每一个 Kubernetes 监控方案里。约定是：应用只要在 Pod 上打三个 annotation，就会被自动抓取，运维侧完全不用改配置。
+
+```yaml
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+
+    relabel_configs:
+      # 1. 只抓 prometheus.io/scrape: "true" 的 Pod
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: 'true'
+
+      # 2. 按 prometheus.io/scheme 设置 http/https（可选）
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scheme]
+        action: replace
+        target_label: '__scheme__'
+        regex: '(https?)'
+
+      # 3. 按 prometheus.io/path 设置指标路径（可选）
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: '__metrics_path__'
+        regex: '(.+)'
+
+      # 4. 按 prometheus.io/port 替换端口
+      #    源标签有两个，用分号连接后一起匹配
+      - source_labels:
+          - '__address__'
+          - '__meta_kubernetes_pod_annotation_prometheus_io_port'
+        action: replace
+        regex: '([^:]+)(?::\d+)?;(\d+)'
+        replacement: '$1:$2'
+        target_label: '__address__'
+
+      # 5. 把 Pod 的所有 label 平铺过来
+      - action: labelmap
+        regex: '__meta_kubernetes_pod_label_(.+)'
+
+      # 6. namespace / pod / node 三个上下文标签
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: 'namespace'
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: 'pod'
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        action: replace
+        target_label: 'node'
+
+      # 7. 丢掉未就绪的 Pod，避免启动期的抓取失败噪音
+      - source_labels: [__meta_kubernetes_pod_ready]
+        action: keep
+        regex: 'true'
+```
+
+第 4 条值得单独拆解，因为它是整段配置里最难懂的一行。`source_labels` 写了两个标签，Prometheus 会把它们的值用**分隔符**（默认是分号）连接成一个字符串再去匹配正则。假设 Pod IP 是 `10.244.1.7`、容器端口是 `8080`、annotation 里写的端口是 `9090`，那么拼出来的字符串就是 `10.244.1.7:8080;9090`。正则 `([^:]+)(?::\d+)?;(\d+)` 把它拆成两个捕获组：`$1` 是 `10.244.1.7`，`$2` 是 `9090`，`replacement` 再把它们拼成 `10.244.1.7:9090`。整条规则的作用就是「用 annotation 里的端口覆盖掉默认端口」。
+
+第 5 条的 `labelmap` 是另一个高频动作。它不看 `source_labels`，而是拿 `regex` 去匹配**所有现有标签的名字**，把匹配上的标签**改名后复制一份**。`__meta_kubernetes_pod_label_app` 匹配 `__meta_kubernetes_pod_label_(.+)` 后，捕获组是 `app`，于是产生一个新标签 `app`，值不变。一条规则就把所有 Pod label 都搬过来了。
+
+### 实战三：抓 Service 背后的应用
+
+```yaml
+scrape_configs:
+  - job_name: 'kubernetes-endpoints'
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names: ['production', 'payment']
+
+    relabel_configs:
+      - source_labels:
+          - '__meta_kubernetes_service_annotation_prometheus_io_scrape'
+        action: keep
+        regex: 'true'
+
+      # 只抓名为 metrics 的那个端口，避免一个 Pod 被抓多次
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: 'metrics'
+
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: 'namespace'
+      - source_labels: [__meta_kubernetes_service_name]
+        target_label: 'service'
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: 'pod'
+```
+
+注意 `namespaces.names` 可以限制发现范围，在大集群里能显著减少内存占用和 API Server 压力。另外「只抓名为 metrics 的端口」这条很重要：一个 Pod 如果声明了 `http`、`grpc`、`metrics` 三个端口，`role: endpoints` 会为每个端口各产生一个目标，不做过滤的话你会对同一个 Pod 抓三次，其中两次必然失败。
+
+<Callout type="exercise" title="练习 3：修复一段有问题的 K8s relabel">
+下面这段配置在集群里跑起来后出现了三个现象：（1）几乎所有 Pod 都被抓了，包括根本没有指标接口的；（2）少数应用的指标路径是 `/actuator/prometheus`，但全部被抓成了 `/metrics`；（3）指标上只有 `instance` 标签，看不出属于哪个命名空间。
+
+```yaml
+relabel_configs:
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus.io/scrape]
+    action: keep
+    regex: true
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+    target_label: __metrics_path__
+```
+
+请指出每个现象的原因并给出修正后的配置。
+
+<Answer>
+三个问题各自对应一处错误。
+
+**现象 1：所有 Pod 都被抓了。** 元标签名写错了——annotation 里的点和斜杠必须替换成下划线，正确写法是 `__meta_kubernetes_pod_annotation_prometheus_io_scrape`。写错的标签名对应的值永远是空字符串，而 `regex: true` 在 YAML 里会被解析成布尔值 `true`，Prometheus 转成字符串 `"true"` 去匹配空串——理论上匹配不上应该全被丢弃。但更常见的翻车方式是有人把 `keep` 写成了默认的 `replace`，或者 regex 写成了 `.*`，导致全量放行。**根因就是标签名拼错**，写对之后语义才成立。稳妥起见 `regex` 应该加引号写成 `'true'`，避免 YAML 类型歧义。
+
+**现象 2：自定义路径没生效。** 缺了 `regex: '(.+)'`。默认 `regex` 是 `(.*)`，当 Pod 没有 `prometheus.io/path` 这个 annotation 时源标签为空串，仍然匹配成功，于是 `__metrics_path__` 被覆盖成空字符串。有些应用因此完全抓不到，看起来就像「路径没改成功」。加上 `(.+)` 后空值不匹配，规则被跳过，保留默认路径。
+
+**现象 3：缺上下文标签。** 压根没写提取 `namespace` / `pod` 的规则。
+
+修正后：
+
+```yaml
+relabel_configs:
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+    action: keep
+    regex: 'true'
+
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+    action: replace
+    target_label: '__metrics_path__'
+    regex: '(.+)'
+    replacement: '$1'
+
+  - source_labels:
+      - '__address__'
+      - '__meta_kubernetes_pod_annotation_prometheus_io_port'
+    action: replace
+    regex: '([^:]+)(?::\d+)?;(\d+)'
+    replacement: '$1:$2'
+    target_label: '__address__'
+
+  - source_labels: [__meta_kubernetes_namespace]
+    action: replace
+    target_label: 'namespace'
+
+  - source_labels: [__meta_kubernetes_pod_name]
+    action: replace
+    target_label: 'pod'
+
+  - action: labelmap
+    regex: '__meta_kubernetes_pod_label_(.+)'
+```
+
+调试建议：改完之后打开 Prometheus Web UI 的 **Status → Service Discovery** 页面，它会同时展示每个目标 relabel **之前**的全部元标签和 relabel **之后**的最终标签，一眼就能看出哪条规则没生效。
+</Answer>
+</Callout>
+
+## 八、relabel 的完整动作表与组合技
+
+前面的例子里我们已经用过 `keep`、`replace`、`labelmap`，这里把所有动作补齐。
+
+| action | 作用 |
+| --- | --- |
+| `replace` | 默认动作。正则匹配 `source_labels` 拼接后的值，把 `replacement` 展开后写入 `target_label` |
+| `keep` | 匹配上的目标保留，匹配不上的丢弃 |
+| `drop` | 匹配上的目标丢弃，与 `keep` 相反 |
+| `keepequal` | 保留「`source_labels` 拼接值等于 `target_label` 值」的目标 |
+| `dropequal` | 与上一条相反 |
+| `labelmap` | 用 `regex` 匹配标签**名**，把匹配到的标签按 `replacement` 改名复制 |
+| `labeldrop` | 删除名字匹配 `regex` 的标签 |
+| `labelkeep` | 只保留名字匹配 `regex` 的标签，其余全删 |
+| `hashmod` | 对 `source_labels` 求哈希取模，结果写入 `target_label`，用于分片 |
+| `lowercase` / `uppercase` | 把源标签值转成小写 / 大写写入目标标签 |
+
+三个必须记住的默认值：`separator` 默认是分号，`regex` 默认是 `(.*)` 且**两端自动锚定**，`replacement` 默认是 `$1`。
+
+### 组合技一：用 hashmod 做水平分片
+
+当一个 Prometheus 抓不动全部目标时，可以起多个实例，每个只抓一部分。`hashmod` 就是干这个的：
+
+```yaml
+relabel_configs:
+  - source_labels: [__address__]
+    modulus: 4
+    target_label: '__tmp_hash'
+    action: hashmod
+  # 第 0 号实例只保留哈希值为 0 的目标，其余实例改成 1/2/3
+  - source_labels: [__tmp_hash]
+    regex: '0'
+    action: keep
+```
+
+四个 Prometheus 用同一份配置，只有最后那条 `regex` 不同，就把目标均匀切成了四份。注意中间标签用 `__tmp_` 前缀命名，这样它会在抓取前被自动丢弃，不会污染最终序列。
+
+### 组合技二：用 labeldrop 清理噪音标签
+
+`labelmap` 一把梭把 Pod 的所有 label 都搬过来之后，往往会带上一堆没用的（比如 `pod_template_hash` 这种每次发布都会变的），它们会造成时间序列大量断裂。用 `labeldrop` 清掉：
+
+```yaml
+relabel_configs:
+  - action: labelmap
+    regex: '__meta_kubernetes_pod_label_(.+)'
+  - action: labeldrop
+    regex: '(pod_template_hash|controller_revision_hash|pod_template_generation)'
+```
+
+<Callout type="warn" title="relabel_configs 和 metric_relabel_configs 别搞混">
+两者语法完全一样，但作用时机和对象完全不同：
+
+- `relabel_configs` 在**抓取之前**执行，作用对象是**目标**。它决定「抓不抓、抓哪里、目标带什么标签」。
+- `metric_relabel_configs` 在**抓取之后、入库之前**执行，作用对象是**抓回来的每一条样本**。它决定「这条指标留不留、标签怎么改」，常用来丢弃高基数指标。
+
+想过滤目标却写进了 `metric_relabel_configs`，结果是「照抓不误，只是数据被扔了」，白白浪费带宽和 CPU；反过来想过滤指标却写进 `relabel_configs`，则完全不会生效，因为那时候还没有指标名可言。
+</Callout>
+
+## 九、排错工作流
+
+服务发现出问题时，按这个顺序查基本不会跑偏：
+
+1. **`promtool check config prometheus.yml`** —— 先确认配置语法和正则本身没写错。
+2. **Web UI 的 Status → Service Discovery** —— 看 SD 到底发现了什么。这个页面对每个目标同时展示 relabel 前的元标签（`Discovered Labels`）和 relabel 后的结果（`Target Labels`）。如果 relabel 后的目标被丢弃了，页面上会显示为 dropped。
+3. **Web UI 的 Status → Targets** —— 看留下来的目标抓取状态、最后一次抓取时间和错误信息。
+4. **查询 `up` 指标** —— `up == 0` 找出所有抓取失败的目标，配合 `scrape_duration_seconds` 看是不是超时。
+
+改完配置后，如果启动时加了 `--web.enable-lifecycle`，可以热加载而不用重启：
+
+```bash
+curl -X POST http://localhost:9090/-/reload
+```
+
+<Callout type="tip" title="dropped targets 默认只保留一部分">
+在超大规模集群里，被 relabel 丢弃的目标可能有几十万个，全部保留在内存里供 UI 展示会很浪费。Prometheus 因此对 dropped targets 的保留数量做了限制，可以用 `--scrape.discovery-reload-interval` 之外的相关参数调整。调试时如果在 UI 上找不到某个被丢弃的目标，先别怀疑 SD 没发现它，很可能只是没被展示出来。
+</Callout>
+
+<Callout type="exercise" title="练习 4：从零设计一套混合环境的发现方案">
+你接手了一套混合环境：
+
+- 一个 Kubernetes 集群，跑着约 300 个业务 Pod，其中只有打了 `prometheus.io/scrape: "true"` 的需要抓取
+- 20 台没有上容器的物理机，跑着 node_exporter，机器清单在公司 CMDB 里，可以通过脚本导出
+- 3 台 Prometheus 自身、1 台 Alertmanager、1 台 Grafana，地址固定不变
+
+请给出完整的 `scrape_configs` 骨架（可省略部分 relabel 细节），并说明每一部分为什么选这种服务发现。
+
+<Answer>
+三类目标的变化频率和数据源完全不同，所以应该用三种不同的机制。
+
+```yaml
+global:
+  scrape_interval: 30s
+  external_labels:
+    cluster: 'main'
+
+scrape_configs:
+  # ---- 第一类：固定不变的基础设施，用 static_configs ----
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+          - 'prom-1:9090'
+          - 'prom-2:9090'
+          - 'prom-3:9090'
+        labels:
+          component: 'prometheus'
+
+  - job_name: 'alertmanager'
+    static_configs:
+      - targets: ['alertmanager:9093']
+
+  - job_name: 'grafana'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['grafana:3000']
+
+  # ---- 第二类：物理机，用 file_sd + CMDB 导出 ----
+  - job_name: 'node'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/node/*.json']
+        refresh_interval: 5m
+    relabel_configs:
+      - source_labels: [__meta_filepath]
+        regex: '.*/([^/]+)\.json'
+        target_label: 'idc'
+        replacement: '$1'
+
+  # ---- 第三类：K8s Pod，用 kubernetes_sd ----
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: 'true'
+      - source_labels:
+          - '__address__'
+          - '__meta_kubernetes_pod_annotation_prometheus_io_port'
+        action: replace
+        regex: '([^:]+)(?::\d+)?;(\d+)'
+        replacement: '$1:$2'
+        target_label: '__address__'
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: '__metrics_path__'
+        regex: '(.+)'
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: 'namespace'
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: 'pod'
+      - action: labelmap
+        regex: '__meta_kubernetes_pod_label_(.+)'
+      - action: labeldrop
+        regex: '(pod_template_hash|controller_revision_hash)'
+```
+
+选型理由：
+
+1. **基础设施用 `static_configs`**：这些地址在集群生命周期里几乎不会变，引入服务发现只会增加一个失败点。而且监控系统自身的监控必须尽可能简单可靠——如果 Prometheus 靠 Consul 才能发现自己，Consul 挂了你就同时失去了监控和监控的监控。
+
+2. **物理机用 `file_sd_configs`**：目标清单的**权威来源是 CMDB**，不是 DNS 也不是 Consul。用 file_sd 可以写一个定时任务从 CMDB 导出 JSON（记得用临时文件加 `mv` 原子替换），Prometheus 自动热加载。同时 CMDB 里的机房、业务线、责任人等字段都可以直接写进 JSON 的 `labels`，一次性解决上下文缺失问题。
+
+3. **K8s 用 `kubernetes_sd_configs`**：Pod 生命周期太短，只有 watch API Server 才跟得上。用 annotation 做开关的好处是**把决定权交给了应用团队**——他们改自己的 Deployment 就能接入监控，不需要提工单让运维改 Prometheus 配置。
+
+补充建议：给 `global.external_labels` 加上 `cluster` 标记，这样后面做联邦或者接入 Thanos 时能区分数据来源（下一章会用到）。
+</Answer>
+</Callout>
+
+## 小结
+
+服务发现不是一个「高级特性」，而是 Prometheus 在真实生产环境里的**默认工作方式**。回顾本章的核心：
+
+- 所有 SD 机制共享同一个模型：**产出目标地址 + `__meta_` 元标签**，然后交给 `relabel_configs` 加工。
+- `static_configs` 适合永不变化的基础设施；`file_sd_configs` 适合「有权威数据源但不是标准注册中心」的场景，是集成 CMDB / Ansible / Terraform 的最佳桥梁；`dns_sd_configs` 轻量但元数据贫瘠；`consul_sd_configs` 和 `kubernetes_sd_configs` 元数据最丰富，配合 relabel 能自动打出完整的上下文标签。
+- relabel 的三个默认值（分隔符是分号、`regex` 是 `(.*)` 且两端锚定、`replacement` 是 `$1`）和「可选字段要用 `(.+)` 保护」是最容易踩的坑。
+- 分不清 `relabel_configs` 和 `metric_relabel_configs` 是新手最常见的错误，前者管目标，后者管样本。
+
+下一章我们会看到，当单个 Prometheus 已经抓不动、或者你需要一个跨集群的全局视图时，**联邦**是官方给出的第一个答案。

@@ -1,0 +1,326 @@
+---
+title: 常用函数
+order: 8
+description: rate/irate、increase、histogram_quantile、topk 等实战函数
+---
+
+# 常用函数
+
+学完数据模型（第 5 章）和运算符（第 7 章）之后，你已经有能力写出不少查询。但真正让 PromQL 从「能查」变成「好用」的，是它内置的几十个函数。本章挑出在监控告警里最高频、最容易踩坑的一组函数，逐一讲清楚**它算什么、什么时候该用、有什么陷阱**。
+
+读完本章你会掌握：
+
+- `rate` / `irate` / `increase` 的区别，以及为什么 99% 的「速率」查询都用 `rate`
+- 怎么用 `histogram_quantile` 把 Histogram 指标换算成 P99 延迟
+- `delta` / `idelta` 只能用在 Gauge 上，以及原因
+- `topk` / `bottomk` / `clamp_max` 等聚合与裁剪函数
+- `absent` / `count_values` / `label_replace` / `label_join` 这类「辅助」函数
+- 用函数组合出生产里最常用的两个指标：**错误率** 和 **P99 延迟**
+
+## 速率类：rate / irate / increase
+
+Counter 只增不减，所以单独看它的值没意义，真正有用的是**单位时间内的增长速率**。Prometheus 提供了三个相关函数：
+
+| 函数 | 作用 | 适用场景 |
+| --- | --- | --- |
+| `rate(range)` | 区间内的平均每秒增长率（自动处理 Counter 重置） | 绝大多数「速率」「QPS」「错误率」查询 |
+| `irate(range)` | 只取区间内**最后两个样本点**算瞬时速率 | 看毛刺、快速波动，不适合画长期趋势 |
+| `increase(range)` | 区间内的**总增量**（不带「每秒」），等价于 `rate * 区间秒数` | 算「过去 5 分钟一共多少个请求」 |
+
+```promql
+# 过去 5 分钟内，每秒平均 HTTP 请求数
+rate(http_requests_total[5m])
+
+# 只看最后两个样本点的瞬时 QPS（区间里至少要有两个点）
+irate(http_requests_total[5m])
+
+# 过去 5 分钟的总请求数（注意：不是「每秒」）
+increase(http_requests_total[5m])
+```
+
+<Callout type="warn" title="rate 必须吃区间向量">
+`rate()` 的参数必须是一个**区间向量**（带 `[5m]` 这种范围选择器）。写成 `rate(http_requests_total)` 会直接报错——因为单点的瞬时向量没有「区间」可以求平均。`irate` 和 `increase` 同理。
+</Callout>
+
+三个函数的关键差异在「平滑程度」上：
+
+- `rate` 看整个区间的**平均斜率**，曲线平滑，适合画趋势图、设阈值告警。
+- `irate` 只看最后两个点，对突发敏感，能显示尖刺，但曲线更抖，长期趋势图会显得很乱。
+- `increase` 不做「每秒归一化」，语义上是「这一段时间里涨了多少」。
+
+<Callout type="tip" title="区间选多大？">
+区间太小（如 `[1m]`）时样本少、容易受抖动影响；太大（如 `[1h]`）会抹平细节、且内存占用更高。常用经验值：
+- 看板趋势：`[5m]` 配 `rate`
+- 告警规则：`[2m]` ~ `[5m]` 配 `rate`
+- 想捕捉尖刺：`[5m]` 配 `irate`
+
+Grafana 里更推荐用变量 `$__rate_interval`，它会根据面板时间跨度自动调整区间。
+</Callout>
+
+## Gauge 的差值：delta / idelta
+
+`rate` 家族只适用于 Counter。如果你对**可增可减的 Gauge**（如温度、队列长度、内存使用量）求差值，要用 `delta`：
+
+```promql
+# 过去 1 小时内存使用量的变化（可能为负）
+delta(process_resident_memory_bytes[1h])
+
+# 只看最后两个样本点的瞬时变化
+idelta(process_resident_memory_bytes[5m])
+```
+
+`delta(range)` 返回区间内第一个和最后一个样本的**差**，`idelta(range)` 只看最后两个点的差。`delta` 结果可正可负——这点和 `increase`（永远非负）不同。
+
+<Callout type="warn" title="别拿 rate 套 Gauge">
+对 Gauge 用 `rate` 在语法上不会报错，但语义是错的：`rate` 假设数值是「单调递增、会重置」，而 Gauge 会上下波动，算出来的「每秒增长率」毫无意义。看到「温度上升速率」这种需求，正确做法是 `delta` 或直接画原始值。
+</Callout>
+
+## 从 Histogram 算分位数：histogram_quantile
+
+第 5 章讲过，Histogram 暴露的是一堆 `_bucket{le="..."}` 计数器。要还原出「99% 的请求慢于多少毫秒」，靠的就是 `histogram_quantile`：
+
+```promql
+# P99 请求延迟（单位取决于 bucket 的 le 单位，这里是秒）
+histogram_quantile(
+  0.99,
+  rate(http_request_duration_seconds_bucket[5m])
+)
+```
+
+它的两个参数：
+
+1. **分位值** `0.99`：要算第几百分位。
+2. **区间向量**：必须是 `rate(..._bucket[...])` 的结果——即每个 bucket 的**每秒增长速率**。函数内部用相邻 bucket 的速率做**线性插值**，估算出分位数落在哪个区间。
+
+<Callout type="info" title="为什么必须套 rate？">
+`histogram_quantile` 需要的是「各 bucket 的相对权重」，而 `_bucket` 本身是累计 Counter。直接喂 `http_request_duration_seconds_bucket` 得到的是「从历史起点到现在全量累计」的权重，老数据会一直占着比例，分位数就失真了。套一层 `rate(...[5m])` 等于只看「最近 5 分钟」的分布。
+</Callout>
+
+常见陷阱：
+
+- **P99 比 P50 还低？** 多半是 bucket 边界（`le`）设置有问题，或者查询里漏了 `rate` / `sum by (le)`。
+- **分位「掉出去」**：如果所有请求都落在最大 bucket 之外，分位数会被钳在最大 `le` 值，显示为一条直线。需要把最大的 `le` 调到足够大（如 `Inf`）。
+- **多实例要聚合**：`histogram_quantile` 必须在 `le` 维度上 `sum by (le, ...)`，否则每个实例各算各的，结果错乱：
+
+```promql
+# 跨所有实例聚合后算 P99（按 le 和 path 分组）
+histogram_quantile(
+  0.99,
+  sum by (le, path) (
+    rate(http_request_duration_seconds_bucket[5m])
+  )
+)
+```
+
+## 辅助函数：absent / count_values / label_replace / label_join
+
+这几个函数不常出现在主图里，但在告警、排障、标签清洗时非常有用。
+
+**absent —— 判断「某个序列是否不存在」**
+
+```promql
+# 如果 up{job="api"} 一个样本都没有（服务全挂或没上报），返回一条值为 1 的序列
+absent(up{job="api"})
+```
+
+典型用途：告警「目标彻底失联」。配合 `absent()` 可以在指标消失时触发，而非仅在值为 0 时触发。
+
+**count_values —— 按「值」分组计数**
+
+```promql
+# 统计每个「版本号数值」出现了多少次（常用于看实例分布）
+count_values("version", build_info_version)
+```
+
+它把出现的每个唯一值作为一条新时间序列的标签（`version` 是标签名），值是对应的出现次数。适合「有哪些不同取值、各出现几次」的场景。
+
+**label_replace —— 从标签值里提取/重命名标签**
+
+```promql
+# 从 instance 标签 "10.0.0.1:9090" 中提取 IP，写入新标签 ip
+label_replace(up, "ip", "$1", "instance", "(.+):(.+)")
+```
+
+语法：`label_replace(向量, 新标签名, 替换模板, 源标签, 正则)`。模板里的 `$1` `$2` 对应正则捕获组。常用于把 `instance`、`pod` 等含端口/后缀的标签拆出干净字段。
+
+**label_join —— 把多个标签拼接成一个**
+
+```promql
+# 把 namespace 和 pod 两个标签用 "-" 拼成 label 新标签
+label_join(up, "label", "-", "namespace", "pod")
+```
+
+<Callout type="tip" title="label_replace vs label_join">
+一个「拆」一个「合」：`label_replace` 是从**一个**标签里用正则提取并改名；`label_join` 是把**多个**已有标签按分隔符拼到一起。两者都不改变原始数值，只动标签。
+</Callout>
+
+## 聚合与裁剪：topk / bottomk / clamp_max / clamp_min
+
+**topk / bottomk —— 取最大/最小的 N 条序列**
+
+```promql
+# QPS 最高的 5 个接口
+topk(5, rate(http_requests_total[5m]))
+
+# 延迟最高的 5 个实例（配合 histogram_quantile 后取 top）
+topk(5, histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])))
+```
+
+`topk` 在排障时极好用：「到底是哪几个接口/实例把整体拖垮了」。`bottomk` 反之，取最小的 N 条。
+
+<Callout type="info" title="topk 会丢标签上下文">
+`topk(5, ...)` 只保留排名前 5 的序列及其标签，其余的被丢弃。如果你后面还要把它们和其他指标做向量匹配，要小心被丢弃的部分。另外 `topk` 默认是按**每条序列的最后一个样本值**排名的。
+</Callout>
+
+**clamp_max / clamp_min —— 把数值裁到上下限**
+
+```promql
+# 延迟再高也只显示到 2 秒，避免个别极端值把纵轴拉爆
+clamp_max(histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])), 2)
+
+# 缓存命中率最低显示 0%，避免出现负值的怪图
+clamp_min(cache_hit_ratio, 0)
+```
+
+这两个函数单纯把超出边界的值「夹」在边界上，常用于看板美化或防止异常值干扰。
+
+## 区间聚合函数：avg_over_time 等
+
+以 `_over_time` 结尾的函数作用于**单条序列的区间向量**，返回该序列在区间内的某种统计（仍保留标签，不跨序列聚合）：
+
+| 函数 | 含义 |
+| --- | --- |
+| `avg_over_time(v[range])` | 区间内平均值 |
+| `max_over_time` / `min_over_time` | 最大 / 最小值 |
+| `sum_over_time` | 区间内求和 |
+| `count_over_time` | 区间内样本数 |
+| `stddev_over_time` / `quantile_over_time` | 标准差 / 区间分位数 |
+
+```promql
+# 过去 1 小时内存使用量的最高峰（Gauge 直接看峰谷）
+max_over_time(process_resident_memory_bytes[1h])
+
+# 过去 10 分钟 CPU 使用率的平均值
+avg_over_time(rate(process_cpu_seconds_total[5m])[10m:])
+```
+
+<Callout type="tip" title="嵌套区间的写法">
+上例里 `rate(...[5m])[10m:]` 是「先算 5m 速率，再取这串速率在过去 10 分钟的子区间」。`[10m:]` 末尾的冒号表示「步长为默认」的区间切片，这是 PromQL 处理「对速率再求平均」的标准写法。
+</Callout>
+
+## 综合实战：用函数组合出两个关键指标
+
+掌握了上面的函数，生产里最经典的两个指标其实都是「函数组合」出来的。
+
+**① 错误率（错误请求数 / 总请求数）**
+
+假设 `http_requests_total` 带 `code` 标签（如 `code="200"`、`code="500"`）：
+
+```promql
+# 5xx 错误率
+sum(rate(http_requests_total{code=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+思路：分子是 5xx 的速率，分母是总速率，相除得到比率（0~1，乘 100 即百分比）。
+
+**② P99 延迟（Histogram + rate + histogram_quantile）**
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le, path) (
+    rate(http_request_duration_seconds_bucket[5m])
+  )
+)
+```
+
+思路：先 `rate` 取最近 5 分钟各 bucket 的增速，再 `sum by (le, path)` 跨实例聚合，最后 `histogram_quantile` 插值出分位。这条查询几乎是所有「延迟 SLO 看板」的骨架。
+
+<Callout type="info" title="错误率与 P99 几乎是标配">
+在 SRE 实践里，「错误率」「延迟分位数」「流量（QPS）」「饱和度」合称**黄金四指标（Four Golden Signals）**。本章覆盖了其中三个（错误率、延迟、流量）的查询写法；饱和度通常直接用 Gauge 原始值或 `clamp` 后展示。
+</Callout>
+
+## 小结
+
+- 速率用 `rate`（平滑、告警首选），抓尖刺用 `irate`，算总量用 `increase`；三者都只吃区间向量、都只用于 Counter。
+- Gauge 求差值用 `delta` / `idelta`，不要套 `rate`。
+- `histogram_quantile` 必须吃 `rate(..._bucket[...])`，并且要 `sum by (le, ...)` 跨实例聚合。
+- 辅助函数 `absent` / `count_values` / `label_replace` / `label_join` 负责「存在性判断、取值计数、标签拆合」。
+- `topk` / `bottomk` 找极值，`clamp_max` / `clamp_min` 裁异常值，`*_over_time` 对单序列做区间统计。
+- 错误率 = `rate(错误) / rate(总)`，P99 = `histogram_quantile(0.99, rate(bucket))`——记住这两条，就掌握了监控查询的半壁江山。
+
+<Callout type="exercise" title="练习 1：选对函数">
+下面这些需求，分别该用 rate / irate / increase / delta 中的哪一个？
+1. 告警规则：过去 2 分钟 API 平均每秒错误数。
+2. 看板：展示「今天凌晨到现在总共处理了多少订单」（Counter，单位：个）。
+3. 排障：捕捉某个接口延迟的瞬间尖刺。
+4. 看板：过去 1 小时 CPU 使用率（Gauge，百分比）下降了多少个百分点。
+
+<Answer>
+1. `rate(errors_total[2m])` —— 平均每秒，适合告警阈值。
+2. `increase(orders_total[since midnight])` —— 要的是「总增量」而不是每秒速率，用 increase。
+3. `irate(http_request_duration_seconds[5m])` —— 只看最后两点，对尖刺敏感。
+4. `delta(cpu_usage_percent[1h])` —— Gauge 求差值，用 delta（可正可负，这里为负）。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：修复 P99 查询">
+小明写了这条查询，结果 P99 曲线是一条平直的线，且数值等于最大 bucket 的 `le`：
+
+```promql
+histogram_quantile(0.99, http_request_duration_seconds_bucket)
+```
+
+请指出至少两个错误，并写出正确版本。
+
+<Answer>
+错误有两处：
+1. 没有套 `rate(...[5m])`，直接喂了累计 Counter，分位权重被历史累计污染。
+2. 没有 `sum by (le, ...)` 跨实例聚合，多实例时每个实例各算各的，结果错乱；同时若曲线平直等于最大 le，说明请求都落到了最大 bucket 之外（le 设置过小）。
+
+正确版本：
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le, path) (
+    rate(http_request_duration_seconds_bucket[5m])
+  )
+)
+```
+另外要把最大 `le` 调到足够大（含 `Inf`）以覆盖长尾请求。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：错误率查询">
+你的 `http_requests_total` 带 `code` 标签，取值如 `"200"`、`"404"`、`"500"`。请写出「整体错误率」的查询（4xx + 5xx 都算错误）。
+
+<Answer>
+```promql
+sum(rate(http_requests_total{code=~"4..|5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+分子用正则匹配 4xx 和 5xx 的速率并求和，分母是所有状态码的总速率。结果在 0~1 之间，乘 100 即百分比错误率。若想按 `path` 分别看，可改成 `sum by (path)(...) / sum by (path)(...)`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 4：标签清洗与极值定位">
+1. `instance` 标签值为 `"10.0.0.3:9090"`，请用 `label_replace` 提取纯 IP 到新标签 `ip`。
+2. 要快速找出「当前 QPS 最高的 3 个接口路径」该用什么函数？写出查询骨架。
+
+<Answer>
+1.
+```promql
+label_replace(up, "ip", "$1", "instance", "(.+):(.+)")
+```
+正则把 `instance` 拆成「IP:端口」两个捕获组，`$1` 取 IP 写入新标签 `ip`。
+
+2. 用 `topk`：
+```promql
+topk(3, sum by (path) (rate(http_requests_total[5m])))
+```
+先按 `path` 聚合各接口 QPS，再取前 3 高。
+</Answer>
+</Callout>

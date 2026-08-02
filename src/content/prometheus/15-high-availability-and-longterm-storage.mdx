@@ -1,0 +1,994 @@
+---
+title: 高可用与长期存储
+order: 15
+description: 双副本高可用、remote_write 远程存储，以及 Thanos、Cortex、Mimir 的选型对比
+---
+
+# 高可用与长期存储
+
+上一章结尾我们留下了三个联邦解决不了的问题：**高可用**、**长期存储**、**全局明细查询**。这一章就来正面回答它们。
+
+需要先说清楚一件事：Prometheus 的设计哲学是「**每个实例都是独立、自包含、无依赖的**」。它故意不做集群、不做数据复制、不做分布式共识——因为监控系统最重要的属性是**在别的东西都挂了的时候它还活着**，而分布式系统会引入一堆新的失败模式。所以 Prometheus 的高可用不是「让一个集群变得可靠」，而是「**跑两个互不相干的实例，用外围组件处理重复**」。这个思路一开始会让人觉得粗糙，但用久了你会发现它简单得可爱。
+
+至于长期存储，Prometheus 的做法是**把这件事外包出去**：本地 TSDB 只负责最近几天到几周的数据，更久的数据通过 `remote_write` 推给专门的系统。围绕这个接口，社区长出了 Thanos、Cortex、Mimir、VictoriaMetrics 等一整个生态。
+
+读完本章你会掌握：
+
+- 本地 TSDB 的存储结构、`--storage.tsdb.retention.time` 与 `--storage.tsdb.retention.size` 的行为
+- 双副本高可用的完整做法，以及为什么必须用 `alert_relabel_configs` 处理 `replica` 标签
+- Alertmanager 集群的 gossip 去重机制，以及为什么**不能**把 Alertmanager 放在负载均衡后面
+- `remote_write` 的分片队列模型、`queue_config` 调优与 `write_relabel_configs` 过滤
+- Thanos 各组件（Sidecar / Query / Store / Compact / Receive）的职责与部署要点
+- Cortex 与 Mimir 的关系、架构差异，以及三套方案按规模的选型建议
+
+## 一、先搞清楚本地存储的边界
+
+在谈「长期存储」之前，得先知道「短期存储」的能力到底在哪里。
+
+### TSDB 的物理结构
+
+Prometheus 的数据目录（默认 `data/`，用 `--storage.tsdb.path` 修改）大致长这样：
+
+```text
+data/
+├── 01HXYZ.../             # 一个持久化块（block）
+│   ├── chunks/
+│   │   └── 000001         # 实际的样本数据，单文件最大 512MB
+│   ├── index              # 倒排索引，标签到序列的映射
+│   ├── meta.json          # 块的元信息：时间范围、序列数、压缩层级
+│   └── tombstones         # 删除标记
+├── 01HXZA.../
+├── chunks_head/           # 内存中 head 块已落盘的部分
+├── wal/                   # 预写日志
+│   ├── 00000001
+│   ├── 00000002
+│   └── checkpoint.000001/
+└── lock
+```
+
+工作方式是这样的：新到达的样本先写进**内存中的 head 块**，同时追加到 **WAL**（预写日志）保证崩溃后能恢复。每隔 **2 小时**，head 块被持久化成一个磁盘上的 block 并清空 WAL。后台的 compaction 会把相邻的小 block 逐步合并成更大的 block（最大不超过保留期的 10% 或 31 天，取较小者），合并过程中会删掉过期数据。
+
+理解这个结构很重要，因为它解释了很多现象：为什么 Prometheus 重启后要花一段时间「replaying WAL」；为什么内存占用和「活跃序列数」强相关；为什么删除数据不是立刻生效的（要等下一次 compaction）。
+
+### 保留期怎么配
+
+```bash
+./prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --storage.tsdb.retention.size=400GB
+```
+
+规则如下：
+
+- `--storage.tsdb.retention.time` 控制**按时间**保留，支持 `s` / `m` / `h` / `d` / `w` / `y` 单位。
+- `--storage.tsdb.retention.size` 控制**按磁盘大小**保留，支持 `B` / `KB` / `MB` / `GB` / `TB` / `PB` 单位（也接受 `KiB` 这类二进制单位）。
+- 两个都设置时，**任意一个条件被触发就会删除最老的块**，相当于取更严格的那个。
+- 两个都不设置时，默认按 **15 天**保留。
+- **只设置 size 不设置 time 时，时间维度的保留就被关闭了**，只按容量淘汰。这一点经常被误解。
+
+<Callout type="warn" title="旧的 --storage.tsdb.retention 已经被移除">
+早期版本里有一个不带后缀的 `--storage.tsdb.retention` 参数，它在 2.x 中被标记为废弃，在 **Prometheus 3.0 中已被彻底移除**。如果你的启动脚本或 systemd unit 文件里还写着它，升级到 3.x 后 Prometheus 会直接启动失败。
+
+升级前记得全局搜一遍这个字符串，改成 `--storage.tsdb.retention.time`。
+</Callout>
+
+### 单机能撑多大
+
+给一个粗略的量级感受（具体数值和硬件、指标特征关系很大，仅供估算）：
+
+| 活跃序列数 | 大致内存需求 | 备注 |
+| --- | --- | --- |
+| 10 万 | 2 到 4 GB | 小团队，随便一台机器 |
+| 100 万 | 8 到 16 GB | 中等规模，需要认真规划 |
+| 500 万 | 32 到 64 GB | 接近舒适区上限 |
+| 1000 万以上 | 需要分片 | 单机可以跑但风险很高 |
+
+磁盘方面，一个样本压缩后平均占用 **1 到 2 字节**。用这个数可以估算：100 万活跃序列、15 秒采集间隔、保留 30 天，大约需要 `1e6 × (30×24×3600/15) × 1.5B`，约等于 260 GB。
+
+当单机撑不住时，你的选项是：**先做垂直优化**（降低采集频率、用 `metric_relabel_configs` 丢掉高基数指标、治理标签），**再做水平分片**（上一章讲过的 `hashmod`，或者按业务拆多个 Prometheus），**最后才上远程存储**。远程存储解决的是「存多久」和「怎么全局查」，它并不能减轻单个 Prometheus 的抓取压力。
+
+## 二、高可用：双副本 + 去重
+
+### 基本做法
+
+Prometheus 的高可用方案简单到只有一句话：**跑两台配置完全相同的实例，让它们各自独立抓取同一批目标。**
+
+副本 A 的配置：
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'prod-bj'
+    replica: 'A'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager-1:9093'
+            - 'alertmanager-2:9093'
+            - 'alertmanager-3:9093'
+```
+
+副本 B 的配置**只有一处不同**：
+
+```yaml
+global:
+  external_labels:
+    cluster: 'prod-bj'
+    replica: 'B'
+```
+
+其余的 `scrape_configs`、`rule_files` 全部一模一样。两台机器完全对等，没有主从、没有选举、没有数据同步，谁挂了另一台照常工作。
+
+<Callout type="info" title="两个副本的数据不会逐点一致">
+这是必须接受的事实。两台实例的抓取时刻是独立调度的，A 可能在 `10:00:03` 抓，B 在 `10:00:11` 抓。所以：
+
+- 同一时刻两边的样本值会有细微差异（尤其是 Gauge）。
+- 如果查询请求在两个副本之间随机切换，Grafana 图上会出现**数值跳变**。
+- 某个副本重启期间会有数据空洞，另一个副本没有——两边的空洞位置不同。
+
+这不是 bug，是设计权衡的结果：**用少量的数据不一致换取了架构上的极度简单**。绝大多数监控场景里，几秒钟的采集偏移完全无所谓。
+</Callout>
+
+### 查询侧的处理
+
+查询侧有三种选择，复杂度递增：
+
+**方案一：负载均衡 + 会话保持。** 在两个副本前面放一个 nginx 或 HAProxy，开启 sticky session（比如按源 IP 哈希）。这样同一个用户的查询总是落到同一个副本，避免图上跳变。缺点是副本切换时（比如 A 重启）用户会看到数据不连续。
+
+```text
+upstream prometheus {
+    ip_hash;
+    server prom-a:9090;
+    server prom-b:9090;
+}
+```
+
+**方案二：主动指定。** Grafana 里配两个数据源，日常用 A，A 挂了手动切 B。简单粗暴但需要人工介入。
+
+**方案三：Thanos Query 去重。** Thanos Query 同时连接两个副本，用 `--query.replica-label=replica` 告诉它「`replica` 这个标签是副本标识」。查询时它会把 `replica="A"` 和 `replica="B"` 的同名序列合并，**优先取数据更完整的那一条**，从而输出一条无空洞、无跳变的序列。这是最优雅的方案，代价是要引入 Thanos。
+
+### 告警侧的处理：这里有个大坑
+
+两个副本都在独立评估告警规则，都会往 Alertmanager 发告警。如果不做处理，你会收到**两份一模一样的告警通知**。
+
+很多人以为「Alertmanager 会自动去重啊」——它确实会，但去重的判断依据是**告警的标签集完全相同**。而我们刚刚给两个副本打了 `replica: A` 和 `replica: B` 的 `external_labels`，这些标签会附加到告警上，导致两条告警的标签集**不相同**，Alertmanager 认为它们是两个不同的告警，于是各发一遍。
+
+解决办法是用 `alert_relabel_configs`，在**发送给 Alertmanager 之前**把 `replica` 标签删掉：
+
+```yaml
+alerting:
+  alert_relabel_configs:
+    # 发给 Alertmanager 前去掉副本标识，让两个副本的告警标签集一致
+    - regex: 'replica'
+      action: labeldrop
+
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager-1:9093'
+            - 'alertmanager-2:9093'
+            - 'alertmanager-3:9093'
+```
+
+这样副本 A 和副本 B 发出的告警标签集完全相同，Alertmanager 的去重机制才能生效，最终只发出一条通知。
+
+<Callout type="warn" title="alert_relabel_configs 只影响告警，不影响存储">
+`alert_relabel_configs` 处理的是「即将发往 Alertmanager 的告警」，它**不会**改变本地存储里的时间序列。所以你的 TSDB 里、Thanos 里，`replica` 标签依然存在，Thanos Query 的去重也依然能正常工作。两者互不干扰。
+</Callout>
+
+<Callout type="exercise" title="练习 1：排查重复告警">
+某团队部署了双副本 Prometheus，配置如下（两台只有 `replica` 值不同）：
+
+```yaml
+global:
+  external_labels:
+    cluster: 'prod'
+    replica: 'A'
+    prometheus_host: 'prom-a.internal'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager-lb:9093']
+```
+
+上线后出现两个现象：（1）每次故障都收到 2 条一模一样的钉钉通知；（2）某次 Alertmanager 实例 2 重启后，有几条告警发了 3 遍。
+
+请分析两个现象的原因并给出修正配置。
+
+<Answer>
+**现象 1：重复通知，两个原因叠加。**
+
+第一个原因是 `replica` 标签没有在发送前剥离，导致两个副本的告警标签集不同，Alertmanager 无法识别为同一告警。
+
+第二个、也是更隐蔽的原因是 `prometheus_host: 'prom-a.internal'` 这个 `external_labels`。**它对每台机器都是不同的值**，即使你删掉了 `replica`，这个标签依然会让两条告警的标签集不一致。这类「带主机名/IP 的 external_labels」是重复告警最常见的隐藏元凶。
+
+**原则：任何在两个副本之间取值不同的 `external_labels`，都必须在 `alert_relabel_configs` 里剥离。** 反过来说，`external_labels` 里应该只放「标识这批数据属于哪个逻辑集群」的信息（如 `cluster`、`region`、`env`），副本级别的标识只放 `replica` 一个，剥离起来最省事。
+
+**现象 2：Alertmanager 放在负载均衡后面了。**
+
+`targets: ['alertmanager-lb:9093']` 说明 Prometheus 只知道一个 LB 地址。这是**错误**的部署方式。
+
+Alertmanager 集群的去重依赖 gossip 协议同步「通知日志」（nflog）：某个实例发出通知后，会把「我已经通知过这条告警了」广播给其他实例，其他实例收到相同告警时就不再重复发送。这个机制的**前提是每个 Alertmanager 实例都收到了这条告警**——它们需要看到相同的输入才能协同去重。
+
+如果放在 LB 后面，每条告警只会随机到达其中一个实例，gossip 的去重逻辑失去了输入基础。更糟的是集群状态同步会出现偏差，实例重启后重新加入集群、状态尚未收敛的窗口期内，就会出现「发 3 遍」这种现象。
+
+**正确做法是让 Prometheus 把告警发给集群里的每一个 Alertmanager 实例，由 Alertmanager 自己负责去重。** 这是官方明确推荐的方式，看起来像是「故意制造重复」，但恰恰是可靠去重的前提。
+
+**修正后的配置：**
+
+```yaml
+global:
+  external_labels:
+    cluster: 'prod'
+    replica: 'A'
+    # prometheus_host 删掉；如果确实需要，也必须在下面剥离
+
+alerting:
+  alert_relabel_configs:
+    - regex: 'replica'
+      action: labeldrop
+
+  alertmanagers:
+    - static_configs:
+        # 列出所有实例，不要用 LB
+        - targets:
+            - 'alertmanager-1:9093'
+            - 'alertmanager-2:9093'
+            - 'alertmanager-3:9093'
+```
+
+Alertmanager 侧的集群启动参数：
+
+```bash
+# 实例 1
+./alertmanager \
+  --config.file=alertmanager.yml \
+  --cluster.listen-address=0.0.0.0:9094 \
+  --cluster.peer=alertmanager-2:9094 \
+  --cluster.peer=alertmanager-3:9094
+```
+
+其余实例同理，把 `--cluster.peer` 指向另外两台即可。
+</Answer>
+</Callout>
+
+## 三、Alertmanager 的高可用细节
+
+既然上面已经提到了，就把 Alertmanager 集群讲完整。
+
+Alertmanager 用 gossip 协议（基于 HashiCorp memberlist）组成集群，**没有 leader、没有共识算法**。集群内同步两类状态：
+
+- **Silences（静默规则）**：你在任意一个实例上创建的静默，会广播到所有实例。
+- **Notification Log（nflog）**：「哪条告警在什么时候已经通知过了」的记录，这是去重的核心。
+
+去重的实际流程是：告警到达所有实例后各自开始计时（`group_wait`），但每个实例会根据自己在集群成员列表里的**位置序号**额外等待一段时间（大约 `位置序号 × 15 秒`）。排在第一位的实例最先发出通知并广播 nflog；排在后面的实例在轮到自己时先查 nflog，发现「已经发过了」就跳过。
+
+这个机制有几个实践含义：
+
+- **集群规模建议 3 个实例。** 2 个也能工作但没有冗余余量，超过 3 个只会增加末位实例的通知延迟。
+- **通知会有额外延迟。** 如果第一个实例卡住了，第二个实例要等 15 秒左右才会接手。这是可靠性的代价。
+- **静默的生效有传播延迟。** 刚创建的静默需要几秒才能同步到所有实例，极端情况下可能漏掉一条已经在发送途中的通知。
+- **网络分区会导致重复通知。** 如果集群被网络分区切成两半，两边都会认为自己该发通知。这是 gossip 系统的固有取舍：**宁可重复通知，不可漏发通知**。
+
+<Callout type="tip" title="Alertmanager 自己也要被监控">
+Alertmanager 挂了是最危险的故障之一——所有告警都发不出去，而且没有任何东西会告诉你。务必加上这几条规则（放在 Prometheus 侧）：
+
+```promql
+# Alertmanager 实例宕机
+up{job="alertmanager"} == 0
+
+# 集群成员数不足
+alertmanager_cluster_members < 3
+
+# 通知发送失败
+rate(alertmanager_notifications_failed_total[5m]) > 0
+```
+
+再进一步，很多团队会配一条永远处于 firing 状态的「心跳告警」（Watchdog），路由到一个外部的 dead man's switch 服务。只要那个服务超过 5 分钟没收到心跳，就说明整条告警链路断了。
+</Callout>
+
+<Callout type="exercise" title="练习 2：设计一套完整的双副本告警链路">
+你要为一个生产集群搭建高可用监控。要求：
+
+1. Prometheus 双副本，任意一台宕机不影响告警和查询
+2. Alertmanager 三副本，不重复通知
+3. 有办法发现「整条告警链路失效」
+4. Grafana 查询时不出现数据跳变
+
+请写出关键配置，并说明每一处的作用。
+
+<Answer>
+**第一部分：Prometheus 双副本配置**
+
+副本 A（副本 B 只改 `replica` 的值）：
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'prod-bj'
+    replica: 'A'
+
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
+
+alerting:
+  alert_relabel_configs:
+    # 关键：剥离副本标识，让两副本的告警标签集一致
+    - regex: 'replica'
+      action: labeldrop
+  alertmanagers:
+    - static_configs:
+        # 关键：列出全部实例，不能用 LB
+        - targets:
+            - 'am-1:9093'
+            - 'am-2:9093'
+            - 'am-3:9093'
+
+scrape_configs:
+  # 两个副本的 scrape_configs 必须完全相同
+  - job_name: 'node'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/node/*.json']
+
+  # 互相监控：A 抓 B，B 抓 A，加上抓自己
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['prom-a:9090', 'prom-b:9090']
+
+  - job_name: 'alertmanager'
+    static_configs:
+      - targets: ['am-1:9093', 'am-2:9093', 'am-3:9093']
+```
+
+「互相监控」这一步很重要：只有 A 在抓 B，才能在 B 挂掉时由 A 发出告警。
+
+**第二部分：Alertmanager 三副本**
+
+```bash
+# am-1
+./alertmanager --config.file=am.yml \
+  --cluster.listen-address=0.0.0.0:9094 \
+  --cluster.peer=am-2:9094 --cluster.peer=am-3:9094
+
+# am-2
+./alertmanager --config.file=am.yml \
+  --cluster.listen-address=0.0.0.0:9094 \
+  --cluster.peer=am-1:9094 --cluster.peer=am-3:9094
+
+# am-3
+./alertmanager --config.file=am.yml \
+  --cluster.listen-address=0.0.0.0:9094 \
+  --cluster.peer=am-1:9094 --cluster.peer=am-2:9094
+```
+
+三个实例的 `am.yml` 内容必须完全一致（路由树、接收器、抑制规则）。
+
+**第三部分：监控告警链路本身**
+
+```yaml
+groups:
+  - name: meta-monitoring
+    rules:
+      # 对端 Prometheus 宕机
+      - alert: PrometheusReplicaDown
+        expr: 'up{job="prometheus"} == 0'
+        for: 3m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: 'Prometheus 副本 {{ $labels.instance }} 宕机'
+
+      # Alertmanager 宕机
+      - alert: AlertmanagerDown
+        expr: 'up{job="alertmanager"} == 0'
+        for: 3m
+        labels:
+          severity: 'critical'
+
+      # 集群成员不足 3 个，说明有实例脱离了集群
+      - alert: AlertmanagerClusterDegraded
+        expr: 'alertmanager_cluster_members < 3'
+        for: 5m
+        labels:
+          severity: 'warning'
+
+      # 通知发送失败（钉钉/邮件/webhook 出问题）
+      - alert: AlertmanagerNotificationsFailing
+        expr: 'rate(alertmanager_notifications_failed_total[5m]) > 0'
+        for: 5m
+        labels:
+          severity: 'critical'
+
+      # Prometheus 规则评估落后，说明负载过重
+      - alert: PrometheusRuleEvaluationSlow
+        expr: |
+          rate(prometheus_rule_group_last_duration_seconds[5m])
+          > rate(prometheus_rule_group_interval_seconds[5m])
+        for: 10m
+        labels:
+          severity: 'warning'
+
+      # 心跳告警：永远 firing，路由到外部 dead man's switch
+      - alert: Watchdog
+        expr: 'vector(1)'
+        labels:
+          severity: 'none'
+        annotations:
+          summary: '此告警始终触发，用于验证告警链路可用'
+```
+
+Alertmanager 里把 Watchdog 单独路由出去：
+
+```yaml
+route:
+  receiver: 'default'
+  routes:
+    - matchers:
+        - alertname = "Watchdog"
+      receiver: 'deadmansswitch'
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1m
+```
+
+这条链路的巧妙之处在于：它把「没有告警」这个无法被观测的状态，转换成了「外部服务没收到心跳」这个可以被观测的状态。**监控系统自己出故障时，是不可能靠自己发出告警的**，必须借助一个外部观察者。
+
+**第四部分：查询侧防跳变**
+
+最简单的做法是 nginx 加会话保持：
+
+```text
+upstream prometheus {
+    ip_hash;
+    server prom-a:9090 max_fails=3 fail_timeout=30s;
+    server prom-b:9090 max_fails=3 fail_timeout=30s;
+}
+
+server {
+    listen 9090;
+    location / {
+        proxy_pass http://prometheus;
+    }
+}
+```
+
+`ip_hash` 保证同一个用户始终落到同一个副本，避免刷新页面时数值跳变。更彻底的方案是引入 Thanos Query，用 `--query.replica-label=replica` 做真正的副本合并去重，同时还顺便解决了长期存储的接入问题——这就引出了下一节。
+</Answer>
+</Callout>
+
+## 四、remote_write 与 remote_read
+
+### remote_write 的工作原理
+
+`remote_write` 是 Prometheus 对接外部存储的标准接口。它的数据流是：
+
+**样本进入 head 块 → 同时写入 WAL → remote_write 组件读取 WAL → 按序列哈希分配到若干个分片队列 → 每个分片攒够一批就用 protobuf + snappy 压缩后 POST 给远端。**
+
+这里有几个设计要点值得注意：
+
+- **基于 WAL 而不是内存。** 这意味着远端短暂不可用时，数据不会丢——Prometheus 会在 WAL 里保留读取位置，恢复后继续从断点发送。但 WAL 本身有保留期，远端挂太久（通常超过 2 小时）还是会丢数据。
+- **分片是动态的。** Prometheus 会根据「样本积压量」和「远端响应速度」自动调整分片数量，在 `min_shards` 和 `max_shards` 之间伸缩。
+- **它是异步的。** 抓取和远程写入是解耦的，远端慢不会阻塞抓取。
+
+配置示例：
+
+```yaml
+remote_write:
+  - url: 'https://thanos-receive.internal/api/v1/receive'
+    name: 'thanos'
+
+    # 认证
+    basic_auth:
+      username: 'prometheus'
+      password_file: '/etc/prometheus/remote_write_password'
+
+    # 只把需要长期保存的指标写出去
+    write_relabel_configs:
+      # 丢弃 Go runtime 这类噪音指标
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*'
+        action: drop
+      # 丢弃已知的高基数指标
+      - source_labels: [__name__]
+        regex: 'apiserver_request_duration_seconds_bucket'
+        action: drop
+
+    queue_config:
+      capacity: 10000            # 每个分片的内存队列容量
+      max_shards: 50             # 分片数上限
+      min_shards: 1              # 分片数下限
+      max_samples_per_send: 2000 # 每次请求带多少样本
+      batch_send_deadline: 5s    # 攒不满一批时最长等待
+      min_backoff: 30ms          # 失败重试的最小退避
+      max_backoff: 5s            # 失败重试的最大退避
+```
+
+<Callout type="tip" title="write_relabel_configs 是省钱的关键">
+如果你用的是按数据量计费的托管服务（Grafana Cloud、各家云厂商的托管 Prometheus），`write_relabel_configs` 直接决定了你的账单。
+
+实践中通常能砍掉一半以上的数据量：`go_*` 和 `process_*` 这类运行时指标几乎没人看；`*_bucket` 这类 Histogram 序列数量巨大但只有少数几个真的会被查；很多 exporter 会暴露上百个默认指标而你只用其中几个。
+
+比 `drop` 更激进的做法是反过来用 `keep`——**只把明确需要的指标写出去**：
+
+```yaml
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: '(job|service|cluster):.*|up|http_requests_total|node_.*'
+        action: keep
+```
+
+白名单的维护成本更高，但对成本的控制力也强得多。
+</Callout>
+
+### 队列积压怎么排查
+
+`remote_write` 出问题时最典型的症状是「远端数据落后于本地」。看这几个指标：
+
+```promql
+# 积压程度：最新采集的样本时间 与 已成功发送的样本时间 之差（秒）
+prometheus_remote_storage_highest_timestamp_in_seconds
+  - ignoring(remote_name, url)
+    prometheus_remote_storage_queue_highest_sent_timestamp_seconds
+
+# 分片数是否已经打满上限
+prometheus_remote_storage_shards
+  / prometheus_remote_storage_shards_max
+
+# 发送失败速率
+rate(prometheus_remote_storage_samples_failed_total[5m])
+
+# 因队列满而被丢弃的样本
+rate(prometheus_remote_storage_samples_dropped_total[5m])
+```
+
+第一个查询给出的「落后秒数」是最直观的健康指标。持续超过 60 秒就该介入了：先看是不是远端太慢（看响应延迟），再考虑调大 `max_shards` 和 `max_samples_per_send`，或者用 `write_relabel_configs` 减少数据量。
+
+### Remote Write 2.0
+
+Prometheus 3.0 引入了 Remote Write 协议的 2.0 版本，主要改进是：用字符串表（string interning）显著降低了重复标签的传输体积；原生支持传输**元数据**（HELP / TYPE / UNIT）、**exemplars** 和**创建时间戳**；对原生直方图（native histograms）有一等支持。
+
+配置上通过 `protobuf_message` 指定版本：
+
+```yaml
+remote_write:
+  - url: 'https://mimir.internal/api/v1/push'
+    protobuf_message: 'io.prometheus.write.v2.Request'
+```
+
+客户端和服务端会通过 HTTP 头协商版本，远端不支持 2.0 时可以回落到 1.0。除非你的后端明确支持，否则暂时保持默认（1.0）更稳妥。
+
+### remote_read 及其局限
+
+`remote_read` 是反方向的接口：让 Prometheus 在执行查询时，把请求也发一份给远端存储，然后把结果和本地数据合并。
+
+```yaml
+remote_read:
+  - url: 'https://remote-storage.internal/api/v1/read'
+    # 只有匹配这些标签的查询才走远端，避免每次查询都打扰远端
+    required_matchers:
+      cluster: 'prod-bj'
+    # false 表示「本地已有的时间范围就不查远端了」
+    read_recent: false
+```
+
+说实话，**`remote_read` 在生产里用得很少**，原因有三：
+
+1. **性能差。** 它需要把远端的原始样本全部传回本地，再由本地的 PromQL 引擎计算。查询一个月的数据可能要传输几百 MB，还没有任何下推优化。
+2. **没有全局视图。** 它只能让「这一个 Prometheus」看到更长的历史，别的实例的数据依然看不到。
+3. **有更好的替代。** Thanos Query、Mimir、VictoriaMetrics 都提供了自己的 PromQL 查询端点，Grafana 直接连它们就行，计算在存储侧完成，效率高得多。
+
+<Callout type="info" title="实践建议">
+**用 `remote_write` 把数据送出去，然后直接查远端存储的查询端点。** 不要试图让 Prometheus 通过 `remote_read` 充当一个「统一查询入口」，那不是它擅长的角色。
+</Callout>
+
+<Callout type="exercise" title="练习 3：调优一个积压的 remote_write">
+线上告警显示远程写入持续落后 20 分钟。你查到以下数据：
+
+```text
+prometheus_remote_storage_shards          = 200
+prometheus_remote_storage_shards_max      = 200
+prometheus_remote_storage_samples_pending = 1800000
+远端接口 P99 响应时间                       = 3.2s
+Prometheus 每秒产生样本数                   = 150000
+写出的指标里，go_* 和 *_bucket 占了 62%
+```
+
+请分析瓶颈并给出至少三个改进方向，写出具体配置。
+
+<Answer>
+**瓶颈分析**
+
+关键信号是 `shards` 已经等于 `shards_max`（200 = 200），说明 Prometheus 想再加分片但被上限卡住了，**分片数已经打满**。同时远端 P99 响应 3.2 秒是非常慢的——正常应该在几十到几百毫秒。
+
+做一个吞吐量估算：每个分片同时只有一个在途请求，每次请求带 `max_samples_per_send`（假设默认 2000）个样本，耗时 3.2 秒。那么单分片吞吐约 `2000 / 3.2 ≈ 625` 样本/秒，200 个分片总共约 12.5 万样本/秒。而 Prometheus 每秒产生 15 万样本——**产出大于发出，必然持续积压**。
+
+所以根因是「远端太慢」，表现是「分片打满」。三个方向：减少要发的量、提高单次发送效率、提高并发。
+
+**改进方向一：用 write_relabel_configs 砍掉 62% 的数据（收益最大，优先做）**
+
+```yaml
+remote_write:
+  - url: 'https://remote-storage.internal/api/v1/write'
+    write_relabel_configs:
+      # 丢掉 Go runtime 与进程指标
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*|promhttp_.*'
+        action: drop
+
+      # Histogram 的 bucket 序列数量巨大，只保留真正会被查的
+      - source_labels: [__name__]
+        regex: '.*_bucket'
+        action: drop
+      # 但保留核心接口的延迟直方图
+      - source_labels: [__name__]
+        regex: 'http_request_duration_seconds_bucket'
+        action: keep
+```
+
+注意上面 `drop` 后再 `keep` 的写法是**错的**——relabel 是顺序执行的，前面 drop 掉之后就没了。正确写法是用一条规则精确表达：
+
+```yaml
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*|promhttp_.*'
+        action: drop
+      # 丢弃除白名单之外的所有 bucket
+      - source_labels: [__name__]
+        regex: '(?:(?!http_request_duration_seconds).)*_bucket'
+        action: drop
+```
+
+如果负向前瞻的正则不好维护（Prometheus 用的 RE2 引擎**不支持**负向前瞻），更实际的做法是明确列出要丢弃的 bucket 指标名：
+
+```yaml
+      - source_labels: [__name__]
+        regex: '(apiserver_request_duration_seconds|grpc_server_handling_seconds|etcd_disk_.*)_bucket'
+        action: drop
+```
+
+砍掉 62% 后，每秒样本数从 15 万降到约 5.7 万，已经低于现有的 12.5 万吞吐上限，积压会自然消化。
+
+**改进方向二：调整 queue_config 提高吞吐**
+
+```yaml
+    queue_config:
+      # 分片上限翻倍，给动态伸缩留空间
+      max_shards: 500
+      # 每次多带一些样本，摊薄 3.2 秒的往返开销
+      max_samples_per_send: 5000
+      # 队列容量相应放大（建议是 max_samples_per_send 的若干倍）
+      capacity: 25000
+      # 攒批时间放宽，减少小请求
+      batch_send_deadline: 10s
+```
+
+把 `max_samples_per_send` 从 2000 提到 5000，单分片吞吐从 625 提到约 1560 样本/秒，同样的分片数吞吐提升 2.5 倍。这是应对高延迟远端最有效的旋钮——**当往返延迟高时，增大批量比增加并发更划算**。
+
+<Callout type="warn" title="别无脑调大 max_shards">
+分片数直接对应并发的 HTTP 连接数和内存占用（每个分片都有自己的队列）。`max_shards: 500` 配合 `capacity: 25000` 意味着最坏情况下要缓存 1250 万个样本，内存可能涨好几个 GB。而且 500 个并发请求可能直接把远端压垮，让 P99 变得更慢，形成恶性循环。
+
+调 `max_shards` 之前先确认远端能扛住。
+</Callout>
+
+**改进方向三：解决远端本身的性能问题（治本）**
+
+3.2 秒的 P99 是不正常的，这才是根因。需要去远端查：是不是接收节点数量不够、是不是对象存储写入慢、是不是有热点租户、是不是网络带宽打满。前两个方向都是在「适应一个有病的远端」，只有这个方向是真正的修复。
+
+**改进方向四（补充）：降低样本产生速率**
+
+如果上面都做了还是不够，就要回到源头：把非核心 job 的 `scrape_interval` 从 15 秒放宽到 30 或 60 秒，或者用 `metric_relabel_configs` 在入库阶段就丢掉高基数指标（这样连本地存储也一起省了）。
+
+**执行顺序建议：** 方向一（立竿见影、零风险）→ 方向二（快速缓解）→ 方向三（治本，但需要另一个团队配合）→ 方向四（有损，最后考虑）。
+</Answer>
+</Callout>
+
+## 五、长期存储方案对比
+
+现在进入选型环节。三个主流方案的定位差异其实很清晰。
+
+### Thanos
+
+Thanos 的核心思路是「**给现有的 Prometheus 加装扩展件，数据放对象存储**」。它不要求你改变现有部署，只是在每个 Prometheus 旁边贴一个 sidecar。
+
+| 组件 | 一句话职责 |
+| --- | --- |
+| **Sidecar** | 和 Prometheus 同 Pod 部署，把 2 小时 block 上传到对象存储，并通过 StoreAPI 暴露 Prometheus 本地的近期数据 |
+| **Query** | 无状态查询层，实现 PromQL，向所有 StoreAPI 扇出查询并合并结果，负责副本去重 |
+| **Store Gateway** | 把对象存储里的历史 block 通过 StoreAPI 暴露出来，本地只缓存索引头 |
+| **Compact** | 对对象存储里的 block 做压缩、**降采样**（5 分钟和 1 小时两级）、按分辨率应用保留策略 |
+| **Ruler** | 在全局数据上评估 recording rules 和告警规则 |
+| **Receive** | 接收 `remote_write` 推送，为「不方便部署 sidecar」的场景提供推模式入口 |
+| **Query Frontend** | 查询拆分与结果缓存，加速大跨度查询 |
+
+一个最小可用的 Thanos 部署长这样：
+
+```text
+   Prometheus A ──┐                        ┌── Store Gateway ──┐
+   + Sidecar      │                        │                   │
+                  ├── Thanos Query ────────┤                   ├── 对象存储
+   Prometheus B ──┤     (去重)              │                   │   (S3/GCS/COS)
+   + Sidecar      │                        └── Compact ────────┘
+                  │                             (降采样)
+                  └── Grafana 连这里
+```
+
+**部署 Thanos Sidecar 时，Prometheus 的启动参数必须改：**
+
+```bash
+./prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=2d \
+  --storage.tsdb.min-block-duration=2h \
+  --storage.tsdb.max-block-duration=2h \
+  --web.enable-lifecycle
+```
+
+<Callout type="warn" title="min-block-duration 和 max-block-duration 必须都设成 2h">
+这是 Thanos Sidecar 的**硬性要求**，原因是：Prometheus 默认会做本地 compaction，把小 block 合并成大 block。如果 sidecar 正在上传一个 block，而 Prometheus 同时把它合并掉了，就会产生数据损坏或上传失败。
+
+把两个参数都设成 `2h` 等于**禁用本地 compaction**，让 Thanos Compact 在对象存储侧统一负责压缩和降采样。
+
+同时，本地 `retention.time` 要留够**至少 6 小时**（推荐 2 天），给 sidecar 足够的时间完成上传，也给对象存储或网络出故障时留出缓冲。设成 `2h` 或更短是危险的——block 还没传完就被删了，数据就永久丢失了。
+</Callout>
+
+Thanos 的**降采样**是它相对于「简单堆磁盘」的最大优势。Compact 会为每个 block 额外生成 5 分钟和 1 小时分辨率的版本，查询时 Thanos Query 根据请求的时间跨度自动选择合适的分辨率。查一年的趋势图时用 1 小时分辨率，数据量是原始数据的几百分之一，查询秒开。
+
+<Callout type="warn" title="Thanos Compact 必须是单例">
+同一个对象存储 bucket **只能有一个 Compact 实例**在运行。两个实例同时对同一批 block 做压缩会互相覆盖元数据，造成数据损坏，而且这种损坏很难修复。
+
+如果用 Kubernetes 部署，务必用 `replicas: 1` 的 StatefulSet 或 Deployment，并且确认滚动更新策略是 `Recreate` 而不是 `RollingUpdate`——后者会短暂出现两个实例并存。
+</Callout>
+
+### Cortex
+
+Cortex 走的是完全不同的路线：**它是一个多租户的、水平扩展的、推模式的时序数据库**，Prometheus 通过 `remote_write` 把数据推给它。
+
+架构是典型的微服务拆分：
+
+- **Distributor**：接收 `remote_write` 请求，校验后按序列哈希分发给多个 Ingester（默认写 3 副本）。
+- **Ingester**：在内存里构建 TSDB head 块，定期刷成 block 上传到对象存储。
+- **Querier**：执行 PromQL，同时向 Ingester（近期数据）和 Store Gateway（历史数据）取数。
+- **Store Gateway / Compactor / Ruler / Alertmanager / Query Frontend**：职责与 Thanos 中的同名组件类似。
+
+多租户是 Cortex 的一等特性：每个请求带 `X-Scope-OrgID` 头，数据在存储和查询层面完全隔离，每个租户还能有独立的限流配额。这让它很适合做「内部监控 PaaS」。
+
+Cortex 早期用的是自研的 chunks 存储（依赖 Cassandra / DynamoDB 等），运维复杂且性能不佳。现在已经全面转向基于 Prometheus TSDB 的 blocks 存储，只依赖对象存储，架构清爽了很多。Cortex 目前是 CNCF 孵化项目。
+
+### Mimir
+
+**Grafana Mimir 是 Grafana Labs 在 2022 年从 Cortex fork 出来的项目，可以理解为 Cortex 的演进版本。** 它保留了 Cortex 的整体架构（distributor / ingester / querier / store-gateway / compactor 那一套），在此基础上做了大量工程优化：
+
+- **查询分片（query sharding）**：把一个大查询自动拆成多个可并行执行的子查询，大幅提升重查询的速度。
+- **更快的 compactor**：支持按时间和序列并行压缩，能处理更大的数据量。
+- **单体部署模式**：用 `-target=all` 可以把所有组件跑在一个二进制里，本地测试和小规模部署时不需要拉起十几个微服务。这大幅降低了上手门槛。
+- **乱序样本写入**：支持接收时间戳早于当前 head 的样本，对边缘采集、批量回填场景很有用。
+- **官方声称可扩展到 10 亿级活跃序列**。
+
+需要注意 Mimir 的许可证是 **AGPLv3**，而 Cortex 和 Thanos 都是 Apache 2.0。如果你要把它嵌入商业产品对外提供服务，这个差异需要法务评估。Cortex 项目本身仍在 CNCF 下继续维护，但社区活跃度和新特性投入明显向 Mimir 倾斜。
+
+### 还有 VictoriaMetrics
+
+值得一提的第四个选项。VictoriaMetrics 不是 Prometheus 生态的「原生」项目，而是一套独立实现的时序数据库，兼容 Prometheus 的 `remote_write` 和查询接口（用它自己的 MetricsQL，是 PromQL 的超集）。
+
+它的卖点是**极致的资源效率和运维简单性**：单二进制模式下一个进程就能跑，压缩率通常比 Prometheus TSDB 高数倍，内存占用也低不少，不依赖对象存储（用本地磁盘，也有集群版）。对于「不想引入对象存储、不想管十个微服务、就想让数据存久一点」的团队来说，它往往是投入产出比最高的选择。
+
+代价是它偏离了 Prometheus 官方生态，MetricsQL 和 PromQL 有细微行为差异，遇到问题时能参考的社区资料相对少一些。
+
+### 选型速查
+
+| 维度 | Thanos | Cortex | Mimir | VictoriaMetrics |
+| --- | --- | --- | --- | --- |
+| 数据流向 | 拉（Sidecar 上传）为主，也支持推 | 推（remote_write） | 推（remote_write） | 推（remote_write） |
+| 是否改动现有 Prometheus | 只加 sidecar，配置微调 | 加 remote_write | 加 remote_write | 加 remote_write |
+| 多租户 | 弱（靠标签隔离） | 一等公民 | 一等公民 | 集群版支持 |
+| 降采样 | 有（5m / 1h） | 无 | 无 | 无（靠高压缩率） |
+| 组件数量 | 中（5 到 7 个） | 多（10 个以上） | 多，但可单体部署 | 少 |
+| 许可证 | Apache 2.0 | Apache 2.0 | AGPLv3 | Apache 2.0 |
+| 上手难度 | 中 | 高 | 中到高 | 低 |
+
+按规模给个粗略建议：
+
+- **活跃序列 100 万以内、单团队、只需要 30 到 90 天数据**：老老实实用单机 Prometheus（或双副本），把 `retention.time` 调大、磁盘给够就行。**不要过早引入长期存储**，它带来的运维复杂度往往超过收益。
+- **多个集群、需要全局视图、需要存 1 年以上、已经有对象存储**：**Thanos**。它对现有部署侵入最小，降采样让长跨度查询变得可用，是这个场景的最优解。
+- **需要做内部监控平台、多个团队多租户、超大规模、有专门的团队维护**：**Mimir**（新项目直接选 Mimir，不建议再从 Cortex 起步）。
+- **想要最低运维成本、单一二进制、对生态兼容性要求不极端**：**VictoriaMetrics**。
+
+<Callout type="tip" title="Thanos 和 remote_write 不是二选一">
+一个常见的误解是「用了 Thanos 就不能用 remote_write」。实际上 Thanos Receive 组件本身就是一个 `remote_write` 接收端。
+
+两种模式的取舍是：**Sidecar 模式**下数据每 2 小时才上传一次，全局查询近期数据要经过 sidecar 代理，但架构简单、Prometheus 保持完全自治；**Receive 模式**下数据实时推送，全局查询延迟低，适合 Prometheus 部署在你无法控制的环境（比如客户侧、边缘节点），代价是 Receive 集群本身需要做高可用和哈希环管理。
+
+大多数团队从 Sidecar 开始，只在确实需要实时全局查询时才引入 Receive。
+</Callout>
+
+<Callout type="exercise" title="练习 4：为三个场景做选型并写出关键配置">
+为下面三个团队做长期存储选型，说明理由并给出关键配置片段。
+
+**团队 A**：创业公司，一套 K8s 集群，约 40 万活跃序列，2 个后端工程师兼职做运维，需求是「数据能存 90 天，能查历史做容量规划」。
+
+**团队 B**：中型公司，6 个 K8s 集群分布在 3 个地域，共约 800 万活跃序列，有 3 人 SRE 团队，已经在用对象存储，需求是「统一大盘、数据存 1 年、排障时能查任意集群的明细」。
+
+**团队 C**：云厂商内部，为 200 多个业务团队提供监控服务，需要按团队隔离和限流，总量约 3 亿活跃序列，有专职的 10 人监控平台团队。
+
+<Answer>
+**团队 A：不上长期存储，加大本地保留期即可。**
+
+40 万活跃序列在单机 Prometheus 的舒适区内。估算一下磁盘：`4e5 × (90×24×3600/30) × 1.5B ≈ 155GB`（按 30 秒采集间隔算）。一块 500GB 的 SSD 绰绰有余。
+
+对一个只有 2 个兼职运维的团队来说，引入 Thanos 意味着要额外维护对象存储、5 个组件、一套新的告警——**这些运维负担远超「能存 90 天」这个需求本身的价值**。
+
+```bash
+./prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=90d \
+  --storage.tsdb.retention.size=400GB
+```
+
+同时设置 time 和 size 是个好习惯：size 作为兜底，防止某天序列数暴涨把磁盘写满导致 Prometheus 崩溃。
+
+配套建议：把采集间隔从 15 秒放宽到 30 秒（容量规划场景不需要那么细的粒度），用 `metric_relabel_configs` 丢掉 `go_*` 之类的噪音，再写几条 recording rule 把常看的聚合指标预算好。做完这三件事，磁盘和查询性能都会舒服很多。
+
+如果将来真的存不下了，第一步应该是加磁盘，第二步才是考虑 VictoriaMetrics 单机版（一个二进制，运维成本接近于零）。
+
+**团队 B：Thanos，Sidecar 模式。**
+
+这是 Thanos 最标准的适用场景：多集群、有对象存储、需要全局视图和明细下钻、需要长期存储、有专职 SRE 但人手不多。
+
+选 Thanos 而不是 Mimir 的理由：
+1. **侵入性最小。** 6 个集群已有的 Prometheus 不用改变部署形态，只在旁边加个 sidecar 容器。
+2. **降采样是刚需。** 存 1 年、跨 6 个集群做大盘，没有降采样的话查一次年度趋势可能要几分钟。Thanos 的 1 小时分辨率能让这类查询秒开。
+3. **组件更少，3 个人管得过来。** Mimir 的微服务模式对 3 人团队来说负担偏重。
+4. **明细下钻能力天然具备。** Thanos Query 扇出到所有 StoreAPI，原始明细一直在，随时能查。
+
+Prometheus 侧（每个集群两个副本）：
+
+```yaml
+global:
+  scrape_interval: 15s
+  external_labels:
+    cluster: 'hb-1'
+    region: 'huabei'
+    replica: 'A'      # 另一副本为 B
+
+alerting:
+  alert_relabel_configs:
+    - regex: 'replica'
+      action: labeldrop
+```
+
+```bash
+./prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=2d \
+  --storage.tsdb.min-block-duration=2h \
+  --storage.tsdb.max-block-duration=2h \
+  --web.enable-lifecycle
+```
+
+Sidecar：
+
+```bash
+thanos sidecar \
+  --tsdb.path=/var/lib/prometheus \
+  --prometheus.url=http://127.0.0.1:9090 \
+  --objstore.config-file=/etc/thanos/objstore.yml \
+  --grpc-address=0.0.0.0:10901 \
+  --http-address=0.0.0.0:10902
+```
+
+对象存储配置 `objstore.yml`：
+
+```yaml
+type: S3
+config:
+  bucket: 'thanos-metrics'
+  endpoint: 's3.internal.example.com'
+  access_key: '<key>'
+  secret_key: '<secret>'
+  insecure: false
+```
+
+全局 Query（部署在中心，无状态，可多副本）：
+
+```bash
+thanos query \
+  --http-address=0.0.0.0:10902 \
+  --grpc-address=0.0.0.0:10901 \
+  --query.replica-label=replica \
+  --endpoint=dnssrv+_grpc._tcp.thanos-sidecar.hb-1.svc \
+  --endpoint=dnssrv+_grpc._tcp.thanos-sidecar.hb-2.svc \
+  --endpoint=dnssrv+_grpc._tcp.thanos-store.svc
+```
+
+`--query.replica-label=replica` 是双副本去重的关键，它让 Query 把 `replica="A"` 和 `replica="B"` 的同名序列合并成一条。
+
+Store Gateway 和 Compact：
+
+```bash
+thanos store \
+  --data-dir=/var/thanos/store \
+  --objstore.config-file=/etc/thanos/objstore.yml \
+  --grpc-address=0.0.0.0:10901
+
+# 注意：Compact 全局只能有一个实例
+thanos compact \
+  --data-dir=/var/thanos/compact \
+  --objstore.config-file=/etc/thanos/objstore.yml \
+  --retention.resolution-raw=30d \
+  --retention.resolution-5m=180d \
+  --retention.resolution-1h=365d \
+  --wait
+```
+
+按分辨率设置差异化保留期是 Thanos 的精髓：原始数据只留 30 天（够排障），5 分钟降采样留半年，1 小时降采样留 1 年（够做趋势分析和容量规划）。这样既满足了「存 1 年」的需求，对象存储成本又只有全量保存的零头。
+
+Grafana 只需要配一个数据源，指向 Thanos Query，就能查到所有集群、所有时间范围的数据。
+
+**团队 C：Mimir。**
+
+3 亿活跃序列、200 多个租户、需要按团队隔离和限流——这已经是「做监控 PaaS」的规模了，Thanos 的标签隔离方式完全撑不住。
+
+选 Mimir 而不是 Cortex 的理由：Mimir 是 Cortex 的后继者，在同样的架构基础上提供了查询分片、更快的 compactor 和更好的运维工具；Grafana Labs 在生产环境验证过 10 亿级序列；社区活跃度和文档质量也更好。新项目没有理由再从 Cortex 起步。唯一要确认的是 AGPLv3 许可证——**如果这套监控服务只对公司内部提供，AGPL 完全没问题；如果要作为云产品对外售卖，需要法务评估或联系 Grafana 商谈商业许可。**
+
+各集群 Prometheus 侧（也可以直接用 Grafana Agent / Alloy 替代 Prometheus 做纯采集）：
+
+```yaml
+remote_write:
+  - url: 'https://mimir.internal/api/v1/push'
+    headers:
+      # 租户隔离的关键
+      X-Scope-OrgID: 'team-payment'
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*'
+        action: drop
+    queue_config:
+      max_shards: 200
+      max_samples_per_send: 5000
+      capacity: 25000
+```
+
+Mimir 侧按租户设置限额（`runtime.yml`，支持热更新）：
+
+```yaml
+overrides:
+  team-payment:
+    ingestion_rate: 200000
+    ingestion_burst_size: 400000
+    max_global_series_per_user: 5000000
+    max_fetched_series_per_query: 1000000
+    compactor_blocks_retention_period: 365d
+
+  team-search:
+    ingestion_rate: 500000
+    max_global_series_per_user: 20000000
+    compactor_blocks_retention_period: 180d
+```
+
+按租户设置差异化的写入速率、序列数上限和保留期，这正是 Thanos 做不到而 Mimir 原生支持的能力。这个规模下必须用微服务模式部署（每类组件独立扩缩容），`-target=all` 的单体模式只适合测试。
+
+**三个场景的共同教训：** 选型的第一决定因素**不是数据规模，而是团队能承受的运维复杂度**。团队 A 硬上 Thanos 会被拖垮，团队 C 用 Thanos 会撞上多租户的墙。**先问「谁来维护它」，再问「它能存多少」。**
+</Answer>
+</Callout>
+
+## 小结
+
+- **本地存储**：2 小时一个 block，WAL 保证崩溃恢复，`--storage.tsdb.retention.time` 和 `.size` 共同决定保留策略（都不设默认 15 天，只设 size 则关闭时间维度）。老的 `--storage.tsdb.retention` 在 3.0 已移除。
+- **高可用**：跑两个配置相同的独立副本，用 `external_labels` 里的 `replica` 区分。**必须**用 `alert_relabel_configs` 剥离所有副本间取值不同的标签，否则 Alertmanager 无法去重。
+- **Alertmanager**：三副本 gossip 集群，Prometheus 要把告警发给**每一个实例**而不是 LB。加上 Watchdog 心跳告警，让外部服务来监控告警链路本身。
+- **remote_write**：基于 WAL 的异步分片队列。`write_relabel_configs` 是控制成本和缓解积压的第一手段；高延迟远端优先调大 `max_samples_per_send` 而不是 `max_shards`。`remote_read` 在生产里基本不用。
+- **长期存储选型**：Thanos 适合「多集群 + 对象存储 + 需要降采样 + 侵入性小」；Mimir 适合「多租户 + 超大规模 + 有专职团队」；VictoriaMetrics 适合「要运维简单」；小规模团队最好的方案是**什么都不上，把本地保留期调大**。
+
+到这里，Prometheus 的采集、查询、告警、扩展性话题都覆盖了。但我们始终是在「从内部看系统」——所有指标都来自被监控对象自己暴露的接口。下一章我们换个视角，看看怎么**从外部像用户一样探测服务**，这就是黑盒监控。

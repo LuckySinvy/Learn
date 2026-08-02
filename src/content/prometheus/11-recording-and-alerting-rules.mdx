@@ -1,0 +1,1220 @@
+---
+title: 记录规则与告警规则
+order: 11
+description: rule_files 组织方式、recording rules 命名约定与性能优化、alerting rules 结构与模板变量
+---
+
+# 记录规则与告警规则
+
+到目前为止，Prometheus 在我们手里还是个「被动」的系统：数据存进去，你去查它才给结果。本章加上主动性——让它**按固定节奏自己跑查询**，把结果要么存回库里（记录规则），要么变成告警推给 Alertmanager（告警规则）。
+
+这两件事共用同一套机制：**规则文件**。它们的语法几乎一样，只差一个关键字。理解了这一点，本章的一半内容就通了。
+
+读完本章你会掌握：
+
+- `rule_files` 怎么写，规则文件的 `groups` / `interval` / `rules` 三层结构
+- **记录规则**（recording rules）如何把昂贵查询预计算成廉价指标，以及官方命名约定 `level:metric:operations`
+- 同一个 group 内规则**顺序执行**这个特性带来的能力与约束
+- **告警规则**（alerting rules）的五个字段：`alert` / `expr` / `for` / `labels` / `annotations`
+- `for` 的真正作用：消除抖动，以及告警的三种状态 inactive / pending / firing
+- 注解模板变量 `{{ $labels.xxx }}`、`{{ $value }}` 和 `humanize` 系列函数
+- 用 `promtool check rules` 和 `promtool test rules` 在上线前验证规则
+
+## 一、rule_files 与规则文件结构
+
+主配置里用 `rule_files` 指定从哪加载规则，支持 glob 通配：
+
+```yaml
+# prometheus.yml
+global:
+  evaluation_interval: 15s      # 规则求值的全局默认间隔
+
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
+  - '/etc/prometheus/rules/team-*/*.yml'
+```
+
+<Callout type="warn" title="glob 不递归，后缀也要对上">
+`rules/*.yml` **不会**匹配 `rules/node/cpu.yml`——单个星号不跨目录。要覆盖子目录必须显式再写一行，或者用 `rules/*/*.yml`。
+
+另外 `*.yml` 匹配不到 `.yaml` 后缀的文件。团队里混用两种后缀是很常见的踩坑点，建议统一成一种，并在 CI 里加一条检查。
+</Callout>
+
+规则文件本身是三层结构：
+
+```yaml
+groups:
+  - name: node-recording           # 组名，同一个文件内必须唯一
+    interval: 30s                  # 本组的求值间隔，不写则用 global.evaluation_interval
+    limit: 0                       # 本组每次求值最多产出多少条序列/告警，0 表示不限
+    rules:
+      - record: instance:node_cpu_utilization:ratio_rate5m
+        expr: |
+          1 - avg without (cpu, mode) (
+            rate(node_cpu_seconds_total{mode="idle"}[5m])
+          )
+
+  - name: node-alerts
+    rules:
+      - alert: HostHighCpu
+        expr: instance:node_cpu_utilization:ratio_rate5m > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: '主机 CPU 使用率过高'
+```
+
+### group 的三条执行语义
+
+这三条决定了你该怎么组织规则，务必记牢：
+
+1. **同一个 group 内，规则严格按书写顺序、串行执行**，且所有规则使用**同一个求值时间戳**。
+2. **不同 group 之间并行执行**，互不等待。
+3. 每个 group 按自己的 `interval` 独立调度。
+
+第 1 条带来一个非常有用的能力：**后面的规则可以直接引用前面规则刚算出来的结果**。
+
+```yaml
+groups:
+  - name: api-slo
+    interval: 30s
+    rules:
+      # 第一步：分别算出错误数和总数的速率
+      - record: path:http_errors:rate5m
+        expr: sum by (path) (rate(http_requests_total{code=~"5.."}[5m]))
+
+      - record: path:http_requests:rate5m
+        expr: sum by (path) (rate(http_requests_total[5m]))
+
+      # 第二步：直接用上面两条的结果算比率（同一个 group 才能这么写）
+      - record: path:http_errors_per_requests:ratio_rate5m
+        expr: path:http_errors:rate5m / path:http_requests:rate5m
+```
+
+<Callout type="warn" title="跨 group 引用会拿到「上一轮」的旧数据">
+如果把上面第三条规则单独放到另一个 group 里，它依然能查到 `path:http_errors:rate5m`——但那是**上一次求值时写入的数据**，可能已经过时几十秒。更糟的是 Prometheus 刚启动时那条序列还不存在，第三条规则会返回空结果。
+
+**原则**：有依赖关系的规则必须放在同一个 group 里，并按依赖顺序书写。没有依赖关系的规则应该拆到不同 group，让它们并行跑得更快。
+</Callout>
+
+### 一个 group 太慢会怎样
+
+group 内串行执行，意味着组里所有规则的耗时是**累加**的。如果总耗时超过了 `interval`，Prometheus 会记录一条告警日志，并跳过本轮的部分执行。监控这件事的指标是：
+
+```promql
+# 每个规则组上次求值花了多久
+prometheus_rule_group_last_duration_seconds
+
+# 求值耗时占间隔的比例，接近 1 就危险了
+prometheus_rule_group_last_duration_seconds
+  / prometheus_rule_group_interval_seconds
+
+# 有多少次求值因为上一轮没跑完而被跳过
+rate(prometheus_rule_group_iterations_missed_total[5m])
+```
+
+<Callout type="tip" title="给规则组本身配一条告警">
+规则求值跟不上是个隐性故障：告警会延迟甚至漏发，而你毫无感知。建议加上这条：
+
+```yaml
+- alert: PrometheusRuleGroupSlow
+  expr: |
+    prometheus_rule_group_last_duration_seconds
+      / prometheus_rule_group_interval_seconds > 0.8
+  for: 15m
+  labels:
+    severity: warning
+```
+
+出现后的处理方向：拆分 group 增加并行度、减小查询区间、给昂贵的子表达式再加一层记录规则。
+</Callout>
+
+## 二、记录规则：把昂贵查询变便宜
+
+### 为什么需要它
+
+看这条查询——某个 SLO 看板上的错误率：
+
+```promql
+sum by (service, path) (
+  rate(http_requests_total{code=~"5..", env="prod"}[5m])
+)
+/
+sum by (service, path) (
+  rate(http_requests_total{env="prod"}[5m])
+)
+```
+
+假设 `http_requests_total` 有 20 万条序列。这条查询每执行一次，就要从 TSDB 里捞出 20 万条序列在 5 分钟内的全部样本，做两遍 `rate`、两遍 `sum`。看板上有 10 个面板、5 个人同时打开、Grafana 每 15 秒自动刷新一次——瞬间就是几十次重复的重量级计算。
+
+记录规则的思路很朴素：**这个结果反正每次都一样，不如让 Prometheus 每 30 秒自己算一次存起来，大家直接查那条现成的序列。**
+
+```yaml
+- record: service_path:http_errors_per_requests:ratio_rate5m
+  expr: |
+    sum by (service, path) (rate(http_requests_total{code=~"5..", env="prod"}[5m]))
+    /
+    sum by (service, path) (rate(http_requests_total{env="prod"}[5m]))
+```
+
+看板改成查这一条：
+
+```promql
+service_path:http_errors_per_requests:ratio_rate5m
+```
+
+原本要扫 20 万条序列的查询，现在只扫几十条。响应时间从几秒降到几毫秒。
+
+### 官方命名约定：level:metric:operations
+
+这是 Prometheus 官方文档明确推荐的格式，用冒号分成三段：
+
+```text
+level : metric : operations
+  ↑       ↑         ↑
+聚合维度  指标名   施加的操作（最新的写在最前）
+```
+
+- **level**：结果保留了哪些标签维度，用下划线连接。比如按 `instance` 和 `path` 聚合就写 `instance_path`；聚合到 job 级别就写 `job`。
+- **metric**：原始指标名，去掉 Counter 的 `_total` 后缀（因为 `rate` 之后它已经不是计数器了）。
+- **operations**：施加了哪些操作，最近的一次写在最前面，用下划线连接。
+
+官方文档里的标准示例：
+
+| 记录规则名 | 含义 |
+| --- | --- |
+| `instance_path:requests:rate5m` | 按 instance 和 path，请求数的 5 分钟速率 |
+| `path:requests:rate5m` | 在上面的基础上跨 instance 求和 |
+| `instance_path:request_failures:rate5m` | 按 instance 和 path，失败请求的 5 分钟速率 |
+| `path:request_failures_per_requests:ratio_rate5m` | 失败率（先算 rate 再算 ratio，所以 ratio 在前） |
+| `job:http_inprogress_requests:sum` | 按 job 聚合的进行中请求数 |
+
+<Callout type="info" title="为什么冒号很重要">
+Prometheus **自身产生的指标名从不使用冒号**，Exporter 也约定不用。所以冒号成了一个天然的命名空间隔离符：看到指标名里有冒号，你立刻知道「这是人为定义的记录规则，不是原始采集数据」。
+
+这不只是美观问题。当有人在 Grafana 里看到 `path:requests:rate5m` 时，他知道去规则文件里能找到它的定义；而如果你把它命名成 `http_requests_rate`，别人会误以为这是某个 Exporter 直接暴露的原始指标，排查时会去翻 Exporter 文档，白费半天力气。
+</Callout>
+
+### 记录规则的 labels 字段
+
+可以给记录规则的输出**追加或覆盖**标签：
+
+```yaml
+- record: job:http_requests:rate5m
+  expr: sum by (job) (rate(http_requests_total[5m]))
+  labels:
+    aggregation: 'global'
+    computed_by: 'recording-rule'
+```
+
+用得不多，主要场景是给多个来源计算出的同名指标打上区分标记。
+
+### 什么该做成记录规则，什么不该
+
+**适合的场景：**
+
+- 被多个看板/告警反复使用的表达式
+- 计算成本高（涉及大量序列、多层聚合、`histogram_quantile`）
+- 需要长期保留的聚合结果（原始高基数数据可以短保留，聚合结果长保留）
+- 跨很长时间窗口的查询，比如按天/周聚合
+
+**不适合的场景：**
+
+- 只用一次的临时查询
+- 结果序列数几乎和输入一样多（没有降基数，白白多存一份）
+- 依赖查询时才确定的参数（比如 Grafana 变量选择的时间窗口）
+
+<Callout type="warn" title="记录规则不会追溯计算历史数据">
+新加一条记录规则，它**只从现在开始产生数据**。昨天的、上周的数据不会自动补上——你打开看板选「最近 7 天」，会看到一条只有最近几分钟有数据的曲线。
+
+所以：**先加记录规则，等它积累够时间跨度，再把看板切过去**。如果确实需要回填历史，可以用 `promtool tsdb create-blocks-from rules` 从已有数据生成历史 block，但这属于高级操作，要求原始数据还没过期。
+</Callout>
+
+<Callout type="exercise" title="练习 1：设计一组记录规则">
+你的服务有一个 Histogram 指标 `api_request_duration_seconds_bucket`，带 `service`、`path`、`le` 标签，还有一个 Counter `api_requests_total`，带 `service`、`path`、`code` 标签。总序列数约 30 万。
+
+Grafana 看板需要展示三样东西，而且每 10 秒刷新一次，卡得不行：
+
+1. 各接口的 P99 延迟
+2. 各接口的 QPS
+3. 各服务的整体错误率（5xx 占比）
+
+请设计一组记录规则来优化，命名要符合官方约定，并说明 group 该怎么划分。
+
+<Answer>
+```yaml
+groups:
+  - name: api-recording
+    interval: 30s
+    rules:
+      # ---------- 1) 各接口 QPS ----------
+      - record: service_path:api_requests:rate5m
+        expr: sum by (service, path) (rate(api_requests_total[5m]))
+
+      # ---------- 2) 各接口 P99 延迟 ----------
+      # 先把 bucket 的速率按 le 聚合好（这一步最贵，单独存一条）
+      - record: service_path_le:api_request_duration_seconds_bucket:rate5m
+        expr: |
+          sum by (service, path, le) (
+            rate(api_request_duration_seconds_bucket[5m])
+          )
+
+      # 再基于上一条算分位数（同 group，能直接用刚写入的结果）
+      - record: service_path:api_request_duration_seconds:p99_rate5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            service_path_le:api_request_duration_seconds_bucket:rate5m
+          )
+
+      - record: service_path:api_request_duration_seconds:p50_rate5m
+        expr: |
+          histogram_quantile(
+            0.50,
+            service_path_le:api_request_duration_seconds_bucket:rate5m
+          )
+
+      # ---------- 3) 各服务整体错误率 ----------
+      - record: service:api_errors:rate5m
+        expr: sum by (service) (rate(api_requests_total{code=~"5.."}[5m]))
+
+      - record: service:api_requests:rate5m
+        expr: sum by (service) (rate(api_requests_total[5m]))
+
+      - record: service:api_errors_per_requests:ratio_rate5m
+        expr: |
+          service:api_errors:rate5m / service:api_requests:rate5m
+```
+
+**命名逐项对照：**
+
+| 名字 | level | metric | operations |
+| --- | --- | --- | --- |
+| `service_path:api_requests:rate5m` | 按 service 和 path | `api_requests`（去掉了 `_total`） | `rate5m` |
+| `service_path:api_request_duration_seconds:p99_rate5m` | 按 service 和 path | 延迟指标 | 先 rate 后 p99，最新的写前面 |
+| `service:api_errors_per_requests:ratio_rate5m` | 按 service | 两个指标相除 | 先 rate 后 ratio |
+
+**group 划分的理由：**
+
+这六条规则**必须放在同一个 group** 里，因为存在明确的依赖链：
+
+```text
+service_path_le:..._bucket:rate5m
+        到 service_path:...:p99_rate5m
+        到 service_path:...:p50_rate5m
+
+service:api_errors:rate5m  ┐
+service:api_requests:rate5m ┘ 到 service:api_errors_per_requests:ratio_rate5m
+```
+
+同 group 内串行执行且共享同一个时间戳，被依赖的规则写在前面，后面的规则就能立刻用上本轮的新鲜结果。如果拆到不同 group，后面的规则会读到上一轮的旧数据，甚至在刚启动时读到空。
+
+**为什么把 bucket 的聚合单独存一条：**
+
+P99 和 P50 都要用到「按 le 聚合后的 bucket 速率」。如果两条规则各写一遍完整表达式，那个最贵的 `sum by (..., le) (rate(...))` 就要算两遍。抽出来存成中间结果，只算一次，两条分位数规则共用。
+
+这条中间结果本身序列数不少（保留了 `le` 维度），如果不想长期存储，可以只在这个 group 内用，然后靠短保留策略或 `remote_write` 的过滤规则不把它推到长期存储。
+
+**interval 选 30s 的理由：**
+
+- 表达式里的 `rate(...[5m])` 窗口是 5 分钟，30 秒求值一次已经足够密（窗口远大于步长，相邻两次结果高度重叠）。
+- 求值间隔越短，产生的序列样本越多，存储压力越大。
+- 如果这个 group 求值很慢（用 `prometheus_rule_group_last_duration_seconds` 观察），可以放宽到 1m。
+
+**看板改造后的查询：**
+
+```promql
+# P99 延迟
+service_path:api_request_duration_seconds:p99_rate5m
+
+# QPS
+service_path:api_requests:rate5m
+
+# 错误率（乘 100 变成百分比）
+service:api_errors_per_requests:ratio_rate5m * 100
+```
+
+原本每次刷新要扫 30 万条序列，现在只扫几百条。
+
+**上线注意事项**：新规则不会回填历史数据。先部署规则、观察一两天确认数据正常，再把看板的查询切过去，否则用户会看到一条大部分时间是空白的曲线。
+</Answer>
+</Callout>
+
+## 三、告警规则：把异常变成事件
+
+### 五个字段
+
+```yaml
+- alert: HighErrorRate                        # 告警名，会变成 alertname 标签
+  expr: |                                     # 表达式，非空结果即为「异常」
+    service:api_errors_per_requests:ratio_rate5m > 0.05
+  for: 5m                                     # 持续多久才真正触发
+  keep_firing_for: 5m                         # 恢复后再多保持一会儿（2.42+，可选）
+  labels:                                     # 附加标签，用于 Alertmanager 路由
+    severity: critical
+    team: backend
+  annotations:                                # 给人看的描述，支持模板
+    summary: '{{ $labels.service }} 错误率过高'
+    description: '错误率已达 {{ $value | humanizePercentage }}，持续 5 分钟以上。'
+    runbook_url: 'https://wiki.internal/runbooks/high-error-rate'
+```
+
+**核心机制**：Prometheus 每隔 `evaluation_interval` 执行一次 `expr`。**表达式返回的每一条序列，就是一条告警**。返回空结果表示一切正常。
+
+这意味着告警表达式必须是一个**过滤型**表达式：用 `> 0.05`、`== 0`、`< 10` 这类比较运算符把「正常的数据」过滤掉，只留下异常的。写 `rate(errors[5m])` 是错的——它永远有结果，告警会一直触发。
+
+### 三种状态与 for 的作用
+
+一条告警在 Prometheus 内部有三种状态：
+
+```text
+inactive  表达式没有结果 → 一切正常
+
+pending   表达式刚开始有结果，但还没满足 for 指定的时长
+          此时告警「已发现但不上报」，不会发给 Alertmanager
+
+firing    表达式持续有结果，且已经超过 for 指定的时长
+          此时才真正推送给 Alertmanager
+```
+
+`for` 的价值就在 pending 这个缓冲区：
+
+```yaml
+- alert: HostHighCpu
+  expr: instance:node_cpu_utilization:ratio_rate5m > 0.9
+  for: 10m
+```
+
+CPU 偶尔飙到 95% 持续几十秒，是完全正常的（一次编译、一次备份、一次 GC）。没有 `for` 的话，这种毛刺会立刻发出告警，几十秒后又发一条恢复通知——这就是**告警抖动**（flapping），是消磨值班人耐心的头号杀手。加上 `for: 10m` 之后，只有真正持续 10 分钟的高负载才会被上报。
+
+<Callout type="warn" title="for 期间表达式一旦返回空，计时器会归零">
+假设 `for: 10m`，某条告警已经 pending 了 9 分 30 秒。这时表达式恰好有一次求值返回了空（比如 CPU 短暂降到 89%），状态立刻回到 inactive，**计时清零**。下次再超阈值，要重新从 0 开始数 10 分钟。
+
+这个特性在「反复横跳」的场景下会导致告警**永远发不出去**：指标在阈值附近来回震荡，每次 pending 到 8 分钟就被打断。
+
+**应对办法：**
+- 把阈值判断改成基于更长窗口的平均值，比如把 `rate(...[5m])` 改成 `rate(...[15m])`，天然更平滑。
+- 或者用 `avg_over_time` 显式平滑：`avg_over_time(cpu_usage[15m]) > 0.9`。
+- 或者适当降低 `for`，配合 Alertmanager 的 `group_wait` / `repeat_interval` 来抑制噪声。
+</Callout>
+
+### keep_firing_for：恢复后多撑一会儿
+
+2.42 引入的字段，作用和 `for` 相反：表达式已经不返回结果了，但告警还继续保持 firing 状态一段时间才转为 resolved。
+
+```yaml
+- alert: FlappyService
+  expr: up{job="flaky"} == 0
+  for: 2m
+  keep_firing_for: 10m
+```
+
+用于抑制「恢复了又挂、挂了又恢复」造成的大量 resolved/firing 通知刷屏。
+
+### ALERTS 指标：告警本身也是数据
+
+Prometheus 会把每条处于 pending 或 firing 状态的告警，写成一条名为 `ALERTS` 的序列，值恒为 1：
+
+```promql
+# 当前所有正在触发的告警
+ALERTS{alertstate="firing"}
+
+# 按告警名统计当前有多少条在烧
+count by (alertname) (ALERTS{alertstate="firing"})
+
+# 过去 24 小时里，哪条告警触发的时间最长（找出最吵的告警）
+topk(10,
+  sum by (alertname) (
+    count_over_time(ALERTS{alertstate="firing"}[24h])
+  )
+)
+
+# 某条告警在过去一周触发了多少次（用于评估告警质量）
+changes(ALERTS_FOR_STATE{alertname="HighErrorRate"}[7d])
+```
+
+<Callout type="tip" title="用 ALERTS 做「告警的告警」和季度复盘">
+`ALERTS` 是评估告警体系健康度的金矿。定期跑一次上面那条 `topk`，你会发现通常有两三条告警贡献了 80% 的通知量——它们要么阈值定得太敏感，要么根本不该是告警（应该只是看板上的一个指标）。
+
+另一个实用查询是找出「从来没触发过的告警」：这类规则往往是表达式写错了（比如指标名改了没同步），一直静默失效，等真出事时才发现它根本不工作。
+</Callout>
+
+## 四、注解模板
+
+`annotations` 和 `labels` 的值都支持 Go 模板语法，在**每次求值时**渲染。
+
+### 两个核心变量
+
+- `{{ $labels.标签名 }}`：当前这条告警序列的标签值。
+- `{{ $value }}`：当前这条告警序列的**数值**（就是表达式算出来的那个数）。
+
+```yaml
+annotations:
+  summary: '实例 {{ $labels.instance }} 磁盘将满'
+  description: '{{ $labels.instance }} 上的挂载点 {{ $labels.mountpoint }} 剩余空间仅 {{ $value }}%'
+```
+
+标签名如果含有特殊字符，用 index 函数取：
+
+```yaml
+description: '{{ index $labels "kubernetes.io/hostname" }} 出现异常'
+```
+
+### humanize 系列：把数字变成人话
+
+裸写 `{{ $value }}` 常常会得到 `0.05263157894736842` 或 `1073741824` 这种没法读的东西。模板函数负责把它变好看：
+
+| 函数 | 输入 | 输出 |
+| --- | --- | --- |
+| `humanize` | `1234567` | `1.235M` |
+| `humanize1024` | `1073741824` | `1Gi` |
+| `humanizeDuration` | `3725` | `1h 2m 5s` |
+| `humanizePercentage` | `0.0526` | `5.26%` |
+| `humanizeTimestamp` | `1735689600` | `2025-01-01 00:00:00 +0000 UTC` |
+| `printf "%.2f"` | `0.05263` | `0.05` |
+
+用法是管道形式：
+
+```yaml
+annotations:
+  summary: '{{ $labels.service }} 错误率异常'
+  description: >-
+    错误率 {{ $value | humanizePercentage }}，
+    已持续 5 分钟。当前 QPS 约 {{ $value | humanize }}。
+  disk: '剩余 {{ $value | humanize1024 }}B'
+  duration: '已经宕机 {{ $value | humanizeDuration }}'
+  precise: '负载 {{ printf "%.2f" $value }}'
+```
+
+<Callout type="info" title="$value 是「这条序列的值」，不是「所有序列」">
+新手常见的误解：以为 `{{ $value }}` 是整个查询的结果。实际上告警表达式返回 N 条序列就产生 N 条独立告警，每条告警渲染自己那份模板，`{{ $value }}` 取的是**它自己那条序列**的数值。
+
+所以如果你想在描述里写「共有 5 台机器出问题」，`{{ $value }}` 是做不到的——它只知道自己这一台。要么在表达式里用 `count()` 聚合成一条告警，要么交给 Alertmanager 的分组功能去汇总。
+</Callout>
+
+<Callout type="warn" title="labels 里也能用模板，但要非常克制">
+`labels` 字段同样支持模板渲染，但请记住：**标签是 Alertmanager 分组和去重的依据**。如果你在 labels 里塞了 `{{ $value }}`，那么值每变化一次，Alertmanager 就认为这是一条全新的告警，去重和分组彻底失效，通知会像雪崩一样刷屏。
+
+**铁律**：变化的东西放 `annotations`，稳定的分类信息放 `labels`。
+</Callout>
+
+<Callout type="exercise" title="练习 2：写出三条生产级告警规则">
+为下面三个需求写出完整的告警规则（含 `for`、`labels`、`annotations`）：
+
+1. 任何实例宕机超过 3 分钟。
+2. 任何磁盘挂载点剩余空间低于 15%，且持续 10 分钟（要在描述里显示具体百分比和挂载点）。
+3. 某个服务的 P99 延迟超过 1 秒，持续 5 分钟（P99 已有记录规则 `service_path:api_request_duration_seconds:p99_rate5m`）。
+
+<Answer>
+```yaml
+groups:
+  - name: critical-alerts
+    rules:
+      # ---------- 1) 实例宕机 ----------
+      - alert: InstanceDown
+        expr: up == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: '实例 {{ $labels.instance }} 宕机'
+          description: >-
+            job {{ $labels.job }} 下的实例 {{ $labels.instance }}
+            已经无法抓取超过 3 分钟。
+          runbook_url: 'https://wiki.internal/runbooks/instance-down'
+
+      # ---------- 2) 磁盘空间不足 ----------
+      - alert: DiskSpaceLow
+        expr: |
+          100 * node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.instance }} 磁盘空间不足'
+          description: >-
+            挂载点 {{ $labels.mountpoint }}（设备 {{ $labels.device }}）
+            剩余空间仅 {{ printf "%.1f" $value }}%，低于 15% 阈值。
+
+      # ---------- 3) P99 延迟过高 ----------
+      - alert: HighP99Latency
+        expr: service_path:api_request_duration_seconds:p99_rate5m > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: '{{ $labels.service }} 接口延迟过高'
+          description: >-
+            服务 {{ $labels.service }} 的接口 {{ $labels.path }}
+            P99 延迟为 {{ $value | humanizeDuration }}，超过 1 秒阈值。
+```
+
+**设计要点逐条说明：**
+
+**第 1 条 —— 为什么用 `up == 0` 而不是「指标消失」**
+
+`up` 是 Prometheus 自己生成的，即使目标彻底连不上，这条序列也依然存在（值变 0）。而业务指标在目标宕机后是**整条序列消失**，表达式返回空，告警反而不会触发。这是新手最容易搞反的地方。
+
+`for: 3m` 的取值考虑：太短会被一次网络抖动误触发，太长会延误发现。3 到 5 分钟是常见选择。注意 `for` 必须**大于** `evaluation_interval`，否则毫无意义。
+
+**第 2 条 —— 三个细节**
+
+- `fstype!~"tmpfs|overlay"` 必须加。不过滤的话，容器环境里一大堆 `tmpfs`、`overlay` 挂载点会疯狂误报——它们本来就是小容量的内存文件系统。生产环境通常还要再排除 `squashfs`、`iso9660`。
+- 分子分母上的标签过滤条件必须**完全一致**，否则向量匹配会失败，表达式返回空，告警静默失效。这是最隐蔽的坑之一。
+- 用 `printf "%.1f"` 而不是裸 `$value`，否则描述里会出现 `14.372839471028374%` 这种东西。
+
+更严谨的版本还应该考虑「磁盘增长趋势」，用 `predict_linear` 预测多久会满：
+
+```promql
+predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[6h], 4 * 3600) < 0
+```
+
+这条的语义是「按过去 6 小时的趋势，4 小时后会写满」，比固定百分比阈值更有前瞻性。
+
+**第 3 条 —— 直接用记录规则**
+
+表达式只有短短一行，因为重活已经在记录规则里做完了。这带来三个好处：
+
+1. 告警求值极快，不会拖慢整个规则组。
+2. 表达式一眼能看懂，谁都能 review。
+3. 看板和告警用的是**同一条序列**，绝不会出现「看板显示正常但告警在响」的诡异情况——这个问题在看板和告警各写一份表达式时非常常见。
+
+`humanizeDuration` 会把 `1.35` 渲染成 `1.35s`，把 `65` 渲染成 `1m 5s`，比裸数字友好得多。
+
+**三条规则共同遵守的约定：**
+
+- 每条都有 `severity` 标签，这是 Alertmanager 路由的依据（第 12 章会用到）。
+- `summary` 一句话说清「谁出了什么问题」，用于通知标题。
+- `description` 补充具体数值和上下文，用于通知正文。
+- 关键告警配 `runbook_url`，凌晨三点被叫醒的人会感谢你。
+</Answer>
+</Callout>
+
+## 五、告警规则的常见陷阱
+
+### 陷阱 1：表达式不带比较运算符
+
+```yaml
+# 错误：这条表达式永远有结果，告警会一直烧着
+expr: rate(http_errors_total[5m])
+
+# 正确
+expr: rate(http_errors_total[5m]) > 1
+```
+
+### 陷阱 2：用「指标消失」判断故障
+
+```yaml
+# 无效：服务挂了之后这条序列就不存在了，表达式返回空，告警不触发
+expr: my_service_healthy == 0
+
+# 正确：用 absent 检测「序列消失」
+expr: absent(my_service_healthy)
+
+# 或者两者结合
+expr: my_service_healthy == 0 or absent(my_service_healthy)
+```
+
+<Callout type="warn" title="absent 会丢失原有标签">
+`absent(up{job="api"})` 在序列不存在时返回一条值为 1 的序列，但它的标签只包含**你在选择器里显式写出的那些**（这里是 `job="api"`），`instance` 之类的是没有的——毕竟序列都不存在了，从哪儿知道是哪台机器。
+
+所以基于 `absent` 的告警只能定位到 job 级别。如果需要精确到实例，得靠 `up == 0`（前提是目标还在服务发现列表里）。
+</Callout>
+
+### 陷阱 3：for 小于 evaluation_interval
+
+`evaluation_interval: 1m` 配 `for: 30s` 是没有意义的——表达式一分钟才求值一次，第二次求值时已经过去 60 秒，直接就跨过了 30 秒的门槛，等价于没写 `for`。**`for` 至少要是 `evaluation_interval` 的 2 到 3 倍才有平滑效果。**
+
+### 陷阱 4：告警表达式产生高基数结果
+
+```yaml
+# 危险：如果 http_requests_total 带 user_id 标签，这条会产生成千上万条告警
+expr: rate(http_requests_total{code="500"}[5m]) > 0
+```
+
+一次故障刷出上万条告警，Alertmanager 和通知渠道都会被打垮。**告警表达式几乎总应该先做聚合**：
+
+```yaml
+expr: sum by (service, path) (rate(http_requests_total{code="500"}[5m])) > 1
+```
+
+### 陷阱 5：阈值写死在表达式里，没考虑规模差异
+
+`node_load1 > 10` 对 4 核机器是灾难，对 64 核机器毫无压力。要写成相对值：
+
+```promql
+node_load1 / count by (instance) (node_cpu_seconds_total{mode="idle"}) > 2
+```
+
+<Callout type="exercise" title="练习 3：修复五条有问题的告警规则">
+下面每条规则都至少有一个问题，请指出并修正：
+
+```yaml
+- alert: A
+  expr: node_memory_MemFree_bytes / node_memory_MemTotal_bytes < 0.1
+  for: 30s
+
+- alert: B
+  expr: mysql_up == 0
+  labels:
+    instance: '{{ $labels.instance }}'
+    current_value: '{{ $value }}'
+
+- alert: C
+  expr: increase(http_requests_total{code="500"}[5m])
+
+- alert: D
+  expr: rate(http_requests_total{code=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+  for: 5m
+
+- alert: E
+  expr: kafka_consumer_lag > 1000
+  for: 1m
+  annotations:
+    summary: 'Kafka 消费延迟'
+```
+
+假设 `global.evaluation_interval: 15s`。
+
+<Answer>
+**规则 A：用错了内存指标 + for 太短**
+
+```yaml
+# 问题
+- alert: A
+  expr: node_memory_MemFree_bytes / node_memory_MemTotal_bytes < 0.1
+  for: 30s
+```
+
+问题 1：`MemFree` 不等于「可用内存」。Linux 会把空闲内存拿去做 page cache，健康机器上 `MemFree` 常年低于 10%，这条告警会**永远在响**。必须用 `MemAvailable`——那是内核给出的「真正还能分配多少」。
+
+问题 2：`for: 30s` 只有 evaluation_interval 的两倍，几乎起不到消抖作用。内存使用率短暂尖峰很常见，建议至少 5 分钟。
+
+问题 3：缺 `labels` 和 `annotations`，Alertmanager 没法路由，值班人看不懂。
+
+```yaml
+# 修正
+- alert: HostMemoryLow
+  expr: |
+    node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.1
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: '{{ $labels.instance }} 可用内存不足 10%'
+    description: '当前可用内存占比 {{ $value | humanizePercentage }}。'
+```
+
+---
+
+**规则 B：把变化的值塞进了 labels**
+
+```yaml
+# 问题
+  labels:
+    instance: '{{ $labels.instance }}'
+    current_value: '{{ $value }}'
+```
+
+两个问题：
+
+1. `current_value: '{{ $value }}'` 是灾难性的。`$value` 每次求值都在变，标签一变 Alertmanager 就认为是全新的告警，去重和分组完全失效，同一个故障会刷出几十条通知。
+2. `instance: '{{ $labels.instance }}'` 是多余的——`instance` 标签本来就在告警上，这么写等于用自己覆盖自己。
+
+**铁律：变化的值放 `annotations`，稳定的分类放 `labels`。**
+
+```yaml
+# 修正
+- alert: MySQLDown
+  expr: mysql_up == 0
+  for: 2m
+  labels:
+    severity: critical
+    component: mysql
+  annotations:
+    summary: 'MySQL 实例 {{ $labels.instance }} 不可用'
+    description: 'mysql_up 当前值为 {{ $value }}，已持续 2 分钟。'
+```
+
+顺带补上了 `for`：原规则完全没有 `for`，一次采集抖动就会误报。
+
+---
+
+**规则 C：没有比较运算符 + 没有聚合**
+
+```yaml
+# 问题
+  expr: increase(http_requests_total{code="500"}[5m])
+```
+
+问题 1：表达式没有比较运算符。只要有任何一条 5xx 序列存在（哪怕值是 0），表达式就有结果，告警**永远处于 firing**。
+
+问题 2：没聚合。如果指标带 `path`、`instance` 等标签，每个组合都会产生一条独立告警，一次故障刷出几百条。
+
+问题 3：缺 `for`、`labels`、`annotations`。
+
+```yaml
+# 修正
+- alert: HighServerErrors
+  expr: |
+    sum by (service) (rate(http_requests_total{code=~"5.."}[5m])) > 1
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: '{{ $labels.service }} 5xx 错误率过高'
+    description: '当前每秒 {{ printf "%.2f" $value }} 个 5xx 错误。'
+```
+
+---
+
+**规则 D：向量匹配会失败**
+
+```yaml
+# 问题
+  expr: rate(http_requests_total{code=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+```
+
+分子的序列带有 `code="500"`、`code="503"` 等标签，分母的序列带有所有状态码。两边标签集不同，**向量匹配匹配不上任何一对**，结果是空——这条告警永远不会触发，属于「看起来在工作，实际上是个摆设」的静默失效。
+
+必须两边都聚合掉 `code` 标签：
+
+```yaml
+# 修正
+- alert: HighErrorRatio
+  expr: |
+    sum by (service) (rate(http_requests_total{code=~"5.."}[5m]))
+    /
+    sum by (service) (rate(http_requests_total[5m]))
+    > 0.05
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: '{{ $labels.service }} 错误率超过 5%'
+    description: '当前错误率 {{ $value | humanizePercentage }}。'
+```
+
+**这条错误极其隐蔽**，因为语法完全合法、`promtool check rules` 也能通过。唯一的发现方式是**在 Graph 页面里手动跑一遍表达式**，确认它在故障时真的能返回结果。所有告警上线前都应该做这一步。
+
+---
+
+**规则 E：annotations 信息量为零 + 阈值绝对化**
+
+```yaml
+# 问题
+  annotations:
+    summary: 'Kafka 消费延迟'
+```
+
+问题 1：`summary` 没有任何具体信息。值班人收到通知只知道「有个 Kafka 延迟」，不知道是哪个集群、哪个 topic、哪个消费组、延迟多少。半夜被叫醒之后还要自己去翻，体验极差。
+
+问题 2：`1000` 这个绝对阈值对高吞吐 topic（每秒几万条）来说毫无意义，1000 条延迟只有几十毫秒；对低吞吐 topic 又太宽松。
+
+问题 3：缺 `labels`，无法路由。
+
+```yaml
+# 修正
+- alert: KafkaConsumerLagHigh
+  expr: |
+    sum by (consumergroup, topic) (kafka_consumergroup_lag)
+      / sum by (consumergroup, topic) (rate(kafka_topic_partition_current_offset[5m]))
+    > 300
+  for: 10m
+  labels:
+    severity: warning
+    component: kafka
+  annotations:
+    summary: '消费组 {{ $labels.consumergroup }} 在 topic {{ $labels.topic }} 上滞后'
+    description: >-
+      按当前消费速率估算，追平积压还需要
+      {{ $value | humanizeDuration }}，超过 5 分钟阈值。
+    runbook_url: 'https://wiki.internal/runbooks/kafka-lag'
+```
+
+修正后的表达式把「积压条数」换算成了「按当前速率还要多久才能追上」，这是一个**与吞吐量无关的相对指标**，对大小 topic 都适用。
+
+---
+
+**五条规则总结出的检查清单：**
+
+```text
+□ 表达式带比较运算符了吗？（否则永远 firing）
+□ 在 Graph 页面手动跑过吗？（防止向量匹配静默失效）
+□ 做聚合了吗？（防止一次故障刷几百条告警）
+□ for 至少是 evaluation_interval 的 3 倍吗？
+□ labels 里只有稳定的分类信息吗？（不能有 $value）
+□ annotations 说清了「谁、什么问题、多严重」吗？
+□ 阈值是相对值还是绝对值？绝对值在不同规模下还成立吗？
+□ 关键告警配 runbook_url 了吗？
+```
+</Answer>
+</Callout>
+
+## 六、用 promtool 验证规则
+
+### 静态语法检查
+
+```bash
+# 检查单个规则文件
+promtool check rules /etc/prometheus/rules/node.yml
+
+# 检查所有
+promtool check rules /etc/prometheus/rules/*.yml
+
+# 检查主配置（会连带检查 rule_files 引用到的所有文件）
+promtool check config /etc/prometheus/prometheus.yml
+```
+
+它能查出：YAML 缩进错误、PromQL 语法错误、必填字段缺失、模板语法错误、同一组内记录规则名重复。
+
+**查不出**的是：向量匹配失败、指标名拼错（那也是合法的 PromQL）、阈值不合理。
+
+### 规则单元测试
+
+这是被严重低估的功能。你可以给规则写单元测试，用**构造的时间序列**验证告警在什么时候该响、什么时候不该响：
+
+```yaml
+# test-node.yml
+rule_files:
+  - node-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    # 构造输入序列：值用 "初始值+步长x次数" 的紧凑语法
+    input_series:
+      - series: 'up{job="node", instance="10.0.0.1:9100"}'
+        values: '1 1 1 0 0 0 0 0 1 1'
+
+    alert_rule_test:
+      # 第 4 分钟：刚宕机 1 分钟，for: 3m 还没满足，不应该有告警
+      - eval_time: 4m
+        alertname: InstanceDown
+        exp_alerts: []
+
+      # 第 7 分钟：已宕机 4 分钟，超过 for: 3m，应该触发
+      - eval_time: 7m
+        alertname: InstanceDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: node
+              instance: 10.0.0.1:9100
+            exp_annotations:
+              summary: '实例 10.0.0.1:9100 宕机'
+
+      # 第 9 分钟：已恢复，不应该有告警
+      - eval_time: 9m
+        alertname: InstanceDown
+        exp_alerts: []
+```
+
+```bash
+promtool test rules test-node.yml
+```
+
+也可以测记录规则的输出值：
+
+```yaml
+    promql_expr_test:
+      - expr: 'instance:node_cpu_utilization:ratio_rate5m'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'instance:node_cpu_utilization:ratio_rate5m{instance="10.0.0.1:9100"}'
+            value: 0.85
+```
+
+<Callout type="tip" title="把规则测试放进 CI">
+监控配置也是代码，应该纳入版本管理和 CI。一个最小可用的流水线：
+
+```bash
+promtool check config prometheus.yml
+promtool check rules rules/*.yml
+promtool test rules tests/*.yml
+```
+
+三条命令都是纯静态的，几秒就跑完。它们能拦住：语法错、模板错、`for` 逻辑错、告警该响时不响。
+
+尤其是第三条——「重构了一下表达式，结果告警再也不触发了」这种事故，只有单元测试能提前发现。
+</Callout>
+
+<Callout type="exercise" title="练习 4：从零搭建一套完整的规则体系">
+你接手了一个新服务的监控，现有原始指标：
+
+- `http_requests_total`（Counter，标签 `service`、`path`、`method`、`code`）
+- `http_request_duration_seconds_bucket`（Histogram，标签 `service`、`path`、`le`）
+- `process_resident_memory_bytes`（Gauge，标签 `service`、`instance`）
+- `up`（标签 `job`、`instance`）
+
+请设计一套完整的规则体系，包含：(1) 记录规则；(2) 告警规则（至少覆盖可用性、错误率、延迟三类）；(3) 一个针对告警规则的单元测试片段；(4) 说明 group 划分与 interval 选择的理由。
+
+<Answer>
+**完整规则文件：**
+
+```yaml
+# ============ rules/service-recording.yml ============
+groups:
+  - name: service-recording
+    interval: 30s
+    rules:
+      # ---- 流量 ----
+      - record: service:http_requests:rate5m
+        expr: sum by (service) (rate(http_requests_total[5m]))
+
+      - record: service_path:http_requests:rate5m
+        expr: sum by (service, path) (rate(http_requests_total[5m]))
+
+      # ---- 错误 ----
+      - record: service:http_errors:rate5m
+        expr: sum by (service) (rate(http_requests_total{code=~"5.."}[5m]))
+
+      - record: service:http_errors_per_requests:ratio_rate5m
+        expr: |
+          service:http_errors:rate5m
+            / service:http_requests:rate5m
+
+      # ---- 延迟（先聚合 bucket，再算分位）----
+      - record: service_path_le:http_request_duration_seconds_bucket:rate5m
+        expr: |
+          sum by (service, path, le) (
+            rate(http_request_duration_seconds_bucket[5m])
+          )
+
+      - record: service_path:http_request_duration_seconds:p99_rate5m
+        expr: |
+          histogram_quantile(0.99,
+            service_path_le:http_request_duration_seconds_bucket:rate5m)
+
+      - record: service_path:http_request_duration_seconds:p50_rate5m
+        expr: |
+          histogram_quantile(0.50,
+            service_path_le:http_request_duration_seconds_bucket:rate5m)
+```
+
+```yaml
+# ============ rules/service-alerts.yml ============
+groups:
+  - name: service-availability
+    interval: 15s          # 可用性告警要快，用更短的间隔
+    rules:
+      - alert: InstanceDown
+        expr: up{job="my-service"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: '实例 {{ $labels.instance }} 宕机'
+          description: '{{ $labels.instance }} 已无法抓取超过 3 分钟。'
+          runbook_url: 'https://wiki.internal/runbooks/instance-down'
+
+      - alert: ServiceAllInstancesDown
+        expr: |
+          count by (job) (up{job="my-service"} == 0)
+            == count by (job) (up{job="my-service"})
+        for: 2m
+        labels:
+          severity: critical
+          page: 'true'
+        annotations:
+          summary: '{{ $labels.job }} 全部实例宕机'
+          description: '该服务已完全不可用。'
+
+      - alert: NoTrafficReceived
+        expr: absent(service:http_requests:rate5m)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: '服务无任何流量数据'
+          description: '记录规则输出消失，可能是抓取中断或规则失效。'
+
+  - name: service-quality
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: service:http_errors_per_requests:ratio_rate5m > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.service }} 错误率超过 5%'
+          description: >-
+            服务 {{ $labels.service }} 当前错误率
+            {{ $value | humanizePercentage }}，已持续 5 分钟以上。
+          runbook_url: 'https://wiki.internal/runbooks/high-error-rate'
+
+      - alert: ElevatedErrorRate
+        expr: service:http_errors_per_requests:ratio_rate5m > 0.01
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.service }} 错误率偏高'
+          description: '当前错误率 {{ $value | humanizePercentage }}，持续 15 分钟。'
+
+      - alert: HighP99Latency
+        expr: service_path:http_request_duration_seconds:p99_rate5m > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.service }} 接口 {{ $labels.path }} 延迟过高'
+          description: 'P99 延迟 {{ $value | humanizeDuration }}，超过 1 秒。'
+
+  - name: service-resource
+    interval: 1m
+    rules:
+      - alert: MemoryGrowthSuspected
+        expr: |
+          predict_linear(process_resident_memory_bytes[6h], 12 * 3600)
+            > 4 * 1024 * 1024 * 1024
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.instance }} 疑似内存泄漏'
+          description: >-
+            按过去 6 小时趋势，12 小时后内存将达到
+            {{ $value | humanize1024 }}B，超过 4GiB。
+```
+
+**(3) 单元测试片段：**
+
+```yaml
+# tests/service-alerts-test.yml
+rule_files:
+  - ../rules/service-recording.yml
+  - ../rules/service-alerts.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ---- 测试 1：错误率告警在正确时机触发 ----
+  - interval: 30s
+    input_series:
+      # 总请求：每 30s 增加 300 次（QPS = 10）
+      - series: 'http_requests_total{service="api", path="/v1", method="GET", code="200"}'
+        values: '0+285x40'
+      # 5xx 错误：前 10 个点几乎没有，之后大幅上升
+      - series: 'http_requests_total{service="api", path="/v1", method="GET", code="500"}'
+        values: '0+1x10 10+45x30'
+
+    alert_rule_test:
+      # 第 6 分钟：错误刚开始上升，rate 窗口还没充分反映，且 for: 5m 未满足
+      - eval_time: 6m
+        alertname: HighErrorRate
+        exp_alerts: []
+
+      # 第 15 分钟：错误率已稳定在 5% 以上并持续超过 5 分钟
+      - eval_time: 15m
+        alertname: HighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: api
+            exp_annotations:
+              summary: 'api 错误率超过 5%'
+
+  # ---- 测试 2：实例宕机 ----
+  - interval: 30s
+    input_series:
+      - series: 'up{job="my-service", instance="10.0.0.1:8080"}'
+        values: '1x10 0x20 1x10'
+
+    alert_rule_test:
+      # 第 6 分钟：宕机 1 分钟，for: 3m 未满足
+      - eval_time: 6m
+        alertname: InstanceDown
+        exp_alerts: []
+
+      # 第 9 分钟：已宕机 4 分钟，应该 firing
+      - eval_time: 9m
+        alertname: InstanceDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: my-service
+              instance: 10.0.0.1:8080
+            exp_annotations:
+              summary: '实例 10.0.0.1:8080 宕机'
+              description: '10.0.0.1:8080 已无法抓取超过 3 分钟。'
+              runbook_url: 'https://wiki.internal/runbooks/instance-down'
+
+  # ---- 测试 3：记录规则的数值正确 ----
+  - interval: 30s
+    input_series:
+      - series: 'http_requests_total{service="api", path="/v1", code="200"}'
+        values: '0+300x30'
+      - series: 'http_requests_total{service="api", path="/v1", code="500"}'
+        values: '0+30x30'
+
+    promql_expr_test:
+      - expr: 'service:http_errors_per_requests:ratio_rate5m'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'service:http_errors_per_requests:ratio_rate5m{service="api"}'
+            value: 0.09090909090909091
+```
+
+运行：
+
+```bash
+promtool test rules tests/service-alerts-test.yml
+```
+
+**(4) group 划分与 interval 的理由：**
+
+一共分了四个 group，划分依据是**依赖关系**和**时效性要求**：
+
+| group | interval | 理由 |
+| --- | --- | --- |
+| `service-recording` | 30s | 所有记录规则有依赖链，必须同组串行；30s 相对 5m 的 rate 窗口已足够密 |
+| `service-availability` | 15s | 可用性是最紧急的，求值要快。表达式简单（只查 `up`），跑得起 |
+| `service-quality` | 30s | 依赖记录规则的输出，和记录规则同频即可，更快也没有新数据 |
+| `service-resource` | 1m | `predict_linear` 要扫 6 小时数据，非常昂贵，1 分钟一次足够 |
+
+**为什么不全塞进一个 group：**
+
+1. **并行度**。不同 group 并行执行，四个 group 的总耗时约等于最慢那个，而不是四者相加。
+2. **隔离故障**。`predict_linear` 那条规则很重，如果它拖慢了整个组，会连带延误可用性告警。分开之后互不影响。
+3. **差异化频率**。可用性要 15s，资源预测 1m 就够，塞一起只能取最小值，白白浪费算力。
+
+**为什么记录规则和告警规则要分文件：**
+
+不是技术要求，是工程习惯。记录规则相对稳定、改动少；告警规则频繁调阈值。分开之后 Git 历史更清晰，code review 时也更容易聚焦。
+
+**分层告警的设计（`HighErrorRate` 和 `ElevatedErrorRate`）：**
+
+同一个指标配了两条阈值不同的告警：
+
+- 5% 错误率 + `for: 5m` → `severity: critical`，需要立刻处理
+- 1% 错误率 + `for: 15m` → `severity: warning`，工作时间跟进即可
+
+这种分层能让 Alertmanager 按 `severity` 路由到不同渠道（critical 打电话、warning 进群），同时配合抑制规则让 critical 触发时自动压掉 warning（第 12 章会讲）。
+
+**`NoTrafficReceived` 这条为什么重要：**
+
+它是**元告警**——监控「监控本身」。如果抓取中断、记录规则写错、Exporter 挂了，其他所有基于业务指标的告警都会静默失效（表达式返回空 = 没有告警）。只有 `absent()` 能发现这种「什么都没有」的状态。
+
+**每套监控体系都应该有至少一条这样的守夜人告警。**
+</Answer>
+</Callout>
+
+## 小结
+
+- `rule_files` 支持 glob 但不递归；规则文件是 `groups` → `interval` / `rules` 的三层结构。
+- **同 group 内串行、共享时间戳、可引用前面规则的结果；不同 group 并行。** 有依赖必须同组，无依赖尽量分组。
+- 记录规则用于把昂贵查询预计算成廉价序列，命名遵循 `level:metric:operations`，冒号是「人为定义」的标志。
+- 记录规则**不回填历史**，先上线积累一段时间再切看板。
+- 告警规则的表达式必须带比较运算符，返回的每条序列就是一条告警；返回空 = 正常。
+- 状态机是 inactive → pending → firing，`for` 是消除抖动的缓冲期，期间表达式返回空会导致计时归零。
+- `{{ $labels.xxx }}` 取标签，`{{ $value }}` 取本条序列的值，配合 `humanize` / `humanizeDuration` / `humanizePercentage` 让通知可读。
+- **变化的值放 `annotations`，稳定的分类放 `labels`**——`labels` 里出现 `$value` 会摧毁 Alertmanager 的去重。
+- 五大陷阱：不带比较符、靠指标消失判故障、`for` 短于求值间隔、结果高基数、绝对阈值不适配规模。
+- 上线前跑 `promtool check rules` 和 `promtool test rules`，并**在 Graph 页面手动执行一遍表达式**——这一步能抓住 `promtool` 查不出的向量匹配失效。
+- 下一章讲 Alertmanager：告警发出去之后，怎么分组、去重、抑制、静默，最后送到正确的人手上。

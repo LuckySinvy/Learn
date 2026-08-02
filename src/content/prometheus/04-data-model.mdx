@@ -1,0 +1,1143 @@
+---
+title: 数据模型
+order: 4
+description: 指标名、标签、样本与时间戳，理解时序的构成
+---
+
+# 数据模型
+
+数据模型是 Prometheus 最核心、也最容易被匆匆略过的部分。**理解它，PromQL 会变得直观；不理解它，你会一直在「为什么查不出我要的结果」和「为什么内存又爆了」之间反复横跳。**
+
+好消息是：整个模型只有四个概念，而且极其简洁。
+
+## 1. 时序 = 指标名 + 标签集合 + 样本序列
+
+Prometheus 存储的一切都是**时间序列（time series）**。一条时间序列由两部分构成：
+
+```text
+时间序列 = 【标识】 + 【数据】
+           指标名 + 标签集合    (时间戳, 值) 的有序列表
+```
+
+形式化地写：
+
+```text
+<metric_name>{<label_1>="<value_1>", <label_2>="<value_2>", ...}
+    → [(t1, v1), (t2, v2), (t3, v3), ...]
+```
+
+一个具体例子：
+
+```text
+http_requests_total{job="api", instance="10.0.0.5:8080", method="GET", status="200"}
+    → (1714540800000, 1342)
+      (1714540815000, 1360)
+      (1714540830000, 1389)
+      (1714540845000, 1401)
+      ...
+```
+
+**关键规则：标识部分唯一确定一条序列。** 只要有任何一个标签的键或值不同，那就是**另一条完全独立的序列**，各自有各自的数据点。
+
+```text
+指标名: http_requests_total
+│
+├─ 序列①  {method="GET",  status="200"}  → (t1,1342) (t2,1360) (t3,1389) ...
+├─ 序列②  {method="GET",  status="500"}  → (t1,   3) (t2,   3) (t3,   7) ...
+├─ 序列③  {method="POST", status="200"}  → (t1, 221) (t2, 230) (t3, 244) ...
+└─ 序列④  {method="POST", status="500"}  → (t1,   0) (t2,   1) (t3,   1) ...
+```
+
+<Callout type="info" title="指标名其实也是一个标签">
+Prometheus 内部把指标名存成一个特殊标签 `__name__`。也就是说：
+
+```promql
+http_requests_total{status="200"}
+```
+
+完全等价于：
+
+```promql
+{__name__="http_requests_total", status="200"}
+```
+
+这个认知有实用价值——你可以对指标名做正则匹配：
+
+```promql
+# 查所有以 node_cpu 开头的指标
+{__name__=~"node_cpu.*"}
+```
+
+也解释了为什么 `metric_relabel_configs` 里用 `source_labels: [__name__]` 就能按指标名过滤。
+</Callout>
+
+## 2. 指标名（metric name）：测的是什么
+
+指标名回答「这个数字测量的是什么量」。它的合法字符集是：
+
+```text
+[a-zA-Z_:][a-zA-Z0-9_:]*
+```
+
+即：字母、数字、下划线、冒号，且不能以数字开头。**冒号 `:` 按约定保留给记录规则（recording rule）使用**，直接采集的指标不要用冒号。
+
+### 2.1 命名规范
+
+社区有一套约定俗成的规范，遵守它能让你的指标对所有人都自解释：
+
+```text
+<命名空间>_<被测对象>_<单位>_<后缀>
+   ↓          ↓         ↓       ↓
+  http    _requests_ ...    _total
+  node    _memory_  _bytes
+  process _cpu_seconds_     _total
+```
+
+**规则一：全部 snake_case 小写。**
+
+```text
+✅ http_requests_total
+❌ HttpRequestsTotal
+❌ http-requests-total
+```
+
+**规则二：带上单位后缀，且用基本单位。**
+
+```text
+✅ node_memory_MemFree_bytes         用 bytes，不用 KB/MB
+✅ http_request_duration_seconds     用 seconds，不用 ms
+✅ node_network_transmit_bytes_total
+❌ request_duration_ms               避免非基本单位
+❌ memory_usage                      单位不明，看的人只能猜
+```
+
+**为什么坚持基本单位？** 因为 Grafana 等展示层能自动把 `bytes` 换算成 KB/MB/GB、把 `seconds` 换算成 ms/µs，前提是你用了标准单位。用了 `ms` 反而失去了自动格式化能力，还容易在计算时出错（比如把 ms 和 s 混着相加）。
+
+**规则三：Counter 类型加 `_total` 后缀。**
+
+```text
+✅ http_requests_total          累计请求数
+✅ errors_total                 累计错误数
+✅ process_cpu_seconds_total    累计 CPU 时间
+```
+
+看到 `_total` 就知道这是个只增不减的计数器，必须配 `rate()` / `increase()` 使用。
+
+**规则四：加统一的命名空间前缀。**
+
+```text
+✅ mysql_global_status_threads_connected
+✅ redis_connected_clients
+✅ myapp_order_created_total
+❌ connected_clients            太泛，会和别人撞名
+```
+
+**规则五：同一指标名的所有序列必须是同一逻辑量。**
+
+```text
+❌ 错误做法：用 type 标签区分完全不同的东西
+   system_usage{type="cpu"}      单位是百分比
+   system_usage{type="memory"}   单位是字节
+   → sum(system_usage) 会把百分比和字节加在一起，毫无意义
+
+✅ 正确做法：拆成两个指标
+   system_cpu_usage_ratio
+   system_memory_usage_bytes
+```
+
+<Callout type="tip" title="命名自检法">
+写完指标名，问自己：「一个从没见过我系统的人，光看这个名字能猜出它测什么、单位是什么、是不是累计值吗？」
+
+`http_request_duration_seconds` —— 能。HTTP 请求耗时，单位秒，不是累计值。
+`req_time` —— 不能。哪种请求？单位是秒还是毫秒？是平均值还是当前值？
+</Callout>
+
+### 2.2 常见后缀速查
+
+| 后缀 | 含义 | 示例 |
+|---|---|---|
+| `_total` | Counter 累计值 | `http_requests_total` |
+| `_seconds` | 时间，单位秒 | `process_cpu_seconds_total` |
+| `_bytes` | 大小，单位字节 | `node_memory_MemFree_bytes` |
+| `_ratio` | 比率，取值 0–1 | `node_cpu_usage_ratio` |
+| `_count` | Histogram/Summary 的样本个数 | `http_request_duration_seconds_count` |
+| `_sum` | Histogram/Summary 的总和 | `http_request_duration_seconds_sum` |
+| `_bucket` | Histogram 的桶 | `http_request_duration_seconds_bucket` |
+| `_info` | 元信息指标，值恒为 1 | `node_uname_info` |
+
+## 3. 标签（label）：维度切分
+
+标签是 Prometheus 相对于传统监控系统最大的优势。它把「一个指标」变成了「一个可以任意切片的多维数据立方体」。
+
+### 3.1 标签让查询变成切片操作
+
+有了标签，同一个指标可以回答无数个问题：
+
+```promql
+# 全部：所有维度组合的 QPS
+sum(rate(http_requests_total[5m]))
+
+# 切片：只看 POST 请求
+sum(rate(http_requests_total{method="POST"}[5m]))
+
+# 切片：只看 5xx 错误（正则匹配）
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+
+# 分组：按状态码维度展开
+sum by (status) (rate(http_requests_total[5m]))
+
+# 组合：北京机房 POST 接口的 5xx 率，按实例展开
+sum by (instance) (rate(http_requests_total{region="bj", method="POST", status=~"5.."}[5m]))
+/
+sum by (instance) (rate(http_requests_total{region="bj", method="POST"}[5m]))
+```
+
+四种标签匹配运算符：
+
+| 运算符 | 含义 | 示例 |
+|---|---|---|
+| `=` | 精确等于 | `http_requests_total{status="200"}` |
+| `!=` | 不等于 | `http_requests_total{status!="200"}` |
+| `=~` | 正则匹配（完全匹配，自动锚定） | `http_requests_total{method=~"GET\|POST"}` |
+| `!~` | 正则不匹配 | `http_requests_total{path!~"/health.*"}` |
+
+<Callout type="warn" title="正则是完全匹配的">
+Prometheus 的 `=~` 会自动在两端加上 `^` 和 `$`。所以 `status=~"5"` **匹配不到** `500`——它要求整个值就是字符串 `"5"`。想匹配 5 开头的三位数要写 `status=~"5.."` 或 `status=~"5.*"`。这是新手最常见的困惑之一。
+</Callout>
+
+### 3.2 自动附加的标签
+
+有两个标签是 Prometheus **自动加上**的，不需要（也不应该）在应用里定义：
+
+- **`job`**：来自配置里的 `job_name`，标识「这是哪一类服务」。
+- **`instance`**：目标的 `host:port`，标识「这是哪一个具体实例」。
+
+```text
+# 应用暴露的原始文本
+http_requests_total{method="GET",status="200"} 1027
+
+# Prometheus 入库后实际存储的
+http_requests_total{method="GET",status="200",job="api",instance="10.0.0.5:8080"} 1027
+```
+
+<Callout type="warn" title="不要在应用里手动打 instance 标签">
+如果你的代码里给指标加了 `instance="xxx"`，会与 Prometheus 自动附加的标签冲突。默认情况下 Prometheus 会把你的值改名为 `exported_instance`，制造混乱。实例身份应该由**采集端**（配置和服务发现）决定，而不是应用自己声明——这样才能在换 IP、换端口时不用改代码。
+</Callout>
+
+### 3.3 标签基数（cardinality）初识
+
+**基数 = 一个指标产生的时间序列条数 = 各标签取值数的乘积。**
+
+```text
+指标 http_requests_total 有三个标签：
+  method:   4 种取值 (GET/POST/PUT/DELETE)
+  status:   5 种取值 (200/400/404/500/503)
+  instance: 6 个实例
+
+基数 = 4 × 5 × 6 = 120 条序列   ✅ 完全健康
+```
+
+危险在于**乘法会失控**：
+
+```text
+再加一个 user_id 标签（10 万用户）：
+基数 = 4 × 5 × 6 × 100,000 = 12,000,000 条序列   💥 直接 OOM
+```
+
+按经验值 1–3 KB/序列估算，1200 万条序列需要 **12–36 GB 内存**。而且这还只是一个指标。
+
+**高基数带来的连锁反应：**
+
+1. **内存爆炸** → Prometheus OOM。
+2. **重启后 WAL 重放要几十分钟** → 这期间监控完全失明。
+3. **查询变慢甚至超时** → 需要它的时候它却查不动。
+4. **磁盘暴涨** → 触发保留策略提前删数据。
+
+### 3.4 什么样的标签值是危险的
+
+判断标准很简单：**这个标签的取值集合是「有限可枚举」的吗？**
+
+| 危险的标签值 | 为什么 | 应该怎么办 |
+|---|---|---|
+| `user_id`、`session_id` | 取值无上限 | 放日志里；指标里只统计聚合量 |
+| `request_id`、`trace_id` | 每次请求都不同 | 放链路追踪系统 |
+| `url` 完整路径（含 ID） | `/order/12345` 每个订单一条序列 | 归一化为路由模板 `/order/:id` |
+| `email`、`phone` | 无上限，还涉及隐私 | 绝不要放指标 |
+| 时间戳、UUID | 天然无限 | 值本身就是时间，不需要标签 |
+| 错误堆栈、异常消息 | 文本自由度极高 | 归一化为错误类型枚举 |
+| IP 地址（客户端） | 公网 IP 上亿种 | 归一化为地区/运营商 |
+
+<Callout type="tip" title="URL 归一化是最常见的救火操作">
+Web 应用埋点最容易踩的坑就是把原始 URL 当标签：
+
+```text
+❌ http_requests_total{path="/api/order/10001"}
+   http_requests_total{path="/api/order/10002"}
+   → 每个订单一条序列，一天几十万条
+
+✅ http_requests_total{path="/api/order/:id"}
+   → 一条序列，且这才是你真正想看的「订单查询接口的性能」
+```
+
+大部分 Web 框架的 Prometheus 中间件都支持自动获取「路由模板」而非「实际路径」，接入时务必确认这一点。
+</Callout>
+
+**紧急止血手段**：如果高基数指标已经进来了，可以在 Prometheus 侧用 `metric_relabel_configs` 在入库前拦下：
+
+```yaml
+scrape_configs:
+  - job_name: 'app'
+    static_configs:
+      - targets: ['10.0.1.5:8080']
+    metric_relabel_configs:
+      # 方案 A：直接丢弃整个高基数指标
+      - source_labels: [__name__]
+        regex: 'http_requests_by_user_total'
+        action: drop
+
+      # 方案 B：保留指标但删掉高基数标签（会自动合并同名序列）
+      - regex: 'user_id|session_id|request_id'
+        action: labeldrop
+```
+
+用 Web UI 的 `/tsdb-status` 页面可以快速定位罪魁祸首，它直接列出序列数 Top10 的指标名和标签。
+
+## 4. 样本（sample）：(时间戳, 值)
+
+样本是时间序列中的一个数据点，只有两个字段：
+
+```text
+样本 = (时间戳, 值)
+        int64    float64
+       毫秒精度   64 位浮点
+```
+
+### 4.1 值永远是 float64
+
+这是个硬性约束，带来几个必须知道的推论：
+
+**推论一：存不了字符串。**
+
+想记录「当前版本号是 v2.3.1」怎么办？用 **info 指标模式**——把信息编码进标签，值恒为 1：
+
+```text
+# 版本信息用 info 指标表达
+myapp_build_info{version="2.3.1", commit="a1b2c3d", branch="main"} 1
+node_uname_info{nodename="web-01", release="5.15.0", machine="x86_64"} 1
+```
+
+查询时用向量匹配把信息「贴」到其他指标上：
+
+```promql
+# 按版本查看 QPS（把 version 标签关联进来）
+sum by (version) (
+  rate(http_requests_total[5m])
+  * on(instance) group_left(version) myapp_build_info
+)
+```
+
+**推论二：布尔状态用 0/1 表示。**
+
+```text
+up 1                          # 1=健康 0=不健康
+node_systemd_unit_state{name="nginx.service", state="active"} 1
+```
+
+**推论三：超大整数会损失精度。**
+
+float64 只能精确表示 2^53（约 9×10^15）以内的整数。极大的计数器（如纳秒级累计值）可能丢精度，这也是为什么 Prometheus 推荐用 `seconds` 而不是 `nanoseconds`。
+
+**推论四：支持特殊值。**
+
+```text
+NaN     非数字，常用于表示「无数据」
++Inf    正无穷（Histogram 的最后一个桶就是 le="+Inf"）
+-Inf    负无穷
+```
+
+### 4.2 时间戳通常由 Prometheus 决定
+
+文本格式**允许**在值后面写一个毫秒时间戳，但绝大多数情况下应该省略：
+
+```text
+# 推荐：省略时间戳，用抓取时刻
+http_requests_total{status="200"} 1027
+
+# 不推荐：显式指定时间戳（毫秒）
+http_requests_total{status="200"} 1027 1714540800000
+```
+
+**为什么推荐省略？**
+
+- 抓取时刻由 Prometheus 统一记录，所有目标的时间基准一致，不受各机器时钟漂移影响。
+- 显式时间戳有严格限制：不能太旧（超出容忍窗口会被拒），乱序样本会被丢弃。
+- 只有 Pushgateway 转发、联邦抓取这类「代理别人的数据」的场景才需要显式时间戳。
+
+<Callout type="warn" title="Prometheus 不接受乱序和过旧的样本">
+TSDB 的 Head block 要求同一序列的样本**按时间递增**写入。晚到的样本（时间戳小于该序列已有的最新样本）会被直接丢弃并计入 `prometheus_target_scrapes_sample_out_of_order_total`。
+
+这就是为什么 Prometheus 不适合做「补录历史数据」——它是为实时监控设计的。（2.39+ 提供了实验性的 out-of-order 支持，但需要显式开启且有窗口限制。）
+</Callout>
+
+### 4.3 陈旧性标记（staleness）
+
+当一个序列在某次抓取中「消失」了（比如某个 Pod 被销毁），Prometheus 会写入一个特殊的 **stale marker**（一个特殊的 NaN 值）。这让查询能立即知道「这条序列已经不存在了」，而不是继续返回 5 分钟前的旧值。
+
+这个机制解释了一个常见现象：Pod 删除后，Grafana 上对应的线会**立刻断掉**，而不是拖着一条水平直线。
+
+## 5. 何时加标签，何时拆成不同指标
+
+这是设计指标时最需要判断力的地方。给一条清晰的判断准则：
+
+> **如果两组数据「加起来有意义」，就用标签区分；如果「加起来无意义」，就拆成不同指标。**
+
+### 5.1 该用标签的情况
+
+**同一个物理量，只是维度不同：**
+
+```text
+✅ http_requests_total{method="GET"}   1000
+   http_requests_total{method="POST"}   500
+   → sum() = 1500 总请求数，有意义 ✓
+```
+
+```text
+✅ node_network_receive_bytes_total{device="eth0"}
+   node_network_receive_bytes_total{device="eth1"}
+   → sum() = 网卡总接收字节数，有意义 ✓
+```
+
+```text
+✅ node_filesystem_avail_bytes{mountpoint="/"}
+   node_filesystem_avail_bytes{mountpoint="/data"}
+   → sum() = 总剩余空间，有意义 ✓
+```
+
+### 5.2 该拆成不同指标的情况
+
+**语义不同、单位不同，加起来是废话：**
+
+```text
+❌ 错误：用标签区分不同的量
+   node_stats{type="cpu_percent"}    75      单位：百分比
+   node_stats{type="memory_bytes"}   8.6e9   单位：字节
+   node_stats{type="disk_percent"}   42      单位：百分比
+   → sum() = 8600000117，毫无意义 ✗
+
+✅ 正确：拆成三个指标
+   node_cpu_usage_percent      75
+   node_memory_used_bytes      8.6e9
+   node_disk_usage_percent     42
+```
+
+**读写方向不同（虽然单位相同，但混算容易出错）：**
+
+```text
+⚠️ 这两种写法都有人用，各有取舍：
+
+写法 A（拆指标，Prometheus 官方 exporter 的选择）：
+   node_network_receive_bytes_total{device="eth0"}
+   node_network_transmit_bytes_total{device="eth0"}
+
+写法 B（用标签）：
+   node_network_bytes_total{device="eth0", direction="receive"}
+   node_network_bytes_total{device="eth0", direction="transmit"}
+
+官方倾向 A：因为「收 + 发」的总和很少有人真的需要，
+而分开写能让 rate(node_network_receive_bytes_total[5m]) 一目了然。
+```
+
+### 5.3 判断流程
+
+```text
+问题 1：这两组数据的单位相同吗？
+        否 → 拆成不同指标
+        是 ↓
+问题 2：把它们 sum() 起来，得到的数字有业务含义吗？
+        否 → 拆成不同指标
+        是 ↓
+问题 3：这个区分维度的取值是有限可枚举的吗？
+        否 → 别放进指标（放日志）
+        是 → ✅ 用标签
+```
+
+<Callout type="info" title="一个实战反例">
+见过一个真实的糟糕设计：
+
+```text
+app_metric{name="qps", service="order"} 120
+app_metric{name="latency_p99", service="order"} 0.85
+app_metric{name="error_rate", service="order"} 0.02
+```
+
+所有东西挤在一个叫 `app_metric` 的指标里，用 `name` 标签区分。问题是：
+
+- `sum(app_metric)` 完全无意义
+- 无法为不同的量设置不同的告警单位和阈值语义
+- Grafana 里没法自动选择合适的单位格式
+- 后来想给延迟加 Histogram 桶时彻底做不到
+
+这是典型的「把 Prometheus 当成 key-value 存储」的错误心智模型。
+</Callout>
+
+## 6. 从 /metrics 文本理解数据模型
+
+最后，我们回到最本质的地方：亲眼看一段真实的 `/metrics` 输出，把前面所有概念对上号。
+
+```bash
+curl -s http://localhost:9100/metrics
+```
+
+节选一段真实的 node_exporter 输出：
+
+```text
+# HELP node_cpu_seconds_total Seconds the CPUs spent in each mode.
+# TYPE node_cpu_seconds_total counter
+node_cpu_seconds_total{cpu="0",mode="idle"} 152834.71
+node_cpu_seconds_total{cpu="0",mode="iowait"} 412.85
+node_cpu_seconds_total{cpu="0",mode="system"} 3021.44
+node_cpu_seconds_total{cpu="0",mode="user"} 8934.12
+node_cpu_seconds_total{cpu="1",mode="idle"} 153011.29
+node_cpu_seconds_total{cpu="1",mode="iowait"} 398.17
+node_cpu_seconds_total{cpu="1",mode="system"} 2987.63
+node_cpu_seconds_total{cpu="1",mode="user"} 8712.55
+
+# HELP node_memory_MemTotal_bytes Memory information field MemTotal_bytes.
+# TYPE node_memory_MemTotal_bytes gauge
+node_memory_MemTotal_bytes 1.6633360384e+10
+
+# HELP node_memory_MemAvailable_bytes Memory information field MemAvailable_bytes.
+# TYPE node_memory_MemAvailable_bytes gauge
+node_memory_MemAvailable_bytes 9.284698112e+09
+
+# HELP node_filesystem_avail_bytes Filesystem space available to non-root users in bytes.
+# TYPE node_filesystem_avail_bytes gauge
+node_filesystem_avail_bytes{device="/dev/sda1",fstype="ext4",mountpoint="/"} 4.1863168e+10
+node_filesystem_avail_bytes{device="/dev/sdb1",fstype="ext4",mountpoint="/data"} 2.16172544e+11
+
+# HELP node_uname_info Labeled system information as provided by the uname system call.
+# TYPE node_uname_info gauge
+node_uname_info{machine="x86_64",nodename="web-01",release="5.15.0-91-generic",sysname="Linux"} 1
+
+# HELP node_load1 1m load average.
+# TYPE node_load1 gauge
+node_load1 0.42
+
+# HELP node_scrape_collector_duration_seconds node_exporter: Duration of a collector scrape.
+# TYPE node_scrape_collector_duration_seconds gauge
+node_scrape_collector_duration_seconds{collector="cpu"} 0.000412331
+node_scrape_collector_duration_seconds{collector="filesystem"} 0.002187654
+```
+
+逐行解读：
+
+| 文本片段 | 对应概念 |
+|---|---|
+| `# HELP node_load1 1m load average.` | 元信息：人类可读描述，会显示在 Web UI |
+| `# TYPE node_load1 gauge` | 元信息：指标类型 |
+| `node_cpu_seconds_total` | **指标名**，snake_case + `seconds` 单位 + `_total` 表明是 Counter |
+| `{cpu="0",mode="idle"}` | **标签集合**，两个维度：哪个核、哪种模式 |
+| `152834.71` | **样本值**，float64 |
+| （行末无时间戳） | 时间戳由 Prometheus 用抓取时刻填充 |
+| `node_uname_info{...} 1` | **info 指标**模式：信息在标签里，值恒为 1 |
+| `1.6633360384e+10` | 科学计数法，等于 16633360384 字节（约 15.5 GiB） |
+
+**数一数序列数：**
+
+```text
+node_cpu_seconds_total       : 2 cpu × 4 mode = 8 条
+node_memory_MemTotal_bytes   : 无标签         = 1 条
+node_memory_MemAvailable_bytes: 无标签        = 1 条
+node_filesystem_avail_bytes  : 2 个挂载点     = 2 条
+node_uname_info              : 无变化维度     = 1 条
+node_load1                   : 无标签         = 1 条
+node_scrape_collector_...    : 2 个 collector = 2 条
+                                        合计 = 16 条序列
+```
+
+（入库后每条还会自动附加 `job` 和 `instance` 标签，但它们在同一个目标下是常量，不改变序列数。）
+
+**基于这段文本能写出的查询：**
+
+```promql
+# CPU 使用率（100% 减去 idle 的占比）
+100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# 内存使用率
+100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+# 根分区剩余空间（GB）
+node_filesystem_avail_bytes{mountpoint="/"} / 1024 / 1024 / 1024
+
+# 磁盘使用率超过 85% 的分区
+100 * (1 - node_filesystem_avail_bytes / node_filesystem_size_bytes) > 85
+```
+
+<Callout type="tip" title="动手是最快的理解方式">
+花两分钟做这件事，胜过读十遍文档：
+
+```bash
+# 1. 起一个 node_exporter
+docker run -d -p 9100:9100 prom/node-exporter
+
+# 2. 看看它暴露了多少条序列
+curl -s http://localhost:9100/metrics | grep -v '^#' | wc -l
+
+# 3. 看看有哪些指标名（去重后）
+curl -s http://localhost:9100/metrics | grep -v '^#' | cut -d'{' -f1 | cut -d' ' -f1 | sort -u | head -30
+
+# 4. 找出序列数最多的指标（基数排查的手工版）
+curl -s http://localhost:9100/metrics | grep -v '^#' | cut -d'{' -f1 | cut -d' ' -f1 | sort | uniq -c | sort -rn | head -10
+```
+
+你会发现一个默认的 node_exporter 就有 500–1000 条序列。乘以你的机器数量，就是主机监控的基数成本。
+</Callout>
+
+---
+
+<Callout type="exercise" title="练习 1：数序列与算基数">
+给定下面这段 `/metrics` 输出：
+
+```text
+# HELP cache_operations_total Total cache operations.
+# TYPE cache_operations_total counter
+cache_operations_total{cache="user",op="get",result="hit"} 88231
+cache_operations_total{cache="user",op="get",result="miss"} 1204
+cache_operations_total{cache="user",op="set",result="ok"} 3341
+cache_operations_total{cache="product",op="get",result="hit"} 45120
+cache_operations_total{cache="product",op="get",result="miss"} 890
+
+# HELP cache_size_bytes Current cache size.
+# TYPE cache_size_bytes gauge
+cache_size_bytes{cache="user"} 4.194304e+06
+cache_size_bytes{cache="product"} 1.2582912e+07
+```
+
+回答：
+1. 这段文本包含几个**指标名**？几条**时间序列**？
+2. 假设这个应用部署了 8 个实例，总共会在 Prometheus 里产生多少条序列？
+3. 写一条 PromQL 计算 `user` 缓存的命中率。
+
+<Answer>
+**参考答案：**
+
+**问题 1：2 个指标名，7 条时间序列。**
+
+指标名（`# TYPE` 行的数量，也是不含标签的名字）：
+
+```text
+cache_operations_total
+cache_size_bytes
+```
+
+时间序列（每一行非注释的样本 = 一条序列的标识）：
+
+```text
+cache_operations_total{cache="user",   op="get", result="hit"}    → 1
+cache_operations_total{cache="user",   op="get", result="miss"}   → 2
+cache_operations_total{cache="user",   op="set", result="ok"}     → 3
+cache_operations_total{cache="product",op="get", result="hit"}    → 4
+cache_operations_total{cache="product",op="get", result="miss"}   → 5
+cache_size_bytes{cache="user"}                                    → 6
+cache_size_bytes{cache="product"}                                 → 7
+```
+
+注意这里的标签组合是**稀疏**的，不是满乘积：`product` 缓存没有 `op="set"` 的记录，`set` 操作也没有 `result="miss"`。**实际序列数取决于真实出现的组合，而不是标签取值数的理论乘积**——这一点在估算基数时很重要，理论乘积通常是上界。
+
+**问题 2：8 个实例 → 56 条序列。**
+
+```text
+7 条/实例 × 8 实例 = 56 条
+```
+
+因为 Prometheus 会给每条序列自动附加 `instance` 标签，不同实例的同名同标签序列是**互相独立**的：
+
+```text
+cache_size_bytes{cache="user", job="app", instance="10.0.1.1:8080"}
+cache_size_bytes{cache="user", job="app", instance="10.0.1.2:8080"}
+... 共 8 条
+```
+
+**问题 3：user 缓存命中率。**
+
+```promql
+sum(rate(cache_operations_total{cache="user", op="get", result="hit"}[5m]))
+/
+sum(rate(cache_operations_total{cache="user", op="get"}[5m]))
+```
+
+**几个关键点：**
+
+1. **必须用 `rate()`**。`cache_operations_total` 是 Counter（进程启动以来的累计值），直接相除得到的是「有史以来的平均命中率」，这个数字会越来越迟钝，掩盖近期的异常。用 `rate(...[5m])` 得到的是「最近 5 分钟的命中率」，才有排查价值。
+
+2. **分母要限定 `op="get"`**。命中率只对读操作有意义。如果不加这个条件，`op="set"` 的次数会被算进分母，得到一个偏低且无意义的数字。
+
+3. **用 `sum()` 聚合掉 instance**。上面的写法算的是所有实例的整体命中率。如果想看每个实例：
+
+   ```promql
+   sum by (instance) (rate(cache_operations_total{cache="user", op="get", result="hit"}[5m]))
+   /
+   sum by (instance) (rate(cache_operations_total{cache="user", op="get"}[5m]))
+   ```
+
+4. **除零问题**。如果某段时间完全没有 get 请求，分母为 0，结果是 `NaN`。写告警时要注意，可以加一个流量下限条件：
+
+   ```promql
+   (
+     sum(rate(cache_operations_total{cache="user", op="get", result="hit"}[5m]))
+     / sum(rate(cache_operations_total{cache="user", op="get"}[5m]))
+   ) < 0.8
+   and
+   sum(rate(cache_operations_total{cache="user", op="get"}[5m])) > 1
+   ```
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：给指标改名">
+下面 6 个指标名都有问题，请指出问题并给出符合规范的写法：
+
+```text
+1. RequestCount
+2. api_latency_ms
+3. disk_free
+4. errors
+5. memory_usage_percent_total
+6. queue_size{type="length"}
+```
+
+<Answer>
+**参考答案：**
+
+**1. `RequestCount` → `http_requests_total`**
+
+问题：
+- 用了驼峰命名，应该是 snake_case
+- 没有命名空间前缀，`RequestCount` 太泛，容易和其他组件撞名
+- Counter 类型应该以 `_total` 结尾
+
+修正后一眼就能看出：HTTP 请求，累计计数器。
+
+---
+
+**2. `api_latency_ms` → `api_request_duration_seconds`**
+
+问题：
+- **单位错误**：Prometheus 约定用**基本单位**，时间必须用 `seconds` 而不是 `ms`
+- `latency` 不如 `duration` 精确（业界更倾向用 duration 表示耗时）
+
+为什么这条特别重要：Grafana 会根据 `seconds` 单位自动把 `0.0032` 显示成 `3.2 ms`，用 `ms` 反而失去了自动格式化。而且不同组件如果单位不统一（有的 ms 有的 s），做聚合运算时必然出错。
+
+如果这是个耗时分布，更好的做法是用 Histogram：
+
+```text
+api_request_duration_seconds_bucket{le="0.1"} 900
+api_request_duration_seconds_sum 187.3
+api_request_duration_seconds_count 1248
+```
+
+---
+
+**3. `disk_free` → `node_filesystem_avail_bytes`**
+
+问题：
+- **缺少单位后缀**，`disk_free` 是 4.2 还是 4200000000？是 GB 还是字节？看的人只能猜
+- 缺少命名空间前缀
+- 缺少维度标签，应该带上 `mountpoint`、`device`、`fstype`
+
+修正后：
+
+```text
+node_filesystem_avail_bytes{device="/dev/sda1",fstype="ext4",mountpoint="/"} 4.1863168e+10
+```
+
+---
+
+**4. `errors` → `myapp_request_errors_total`**
+
+问题：
+- 名字过于笼统，什么的错误？请求错误、数据库错误还是解析错误？
+- 无命名空间，必然与其他 exporter 撞名
+- Counter 缺 `_total` 后缀
+
+更好的设计其实是**不单独建错误指标**，而是给已有的请求指标加一个 `status` 或 `result` 标签：
+
+```text
+myapp_requests_total{result="success"} 98213
+myapp_requests_total{result="error"}      47
+```
+
+这样错误率可以直接用同一个指标算出来，不用担心两个指标的采样窗口不一致：
+
+```promql
+sum(rate(myapp_requests_total{result="error"}[5m])) / sum(rate(myapp_requests_total[5m]))
+```
+
+---
+
+**5. `memory_usage_percent_total` → `node_memory_usage_ratio`（或直接用原始字节数）**
+
+问题：
+- **`_total` 用错了**。`_total` 专门表示「只增不减的 Counter」，而内存使用率是会上下波动的 Gauge，加 `_total` 会严重误导（别人可能对它用 `rate()`）
+- Prometheus 约定用 `ratio`（0–1）而不是 `percent`（0–100），因为 Grafana 的百分比单位默认按 0–1 解析
+
+最佳实践其实是**不要在 exporter 里算比率，而是暴露原始值**，让查询时再算：
+
+```text
+node_memory_MemTotal_bytes      1.6633360384e+10
+node_memory_MemAvailable_bytes  9.284698112e+09
+```
+
+```promql
+100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+```
+
+**为什么暴露原始值更好？** 因为比率丢失了信息——你无法从「使用率 60%」反推出总量是 16 GB 还是 160 GB，也无法跨实例做加权平均。原始值可以随时算出比率，反之不行。
+
+---
+
+**6. `queue_size{type="length"}` → `myapp_queue_length` 或 `myapp_queue_depth`**
+
+问题：
+- **用标签表达本该属于指标名的语义**。`type="length"` 这个标签没有任何切分价值，它描述的是「这个指标是什么」，而不是「这条数据属于哪个维度」
+- 缺少命名空间
+
+修正：
+
+```text
+myapp_queue_length{queue="email", priority="high"} 12
+```
+
+这里 `queue` 和 `priority` 才是真正的维度标签——它们能回答「哪个队列」「什么优先级」，而 `type="length"` 只是把指标名的一部分挪到了标签里。
+
+**判断方法**：如果一个标签的取值集合永远只有一个值，或者去掉它之后 `sum()` 的结果反而变得无意义，那它就不该是标签。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：标签还是拆指标？">
+以下 4 组数据，判断应该「用标签区分」还是「拆成不同指标」，并说明理由：
+
+1. Nginx 的 2xx / 3xx / 4xx / 5xx 响应数
+2. 一台机器的 CPU 温度（摄氏度）和 CPU 使用率（百分比）
+3. Kafka 各个 topic 各个 partition 的消息堆积量
+4. JVM 的堆内存已用量、堆内存上限、非堆内存已用量
+
+<Answer>
+**参考答案：**
+
+**1. 2xx / 3xx / 4xx / 5xx 响应数 → 用标签 ✅**
+
+```text
+nginx_http_requests_total{status="200"} 98213
+nginx_http_requests_total{status="404"}   412
+nginx_http_requests_total{status="500"}    47
+```
+
+理由：
+- **单位相同**（都是「请求次数」）
+- **求和有意义**：`sum(nginx_http_requests_total)` = 总请求数，这正是你想要的
+- **取值有限可枚举**：HTTP 状态码就那几十个
+- 用标签才能方便地算错误率：
+
+  ```promql
+  sum(rate(nginx_http_requests_total{status=~"5.."}[5m]))
+  / sum(rate(nginx_http_requests_total[5m]))
+  ```
+
+  如果拆成 `nginx_5xx_total` 和 `nginx_total` 两个指标，这个查询就变得笨拙，而且两个指标可能来自不同的采集时刻，存在不一致风险。
+
+**小优化**：如果状态码种类太多（自定义状态码），可以额外加一个 `status_class="5xx"` 标签，方便按类聚合而不必写正则。
+
+---
+
+**2. CPU 温度 和 CPU 使用率 → 拆成不同指标 ✅**
+
+```text
+node_hwmon_temp_celsius{chip="coretemp", sensor="temp1"} 58.0
+node_cpu_seconds_total{cpu="0", mode="user"} 8934.12
+```
+
+理由：
+- **单位完全不同**：摄氏度 vs 秒（或百分比）
+- **求和毫无意义**：`58 + 75 = 133`，这个数字不代表任何东西
+- 告警阈值语义完全不同：温度 > 80°C 是硬件告警，使用率 > 90% 是容量告警
+- Grafana 需要用不同的单位格式渲染（`°C` vs `%`）
+
+**反面教材**：
+
+```text
+❌ node_stats{type="cpu_temp"} 58
+   node_stats{type="cpu_usage"} 75
+```
+
+这种写法会让所有聚合函数失效，也无法为两者配置不同的图表单位。
+
+---
+
+**3. Kafka 各 topic 各 partition 的堆积量 → 用标签 ✅（但要注意基数）**
+
+```text
+kafka_consumergroup_lag{group="order-consumer", topic="orders", partition="0"} 1204
+kafka_consumergroup_lag{group="order-consumer", topic="orders", partition="1"}  890
+kafka_consumergroup_lag{group="order-consumer", topic="payments", partition="0"} 12
+```
+
+理由：
+- **单位相同**（消息条数）
+- **求和有意义**：`sum by (topic) (kafka_consumergroup_lag)` = 该 topic 的总堆积，这正是最常看的指标
+- 可以灵活切片：按 group 看、按 topic 看、按 partition 看
+
+**但必须警惕基数**：
+
+```text
+基数 = 消费组数 × topic 数 × partition 数
+例：50 个消费组 × 100 个 topic × 20 个分区 = 100,000 条序列
+```
+
+十万条序列已经不小了。如果集群规模更大，考虑：
+- 在 exporter 侧就聚合掉 partition 维度（大多数场景只需要 topic 级别的总堆积）
+- 用 `metric_relabel_configs` 的 `labeldrop` 去掉 `partition` 标签
+
+**判断标准**：partition 级别的粒度你真的会去看吗？如果只在极少数排查场景用得上，就不值得为它承担 20 倍的基数。
+
+---
+
+**4. JVM 堆已用 / 堆上限 / 非堆已用 → 混合方案 ✅**
+
+标准的 Micrometer / JMX exporter 做法：
+
+```text
+# 「已用量」和「上限」是不同的量 → 拆成不同指标
+jvm_memory_used_bytes{area="heap", id="G1 Eden Space"} 2.68435456e+08
+jvm_memory_used_bytes{area="heap", id="G1 Old Gen"}    5.36870912e+08
+jvm_memory_used_bytes{area="nonheap", id="Metaspace"}  8.3886080e+07
+
+jvm_memory_max_bytes{area="heap", id="G1 Eden Space"}  1.073741824e+09
+jvm_memory_max_bytes{area="heap", id="G1 Old Gen"}     2.147483648e+09
+```
+
+**为什么这么设计：**
+
+- **「已用」和「上限」拆成两个指标**：虽然单位都是 bytes，但 `sum(used) + sum(max)` 毫无意义。它们是两个不同性质的量（观测值 vs 配置值）。
+
+- **「堆」和「非堆」用 `area` 标签**：单位相同，且 `sum(jvm_memory_used_bytes)` = JVM 总内存占用，这个数字有明确意义（可以和容器内存限制对比）。
+
+- **各内存区用 `id` 标签**：`sum by (area) (jvm_memory_used_bytes{area="heap"})` = 堆总使用量，有意义。
+
+这样设计后，堆使用率的查询非常自然：
+
+```promql
+sum(jvm_memory_used_bytes{area="heap"}) / sum(jvm_memory_max_bytes{area="heap"})
+```
+
+**通用判断流程再回顾一遍：**
+
+```text
+单位相同吗？ 否 → 拆指标
+    ↓ 是
+sum() 有意义吗？ 否 → 拆指标
+    ↓ 是
+维度取值有限吗？ 否 → 别进指标
+    ↓ 是
+→ 用标签，但估算一下基数是否可接受
+```
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 4：诊断一次基数爆炸">
+某天 Prometheus 突然 OOM，重启后 `prometheus_tsdb_head_series` 显示 480 万条序列（平时只有 20 万）。打开 `/tsdb-status` 页面，看到序列数 Top1 的指标是：
+
+```text
+api_request_duration_seconds_bucket    4,320,000
+```
+
+进一步查看该指标的一条样本：
+
+```text
+api_request_duration_seconds_bucket{le="0.5",path="/user/8823/orders",method="GET",trace_id="9f2a...",instance="10.0.1.5:8080"} 12
+```
+
+请回答：
+1. 基数爆炸的根本原因是什么？（可能不止一个）
+2. 为什么 Histogram 类型的指标特别容易爆？
+3. 给出紧急止血方案和根治方案。
+
+<Answer>
+**参考答案：**
+
+**问题 1：根本原因——有两个高基数标签，且被 Histogram 放大了。**
+
+**原因 A：`trace_id` 标签（致命）**
+
+`trace_id` 每次请求都不同，取值数量等于请求总数，是**无上限**的。这是绝对不该出现在指标里的标签——链路 ID 属于分布式追踪系统（Tempo / Jaeger），不属于监控指标。
+
+**原因 B：`path` 用了原始 URL 而非路由模板（严重）**
+
+```text
+❌ path="/user/8823/orders"
+❌ path="/user/8824/orders"
+❌ path="/user/8825/orders"
+✅ path="/user/:id/orders"
+```
+
+每个用户 ID 都产生一条新序列。如果有 10 万活跃用户，光这一个标签就是 10 万倍放大。
+
+**原因 C：Histogram 的桶数量放大（倍数效应）**
+
+见下一问。
+
+---
+
+**问题 2：Histogram 为什么特别容易爆？**
+
+因为**一个 Histogram 指标实际会产生 `桶数 + 2` 条序列**：
+
+```text
+api_request_duration_seconds_bucket{le="0.005"}   ┐
+api_request_duration_seconds_bucket{le="0.01"}    │
+api_request_duration_seconds_bucket{le="0.025"}   │
+api_request_duration_seconds_bucket{le="0.05"}    │
+api_request_duration_seconds_bucket{le="0.1"}     ├─ 默认 12 个桶
+api_request_duration_seconds_bucket{le="0.25"}    │  （Go 客户端默认）
+api_request_duration_seconds_bucket{le="0.5"}     │
+api_request_duration_seconds_bucket{le="1"}       │
+api_request_duration_seconds_bucket{le="2.5"}     │
+api_request_duration_seconds_bucket{le="5"}       │
+api_request_duration_seconds_bucket{le="10"}      │
+api_request_duration_seconds_bucket{le="+Inf"}    ┘
+api_request_duration_seconds_sum                  ┐ 额外 2 条
+api_request_duration_seconds_count                ┘
+                                    合计 14 条序列
+```
+
+**这 14 是一个乘数**。也就是说：
+
+```text
+最终序列数 = 14 × path 取值数 × method 取值数 × trace_id 取值数 × instance 数
+```
+
+一个普通 Gauge 加了高基数标签会爆 10 万条，同样的标签加在 Histogram 上就是 140 万条。**Histogram 是基数的放大器**。
+
+题目中的 432 万条，反推大概是：
+
+```text
+4,320,000 ÷ 14(桶) ÷ 4(method) ÷ 6(instance) ≈ 12,857 种 path/trace_id 组合
+```
+
+---
+
+**问题 3：紧急止血 + 根治**
+
+**【紧急止血】在 Prometheus 侧拦截（5 分钟内可生效）**
+
+改 `prometheus.yml`，用 `metric_relabel_configs` 在**入库前**丢弃：
+
+```yaml
+scrape_configs:
+  - job_name: 'api'
+    static_configs:
+      - targets: ['10.0.1.5:8080']
+    metric_relabel_configs:
+      # 第一刀：直接删掉 trace_id 标签（labeldrop 会自动合并同名序列）
+      - regex: 'trace_id'
+        action: labeldrop
+
+      # 第二刀：丢弃 path 中含数字 ID 的序列（临时粗暴方案）
+      - source_labels: [path]
+        regex: '.*/[0-9]+/.*'
+        action: drop
+```
+
+然后校验并热加载：
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml
+curl -X POST http://localhost:9090/-/reload
+```
+
+**注意**：`labeldrop` 只是让新数据不再产生新序列，**已经在 Head block 里的 432 万条序列不会立刻消失**。它们会随着不再被写入而在 2 小时后的压实中被移出 Head，内存才会真正降下来。如果情况危急，可以配合：
+
+```bash
+# 临时缩短保留期，加速旧数据清理（需要 --web.enable-admin-api）
+curl -X POST -g 'http://localhost:9090/api/v1/admin/tsdb/delete_series?match[]=api_request_duration_seconds_bucket'
+curl -X POST http://localhost:9090/api/v1/admin/tsdb/clean_tombstones
+```
+
+（这个操作会删数据，执行前务必确认。）
+
+**【根治】在应用埋点侧修复（正确做法）**
+
+**第一步：删掉 `trace_id`。** 它不该存在于指标中。需要按 trace 排查时，用「指标发现异常 → 到 Tempo/Jaeger 按时间和服务筛选 trace」的路径，这叫 exemplar 关联，Prometheus 2.26+ 原生支持：
+
+```text
+# exemplar 是附在样本上的少量采样示例，不产生新序列
+api_request_duration_seconds_bucket{le="0.5"} 12 # {trace_id="9f2a..."} 0.42 1714540800
+```
+
+**第二步：`path` 改用路由模板。** 大部分 Web 框架的中间件都支持，关键是取「注册的路由」而不是「实际 URL」：
+
+```go
+// Go + gin 的正确写法
+router.Use(func(c *gin.Context) {
+    c.Next()
+    // c.FullPath() 返回路由模板 "/user/:id/orders"
+    // 而不是 c.Request.URL.Path 的 "/user/8823/orders"
+    histogram.WithLabelValues(c.FullPath(), c.Request.Method).Observe(elapsed)
+})
+```
+
+**第三步：削减桶数量。** 默认 12 个桶往往过多，根据实际 SLO 定制 5–8 个就够：
+
+```go
+prometheus.HistogramOpts{
+    Name:    "api_request_duration_seconds",
+    Buckets: []float64{0.05, 0.1, 0.3, 0.5, 1, 3},  // 6 个桶
+}
+```
+
+**第四步：给端点数量设上限。** 如果路由模板本身就有几千个（比如动态路由），考虑只对核心接口做 Histogram，其余接口只用 Counter 统计次数。
+
+**修复后的合理设计：**
+
+```text
+api_request_duration_seconds_bucket{le="0.1",path="/user/:id/orders",method="GET"} 900
+基数 = 8(桶+sum+count) × 50(路由) × 4(method) × 6(instance) = 9,600 条  ✅
+```
+
+从 432 万降到 9600，减少了 450 倍。
+
+**【预防】给 Prometheus 自己加个基数告警**
+
+```yaml
+- alert: PrometheusHighCardinality
+  expr: prometheus_tsdb_head_series > 1000000
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Prometheus 活跃序列数达到 {{ $value }}，可能存在基数问题"
+    description: "请检查 /tsdb-status 页面确认是哪个指标失控"
+```
+
+同时可以给单个目标加硬限制，防止某个应用把整个 Prometheus 拖垮：
+
+```yaml
+scrape_configs:
+  - job_name: 'api'
+    sample_limit: 50000          # 单次抓取超过 5 万个样本就整体丢弃
+    label_limit: 30              # 单条序列最多 30 个标签
+    label_value_length_limit: 200
+```
+
+`sample_limit` 是最有效的护栏：某个应用埋点出问题时，Prometheus 会拒绝这次抓取（该目标变 DOWN 并告警），而不是默默把自己撑死。**宁可失去一个目标的监控，也不能让整个监控系统崩溃。**
+</Answer>
+</Callout>
+
+## 小结
+
+- **时序 = 指标名 + 标签集合 +（时间戳, 值）序列**。标识部分唯一确定一条序列，任何标签不同就是新序列。
+- 指标名本质上是 `__name__` 标签；命名遵循 snake_case、基本单位后缀（`_seconds` / `_bytes`）、Counter 加 `_total`、带命名空间前缀。
+- **标签用于维度切分**；`job` 和 `instance` 由 Prometheus 自动附加，不要在应用里手写。
+- **基数 = 标签取值数的乘积**，是 Prometheus 头号事故来源。高基数标签（ID、UUID、原始 URL）必须归一化或移出指标；Histogram 是基数放大器。
+- **样本值永远是 float64**，字符串信息用 info 指标（值恒为 1）表达；时间戳通常交给 Prometheus 用抓取时刻填充，且不接受乱序。
+- **标签还是拆指标**：单位相同且 `sum()` 有意义 → 用标签；否则 → 拆成不同指标。
+- 一切都能从 `/metrics` 文本里看明白，动手 curl 一次胜过读十遍文档。

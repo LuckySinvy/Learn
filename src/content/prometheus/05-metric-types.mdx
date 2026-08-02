@@ -1,0 +1,1270 @@
+---
+title: 四种指标类型
+order: 5
+description: Counter、Gauge、Histogram、Summary 的语义、命名与典型用法
+---
+
+# 四种指标类型
+
+上一章我们知道了：Prometheus 存的每个样本值都是一个 float64。既然存储层不区分类型，那为什么还要有 Counter、Gauge、Histogram、Summary 这四种「类型」？
+
+因为**类型不是给存储引擎看的，是给「人」和「查询」看的**。类型回答的是这样一个问题：
+
+> 拿到这个数字，我该怎么用它？直接看？还是必须先求速率？
+
+答错这个问题，你会得到一张看起来很正常、但完全错误的图表——这是 Prometheus 使用中最隐蔽的一类 bug。
+
+## 1. 类型是约定，不是强制
+
+先破除一个误解：`# TYPE` 注释**不会被 TSDB 强制执行**。
+
+```text
+# HELP http_requests_total Total HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{method="GET"} 1027
+```
+
+这里的 `counter` 只是一行元信息。Prometheus 把它记下来展示在 Web UI 里，但如果你的应用下一秒把这个值改成 3，TSDB 照存不误——它并不会拒绝。
+
+那类型的价值在哪？
+
+- **告诉查询者该用哪些函数**：Counter 必须配 `rate()`，Gauge 不能用 `rate()`。
+- **约束客户端库的行为**：Go/Java 客户端的 `Counter` 对象根本没有 `Set()` 方法，只有 `Inc()` 和 `Add()`（且 `Add` 拒绝负数），从源头保证语义。
+- **驱动工具链**：Grafana 的指标浏览器、`promtool`、各种 linter 都会依据类型给出建议。
+
+<Callout type="info" title="四种类型速览">
+| 类型 | 语义 | 值的走向 | 必配函数 | 典型后缀 |
+|---|---|---|---|---|
+| Counter | 累计发生次数/总量 | 只增，重启归零 | `rate()` `increase()` | `_total` |
+| Gauge | 某一刻的瞬时状态 | 可增可减 | 直接看、`*_over_time()` | `_bytes` `_ratio` |
+| Histogram | 观察值的分布（服务端分桶） | 桶是 Counter | `histogram_quantile()` | `_bucket` `_sum` `_count` |
+| Summary | 观察值的分位（客户端算好） | 分位是 Gauge | 直接看 | `quantile` 标签 `_sum` `_count` |
+</Callout>
+
+## 2. Counter：只增不减的累计量
+
+### 2.1 定义与心智模型
+
+Counter 就像**汽车的总里程表**：只会往前走，永远不会倒退；换了发动机（进程重启）会归零重新计。
+
+它适合表达「从某个起点到现在，一共发生了多少次 / 累计了多少量」：
+
+```text
+http_requests_total          累计处理了多少个请求
+errors_total                 累计出了多少次错
+process_cpu_seconds_total    累计消耗了多少 CPU 秒
+node_network_receive_bytes_total  累计收了多少字节
+```
+
+### 2.2 Counter 的原始值几乎没有意义
+
+这是最重要的一条认知。看这张图：
+
+```text
+时间     http_requests_total 的值
+10:00    1,203,441
+10:01    1,203,987
+10:02    1,204,512
+```
+
+`1203441` 这个数字告诉你什么？只说明「这个进程从启动到现在处理过 120 万个请求」。它取决于进程启动了多久，而不是取决于当前的负载。
+
+**你真正关心的是它的变化速度**：
+
+```text
+(1204512 - 1203441) / 120 秒 ≈ 8.9 请求/秒
+```
+
+这正是 `rate()` 在做的事：
+
+```promql
+# 每秒请求数（QPS），基于最近 5 分钟的样本拟合
+rate(http_requests_total[5m])
+
+# 最近 1 小时一共增长了多少（次数，不是速率）
+increase(http_requests_total[1h])
+```
+
+`increase(x[1h])` 在数学上就等于 `rate(x[1h]) * 3600`，只是语义更直观。
+
+<Callout type="warn" title="看到 _total 结尾却没写 rate，八成是错的">
+在 Grafana 面板上直接画 `http_requests_total`，你会得到一条**永远向上的斜线**。它看起来「很有信息量」，但实际上：流量翻倍了、流量归零了，斜线的形状变化都很难用肉眼分辨。而且不同实例因为启动时间不同，起点天差地别，图表会变成一团乱麻。
+
+自查方法：**指标名以 `_total` 结尾、或者 TYPE 是 counter，查询里就必须出现 `rate` / `irate` / `increase` 之一。**
+</Callout>
+
+### 2.3 rate 会自动处理「计数器重置」
+
+进程重启后 Counter 归零。如果朴素地做减法，会得到一个巨大的负数：
+
+```text
+10:00    1,204,512     ← 重启前
+10:01            83    ← 重启后
+朴素差值 = 83 - 1204512 = -1,204,429   💥
+```
+
+`rate()` / `increase()` 内置了**重置检测**：当发现后一个样本比前一个小时，它认为发生了重置，把「重置前的最后值」补加回来：
+
+```text
+rate 的处理：83 - 1204512 → 判定为重置 → 修正为 (1204512 - 1204512) + 83 = 83
+```
+
+这就是为什么 Counter **必须**用 `rate()` 而不能用 `x - x offset 5m` 的原因之一。
+
+想知道某段时间内重启了几次，用 `resets()`：
+
+```promql
+# 最近 1 小时内该 Counter 归零了几次（约等于进程重启次数）
+resets(process_cpu_seconds_total[1h])
+```
+
+### 2.4 经典陷阱：sum 和 rate 的顺序
+
+```promql
+# ✅ 正确：先各自求速率，再相加
+sum(rate(http_requests_total[5m]))
+
+# ❌ 错误：先把多条 Counter 加起来，再求速率
+rate(sum(http_requests_total)[5m:])
+```
+
+为什么错？因为 `sum()` 之后就丢失了「哪条序列」的身份。当其中一个实例重启归零时，求和后的曲线会出现一个**向下的台阶**，而 `rate()` 会把这个台阶误判为整体重置，计算结果严重失真。
+
+口诀：**rate 在内，sum 在外。**
+
+### 2.5 Counter 的客户端用法
+
+```go
+// Go 客户端
+var httpRequests = prometheus.NewCounterVec(
+    prometheus.CounterOpts{
+        Name: "http_requests_total",
+        Help: "Total number of HTTP requests.",
+    },
+    []string{"method", "status"},
+)
+
+func handler(w http.ResponseWriter, r *http.Request) {
+    // ... 处理请求
+    httpRequests.WithLabelValues(r.Method, "200").Inc()
+}
+```
+
+注意 `Counter` 接口只有 `Inc()` 和 `Add(float64)`，且 `Add` 传负数会 panic。**语义由类型系统保证**。
+
+<Callout type="tip" title="错误也用 Counter，但不要单独建指标">
+统计错误时，不要新建一个 `errors_total`，而是给已有的请求 Counter 加一个标签：
+
+```text
+✅ http_requests_total{status="200"} 98213
+   http_requests_total{status="500"}    47
+
+❌ http_requests_total  98260
+   http_errors_total       47
+```
+
+前者算错误率是一个查询里的事，分子分母来自同一次抓取，天然一致；后者两个指标可能来自不同抓取时刻，在流量剧变时会算出 `> 1` 的荒谬错误率。
+</Callout>
+
+## 3. Gauge：可增可减的瞬时值
+
+### 3.1 定义与心智模型
+
+Gauge 就像**汽车的时速表或油量表**：它反映「此时此刻是多少」，可以上升也可以下降，没有累计含义。
+
+```text
+node_memory_MemAvailable_bytes   当前可用内存
+node_load1                       当前 1 分钟负载
+go_goroutines                    当前协程数
+queue_length                     当前队列长度
+kube_pod_status_ready            当前是否就绪（1/0）
+temperature_celsius              当前温度
+```
+
+### 3.2 Gauge 可以直接看，也可以做时间聚合
+
+```promql
+# 直接看当前值
+node_memory_MemAvailable_bytes
+
+# 最近 5 分钟的平均值（削峰填谷）
+avg_over_time(node_load1[5m])
+
+# 最近 1 小时的峰值（容量规划最常用）
+max_over_time(go_goroutines[1h])
+
+# 最近 1 小时的最低点
+min_over_time(node_memory_MemAvailable_bytes[1h])
+```
+
+`*_over_time` 系列是 Gauge 的专属工具箱——它们对区间向量做「纵向」的时间聚合，而 `sum()` / `avg()` 做的是跨序列的「横向」聚合。两者可以组合：
+
+```promql
+# 每个实例最近 1 小时的峰值协程数，再取全局最大
+max(max_over_time(go_goroutines[1h]))
+```
+
+### 3.3 Gauge 的变化量：delta 与 deriv
+
+Counter 用 `rate` / `increase`，Gauge 对应的是 `delta` / `deriv`：
+
+```promql
+# 最近 1 小时磁盘可用空间变化了多少字节（可能是负数）
+delta(node_filesystem_avail_bytes[1h])
+
+# 每秒变化率（用最小二乘法拟合，比 delta 平滑）
+deriv(node_filesystem_avail_bytes[1h])
+
+# 基于当前趋势外推：4 小时后可用空间会是多少
+predict_linear(node_filesystem_avail_bytes[6h], 4 * 3600)
+```
+
+`predict_linear` 是磁盘告警的标准写法：
+
+```yaml
+- alert: DiskWillFillIn4Hours
+  expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs"}[6h], 4*3600) < 0
+  for: 30m
+  labels:
+    severity: warning
+  annotations:
+    summary: "磁盘预计 4 小时内写满"
+```
+
+它比「使用率 > 90%」聪明得多：一块 90% 满但一年没变化的盘不需要告警，一块 50% 满但正在飞速增长的盘才危险。
+
+<Callout type="warn" title="千万不要对 Gauge 用 rate">
+```promql
+# ❌ 严重错误
+rate(node_memory_MemAvailable_bytes[5m])
+```
+
+`rate()` 假设「值下降 = 计数器重置」。内存可用量下降是完全正常的现象，但 `rate()` 会把每一次下降都当成重置并做补偿，算出的结果既不是速率也不是差值，而是**彻头彻尾的垃圾数据**——而且它不会报错，会安安静静地画出一条看起来很合理的曲线。
+
+对 Gauge 想看变化率，用 `delta()` 或 `deriv()`。
+</Callout>
+
+### 3.4 Gauge 的客户端用法
+
+```go
+var queueLength = prometheus.NewGauge(prometheus.GaugeOpts{
+    Name: "myapp_queue_length",
+    Help: "Current number of items in the queue.",
+})
+
+queueLength.Set(42)      // 直接设值
+queueLength.Inc()        // +1
+queueLength.Dec()        // -1
+queueLength.Add(-5)      // 允许负数
+queueLength.SetToCurrentTime()  // 设为当前 Unix 时间戳
+```
+
+`SetToCurrentTime()` 有个经典用法——记录「上次成功执行的时间」：
+
+```promql
+# 备份任务超过 25 小时没成功 → 告警
+time() - myapp_last_successful_backup_timestamp_seconds > 25 * 3600
+```
+
+## 4. Histogram：观察值的分布
+
+### 4.1 为什么需要 Histogram
+
+假设你想知道「接口有多慢」。用 Gauge 记录每次请求的耗时？做不到——抓取间隔 15 秒，这 15 秒里可能发生了 1 万次请求，你只能采样到其中一个瞬间。
+
+用平均值？平均值是**最会骗人的统计量**：
+
+```text
+1000 次请求，999 次耗时 10ms，1 次耗时 10 秒
+平均值 = (999 × 0.01 + 10) / 1000 ≈ 0.02 秒 = 20ms
+
+看起来很健康。但那 1 个等了 10 秒的用户已经把 App 卸载了。
+```
+
+你需要的是**分布**：多少请求在 100ms 内完成？P99 是多少？这就是 Histogram 存在的意义。
+
+### 4.2 Histogram 的物理结构
+
+一个 Histogram 指标在 `/metrics` 里会展开成 **N+2 条序列**：
+
+```text
+# HELP http_request_duration_seconds Request latency in seconds.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.005"}  120
+http_request_duration_seconds_bucket{le="0.01"}   480
+http_request_duration_seconds_bucket{le="0.025"}  920
+http_request_duration_seconds_bucket{le="0.05"}  1180
+http_request_duration_seconds_bucket{le="0.1"}   1290
+http_request_duration_seconds_bucket{le="0.25"}  1330
+http_request_duration_seconds_bucket{le="0.5"}   1342
+http_request_duration_seconds_bucket{le="1"}     1346
+http_request_duration_seconds_bucket{le="2.5"}   1347
+http_request_duration_seconds_bucket{le="5"}     1348
+http_request_duration_seconds_bucket{le="10"}    1348
+http_request_duration_seconds_bucket{le="+Inf"}  1350
+http_request_duration_seconds_sum                 87.32
+http_request_duration_seconds_count             1350
+```
+
+三个组成部分：
+
+| 序列 | 类型 | 含义 |
+|---|---|---|
+| `_bucket` 带 `le` 标签 | Counter | 耗时 **≤ le** 的请求累计有多少个 |
+| `_sum` | Counter | 所有观察值之和（这里是总耗时秒数） |
+| `_count` | Counter | 观察次数总和，等于 `le="+Inf"` 的桶 |
+
+**关键点一：桶是「累积」的（cumulative）。**
+
+`le="0.1"` 的值 1290 表示「耗时 ≤ 0.1 秒的请求有 1290 个」，它**包含**了 `le="0.05"` 的那 1180 个。所以桶的值一定单调不减，最后一个 `le="+Inf"` 必然等于 `_count`。
+
+想知道「落在 50ms 到 100ms 之间的请求数」，需要自己做减法：`1290 - 1180 = 110`。
+
+**关键点二：每个桶都是 Counter。**
+
+所以查询时必须先套 `rate()`：
+
+```promql
+rate(http_request_duration_seconds_bucket[5m])
+```
+
+**关键点三：`le` 是普通标签，值是字符串。**
+
+`le="0.1"` 里的 `0.1` 是字符串。这就是为什么在配置桶时 `1` 和 `1.0` 会产生两条不同的序列（历史上踩过坑，现在客户端会做规范化）。
+
+### 4.3 从 Histogram 能算出什么
+
+**（1）平均值——最简单，几乎免费**
+
+```promql
+# 平均耗时 = 总耗时 / 总次数
+rate(http_request_duration_seconds_sum[5m])
+/
+rate(http_request_duration_seconds_count[5m])
+```
+
+注意分子分母都要 `rate()`，这样算的是「最近 5 分钟的平均」，而不是「进程启动以来的平均」。
+
+**（2）分位数——Histogram 的招牌能力**
+
+```promql
+# P99 延迟（秒）
+histogram_quantile(
+  0.99,
+  sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+)
+
+# 按接口分别看 P95
+histogram_quantile(
+  0.95,
+  sum by (le, path) (rate(http_request_duration_seconds_bucket[5m]))
+)
+```
+
+**这个写法有三个必须记住的要点**，缺一个结果就是错的：
+
+1. 内层必须是 `rate(..._bucket[...])`，因为桶是 Counter。
+2. `sum by (le, ...)` 中**必须保留 `le` 标签**——`histogram_quantile` 就是靠 `le` 重建分布的。
+3. 想按某个维度分组（如 `path`），把它一起写进 `by` 里；其余维度（如 `instance`）会被聚合掉，得到的是全局 P95 而不是各实例 P95 的平均。
+
+**（3）SLO 达成率——比分位数更实用**
+
+```promql
+# 300ms 内完成的请求占比
+sum(rate(http_request_duration_seconds_bucket{le="0.3"}[5m]))
+/
+sum(rate(http_request_duration_seconds_count[5m]))
+```
+
+这个写法**没有任何估算误差**（只要 0.3 恰好是一个桶边界），而且比 P99 更贴近 SLO 语言：「99% 的请求在 300ms 内完成」。Google SRE 手册推荐优先用这种形式。
+
+### 4.4 histogram_quantile 是「估算」，不是精确值
+
+理解这一点，你才不会被 P99 的数字误导。
+
+`histogram_quantile` 的算法是：找到目标分位落在哪个桶里，然后在这个桶的**上下边界之间做线性插值**。
+
+用前面的数据算 P99：
+
+```text
+总数 _count = 1350
+P99 的目标位置 = 1350 × 0.99 = 1336.5
+
+查桶：
+  le="0.25" → 1330   (还不到 1336.5)
+  le="0.5"  → 1342   (超过了 → P99 落在 (0.25, 0.5] 这个桶里)
+
+线性插值：
+  桶内样本数 = 1342 - 1330 = 12
+  目标在桶内的位置 = 1336.5 - 1330 = 6.5
+  P99 ≈ 0.25 + (0.5 - 0.25) × (6.5 / 12) ≈ 0.385 秒
+```
+
+**这个 0.385 秒的可信度取决于一个假设：这 12 个样本在 0.25s 到 0.5s 之间均匀分布。**现实中它们可能全都挤在 0.26 秒，也可能全都是 0.49 秒。
+
+<Callout type="warn" title="Histogram 的三条铁律">
+**铁律一：分位数永远落在某个桶的范围内。**
+如果你的最大有限桶是 `le="10"`，而实际有请求耗时 60 秒，`histogram_quantile` 最多只能告诉你「大于 10 秒」，返回 `+Inf`。**桶的上界必须覆盖你关心的最坏情况。**
+
+**铁律二：桶要卡在关心的阈值上。**
+如果 SLO 是「300ms」，就一定要有一个 `le="0.3"` 的桶。默认桶里没有 0.3，你只能在 0.25 和 0.5 之间插值，误差可能达到 50%。
+
+**铁律三：桶越密越准，但序列数线性增长。**
+桶数是基数的乘数。10 个桶 × 50 个接口 × 6 个实例 = 3600 条序列，还没算 `_sum` 和 `_count`。
+</Callout>
+
+### 4.5 桶该怎么选
+
+Go 客户端的默认桶是：
+
+```go
+prometheus.DefBuckets = []float64{
+    .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10,
+}
+```
+
+这套桶是为「典型的网络 API」设计的。如果你的场景不同，一定要自定义：
+
+```go
+// 场景 A：内部 RPC，都在毫秒级 —— 默认桶太粗，前 3 个桶就装完了 99% 的请求
+Buckets: []float64{0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.5}
+
+// 场景 B：SLO 驱动 —— 桶边界直接对齐 SLO 阈值
+Buckets: []float64{0.1, 0.3, 1, 3},   // 只要 4 个桶，但每个都有业务含义
+
+// 场景 C：批处理任务，耗时几分钟 —— 用指数桶
+Buckets: prometheus.ExponentialBuckets(1, 2, 10),  // 1,2,4,...,512 秒
+
+// 场景 D：线性分布，比如「批次大小」
+Buckets: prometheus.LinearBuckets(100, 100, 10),   // 100,200,...,1000
+```
+
+<Callout type="tip" title="Native Histogram（Prometheus 2.40+）">
+Prometheus 引入了实验性的 **Native Histogram**（原生直方图）：桶边界由一个分辨率参数自动生成（指数分布），一条序列就能表达整个分布，不再需要为每个桶建一条序列。
+
+优点很诱人：基数从「N+2 条」降到「1 条」，精度还更高（可以做到相对误差 1% 以内），且不需要预先猜测桶边界。
+
+代价是需要客户端库、Prometheus、Grafana 三方都支持，且远程写协议要用 Protobuf。目前（截至 3.x）仍在逐步稳定中，新项目可以关注，存量系统不急着迁移。
+</Callout>
+
+## 5. Summary：客户端算好的分位数
+
+### 5.1 结构
+
+Summary 表面上和 Histogram 很像，都有 `_sum` 和 `_count`，但第三部分完全不同：
+
+```text
+# HELP rpc_duration_seconds RPC latency in seconds.
+# TYPE rpc_duration_seconds summary
+rpc_duration_seconds{quantile="0.5"}   0.012
+rpc_duration_seconds{quantile="0.9"}   0.048
+rpc_duration_seconds{quantile="0.99"}  0.213
+rpc_duration_seconds_sum              87.32
+rpc_duration_seconds_count          1350
+```
+
+区别在于：
+
+- Histogram 暴露的是 `_bucket`（**原始的桶计数**），分位数在**查询时**由 Prometheus 算。
+- Summary 暴露的是 `quantile` 标签（**已经算好的分位值**），计算发生在**应用进程内**。
+
+而且注意：Summary 的分位数序列**没有 `_` 后缀**，它就是指标名本身加一个 `quantile` 标签。
+
+### 5.2 Summary 的致命缺陷：分位数不可聚合
+
+这是选型时唯一需要记住的一条：
+
+```promql
+# ❌ 这个查询在数学上是错的
+avg(rpc_duration_seconds{quantile="0.99"})
+```
+
+**为什么？** 因为分位数不是可加的统计量。
+
+```text
+实例 A：1000 次请求，P99 = 100ms
+实例 B：  10 次请求，P99 = 900ms
+
+avg = (100 + 900) / 2 = 500ms   ← 完全错误
+
+真实的全局 P99：
+  1010 次请求中最慢的 1%（约 10 次）
+  → 这 10 次大概率来自 B 的慢请求 + A 的尾部
+  → 真实值可能是 150ms，也可能是 900ms，
+    但绝对不可能靠两个 P99 的平均算出来
+```
+
+**你无法从「各实例的 P99」推出「集群的 P99」**，就像你无法从各班的中位数身高推出全年级的中位数身高。唯一的办法是拿到原始分布——这正是 Histogram 提供而 Summary 不提供的东西。
+
+对比一下，Histogram 因为暴露的是原始桶计数（可加的 Counter），聚合是完全合法的：
+
+```promql
+# ✅ 桶可以先 sum 再算分位，这才是真正的全局 P99
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+### 5.3 Summary 的滑动窗口
+
+Summary 的分位数是在一个**客户端维护的滑动时间窗口**上计算的（Go 客户端默认 10 分钟，分 5 个 2 分钟的桶轮转）：
+
+```go
+prometheus.NewSummary(prometheus.SummaryOpts{
+    Name: "rpc_duration_seconds",
+    Objectives: map[float64]float64{
+        0.5:  0.05,    // P50，允许 5% 相对误差
+        0.9:  0.01,    // P90，允许 1% 相对误差
+        0.99: 0.001,   // P99，允许 0.1% 相对误差
+    },
+    MaxAge:     10 * time.Minute,  // 滑动窗口长度
+    AgeBuckets: 5,
+})
+```
+
+这带来两个后果：
+
+1. **窗口长度写死在代码里**。你在 PromQL 里没法改成「最近 1 小时的 P99」——那是应用配置决定的，改要重新发版。而 Histogram 只要把 `[5m]` 改成 `[1h]` 即可。
+2. **计算成本在应用侧**。目标误差越小，客户端需要维护的采样数据结构越大、CPU 开销越高。`0.99: 0.001` 这样的配置在高 QPS 下可能带来可观的开销。
+
+<Callout type="warn" title="Summary 不填 Objectives 会怎样">
+Go 客户端里，如果 `Objectives` 留空（这是 1.x 之后的默认值），Summary **不会暴露任何 quantile 序列**，只剩 `_sum` 和 `_count`。
+
+这其实是社区有意为之的引导：大多数人真正需要的只是 `_sum / _count`（平均值），而分位数应该用 Histogram。见过不少人配了 Summary 却查不到 quantile 标签，原因就在这里。
+</Callout>
+
+### 5.4 什么时候 Summary 反而更合适
+
+Summary 并非一无是处，它有两个 Histogram 做不到的优势：
+
+**优势一：精度更高。** Summary 的分位数是基于真实样本流计算的（φ-quantile 算法），误差可控在配置的目标内。Histogram 的插值误差取决于桶边界，可能相差很远。
+
+**优势二：不需要预先知道值域。** Histogram 必须提前猜好桶边界，猜错了数据就废了（改桶边界会导致历史数据不可比）。Summary 完全不用操心。
+
+所以 Summary 适合：
+
+- **单实例、无需聚合的场景**：批处理任务、单机守护进程、CLI 工具。
+- **值域完全未知的场景**：第一次接入一个新指标，先用 Summary 摸清分布范围，再改成 Histogram 并按实际分布设桶。
+
+## 6. Histogram vs Summary 决策表
+
+| 维度 | Histogram | Summary |
+|---|---|---|
+| 分位数在哪算 | 查询时，Prometheus 算 | 采集时，应用进程算 |
+| 能否跨实例聚合 | ✅ 能（桶可加） | ❌ 不能（分位数不可加） |
+| 时间窗口 | 查询时决定，随时可改 | 代码里写死，改要发版 |
+| 需要预知值域 | ✅ 需要（配桶） | ❌ 不需要 |
+| 分位精度 | 受桶边界影响，插值估算 | 高，误差可配置 |
+| 应用侧 CPU 开销 | 极低（就是几个计数器 +1） | 中到高（维护采样结构） |
+| 产生的序列数 | 桶数 + 2 | 分位数 + 2 |
+| 服务端查询开销 | 略高（要算插值） | 低（直接读） |
+
+<Callout type="tip" title="一句话选型">
+**默认选 Histogram。** 只有当你确信「这个指标永远只有一个实例，且我不知道值域范围」时，才考虑 Summary。
+
+现实中的分布式服务几乎总要跨实例聚合，而聚合能力是 Summary 的硬伤——这一条基本就决定了答案。
+</Callout>
+
+## 7. 命名约定与单位后缀
+
+类型和命名是配套的。好的命名让人**不看 `# TYPE` 就知道该怎么查**。
+
+### 7.1 后缀速查表
+
+| 后缀 | 适用类型 | 含义 | 示例 |
+|---|---|---|---|
+| `_total` | Counter | 累计值 | `http_requests_total` |
+| `_seconds` | 任意 | 时间，单位秒 | `process_cpu_seconds_total` |
+| `_bytes` | 任意 | 大小，单位字节 | `node_memory_MemFree_bytes` |
+| `_ratio` | Gauge | 比率，取值 0–1 | `node_cpu_usage_ratio` |
+| `_info` | Gauge | 元信息，值恒为 1 | `node_uname_info` |
+| `_bucket` | Histogram | 桶（自动生成） | `..._seconds_bucket` |
+| `_sum` | Histogram/Summary | 观察值总和（自动生成） | `..._seconds_sum` |
+| `_count` | Histogram/Summary | 观察次数（自动生成） | `..._seconds_count` |
+| `_timestamp_seconds` | Gauge | 某事件发生的 Unix 时间 | `..._last_success_timestamp_seconds` |
+
+### 7.2 组合规则
+
+Counter 的后缀顺序是「单位在前，`_total` 在后」：
+
+```text
+✅ process_cpu_seconds_total        单位 seconds + Counter 标志 total
+✅ node_network_receive_bytes_total 单位 bytes + Counter 标志 total
+❌ process_cpu_total_seconds        顺序反了
+```
+
+Histogram 只需要给基础名加单位，`_bucket` / `_sum` / `_count` 由客户端自动生成：
+
+```text
+声明的指标名:  http_request_duration_seconds
+实际暴露的:    http_request_duration_seconds_bucket{le="..."}
+              http_request_duration_seconds_sum
+              http_request_duration_seconds_count
+```
+
+<Callout type="warn" title="Histogram 不要加 _total">
+```text
+❌ http_request_duration_seconds_total
+   → 客户端会生成 http_request_duration_seconds_total_bucket，非常难看
+   → 而且 _total 暗示这是 Counter，误导查询者
+
+✅ http_request_duration_seconds
+```
+
+同理，Gauge 也绝不能加 `_total`——那会诱导别人对它用 `rate()`，得到垃圾数据。
+</Callout>
+
+### 7.3 用基本单位
+
+```text
+✅ seconds   （不是 ms / us / ns）
+✅ bytes     （不是 KB / MB / GiB）
+✅ ratio     （0–1，不是 percent 的 0–100）
+✅ celsius   （不是 fahrenheit）
+```
+
+原因在上一章讲过：Grafana 能自动把 `0.0032 seconds` 渲染成 `3.2 ms`，把 `16633360384 bytes` 渲染成 `15.5 GiB`。用非基本单位反而丢掉了这个能力，还容易在跨组件计算时把 ms 和 s 加在一起。
+
+## 8. 选型决策流程
+
+```text
+我要记录什么？
+│
+├─ 「发生了多少次 / 累计了多少量」，只会往上加
+│   → Counter，名字加 _total，查询必配 rate()
+│
+├─ 「此刻是多少」，会上下波动
+│   → Gauge，名字加单位后缀，直接看或用 *_over_time()
+│
+└─ 「一批数值的分布」（耗时、大小、批次量）
+    │
+    ├─ 需要跨实例聚合？（几乎总是「是」）
+    │   → Histogram
+    │
+    └─ 单实例 + 值域完全未知
+        → Summary（用完摸清分布后建议改回 Histogram）
+```
+
+一个订单服务的完整指标设计示例：
+
+```text
+# Counter：累计事件
+orders_created_total{channel="app", region="bj"}          累计下单数
+orders_failed_total{channel="app", reason="out_of_stock"} 累计失败数
+payment_amount_yuan_total{method="alipay"}                累计支付金额
+
+# Gauge：瞬时状态
+orders_pending_count{region="bj"}                         当前待处理订单
+order_queue_length                                        当前队列长度
+inventory_available_count{sku_category="phone"}           当前可用库存
+
+# Histogram：分布
+order_processing_duration_seconds_bucket{le="0.5"}        下单处理耗时
+order_amount_yuan_bucket{le="100"}                        订单金额分布
+
+# Info：元信息
+orderservice_build_info{version="2.3.1", commit="a1b2c3d"} 1
+```
+
+<Callout type="info" title="Counter 也可以记录「量」而不只是「次数」">
+`payment_amount_yuan_total` 累加的是金额而不是次数，这完全合法——Counter 的约束只有「单调不减」，不要求是整数或计数。
+
+同理 `process_cpu_seconds_total` 累加的是秒数，`node_network_receive_bytes_total` 累加的是字节数。用 `rate()` 查它们，得到的就是「每秒收入多少元」「每秒消耗多少 CPU 秒」「每秒收多少字节」。
+</Callout>
+
+---
+
+<Callout type="exercise" title="练习 1：为下列场景选择指标类型">
+为以下 8 个监控需求各选一种指标类型（Counter / Gauge / Histogram / Summary），并给出符合规范的指标名：
+
+1. 网站累计被访问的次数
+2. 当前在线用户数
+3. 每次数据库查询的耗时分布，需要看集群整体的 P99
+4. 服务器当前 CPU 温度
+5. 消息队列中积压的消息条数
+6. 上传文件的大小分布，需要按存储桶分组统计
+7. 应用上次成功执行定时任务的时间
+8. 某个单机 CLI 工具内部函数的执行耗时（只在本机看，不上报集群）
+
+<Answer>
+**参考答案：**
+
+| # | 类型 | 指标名 | 理由 |
+|---|---|---|---|
+| 1 | Counter | `http_requests_total` | 累计事件，只增不减 |
+| 2 | Gauge | `myapp_online_users` | 瞬时状态，会上下波动 |
+| 3 | Histogram | `db_query_duration_seconds` | 分布 + 需要跨实例聚合 |
+| 4 | Gauge | `node_hwmon_temp_celsius` | 瞬时状态 |
+| 5 | Gauge | `kafka_consumergroup_lag` | 瞬时状态，消费后会减少 |
+| 6 | Histogram | `upload_file_size_bytes` | 分布 + 需要按维度聚合 |
+| 7 | Gauge | `myapp_last_success_timestamp_seconds` | 瞬时状态（Unix 时间戳） |
+| 8 | Summary | `cli_function_duration_seconds` | 单实例、无需聚合、值域未知 |
+
+**几个容易做错的点：**
+
+**第 2 题 —— 不要用 Counter。** 在线用户数会下降（用户离线），Counter 语义上禁止下降。如果用 Counter 记录「累计登录次数」那是另一个指标，回答的是另一个问题。
+
+**第 3 题 —— 关键词是「集群整体的 P99」。** 一旦需要跨实例聚合，Summary 就出局了。因为 `avg(x{quantile="0.99"})` 在数学上是错的：
+
+```promql
+# ❌ Summary 无法算集群 P99
+avg(db_query_duration_seconds{quantile="0.99"})
+
+# ✅ Histogram 可以
+histogram_quantile(0.99, sum by (le) (rate(db_query_duration_seconds_bucket[5m])))
+```
+
+**第 5 题 —— Kafka lag 是 Gauge 不是 Counter。** 它表示「当前还差多少条没消费」，消费追上后会归零，是典型的瞬时量。
+
+**第 6 题 —— 文件大小也可以做 Histogram。** Histogram 不只用于时间，任何「一批观察值的分布」都适用：文件大小、批次条数、响应体字节数、订单金额。桶要按实际分布配：
+
+```go
+// 文件大小从几 KB 到几百 MB，用指数桶
+Buckets: prometheus.ExponentialBuckets(1024, 4, 10),  // 1KB, 4KB, ..., 256MB
+```
+
+**第 7 题 —— 记录「时间点」用 Gauge 存 Unix 时间戳。** 这样可以直接算「距今多久」：
+
+```promql
+# 超过 25 小时没成功执行
+time() - myapp_last_success_timestamp_seconds > 25 * 3600
+```
+
+注意名字要以 `_timestamp_seconds` 结尾，明确这是一个时间点而不是一段时长。
+
+**第 8 题 —— 这是 Summary 少数合理的场景。** 单实例、不需要聚合、值域未知（不知道该配什么桶）。但即便如此，摸清分布后改成 Histogram 通常仍是更好的长期选择。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：读懂一段 Histogram 输出">
+给定下面这段 `/metrics` 输出（某接口最近的累计值）：
+
+```text
+# TYPE api_latency_seconds histogram
+api_latency_seconds_bucket{le="0.01"}   200
+api_latency_seconds_bucket{le="0.05"}   700
+api_latency_seconds_bucket{le="0.1"}    900
+api_latency_seconds_bucket{le="0.5"}    980
+api_latency_seconds_bucket{le="1"}      995
+api_latency_seconds_bucket{le="+Inf"}  1000
+api_latency_seconds_sum                 62.5
+api_latency_seconds_count              1000
+```
+
+回答：
+
+1. 一共观察了多少次请求？平均耗时是多少？
+2. 耗时落在 50ms 到 100ms 之间的请求有多少个？
+3. 手工估算 P95 是多少（写出计算过程）。
+4. 写出「计算最近 5 分钟集群整体 P95」的 PromQL，并说明为什么每一层都不能省。
+
+<Answer>
+**参考答案：**
+
+**问题 1：1000 次请求，平均耗时 62.5ms。**
+
+```text
+观察次数 = _count = 1000（也等于 le="+Inf" 桶的值）
+平均耗时 = _sum / _count = 62.5 / 1000 = 0.0625 秒 = 62.5 ms
+```
+
+对应的 PromQL（注意分子分母都要 `rate`，否则算的是进程启动以来的平均）：
+
+```promql
+rate(api_latency_seconds_sum[5m]) / rate(api_latency_seconds_count[5m])
+```
+
+---
+
+**问题 2：200 个。**
+
+因为桶是**累积**的，要做减法：
+
+```text
+le="0.1"  → 900  （耗时 ≤ 100ms 的有 900 个）
+le="0.05" → 700  （耗时 ≤ 50ms  的有 700 个）
+落在 (0.05, 0.1] 区间 = 900 - 700 = 200 个
+```
+
+对应的 PromQL：
+
+```promql
+rate(api_latency_seconds_bucket{le="0.1"}[5m])
+- ignoring(le)
+rate(api_latency_seconds_bucket{le="0.05"}[5m])
+```
+
+这里必须加 `ignoring(le)`，否则两边的 `le` 标签不同，向量匹配找不到配对，结果为空。
+
+---
+
+**问题 3：P95 ≈ 0.375 秒。**
+
+```text
+目标位置 = _count × 0.95 = 1000 × 0.95 = 950
+
+定位桶：
+  le="0.1" → 900   （不足 950）
+  le="0.5" → 980   （超过 950 → P95 落在 (0.1, 0.5] 桶内）
+
+线性插值：
+  桶内样本数     = 980 - 900 = 80
+  目标在桶内位置 = 950 - 900 = 50
+  P95 ≈ 0.1 + (0.5 - 0.1) × (50 / 80)
+      = 0.1 + 0.4 × 0.625
+      = 0.35 秒
+```
+
+（注：不同实现的插值细节略有差异，`histogram_quantile` 会给出接近 0.35 的值。）
+
+**这个估算的可靠性有多高？** 不高。因为 `(0.1, 0.5]` 是一个非常宽的桶——真实的 P95 可能是 0.11 秒，也可能是 0.49 秒，误差高达 4 倍。
+
+**改进方法：在关心的区间加密桶。**
+
+```go
+// 原来：0.1 到 0.5 之间是一片空白
+Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1}
+
+// 改进：在 0.1–0.5 之间补桶
+Buckets: []float64{0.01, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1}
+```
+
+---
+
+**问题 4：集群 P95 的标准写法。**
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le) (rate(api_latency_seconds_bucket[5m]))
+)
+```
+
+**从内往外逐层解释，每一层为什么不能省：**
+
+**第 1 层：`rate(api_latency_seconds_bucket[5m])`**
+
+桶是 Counter（进程启动以来的累计值）。如果直接用原始值，算出的是「有史以来的 P95」——一次凌晨的故障会永远拉高这个数字。`rate()` 把它变成「最近 5 分钟每秒落入该桶的请求数」，反映的才是当下的状况。
+
+**第 2 层：`sum by (le)`**
+
+- **为什么要 `sum`**：不加聚合的话，每个 `instance` 都是一条独立序列，`histogram_quantile` 会为每个实例分别算一个 P95，返回 N 条线。要看集群整体，必须先把各实例的桶加起来（桶是可加的 Counter，这是合法操作）。
+- **为什么必须 `by (le)`**：`histogram_quantile` 完全依赖 `le` 标签重建分布。如果写成 `sum(rate(...))` 把 `le` 也聚合掉，函数拿到的是一个没有 `le` 标签的向量，直接返回空结果或 `NaN`。
+
+**第 3 层：`histogram_quantile(0.95, ...)`**
+
+在重建出的分布上做插值。第一个参数是分位（0–1 之间），不是百分数——写 `95` 会得到 `+Inf`。
+
+**如果想按接口分别看 P95**，把维度加进 `by` 里：
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, path) (rate(api_latency_seconds_bucket[5m]))
+)
+```
+
+**常见错误对照：**
+
+```promql
+# ❌ 忘了 rate —— 算的是历史全期的分位数，永远不变
+histogram_quantile(0.95, sum by (le) (api_latency_seconds_bucket))
+
+# ❌ 丢了 le —— 返回空
+histogram_quantile(0.95, sum(rate(api_latency_seconds_bucket[5m])))
+
+# ❌ 分位写成百分数 —— 返回 +Inf
+histogram_quantile(95, sum by (le) (rate(api_latency_seconds_bucket[5m])))
+
+# ❌ 先算分位再平均 —— 数学上错误（分位数不可加）
+avg(histogram_quantile(0.95, rate(api_latency_seconds_bucket[5m])))
+```
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：找出错误用法">
+下面 6 段代码或查询都有问题，指出问题并给出修正：
+
+```text
+1.  指标名: memory_usage_total       类型: gauge      当前值: 8589934592
+
+2.  查询:   rate(node_load1[5m])
+
+3.  查询:   http_requests_total
+
+4.  查询:   avg(rpc_duration_seconds{quantile="0.99"})
+
+5.  查询:   histogram_quantile(0.99, sum(rate(api_latency_seconds_bucket[5m])))
+
+6.  Go 代码:
+    prometheus.NewCounter(prometheus.CounterOpts{
+        Name: "queue_size",
+    })
+    // 使用处
+    queueSize.Add(-1)
+```
+
+<Answer>
+**参考答案：**
+
+---
+
+**1. `memory_usage_total` 是 Gauge 却带 `_total` 后缀**
+
+**问题**：`_total` 是 Counter 的专属标志。看到这个名字的人会本能地写 `rate(memory_usage_total[5m])`，而对 Gauge 用 `rate()` 会产生完全错误的数据（下降被误判为计数器重置）。
+
+**修正**：
+
+```text
+✅ node_memory_used_bytes    去掉 _total，加上单位后缀
+```
+
+更好的做法是暴露原始值让查询时再算比率：
+
+```text
+node_memory_MemTotal_bytes
+node_memory_MemAvailable_bytes
+```
+
+```promql
+100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+```
+
+---
+
+**2. `rate(node_load1[5m])` —— 对 Gauge 用 rate**
+
+**问题**：`node_load1` 是 Gauge（系统负载，上下波动）。`rate()` 假定输入是单调不减的 Counter，遇到下降就当成重置并做补偿。结果是一个既不是速率也不是差值的数字，**而且不会报错**——这是它最危险的地方。
+
+**修正**（按你真正想要的语义选一个）：
+
+```promql
+# 想看当前值
+node_load1
+
+# 想看最近 5 分钟的平均，去掉毛刺
+avg_over_time(node_load1[5m])
+
+# 想看最近 5 分钟的变化量
+delta(node_load1[5m])
+
+# 想看每秒变化率（平滑拟合）
+deriv(node_load1[5m])
+```
+
+---
+
+**3. `http_requests_total` —— Counter 不套 rate**
+
+**问题**：画出来是一条永远上升的斜线。流量翻倍还是归零，从斜线上很难看出来；不同实例因启动时间不同起点各异，多条线完全无法对比。
+
+**修正**：
+
+```promql
+# QPS
+sum(rate(http_requests_total[5m]))
+
+# 最近 1 小时的总请求数
+sum(increase(http_requests_total[1h]))
+```
+
+**唯一的例外**：在表格里展示「进程启动以来一共处理了多少请求」这类信息时，直接看原始值是合理的。但在时序图上，几乎总是错的。
+
+---
+
+**4. `avg(rpc_duration_seconds{quantile="0.99"})` —— 平均分位数**
+
+**问题**：分位数不是可加的统计量，对多个实例的 P99 求平均在数学上没有意义。
+
+```text
+实例 A：1000 次请求，P99 = 100ms
+实例 B：  10 次请求，P99 = 900ms
+avg = 500ms  ← 这个数字不对应任何真实存在的东西
+```
+
+**修正**：Summary 结构上就做不到跨实例聚合。要么改用 Histogram：
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(rpc_duration_seconds_bucket[5m])))
+```
+
+要么退而求其次，看**最差的那个实例**（这至少是一个有意义的数字）：
+
+```promql
+max(rpc_duration_seconds{quantile="0.99"})
+```
+
+或者只用 Summary 能可靠聚合的部分——`_sum` 和 `_count`（它们是 Counter，可加）：
+
+```promql
+sum(rate(rpc_duration_seconds_sum[5m])) / sum(rate(rpc_duration_seconds_count[5m]))
+```
+
+---
+
+**5. `histogram_quantile(0.99, sum(rate(..._bucket[5m])))` —— 丢了 le 标签**
+
+**问题**：`sum()` 没有 `by (le)`，把所有标签（包括 `le`）都聚合掉了。`histogram_quantile` 拿不到桶边界信息，无法重建分布，返回空结果或 `NaN`。
+
+**修正**：
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(api_latency_seconds_bucket[5m])))
+```
+
+**记忆点**：`histogram_quantile` 的输入向量**必须带 `le` 标签**。任何聚合操作都要把 `le` 放进 `by` 里。
+
+---
+
+**6. Counter 调用 `Add(-1)`**
+
+**问题**有两个：
+
+**（a）语义错误**：`queue_size`（队列长度）会增会减，是 Gauge 不是 Counter。Go 客户端的 `Counter.Add()` 遇到负数会直接 **panic**，程序崩溃。
+
+**（b）命名错误**：缺少命名空间前缀，`queue_size` 太泛容易撞名；且 `size` 语义不明（是条数还是字节数？）。
+
+**修正**：
+
+```go
+var queueLength = prometheus.NewGaugeVec(
+    prometheus.GaugeOpts{
+        Name: "myapp_queue_length",
+        Help: "Current number of items waiting in the queue.",
+    },
+    []string{"queue"},
+)
+
+queueLength.WithLabelValues("email").Inc()
+queueLength.WithLabelValues("email").Dec()   // Gauge 允许减少
+```
+
+**顺带一提**：队列场景通常需要**两个**指标配合，它们回答不同的问题：
+
+```text
+myapp_queue_length            Gauge，当前积压多少（现在健康吗）
+myapp_queue_processed_total   Counter，累计处理了多少（吞吐是多少）
+```
+
+```promql
+# 处理速率
+rate(myapp_queue_processed_total[5m])
+
+# 预计消化完积压需要多久（秒）
+myapp_queue_length / rate(myapp_queue_processed_total[5m])
+```
+
+最后这个查询非常实用——它把「积压 10000 条」这个没有体感的数字，翻译成了「还要 20 分钟才能消化完」。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 4：为文件上传服务设计指标">
+你负责一个文件上传服务，需要监控以下方面：
+
+- 上传成功 / 失败的次数，需要能区分失败原因和文件类型
+- 当前正在处理的上传请求数
+- 上传文件的大小分布（从几 KB 到几百 MB）
+- 上传处理耗时的 P99，需要看整个集群的
+- 当前存储空间剩余量，并希望在「预计 12 小时内写满」时告警
+
+请设计完整的指标集（含类型、名称、标签），说明 Histogram 桶的选择，并写出关键的 PromQL 查询和一条告警规则。
+
+<Answer>
+**参考答案：**
+
+## 一、指标设计
+
+```text
+# ── Counter：累计事件 ──────────────────────────────
+# TYPE upload_requests_total counter
+upload_requests_total{result="success", file_type="image"}          128340
+upload_requests_total{result="failure", file_type="image", reason="too_large"}  412
+upload_requests_total{result="failure", file_type="video", reason="timeout"}     87
+upload_requests_total{result="failure", file_type="doc",   reason="storage_full"} 3
+
+# TYPE upload_bytes_total counter
+upload_bytes_total{file_type="image"}   8.83e+11
+
+# ── Gauge：瞬时状态 ────────────────────────────────
+# TYPE upload_in_flight gauge
+upload_in_flight{instance_role="worker"}  17
+
+# TYPE storage_available_bytes gauge
+storage_available_bytes{volume="/data", backend="s3"}  2.147483648e+11
+
+# ── Histogram：分布 ────────────────────────────────
+# TYPE upload_file_size_bytes histogram
+upload_file_size_bytes_bucket{le="10240", file_type="image"}  ...
+upload_file_size_bytes_sum{file_type="image"}   ...
+upload_file_size_bytes_count{file_type="image"} ...
+
+# TYPE upload_duration_seconds histogram
+upload_duration_seconds_bucket{le="0.5", file_type="image"}  ...
+upload_duration_seconds_sum{file_type="image"}   ...
+upload_duration_seconds_count{file_type="image"} ...
+
+# ── Info：元信息 ───────────────────────────────────
+# TYPE uploadsvc_build_info gauge
+uploadsvc_build_info{version="1.4.2", commit="8f3a1c9"} 1
+```
+
+**设计要点：**
+
+**（1）成功和失败用同一个 Counter，靠 `result` 标签区分。**
+不要建 `upload_success_total` 和 `upload_failure_total` 两个指标。用一个指标算成功率只需一个查询，分子分母来自同一次抓取，天然一致。
+
+**（2）`reason` 标签只出现在失败的序列上，这是合法的。**
+Prometheus 不要求同一指标的所有序列有相同的标签集。但要注意 `reason` 的取值必须是**有限枚举**（`too_large` / `timeout` / `storage_full` / `invalid_format` / `internal`），绝不能把原始错误消息塞进去。
+
+**（3）`upload_bytes_total` 单独建 Counter。**
+虽然 Histogram 的 `_sum` 也能算总字节数，但单独的 Counter 语义更清晰、查询更便宜，而且不受 Histogram 桶配置变更的影响。
+
+**（4）基数估算：**
+
+```text
+upload_requests_total : 2(result) × 5(file_type) × 5(reason) ≈ 30 条/实例（稀疏，实际更少）
+upload_file_size_bytes: 12(桶+2) × 5(file_type)              = 60 条/实例
+upload_duration_seconds: 10(桶+2) × 5(file_type)             = 50 条/实例
+其余                                                          ≈ 5 条/实例
+                                              合计 ≈ 145 条/实例
+10 个实例 = 1450 条  ✅ 完全健康
+```
+
+## 二、Histogram 桶的选择
+
+**文件大小（几 KB 到几百 MB，跨 5 个数量级）→ 指数桶**
+
+```go
+// 10KB 起，每档 ×4，共 10 档
+// 10KB, 40KB, 160KB, 640KB, 2.5MB, 10MB, 40MB, 160MB, 640MB, 2.5GB
+Buckets: prometheus.ExponentialBuckets(10240, 4, 10)
+```
+
+**为什么用指数桶？** 因为文件大小的分布本身就是数量级跨度很大的。用线性桶（比如每 10MB 一档）的话，99% 的小文件全挤在第一个桶里，完全看不出分布。
+
+**上传耗时 → SLO 驱动 + 覆盖长尾**
+
+```go
+Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+```
+
+**为什么这么配：**
+- 前几档密集（0.1–1s）：绝大多数小文件上传落在这个区间，需要分辨率。
+- 有 `le="1"` 这个桶：因为 SLO 是「1 秒内完成」，桶边界必须卡在阈值上，这样 SLO 达成率是精确值而非估算值。
+- 尾部到 60s：大文件上传可能要几十秒，**最大有限桶必须覆盖最坏情况**。否则 P99 会落在 `+Inf` 桶里，`histogram_quantile` 返回 `+Inf`，图表直接废掉。
+
+## 三、关键查询
+
+```promql
+# 1. 上传 QPS（按文件类型）
+sum by (file_type) (rate(upload_requests_total[5m]))
+
+# 2. 失败率（整体）
+sum(rate(upload_requests_total{result="failure"}[5m]))
+/
+sum(rate(upload_requests_total[5m]))
+
+# 3. 失败原因 Top 分布
+sum by (reason) (rate(upload_requests_total{result="failure"}[5m]))
+
+# 4. 集群整体 P99 耗时
+histogram_quantile(
+  0.99,
+  sum by (le) (rate(upload_duration_seconds_bucket[5m]))
+)
+
+# 5. 按文件类型分别看 P99
+histogram_quantile(
+  0.99,
+  sum by (le, file_type) (rate(upload_duration_seconds_bucket[5m]))
+)
+
+# 6. SLO 达成率：1 秒内完成的比例（无估算误差）
+sum(rate(upload_duration_seconds_bucket{le="1"}[5m]))
+/
+sum(rate(upload_duration_seconds_count[5m]))
+
+# 7. 平均文件大小
+rate(upload_file_size_bytes_sum[5m]) / rate(upload_file_size_bytes_count[5m])
+
+# 8. 上传吞吐（MB/s）
+sum(rate(upload_bytes_total[5m])) / 1024 / 1024
+
+# 9. 当前并发上传数
+sum(upload_in_flight)
+
+# 10. 存储剩余（TB）
+storage_available_bytes{volume="/data"} / 1024 / 1024 / 1024 / 1024
+```
+
+## 四、告警规则
+
+```yaml
+groups:
+  - name: upload-service
+    rules:
+      # 存储预计 12 小时内写满
+      - alert: StorageWillFillIn12Hours
+        expr: |
+          predict_linear(storage_available_bytes[6h], 12 * 3600) < 0
+          and
+          storage_available_bytes < 500 * 1024 * 1024 * 1024
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "存储卷预计 12 小时内写满"
+          description: "当前剩余 {{ $value | humanize1024 }}B，按最近 6 小时的增速外推将在 12 小时内耗尽"
+
+      # 失败率过高
+      - alert: UploadHighFailureRate
+        expr: |
+          (
+            sum(rate(upload_requests_total{result="failure"}[5m]))
+            / sum(rate(upload_requests_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(upload_requests_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "上传失败率超过 5%"
+
+      # P99 延迟劣化
+      - alert: UploadHighLatency
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(upload_duration_seconds_bucket[5m]))
+          ) > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "上传 P99 耗时超过 10 秒"
+```
+
+**告警设计的三个细节：**
+
+**（1）`predict_linear` 为什么配 `[6h]` 而不是 `[30m]`？**
+窗口太短会被临时波动带偏（比如一次大批量上传），产生大量误报。用 6 小时的趋势外推 12 小时，是一个比较稳的比例。经验法则：**外推时长不要超过观察窗口的 2 倍。**
+
+**（2）为什么给存储告警加 `and storage_available_bytes < 500GB`？**
+一块 100TB 的盘即使正在增长，剩余 50TB 时也不需要半夜叫醒人。加一个绝对值下限，避免「趋势危险但绝对量充裕」的误报。
+
+**（3）为什么失败率告警要加 `and sum(rate(...)) > 1`？**
+凌晨流量低谷时，可能 5 分钟内只有 2 个请求，其中 1 个失败 → 失败率 50% → 触发告警。但这在统计上毫无意义。加一个流量下限，让告警只在有足够样本时生效。
+
+**（4）为什么 `for` 要设 10–30 分钟？**
+`for` 表示「持续满足条件多久才真正告警」。瞬时抖动不该叫人起床；`for: 10m` 过滤掉了绝大部分噪声，代价是告警延迟 10 分钟——对于「失败率 5%」这种非致命问题，这个交换是划算的。
+</Answer>
+</Callout>
+
+## 小结
+
+- **类型是约定不是强制**：TSDB 只存 float64，`# TYPE` 的价值在于告诉你「该用什么函数查它」。
+- **Counter**：只增不减，原始值几乎无意义，**必须配 `rate()` / `increase()`**；`rate` 内置计数器重置检测；口诀是「rate 在内，sum 在外」。
+- **Gauge**：可增可减的瞬时值，直接看或用 `avg_over_time` / `max_over_time`；变化量用 `delta` / `deriv`，**绝不能用 `rate`**。
+- **Histogram**：服务端分桶，暴露 `_bucket`（累积计数，带 `le` 标签）、`_sum`、`_count`。分位数在查询时用 `histogram_quantile` 插值估算——**精度取决于桶边界，桶要卡在 SLO 阈值上，上界要覆盖最坏情况**。
+- **Summary**：客户端算好分位数，精度高、不需预知值域，但**分位数不可跨实例聚合**，且时间窗口写死在代码里。
+- **选型默认 Histogram**，只有单实例且值域未知时才用 Summary。
+- **命名与类型配套**：Counter 加 `_total`，一律用基本单位（`_seconds` / `_bytes`），Gauge 和 Histogram 绝不加 `_total`。

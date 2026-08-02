@@ -1,0 +1,666 @@
+---
+title: 整体架构与核心组件
+order: 2
+description: Prometheus Server、TSDB、Exporter、Alertmanager、Pushgateway 与抓取流程
+---
+
+# 整体架构与核心组件
+
+上一章我们知道了 Prometheus 「主动去拉指标」。这一章拆开机箱，看看里面到底有哪些零件、数据是怎么一路流过去的。
+
+先记住一个关键的设计哲学：**Prometheus 生态是一堆各司其职的独立进程，而不是一个巨型单体。** Server 只管抓取、存储和查询；告警的路由与通知交给 Alertmanager；采集适配交给 Exporter。这种解耦让每个组件都能独立扩缩容和升级。
+
+## 1. 全景图
+
+```text
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  你的应用     │  │ node_exporter │  │ mysqld_export│   ← 各种 target
+│  /metrics    │  │  /metrics    │  │  /metrics    │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       └────────┬────────┴─────────────────┘
+                │  HTTP GET /metrics（Pull，默认 15s 一次）
+                ▼
+    ┌───────────────────────────────────────────┐
+    │           Prometheus Server               │
+    │  ┌─────────────┐                          │
+    │  │  Retrieval  │ ← Service Discovery      │
+    │  │  （抓取器）  │   (K8s / Consul / file)  │
+    │  └──────┬──────┘                          │
+    │         ▼                                 │
+    │  ┌─────────────┐    ┌──────────────────┐  │
+    │  │    TSDB     │◀──▶│  Rule Evaluator  │  │
+    │  │  （存储）    │    │  （规则求值）     │  │
+    │  └──────┬──────┘    └────────┬─────────┘  │
+    │         ▼                    │            │
+    │  ┌─────────────┐             │            │
+    │  │ HTTP API /  │             │            │
+    │  │  Web UI     │             │            │
+    │  └──────┬──────┘             │            │
+    └─────────┼────────────────────┼────────────┘
+              │                    │ 告警（Alert）
+              ▼                    ▼
+       ┌────────────┐      ┌──────────────┐
+       │  Grafana   │      │ Alertmanager │
+       │  PromQL 查询│      │ 分组/抑制/静默│
+       └────────────┘      └──────┬───────┘
+                                  ▼
+                     邮件 / 钉钉 / Slack / Webhook
+
+       ┌──────────────┐
+       │  短任务/批处理 │──push──▶ Pushgateway ──被 Prometheus 抓取──┐
+       └──────────────┘                                          │
+                                                    （汇入上方 Retrieval）
+```
+
+<Callout type="info" title="唯一必须的组件只有 Server">
+只跑一个 Prometheus Server 就能工作（自己抓自己）。Exporter、Alertmanager、Pushgateway、Grafana 都是**按需加入**的。理解这一点能帮你在部署时不被复杂度吓到。
+</Callout>
+
+## 2. Prometheus Server 内部
+
+Server 是单个 Go 二进制文件，内部由几个协作的模块组成。
+
+### 2.1 Retrieval（抓取器）
+
+抓取器是整个系统的心脏。它维护一份「目标列表（targets）」，为每个目标启动一个独立的抓取循环：
+
+1. 按 `scrape_interval` 定时触发，并对每个目标做**抖动（jitter）**，避免上千个目标在同一毫秒同时被抓。
+2. 发起 `GET /metrics` 请求，带上 `scrape_timeout` 超时限制。
+3. 解析返回的文本格式，得到一批样本。
+4. 为每个样本自动附加两个标签：`job`（来自配置里的 `job_name`）和 `instance`（目标的 host:port）。
+5. 执行 `relabel_configs` / `metric_relabel_configs`（改写、丢弃标签或整条序列）。
+6. 写入 TSDB，同时写入一条 `up` 指标记录本次抓取是否成功。
+
+除了 `up`，每次抓取还会自动生成这几个「元指标」，排查抓取问题时非常有用：
+
+```promql
+up                              # 1=成功 0=失败
+scrape_duration_seconds         # 本次抓取耗时
+scrape_samples_scraped          # 本次抓回多少个样本
+scrape_samples_post_metric_relabeling  # relabel 过滤后剩多少
+scrape_series_added             # 本次新增了多少条序列
+```
+
+<Callout type="tip" title="抓取超时的排查起点">
+如果目标偶尔抓不到，先看 `scrape_duration_seconds` 是不是逼近了 `scrape_timeout`。一个暴露了几万条序列的应用，生成 `/metrics` 响应可能要好几秒。要么优化指标数量，要么调大超时（但超时必须小于抓取间隔）。
+</Callout>
+
+### 2.2 TSDB（本地时序数据库）
+
+TSDB 是 Prometheus 自研的存储引擎，采用「内存 + WAL + 磁盘块」的经典组合：
+
+- **Head Block（内存）**：最近约 2 小时的数据放在内存里，写入极快，查询也最快。
+- **WAL（Write-Ahead Log）**：内存里的数据同时顺序追加写入磁盘的预写日志。进程崩溃重启时，通过重放 WAL 恢复内存数据，保证不丢。
+- **持久化块（Block）**：每 2 小时，Head 里的数据被压实（compact）成一个不可变的磁盘块，目录以 ULID 命名，内含索引与压缩后的 chunk 文件。
+- **压实（Compaction）**：后台会把多个小块合并成更大的块（2h → 6h → 24h …），减少文件数量、提升查询效率。
+- **过期（Retention）**：超过保留期（默认 15 天）的整个块被直接删除——因为块是按时间切分的，删除是 O(1) 的目录删除，不需要扫描。
+
+<Callout type="warn" title="TSDB 是本地存储，不做集群">
+Prometheus 的 TSDB **只写本地磁盘，没有内置的集群或复制机制**。做高可用的常规做法是「跑两个配置完全相同的实例」，做长期存储则要通过 `remote_write` 把数据同时写到 Thanos / Mimir / VictoriaMetrics。这是刻意的设计取舍：保证单机极其简单可靠。
+</Callout>
+
+### 2.3 Rule Evaluator（规则求值器）
+
+它按 `evaluation_interval`（默认 15s）周期性地执行你定义的规则，规则分两类：
+
+- **Recording Rule（记录规则）**：把一个复杂查询的结果**预计算**成一条新序列存回 TSDB。用于加速看板——把每次都要算 30 秒的查询变成直接读一条现成序列。
+- **Alerting Rule（告警规则）**：求值一个布尔表达式，结果非空即视为触发。配合 `for` 字段做「持续 N 分钟才真正告警」的去抖动。
+
+```yaml
+groups:
+  - name: example
+    rules:
+      # 记录规则：预计算各 job 的 QPS
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+
+      # 告警规则：实例宕机
+      - alert: InstanceDown
+        expr: up == 0
+        for: 5m                    # 持续 5 分钟才真正告警
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} 已宕机超过 5 分钟"
+          description: "job={{ $labels.job }} 的实例 {{ $labels.instance }} 抓取失败"
+```
+
+<Callout type="info" title="为什么要有 for">
+瞬时抖动（一次网络超时）不该半夜把人叫醒。`for: 5m` 表示表达式必须**连续 5 分钟**都为真，告警才从 `Pending` 状态转为 `Firing` 并推送给 Alertmanager。这是最简单也最有效的降噪手段。
+</Callout>
+
+### 2.4 HTTP API 与 Web UI
+
+Server 在 `9090` 端口暴露一个 HTTP 服务，主要包括：
+
+| 路径 | 用途 |
+|---|---|
+| `/` 、`/graph` | Web UI，输入 PromQL 查询并画图 |
+| `/targets` | 查看所有抓取目标的状态（UP / DOWN、最后抓取时间、错误原因） |
+| `/rules` | 查看已加载的记录规则与告警规则 |
+| `/alerts` | 查看当前处于 Pending / Firing 的告警 |
+| `/config` | 查看当前生效的完整配置 |
+| `/metrics` | Prometheus **自己的**指标（它会抓自己） |
+| `/api/v1/query` | 瞬时查询 API |
+| `/api/v1/query_range` | 区间查询 API（Grafana 画图用的就是它） |
+| `/-/reload` | 热加载配置（需启动时加 `--web.enable-lifecycle`） |
+
+```bash
+# 瞬时查询：当前有哪些目标挂了
+curl -s 'http://localhost:9090/api/v1/query?query=up==0' | jq
+
+# 区间查询：最近 1 小时的 QPS，每 60 秒一个点
+curl -s 'http://localhost:9090/api/v1/query_range' \
+  --data-urlencode 'query=sum(rate(http_requests_total[5m]))' \
+  --data-urlencode "start=$(date -u -v-1H +%s)" \
+  --data-urlencode "end=$(date -u +%s)" \
+  --data-urlencode 'step=60' | jq
+```
+
+<Callout type="tip" title="Web UI 只够调试">
+原生 Web UI 功能很朴素：没有仪表盘、没有权限、图表也简陋。它的定位是**调试 PromQL 和排查抓取问题**。生产环境的展示层交给 Grafana。
+</Callout>
+
+## 3. Exporter：把「别人的指标」翻译成 Prometheus 格式
+
+Prometheus 只认一种输入：一个返回**特定文本格式**的 HTTP 接口。可现实世界里 MySQL、Redis、Nginx、Linux 内核都不会主动说这门语言。
+
+**Exporter 就是翻译官**：它去用目标系统自己的方式（执行 SQL、读 `/proc`、调 Redis INFO 命令）取数据，转换成 Prometheus 文本格式，暴露在自己的 `/metrics` 上。
+
+```text
+┌──────────┐   SHOW GLOBAL STATUS  ┌───────────────┐  /metrics  ┌────────────┐
+│  MySQL   │◀──────────────────────│ mysqld_exporter│◀──────────│ Prometheus │
+└──────────┘                       └───────────────┘            └────────────┘
+```
+
+常见 Exporter 与默认端口：
+
+| Exporter | 端口 | 采集内容 |
+|---|---|---|
+| `node_exporter` | 9100 | Linux/Unix 主机：CPU、内存、磁盘、网络、文件系统 |
+| `mysqld_exporter` | 9104 | MySQL：连接数、QPS、慢查询、主从延迟 |
+| `redis_exporter` | 9121 | Redis：内存、命中率、连接数、键数量 |
+| `blackbox_exporter` | 9115 | 黑盒探测：HTTP/TCP/ICMP/DNS 可达性与证书有效期 |
+| `nginx-prometheus-exporter` | 9113 | Nginx 连接数与请求数 |
+| `kube-state-metrics` | 8080 | K8s 对象状态：Deployment 副本数、Pod 阶段 |
+| `cAdvisor` | 8080 | 容器级 CPU / 内存 / 网络 |
+| Pushgateway | 9091 | 短任务指标中转（见下文） |
+
+<Callout type="info" title="应用自己也可以是 Exporter">
+如果是你自己写的服务，不需要额外 Exporter——直接引入官方客户端库（Go / Java / Python / Node.js 等），在代码里定义指标，库会自动帮你在 `/metrics` 上暴露。这叫**直接埋点（direct instrumentation）**，比 Exporter 更准确、更贴近业务。
+</Callout>
+
+### 3.1 `/metrics` 文本格式
+
+这是整个生态的「通用语」，规则极简：**一行一个样本**，以 `#` 开头的是元信息注释。
+
+```text
+# HELP http_requests_total Total number of HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{method="GET",status="200"} 1027
+http_requests_total{method="GET",status="500"} 3
+http_requests_total{method="POST",status="200"} 218
+
+# HELP process_resident_memory_bytes Resident memory size in bytes.
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes 3.4275328e+07
+
+# HELP http_request_duration_seconds Request latency histogram.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.1"} 900
+http_request_duration_seconds_bucket{le="0.5"} 1200
+http_request_duration_seconds_bucket{le="1"} 1240
+http_request_duration_seconds_bucket{le="+Inf"} 1248
+http_request_duration_seconds_sum 187.3
+http_request_duration_seconds_count 1248
+```
+
+要点：
+
+- `# HELP <指标名> <描述>`：人类可读的说明，会显示在 Web UI 里。
+- `# TYPE <指标名> <类型>`：类型为 `counter` / `gauge` / `histogram` / `summary` / `untyped`。
+- 样本行格式：`指标名{标签...} 值 [毫秒时间戳]`。**时间戳通常省略**，让 Prometheus 用抓取时刻作为时间戳（这是推荐做法）。
+- 值是 float64，支持科学计数法（`3.4275328e+07`），也支持 `NaN`、`+Inf`、`-Inf`。
+- 无标签的指标可以直接写指标名和值。
+
+```bash
+# 亲手看一眼真实的输出
+curl -s http://localhost:9100/metrics | grep -A2 '^# TYPE node_load1'
+```
+
+## 4. Alertmanager：告警的路由与降噪
+
+一个常见的误解是「Prometheus 会发告警邮件」。**不会。** Prometheus 只负责**判断告警是否触发**，然后把告警事件通过 HTTP 推给 Alertmanager。剩下的事全是 Alertmanager 的：
+
+| 能力 | 解决的问题 |
+|---|---|
+| **分组（Grouping）** | 100 台机器同时磁盘告警，合并成 1 条通知，而不是 100 封邮件 |
+| **抑制（Inhibition）** | 整个机房断网时，抑制掉该机房内所有应用的「服务不可用」告警 |
+| **静默（Silence）** | 计划内维护窗口期间，临时屏蔽指定标签的告警 |
+| **去重（Deduplication）** | 两个 HA 的 Prometheus 发来同一条告警，只通知一次 |
+| **路由（Routing）** | 按标签把告警发给不同的人：`severity=critical` 打电话，`warning` 发 Slack |
+| **重复通知控制** | 问题一直没解决时，每隔 4 小时提醒一次，而不是每 15 秒 |
+
+```yaml
+# alertmanager.yml 骨架
+route:
+  group_by: ['alertname', 'cluster']
+  group_wait: 30s          # 首次触发后等 30s，攒一批一起发
+  group_interval: 5m       # 同组内有新告警时，最快 5m 再发一次
+  repeat_interval: 4h      # 同一告警未恢复时，4h 重复提醒
+  receiver: 'default-mail'
+  routes:
+    - matchers:
+        - severity = critical
+      receiver: 'oncall-webhook'
+
+inhibit_rules:
+  # critical 存在时，压制同一实例上的 warning
+  - source_matchers: [severity = critical]
+    target_matchers: [severity = warning]
+    equal: ['alertname', 'instance']
+
+receivers:
+  - name: 'default-mail'
+    email_configs:
+      - to: 'ops@example.com'
+  - name: 'oncall-webhook'
+    webhook_configs:
+      - url: 'http://dingtalk-bridge:8060/dingtalk/webhook/send'
+```
+
+Alertmanager 推给 Webhook 的载荷长这样，自己写钉钉/飞书桥接时会用到：
+
+```json
+{
+  "receiver": "oncall-webhook",
+  "status": "firing",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "InstanceDown",
+        "instance": "10.0.0.12:9100",
+        "job": "node",
+        "severity": "critical"
+      },
+      "annotations": {
+        "summary": "10.0.0.12:9100 已宕机超过 5 分钟"
+      },
+      "startsAt": "2024-05-01T10:00:00.000Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "fingerprint": "a1b2c3d4e5f60718"
+    }
+  ],
+  "groupLabels": { "alertname": "InstanceDown" },
+  "commonLabels": { "severity": "critical", "job": "node" },
+  "externalURL": "http://alertmanager:9093"
+}
+```
+
+<Callout type="warn" title="为什么 Alertmanager 要独立出来">
+两个原因。**其一是高可用**：多个 Prometheus 实例（含 HA 副本）可以共用同一组 Alertmanager，由它统一去重；Alertmanager 自身也能组成 gossip 集群互相同步状态。**其二是职责分离**：告警「什么时候触发」是数据问题（Prometheus 擅长），「发给谁、怎么发、要不要合并」是流程问题（跟数据无关）。混在一起会让两边都变复杂。
+</Callout>
+
+## 5. Pushgateway：短任务的中转站
+
+上一章提到 Pull 模型对付不了「跑几秒就退出」的任务。Pushgateway 是官方给出的答案：一个**长期运行的、可以被推送的缓存**。
+
+```text
+CronJob (30s 后退出) ──POST──▶ Pushgateway ──被 Prometheus 抓取──▶ TSDB
+                               （常驻，一直持有最后一次推送的值）
+```
+
+```bash
+# 备份脚本结束时上报结果
+cat <<EOF | curl --data-binary @- http://pushgateway:9091/metrics/job/db_backup/instance/db01
+# TYPE backup_last_success_timestamp_seconds gauge
+backup_last_success_timestamp_seconds $(date +%s)
+# TYPE backup_duration_seconds gauge
+backup_duration_seconds 128.4
+# TYPE backup_size_bytes gauge
+backup_size_bytes 4823449600
+EOF
+
+# 删除某个 job 的所有指标（任务下线时清理）
+curl -X DELETE http://pushgateway:9091/metrics/job/db_backup/instance/db01
+```
+
+然后基于它写告警——「备份超过 26 小时没成功」：
+
+```promql
+time() - backup_last_success_timestamp_seconds > 26 * 3600
+```
+
+<Callout type="warn" title="Pushgateway 的三个坑">
+1. **它不会过期数据**。推上去的值会**永远**保留，直到你显式 DELETE 或重启它。所以一个已经下线的任务会一直上报「陈旧的成功状态」，制造假象。
+2. **它是单点**。所有短任务的数据都经过它，它挂了这部分数据就断了。
+3. **它会掩盖任务失活**。Prometheus 抓的是 Pushgateway（一直 UP），所以 `up` 指标反映的是 Pushgateway 的健康，不是任务的。判断任务是否还活着，必须靠上面那种「最后成功时间戳」的写法。
+
+**结论：Pushgateway 只用于短生命周期的批处理任务，绝不要拿它当通用的 Push 入口。** 常驻服务永远应该直接暴露 `/metrics`。
+</Callout>
+
+## 6. Service Discovery：让目标列表自己维护自己
+
+如果目标是 3 台固定的机器，手写 IP 就够了。但在 K8s 里 Pod 随时被销毁重建、IP 每次都变，手写配置根本不可行。
+
+**服务发现（SD）** 让 Prometheus 从外部系统动态获取目标列表：
+
+| SD 类型 | 数据来源 | 典型场景 |
+|---|---|---|
+| `static_configs` | 配置文件里写死 | 少量固定机器、自监控 |
+| `file_sd_configs` | 监听本地 JSON/YAML 文件变化 | 用 CMDB 脚本生成文件，通用性最强 |
+| `kubernetes_sd_configs` | 查询 K8s API Server | 容器环境，最常用 |
+| `consul_sd_configs` | Consul 服务目录 | 微服务注册中心 |
+| `dns_sd_configs` | DNS SRV / A 记录 | 有内部 DNS 的环境 |
+| `ec2/gce/azure_sd_configs` | 云厂商 API | 云主机自动纳管 |
+
+```yaml
+scrape_configs:
+  # 1) 静态：写死地址
+  - job_name: 'node'
+    static_configs:
+      - targets: ['10.0.0.11:9100', '10.0.0.12:9100']
+        labels:
+          env: prod
+
+  # 2) 文件发现：外部脚本写这个文件，Prometheus 自动感知变化，无需重启
+  - job_name: 'app-from-cmdb'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/*.json']
+        refresh_interval: 30s
+
+  # 3) K8s 发现：自动纳管所有带注解的 Pod
+  - job_name: 'k8s-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # 只保留注解 prometheus.io/scrape=true 的 Pod
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      # 把 Pod 的 namespace 提升为正式标签
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+```
+
+`file_sd_configs` 读取的 JSON 文件格式：
+
+```json
+[
+  {
+    "targets": ["10.0.1.5:8080", "10.0.1.6:8080"],
+    "labels": { "job": "order-service", "env": "prod", "region": "bj" }
+  },
+  {
+    "targets": ["10.0.2.5:8080"],
+    "labels": { "job": "order-service", "env": "staging", "region": "sh" }
+  }
+]
+```
+
+<Callout type="tip" title="relabel_configs 是 SD 的灵魂">
+服务发现返回的原始元数据都带 `__meta_` 前缀（如 `__meta_kubernetes_pod_name`），并且**默认会被丢弃**。`relabel_configs` 就是在抓取前对这些元数据做加工的流水线：用 `keep`/`drop` 过滤掉不想要的目标，用 `replace` 把元数据提升成正式标签。可以说，没有 relabel 的服务发现是不完整的。
+</Callout>
+
+## 7. 完整数据流：从 target 到通知
+
+把所有零件串起来，一条数据的完整旅程是这样的：
+
+1. **发现目标**：Service Discovery（或静态配置）产出一批 target，每个 target 是一个 `host:port` + 一堆 `__meta_` 元标签。
+2. **relabel 加工**：执行 `relabel_configs`，过滤掉不需要的 target，把元标签改写成正式标签，确定最终的抓取地址与路径。
+3. **抓取（scrape）**：Retrieval 模块按 `scrape_interval` 发起 `GET /metrics`，超时受 `scrape_timeout` 约束。
+4. **解析与打标**：解析文本格式为样本，自动附加 `job` 和 `instance` 标签，并写入 `up`、`scrape_duration_seconds` 等元指标。
+5. **metric_relabel 过滤**：执行 `metric_relabel_configs`，在**入库前**丢弃高基数或无用的序列（这是控制成本最有效的一道闸门）。
+6. **写入 TSDB**：样本先写 WAL（保证崩溃不丢），再进 Head Block（内存）；2 小时后压实成磁盘 block。
+7. **分叉一：查询**。Grafana 或 Web UI 通过 `/api/v1/query_range` 发起 PromQL 查询，TSDB 用倒排索引定位序列、按时间范围取样本、执行 PromQL 引擎，返回结果画图。
+8. **分叉二：规则求值**。Rule Evaluator 每 `evaluation_interval` 跑一遍所有规则：
+   - 记录规则 → 结果**写回 TSDB**，变成一条新序列。
+   - 告警规则 → 表达式结果非空则告警进入 `Pending`；持续满足 `for` 时长后转为 `Firing`。
+9. **推送告警**：`Firing` 状态的告警被持续（默认每分钟）POST 给 Alertmanager 的 `/api/v2/alerts`。
+10. **Alertmanager 处理**：去重 → 按 `group_by` 分组 → 等待 `group_wait` 攒批 → 检查抑制规则和静默规则 → 匹配路由树找到 receiver。
+11. **发出通知**：调用邮件 / Slack / Webhook 等 receiver 发送；未恢复的告警按 `repeat_interval` 重复提醒。
+12. **恢复**：表达式不再满足时，Prometheus 发送 `endsAt` 让告警 `resolved`，Alertmanager 视配置发送恢复通知。
+
+<Callout type="info" title="一句话记住数据流">
+`target → scrape → relabel → TSDB →` 分两路：一路 `→ PromQL 查询 → Grafana`，另一路 `→ 告警规则求值 → Alertmanager → 分组/抑制/路由 → 通知`。
+</Callout>
+
+---
+
+<Callout type="exercise" title="练习 1：把组件对号入座">
+下面 5 个需求，各自应该由哪个组件负责？简述理由。
+
+1. 采集 Linux 主机的磁盘剩余空间
+2. 让「同一机房 50 台机器同时告警」只发一条钉钉消息
+3. 让每天凌晨的数据清洗任务把执行结果上报到监控系统
+4. 判断「5xx 错误率连续 10 分钟超过 1%」
+5. K8s 集群扩容后，新 Pod 自动被纳入监控
+
+<Answer>
+**参考答案：**
+
+1. **node_exporter**（Exporter）。Prometheus Server 自己不会读 `/proc` 和文件系统，需要 node_exporter 把主机层面的数据翻译成 `/metrics` 格式。对应指标是 `node_filesystem_avail_bytes`。
+
+2. **Alertmanager**。这是典型的「分组（grouping）」需求。Prometheus 只管判断每台机器是否触发告警，合并通知是 Alertmanager 的职责：
+
+   ```yaml
+   route:
+     group_by: ['alertname', 'datacenter']
+     group_wait: 30s
+   ```
+
+   按 `alertname` + `datacenter` 分组后，同机房同类型的 50 条告警会被攒成一条通知。
+
+3. **Pushgateway**。清洗任务是短生命周期任务，跑完就退出，Prometheus 的 Pull 抓不到。任务在结束前把结果推给常驻的 Pushgateway，Prometheus 再从 Pushgateway 抓取。注意要上报「最后成功时间戳」而不是简单的成功标志，否则任务不再运行时会一直显示「成功」。
+
+4. **Prometheus Server 的 Rule Evaluator（告警规则）**。这是纯粹的数据判断，由 Server 内部的规则求值器完成：
+
+   ```yaml
+   - alert: HighErrorRate
+     expr: |
+       sum(rate(http_requests_total{status=~"5.."}[5m]))
+       / sum(rate(http_requests_total[5m])) > 0.01
+     for: 10m
+   ```
+
+   `for: 10m` 保证「连续 10 分钟」这个条件。触发后 Server 才把告警推给 Alertmanager。
+
+5. **Service Discovery（`kubernetes_sd_configs`）**。K8s SD 会持续查询 API Server 获取 Pod 列表，新 Pod 一创建就出现在目标列表里，无需改配置、无需重启 Prometheus。配合 `relabel_configs` 按注解过滤要抓哪些 Pod。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：读懂 /metrics 文本">
+给定下面这段 `/metrics` 输出：
+
+```text
+# HELP app_queue_depth Current number of jobs in queue.
+# TYPE app_queue_depth gauge
+app_queue_depth{queue="email",priority="high"} 12
+app_queue_depth{queue="email",priority="low"} 340
+app_queue_depth{queue="sms",priority="high"} 0
+
+# HELP app_jobs_processed_total Total jobs processed.
+# TYPE app_jobs_processed_total counter
+app_jobs_processed_total{queue="email",result="ok"} 98213
+app_jobs_processed_total{queue="email",result="fail"} 47
+```
+
+回答：
+1. 这段文本一共包含几条时间序列？
+2. Prometheus 抓取后，每条序列上实际会有哪些标签（比配置文件里多了什么）？
+3. 写一条 PromQL，查询所有队列的总积压量（按 queue 分组）。
+
+<Answer>
+**参考答案：**
+
+**问题 1：一共 5 条时间序列。**
+
+时间序列由「指标名 + 唯一标签组合」确定，`# HELP` 和 `# TYPE` 是注释元信息，不算样本：
+
+```text
+app_queue_depth{queue="email", priority="high"}     → 序列 1
+app_queue_depth{queue="email", priority="low"}      → 序列 2
+app_queue_depth{queue="sms",   priority="high"}     → 序列 3
+app_jobs_processed_total{queue="email", result="ok"}   → 序列 4
+app_jobs_processed_total{queue="email", result="fail"} → 序列 5
+```
+
+注意：虽然只有 2 个**指标名**，但因为标签组合不同，产生了 5 条**序列**。
+
+**问题 2：抓取时 Prometheus 会自动附加 `job` 和 `instance` 两个标签。**
+
+假设配置里 `job_name: worker`，目标是 `10.0.0.20:8080`，那么入库后第一条序列实际是：
+
+```text
+app_queue_depth{queue="email", priority="high", job="worker", instance="10.0.0.20:8080"}
+```
+
+此外，如果 `scrape_configs` 或 SD 里通过 `labels` / `relabel_configs` 加了额外标签（如 `env="prod"`），也会一并附加。同时 Prometheus 还会为这次抓取单独生成 `up{job="worker", instance="10.0.0.20:8080"}` 等元指标（它们不属于这 5 条序列）。
+
+**问题 3：按 queue 分组求总积压。**
+
+```promql
+sum by (queue) (app_queue_depth)
+```
+
+结果会得到两条线：`queue="email"` 值为 `12 + 340 = 352`，`queue="sms"` 值为 `0`。
+
+这里 `sum by (queue)` 把 `priority`、`instance` 等其他标签都聚合掉了，只保留 `queue` 维度。如果想看总的（不分队列），直接 `sum(app_queue_depth)`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：设计一个批处理任务的监控方案">
+你有一个每天 02:00 执行的数据库备份脚本，正常耗时约 10 分钟。要求：
+
+1. 备份失败或超过 26 小时未成功，要告警。
+2. 备份耗时超过 30 分钟，要告警（可能出问题了）。
+
+请给出：上报方式（推什么指标、怎么推）+ 两条告警规则。
+
+<Answer>
+**参考答案：**
+
+**一、上报方式：用 Pushgateway。**
+
+关键设计是**上报时间戳而非布尔状态**——因为 Pushgateway 的数据不会过期，如果只推 `backup_success 1`，任务哪天没跑（比如 crontab 被删了），这个 1 会永远挂在那里，你永远收不到告警。而时间戳会随着 `time()` 的推进自动「变旧」，天然能表达失活。
+
+在备份脚本末尾加上：
+
+```bash
+#!/bin/bash
+START=$(date +%s)
+
+if mysqldump --all-databases | gzip > /backup/db-$(date +%F).sql.gz; then
+  RESULT=1
+else
+  RESULT=0
+fi
+
+END=$(date +%s)
+DURATION=$((END - START))
+
+cat <<EOF | curl --data-binary @- http://pushgateway:9091/metrics/job/db_backup/instance/db01
+# TYPE backup_last_run_timestamp_seconds gauge
+backup_last_run_timestamp_seconds $END
+# TYPE backup_last_success_timestamp_seconds gauge
+backup_last_success_timestamp_seconds $([ $RESULT -eq 1 ] && echo $END || echo 0)
+# TYPE backup_duration_seconds gauge
+backup_duration_seconds $DURATION
+# TYPE backup_success gauge
+backup_success $RESULT
+EOF
+```
+
+注意失败时**不要**更新 `backup_last_success_timestamp_seconds`（这里推 0 是为了首次初始化；更严谨的做法是失败时干脆不推这一行，让旧值保留）。
+
+**二、告警规则：**
+
+```yaml
+groups:
+  - name: db-backup
+    rules:
+      # 规则 1：超过 26 小时没有成功过（覆盖「失败」和「压根没跑」两种情况）
+      - alert: BackupTooOld
+        expr: time() - backup_last_success_timestamp_seconds > 26 * 3600
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} 备份已超过 26 小时未成功"
+          description: "上次成功时间距今 {{ $value | humanizeDuration }}"
+
+      # 规则 2：备份耗时超过 30 分钟
+      - alert: BackupTooSlow
+        expr: backup_duration_seconds > 1800
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} 备份耗时异常：{{ $value | humanizeDuration }}"
+```
+
+**为什么阈值取 26 小时而不是 24 小时？** 留 2 小时缓冲，避免任务正常执行（10 分钟）+ 轻微延迟就误报。告警阈值应当明显宽于正常波动范围。
+
+**规则 1 为什么能同时覆盖「失败」和「没跑」？** 因为它只看「距离上次成功过了多久」，不关心中间发生了什么。脚本崩溃、crontab 被误删、机器关机——所有导致「没有新的成功」的原因，都会在 26 小时后触发同一条告警。这比分别为每种失败模式写规则要健壮得多。
+
+**补充**：`backup_success` 这个瞬时布尔值仍然有用——它可以让你在看板上一眼看到最近一次的结果，只是不适合单独用来告警。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 4：为什么 Alertmanager 不能合并进 Prometheus？">
+有人提议：「告警规则都在 Prometheus 里判断了，为什么不干脆让它直接发邮件，非要多部署一个 Alertmanager？」
+
+请从**高可用**和**职责分离**两个角度说明这样做的问题。
+
+<Answer>
+**参考答案：**
+
+**角度一：高可用（这是最关键的原因）**
+
+生产环境的 Prometheus 通常跑**两个或多个完全相同的副本**来实现高可用——它们抓同样的目标、跑同样的规则，互不通信。这样任何一个挂了，另一个还能继续工作。
+
+问题来了：同一条 `InstanceDown` 告警，两个副本都会判定为触发。如果每个 Prometheus 各自发邮件，运维就会收到**两封一模一样的告警**。副本数越多，重复越严重。
+
+Alertmanager 通过 `fingerprint`（标签集合的哈希）识别出这是同一条告警，**自动去重**，只通知一次：
+
+```text
+Prometheus-A ──┐
+               ├──▶ Alertmanager（去重）──▶ 只发 1 条通知
+Prometheus-B ──┘
+```
+
+而且 Alertmanager 自己也能组成集群（通过 gossip 协议同步「谁已经发过了」的状态），做到「多个 Alertmanager 实例中任意一个挂掉，通知不丢也不重」。这套去重与状态同步机制相当复杂，如果内嵌进 Prometheus，就意味着多个 Prometheus 副本之间必须互相通信、共享状态——这直接破坏了 Prometheus「单机独立、无外部依赖」的核心设计，可靠性反而下降。
+
+**角度二：职责分离**
+
+这两件事的性质完全不同：
+
+| | Prometheus 的职责 | Alertmanager 的职责 |
+|---|---|---|
+| 关心的问题 | **什么时候该告警** | **告警了之后怎么办** |
+| 输入 | 时序数据 | 告警事件 |
+| 变更频率 | 规则相对稳定 | 值班表、通知渠道频繁变 |
+| 变更影响 | 改规则要重载配置，影响数据处理 | 改路由只影响通知，不碰数据 |
+
+具体来说，分组、抑制、静默、路由、重复间隔这些能力，**跟时序数据毫无关系**，它们是纯粹的「事件流处理」逻辑。把它们塞进 Prometheus 会带来几个实际麻烦：
+
+- **变更风险耦合**：值班同事想改个通知群，却要动 Prometheus 的配置并触发重载，可能影响正在进行的抓取。
+- **复用性丧失**：Alertmanager 不只服务 Prometheus，Grafana Alerting、Thanos Ruler、甚至自研系统都可以往它推告警，共用同一套路由和静默策略。内嵌就没法复用了。
+- **静默功能无处安放**：静默需要一个带 UI 和持久化状态的服务（「这条规则从现在起屏蔽 2 小时」）。这是有状态的运维操作，硬塞进无状态的数据引擎里非常别扭。
+
+**总结**：这不是「多部署一个组件」的麻烦，而是 Unix 哲学「做好一件事」的体现。Prometheus 做数据判断，Alertmanager 做通知编排，两者用一个简单的 HTTP 接口连接，各自都能独立演进和扩展。
+</Answer>
+</Callout>
+
+## 小结
+
+- Prometheus 生态是**多个独立进程协作**，Server 是唯一必需组件。
+- **Server 内部**：Retrieval 抓取（附带 `up` 等元指标）、TSDB 存储（内存 Head + WAL + 2h 磁盘块）、Rule Evaluator 求值规则、HTTP API / Web UI 对外服务。
+- **Exporter** 是翻译官，把 MySQL/Redis/主机的数据转成 `/metrics` 文本格式；自己的应用可以用客户端库直接埋点。
+- **Alertmanager** 独立负责去重、分组、抑制、静默与路由——独立的根本原因是 Prometheus 多副本高可用需要一个统一的去重点。
+- **Pushgateway** 只服务短生命周期批处理任务，注意「数据不过期」和「掩盖任务失活」两个坑。
+- **Service Discovery** + `relabel_configs` 让目标列表在动态环境下自我维护。
+- 数据流：`target → scrape → relabel → TSDB →` 一路查询、一路告警。
+- 下一章我们真正把它装起来跑一遍 →

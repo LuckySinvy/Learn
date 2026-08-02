@@ -1,0 +1,2452 @@
+---
+title: 运维最佳实践
+order: 18
+description: 基数爆炸的诊断与治理、保留期与容量估算、性能调优、记录规则减负、联邦边界与告警疲劳
+---
+
+# 运维最佳实践
+
+前面十七章讲的都是「怎么用 Prometheus」。这一章讲的是**「怎么让 Prometheus 活下去」**。
+
+这两件事的区别，在小规模时几乎感觉不到。50 个目标、20 万条序列，一台 4 核 8G 的机器能稳稳跑上一年，你不需要懂任何调优知识。
+
+但当规模翻十倍——或者更常见的情况：**规模没翻十倍，但有人给某个指标加了一个 `user_id` 标签**——一切都会在几个小时内崩塌：
+
+- Prometheus 内存从 6G 涨到 60G，被 OOM Killer 杀掉。
+- 重启后进入 WAL 重放，花了 40 分钟才恢复服务，期间监控全瞎。
+- 好不容易起来了，因为要重新加载所有序列，内存又爆了，进入无限重启循环。
+- 看板全部超时，告警规则大面积跳过求值，`prometheus_rule_group_iterations_missed_total` 一路飙升。
+- 磁盘在两天内被写满。
+
+这不是危言耸听，这是每个跑过大规模 Prometheus 的团队都经历过的剧本。这一章要讲的，就是**如何避免它，以及它发生时如何抢救**。
+
+读完本章你会掌握：
+
+- 基数（cardinality）的确切含义、爆炸的传导路径，以及用 `/status/tsdb` 和 PromQL 做诊断的完整流程
+- 哪些标签是「高基数陷阱」，以及用 `metric_relabel_configs`、`sample_limit`、`label_limit` 建立防线
+- 磁盘容量与内存的估算公式，`--storage.tsdb.retention.time` 与 `retention.size` 的取舍
+- 抓取间隔、`--query.max-samples`、`GOMEMLIMIT` 等性能相关参数的实际影响
+- 记录规则的减负原理、命名规范、以及「什么该做什么不该做」
+- 联邦（federation）的能力边界，什么时候必须换成远程写入 + 长期存储
+- 告警疲劳的量化诊断与分诊体系设计
+
+## 一、基数：Prometheus 的第一杀手
+
+### 什么是基数
+
+**基数 = 时间序列的条数。**
+
+在 Prometheus 里，**指标名 + 一组标签键值对**唯一确定一条时间序列。所以：
+
+```text
+某个指标的序列数 = 各标签取值数的乘积
+```
+
+举例，`http_requests_total` 有这些标签：
+
+```text
+job      : 1 个值（api）
+instance : 20 个值
+method   : 4 个值（GET/POST/PUT/DELETE）
+status   : 8 个值
+path     : 50 个值
+```
+
+序列数 = `1 × 20 × 4 × 8 × 50 = 32000`。
+
+这个数字还算健康。现在假设有人加了一个 `user_id` 标签，日活 10 万：
+
+序列数 = `32000 × 100000 = 32 亿`。
+
+**这就是基数爆炸。** 注意它的关键特征：**是乘法，不是加法**。加一个标签不是「多一点开销」，而是「乘以这个标签的取值数」。
+
+<Callout type="warn" title="Histogram 是基数的隐形放大器">
+一个 Histogram 指标实际上会产生 **`桶数 + 2`** 条序列：每个桶一条 `_bucket`，加上 `_sum` 和 `_count`。
+
+默认的 Go 客户端 Histogram 有 11 个桶（外加 `+Inf`），也就是 **14 条序列**。
+
+所以「给 Histogram 加一个有 50 个取值的 `path` 标签」，实际增加的是 `50 × 14 = 700` 条序列，而不是 50 条。再乘以 20 个实例，就是 **14000 条序列**——一个指标就吃掉了整个系统基数预算的一大块。
+
+**Histogram 上加标签要按 14 倍来估算代价。** 这也是原生直方图（native histogram）最大的价值：它把一个直方图压缩成一条序列。
+</Callout>
+
+### 基数爆炸的传导路径
+
+理解「为什么高基数这么致命」，需要知道 Prometheus 的内存结构。
+
+Prometheus 的 TSDB 分成 **head block（内存中的最近 2 小时数据）** 和 **persistent blocks（磁盘上已压缩的历史块）**。head block 里，**每一条活跃序列都需要常驻内存**：
+
+1. **一个正在写入的 chunk**（约 1 到 2 KB，压缩后存放最近的样本）
+2. **倒排索引的一部分**（标签名到序列 ID 的映射、标签值到序列 ID 的 posting list）
+3. **序列的元数据**（标签集本身的字符串，虽然有 interning 去重，但仍占空间）
+
+经验值是**每条活跃序列 3 到 8 KB 内存**，取决于标签数量和标签值长度。取中间值 5 KB 算：
+
+- 100 万序列 ≈ **5 GB**
+- 500 万序列 ≈ **25 GB**
+- 3200 万序列 ≈ **160 GB**
+
+而且这只是 head block 的基础开销。**查询时还要额外分配内存**：一次 `sum(rate(x[5m]))` 扫描 100 万条序列，中间结果会再占用几个 GB。
+
+更糟的是**序列流失（churn）**。如果标签值本身在不断变化（比如 `pod` 名字每次发布都变、`request_id` 每次请求都变），那么「活跃序列」和「历史序列」都在暴涨：
+
+- 活跃序列：当前正在写入的
+- 历史序列：head block 里 2 小时内出现过、但已经不再写入的——**它们的索引仍然占着内存**，直到 head block 被压缩落盘
+
+**每次发布导致所有 pod 名字变化，就意味着基数在 2 小时内翻倍。** 一个发布频繁的环境，churn 造成的内存压力可能比稳态基数还大。
+
+### 诊断第一站：`/status/tsdb`
+
+Prometheus Web UI 的 **Status → TSDB Status** 页面（URL 是 `/tsdb-status` 或 `/status/tsdb`，取决于版本）是排查基数问题最快的入口。它直接给出：
+
+- **Head Stats**：head block 里的序列总数、样本总数、时间范围
+- **Top 10 series count by metric names**：哪些指标的序列最多——**九成的问题在这一栏就能看出来**
+- **Top 10 label names with value count**：哪些标签的取值最多
+- **Top 10 series count by label value pairs**：哪个具体的标签值组合关联了最多序列
+- **Top 10 label names with high memory usage**：哪些标签名占内存最多（长字符串标签会在这里暴露）
+
+这个页面是本地计算的，不消耗查询资源，**应该成为你排查的第一反应**。
+
+### 诊断第二站：PromQL
+
+页面看不出全貌时，用查询继续深挖。
+
+```promql
+# 【最重要的一条】按指标名统计序列数，取 Top 20
+topk(20, count by (__name__) ({__name__=~".+"}))
+```
+
+<Callout type="warn" title="这条查询本身很贵，别在看板上放">
+`{__name__=~".+"}` 匹配**所有序列**。在一个 500 万序列的 Prometheus 上执行，会瞬间加载全部序列的索引，可能直接触发 `--query.max-samples` 限制或者把内存打高一截。
+
+**排查时手动执行一次没问题，绝对不要放进 Grafana 看板或者记录规则。** 更安全的做法是优先看 `/status/tsdb` 页面，它给的是同样的信息但零查询成本。
+
+如果一定要查询，可以先缩小范围：
+
+```promql
+topk(10, count by (__name__) ({job="suspect-job"}))
+```
+</Callout>
+
+其他诊断查询：
+
+```promql
+# 按 job 看序列分布
+topk(20, count by (job) ({__name__=~".+"}))
+
+# 某个指标的哪个标签基数最高（逐个标签试）
+count(count by (path) (http_requests_total))
+count(count by (user_id) (http_requests_total))
+count(count by (instance) (http_requests_total))
+
+# 每次抓取拉回来多少样本（不需要扫索引，很便宜，可以放看板）
+topk(20, scrape_samples_scraped)
+
+# 经过 metric_relabel_configs 处理后实际入库的样本数
+topk(20, scrape_samples_post_metric_relabeling)
+
+# 这个差值就是被 drop 掉的量，可以验证 relabel 规则有没有生效
+scrape_samples_scraped - scrape_samples_post_metric_relabeling
+
+# head block 当前的序列总数（这是最该长期监控的一个指标）
+prometheus_tsdb_head_series
+
+# 序列流失率：每秒新建了多少序列
+rate(prometheus_tsdb_head_series_created_total[5m])
+rate(prometheus_tsdb_head_series_removed_total[5m])
+
+# 样本摄入速率（samples/s）
+rate(prometheus_tsdb_head_samples_appended_total[5m])
+
+# 有没有目标因为超过 sample_limit 被拒绝
+increase(prometheus_target_scrapes_exceeded_sample_limit_total[1h]) > 0
+```
+
+<Callout type="tip" title="churn 比稳态基数更值得警惕">
+```promql
+# 流失率 / 稳态序列数。这个比值越高，内存压力越大
+rate(prometheus_tsdb_head_series_created_total[1h]) * 3600
+  /
+prometheus_tsdb_head_series
+```
+
+这个值等于「一小时内新建的序列数占总序列数的比例」。
+
+- 小于 **0.1** → 健康，序列基本稳定。
+- 大于 **1** → 每小时都在把整个序列集换一遍，说明有标签在高频变化。典型元凶：`pod` 名字（每次发布变）、`container_id`、随机端口、时间戳、批次号。
+
+治理方向不是「减少标签」，而是「让标签值变稳定」——比如用 `deployment` 名代替 `pod` 名，用 `statefulset` 序号代替随机后缀。
+</Callout>
+
+### 高基数标签黑名单
+
+这些标签，**永远不要**放进 Prometheus 指标：
+
+| 标签 | 基数量级 | 为什么危险 |
+| --- | --- | --- |
+| `user_id` / `account_id` | 用户总数 | 直接乘以日活，几乎必然爆炸 |
+| `email` / `phone` | 用户总数 | 同上，外加 PII 合规风险 |
+| `request_id` / `trace_id` | 请求总数 | 每条序列只有一个样本，纯粹的浪费 |
+| `session_id` | 会话总数 | 同上 |
+| `timestamp` / 日期字符串 | 无上限 | 时间本来就是 TSDB 的维度，放标签里是双重记账 |
+| 完整 URL（含 query string） | 无上限 | `?page=1`、`?page=2` 各算一条序列 |
+| 完整错误消息 | 无上限 | 错误消息里常带变量（ID、时间、路径） |
+| SQL 语句原文 | 无上限 | 同上，且字符串很长，索引内存翻倍 |
+| IP 地址（客户端） | 很大 | 服务端 IP 可以，客户端 IP 绝对不行 |
+| `container_id` | 高流失 | 每次重启就变，churn 灾难 |
+| 版本号（每次构建变） | 中等但持续增长 | 用 `build_info` 单独一条指标承载，别贴到业务指标上 |
+
+<Callout type="info" title="判断标准：这个标签的取值集合会随时间无限增长吗？">
+好标签的取值集合是**有界且稳定**的：环境名、集群名、服务名、状态码、HTTP 方法、路由模板、错误类别、数据中心。这些东西的取值数量是有限的，而且不会天天变。
+
+坏标签的取值集合**随业务量增长**：用户、请求、会话、订单、消息。
+
+**遇到「我就是想知道某个用户的情况」这类需求，答案是：那不是 Prometheus 该干的事。** 用日志（Loki / ELK）或链路追踪（Jaeger / Tempo）。Prometheus 是聚合系统，不是明细查询系统。这个边界一旦模糊，系统必然崩溃。
+
+有一个折中方案：把高基数维度**降维成有界维度**。比如不存 `user_id`，而是存 `user_tier`（free / pro / enterprise，3 个值）；不存完整 URL，而是存**路由模板** `/api/users/:id`（有界）；不存错误消息原文，而是存 `error_code`（有界枚举）。
+</Callout>
+
+### 建立防线
+
+**第一道防线：`metric_relabel_configs`——在入库前丢掉。**
+
+```yaml
+scrape_configs:
+  - job_name: 'app'
+    static_configs:
+      - targets: ['app:8080']
+
+    metric_relabel_configs:
+      # 丢掉整个高基数指标
+      - source_labels: [__name__]
+        regex: 'app_request_detail_.*'
+        action: drop
+
+      # 丢掉某个指标的某个高基数标签（保留指标本身）
+      - source_labels: [__name__]
+        regex: 'http_requests_total'
+        action: labeldrop
+        # 注意：labeldrop 的 regex 匹配的是「标签名」，不看 source_labels
+        # 上面这条写法是错的，正确写法见下
+
+      # 正确的 labeldrop：直接用 regex 匹配标签名
+      - regex: 'user_id|session_id|request_id'
+        action: labeldrop
+
+      # 只保留白名单内的指标（最激进也最有效）
+      - source_labels: [__name__]
+        regex: 'http_requests_total|http_request_duration_seconds_bucket|up|process_.*|go_goroutines'
+        action: keep
+
+      # 截断超长的标签值（避免索引内存爆炸）
+      - source_labels: [error_message]
+        regex: '(.{0,64}).*'
+        target_label: 'error_message'
+        replacement: '${1}'
+```
+
+<Callout type="warn" title="labeldrop / labelkeep 不看 source_labels">
+`labeldrop` 和 `labelkeep` 这两个 action 有一个和其他 action 完全不同的语义：**它们的 `regex` 匹配的是标签名本身，而且忽略 `source_labels` 字段**。
+
+```yaml
+# ✅ 正确：丢掉所有名字匹配 user_id 或 session_id 的标签
+- regex: 'user_id|session_id'
+  action: labeldrop
+
+# ❌ 错误：source_labels 会被忽略，这条实际上会丢掉所有名字匹配
+#    'http_requests_total' 的标签（当然一个也匹配不上），等于什么都没做
+- source_labels: [__name__]
+  regex: 'http_requests_total'
+  action: labeldrop
+```
+
+想「只对某个指标丢标签」是做不到的——`labeldrop` 作用于该 job 的所有指标。如果只想处理一个指标，得用 `replace` 把标签置空（Prometheus 会自动移除空值标签）：
+
+```yaml
+- source_labels: [__name__]
+  regex: 'http_requests_total'
+  target_label: 'user_id'
+  replacement: ''
+```
+
+注意这条只在 `__name__` 匹配时才执行替换，不匹配时规则整体跳过，其他指标的 `user_id` 得以保留。
+</Callout>
+
+**第二道防线：抓取层的硬限制。**
+
+```yaml
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+
+  # 全局兜底：单次抓取超过这么多样本就整个丢弃（0 表示不限制）
+  sample_limit: 20000
+  # 单个指标的标签数上限
+  label_limit: 30
+  # 标签名长度上限
+  label_name_length_limit: 100
+  # 标签值长度上限
+  label_value_length_limit: 512
+  # 单个 job 的目标数上限
+  target_limit: 500
+
+scrape_configs:
+  # 对不受信任的目标收紧限制
+  - job_name: 'third-party-app'
+    sample_limit: 2000
+    label_limit: 15
+    static_configs:
+      - targets: ['vendor-app:9090']
+```
+
+`sample_limit` 的行为需要特别理解：**超限时整次抓取全部丢弃**，`up` 会变成 0，并且 `prometheus_target_scrapes_exceeded_sample_limit_total` 递增。这是**故意设计成很痛的**——它逼着业务方立刻处理，而不是悄悄地污染 TSDB。
+
+<Callout type="tip" title="sample_limit 的落地策略">
+直接给所有 job 加 `sample_limit` 会误伤（有些 job 本来就合理地暴露很多样本）。推荐的落地顺序：
+
+1. **先观察，不限制。** 用 `topk(20, scrape_samples_scraped)` 看清楚现状。
+2. **按 job 分别设置**，取「当前值的 2 到 3 倍」作为初始阈值，给正常增长留空间。
+3. **加一条预警告警**，在接近限制时就通知，而不是等到超限被丢：
+
+```yaml
+- alert: ScrapeSampleCountHigh
+  expr: 'scrape_samples_scraped > 15000'
+  for: 30m
+  labels:
+    severity: 'warning'
+  annotations:
+    summary: '{{ $labels.job }} / {{ $labels.instance }} 单次抓取 {{ $value }} 个样本，接近上限'
+
+- alert: ScrapeSampleLimitExceeded
+  expr: 'increase(prometheus_target_scrapes_exceeded_sample_limit_total[10m]) > 0'
+  for: 0m
+  labels:
+    severity: 'critical'
+  annotations:
+    summary: '有目标因超过 sample_limit 被整体丢弃，该目标的监控已完全失效'
+```
+
+4. **新接入的 job 一律先加严格限制**，这是最有效的一条——防患于未然比事后治理便宜一百倍。
+</Callout>
+
+**第三道防线：长期监控基数趋势。**
+
+```yaml
+groups:
+  - name: prometheus-cardinality
+    interval: 1m
+    rules:
+      - record: prometheus:head_series:current
+        expr: prometheus_tsdb_head_series
+
+      - alert: HeadSeriesGrowingFast
+        expr: |
+          prometheus_tsdb_head_series
+            /
+          (prometheus_tsdb_head_series offset 1d) > 1.5
+        for: 1h
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: 'Prometheus 序列数 24 小时内增长超过 50%（当前 {{ $value }} 倍）'
+
+      - alert: HeadSeriesTooHigh
+        expr: 'prometheus_tsdb_head_series > 4000000'
+        for: 30m
+        labels:
+          severity: 'warning'
+
+      - alert: HighSeriesChurn
+        expr: |
+          rate(prometheus_tsdb_head_series_created_total[1h]) * 3600
+            /
+          prometheus_tsdb_head_series > 1
+        for: 2h
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '序列流失率过高，每小时新建的序列数超过了总序列数'
+```
+
+<Callout type="exercise" title="练习 1：诊断一次基数爆炸">
+周四下午 3 点，Prometheus 开始频繁 OOM 重启。运维查到：
+
+- `prometheus_tsdb_head_series` 从 80 万涨到 620 万，涨幅发生在下午 2 点到 2 点 40 分之间
+- 内存从 8G 涨到 48G（机器只有 48G）
+- 同一时间窗口内有三个团队分别做了发布
+
+请给出：
+
+1. 一套**按顺序执行**的诊断步骤（说明每一步用什么工具/查询、能得出什么结论）。注意 Prometheus 正在反复 OOM，你的查询本身也可能把它打挂。
+2. 假设定位到是 `payment` 服务的 `payment_transaction_duration_seconds` 这个 Histogram 加了 `merchant_id` 标签（约 4 万个商户，12 个桶），请计算它贡献了多少序列，并验证是否能解释 540 万的增量。
+3. 给出**紧急止血**方案和**长期治理**方案。
+4. 设计一套能在下次「涨到 620 万之前」就发现问题的告警。
+
+<Answer>
+**第 1 步：先止血，再诊断**
+
+Prometheus 在 OOM 循环中，任何查询都可能加速它的死亡。**第一优先级是让它先活下来。**
+
+```bash
+# 1. 临时把 head block 的压力降下来：缩短保留期不管用（那只影响磁盘），
+#    真正有效的是减少活跃序列。最快的办法是先停掉可疑 job 的抓取。
+#    但在还不知道是谁的情况下，先给进程加内存限制防止拖垮宿主机：
+systemctl set-property prometheus.service MemoryMax=40G
+
+# 2. 如果是容器部署，先把 limit 提上去，争取一个能稳定运行的窗口
+```
+
+如果 Prometheus 完全起不来，还有一个杀手锏：**删掉 WAL 让它快速启动**（会丢失最近 2 小时未落盘的数据，但能立刻恢复服务）：
+
+```bash
+systemctl stop prometheus
+mv /var/lib/prometheus/wal /var/lib/prometheus/wal.bak
+systemctl start prometheus
+```
+
+这是有损操作，只在实在起不来时用。
+
+---
+
+**第 2 步：看 `/status/tsdb`（零查询成本）**
+
+只要 Prometheus 的 Web UI 能打开，第一件事就是访问：
+
+```text
+http://prometheus:9090/tsdb-status
+```
+
+重点看 **Top 10 series count by metric names**。基数爆炸几乎总是集中在一两个指标上，这一栏会直接把凶手列出来，而且**这个页面不走查询引擎，不会额外消耗内存**。
+
+同时看 **Top 10 label names with value count**——如果 `merchant_id` 出现在这里且取值数是几万，答案就已经出来了。
+
+---
+
+**第 3 步：从「抓取侧」定位，而不是「存储侧」**
+
+`scrape_samples_scraped` 这类指标的序列数极少（每个目标一条），查询它**几乎不消耗资源**，是 OOM 状态下最安全的诊断入口：
+
+```promql
+# 哪些目标现在吐的样本最多
+topk(20, scrape_samples_scraped)
+
+# 【关键】哪些目标的样本数在 2 点前后暴涨
+topk(10,
+  scrape_samples_scraped
+    /
+  (scrape_samples_scraped offset 3h)
+)
+
+# 按 job 汇总，看增量集中在哪个 job
+topk(10, sum by (job) (scrape_samples_scraped))
+```
+
+第二条查询是本次诊断的核心。它把「现在」和「3 小时前（爆炸发生前）」做比值，倍数最大的那个目标就是元凶。**这条查询只扫描几百条低基数序列，在 OOM 状态下也能安全执行。**
+
+三个团队同时发布的情况下，这条查询能精确指出是哪个团队的问题，避免无谓的扯皮。
+
+---
+
+**第 4 步：确认到指标级别**
+
+锁定 job 之后，再做范围受限的指标级查询（此时范围已经小了，相对安全）：
+
+```promql
+topk(10, count by (__name__) ({job="payment"}))
+```
+
+确认是 `payment_transaction_duration_seconds_bucket` 之后，再确认是哪个标签：
+
+```promql
+count(count by (merchant_id) (payment_transaction_duration_seconds_count))
+count(count by (instance) (payment_transaction_duration_seconds_count))
+count(count by (status) (payment_transaction_duration_seconds_count))
+```
+
+---
+
+**第 2 题：验算序列数**
+
+`payment_transaction_duration_seconds` 是一个 Histogram，12 个桶（题目说 12 个桶，通常包含 `+Inf`，这里按 12 个 `_bucket` 序列算），加上 `_sum` 和 `_count`：
+
+```text
+每个标签组合的序列数 = 12 + 2 = 14
+```
+
+假设 payment 服务有 N 个实例。先算单实例：
+
+```text
+40000 个商户 × 14 = 560000 条序列 / 实例
+```
+
+**如果是 10 个实例：`560000 × 10 = 560 万`。**
+
+观测到的增量是 `620 万 - 80 万 = 540 万`。
+
+**结论：完全吻合。** 考虑到不是每个商户在每个实例上都有流量（负载均衡会让商户分散），实际值略低于理论上限 560 万，540 万是一个非常合理的实测值。
+
+**这个计算揭示了三重放大：**
+
+1. **标签放大**：`merchant_id` 有 4 万个取值
+2. **桶放大**：Histogram 的 14 倍
+3. **实例放大**：10 个实例
+
+`40000 × 14 × 10 = 560 万`。三个因子相乘，任何一个单独看都不吓人（4 万个商户很正常、14 个序列很正常、10 个实例很正常），**乘起来就是灾难**。这就是基数问题最阴险的地方——每一步看起来都合理。
+
+顺便算一下内存：540 万序列 × 5 KB ≈ **27 GB**。加上原有 80 万序列的 4 GB，再加上查询和 GC 的开销，48 GB 的机器 OOM 完全说得通。
+
+---
+
+**第 3 题：紧急止血 + 长期治理**
+
+**紧急止血（5 分钟内可执行，不需要业务方配合）：**
+
+在 Prometheus 侧直接丢掉这个标签：
+
+```yaml
+scrape_configs:
+  - job_name: 'payment'
+    # ... 其他配置
+    metric_relabel_configs:
+      # 立刻丢掉 merchant_id 标签
+      - regex: 'merchant_id'
+        action: labeldrop
+```
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml
+curl -X POST http://localhost:9090/-/reload
+```
+
+<Callout type="warn" title="labeldrop 之后可能出现「重复序列」错误">
+丢掉 `merchant_id` 后，原本 4 万条不同商户的序列会坍缩成 1 条。同一次抓取里出现 4 万个「标签完全相同」的样本，Prometheus 会报 `duplicate sample for timestamp`，**只保留第一个，其余全部丢弃**。
+
+这意味着 labeldrop 之后的数据是**错的**（只统计了一个随机商户的量）。它是纯粹的止血措施，接下来必须让业务方从代码里移除这个标签，Prometheus 侧才能拿到正确的聚合值。
+
+如果需要临时保住正确的总量，更好的止血方式是**在应用侧关掉这个标签**（很多框架支持通过配置开关控制标签维度），或者**整个 drop 掉这个指标**，让它明确变成「没有数据」而不是「错误数据」：
+
+```yaml
+      - source_labels: [__name__]
+        regex: 'payment_transaction_duration_seconds.*'
+        action: drop
+```
+
+**「没有数据」远好过「错误数据」**——前者你知道自己不知道，后者你以为自己知道。
+</Callout>
+
+止血后还要清理已经写进去的数据（否则 head block 里的旧序列还要等 2 小时才会被压缩出去，磁盘上的块要等更久）：
+
+```bash
+# 需要启动参数带上 --web.enable-admin-api
+curl -X POST -g 'http://localhost:9090/api/v1/admin/tsdb/delete_series' \
+  --data-urlencode 'match[]={__name__=~"payment_transaction_duration_seconds.*"}'
+
+# 立刻回收磁盘空间（这个操作较重，建议在低峰期执行）
+curl -X POST http://localhost:9090/api/v1/admin/tsdb/clean_tombstones
+```
+
+**长期治理：**
+
+1. **改埋点：把 `merchant_id` 降维。** 4 万个商户里，绝大多数流量集中在头部。方案是引入 `merchant_tier`（`top100` / `normal` / `small`，3 个值）：
+
+   ```text
+   3 × 14 × 10 = 420 条序列
+   ```
+
+   从 560 万降到 420 条，降低了 13000 倍，同时保留了「区分大小商户」这个真正有业务价值的维度。
+
+2. **单商户的明细放到别处。** 需要「查某个商户的交易情况」时，走日志系统或者 OLAP（ClickHouse / Doris）。这是明细查询，本来就不该用 Prometheus。
+
+3. **建立指标评审机制。** 新增指标或标签必须走 review，重点检查「这个标签的取值集合有上界吗」。可以做成 CI 检查：扫描代码里的 `labelNames`，对照一份禁用词表（`user`、`id`、`uuid`、`email`、`url`、`trace`、`session`、`merchant` 等）。
+
+4. **给 payment job 加 `sample_limit`。** 按正常水位的 3 倍设置，下次再出这种事，受影响的只有 payment 这一个 job，而不是整个 Prometheus。
+
+---
+
+**第 4 题：提前发现的告警设计**
+
+现有告警的问题是：等到 `prometheus_tsdb_head_series` 超过绝对阈值时，内存往往已经崩了。**要在「涨」的过程中就发现，而不是在「涨到」之后。**
+
+```yaml
+groups:
+  - name: cardinality-guard
+    interval: 1m
+    rules:
+      # ===== 第一层：单目标样本数突增（最灵敏，几分钟内触发）=====
+      - alert: ScrapeSamplesSpiked
+        expr: |
+          scrape_samples_scraped
+            /
+          (scrape_samples_scraped offset 30m) > 2
+          and scrape_samples_scraped > 5000
+        for: 10m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.job }}/{{ $labels.instance }} 样本数 30 分钟内翻倍（{{ $value }} 倍）'
+          description: '通常意味着新增了高基数标签，请立刻检查最近的发布'
+
+      # ===== 第二层：全局序列数增速 =====
+      - alert: HeadSeriesGrowthRateHigh
+        expr: |
+          predict_linear(prometheus_tsdb_head_series[1h], 4 * 3600) > 3000000
+        for: 15m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '按当前增速，4 小时后序列数将超过 300 万'
+
+      # ===== 第三层：内存趋势预测（直接对准 OOM）=====
+      - alert: PrometheusMemoryWillExhaust
+        expr: |
+          predict_linear(process_resident_memory_bytes{job="prometheus"}[1h], 2 * 3600)
+            > 0.85 * 48 * 1024 * 1024 * 1024
+        for: 15m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '按当前趋势，2 小时内 Prometheus 内存将达到机器容量的 85%'
+
+      # ===== 第四层：绝对阈值兜底（分级）=====
+      - alert: HeadSeriesHigh
+        expr: 'prometheus_tsdb_head_series > 1500000'
+        for: 30m
+        labels:
+          severity: 'warning'
+
+      - alert: HeadSeriesCritical
+        expr: 'prometheus_tsdb_head_series > 2500000'
+        for: 10m
+        labels:
+          severity: 'critical'
+
+      # ===== 第五层：流失率 =====
+      - alert: SeriesChurnHigh
+        expr: |
+          rate(prometheus_tsdb_head_series_created_total[1h]) * 3600
+            /
+          prometheus_tsdb_head_series > 1
+        for: 2h
+        labels:
+          severity: 'warning'
+
+      # ===== 第六层：限制被触发 =====
+      - alert: SampleLimitExceeded
+        expr: 'increase(prometheus_target_scrapes_exceeded_sample_limit_total[10m]) > 0'
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '有目标超过 sample_limit 被整体丢弃'
+```
+
+**这套告警的层次设计很关键：**
+
+- **第一层最有价值**，因为它在**单个目标**上就能发现问题，而且能直接指出是哪个 job、哪个实例——排查时间从「三个团队互相甩锅两小时」缩短到「一条告警告诉你是 payment」。而且它的触发时间比全局序列数增长早得多（单目标样本数翻倍时，全局序列数可能才涨了百分之几）。
+- **第二、三层用 `predict_linear`**，把「已经出事」变成「即将出事」，给出 2 到 4 小时的处置窗口。注意 `predict_linear` 的观察窗口 `[1h]` 和预测时长 `4h` 的比例是 1:4，处在合理范围。
+- **第四层是兜底**，防止前面几层因为增长曲线不是线性而漏掉。
+
+另外强烈建议做一个「基数看板」，长期挂着这几个图：`prometheus_tsdb_head_series` 趋势、`topk(10, scrape_samples_scraped)`、序列流失率、Prometheus 自身内存。**基数问题的治理是持续性工作，不是一次性项目。**
+</Answer>
+</Callout>
+
+## 二、保留期与存储容量估算
+
+### 计算公式
+
+Prometheus 的磁盘用量有一个相当准的估算公式：
+
+```text
+所需磁盘 = 保留时间（秒） × 每秒摄入样本数 × 每样本字节数
+```
+
+三个因子分别怎么来：
+
+**每秒摄入样本数：**
+
+```text
+samples/s = 活跃序列数 / 抓取间隔（秒）
+```
+
+或者直接查：
+
+```promql
+rate(prometheus_tsdb_head_samples_appended_total[5m])
+```
+
+**每样本字节数：** Prometheus 用 Gorilla 风格的双 delta 编码，压缩率极高。官方给出的经验值是 **1 到 2 字节/样本**。想知道你自己环境的准确值：
+
+```promql
+rate(prometheus_tsdb_compaction_chunk_size_bytes_sum[1h])
+  /
+rate(prometheus_tsdb_compaction_chunk_samples_sum[1h])
+```
+
+变化平缓的 Gauge（比如 `node_memory_MemTotal_bytes`）能压到 0.5 字节以下；抖动剧烈的值可能到 2 到 3 字节。**规划时用 2 字节比较稳妥。**
+
+### 一个完整的算例
+
+假设：
+
+- 活跃序列：**100 万**
+- 抓取间隔：**30 秒**
+- 保留期：**30 天**
+- 每样本：**2 字节**
+
+```text
+samples/s = 1,000,000 / 30 ≈ 33,333
+
+30 天秒数 = 30 × 86400 = 2,592,000
+
+磁盘 = 2,592,000 × 33,333 × 2 字节
+     ≈ 172,800,000,000 字节
+     ≈ 161 GiB
+```
+
+**再乘以 1.3 到 1.5 的安全系数**（索引开销、压缩过程中的临时空间、WAL、以及块压缩时需要同时存在新旧两份数据），实际应该准备 **220 到 250 GB**。
+
+<Callout type="warn" title="压缩期间需要额外的磁盘峰值">
+TSDB 的块压缩会把多个小块合并成一个大块。合并过程中，**新块和旧块会同时存在于磁盘上**，直到新块写完、旧块才被删除。
+
+最大的一次压缩会涉及「保留期 10% 或 31 天中较小者」大小的块。对 30 天保留期，最大块约 3 天的数据。压缩这个块时的磁盘峰值大约是稳态用量 + 一个大块的大小。
+
+**磁盘使用率超过 80% 就应该告警**，不要等到 95%——压缩失败会导致数据无法落盘，最终 head block 撑爆内存。
+</Callout>
+
+### 内存估算
+
+```text
+内存 ≈ 活跃序列数 × (3 到 8 KB) + 查询峰值开销
+```
+
+更靠谱的做法是直接测量你自己的环境：
+
+```promql
+# 每条序列实际占多少字节
+process_resident_memory_bytes{job="prometheus"}
+  /
+prometheus_tsdb_head_series
+
+# Go 堆的实际使用
+go_memstats_heap_inuse_bytes{job="prometheus"}
+
+# 内存使用率
+process_resident_memory_bytes{job="prometheus"}
+  /
+node_memory_MemTotal_bytes
+```
+
+**查询峰值开销**是最容易被低估的部分。一次扫描 100 万序列的查询，中间结果可能占用好几 GB。所以：
+
+- **稳态内存不要超过机器内存的 50%**，剩下的留给查询和 GC。
+- **一定要设 `GOMEMLIMIT`**（下一节详述）。
+
+### 两个保留期参数
+
+```bash
+prometheus \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --storage.tsdb.retention.size=200GB
+```
+
+- `--storage.tsdb.retention.time`：按时间保留，默认 **15d**。
+- `--storage.tsdb.retention.size`：按大小保留。支持 `B`、`KB`、`MB`、`GB`、`TB`、`PB` 后缀（也接受 `KiB` 这类二进制单位）。
+
+**两者同时设置时，谁先触发就按谁清理。** 这是最推荐的配置方式：
+
+- `retention.time` 保证「不会保留超过业务需要的时长」
+- `retention.size` 保证「不会写爆磁盘」
+
+<Callout type="info" title="retention.size 包含 WAL 和 m-mapped chunks">
+一个容易踩的细节：`--storage.tsdb.retention.size` 统计的**不只是持久化的块**，它还包括 WAL 和 m-mapped 的 head chunks。
+
+这意味着如果你把 `retention.size` 设成和磁盘容量一样大，仍然可能写满——因为 Prometheus 是在超过限制**之后**才删除最老的块，而删除是以「整块」为单位的。
+
+**建议 `retention.size` 设成磁盘容量的 70% 到 80%。** 剩下的空间留给压缩峰值和意外增长。
+</Callout>
+
+删除是**以块为单位**的，不是按样本精确裁剪。所以实际保留的数据量总是略多于配置值，最多多出一个块的时长。
+
+### 降采样与分层保留
+
+Prometheus 本身**不支持降采样（downsampling）**，也不支持「按指标设置不同保留期」。这是它的设计取舍——保持简单。
+
+需要这些能力时，选择是：
+
+- **Thanos**：sidecar 上传块到对象存储，Compactor 做降采样（5m 和 1h 两级），Store Gateway 提供查询。
+- **Cortex / Mimir**：多租户，水平扩展，通过 remote write 接收数据。
+- **VictoriaMetrics**：单体或集群模式，压缩率更高，支持按租户设置保留期。
+
+**用两套 Prometheus 分层**是一个不需要引入新组件的土办法：
+
+```yaml
+# prometheus-short.yml —— 高精度短期
+global:
+  scrape_interval: 15s
+# --storage.tsdb.retention.time=7d
+
+# prometheus-long.yml —— 低精度长期，只联邦记录规则的结果
+global:
+  scrape_interval: 60s
+  evaluation_interval: 60s
+# --storage.tsdb.retention.time=400d
+scrape_configs:
+  - job_name: 'federate-recording-rules'
+    scrape_interval: 60s
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{__name__=~"job:.*"}'
+        - '{__name__=~"instance:.*"}'
+    static_configs:
+      - targets: ['prometheus-short:9090']
+```
+
+这个方案的关键是：**长期实例只联邦记录规则的输出**（用命名前缀 `job:` 和 `instance:` 筛选），序列数只有原始数据的百分之一量级，400 天保留期完全扛得住。
+
+<Callout type="exercise" title="练习 2：为一个中型环境做容量规划">
+你要为一个新集群规划 Prometheus，已知：
+
+- **300 台机器**，每台跑 node_exporter，每个 exporter 约 **1200 条序列**
+- **80 个应用实例**，每个应用暴露约 **3000 条序列**（含 Histogram）
+- **12 个中间件 exporter**（Redis/MySQL/Kafka），每个约 **800 条序列**
+- 计划抓取间隔：node_exporter **30s**，应用 **15s**，中间件 **30s**
+- 需要保留 **45 天**
+- 预计一年内机器数增长 **50%**，应用实例数翻倍
+
+请计算：
+
+1. 总序列数与每秒样本摄入量。
+2. 45 天所需磁盘（给出计算过程和推荐配置值）。
+3. 推荐的内存规格。
+4. 一年后的规模，以及现在应该怎么规划才不用推倒重来。
+5. 如果磁盘预算只有 500 GB，有哪些调整手段？分别能省多少？
+
+<Answer>
+**第 1 题：序列数与摄入速率**
+
+```text
+node_exporter : 300 × 1200 = 360,000 条
+应用          :  80 × 3000 = 240,000 条
+中间件        :  12 ×  800 =   9,600 条
+Prometheus 自身 + 记录规则输出（估 5%）≈ 30,000 条
+────────────────────────────────────────
+总计 ≈ 639,600 条，取整 640,000 条
+```
+
+**每秒样本摄入量**要按各自的抓取间隔分别算，这一步最容易出错——**不能用「总序列数 / 平均间隔」**：
+
+```text
+node_exporter : 360,000 / 30 = 12,000 samples/s
+应用          : 240,000 / 15 = 16,000 samples/s
+中间件        :   9,600 / 30 =    320 samples/s
+自身+规则     :  30,000 / 30 =  1,000 samples/s
+────────────────────────────────────────
+总计 ≈ 29,320 samples/s
+```
+
+注意：应用只占 37% 的序列，却贡献了 55% 的摄入量——**因为它的抓取间隔是别人的一半**。这个细节在容量规划里很重要。
+
+---
+
+**第 2 题：45 天磁盘**
+
+```text
+45 天秒数 = 45 × 86400 = 3,888,000 秒
+
+裸数据 = 3,888,000 × 29,320 × 2 字节
+       = 227,992,320,000 字节
+       ≈ 212 GiB
+```
+
+加安全系数：
+
+```text
+× 1.4（索引 + WAL + 压缩峰值 + 增长余量）≈ 297 GiB
+```
+
+**推荐配置：**
+
+```bash
+--storage.tsdb.retention.time=45d
+--storage.tsdb.retention.size=400GB
+```
+
+**磁盘规格：512 GB SSD**（`retention.size` 设成容量的 78%，留出压缩峰值和意外增长空间）。
+
+**必须用 SSD**。Prometheus 的写入是「每 2 小时一次大批量落盘 + 持续的 WAL 追加」，读取则是大量随机 IO（查询要跳着读不同序列的 chunk）。机械盘上一次跨 30 天的查询可能要跑几分钟。
+
+配套告警：
+
+```yaml
+- alert: PrometheusDiskWillFill
+  expr: |
+    predict_linear(node_filesystem_avail_bytes{mountpoint="/var/lib/prometheus"}[6h], 7*24*3600) < 0
+  for: 1h
+  labels:
+    severity: 'warning'
+  annotations:
+    summary: 'Prometheus 数据盘按当前趋势 7 天内会写满'
+
+- alert: PrometheusDiskHigh
+  expr: |
+    1 - (node_filesystem_avail_bytes{mountpoint="/var/lib/prometheus"}
+         / node_filesystem_size_bytes{mountpoint="/var/lib/prometheus"}) > 0.8
+  for: 30m
+  labels:
+    severity: 'warning'
+```
+
+---
+
+**第 3 题：内存规格**
+
+```text
+稳态：640,000 × 5 KB ≈ 3.2 GB
+     （按上限 8 KB 算是 5.1 GB）
+```
+
+但稳态只是起点，实际要考虑：
+
+- **查询峰值**：Grafana 看板并发刷新、长窗口查询，峰值可能是稳态的 2 到 3 倍
+- **序列流失**：发布期间 head block 里的序列数会短时翻倍
+- **压缩期间**的额外内存
+- **WAL 重放**：重启时要把 WAL 全部读进内存重建 head block，这是内存的最高峰
+
+```text
+推荐 = 稳态 × 4 = 3.2 × 4 ≈ 13 GB
+```
+
+**推荐规格：32 GB 内存**（稳态占用约 10% 到 15%，为一年后的增长留足空间）。
+
+**必须设置 `GOMEMLIMIT`：**
+
+```bash
+GOMEMLIMIT=26GiB    # 机器内存的 80%
+```
+
+它让 Go 运行时在接近这个值时**更激进地 GC**，而不是直接被 OOM Killer 杀掉。这是 Prometheus 运维里投入产出比最高的一个配置——加一行环境变量，就把「硬崩溃」变成了「变慢但活着」。
+
+CPU 方面，3 万 samples/s 的摄入压力不大，**8 核**足够。CPU 主要消耗在查询和规则求值上，不在写入。
+
+---
+
+**第 4 题：一年后的规模**
+
+```text
+node_exporter : 450 × 1200 = 540,000 条   （+50%）
+应用          : 160 × 3000 = 480,000 条   （翻倍）
+中间件        :  18 ×  800 =  14,400 条   （按 50% 增长估）
+自身 + 规则   ≈ 52,000 条
+────────────────────────────────────────
+总计 ≈ 1,086,400 条  （约 1.7 倍）
+
+摄入 = 540,000/30 + 480,000/15 + 14,400/30 + 52,000/30
+     = 18,000 + 32,000 + 480 + 1,733
+     ≈ 52,200 samples/s   （约 1.8 倍）
+
+45 天磁盘 = 3,888,000 × 52,200 × 2 × 1.4 ≈ 530 GiB
+内存稳态  = 1,086,400 × 5 KB ≈ 5.4 GB，峰值按 4 倍 ≈ 22 GB
+```
+
+**现在应该做的规划决策：**
+
+1. **磁盘按 1 TB 准备，或者用可在线扩容的云盘 + LVM。** 磁盘是最容易也最应该提前留量的资源。用云盘时确认支持在线扩容，不要用固定大小的本地盘。
+
+2. **内存 32 GB 够用**（一年后峰值 22 GB，`GOMEMLIMIT` 设 26 GiB 刚好能兜住）。但要提前想好扩容路径。
+
+3. **从第一天就建立记录规则体系**。看板不直接查原始指标，全部走记录规则。这样将来做联邦、做长期存储、做分片时，接口是稳定的。
+
+4. **从第一天就规划分片方案**（即使现在用不上）。单实例的实际上限大约在 **500 万到 1000 万序列**，超过就必须拆。拆分的维度要提前定好，常见的两种：
+
+   ```yaml
+   # 方案 A：按功能拆（推荐，边界清晰）
+   #   prometheus-infra   : node_exporter + 中间件
+   #   prometheus-app     : 所有应用
+   #   prometheus-global  : 联邦上面两个的记录规则，供全局看板和跨域告警使用
+
+   # 方案 B：按哈希拆（适合单类目标数量巨大的场景）
+   scrape_configs:
+     - job_name: 'node'
+       # ... 服务发现配置
+       relabel_configs:
+         - source_labels: [__address__]
+           modulus: 3
+           target_label: '__tmp_shard'
+           action: hashmod
+         - source_labels: [__tmp_shard]
+           regex: '0'          # 第 0 个分片；另两个实例分别写 1 和 2
+           action: keep
+   ```
+
+   **方案 A 更实用**：故障域清晰（应用侧的基数爆炸不会拖垮基础设施监控）、告警规则天然按团队分离、扩容时只需要拆增长最快的那一片。方案 B 的问题是跨分片查询必须靠联邦或 Thanos，复杂度高得多。
+
+5. **应用的抓取间隔是最大的杠杆。** 应用占了 61% 的摄入量，仅仅因为它是 15s。评估一下 15s 是不是真的必需——见第 5 题。
+
+---
+
+**第 5 题：磁盘只有 500 GB 时的调整手段**
+
+目标：从 297 GiB（当前）降下来，并且要为一年后的 530 GiB 留出路。逐个手段算收益：
+
+**手段 1：把应用抓取间隔从 15s 改成 30s** —— 省 **约 27%**
+
+```text
+应用摄入：16,000 → 8,000 samples/s
+总摄入  ：29,320 → 21,320 samples/s（-27.3%）
+磁盘    ：297 → 216 GiB
+```
+
+代价：告警的最快发现时间从约 45 秒变成约 90 秒（`for` 至少要覆盖 2 到 3 个抓取周期）。**对绝大多数业务，30s 完全够用。** 这是收益最大、代价最小的一招，应该首选。
+
+**手段 2：丢掉用不上的指标** —— 省 **10% 到 30%**
+
+大多数环境里，node_exporter 和应用暴露的指标有相当一部分从来没人查过。
+
+```yaml
+    metric_relabel_configs:
+      # node_exporter 的一些低价值高基数采集器
+      - source_labels: [__name__]
+        regex: 'node_scrape_collector_.*|go_gc_.*|node_softnet_.*'
+        action: drop
+
+      # 按挂载点过滤文件系统指标（容器环境里有大量无意义的挂载点）
+      - source_labels: [__name__, mountpoint]
+        separator: ';'
+        regex: 'node_filesystem_.*;/(run|var/lib/docker|var/lib/kubelet)/.*'
+        action: drop
+```
+
+更彻底的做法是在 exporter 侧就关掉不需要的采集器：
+
+```bash
+node_exporter \
+  --collector.disable-defaults \
+  --collector.cpu --collector.meminfo --collector.filesystem \
+  --collector.diskstats --collector.netdev --collector.loadavg \
+  --collector.uname --collector.systemd
+```
+
+**这一招比 relabel 更好**——relabel 是「拉回来再丢掉」，白白浪费网络和 CPU；关采集器是「压根不产生」。
+
+**手段 3：缩短保留期到 30 天** —— 省 **33%**
+
+```text
+297 × (30/45) = 198 GiB
+```
+
+代价：无法做「和上月同期对比」这类分析。**折中方案是配合分层保留**：本地 30 天高精度，用一个低配的长期实例联邦记录规则存 400 天。长期实例的序列数只有几千条，磁盘开销可以忽略。
+
+**手段 4：Histogram 桶数收敛** —— 省 **5% 到 15%**
+
+很多团队直接用客户端库的默认桶（Go 是 11 个桶），但业务实际只关心 P50/P95/P99 和一两个 SLO 阈值。桶从 12 个降到 7 个，Histogram 的序列数就少 36%。
+
+要注意这需要改代码且历史数据不兼容，属于中长期优化。
+
+---
+
+**推荐组合方案：**
+
+```text
+基线                                 297 GiB
+手段 1（应用改 30s）        -27%  →  216 GiB
+手段 2（关无用采集器）      -15%  →  184 GiB
+────────────────────────────────────────────
+配置 retention.size=380GB，保留 45 天不变
+```
+
+**184 GiB 稳态，配 500 GB 磁盘，使用率 37%。** 一年后规模涨到 1.8 倍，约 331 GiB，使用率 66%——仍在安全线内，不需要在这一年里做任何架构改动。这就是容量规划的目标：**用今天可接受的代价，买到一年的从容。**
+
+同时把 `retention.size` 设为 380GB 作为硬保险：即使基数意外增长，Prometheus 也会自动丢弃老数据而不是写爆磁盘。**「宁可丢历史数据，也不能让监控系统本身宕机」**——这是容量规划里最重要的一条原则。
+</Answer>
+</Callout>
+
+## 三、性能调优
+
+### 抓取间隔：最大的那个旋钮
+
+抓取间隔和摄入量、磁盘、CPU 全部成**反比**。把间隔从 15s 改成 30s，这些指标全部**减半**。
+
+但它也直接决定了监控的时间分辨率：
+
+| 抓取间隔 | 最快发现异常 | 适用场景 |
+| --- | --- | --- |
+| 5s | 约 15 秒 | 极少数关键链路，代价很高，慎用 |
+| 15s | 约 45 秒 | 核心业务服务的默认值 |
+| 30s | 约 90 秒 | **大多数场景的最佳平衡点** |
+| 60s | 约 3 分钟 | 基础设施、变化缓慢的指标 |
+| 5m | 约 15 分钟 | 批处理、外部 API 配额、业务日报类指标 |
+
+<Callout type="warn" title="抓取间隔不能超过 2 分钟">
+Prometheus 有一个 `--query.lookback-delta` 参数，默认 **5 分钟**。查询某个时刻的瞬时值时，Prometheus 会往前找最近 5 分钟内的样本，找不到就认为该序列在这个时刻「不存在」。
+
+如果抓取间隔超过 5 分钟，会出现**图表断断续续**的诡异现象。
+
+更实际的约束来自 `rate()`：`rate(x[5m])` 需要区间内至少有 **2 个样本**才能计算。抓取间隔 3 分钟时，5 分钟窗口里可能只有 1 个点，`rate` 直接返回空。
+
+**经验法则：`rate` 的区间至少是抓取间隔的 4 倍。** 30s 间隔配 `[2m]` 及以上，60s 间隔配 `[4m]` 及以上。日常统一用 `[5m]` 是最省心的选择。
+
+**抓取间隔的硬上限建议是 2 分钟。** 需要更长的（比如每小时才更新一次的业务指标），应该用 Pushgateway 或者把值做成 Gauge 由应用维护，而不是拉长抓取间隔。
+</Callout>
+
+按 job 差异化配置，而不是全局一个值：
+
+```yaml
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+
+scrape_configs:
+  # 核心交易链路：高频
+  - job_name: 'payment-api'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # 普通应用：默认
+  - job_name: 'internal-services'
+
+  # 基础设施：低频
+  - job_name: 'node'
+    scrape_interval: 60s
+
+  # 变化极慢的：更低频
+  - job_name: 'ssl-cert-checker'
+    scrape_interval: 5m
+    scrape_timeout: 30s
+```
+
+### 关键启动参数
+
+```bash
+prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --storage.tsdb.retention.size=200GB \
+  --query.max-samples=50000000 \
+  --query.max-concurrency=20 \
+  --query.timeout=2m \
+  --query.lookback-delta=5m \
+  --web.enable-lifecycle \
+  --web.enable-admin-api \
+  --log.level=info
+```
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--query.max-samples` | 50000000 | 单次查询能加载到内存的最大样本数。**这是防止一条查询打挂整个实例的最后防线** |
+| `--query.max-concurrency` | 20 | 并发查询数上限。超过后排队。Grafana 看板多时可能需要调大，但调大会增加内存峰值 |
+| `--query.timeout` | 2m | 查询超时 |
+| `--query.lookback-delta` | 5m | 瞬时查询往前找样本的窗口 |
+| `--web.enable-lifecycle` | 关闭 | 开启后支持 `POST /-/reload` 热加载配置 |
+| `--web.enable-admin-api` | 关闭 | 开启后支持删除序列、快照等管理 API |
+| `--storage.tsdb.head-chunks-write-queue-size` | 0 | head chunk 异步写队列长度。高摄入场景设为 10000 左右能降低写延迟毛刺 |
+
+环境变量层面，**`GOMEMLIMIT` 是最重要的一个**：
+
+```bash
+# systemd unit 里
+Environment="GOMEMLIMIT=26GiB"
+Environment="GOGC=75"
+```
+
+- **`GOMEMLIMIT`**（Go 1.19+）给 Go 运行时设一个软内存上限。接近时 GC 会变得非常激进，宁可多花 CPU 也要把内存压下去。**设成机器物理内存的 80% 左右。** 效果是把「被 OOM Killer 杀掉」变成「变慢但活着」——对监控系统来说这个取舍毫无疑问是对的。
+- **`GOGC`** 默认 100（堆增长一倍才 GC）。降到 75 或 50 能让内存曲线更平缓，代价是 CPU 上升 10% 到 20%。**设了 `GOMEMLIMIT` 之后通常不需要再调 `GOGC`。**
+
+### 找出慢查询
+
+```yaml
+# prometheus.yml
+global:
+  query_log_file: /var/log/prometheus/query.log
+```
+
+开启后，**每一条查询**都会以 JSON 格式记录，包含完整的查询语句、各阶段耗时、以及调用来源：
+
+```bash
+# 找出最慢的 20 条查询
+cat /var/log/prometheus/query.log \
+  | jq -r '[.stats.timings.evalTotalTime, .params.query] | @tsv' \
+  | sort -rn | head -20
+```
+
+这个日志文件会长得很快，建议只在排查期间开启，或者配好 logrotate。
+
+配套的自监控指标：
+
+```promql
+# 规则组求值耗时 vs 求值间隔，接近 1 就危险
+prometheus_rule_group_last_duration_seconds
+  /
+prometheus_rule_group_interval_seconds
+
+# 有多少次求值因为上一轮没跑完被跳过（不为 0 就是严重问题）
+increase(prometheus_rule_group_iterations_missed_total[1h])
+
+# 规则求值失败次数
+increase(prometheus_rule_evaluation_failures_total[1h])
+
+# 抓取耗时接近超时的目标
+topk(10, scrape_duration_seconds / on(job) group_left() (
+  max by (job) (scrape_duration_seconds)
+))
+
+# 抓取超时的目标
+scrape_duration_seconds > 8
+
+# TSDB 压缩耗时
+histogram_quantile(0.99, rate(prometheus_tsdb_compaction_duration_seconds_bucket[1h]))
+
+# WAL 截断耗时（重启慢通常和这个有关）
+prometheus_tsdb_wal_truncate_duration_seconds_sum
+```
+
+<Callout type="tip" title="Prometheus 必须监控自己">
+一套最小可用的 Prometheus 自监控告警：
+
+```yaml
+groups:
+  - name: prometheus-self
+    rules:
+      - alert: PrometheusRuleEvaluationsMissed
+        expr: 'increase(prometheus_rule_group_iterations_missed_total[10m]) > 0'
+        for: 10m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '规则组 {{ $labels.rule_group }} 求值被跳过，告警可能已失效'
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: 'increase(prometheus_rule_evaluation_failures_total[10m]) > 0'
+        for: 5m
+        labels:
+          severity: 'warning'
+
+      - alert: PrometheusRuleGroupSlow
+        expr: |
+          prometheus_rule_group_last_duration_seconds
+            /
+          prometheus_rule_group_interval_seconds > 0.8
+        for: 15m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '规则组 {{ $labels.rule_group }} 求值耗时占间隔的 {{ $value }}，即将开始跳过'
+
+      - alert: PrometheusTargetScrapeTimeout
+        expr: 'scrape_duration_seconds > 0.9 * 10'
+        for: 15m
+        labels:
+          severity: 'warning'
+
+      - alert: PrometheusTSDBCompactionFailing
+        expr: 'increase(prometheus_tsdb_compactions_failed_total[1h]) > 0'
+        labels:
+          severity: 'critical'
+
+      - alert: PrometheusTSDBWALCorruption
+        expr: 'increase(prometheus_tsdb_wal_corruptions_total[1h]) > 0'
+        labels:
+          severity: 'critical'
+
+      - alert: PrometheusNotIngestingSamples
+        expr: 'rate(prometheus_tsdb_head_samples_appended_total[10m]) <= 0'
+        for: 10m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: 'Prometheus 已 10 分钟没有摄入任何样本'
+
+      - alert: PrometheusConfigReloadFailed
+        expr: 'prometheus_config_last_reload_successful == 0'
+        for: 5m
+        labels:
+          severity: 'critical'
+          summary: '配置重载失败，当前运行的是旧配置'
+```
+
+**`PrometheusRuleEvaluationsMissed` 是这里面最重要的一条。** 规则求值被跳过意味着**告警规则没有执行**——你的整套告警在那段时间里是瞎的，而且不会有任何提示。这是监控系统最危险的失效模式。
+
+当然，这些告警由 Prometheus 自己评估，如果它彻底挂了就没人报了。**完整方案需要一个「监控监控系统的监控系统」**：Alertmanager 的 Watchdog 心跳（Prometheus 持续发一条永远 firing 的告警，外部系统检测到心跳中断就报警），或者两个 Prometheus 互相抓取对方的 `up`。
+</Callout>
+
+## 四、记录规则减负
+
+### 减负的原理
+
+记录规则的价值在于**把「查询时计算」变成「写入时计算」**：
+
+- 一个复杂查询如果被 10 个看板面板引用，每个面板 30 秒刷新一次，那就是每分钟执行 20 次。
+- 做成记录规则后，它每 30 秒执行 1 次，看板直接读结果。
+- **计算量降低了 20 倍，而且是把不可预测的突发负载变成了平稳的固定负载。**
+
+第二个好处同样重要：**记录规则的结果序列数极少**。一个扫描 50 万序列的查询，结果可能只有 10 条序列。看板读这 10 条序列几乎零成本。
+
+### 命名规范
+
+官方推荐的格式：
+
+```text
+level:metric:operations
+```
+
+- **level**：聚合层级，也就是结果保留了哪些标签（`job`、`instance`、`cluster`、`namespace`）
+- **metric**：原始指标名
+- **operations**：做了什么操作，从右往左读（`rate5m`、`sum_rate5m`、`ratio_rate5m`）
+
+```yaml
+groups:
+  - name: http-recording
+    interval: 30s
+    rules:
+      # 按 job 聚合的 QPS
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+
+      # 按 job + status 聚合
+      - record: job_status:http_requests:rate5m
+        expr: sum by (job, status) (rate(http_requests_total[5m]))
+
+      # 每个实例的 QPS
+      - record: instance:http_requests:rate5m
+        expr: sum by (instance) (rate(http_requests_total[5m]))
+
+      # 错误率
+      - record: job:http_errors:ratio_rate5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum by (job) (rate(http_requests_total[5m]))
+
+      # P99 延迟
+      - record: job:http_duration_seconds:p99_rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+```
+
+这个命名规范的好处是**从名字就能知道能不能再聚合**。看到 `job:http_requests:rate5m`，你知道它已经按 job 聚合过了，不能再 `sum by (instance)`；看到 `instance:...`，你知道它保留了实例维度。
+
+<Callout type="warn" title="记录规则的三条铁律">
+**1. 不要对已经聚合的结果再算 `rate`。**
+
+```yaml
+# ❌ 错误
+- record: job:http_requests:rate5m
+  expr: rate(sum by (job) (http_requests_total)[5m:])
+```
+
+`sum` 会掩盖 Counter 重置——某个实例重启时它的 Counter 归零，但求和的结果只是「下降了一点」，`rate` 会把这个下降当成重置来处理，产生完全错误的尖峰。
+
+**永远是 `sum(rate(...))`，不是 `rate(sum(...))`。**
+
+**2. `rate` 的区间不要小于规则的 `interval`。**
+
+```yaml
+groups:
+  - name: bad
+    interval: 5m
+    rules:
+      - record: job:x:rate1m
+        expr: sum by (job) (rate(x_total[1m]))   # ❌
+```
+
+每 5 分钟求值一次，每次只看最近 1 分钟——中间 4 分钟的数据被完全跳过，算出来的速率会系统性失真（如果流量有波动，可能偏高也可能偏低）。
+
+**规则：`rate` 区间 ≥ 规则 interval，且 ≥ 4 倍抓取间隔。**
+
+**3. 同一 group 内顺序执行，跨 group 并行。**
+
+同一个 group 里的规则**严格按书写顺序串行执行**，所以后面的规则可以引用前面规则的结果，拿到的是本轮的新值。
+
+不同 group 之间**并行执行**，跨 group 引用会拿到**上一轮的旧值**（甚至可能拿不到）。
+
+所以：**有依赖关系的规则必须放在同一个 group，并按依赖顺序书写。**
+
+```yaml
+groups:
+  - name: slo-base       # 基础层
+    interval: 30s
+    rules:
+      - record: job:requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+      - record: job:errors:rate5m
+        expr: sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+      - record: job:errors:ratio_rate5m           # 依赖上面两条，必须在同一 group 且在其后
+        expr: job:errors:rate5m / job:requests:rate5m
+```
+</Callout>
+
+### 什么该做、什么不该做
+
+**该做：**
+
+- 被多个看板面板引用的表达式
+- 告警规则里的复杂表达式（尤其是多窗口 SLO 那一套）
+- 长窗口聚合（`[1d]`、`[7d]`、`[30d]`）
+- 跨指标的除法（错误率、命中率、饱和度）
+- 联邦要暴露给上层的数据
+- 需要长期保留的核心业务指标
+
+**不该做：**
+
+- **只用一次的查询**——记录规则本身也有成本（占 CPU、占序列、占磁盘），一次性的探索用即席查询就好。
+- **产生高基数结果的规则**——一条 `sum by (instance, path, method, status)` 的规则可能产生几万条新序列。记录规则是用来**降维**的，不是用来复制数据的。
+- **简单到不值得的表达式**——`rate(x[5m])` 这种直接查就行，做成规则反而多了一层间接。
+- **`topk` 类查询**——结果集每轮都在变，序列会疯狂流失。
+
+<Callout type="tip" title="怎么判断某条记录规则值不值">
+```promql
+# 这条规则每轮产生多少条序列
+count(job:http_requests:rate5m)
+
+# 这条规则求值花多久（需要按 group 看）
+prometheus_rule_group_last_duration_seconds{rule_group="http-recording"}
+
+# 整个规则体系产生了多少条序列
+count({__name__=~"^[a-z_]+:[a-z_]+:.*"})
+```
+
+**判断标准：** 如果一条记录规则产生的序列数超过原始序列数的 10%，说明它没有起到降维作用，应该重新设计聚合维度。
+
+另外记得：**记录规则产生的序列同样计入基数**，同样占内存和磁盘。见过团队为了「方便」，把所有指标都按各种维度组合预聚合一遍，结果记录规则的输出比原始数据还多——这属于用记录规则制造问题而不是解决问题。
+</Callout>
+
+## 五、联邦与长期存储的边界
+
+### 联邦能做什么、不能做什么
+
+联邦（federation）的机制是：上层 Prometheus 抓取下层 Prometheus 的 `/federate` 端点，用 `match[]` 参数指定要拉哪些序列。
+
+```yaml
+scrape_configs:
+  - job_name: 'federate'
+    scrape_interval: 60s
+    scrape_timeout: 30s
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{__name__=~"job:.*"}'
+        - '{__name__=~"instance:.*"}'
+        - 'up'
+    static_configs:
+      - targets:
+          - 'prometheus-bj:9090'
+          - 'prometheus-sh:9090'
+          - 'prometheus-gz:9090'
+```
+
+`honor_labels: true` 是必需的——它让下层 Prometheus 上报的 `job` 和 `instance` 标签**保持原样**，而不是被上层的 job 配置覆盖。
+
+<Callout type="warn" title="联邦不是用来「复制全部数据」的">
+最常见的误用是这样：
+
+```yaml
+    params:
+      'match[]':
+        - '{__name__=~".+"}'      # ❌ 拉取全部序列
+```
+
+这行不通，原因有三：
+
+**1. 一次抓取要在 `scrape_timeout` 内完成。** 下层有 100 万条序列，`/federate` 要在一次 HTTP 响应里把 100 万个样本序列化并传输完。这通常需要几十秒甚至几分钟，远超 `scrape_timeout`，抓取永远失败。
+
+**2. 分辨率丢失。** 上层以 60s 间隔抓取，下层的 15s 精度数据被压缩成 60s——中间的点直接丢了。你在上层看到的图和下层看到的图不一样，排障时会非常困惑。
+
+**3. 上层成为新的瓶颈。** 三个下层各 100 万序列，上层就是 300 万序列，你只是把问题搬了个家，还多了一层故障点。
+
+**联邦的正确用法是「只拉聚合结果」**：下层用记录规则把数据聚合成几百到几千条序列，上层只拉这些。序列数从 100 万降到 1000，抓取在 1 秒内完成，上层可以轻松承载几十个下层。
+</Callout>
+
+### 什么时候必须换成远程写入
+
+联邦解决的是「**跨集群的全局视图**」，它解决不了：
+
+- **长期存储**（联邦上来的数据仍然存在上层 Prometheus 的本地盘，仍然受保留期限制）
+- **高可用**（下层挂了，那段数据就永久丢了，没有补偿机制）
+- **水平扩展**（上层仍然是单点）
+- **降采样**（Prometheus 不支持）
+- **原始精度的历史查询**（联邦本身就降低了分辨率）
+
+需要这些能力时，就该上远程写入 + 长期存储方案了：
+
+```yaml
+remote_write:
+  - url: 'http://mimir:8080/api/v1/push'
+    queue_config:
+      capacity: 10000          # 每个分片的内存队列容量
+      max_shards: 50           # 最大并行分片数
+      min_shards: 1
+      max_samples_per_send: 2000
+      batch_send_deadline: 5s
+      min_backoff: 30ms
+      max_backoff: 5s
+    write_relabel_configs:
+      # 只把需要长期保存的送出去，能省一大笔存储和带宽费用
+      - source_labels: [__name__]
+        regex: 'job:.*|instance:.*|up|slo:.*'
+        action: keep
+```
+
+远程写入的健康度必须监控：
+
+```promql
+# 积压：待发送的样本数
+prometheus_remote_storage_samples_pending
+
+# 发送失败率
+rate(prometheus_remote_storage_samples_failed_total[5m])
+
+# 【最重要】写入延迟：远端已确认的时间戳落后本地多少秒
+(
+  prometheus_remote_storage_highest_timestamp_in_seconds
+  -
+  ignoring(remote_name, url) group_right
+  prometheus_remote_storage_queue_highest_sent_timestamp_seconds
+)
+
+# 当前分片数（持续贴着 max_shards 说明需要调大）
+prometheus_remote_storage_shards
+```
+
+### 方案选型速查
+
+| 方案 | 适合规模 | 核心优势 | 主要代价 |
+| --- | --- | --- | --- |
+| **单 Prometheus** | 100 万序列以内 | 零额外组件，运维极简 | 无 HA、无长期存储 |
+| **Prometheus 分片 + 联邦** | 几百万序列 | 不引入新组件，故障域隔离 | 跨分片查询能力弱，只能看聚合值 |
+| **Thanos** | 千万级 | 对象存储成本低、降采样、去重、全局查询 | 组件多（sidecar/store/query/compact/ruler），查询链路长 |
+| **Cortex / Mimir** | 亿级 | 多租户、水平扩展、写入侧高可用 | 架构复杂，运维门槛最高 |
+| **VictoriaMetrics** | 千万到亿级 | 压缩率高、资源占用低、单体模式部署简单 | 与上游 Prometheus 生态有细微行为差异 |
+
+<Callout type="info" title="不要过早引入长期存储方案">
+Thanos、Mimir 这些方案的运维复杂度是 Prometheus 的**好几倍**。它们引入了对象存储依赖、多个需要独立扩缩容的组件、以及一套全新的故障模式（compactor 卡住、store gateway 内存爆炸、查询扇出超时）。
+
+**在单个 Prometheus 还能扛住（低于 500 万序列、保留期需求低于 90 天）的时候，绝对不要引入它们。**
+
+按优先级排的演进路径是：
+
+1. **先治理基数**——大多数「Prometheus 扛不住了」的问题，本质是基数问题，不是架构问题。删掉几个高基数指标能省下的资源，往往比引入 Thanos 还多。
+2. **再加记录规则**——把查询压力降下来。
+3. **再按功能分片**——`prometheus-infra` / `prometheus-app`，故障域隔离，各自独立扩容。
+4. **最后才考虑长期存储方案**——而且要先想清楚：真的需要 400 天原始精度数据吗？还是「400 天的聚合值 + 30 天的原始值」就够了？后者用两层 Prometheus 就能做到。
+</Callout>
+
+## 六、告警疲劳与分诊
+
+### 量化你的告警质量
+
+告警疲劳不是一个感觉问题，它是可以测量的。`ALERTS` 这个内置指标记录了所有告警的状态，用它做一次「告警体检」：
+
+```promql
+# 过去 7 天里，哪些告警触发得最频繁（找出最吵的）
+topk(20, count_over_time(ALERTS{alertstate="firing"}[7d]))
+
+# 过去 7 天每天平均触发多少条告警
+count_over_time(ALERTS{alertstate="firing"}[7d]) / 7
+
+# 哪些告警从来没触发过（可能是阈值设得太宽，形同虚设）
+count_over_time(ALERTS[30d]) == 0
+
+# 「闪烁」的告警：触发次数多但每次持续时间短 —— 典型的噪音源
+count_over_time(ALERTS{alertstate="firing"}[7d]) > 50
+
+# 长期挂着不恢复的告警 —— 说明它不是「事件」而是「状态」，
+# 要么阈值不对，要么这事根本没人管
+ALERTS{alertstate="firing"} and (ALERTS{alertstate="firing"} offset 7d)
+
+# 按严重级别看告警量分布
+sum by (severity) (count_over_time(ALERTS{alertstate="firing"}[7d]))
+```
+
+<Callout type="warn" title="三个危险信号">
+**信号一：某条告警占了总告警量的 30% 以上。** 这条告警一定有问题——要么阈值不对，要么它监控的是一个没人打算修的问题。值班人员早就学会了忽略它，而且会顺带忽略它旁边的其他告警。
+
+**信号二：有告警连续 firing 超过一周。** 告警的定义是「需要人介入的异常事件」。挂了一周还在的，说明它不是事件，是现状。要么修掉根因，要么调整阈值，要么降级成看板指标——**留着不管是最坏的选择**，因为它会永久性地污染告警列表。
+
+**信号三：每天 critical 告警超过 5 条。** 人的注意力有限。超过这个量，值班人员会进入「批量已读」模式，真正的故障就会被淹没。Google SRE 的经验数据是：**一次值班班次（12 小时）内的 page 数量应该控制在 2 条以内**。
+</Callout>
+
+### 分诊体系
+
+一套可持续的告警体系应该是**三层**的，而不是「所有告警一视同仁」：
+
+| 层级 | 判断标准 | 通知方式 | 响应时间 | 数量目标 |
+| --- | --- | --- | --- | --- |
+| **P1 / Page** | 用户正在受影响，且需要立刻人工介入 | 电话、短信、值班 App | 5 分钟内 | 每周不超过 2 条 |
+| **P2 / Ticket** | 会演变成 P1，或已影响部分用户，但可以等 | 工单、企业微信/钉钉群 | 工作时间内 | 每天不超过 10 条 |
+| **P3 / Info** | 需要知道但不需要行动 | 看板、周报 | 无 | 不进告警通道 |
+
+**判断一条告警该放哪一层，只需要问一个问题：**
+
+> 「如果这条告警在凌晨 3 点响，我会起床处理吗？」
+
+- 会 → P1
+- 不会，但明天上班第一件事要处理 → P2
+- 明天也不一定看 → **P3，不该发通知**
+
+<Callout type="tip" title="用 SLO 告警替代阈值告警，是治疗告警疲劳最有效的一招">
+传统方式下，一个服务可能有几十条告警：CPU、内存、磁盘、连接数、队列长度、GC、线程数、慢查询、5xx 率、延迟……每一条都可能在半夜响，但其中大部分**用户根本没感觉**。
+
+改成 SLO 告警之后，**面向用户的告警只有 4 条**（可用性和延迟各两档燃烧率）。它们只在「用户真的在受影响，且预算真的在快速消耗」时才响。
+
+那些 CPU、内存、GC 的指标怎么办？**降级成 P2 或 P3**。它们的价值是**排障时的诊断信息**，而不是叫醒人的理由。CPU 100% 但用户毫无感知，那说明系统设计得很好（资源利用充分），不是故障。
+
+这个转变的心理阻力通常很大——「万一 CPU 满了不报警，出事了怎么办？」答案是：**出事了 SLO 告警会响**。SLO 告警是「症状告警」，它天然覆盖了所有会影响用户的原因，包括那些你没想到的原因。而阈值告警是「原因告警」，你永远只能覆盖到你想得到的那些原因。
+
+保留少量的「容量类」原因告警是合理的（比如磁盘 7 天内会写满、证书 15 天内过期），因为这些问题**发生时已经来不及了**，必须提前预警。但它们应该是 P2 工单，不是 P1 电话。
+</Callout>
+
+### 工程手段
+
+Alertmanager 侧的四件套：
+
+```yaml
+route:
+  # 1. 分组：把同一批告警收成一条通知
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  receiver: 'default-ticket'
+
+  routes:
+    # 2. 分级路由
+    - matchers:
+        - severity = "critical"
+        - page = "true"
+      receiver: 'oncall-phone'
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: false
+
+    - matchers:
+        - severity = "warning"
+      receiver: 'team-ticket'
+      repeat_interval: 12h
+
+    # 3. 按团队路由
+    - matchers:
+        - team = "payment"
+      receiver: 'payment-group'
+
+# 4. 抑制：根因压掉衍生告警
+inhibit_rules:
+  # 实例宕机时，压掉该实例上的所有其他告警
+  - source_matchers:
+      - alertname = "InstanceDown"
+    target_matchers:
+      - severity =~ "warning|critical"
+    equal: ['instance']
+
+  # 整个集群不可用时，压掉单个服务的告警
+  - source_matchers:
+      - alertname = "ClusterDown"
+    target_matchers:
+      - severity =~ "warning|critical"
+    equal: ['cluster']
+
+  # critical 压掉同一告警的 warning 版本
+  - source_matchers:
+      - severity = "critical"
+    target_matchers:
+      - severity = "warning"
+    equal: ['alertname', 'instance']
+```
+
+规则侧的三件套：
+
+```yaml
+      # 1. 合适的 for：过滤瞬时抖动
+      - alert: HighErrorRate
+        expr: 'job:http_errors:ratio_rate5m > 0.05'
+        for: 10m          # 不是 0m，也不是 1h
+
+      # 2. keep_firing_for：防止告警在恢复边缘反复抖动
+      - alert: HighErrorRate
+        expr: 'job:http_errors:ratio_rate5m > 0.05'
+        for: 10m
+        keep_firing_for: 15m
+
+      # 3. 有意义的 annotation：让人不用查看板就知道该干什么
+        annotations:
+          summary: '{{ $labels.job }} 错误率 {{ humanizePercentage $value }}'
+          description: |
+            服务 {{ $labels.job }} 在过去 10 分钟内 5xx 错误率持续超过 5%。
+            影响范围：{{ $labels.cluster }} 集群
+          runbook_url: 'https://wiki.internal/runbook/{{ $labels.alertname }}'
+          dashboard_url: 'https://grafana.internal/d/api-overview?var-job={{ $labels.job }}'
+```
+
+<Callout type="exercise" title="练习 3：一次 Prometheus 性能急救">
+生产 Prometheus 出现以下症状：
+
+- Grafana 上一半的面板显示 `Query timeout`
+- `prometheus_rule_group_iterations_missed_total` 在过去 6 小时增长了 340
+- CPU 稳定在 95%，内存 22G / 32G（没有 OOM）
+- `prometheus_tsdb_head_series` 是 180 万，过去一周基本没变
+- 抓取正常，`up` 全是 1，`scrape_duration_seconds` 都在 2 秒以内
+
+请：
+
+1. 判断瓶颈在哪一环（摄入？存储？查询？规则求值？），说明依据。
+2. 给出定位问题的具体查询和命令。
+3. 给出至少四条优化措施，按「见效速度」排序。
+4. 写一套能防止同类问题复发的告警。
+
+<Answer>
+**第 1 题：瓶颈判断**
+
+先逐项排除：
+
+| 症状 | 结论 |
+| --- | --- |
+| `up` 全是 1，`scrape_duration_seconds` 小于 2s | **摄入正常**，不是抓取问题 |
+| `head_series` 180 万且一周未变 | **不是基数爆炸**（这是最重要的排除，180 万是很健康的规模） |
+| 内存 22G/32G，没 OOM | **不是内存瓶颈**（虽然偏高，但没到危险线） |
+| CPU 95% | **CPU 是瓶颈** |
+| 规则求值被跳过 340 次 | 规则求值抢不到 CPU，或者规则本身太慢 |
+| 查询超时 | 查询抢不到 CPU，或者查询本身太重 |
+
+**结论：瓶颈在 CPU，而 CPU 被「查询」和「规则求值」两者共同吃掉了。**
+
+180 万序列的摄入压力很小（大约几万 samples/s，占不了多少 CPU）。CPU 95% 说明有大量的**计算**在发生，而计算只来自两个地方：**即席/看板查询** 和 **规则求值**。
+
+`iterations_missed` 增长 340 次这个数字很关键：**6 小时 = 360 分钟**，如果规则组是 1 分钟间隔，340 次跳过意味着**几乎每一轮都在跳**。这不是偶发，是持续性的过载。
+
+**规则求值被跳过 = 告警在这 6 小时里基本没有执行。这才是最严重的问题——不是「看板慢」，是「监控已经失效了」。**
+
+---
+
+**第 2 题：定位查询与命令**
+
+**（1）先看规则侧——哪个 group 慢**
+
+```promql
+# 各规则组的求值耗时
+topk(10, prometheus_rule_group_last_duration_seconds)
+
+# 耗时 / 间隔，大于 1 的就是在持续跳过
+topk(10,
+  prometheus_rule_group_last_duration_seconds
+    /
+  prometheus_rule_group_interval_seconds
+)
+
+# 哪个 group 跳过得最多
+topk(10, increase(prometheus_rule_group_iterations_missed_total[6h]))
+
+# 各 group 有多少条规则（规则太多也会慢）
+count by (rule_group) (prometheus_rule_group_rules)
+```
+
+也可以直接看 Web UI 的 **Status → Rules** 页面，它会列出每条规则的最后求值耗时——**能精确到单条规则**，比上面的 group 级指标更细。
+
+**（2）再看查询侧——哪些查询在烧 CPU**
+
+```yaml
+# 临时开启查询日志
+global:
+  query_log_file: /var/log/prometheus/query.log
+```
+
+```bash
+curl -X POST http://localhost:9090/-/reload
+
+# 收集 10 分钟后分析
+sleep 600
+
+# 最慢的 20 条查询
+jq -r '[.stats.timings.evalTotalTime, .params.query] | @tsv' /var/log/prometheus/query.log \
+  | sort -rn | head -20
+
+# 按查询语句聚合，找出「虽然单次不慢但执行次数极多」的
+jq -r '.params.query' /var/log/prometheus/query.log | sort | uniq -c | sort -rn | head -20
+
+# 谁在发这些查询（Grafana 会带上 X-Grafana-* 相关信息）
+jq -r '[.httpRequest.clientIP, .params.query] | @tsv' /var/log/prometheus/query.log \
+  | sort | uniq -c | sort -rn | head -20
+```
+
+**「按语句聚合看执行次数」这一步经常被忽略但极其重要。** 一条 200ms 的查询不慢，但如果它被 40 个面板引用、每 10 秒刷新一次，那就是每秒 4 次、每次 200ms，**单这一条查询就吃掉 80% 的一个核**。
+
+**（3）看并发情况**
+
+```promql
+# 当前并发查询数，贴着 max-concurrency 说明在排队
+prometheus_engine_queries
+
+# 查询排队时间
+rate(prometheus_engine_query_duration_seconds_sum{slice="queue_time"}[5m])
+  /
+rate(prometheus_engine_query_duration_seconds_count{slice="queue_time"}[5m])
+
+# 查询各阶段耗时占比
+rate(prometheus_engine_query_duration_seconds_sum[5m])
+```
+
+**（4）确认 CPU 花在哪**
+
+```bash
+# 抓 30 秒 CPU profile
+curl -o cpu.prof 'http://localhost:9090/debug/pprof/profile?seconds=30'
+go tool pprof -top -nodecount=30 cpu.prof
+
+# 火焰图
+go tool pprof -http=:8081 cpu.prof
+```
+
+pprof 能直接告诉你 CPU 是花在 `promql.(*evaluator).eval`（查询）、`rules.(*Group).Eval`（规则）还是 `tsdb` 相关函数（摄入/压缩）上。**这是最权威的证据**，能终结一切猜测。
+
+---
+
+**第 3 题：优化措施（按见效速度排序）**
+
+**【立刻，1 分钟内生效】措施 1：拉长慢规则组的 interval**
+
+```yaml
+groups:
+  # 原来是 interval: 1m，改成 5m
+  - name: expensive-long-window-rules
+    interval: 5m
+    rules:
+      - record: job:requests:rate1d
+        expr: sum by (job) (rate(http_requests_total[1d]))
+```
+
+长窗口的记录规则（`[1d]`、`[7d]`）根本不需要每分钟算一次——它们的值在一分钟内几乎不变。改成 5 分钟或 10 分钟，CPU 立降。
+
+**这是唯一一个「改配置 reload 就见效、且零风险」的措施，应该第一个做。**
+
+**【立刻，5 分钟内生效】措施 2：拆分大规则组**
+
+```yaml
+# 改造前：一个 group 里 80 条规则，串行执行，一轮要 90 秒
+groups:
+  - name: all-rules
+    interval: 60s
+    rules:
+      # ... 80 条
+
+# 改造后：按依赖关系拆成 4 个 group，并行执行
+groups:
+  - name: rules-base          # 基础聚合，被其他 group 依赖
+    interval: 30s
+    rules: [...]              # 15 条
+
+  - name: rules-http
+    interval: 60s
+    rules: [...]              # 25 条
+
+  - name: rules-infra
+    interval: 60s
+    rules: [...]              # 20 条
+
+  - name: rules-slo-longwindow
+    interval: 5m              # 长窗口的单独放，且降频
+    rules: [...]              # 20 条
+```
+
+**同一 group 内是串行的，不同 group 之间是并行的。** 一个 80 条规则的巨型 group，即使每条只要 1 秒，一轮也要 80 秒——必然跳过 60 秒的间隔。拆成 4 个并行的 group 后，最慢的那个只要 25 秒。
+
+注意拆分时**有依赖关系的规则必须留在同一个 group 且保持顺序**。
+
+**【当天，需要改看板】措施 3：把重复的看板查询做成记录规则**
+
+从第 2 题的「按语句聚合」结果里挑出执行次数最多的 10 条查询，全部做成记录规则：
+
+```yaml
+  - name: dashboard-recording
+    interval: 30s
+    rules:
+      - record: job:http_duration_seconds:p99_rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+
+      - record: instance:node_cpu:utilisation_rate5m
+        expr: |
+          1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+```
+
+然后改看板引用这些记录规则。**一条被 40 个面板引用的查询，做成记录规则后 CPU 消耗降低 40 倍以上**（从每秒 4 次变成每 30 秒 1 次）。
+
+顺手做的两件事：
+
+- **把 Grafana 看板的默认刷新间隔从 10s 改成 1m。** 没人会盯着看板看 10 秒级的变化，这个默认值纯粹是浪费。
+- **给看板的时间范围加限制。** 默认打开就是「最近 30 天」的看板，每次打开都是一次重查询。
+
+**【当天】措施 4：限制查询并发和资源**
+
+```bash
+--query.max-concurrency=10      # 从默认 20 降到 10
+--query.max-samples=20000000    # 从 5000 万降到 2000 万
+--query.timeout=1m              # 从 2m 降到 1m
+```
+
+这看起来是「让查询更容易失败」，但实际效果是**保护规则求值**。
+
+关键理解：**规则求值和用户查询共享同一个查询引擎和并发配额**。查询把 20 个并发槽全占满时，规则求值就得排队，排队超时就跳过。把 `max-concurrency` 降到 10，等于给规则求值留出了资源。
+
+**「宁可让几个看板超时，也不能让告警规则跳过」**——这个优先级排序必须明确。看板超时用户会抱怨（然后你就知道要优化了），规则跳过则是无声的失效。
+
+**【一周内】措施 5：架构层面的隔离**
+
+如果上面几招之后 CPU 仍然吃紧，就该考虑**把规则求值和查询分离**：
+
+```text
+prometheus-ingest  : 只负责抓取 + 规则求值，不对外提供查询
+                     （或者只允许 Grafana 之外的内部调用）
+prometheus-query   : 通过联邦或 remote read 提供查询，
+                     承接所有 Grafana 和人工查询流量
+```
+
+这样用户的任何查询行为都不会影响告警的可靠性。这是大规模环境的标准做法。
+
+另一个思路是引入 **Thanos Ruler** 或 Prometheus 的独立 ruler 部署，把规则求值完全拆出去。
+
+---
+
+**第 4 题：防复发告警**
+
+```yaml
+groups:
+  - name: prometheus-health
+    interval: 30s
+    rules:
+      # ===== 最高优先级：规则求值失效 =====
+      - alert: PrometheusRuleEvaluationsMissed
+        expr: 'increase(prometheus_rule_group_iterations_missed_total[10m]) > 0'
+        for: 10m
+        labels:
+          severity: 'critical'
+          page: 'true'
+        annotations:
+          summary: '规则组 {{ $labels.rule_group }} 求值被跳过，告警可能已失效'
+          description: |
+            过去 10 分钟跳过 {{ $value }} 次。这意味着该规则组内的告警规则
+            没有被执行，任何异常都不会触发通知。
+          runbook_url: 'https://wiki.internal/runbook/prometheus-rule-missed'
+
+      # ===== 提前预警：规则组即将跟不上 =====
+      - alert: PrometheusRuleGroupSlow
+        expr: |
+          prometheus_rule_group_last_duration_seconds
+            /
+          prometheus_rule_group_interval_seconds > 0.7
+        for: 15m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '规则组 {{ $labels.rule_group }} 求值耗时已占间隔的 {{ humanizePercentage $value }}'
+          description: '超过 1.0 就会开始跳过求值，请拆分该组或拉长 interval'
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: 'increase(prometheus_rule_evaluation_failures_total[10m]) > 0'
+        for: 5m
+        labels:
+          severity: 'warning'
+
+      # ===== CPU 饱和 =====
+      - alert: PrometheusCPUSaturated
+        expr: |
+          rate(process_cpu_seconds_total{job="prometheus"}[5m])
+            /
+          count(count by (cpu) (node_cpu_seconds_total{instance="prometheus:9100"})) > 0.8
+        for: 30m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: 'Prometheus CPU 使用率超过 80%，查询和规则求值可能开始互相挤占'
+
+      # ===== 查询侧压力 =====
+      - alert: PrometheusQueryQueueBuildup
+        expr: |
+          rate(prometheus_engine_query_duration_seconds_sum{slice="queue_time"}[5m])
+            /
+          rate(prometheus_engine_query_duration_seconds_count{slice="queue_time"}[5m]) > 1
+        for: 15m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '查询平均排队时间超过 1 秒，并发已饱和'
+
+      - alert: PrometheusQueryTimeouts
+        expr: 'increase(prometheus_engine_queries_concurrent_max[1h]) > 0 and prometheus_engine_queries >= prometheus_engine_queries_concurrent_max'
+        for: 10m
+        labels:
+          severity: 'warning'
+
+      # ===== 内存趋势 =====
+      - alert: PrometheusMemoryPressure
+        expr: |
+          process_resident_memory_bytes{job="prometheus"}
+            /
+          node_memory_MemTotal_bytes{instance="prometheus:9100"} > 0.75
+        for: 30m
+        labels:
+          severity: 'warning'
+
+      # ===== 兜底：Watchdog 心跳 =====
+      - alert: Watchdog
+        expr: 'vector(1)'
+        labels:
+          severity: 'none'
+        annotations:
+          summary: '这条告警永远 firing，用于验证整条告警链路是通的'
+```
+
+最后那条 `Watchdog` 值得解释：它是一条**永远触发**的假告警，路由到一个专门的接收器（比如 Dead Man's Snitch、或者自建的一个心跳检测服务）。外部系统如果**超过 15 分钟没收到这条心跳**，就说明「Prometheus 挂了」或者「Alertmanager 挂了」或者「告警链路断了」——而这三种情况下，Prometheus 自己是不可能报警的。
+
+**这是整套自监控体系的最后一道防线，任何生产环境都应该有。**
+
+除了告警，还建议建立两个长期的运维习惯：
+
+1. **每周看一次「规则组耗时排行」和「查询次数排行」。** 这两个排行的变化能在问题发生前几周就显现出趋势。
+2. **新增看板和记录规则要走 review。** 大多数 CPU 问题不是某一天突然出现的，而是几十个人在几个月里各加了一点点看板，慢慢累积到临界点。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 4：设计一次告警体系治理">
+你接手一个已经运行两年的监控系统，现状：
+
+- 共 **287 条告警规则**
+- 上周触发了 **4300 次**告警（平均每天 614 次）
+- 其中一条 `DiskUsageHigh` 占了 **1800 次**
+- 有 **12 条**告警连续 firing 超过 30 天
+- 值班群里，工程师对告警的平均响应时间是 **2 小时**（对 critical 也是）
+- 上个月有一次真实故障，告警在 3 分钟内触发，但**没人看到**，最后是客户投诉才发现的
+
+请设计一次系统性治理，包括：
+
+1. 用哪些查询做「告警体检」，各能发现什么问题。
+2. 一套分类整改的决策流程（每条告警该怎么处置）。
+3. 针对 `DiskUsageHigh` 这类「最吵告警」的具体改造。
+4. 针对「12 条长期 firing」的处置原则。
+5. 整改后如何衡量效果，以及如何防止半年后又退化。
+
+<Answer>
+**第 1 步：告警体检**
+
+```promql
+# ===== 体检 1：找出最吵的告警 =====
+topk(20, count_over_time(ALERTS{alertstate="firing"}[7d]))
+
+# 按告警名统计占总量的比例
+count_over_time(ALERTS{alertstate="firing"}[7d])
+  /
+scalar(sum(count_over_time(ALERTS{alertstate="firing"}[7d])))
+
+# ===== 体检 2：找出长期不恢复的 =====
+ALERTS{alertstate="firing"} and (ALERTS{alertstate="firing"} offset 30d)
+
+# 每条告警在过去 30 天里 firing 的时间占比
+avg_over_time(ALERTS{alertstate="firing"}[30d])
+
+# ===== 体检 3：找出「闪烁」的（触发多但每次很短）=====
+# 触发次数 / firing 总时长，比值越大越闪
+count_over_time(ALERTS{alertstate="firing"}[7d])
+  /
+sum_over_time(ALERTS{alertstate="firing"}[7d])
+
+# ===== 体检 4：找出从来不触发的「僵尸告警」=====
+# 需要对照规则列表来看，这条查出的是「30 天内有过 pending 或 firing 的」
+count by (alertname) (count_over_time(ALERTS[30d]))
+# 用 Web UI 的 Status → Rules 列出全部 287 条，做差集
+
+# ===== 体检 5：级别分布是否合理 =====
+sum by (severity) (count_over_time(ALERTS{alertstate="firing"}[7d]))
+
+# critical 的日均量（这是最关键的一个数）
+sum(count_over_time(ALERTS{alertstate="firing", severity="critical"}[7d])) / 7
+
+# ===== 体检 6：按团队/服务看分布，找出「告警贫困户」和「告警大户」=====
+topk(20, sum by (team, service) (count_over_time(ALERTS{alertstate="firing"}[7d])))
+
+# ===== 体检 7：告警的持续时长分布 =====
+# 大量「持续时间小于 5 分钟」的告警说明 for 设得太短
+quantile_over_time(0.5, ALERTS{alertstate="firing"}[7d])
+```
+
+**各自能发现的问题：**
+
+| 体检项 | 发现的问题 |
+| --- | --- |
+| 1. 最吵排行 | 噪音源集中在哪几条。本例中 `DiskUsageHigh` 占 42%，是首要目标 |
+| 2. 长期 firing | 「不是事件而是现状」的告警。它们永久占据告警列表，让人麻木 |
+| 3. 闪烁 | `for` 太短或阈值卡在正常波动区间的告警 |
+| 4. 僵尸 | 阈值设得形同虚设的告警。它们给人「已经监控了」的虚假安全感，比没有更危险 |
+| 5. 级别分布 | critical 是否被滥用。如果 critical 占了 60%，说明分级已经失效 |
+| 6. 团队分布 | 哪些服务过度告警，哪些服务可能监控不足 |
+| 7. 持续时长 | 中位数小于 5 分钟说明大量告警是瞬时抖动 |
+
+**本例的关键数据点：**
+
+- 每天 614 条告警 —— 这个量级下，**没人能认真看每一条**，「批量已读」是必然的。
+- 上个月真实故障 3 分钟触发但没人看到 —— **这就是告警疲劳的直接后果**，也是整改的最有力论据。
+- critical 响应时间 2 小时 —— 说明工程师已经不相信 critical 这个级别了。
+
+---
+
+**第 2 步：分类整改的决策流程**
+
+对 287 条规则逐条过一遍，每条问四个问题：
+
+```text
+问题 1：这条告警触发时，用户是否正在受影响？
+   ├─ 是 → 问题 2
+   └─ 否 → 问题 3
+
+问题 2：需要立刻（5 分钟内）人工介入吗？
+   ├─ 是 → 【P1 / Page】保留，配电话通知
+   └─ 否 → 【P2 / Ticket】降级成工单
+
+问题 3：不处理的话，会在多久之后影响用户？
+   ├─ 几小时内   → 【P2 / Ticket】保留，工作时间处理
+   ├─ 几天内     → 【P2 / Ticket】低优先级
+   └─ 不会 / 说不清 → 问题 4
+
+问题 4：过去 90 天里，有人因为这条告警做过任何动作吗？
+   ├─ 有 → 【P3 / Info】降级成看板指标，不发通知
+   └─ 没有 → 【删除】
+```
+
+**「过去 90 天有没有人因为它做过动作」是最狠也最有效的一条筛子。** 一条告警如果三个月里没引发过任何行动，它的信息价值就是零，而它的噪音成本是实实在在的。
+
+按经验，287 条规则过完这个流程的典型结果是：
+
+```text
+P1 / Page   :  8 到 15 条   （核心服务的 SLO 燃烧率 + 少量灾难性故障）
+P2 / Ticket : 60 到 90 条
+P3 / Info   : 50 到 80 条   （转成看板，不发通知）
+删除        : 100 到 150 条 （僵尸告警 + 重复告警 + 已废弃服务的告警）
+```
+
+**能删掉 40% 以上是很正常的**——两年积累下来，一定有大量服务已经下线、指标已经改名、阈值早已过时的规则。
+
+配套的关键动作：**为每一条保留下来的 P1 告警写 runbook**。
+
+```yaml
+        annotations:
+          runbook_url: 'https://wiki.internal/runbook/{{ $labels.alertname }}'
+```
+
+没有 runbook 的告警不允许是 P1。这条规则会自然地淘汰掉一批「说不清该怎么处理」的告警——如果连处理步骤都写不出来，凭什么半夜叫醒人？
+
+---
+
+**第 3 步：改造 `DiskUsageHigh`**
+
+先诊断它为什么这么吵：
+
+```promql
+# 是集中在少数几台机器上，还是全环境普遍触发？
+topk(20, count_over_time(ALERTS{alertname="DiskUsageHigh", alertstate="firing"}[7d]))
+
+# 按挂载点看分布
+sum by (mountpoint) (count_over_time(ALERTS{alertname="DiskUsageHigh", alertstate="firing"}[7d]))
+
+# 平均每次持续多久
+sum_over_time(ALERTS{alertname="DiskUsageHigh"}[7d])
+  /
+count_over_time(ALERTS{alertname="DiskUsageHigh", alertstate="firing"}[7d])
+```
+
+**典型的原规则长这样：**
+
+```yaml
+# 改造前
+- alert: DiskUsageHigh
+  expr: |
+    100 - (node_filesystem_avail_bytes / node_filesystem_size_bytes * 100) > 80
+  for: 5m
+  labels:
+    severity: 'critical'
+```
+
+它的四个问题：
+
+1. **没有过滤文件系统类型。** `tmpfs`、`overlay`、`squashfs`、`devtmpfs` 这些伪文件系统天然就是高使用率，而且完全不需要人管。容器环境里这类挂载点可能有几十个。
+2. **80% 阈值 + `for: 5m` 太敏感。** 磁盘使用率是一个**缓慢变化**的量，80% 完全不是紧急状态。而且它会在 80% 附近来回震荡，反复触发/恢复。
+3. **`critical` 级别不合理。** 磁盘 80% 满，用户毫无感知，凭什么叫醒人？
+4. **它是「状态告警」不是「趋势告警」。** 一块磁盘稳定在 82% 用了半年，每天都在报，但它根本不会满。而一块磁盘从 40% 三小时涨到 70%，明天就会爆，却不报警。
+
+**改造后：**
+
+```yaml
+groups:
+  - name: disk
+    rules:
+      # ===== P2：趋势预警（这才是真正有用的那一条）=====
+      - alert: DiskWillFillIn24h
+        expr: |
+          predict_linear(
+            node_filesystem_avail_bytes{
+              fstype!~"tmpfs|overlay|squashfs|devtmpfs|ramfs|fuse.lxcfs|iso9660|nsfs"
+            }[6h],
+            24 * 3600
+          ) < 0
+          and
+          node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.25
+        for: 1h
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '{{ $labels.instance }} 的 {{ $labels.mountpoint }} 预计 24 小时内写满'
+          description: |
+            当前剩余 {{ humanize1024 $value }}B。
+            按过去 6 小时的写入趋势外推，24 小时内会耗尽。
+          runbook_url: 'https://wiki.internal/runbook/disk-full'
+
+      # ===== P1：真正的紧急状态 =====
+      - alert: DiskAlmostFull
+        expr: |
+          node_filesystem_avail_bytes{
+            fstype!~"tmpfs|overlay|squashfs|devtmpfs|ramfs|fuse.lxcfs|iso9660|nsfs"
+          }
+            /
+          node_filesystem_size_bytes < 0.05
+        for: 15m
+        labels:
+          severity: 'critical'
+          page: 'true'
+        annotations:
+          summary: '{{ $labels.instance }} 的 {{ $labels.mountpoint }} 剩余空间不足 5%'
+
+      # ===== P1：inode 耗尽（经常被遗漏，症状和磁盘满一样但排查方向完全不同）=====
+      - alert: DiskInodesAlmostExhausted
+        expr: |
+          node_filesystem_files_free{
+            fstype!~"tmpfs|overlay|squashfs|devtmpfs|ramfs|fuse.lxcfs"
+          }
+            /
+          node_filesystem_files < 0.05
+        for: 15m
+        labels:
+          severity: 'critical'
+          page: 'true'
+        annotations:
+          summary: '{{ $labels.instance }} 的 {{ $labels.mountpoint }} inode 剩余不足 5%'
+          description: '磁盘空间可能还很充裕，但已无法创建新文件。常见原因：大量小文件、日志碎片、session 文件堆积'
+
+      # ===== P2：只读文件系统（磁盘故障的典型信号）=====
+      - alert: FilesystemReadOnly
+        expr: 'node_filesystem_readonly{fstype!~"tmpfs|overlay|squashfs|iso9660"} == 1'
+        for: 5m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '{{ $labels.instance }} 的 {{ $labels.mountpoint }} 变成只读，疑似磁盘故障'
+```
+
+**改造带来的量化效果：**
+
+| 维度 | 改造前 | 改造后 |
+| --- | --- | --- |
+| 每周触发次数 | 1800 | 预计 10 到 30 |
+| 级别 | 全是 critical | 趋势 warning，紧急 critical |
+| 误报来源 | 伪文件系统、稳态高水位 | 已排除 |
+| 漏报场景 | 快速写满、inode 耗尽、只读 | 已覆盖 |
+
+**关键的思路转变：从「状态告警」变成「趋势告警」。** 「磁盘 80% 满」是一个状态，可能持续一年都没事；「按当前速度 24 小时内会满」是一个趋势，它一定需要人处理。
+
+注意 `DiskWillFillIn24h` 里加了 `and node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.25` 这个条件——一块 10 TB 的盘用了 100 GB，`predict_linear` 可能因为短期波动预测出「24 小时内写满」，但它剩了 99%，完全不用管。**趋势判断必须配一个绝对水位的门槛。**
+
+---
+
+**第 4 步：12 条长期 firing 的处置**
+
+**原则：告警是「事件」，不是「状态」。任何连续 firing 超过 7 天的告警，都是设计错误。**
+
+逐条走这个决策：
+
+```text
+这条告警描述的问题，是「打算修」还是「不打算修」？
+
+├─ 打算修 → 那它现在的存在没有意义（人已经知道了，也已经排期了）
+│           → 【建工单跟踪，删掉或静默这条告警直到修复】
+│           → 静默要设过期时间，不能永久静默
+│
+└─ 不打算修 → 那阈值就是错的（因为它报的不是「异常」而是「现状」）
+            → 【调整阈值到真正异常的水平】
+            → 或者【降级成 P3 看板指标】
+            → 或者【直接删除】
+```
+
+**三种典型情况和对应处理：**
+
+**情况一：阈值定得太激进（最常见，约占一半）**
+
+比如「内存使用率 > 70%」在一台常年跑在 75% 的机器上。这台机器就是这么设计的，75% 是健康状态。
+
+处理：改成「> 90% 且持续 30 分钟」，或者更好——**改成基于趋势的**：
+
+```yaml
+- alert: MemoryPressureRising
+  expr: |
+    predict_linear(node_memory_MemAvailable_bytes[2h], 4*3600) < 0
+    and
+    node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.2
+  for: 30m
+```
+
+**情况二：已知问题，短期内不会修（技术债）**
+
+比如「某个遗留服务的错误率长期 2%」，团队知道，但重构排在下季度。
+
+处理：**用带过期时间的 silence，而不是删除规则**。
+
+```bash
+amtool silence add \
+  alertname="LegacyServiceErrorRate" service="legacy-order" \
+  --duration=90d \
+  --author="wangwu" \
+  --comment="已知技术债，重构排期 Q3，JIRA-4521 跟踪。到期后必须重新评估"
+```
+
+**关键是必须有过期时间和 JIRA 单号。** 永久静默等于删除，但比删除更糟——因为它是隐形的，半年后没人知道这里被静默了。到期后 silence 自动失效，告警重新出现，强制团队重新审视。
+
+**情况三：监控对象已经不存在了**
+
+比如告警指向的服务半年前就下线了，但规则没删，`absent()` 类的告警于是永远触发。
+
+处理：**直接删除规则**。同时检查有没有其他遗留规则——两年的系统里这种「孤儿规则」通常不止一条。
+
+```promql
+# 找出所有引用了不存在指标的告警（间接方法：看规则求值结果长期为空）
+# 更直接的办法是用 promtool 配合脚本扫描规则文件里的指标名，
+# 逐个用 /api/v1/series 查询是否还有数据
+```
+
+```bash
+# 扫描脚本思路
+for metric in $(grep -oE '[a-z_]+_(total|seconds|bytes|count)' rules/*.yml | sort -u); do
+  result=$(curl -sG 'http://localhost:9090/api/v1/series' \
+    --data-urlencode "match[]=${metric}" \
+    --data-urlencode "start=$(date -d '7 days ago' +%s)" | jq '.data | length')
+  [ "$result" -eq 0 ] && echo "ORPHAN: $metric"
+done
+```
+
+---
+
+**第 5 步：衡量效果与防退化**
+
+**衡量指标（做成一个「告警健康度」看板）：**
+
+```promql
+# 1. 日均告警总量（目标：从 614 降到 50 以下）
+sum(count_over_time(ALERTS{alertstate="firing"}[7d])) / 7
+
+# 2. 日均 critical 量（目标：小于 2）
+sum(count_over_time(ALERTS{alertstate="firing", severity="critical"}[7d])) / 7
+
+# 3. 单条告警的最大占比（目标：小于 15%）
+max(
+  count_over_time(ALERTS{alertstate="firing"}[7d])
+    /
+  scalar(sum(count_over_time(ALERTS{alertstate="firing"}[7d])))
+)
+
+# 4. 长期 firing 的告警条数（目标：0）
+count(ALERTS{alertstate="firing"} and (ALERTS{alertstate="firing"} offset 7d))
+
+# 5. 告警总规则数（目标：从 287 降到 150 以内）
+count(count by (alertname) (ALERTS))
+```
+
+**响应时间这类数据 Prometheus 拿不到**，需要从 Alertmanager 的 webhook 记录、或者值班系统（PagerDuty / OnCall）里取。这是整改效果最直接的证据：
+
+- **critical 平均响应时间**（目标：从 2 小时降到 10 分钟内）
+- **告警的「有效率」**：多少比例的告警最终导致了实际操作（目标：大于 50%）
+
+**防退化机制（这是整个治理里最难但最重要的部分）：**
+
+**1. 把「告警健康度」变成一个定期评审项。** 每月一次，15 分钟，只看上面 5 个数字。数字变差就当场找原因。**不评审的治理成果必然退化**——这是规律，不是可能性。
+
+**2. 新增 P1 告警必须走评审。** 检查清单：
+
+- 有 runbook 吗？
+- 半夜响了会有人起床吗？
+- 它和现有的 SLO 告警重复吗？
+- 预估触发频率是多少？
+
+**3. 给告警加「自动降级」机制。** 用一条元告警监控告警本身：
+
+```yaml
+- alert: AlertIsTooNoisy
+  expr: |
+    count_over_time(ALERTS{alertstate="firing"}[7d]) > 100
+  for: 1h
+  labels:
+    severity: 'warning'
+    team: 'sre'
+  annotations:
+    summary: '告警 {{ $labels.alertname }} 过去 7 天触发 {{ $value }} 次，需要治理'
+    description: '按约定，单条告警 7 天内触发超过 100 次应当在两周内完成改造或降级'
+
+- alert: AlertFiringTooLong
+  expr: |
+    ALERTS{alertstate="firing"} and (ALERTS{alertstate="firing"} offset 7d)
+  for: 1h
+  labels:
+    severity: 'warning'
+    team: 'sre'
+  annotations:
+    summary: '告警 {{ $labels.alertname }} 已连续 firing 超过 7 天'
+    description: '告警应当描述「事件」而非「状态」。请调整阈值、修复问题、或降级为看板指标'
+```
+
+**「用告警来监控告警」听起来很绕，但它是唯一能持续生效的机制。** 靠人的自觉去做治理，三个月后一定回到原点；把规则写成告警，它会自己提醒你。
+
+**4. 把 runbook 链接做成硬性要求。** 在 CI 里检查规则文件：所有 `severity: critical` 的规则必须有 `runbook_url` 注解，否则构建失败。
+
+```bash
+# CI 检查脚本
+promtool check rules rules/*.yml || exit 1
+
+# 检查 critical 告警是否都有 runbook
+python3 - <<'EOF'
+import yaml, glob, sys
+bad = []
+for f in glob.glob('rules/*.yml'):
+    for g in yaml.safe_load(open(f)).get('groups', []):
+        for r in g.get('rules', []):
+            if r.get('labels', {}).get('severity') == 'critical':
+                if 'runbook_url' not in r.get('annotations', {}):
+                    bad.append(f"{f}: {r.get('alert')}")
+if bad:
+    print("以下 critical 告警缺少 runbook_url:")
+    print("\n".join(bad))
+    sys.exit(1)
+EOF
+```
+
+**最后一句：告警治理的本质不是技术问题，是「注意力预算」的分配问题。** 人一天能认真处理的告警数量是有上限的（大约 10 条），超过这个数，多出来的告警不但没有价值，还会稀释掉有价值的那些。**每加一条告警，都是在花掉别人的注意力预算。** 让所有人都理解这一点，比任何工具都有效。
+</Answer>
+</Callout>
+
+## 小结
+
+- **基数是 Prometheus 的第一杀手。** 序列数 = 各标签取值数的**乘积**，Histogram 还要再乘以「桶数 + 2」。诊断从 `/status/tsdb` 页面开始（零成本），再用 `topk(20, count by (__name__)(...))` 深挖（很贵，只在排障时用）。
+- **高基数标签黑名单**：用户/请求/会话 ID、邮箱手机号、完整 URL、错误消息原文、客户端 IP、容器 ID。判断标准是「取值集合会随业务量无限增长吗」。降维（`user_tier` 代替 `user_id`、路由模板代替完整 URL）是标准解法。
+- **三道防线**：`metric_relabel_configs` 在入库前丢、`sample_limit` 等硬限制兜底、基数趋势告警提前预警。注意 `labeldrop` 的 `regex` 匹配的是**标签名**且忽略 `source_labels`。
+- **容量公式**：磁盘 = 保留秒数 × 摄入样本/秒 × 每样本字节数（1 到 2 字节），再乘 1.4 的安全系数。内存 = 序列数 × 3 到 8 KB，再留 3 到 4 倍给查询峰值。**`GOMEMLIMIT` 是投入产出比最高的一个配置**，它把硬 OOM 变成软降级。
+- **抓取间隔是最大的性能旋钮**，改一倍所有资源消耗都改一倍。30s 是大多数场景的最佳平衡点。间隔不要超过 2 分钟（`lookback-delta` 是 5 分钟），`rate` 的区间至少是抓取间隔的 4 倍。
+- **记录规则把「查询时计算」变成「写入时计算」**。命名用 `level:metric:operations`。三条铁律：永远 `sum(rate(...))` 不是 `rate(sum(...))`；`rate` 区间不小于规则 interval；有依赖的规则放同一 group 并按序书写。**大 group 要拆**，同组串行、跨组并行。
+- **联邦只能拉聚合结果**，用 `match[]` 配合记录规则的命名前缀筛选。它解决不了长期存储、HA 和水平扩展。**演进路径：治基数 → 加记录规则 → 按功能分片 → 最后才上 Thanos/Mimir。**
+- **`prometheus_rule_group_iterations_missed_total` 是最该盯的自监控指标**——规则求值被跳过意味着告警已经失效，而且是无声的。查询和规则求值共享并发配额，必要时降低 `--query.max-concurrency` 来保护规则。
+- **告警疲劳可以量化**：日均告警量、critical 日均量、单条告警占比、长期 firing 条数。判断一条告警级别只需要问「凌晨 3 点响了我会起床吗」。**用 SLO 告警替代阈值告警是最有效的减噪手段。**
+- **告警是「事件」不是「状态」。** 长期 firing 的告警一定是设计错误。「磁盘 80% 满」是状态，「24 小时内会写满」才是事件。
+- **治理成果必须靠机制维持**：用告警监控告警（`AlertIsTooNoisy`、`AlertFiringTooLong`）、CI 检查 runbook、每月 15 分钟评审。靠自觉的治理，三个月必然退化。
+
+这一章的所有内容可以浓缩成一句话：**Prometheus 的运维，本质上是在管理三种预算——基数预算、资源预算、和人的注意力预算。** 三者都是有限的，都会被「多加一点点」的心态慢慢耗尽，也都需要明确的机制来守住。

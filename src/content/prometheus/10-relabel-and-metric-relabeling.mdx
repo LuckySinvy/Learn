@@ -1,0 +1,935 @@
+---
+title: relabel 与指标重标记
+order: 10
+description: relabel_configs 与 metric_relabel_configs 的时机差异、八种 action 详解与实战避坑
+---
+
+# relabel 与指标重标记
+
+如果说 PromQL 是 Prometheus 的「读」能力，那 relabel 就是它的「写」能力——**在数据进库之前，你有一次机会重新定义它长什么样**。改抓取地址、丢弃不想要的目标、把服务发现塞过来的一堆元数据变成有意义的标签、把占了 40% 存储却从没人看过的指标扔掉，全都靠这套机制。
+
+它也是整个 Prometheus 配置体系里**最容易写错、错了还最难发现**的部分。写错一条 `keep`，结果不是报错，而是「目标悄悄地一个都不剩」，Targets 页面干干净净什么都没有，看起来倒像是一切正常。
+
+本章把这套机制彻底拆开。
+
+读完本章你会掌握：
+
+- `relabel_configs` 与 `metric_relabel_configs` 的**时机差异**：一个改「目标」，一个改「样本」
+- 一条规则的六个字段：`source_labels`、`separator`、`regex`、`target_label`、`replacement`、`modulus`
+- 八种 action：`replace`、`keep`、`drop`、`labelmap`、`labeldrop`、`labelkeep`、`hashmod`、`lowercase` 与 `uppercase`
+- **正则默认全串锚定**这条最关键的隐藏规则
+- 三个实战套路：只抓特定实例、只保留特定指标、重写标签
+- 经典坑：`keep` 写错导致抓不到数据、`labeldrop` 删掉 `instance` 导致样本冲突
+
+## 一、时机：两个 relabel 分别站在流水线的哪个位置
+
+先把第 9 章那张流水线图再看一遍，这次只关注两个 relabel 的位置：
+
+```text
+服务发现产出候选目标（一组标签）
+        到
+【relabel_configs】      ← 作用对象：目标（Target）
+        到
+目标定型：丢弃 __ 开头的标签，确定 instance
+        到
+发起 HTTP 请求，拉回一大堆样本
+        到
+【metric_relabel_configs】 ← 作用对象：每一条样本（Sample）
+        到
+写入 TSDB
+```
+
+两者的对比：
+
+| 维度 | `relabel_configs` | `metric_relabel_configs` |
+| --- | --- | --- |
+| 执行时机 | 抓取**之前** | 抓取**之后**、入库之前 |
+| 作用对象 | 一个「目标」的标签集 | 每一条「样本」的标签集 |
+| 执行次数 | 每轮服务发现时，每个目标执行一次 | 每次抓取，每条样本都执行一遍 |
+| 能看到的标签 | `__address__`、`__scheme__`、`__metrics_path__`、`__param_*`、`__meta_*`、静态 `labels` | `__name__` 以及样本自身的标签 + 已合并的目标标签 |
+| 典型用途 | 决定抓不抓、抓哪个地址、把 SD 元数据变成正式标签 | 丢弃不需要的指标、清洗高基数标签 |
+| 能省抓取流量吗 | 能（目标都不抓了） | 不能（数据已经拉回来了，只是不入库） |
+| `drop` 掉之后 | 该目标从 Targets 页面消失 | 该样本不写入，`up` 仍然正常 |
+
+<Callout type="info" title="一句话记住区别">
+`relabel_configs` 回答的是「**要不要抓这台机器、去哪儿抓**」；`metric_relabel_configs` 回答的是「**抓回来的这堆数据，哪些值得存**」。
+
+前者看到的是 `__address__` 这种「怎么发请求」的信息，后者压根看不到 `__address__`（那时目标标签早已定型，`__` 开头的都被清掉了）。所以想在 `metric_relabel_configs` 里改抓取地址是不可能的，反过来想在 `relabel_configs` 里按 `__name__` 丢指标也是不可能的——那时候一条样本都还没拉回来呢。
+</Callout>
+
+## 二、一条规则的六个字段
+
+无论哪种 relabel，单条规则的字段是同一套：
+
+```yaml
+- source_labels: [label_a, label_b]   # 取哪些标签的值（数组，按顺序）
+  separator: ';'                       # 拼接分隔符，默认分号
+  regex: '(.*);(.*)'                   # 匹配用的正则，默认 (.*)
+  target_label: 'new_label'            # 结果写到哪个标签
+  replacement: '$1-$2'                 # 写什么，默认 $1
+  action: replace                      # 做什么，默认 replace
+  modulus: 8                           # 仅 hashmod 使用
+```
+
+执行逻辑严格按这个顺序：
+
+```text
+1. 按 source_labels 的顺序取出各标签的值
+   （标签不存在时取空字符串，不会报错）
+2. 用 separator 把这些值拼成一个字符串
+3. 用 regex 去匹配这个字符串（全串锚定）
+4. 根据 action 决定动作，replacement 里的 $1 $2 用捕获组填充
+```
+
+举个例子，某目标当前有标签 `env="prod"`、`region="bj"`：
+
+```yaml
+- source_labels: [env, region]
+  separator: '-'
+  regex: '(.+)-(.+)'
+  target_label: zone
+  replacement: '$2.$1'
+  action: replace
+```
+
+拼接得到 `prod-bj`，正则捕获出 `$1 = prod`、`$2 = bj`，最终写入 `zone="bj.prod"`。
+
+<Callout type="warn" title="regex 默认是「全串锚定」的，这是第一大坑">
+Prometheus 会自动在你写的正则两端加上锚点，等价于 `^(?:你的正则)$`。也就是说：
+
+- `regex: 'prod'` **匹配不上** `prod-bj`，因为它要求整个字符串就是 `prod`。
+- 想匹配「以 prod 开头」，必须写 `regex: 'prod.*'`。
+- 想匹配「包含 prod」，必须写 `regex: '.*prod.*'`。
+
+这一条规则是 relabel 事故的头号来源。写 `keep` 的时候尤其致命：正则匹配不上，所有目标全被丢弃，你会得到一个空空如也的 Targets 页面。
+</Callout>
+
+<Callout type="tip" title="几个默认值背下来能省很多字">
+- `separator` 默认是 `;`（分号）
+- `regex` 默认是 `(.*)`，即匹配任意内容并整体捕获为 `$1`
+- `replacement` 默认是 `$1`
+- `action` 默认是 `replace`
+
+所以「把 A 标签的值原样复制到 B 标签」只需要写三行：
+
+```yaml
+- source_labels: [__address__]
+  target_label: instance_addr
+```
+
+因为 `regex: (.*)` 捕获全部内容，`replacement: $1` 原样写出，`action: replace` 是默认。
+</Callout>
+
+## 三、八种 action 逐一详解
+
+### replace：改写或新建标签（默认）
+
+```yaml
+# 从 __address__ = "10.0.0.11:9100" 里抽出 IP，写入 host 标签
+- source_labels: [__address__]
+  regex: '([^:]+):\d+'
+  target_label: host
+  replacement: '$1'
+```
+
+三条重要行为：
+
+1. **正则匹配不上时，这条规则什么都不做**——目标标签保持原样，不会被清空，也不会报错。这是 relabel 里最「安静」的失败方式。
+2. **匹配上但 `replacement` 展开后是空字符串时，`target_label` 会被删除**。这是主动删标签的一种写法。
+3. **不写 `source_labels` 也合法**。此时拼接结果是空串，默认 `regex: (.*)` 能匹配空串，于是 `replacement` 被原样写入。这就是第 9 章 blackbox 配置里那条「硬编码地址」的原理：
+
+```yaml
+- target_label: __address__
+  replacement: 'blackbox-exporter:9115'
+```
+
+### keep / drop：决定「要不要」
+
+```yaml
+# 只保留 __meta_kubernetes_pod_annotation_prometheus_io_scrape 为 "true" 的目标
+- source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+  regex: 'true'
+  action: keep
+
+# 丢弃所有 env 为 dev 或 test 的目标
+- source_labels: [env]
+  regex: 'dev|test'
+  action: drop
+```
+
+- `keep`：正则**匹配上**才留下，匹配不上就丢弃。
+- `drop`：正则**匹配上**就丢弃，匹配不上才留下。
+
+两者互为镜像。用哪个取决于哪种写法的正则更简单、更不容易漏。
+
+<Callout type="warn" title="keep 与 drop 混用时，顺序决定一切">
+规则是**从上到下顺序执行**的，一旦某条 `keep` 或 `drop` 判定丢弃，后面的规则就不再执行了。所以：
+
+```yaml
+# 这样写：先只留 prod，再从 prod 里去掉 canary —— 符合预期
+- source_labels: [env]
+  regex: 'prod'
+  action: keep
+- source_labels: [role]
+  regex: 'canary'
+  action: drop
+```
+
+反过来把两条互斥的 `keep` 叠在一起，结果一定是「一个都不剩」：
+
+```yaml
+# 灾难写法：先 keep 掉只剩 bj，再 keep 只剩 sh，最后什么都没有
+- source_labels: [region]
+  regex: 'bj'
+  action: keep
+- source_labels: [region]
+  regex: 'sh'
+  action: keep
+```
+
+想表达「或」，必须写在同一条规则的正则里：`regex: 'bj|sh'`。
+</Callout>
+
+### labelmap：批量重命名标签
+
+`labelmap` 很特殊：它的 `regex` 匹配的是**标签名**，不是标签值。所有名字能匹配上的标签，都会按 `replacement` 生成一个新标签名，值原样复制过去。
+
+```yaml
+# 把所有 __meta_kubernetes_pod_label_xxx 变成 xxx
+- action: labelmap
+  regex: '__meta_kubernetes_pod_label_(.+)'
+  replacement: '$1'
+```
+
+假设目标有 `__meta_kubernetes_pod_label_app="nginx"` 和 `__meta_kubernetes_pod_label_tier="frontend"`，执行后会多出 `app="nginx"` 和 `tier="frontend"` 两个标签。
+
+<Callout type="info" title="labelmap 是「复制」不是「移动」">
+原来的标签**依然存在**。只不过在 `relabel_configs` 里这通常无所谓——`__meta_*` 和其他 `__` 开头的标签会在目标定型时被自动清掉。但如果你在 `metric_relabel_configs` 里用 `labelmap` 重命名普通标签，就要额外补一条 `labeldrop` 把旧的删掉，否则会同时留下新旧两份。
+</Callout>
+
+### labeldrop / labelkeep：按名字删标签
+
+同样作用于**标签名**：
+
+```yaml
+# 删掉所有以 pod_label_ 开头的标签（通常是清理噪声）
+- action: labeldrop
+  regex: 'pod_label_.*'
+
+# 只保留这几个标签，其余全删（危险，慎用）
+- action: labelkeep
+  regex: '__name__|job|instance|env'
+```
+
+<Callout type="warn" title="labeldrop / labelkeep 只允许写 regex 一个字段">
+这是 Prometheus 明确做了配置校验的地方。如果你给它们额外写了 `source_labels`、`target_label`、`replacement` 或 `modulus`，启动时会直接报错：
+
+```text
+labeldrop and labelkeep actions require only 'regex', and no other fields
+```
+
+另外 `labelkeep` 有个致命细节：**指标名本身也是一个标签，叫 `__name__`**。如果你的 `regex` 没把它包含进去，指标名会被一起删掉，样本就废了。所以 `labelkeep` 的正则里几乎总要写上 `__name__`。
+</Callout>
+
+### hashmod：把目标均匀分片
+
+```yaml
+# 把所有目标按地址哈希分成 4 份，本实例只抓第 1 份
+- source_labels: [__address__]
+  modulus: 4
+  target_label: __tmp_shard
+  action: hashmod
+- source_labels: [__tmp_shard]
+  regex: '1'
+  action: keep
+```
+
+`hashmod` 对拼接后的值做哈希，再对 `modulus` 取模，把结果（0 到 `modulus - 1` 的整数）写进 `target_label`。它本身不丢弃任何目标，必须配合后面一条 `keep` 才能实现分片。
+
+这是**水平扩展 Prometheus** 的标准手法：部署 4 个 Prometheus 实例，配置完全相同，只有那条 `keep` 的 `regex` 分别写 `0`、`1`、`2`、`3`，每个实例就只负责四分之一的目标。因为哈希是确定的，同一个目标永远落在同一个分片上，不会来回漂移。
+
+<Callout type="tip" title="__tmp 前缀是官方保留给你用的">
+Prometheus 官方承诺**永远不会使用 `__tmp` 开头的标签名**。所以当你需要一个中间变量（比如 hashmod 的结果、多步拼接的临时值）时，用 `__tmp_xxx` 命名最安全：既不会和内置标签撞车，又会在目标定型时自动被清掉，不会污染最终数据。
+</Callout>
+
+### lowercase / uppercase：大小写转换
+
+```yaml
+# 把服务发现拿到的主机名统一转成小写
+- source_labels: [__meta_consul_node]
+  target_label: node
+  action: lowercase
+```
+
+这两个 action 在 2.36 加入，用来解决「同一台机器在不同系统里大小写不一致，导致标签值分裂成两条序列」的问题。它们需要 `source_labels` 和 `target_label`，不使用 `regex`。
+
+### keepequal / dropequal：比较两个标签
+
+2.41 加入，用于「保留（或丢弃）`source_labels` 拼接结果等于 `target_label` 值的目标」：
+
+```yaml
+# 只保留「暴露端口」与「注解里声明的端口」一致的目标
+- source_labels: [__meta_kubernetes_pod_container_port_number]
+  target_label: __tmp_port
+  action: keepequal
+```
+
+用得不多，知道有这么回事即可。
+
+<Callout type="exercise" title="练习 1：预测 relabel 的执行结果">
+一个目标经过服务发现后带有这些标签：
+
+```text
+__address__  = "10.20.30.40:9100"
+__scheme__   = "http"
+env          = "production"
+region       = "bj-1"
+role         = "worker"
+```
+
+依次执行下面四条规则，写出每一步之后的标签变化，以及最终这个目标会不会被抓取：
+
+```yaml
+relabel_configs:
+  - source_labels: [env]
+    regex: 'prod'
+    action: keep
+
+  - source_labels: [region]
+    regex: '([a-z]+)-(\d+)'
+    target_label: dc
+    replacement: '$1'
+
+  - source_labels: [__address__]
+    regex: '([^:]+):(\d+)'
+    target_label: host
+    replacement: '$1'
+
+  - action: labeldrop
+    regex: 'role'
+```
+
+<Answer>
+**结论：目标在第 1 条规则就被丢弃了，根本不会被抓取。**
+
+**逐条分析：**
+
+**第 1 条 —— `keep`，匹配失败，目标被丢弃**
+
+```text
+source_labels: [env] → 取出 "production"
+regex: 'prod' → 实际是 ^(?:prod)$
+"production" 不等于 "prod" → 不匹配
+action: keep → 不匹配就丢弃
+```
+
+这就是**正则全串锚定**的坑。`prod` 只能匹配字符串恰好是 `prod` 的情况，`production` 多了后面五个字符，匹配失败。
+
+后面三条规则**不会再执行**——目标已经被丢弃，流水线就此中止。
+
+**修复方式（任选其一）：**
+
+```yaml
+# 方式 A：加通配
+- source_labels: [env]
+  regex: 'prod.*'
+  action: keep
+
+# 方式 B：写全
+- source_labels: [env]
+  regex: 'production'
+  action: keep
+
+# 方式 C：列举多个值
+- source_labels: [env]
+  regex: 'prod|production|prd'
+  action: keep
+```
+
+**假设第 1 条改成 `regex: 'prod.*'` 修好了，后面三条的结果是：**
+
+第 2 条：`region = "bj-1"`，正则 `([a-z]+)-(\d+)` 匹配成功，`$1 = "bj"`，写入 `dc="bj"`。
+
+```text
+__address__="10.20.30.40:9100", __scheme__="http",
+env="production", region="bj-1", role="worker", dc="bj"
+```
+
+第 3 条：`__address__ = "10.20.30.40:9100"`，`$1 = "10.20.30.40"`，写入 `host="10.20.30.40"`。
+
+```text
+... 新增 host="10.20.30.40"
+```
+
+第 4 条：`labeldrop` 删掉 `role` 标签。
+
+**目标定型后的最终标签**（`__` 开头的全部被清除，`instance` 由 `__address__` 填充）：
+
+```text
+job="<job_name>"
+instance="10.20.30.40:9100"
+env="production"
+region="bj-1"
+dc="bj"
+host="10.20.30.40"
+```
+
+**排查这类问题的正确姿势**：打开 Prometheus 的 `/service-discovery` 页面。它会把每个目标 relabel **之前**的原始标签（Discovered Labels）和 relabel **之后**的结果（Target Labels）并排显示，被丢弃的目标也会列出来并标明 dropped。哪一条规则把目标干掉了，一眼就能看出来。
+</Answer>
+</Callout>
+
+## 四、实战套路一：只抓取特定实例
+
+最常见的需求：服务发现返回了一大堆目标，但你只想抓其中一部分。
+
+```yaml
+- job_name: 'node'
+  file_sd_configs:
+    - files: ['/etc/prometheus/targets/*.yml']
+  relabel_configs:
+    # 1) 只要生产环境
+    - source_labels: [env]
+      regex: 'prod.*'
+      action: keep
+
+    # 2) 但排除掉标记为下线中的机器
+    - source_labels: [status]
+      regex: 'draining|decommissioned'
+      action: drop
+
+    # 3) 也排除掉端口不是 9100 的（防止配错）
+    - source_labels: [__address__]
+      regex: '.*:9100'
+      action: keep
+```
+
+在 Kubernetes 里，这个套路演变成大名鼎鼎的「注解驱动」模式：
+
+```yaml
+relabel_configs:
+  # 只抓带有 prometheus.io/scrape=true 注解的 Pod
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+    regex: 'true'
+    action: keep
+
+  # 如果注解指定了路径，就用它覆盖 metrics_path
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+    regex: '(.+)'
+    target_label: __metrics_path__
+
+  # 如果注解指定了端口，就把地址里的端口换掉
+  - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+    regex: '([^:]+)(?::\d+)?;(\d+)'
+    target_label: __address__
+    replacement: '$1:$2'
+```
+
+注意第二条：`regex: '(.+)'` 的作用是「只在注解存在（非空）时才覆盖」。如果 Pod 没有这个注解，取出来是空串，`(.+)` 要求至少一个字符，匹配失败，规则跳过，`__metrics_path__` 保持默认的 `/metrics`。**这个「用 `(.+)` 做存在性判断」的技巧非常常用。**
+
+第三条用了两个 `source_labels`，拼接后形如 `10.244.1.5:9100;8080`，正则把 IP 和注解端口分别捕获，重组成 `10.244.1.5:8080`。
+
+## 五、实战套路二：重写标签
+
+### 从一个标签里提取信息
+
+```yaml
+# instance = "web-01.bj.example.com:8080" → 拆出 hostname 和 idc
+- source_labels: [__address__]
+  regex: '([^.]+)\.([^.]+)\..*'
+  target_label: hostname
+  replacement: '$1'
+- source_labels: [__address__]
+  regex: '([^.]+)\.([^.]+)\..*'
+  target_label: idc
+  replacement: '$2'
+```
+
+### 合并多个标签
+
+```yaml
+- source_labels: [namespace, pod]
+  separator: '/'
+  target_label: pod_full
+  replacement: '$1'
+```
+
+注意这里 `regex` 用的是默认的 `(.*)`，它会把整个拼接结果 `default/nginx-abc` 捕获为 `$1`，所以直接写 `$1` 就得到了拼接结果。
+
+### 删除标签
+
+```yaml
+# 方式 A：labeldrop（推荐，语义清晰）
+- action: labeldrop
+  regex: 'noisy_label'
+
+# 方式 B：replace 成空值
+- source_labels: [noisy_label]
+  target_label: noisy_label
+  replacement: ''
+```
+
+<Callout type="warn" title="千万别随手删掉 instance 或其他区分性标签">
+假设一个 job 下有 20 台机器，你嫌 `instance` 太长，来了一条：
+
+```yaml
+- action: labeldrop
+  regex: 'instance'
+```
+
+后果是：20 台机器的同名指标标签集变得**完全一样**，它们全都在往同一条时间序列里写数据。同一时间戳上出现 20 个不同的值，Prometheus 会报错：
+
+```text
+Error on ingesting samples with different value but same timestamp
+```
+
+只有一台机器的数据能侥幸写进去，其余 19 台全部被丢弃，而且这个错误只出现在日志里，界面上看 `up` 还是 1，极难察觉。
+
+**判定原则**：删标签之前先问一句「删掉它以后，不同来源的数据还能区分开吗？」区分不开就绝对不能删。`instance` 在 99% 的情况下都属于不能删的那一类。
+</Callout>
+
+<Callout type="exercise" title="练习 2：用 relabel 完成一次「乾坤大挪移」">
+你有一批 file_sd 提供的目标，原始标签如下：
+
+```text
+__address__ = "10.1.2.3:9100"
+service     = "ORDER-API"
+zone        = "cn-north-1a"
+tier        = "backend"
+maintenance = "false"
+```
+
+要求：
+
+1. 处于维护状态（`maintenance` 为 `true`）的机器不抓。
+2. `service` 统一转成小写，写入新标签 `app`，并删掉原来的 `service`。
+3. 从 `zone` 里提取出地域部分（`cn-north-1`，即去掉最后的可用区字母），写入标签 `region`。
+4. 新增一个标签 `ip`，值是 `__address__` 里的 IP 部分（不含端口）。
+
+写出完整的 `relabel_configs`。
+
+<Answer>
+```yaml
+relabel_configs:
+  # 1) 维护中的机器不抓
+  - source_labels: [maintenance]
+    regex: 'true'
+    action: drop
+
+  # 2) service 转小写写入 app
+  - source_labels: [service]
+    target_label: app
+    action: lowercase
+
+  #    删掉原来的 service 标签
+  - action: labeldrop
+    regex: 'service'
+
+  # 3) 从 zone 提取 region：cn-north-1a → cn-north-1
+  - source_labels: [zone]
+    regex: '(.*[0-9])[a-z]'
+    target_label: region
+    replacement: '$1'
+
+  # 4) 从 __address__ 提取 IP
+  - source_labels: [__address__]
+    regex: '([^:]+):\d+'
+    target_label: ip
+    replacement: '$1'
+```
+
+**逐条说明与易错点：**
+
+**第 1 条**：用 `drop` 比用 `keep` 更稳妥。如果写成「`keep` 匹配 `false`」，那么当某台机器**根本没有 `maintenance` 标签**时，取值是空串，匹配不上 `false`，这台机器会被误杀。而用 `drop` 匹配 `true`，缺标签的机器取空串，不匹配，正常保留——这才是符合直觉的行为。
+
+**这是一条通用经验：表达「排除少数例外」时用 `drop`，比用 `keep` 列举所有正常值要安全得多。**
+
+**第 2 条**：`lowercase` 需要 `source_labels` 和 `target_label`，不需要 `regex`。如果你的 Prometheus 版本低于 2.36 没有这个 action，只能退而求其次在服务发现侧规范数据，或者用多条 `replace` 硬匹配已知取值（很笨但能用）：
+
+```yaml
+- source_labels: [service]
+  regex: 'ORDER-API'
+  target_label: app
+  replacement: 'order-api'
+```
+
+**第 3 条**：正则 `(.*[0-9])[a-z]` 的思路是「捕获到最后一个数字为止，再匹配掉结尾的一个字母」。因为全串锚定，`cn-north-1a` 会被完整匹配，`$1 = "cn-north-1"`。
+
+一个常见的错误写法是 `regex: '(cn-north-\d)'`——它把地域名写死了，换成 `cn-east-2b` 就失效。另一个错误写法是 `regex: '(.*)[a-z]'`：`.*` 是贪婪的，但因为要给后面的 `[a-z]` 留一个字符，实际也能得到正确结果；不过遇到 `cn-north-1ab` 这类异常值时行为就不好预测了，加上 `[0-9]` 约束更严谨。
+
+**第 4 条**：`([^:]+):\d+` 中 `[^:]+` 表示「若干个非冒号字符」，正好匹配 IP 部分。注意 `\d+` 也必须写——因为全串锚定，正则必须覆盖整个 `10.1.2.3:9100`，只写 `([^:]+)` 是匹配不上的。
+
+**顺序为什么重要**：第 2 条和第 3 条的顺序不能反——如果先 `labeldrop` 删掉 `service`，第 2 条就取不到值了。规则严格自上而下执行，后面的规则看到的是前面规则改造后的结果。
+
+**最终目标标签**：
+
+```text
+job="<job_name>"
+instance="10.1.2.3:9100"
+zone="cn-north-1a"
+tier="backend"
+maintenance="false"
+app="order-api"
+region="cn-north-1"
+ip="10.1.2.3"
+```
+
+如果 `maintenance` 和 `zone` 这些中间标签你也不想留，可以在最后追加一条 `labeldrop` 清理掉。
+</Answer>
+</Callout>
+
+## 六、实战套路三：只保留特定指标
+
+这是 `metric_relabel_configs` 的主战场。典型场景：某个 Exporter 暴露了 2000 条指标，你只关心其中 30 条。
+
+### 按指标名丢弃
+
+```yaml
+- job_name: 'node'
+  static_configs:
+    - targets: ['10.0.0.11:9100']
+  metric_relabel_configs:
+    # 丢掉一整批从来不看的指标
+    - source_labels: [__name__]
+      regex: 'node_(scrape_collector|mountstats|nfsd|infiniband|wifi)_.*'
+      action: drop
+```
+
+### 按指标名白名单（更激进）
+
+```yaml
+metric_relabel_configs:
+  - source_labels: [__name__]
+    regex: 'node_(cpu_seconds_total|memory_Mem(Total|Available)_bytes|filesystem_(avail|size)_bytes|load1|load5)'
+    action: keep
+```
+
+<Callout type="warn" title="白名单会连 up 一起干掉吗？">
+不会。`up`、`scrape_duration_seconds` 这几条自监控指标是 Prometheus 在 `metric_relabel_configs` **之后**才附加的，白名单管不到它们。
+
+但要注意另一件事：**如果 Exporter 自己暴露的 `xxx_up` 指标（比如 `mysql_up`、`mq_exporter_up`）不在白名单里，就会被丢掉**，而你恰恰最需要它。所以写白名单时务必检查一遍，别把健康指标误伤了。
+</Callout>
+
+### 按标签值丢弃
+
+```yaml
+metric_relabel_configs:
+  # 只保留真实磁盘的文件系统指标，丢掉临时/容器挂载点
+  - source_labels: [__name__, mountpoint]
+    separator: ';'
+    regex: 'node_filesystem_.*;/(run|sys|proc|var/lib/docker|var/lib/kubelet).*'
+    action: drop
+
+  # 丢掉 loopback 和虚拟网卡的网络指标
+  - source_labels: [__name__, device]
+    regex: 'node_network_.*;(lo|veth.*|docker0|br-.*)'
+    action: drop
+```
+
+### 清洗高基数标签
+
+有时候不需要丢整条指标，只要把某个「值域太大」的标签删掉：
+
+```yaml
+metric_relabel_configs:
+  # 某个库把 request_id 打进了标签，直接删掉这个标签
+  - action: labeldrop
+    regex: 'request_id|trace_id|session_id'
+```
+
+<Callout type="tip" title="怎么知道该丢什么？先量化，再动手">
+不要凭感觉丢指标。按这个顺序做：
+
+1. 打开 `/tsdb-status` 页面，看「序列数最多的指标名 Top10」和「取值最多的标签 Top10」。
+2. 用 `topk(20, count by (__name__)({__name__=~".+"}))` 精确统计每个指标名占了多少条序列。
+3. 在 Grafana 里全局搜索这个指标名，确认没有任何看板或告警在用它。
+4. 先加 `drop` 规则观察一周，确认没人来投诉数据不见了，再固化。
+
+丢完之后用这个式子验证效果：
+
+```promql
+scrape_samples_scraped - scrape_samples_post_metric_relabeling
+```
+
+它直接告诉你每次抓取过滤掉了多少条样本。
+</Callout>
+
+<Callout type="exercise" title="练习 3：判断该用哪个 relabel">
+下面六个需求，分别应该写在 `relabel_configs` 还是 `metric_relabel_configs` 里？给出理由和示例配置。
+
+1. 不抓取 `env=dev` 的机器。
+2. 不存储 `go_gc_duration_seconds` 这个指标。
+3. 把抓取端口从 9100 改成 9200。
+4. 给所有序列加一个 `datacenter="bj"` 标签。
+5. 删掉指标上一个基数极高的 `user_id` 标签。
+6. 只抓 Kubernetes 里带特定注解的 Pod。
+
+<Answer>
+| 需求 | 用哪个 | 理由 |
+| --- | --- | --- |
+| 1. 不抓 dev 机器 | `relabel_configs` | 决定「抓不抓」，属于目标层面 |
+| 2. 不存某个指标 | `metric_relabel_configs` | 指标名只有抓回来之后才存在 |
+| 3. 改抓取端口 | `relabel_configs` | 只有它能看到并修改 `__address__` |
+| 4. 加静态标签 | 两者都行，推荐 `relabel_configs`（或 `static_configs.labels`） | 目标层面加一次，比每条样本加一次高效 |
+| 5. 删 `user_id` 标签 | `metric_relabel_configs` | 这是样本自带的标签，目标层面看不到 |
+| 6. 只抓特定注解的 Pod | `relabel_configs` | `__meta_*` 元数据只在抓取前存在 |
+
+**配置示例：**
+
+```yaml
+- job_name: 'demo'
+  kubernetes_sd_configs:
+    - role: pod
+
+  relabel_configs:
+    # 1) 不抓 dev
+    - source_labels: [env]
+      regex: 'dev'
+      action: drop
+
+    # 3) 改端口 9100 → 9200
+    - source_labels: [__address__]
+      regex: '([^:]+):9100'
+      target_label: __address__
+      replacement: '$1:9200'
+
+    # 4) 加固定标签
+    - target_label: datacenter
+      replacement: 'bj'
+
+    # 6) 只抓带注解的 Pod
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+      regex: 'true'
+      action: keep
+
+  metric_relabel_configs:
+    # 2) 丢弃 go_gc_duration_seconds
+    - source_labels: [__name__]
+      regex: 'go_gc_duration_seconds'
+      action: drop
+
+    # 5) 删掉高基数标签
+    - action: labeldrop
+      regex: 'user_id'
+```
+
+**三个值得强调的点：**
+
+**第 4 项为什么优先选 `relabel_configs`**：`metric_relabel_configs` 对**每条样本**都要执行一遍。一个目标返回 5000 条样本，就是 5000 次规则执行；而 `relabel_configs` 每轮服务发现对每个目标只执行一次。加固定标签这种事，放在目标层面代价小几个数量级。当然最简单的写法其实是直接写在 `static_configs.labels` 或 `global.external_labels` 里。
+
+**第 5 项的深层问题**：删标签只能缓解症状，序列已经被创建过了（历史数据里依然有那些序列，占着磁盘直到过期）。真正的解决办法是让业务方把 `user_id` 从标签里去掉。`labeldrop` 是止血，不是根治。
+
+另外要小心：如果一个指标只靠 `user_id` 区分，删掉之后不同用户的样本会撞进同一条序列，触发「same timestamp different value」错误。这时正确做法是把整条指标 `drop` 掉，而不是只删标签。
+
+**第 2 项的一个替代思路**：如果只是嫌 Go 运行时指标多，与其一条条 drop，不如整批处理：
+
+```yaml
+- source_labels: [__name__]
+  regex: 'go_.*|process_.*'
+  action: drop
+```
+
+但要权衡——`go_goroutines` 和 `process_resident_memory_bytes` 在排查应用内存泄漏时相当有用，全丢掉可能会后悔。
+</Answer>
+</Callout>
+
+## 七、经典坑合集
+
+### 坑 1：keep 写错，目标全没了
+
+**症状**：Targets 页面上这个 job 一个目标都没有，也没有任何报错。查询时对应的指标完全查不到。
+
+**原因**：多半是正则锚定问题，或者 `source_labels` 里那个标签根本不存在（取到空串）。
+
+**排查**：打开 `/service-discovery` 页面，找到这个 job，把 "Show more" 展开。你会看到：
+
+- **Discovered Labels**：服务发现原始产出的全部标签，包括所有 `__meta_*`
+- **Target Labels**：relabel 之后的结果；被丢弃的目标这里会显示 `Dropped`
+
+对着 Discovered Labels 逐字检查你的 `source_labels` 拼写和 `regex` 写法。九成的问题在这一步就能看出来——要么标签名拼错了（`__meta_kubernetes_pod_annotation_prometheus_io_scrape` 这种长名字极易打错），要么正则少了 `.*`。
+
+### 坑 2：拿 metric_relabel_configs 改抓取行为
+
+```yaml
+# 完全无效的写法
+metric_relabel_configs:
+  - source_labels: [__address__]
+    target_label: __address__
+    replacement: 'other-host:9100'
+```
+
+`__address__` 在目标定型时就被清除了，`metric_relabel_configs` 阶段根本看不到这个标签，`source_labels` 取到空串，这条规则相当于什么都没做。改地址只能在 `relabel_configs` 里。
+
+### 坑 3：以为 metric_relabel_configs 能省抓取开销
+
+不能。数据已经通过网络传过来、已经被解析成样本了，`metric_relabel_configs` 只是决定「不写进 TSDB」。它节省的是**存储和内存**，不节省**网络和 CPU**。
+
+想省抓取开销，只能从源头减：关掉 Exporter 的 collector，或者用 `params` 让 Exporter 只采集部分模块。
+
+### 坑 4：YAML 引号把正则搞坏了
+
+```yaml
+# 危险：双引号里的反斜杠会被 YAML 先转义一次
+- regex: "(\d+)"      # YAML 解析后变成 (d+)，匹配不上任何数字
+
+# 安全：单引号是字面量
+- regex: '(\d+)'
+```
+
+<Callout type="tip" title="relabel 的正则一律用单引号包起来">
+YAML 的双引号字符串支持反斜杠转义，会把 `\d` 吃成 `d`；单引号字符串是字面量，原样传给正则引擎。而 relabel 的正则里几乎必然出现 `\d`、`\.`、`\w`，所以养成「一律单引号」的习惯能规避一整类问题。
+
+同理，`replacement` 里的 `$1` 也建议用单引号包住，避免和某些工具链的变量展开冲突。
+</Callout>
+
+### 坑 5：忘了 relabel 之后 `__` 标签会消失
+
+有人想通过 relabel 把 `__meta_kubernetes_namespace` 留下来当查询维度，写了半天发现查询时根本没这个标签。原因是**所有以双下划线开头的标签在目标定型时都会被删除**，这是硬规则。正确做法是把它复制到一个不带下划线前缀的名字上：
+
+```yaml
+- source_labels: [__meta_kubernetes_namespace]
+  target_label: namespace
+```
+
+<Callout type="exercise" title="练习 4：诊断并修复一份出问题的配置">
+运维同学提交了下面这份配置，上线后出现两个现象：(a) `k8s-pods` 这个 job 在 Targets 页面上一个目标都没有；(b) 把 keep 规则临时注释掉之后目标出现了，但 Prometheus 日志里开始大量刷 `Error on ingesting samples with different value but same timestamp`。
+
+```yaml
+- job_name: 'k8s-pods'
+  kubernetes_sd_configs:
+    - role: pod
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+      regex: true
+      action: keep
+    - source_labels: [__meta_kubernetes_namespace]
+      regex: 'prod'
+      action: keep
+    - action: labeldrop
+      regex: 'instance|pod'
+  metric_relabel_configs:
+    - source_labels: [__address__]
+      regex: '.*'
+      action: keep
+```
+
+请找出所有问题并给出修正后的配置。
+
+<Answer>
+这份配置一共有**五个**问题，其中两个是致命的。
+
+---
+
+**问题 1（致命）：两条 `keep` 互相叠加，命名空间条件过严**
+
+第一条 `keep` 要求注解为 `true`，第二条 `keep` 要求 namespace 恰好等于 `prod`。这两条是「与」的关系。如果实际的命名空间叫 `production` 或 `prod-order`，因为全串锚定，`regex: 'prod'` 匹配不上，目标全被丢弃。
+
+这是现象 (a) 的主因之一。
+
+**问题 2（致命）：`labeldrop` 删掉了 `pod` 和 `instance`**
+
+这是现象 (b) 的直接原因。删掉这两个标签后，同一个 namespace 下所有 Pod 的同名指标标签集变得完全一样，几十个 Pod 同时往一条序列里写值，就报 `same timestamp different value`。
+
+而且这条规则本身还有一个隐蔽点：此时 `instance` 标签**还不存在**——它是在 relabel 全部执行完、目标定型时才由 `__address__` 填充的。所以这条规则实际上只删掉了 `pod`（来自 kubernetes_sd 的标签）。想删 `instance` 得在 `metric_relabel_configs` 里做，但那更不该做。
+
+**问题 3：`regex: true` 没加引号**
+
+YAML 会把不带引号的 `true` 解析成**布尔值**而不是字符串。Prometheus 加载时会报类型错误，或在某些版本里被转成字符串 `"true"` 侥幸能用。无论如何都应该显式写成 `'true'`，别赌解析器的行为。
+
+**问题 4：`metric_relabel_configs` 里用了 `__address__`**
+
+这一整条规则是无效的。`__address__` 在这个阶段已被清除，`source_labels` 取到空串，`regex: '.*'` 恰好能匹配空串，所以 `keep` 判定为「保留」——结果是这条规则「碰巧没造成破坏」，但完全没起到任何作用，纯属摆设。
+
+**如果作者本意是「保留全部指标」，那这条规则本身就是多余的**，删掉即可。更危险的情况是：假如他写的是 `regex: '.+'`（要求至少一个字符），空串匹配失败，**所有样本都会被丢弃**，那才是真正的灾难。
+
+**问题 5：把有用的 K8s 元数据全丢了**
+
+`kubernetes_sd_configs` 提供了 `__meta_kubernetes_namespace`、`__meta_kubernetes_pod_name`、`__meta_kubernetes_pod_node_name` 等一大堆元数据，这份配置一个都没保留下来（`__` 开头的会被自动清除）。查询时没有 `namespace`、`pod` 维度，排障会非常痛苦。
+
+---
+
+**修正后的配置：**
+
+```yaml
+- job_name: 'k8s-pods'
+  kubernetes_sd_configs:
+    - role: pod
+
+  relabel_configs:
+    # 1) 只抓带 prometheus.io/scrape=true 注解的 Pod
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+      regex: 'true'
+      action: keep
+
+    # 2) 命名空间过滤：用宽松的正则，或干脆用 drop 排除法
+    - source_labels: [__meta_kubernetes_namespace]
+      regex: 'prod.*'
+      action: keep
+
+    # 3) 支持注解自定义路径（存在才覆盖）
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+      regex: '(.+)'
+      target_label: __metrics_path__
+
+    # 4) 支持注解自定义端口
+    - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+      regex: '([^:]+)(?::\d+)?;(\d+)'
+      target_label: __address__
+      replacement: '$1:$2'
+
+    # 5) 把有用的元数据变成正式标签
+    - source_labels: [__meta_kubernetes_namespace]
+      target_label: namespace
+    - source_labels: [__meta_kubernetes_pod_name]
+      target_label: pod
+    - source_labels: [__meta_kubernetes_pod_node_name]
+      target_label: node
+    - action: labelmap
+      regex: '__meta_kubernetes_pod_label_(.+)'
+
+  metric_relabel_configs:
+    # 真正有意义的过滤：丢掉不看的运行时指标
+    - source_labels: [__name__]
+      regex: 'go_gc_.*|go_memstats_.*_bytes_total'
+      action: drop
+```
+
+---
+
+**这道题的三条通用教训：**
+
+1. **`keep` 是「与」不是「或」**。多条 `keep` 叠加会不断收窄范围。想表达「或」，写进同一条规则的正则里：`regex: 'prod|staging'`。
+
+2. **删标签前先问「还能区分开吗」**。`instance`、`pod`、`device`、`mountpoint` 这类天然用于区分不同数据来源的标签，删掉必然引发序列冲突。冲突的表现是日志刷错误、数据静默丢失，而界面上 `up` 依然是 1，极难发现。
+
+3. **YAML 里所有 relabel 的值都加单引号**。`true`、`false`、`yes`、`no`、`on`、`off`、`null`、纯数字都会被 YAML 解析成非字符串类型；正则里的 `\d` 在双引号下会被吃掉。统一单引号，一劳永逸。
+
+**上线前的自检清单：**
+
+```bash
+# 1) 静态校验
+promtool check config /etc/prometheus/prometheus.yml
+
+# 2) 热加载
+curl -X POST http://localhost:9090/-/reload
+
+# 3) 打开 /service-discovery，对照 Discovered Labels 和 Target Labels
+#    确认目标数量符合预期、被 Dropped 的确实是该丢的
+
+# 4) 查一下目标数是不是零
+#    在 Graph 页面执行：count by (job) (up)
+```
+</Answer>
+</Callout>
+
+## 小结
+
+- **时机决定能力**：`relabel_configs` 在抓取前作用于「目标」，能改 `__address__`、决定抓不抓；`metric_relabel_configs` 在抓取后作用于「样本」，能按 `__name__` 和标签值过滤。
+- 单条规则的执行链是：取 `source_labels` → 用 `separator` 拼接 → 用 `regex` 匹配 → 按 `action` 动作，`replacement` 里用 `$1` 引用捕获组。
+- **正则默认全串锚定**，`prod` 匹配不上 `production`。这是头号事故来源。
+- 八种 action 分三类：作用于标签**值**的（`replace`、`keep`、`drop`、`hashmod`、`lowercase`、`uppercase`），作用于标签**名**的（`labelmap`、`labeldrop`、`labelkeep`），以及比较型的（`keepequal`、`dropequal`）。
+- `labeldrop` / `labelkeep` 只允许配 `regex`，多写别的字段会启动失败。
+- 「排除少数例外」优先用 `drop`，比用 `keep` 列举正常值更不容易误杀缺标签的目标。
+- 用 `(.+)` 做「标签存在才覆盖」的判断，用 `__tmp_` 前缀存中间结果，都是社区标准技巧。
+- 删标签前务必确认剩下的标签还能区分不同数据来源，否则会撞出 `same timestamp different value`。
+- 排障第一站永远是 `/service-discovery` 页面，它并排显示 relabel 前后的标签。
+- 下一章我们讲规则文件：怎么用 recording rules 把复杂查询预计算好，怎么用 alerting rules 把「异常」变成「告警」。

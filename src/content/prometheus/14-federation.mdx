@@ -1,0 +1,805 @@
+---
+title: 联邦
+order: 14
+description: 用 /federate 端点做分层汇聚与跨集群聚合，以及联邦的适用边界
+---
+
+# 联邦
+
+单台 Prometheus 的能力是有上限的。当你的业务扩张到多个机房、多个 Kubernetes 集群，或者单个实例的时间序列数量已经把内存吃满时，你必然会遇到两个新问题：**一个 Prometheus 抓不完所有目标**，以及**没有任何一个地方能看到全局视图**。
+
+Prometheus 官方给出的第一个答案叫**联邦**（Federation）。它的思路朴素得让人意外：既然 Prometheus 本来就擅长「用 HTTP 抓取指标」，那让一个 Prometheus 去抓另一个 Prometheus 不就行了？于是就有了 `/federate` 端点——它把一个 Prometheus 实例里存着的时间序列，按你指定的条件筛选出来，用标准的 exposition 格式暴露出去，供另一个 Prometheus 抓取。
+
+联邦既是一个非常有用的工具，也是一个**极其容易被滥用**的工具。本章会把它的机制、正确用法和边界都讲透，让你知道什么时候该用它，更重要的是——什么时候不该用。
+
+读完本章你会掌握：
+
+- 联邦的两种典型场景：**分层汇聚**和**跨服务聚合**，以及它们的区别
+- `/federate` 端点的工作方式、`match[]` 参数的语义与多值取并集规则
+- 全局 Prometheus 侧的抓取配置，以及 `honor_labels: true` 为什么是必须的
+- 为什么必须**只联邦 recording rules 聚合后的结果**，而不是全量原始指标
+- 叶子端 recording rule 的命名规范与设计方法
+- 联邦的真实限制，以及什么时候应该转向 Thanos / Mimir 这类方案
+
+## 一、联邦解决的到底是什么问题
+
+在动手之前，先厘清联邦适合的两种场景。它们的拓扑很像，目的却完全不同。
+
+### 场景一：分层汇聚（Hierarchical Federation）
+
+这是最经典的用法。你在北京、上海、广州各有一个机房，每个机房部署一台（或一对）Prometheus，只负责抓本机房内的目标。这些叫**叶子 Prometheus**（leaf）。然后在总部部署一台**全局 Prometheus**（global），它不抓任何业务目标，只从三个叶子那里拉取**已经聚合好的少量指标**。
+
+```text
+                    ┌─────────────────────┐
+                    │  全局 Prometheus     │
+                    │  只存聚合后的指标     │
+                    └──────────┬──────────┘
+                               │ 抓取 /federate
+              ┌────────────────┼────────────────┐
+              │                │                │
+      ┌───────┴──────┐ ┌───────┴──────┐ ┌───────┴──────┐
+      │ 叶子 Prom 北京 │ │ 叶子 Prom 上海 │ │ 叶子 Prom 广州 │
+      └───────┬──────┘ └───────┬──────┘ └───────┬──────┘
+              │                │                │
+        1000 个 target   1200 个 target    800 个 target
+```
+
+这个结构的好处非常明显：
+
+- **抓取压力被分散了。** 每个叶子只管自己机房，网络也是同机房内部通信，延迟低、带宽不花钱。
+- **故障域被隔离了。** 上海机房断网只影响上海的叶子，北京和广州的监控完全不受影响。
+- **全局视图存在了。** 你终于可以在一个地方画出「全公司总 QPS」这样的图，也可以设置「全局错误率超过 1%」这样的跨机房告警。
+- **全局实例负担极小。** 因为它只拉少量的聚合指标，可能只有几千条序列，一台小机器就够了。
+
+### 场景二：跨服务聚合（Cross-service Federation）
+
+第二种场景没有层级关系，而是「平级借数据」。假设你的公司里，基础设施团队的 Prometheus 抓所有机器的 node_exporter，而某个业务团队自己也有一台 Prometheus 抓自己的应用。业务团队想在自己的告警规则里同时用到「应用 QPS」和「宿主机 CPU 使用率」，那他们就可以从基础设施团队的 Prometheus 联邦拉取那部分节点指标过来。
+
+这种用法要克制。它本质上是在制造数据副本和团队间的隐式依赖，能用统一的数据源解决就别用联邦。
+
+<Callout type="info" title="联邦不是高可用方案">
+这是最需要澄清的一个误解。**联邦不能提供高可用，也不是备份手段。** 全局 Prometheus 拿到的只是叶子数据的一个稀疏采样子集，叶子挂了，全局节点上是不会有那些明细数据的。
+
+高可用的正确做法是「同一份配置跑两个副本」，这属于下一章的内容。
+</Callout>
+
+## 二、/federate 端点长什么样
+
+每一个 Prometheus 实例都自带 `/federate` 端点，不需要任何配置就能用。用 curl 直接试一下：
+
+```bash
+curl -G \
+  --data-urlencode 'match[]={job="node"}' \
+  http://leaf-beijing:9090/federate
+```
+
+返回的是标准的文本 exposition 格式：
+
+```text
+# TYPE up untyped
+up{instance="10.0.1.11:9100",job="node",datacenter="beijing"} 1 1719912345678
+up{instance="10.0.1.12:9100",job="node",datacenter="beijing"} 1 1719912345678
+# TYPE node_load1 untyped
+node_load1{instance="10.0.1.11:9100",job="node",datacenter="beijing"} 0.42 1719912345678
+```
+
+有三个细节值得注意。
+
+**第一，类型信息丢失了。** 每个指标族前面的注释都是 `# TYPE <name> untyped`，因为联邦端点不保留原始的 Counter / Gauge / Histogram 类型元数据。这不影响 PromQL 计算（PromQL 本来就不强制校验类型），但意味着全局实例上看不到准确的类型信息。
+
+**第二，每个样本都带毫秒时间戳。** 行尾那串 `1719912345678` 就是样本的原始时间戳。这一点非常关键：联邦返回的是**样本在叶子上被采集时的真实时间**，而不是「联邦抓取的时间」。
+
+**第三，值是最近一个可用样本。** `/federate` 对每个匹配的序列，返回的是**查询时刻往前回溯 5 分钟内最新的那个样本**（也就是 PromQL 的 lookback delta 行为）。如果一条序列已经超过 5 分钟没有新数据，它就不会出现在联邦结果里。
+
+### match[] 参数的语义
+
+`match[]` 是**必填**参数，不带它直接请求会返回 400 错误。它的值是一个**瞬时向量选择器**，语法和你在 PromQL 里写的选择器完全一样。
+
+`match[]` 可以重复出现多次，多个选择器的结果**取并集**（不是交集）：
+
+```bash
+curl -G \
+  --data-urlencode 'match[]={__name__=~"job:.*"}' \
+  --data-urlencode 'match[]={job="node",__name__=~"node_(load1|memory_.*)"}' \
+  --data-urlencode 'match[]=up' \
+  http://leaf-beijing:9090/federate
+```
+
+上面这个请求会返回三部分数据的并集：所有以 `job:` 开头的 recording rule 结果、node 任务下的负载与内存指标、以及所有的 `up` 序列。
+
+<Callout type="tip" title="用 __name__ 正则批量筛选">
+`{__name__=~"job:.*"}` 这种写法是联邦配置里的核心技巧。`__name__` 是存放指标名的内置标签，用正则匹配它就能一次性选中一整类指标。配合下一节讲的 recording rule 命名规范（聚合结果统一以 `job:` 开头），一条 `match[]` 就能把所有该联邦的指标全部覆盖，新增 recording rule 时也不用改联邦配置。
+</Callout>
+
+### 外部标签会被自动附加
+
+如果叶子 Prometheus 配置了 `external_labels`：
+
+```yaml
+global:
+  external_labels:
+    datacenter: 'beijing'
+    replica: 'A'
+```
+
+那么 `/federate` 返回的每一条序列上都会自动带上这些标签。规则是：**只在序列本身没有这个标签时才添加**，已有的不会被覆盖。这个机制让全局实例天然就能区分数据来自哪个机房，是分层联邦里非常关键的一环。
+
+## 三、在全局 Prometheus 上配置抓取
+
+理解了端点行为，配置就很直白了——它就是一个普通的 scrape job，只是路径和参数特殊：
+
+```yaml
+scrape_configs:
+  - job_name: 'federate'
+    scrape_interval: 30s
+    scrape_timeout: 25s
+
+    honor_labels: true
+    metrics_path: '/federate'
+
+    params:
+      'match[]':
+        - '{__name__=~"job:.*"}'
+        - '{__name__=~"instance:.*"}'
+        - 'up{job=~"node|api"}'
+
+    static_configs:
+      - targets:
+          - 'leaf-beijing:9090'
+          - 'leaf-shanghai:9090'
+          - 'leaf-guangzhou:9090'
+```
+
+### honor_labels: true 为什么必须写
+
+这是整段配置里最重要、也最容易被忽略的一行。
+
+正常情况下，Prometheus 抓取一个目标时会**强制**给所有样本打上这个 job 自己的 `job` 和 `instance` 标签。如果抓回来的数据里本来就有同名标签，Prometheus 会把原来的重命名成 `exported_job` 和 `exported_instance`，然后用自己的值覆盖。
+
+在联邦场景里这是灾难性的：叶子传过来的 `job="node"` 和 `instance="10.0.1.11:9100"` 会变成 `exported_job="node"` 和 `exported_instance="10.0.1.11:9100"`，而真正的 `job` 变成了 `"federate"`、`instance` 变成了 `"leaf-beijing:9090"`。所有查询和告警规则里的标签名都对不上了。
+
+`honor_labels: true` 的作用就是**让被抓取数据里已有的标签优先，Prometheus 不再覆盖它们**。加上这一行之后，叶子的 `job` 和 `instance` 原样保留，只有那些叶子数据里没有的标签才会由抓取方补上。
+
+<Callout type="warn" title="honor_labels 的副作用">
+开启 `honor_labels` 后，全局 Prometheus 就**无法**用 `job` 标签区分「这条数据是从哪个联邦目标抓来的」了，因为 `job` 已经是叶子的值。
+
+如果你需要这个信息，正确做法是让**叶子端**通过 `external_labels` 打上 `datacenter` 之类的标识（前面讲过它会被自动附加到联邦结果上），而不是指望全局端的 `job` 标签。这也是为什么规范的多机房部署一定要给每个叶子配置有区分度的 `external_labels`。
+</Callout>
+
+### 其他配置要点
+
+- **`scrape_interval` 要比叶子的采集间隔大。** 联邦本质上是降采样，全局实例没必要也不应该拿到和叶子一样密的数据点。叶子 15 秒采一次，全局 30 秒到 60 秒拉一次比较合理。
+- **`scrape_timeout` 要留足。** `/federate` 请求要在叶子上做一次全量序列扫描和序列化，比普通的 exporter 慢得多。默认的 10 秒经常不够，通常要调到 20 到 60 秒（注意 `scrape_timeout` 必须小于等于 `scrape_interval`）。
+- **保持 `honor_timestamps` 默认开启。** 它默认就是 `true`，意味着全局实例会采用叶子传过来的原始时间戳，而不是抓取时刻。这是我们想要的——数据的时间语义应该和叶子一致。
+
+<Callout type="exercise" title="练习 1：诊断一个联邦配置">
+运维同学配了下面这段联邦，上线后发现：全局 Prometheus 里所有指标的 `job` 标签都变成了 `"federate-leaf"`，`instance` 都是叶子的地址，原来的标签跑到了 `exported_job` 里；并且经常出现抓取超时。
+
+```yaml
+scrape_configs:
+  - job_name: 'federate-leaf'
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{__name__=~".+"}'
+    static_configs:
+      - targets: ['leaf-beijing:9090']
+```
+
+请指出所有问题并给出修正版本。
+
+<Answer>
+这段配置有三个问题，其中两个是致命的。
+
+**问题 1：缺少 `honor_labels: true`。** 这直接导致了标签被覆盖、原标签被改名成 `exported_*` 的现象。这是联邦配置里的头号错误。
+
+**问题 2：`match[]` 写成了 `{__name__=~".+"}`，也就是「联邦全部指标」。** 这是最严重的问题。它让全局 Prometheus 试图把叶子上的**每一条时间序列**都拉过来——如果叶子有 200 万条序列，那么每次抓取都要在叶子上扫描并序列化 200 万条数据，生成几百 MB 的 HTTP 响应。后果是：叶子的内存和 CPU 被打爆、抓取必然超时、全局实例被撑爆，而且这份数据还是稀疏采样的、根本不能用来做精确计算。**联邦绝对不能拉全量。**
+
+**问题 3：没有设置 `scrape_interval` 和 `scrape_timeout`。** 联邦请求比普通抓取重得多，默认参数不合适。
+
+修正版本：
+
+```yaml
+scrape_configs:
+  - job_name: 'federate-leaf'
+    scrape_interval: 60s
+    scrape_timeout: 45s
+
+    honor_labels: true
+    metrics_path: '/federate'
+
+    params:
+      'match[]':
+        # 只拉聚合后的 recording rule 结果
+        - '{__name__=~"job:.*"}'
+        # 外加少量需要全局可见的原始指标
+        - 'up'
+    static_configs:
+      - targets: ['leaf-beijing:9090']
+```
+
+同时叶子端必须配置 `external_labels`，否则多个叶子的数据到了全局端会因标签完全相同而互相冲突：
+
+```yaml
+global:
+  external_labels:
+    datacenter: 'beijing'
+```
+</Answer>
+</Callout>
+
+## 四、核心纪律：只联邦聚合后的结果
+
+这一节是全章最重要的内容。如果你只记住一件事，就记住这句：**联邦的对象必须是 recording rules 预聚合出来的少量指标，绝不能是原始明细指标。**
+
+原因有三层。
+
+**第一层，数据量。** 一个中等规模的叶子 Prometheus 有几十万到几百万条活跃序列。联邦一次要把它们全部序列化成文本，几百 MB 的响应体在网络上传输、在两端解析，这个开销大到不可接受。而聚合后的指标可能只有几百到几千条，差了三个数量级。
+
+**第二层，采样精度。** 联邦是「每隔 60 秒去拉一次每条序列的最新值」，这是一次**降采样**。用降采样后的 Counter 去算 `rate` 是可以的（速率本来就是平均量），但精度会下降；而且如果中间某次抓取失败，全局端就会出现数据空洞。用它做精确计算（比如「这个月总共处理了多少订单」）会算错。
+
+**第三层，语义。** 全局 Prometheus 存在的意义是回答「全局层面的问题」——总 QPS 是多少、各机房错误率对比、全网延迟分位数趋势。要回答这些，你需要的就是聚合值，明细数据放在全局端既没用又浪费。真要看明细，就去对应机房的叶子 Prometheus 上查。
+
+### 在叶子端写 recording rules
+
+所以完整的联邦方案，工作量其实在**叶子端**。你需要为每一个想在全局看到的指标，先在叶子上写好 recording rule。
+
+Prometheus 社区有一套广泛采用的 recording rule 命名规范：
+
+```text
+level:metric_name:operations
+```
+
+- **level**：聚合后剩下的标签维度（也可以理解为「这个结果的粒度」），比如 `job`、`job_instance`、`cluster_job`。
+- **metric_name**：原始指标名，保持不变。
+- **operations**：应用的操作，按从右到左的执行顺序列出，比如 `rate5m`、`sum_rate5m`。
+
+举例：
+
+```yaml
+groups:
+  - name: federation-aggregations
+    interval: 30s
+    rules:
+      # 每个 job 的总请求速率（丢掉 instance、path 等维度）
+      - record: 'job:http_requests:rate5m'
+        expr: 'sum by (job) (rate(http_requests_total[5m]))'
+
+      # 每个 job 的错误请求速率
+      - record: 'job:http_requests_errors:rate5m'
+        expr: 'sum by (job) (rate(http_requests_total{code=~"5.."}[5m]))'
+
+      # 每个 job 的 P99 延迟（注意必须保留 le 维度做分位计算）
+      - record: 'job:http_request_duration_seconds:p99'
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+
+      # 集群整体 CPU 使用率
+      - record: 'cluster:node_cpu_utilization:ratio'
+        expr: |
+          1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m]))
+```
+
+有了统一的 `<level>:` 前缀命名，联邦配置就可以写成一条极简的规则，而且**以后新增 recording rule 完全不用改联邦配置**：
+
+```yaml
+    params:
+      'match[]':
+        - '{__name__=~"job:.*"}'
+        - '{__name__=~"cluster:.*"}'
+```
+
+<Callout type="warn" title="不要联邦「率」以外的原始 Counter">
+一个常见的折中做法是「不联邦全量，但联邦几个关键的原始 Counter，到全局端再算 rate」。这看起来省事，但会出问题：
+
+联邦是降采样的，全局端拿到的 Counter 序列间隔是 60 秒且可能有空洞。在这样的序列上算 `rate(xxx_total[5m])` 只有 5 个左右的点，一旦丢一两次抓取，`rate` 的结果会明显失真甚至变成 NaN。而且 Counter 重置的检测也会因为采样稀疏而不准。
+
+**正确做法是在叶子端就把 `rate` 算好**，联邦传输的是已经算完的 Gauge 值。这样即使全局端丢一个点，影响也只是图上少一个点，不会算错。
+</Callout>
+
+<Callout type="exercise" title="练习 2：为联邦设计 recording rules">
+你要在全局 Prometheus 上做三张看板和一条告警：
+
+1. 看板 A：全公司总 QPS，可以按机房拆分
+2. 看板 B：各业务线（`service` 标签）的错误率对比
+3. 看板 C：全网 API 的 P99 延迟趋势
+4. 告警：任意机房的错误率连续 10 分钟超过 1% 时告警
+
+叶子端的原始指标是 `http_requests_total`（带 `service`、`instance`、`code`、`path` 标签）和 `http_request_duration_seconds_bucket`（带 `service`、`instance`、`le` 标签）。
+
+请写出叶子端需要的 recording rules，以及全局端的联邦 `match[]` 配置和告警规则。
+
+<Answer>
+**第一步：叶子端 recording rules。** 关键是想清楚「全局端需要保留哪些维度」——保留得越少数据量越小，但保留不足就没法拆分。看板 A 要按机房拆（机房由 `external_labels` 提供，不用管），看板 B 要按 `service` 拆，所以聚合时必须保留 `service`，可以丢掉 `instance`、`path`、`code`。
+
+```yaml
+groups:
+  - name: federation
+    interval: 30s
+    rules:
+      # 按 service 的总请求速率
+      - record: 'service:http_requests:rate5m'
+        expr: 'sum by (service) (rate(http_requests_total[5m]))'
+
+      # 按 service 的错误请求速率（5xx）
+      - record: 'service:http_requests_errors:rate5m'
+        expr: 'sum by (service) (rate(http_requests_total{code=~"5.."}[5m]))'
+
+      # 按 service 的 P99 延迟
+      - record: 'service:http_request_duration_seconds:p99'
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (service, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+
+      # 全机房维度的 P99（供看板 C 直接用，无需在全局端再算）
+      - record: 'dc:http_request_duration_seconds:p99'
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+```
+
+**第二步：全局端联邦配置。**
+
+```yaml
+scrape_configs:
+  - job_name: 'federate'
+    scrape_interval: 60s
+    scrape_timeout: 45s
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{__name__=~"service:.*"}'
+        - '{__name__=~"dc:.*"}'
+    static_configs:
+      - targets:
+          - 'leaf-beijing:9090'
+          - 'leaf-shanghai:9090'
+          - 'leaf-guangzhou:9090'
+```
+
+**第三步：全局端的看板查询。** 因为叶子的 `external_labels` 里有 `datacenter`，这些标签自动带过来了：
+
+```promql
+# 看板 A：全公司总 QPS
+sum(service:http_requests:rate5m)
+
+# 看板 A（按机房拆分）
+sum by (datacenter) (service:http_requests:rate5m)
+
+# 看板 B：各业务线错误率
+sum by (service) (service:http_requests_errors:rate5m)
+/
+sum by (service) (service:http_requests:rate5m)
+
+# 看板 C：全网 P99（多机房取最大值更保守）
+max by (datacenter) (dc:http_request_duration_seconds:p99)
+```
+
+**第四步：告警规则。**
+
+```yaml
+groups:
+  - name: global-alerts
+    rules:
+      - alert: DatacenterHighErrorRate
+        expr: |
+          sum by (datacenter) (service:http_requests_errors:rate5m)
+          /
+          sum by (datacenter) (service:http_requests:rate5m)
+          > 0.01
+        for: 10m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '机房 {{ $labels.datacenter }} 错误率超过 1%'
+```
+
+**注意一个设计权衡：** 看板 C 我额外加了 `dc:` 这条规则，而不是让全局端用 `service:` 的结果去算。原因是**分位数不能二次聚合**——你不能把各个 service 的 P99 求平均或求和来得到整体 P99，那在数学上是错的。要得到跨 service 的整体分位数，必须在还有 `le` 维度的地方重新算一遍，所以只能在叶子端多写一条规则。这是联邦设计里最容易被忽略的细节。
+</Answer>
+</Callout>
+
+## 五、典型拓扑与部署实践
+
+### 完整的分层联邦示例
+
+叶子端（北京机房）配置：
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    datacenter: 'beijing'
+    prometheus: 'leaf-bj-01'
+
+rule_files:
+  - '/etc/prometheus/rules/aggregations.yml'
+  - '/etc/prometheus/rules/alerts.yml'
+
+scrape_configs:
+  - job_name: 'node'
+    kubernetes_sd_configs:
+      - role: node
+  # ... 其他本机房目标
+```
+
+全局端配置：
+
+```yaml
+global:
+  scrape_interval: 60s
+  evaluation_interval: 60s
+  external_labels:
+    prometheus: 'global-01'
+    role: 'global'
+
+rule_files:
+  - '/etc/prometheus/rules/global-alerts.yml'
+
+scrape_configs:
+  - job_name: 'federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    scrape_interval: 60s
+    scrape_timeout: 45s
+    params:
+      'match[]':
+        - '{__name__=~"job:.*"}'
+        - '{__name__=~"service:.*"}'
+        - '{__name__=~"dc:.*"}'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/leaves/*.json']
+```
+
+注意全局端用了 `file_sd_configs` 来管理叶子清单——新增机房时只要往目录里加一个 JSON，不用改主配置。
+
+### 告警应该在哪一层做
+
+这是分层联邦里一个经常被问到的架构问题，答案是：**能在叶子做的告警，就一定在叶子做。**
+
+- **叶子端负责具体告警**：某台机器磁盘满了、某个 Pod 一直重启、某个服务错误率高。这些告警需要明细数据，只有叶子有；而且叶子离数据最近，告警延迟最低。
+- **全局端只负责真正跨机房的告警**：全网总错误率超标、所有机房同时出现延迟上升、某个机房的叶子 Prometheus 失联了。
+
+一个非常实用的技巧：**用全局 Prometheus 监控叶子 Prometheus 本身**。
+
+```yaml
+groups:
+  - name: meta-monitoring
+    rules:
+      # 联邦抓取失败，说明某个叶子挂了或网络不通
+      - alert: LeafPrometheusDown
+        expr: 'up{job="federate"} == 0'
+        for: 5m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '叶子 Prometheus {{ $labels.instance }} 无法联邦'
+          description: '该机房可能已失去监控能力，请立即检查'
+```
+
+这条告警解决了监控系统最尴尬的问题：**谁来监控监控系统**。注意这里的 `up{job="federate"}` 是全局端自己生成的（`up` 永远由抓取方生成，`honor_labels` 也管不着它），所以 `job` 确实是 `"federate"`。
+
+<Callout type="tip" title="联邦链条不要超过两层">
+理论上你可以做「叶子 → 区域 → 全局」的三层甚至更多层联邦，但强烈不建议。每多一层就多一次降采样、多一次延迟叠加、多一个故障点，数据到达顶层时的时效性和可信度都很差。
+
+如果两层不够用，说明你的规模已经超出联邦的适用范围了，应该考虑下一章的方案。
+</Callout>
+
+<Callout type="exercise" title="练习 3：设计一个跨集群联邦拓扑">
+你的公司有 5 个 Kubernetes 集群，分布在 3 个地域（华北 2 个、华东 2 个、华南 1 个）。每个集群约 500 个抓取目标、约 80 万条活跃序列。业务方需要：
+
+1. 每个集群的团队能看到自己集群的全部明细并接收告警
+2. SRE 团队能看到按地域和按集群维度的汇总大盘
+3. 有一条「任一集群的整体可用性低于 99.5%」的全局告警
+
+请给出拓扑设计、每一层的配置要点，并说明为什么不做三层联邦。
+
+<Answer>
+**拓扑：两层，5 个叶子 + 1 个全局。**
+
+```text
+                  ┌────────────────────┐
+                  │  全局 Prometheus     │
+                  │  SRE 大盘 + 全局告警  │
+                  └─────────┬──────────┘
+                            │ /federate (60s)
+        ┌───────┬───────────┼───────────┬───────┐
+        │       │           │           │       │
+     ┌──┴──┐ ┌──┴──┐    ┌───┴──┐    ┌───┴──┐ ┌──┴──┐
+     │ hb-1│ │ hb-2│    │ hd-1 │    │ hd-2 │ │ hn-1│
+     └─────┘ └─────┘    └──────┘    └──────┘ └─────┘
+      华北      华北       华东        华东      华南
+```
+
+**叶子层（每个集群一台，生产建议一对做高可用）：**
+
+```yaml
+global:
+  scrape_interval: 15s
+  external_labels:
+    cluster: 'hb-1'
+    region: 'huabei'
+
+rule_files:
+  - '/etc/prometheus/rules/aggregations.yml'   # 供联邦用
+  - '/etc/prometheus/rules/cluster-alerts.yml' # 集群内告警
+```
+
+关键点：`external_labels` 里同时打 `cluster` 和 `region` 两个标签，这样全局端不需要任何映射表就能按两个维度聚合。集群内的所有告警（Pod 重启、节点异常、服务错误率）都在这一层完成，直接发给该集群团队的接收渠道。
+
+聚合规则示例（供联邦）：
+
+```yaml
+groups:
+  - name: federation
+    interval: 30s
+    rules:
+      - record: 'cluster:http_requests:rate5m'
+        expr: 'sum(rate(http_requests_total[5m]))'
+      - record: 'cluster:http_requests_errors:rate5m'
+        expr: 'sum(rate(http_requests_total{code=~"5.."}[5m]))'
+      - record: 'cluster:up:ratio'
+        expr: 'avg(up)'
+      - record: 'service:http_requests:rate5m'
+        expr: 'sum by (service) (rate(http_requests_total[5m]))'
+```
+
+**全局层：**
+
+```yaml
+global:
+  scrape_interval: 60s
+  external_labels:
+    role: 'global'
+
+scrape_configs:
+  - job_name: 'federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    scrape_interval: 60s
+    scrape_timeout: 45s
+    params:
+      'match[]':
+        - '{__name__=~"cluster:.*"}'
+        - '{__name__=~"service:.*"}'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/clusters/*.json']
+```
+
+**SRE 大盘查询：**
+
+```promql
+# 按地域汇总 QPS
+sum by (region) (cluster:http_requests:rate5m)
+
+# 按集群汇总 QPS
+sum by (cluster) (cluster:http_requests:rate5m)
+
+# 各集群错误率
+cluster:http_requests_errors:rate5m / cluster:http_requests:rate5m
+```
+
+**全局告警：**
+
+```yaml
+groups:
+  - name: global
+    rules:
+      - alert: ClusterAvailabilityLow
+        expr: |
+          1 - (
+            cluster:http_requests_errors:rate5m
+            /
+            cluster:http_requests:rate5m
+          ) < 0.995
+        for: 10m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '集群 {{ $labels.cluster }} 可用性低于 99.5%'
+
+      # 联邦链路本身的监控
+      - alert: LeafFederationDown
+        expr: 'up{job="federate"} == 0'
+        for: 5m
+        labels:
+          severity: 'critical'
+```
+
+**为什么不做三层（叶子 → 地域 → 全局）？**
+
+1. **规模根本不需要。** 5 个叶子，每个只联邦几百条聚合序列，总共几千条，一台全局实例轻松承载。加一层区域节点纯属增加复杂度。
+2. **延迟叠加。** 叶子 30 秒算一次 recording rule，区域层 60 秒拉一次，全局层再 60 秒拉一次——最坏情况下全局端看到的数据已经延迟两分半了，告警响应会明显变慢。
+3. **精度进一步损失。** 每一层都是降采样，两次降采样后的数据基本只能看趋势，任何稍微精确一点的计算都不可信。
+4. **多一层故障点。** 区域节点挂了，该地域的全局视图就消失了，而它并没有带来任何可用性收益。
+5. **按地域聚合不需要单独一层。** `region` 标签已经由叶子的 `external_labels` 带上来了，全局端一句 `sum by (region)` 就够了。**用标签维度解决的问题，不要用部署层级解决。**
+</Answer>
+</Callout>
+
+## 六、时间戳、陈旧性与联邦链路的运维
+
+联邦有一组和「时间」相关的行为，不搞清楚就会在图上看到各种莫名其妙的现象。这一节把它们讲透。
+
+### honor_timestamps 与陈旧标记
+
+前面提到过，`/federate` 返回的每个样本都带着**它在叶子上被采集时的原始时间戳**，而全局端默认 `honor_timestamps: true`，会原样采纳这些时间戳。这带来两个后果。
+
+**后果一：图上的点不是等间隔的。** 假设叶子每 15 秒算一次 recording rule，全局端每 60 秒联邦一次。全局端每次拿到的是「叶子最近一次的计算结果」，而这个结果的时间戳取决于叶子的评估节奏。于是全局端存下来的时间戳序列可能是 `10:00:07`、`10:01:03`、`10:02:14`——间隔在 56 到 71 秒之间浮动，而不是整齐的 60 秒。这完全正常，PromQL 本来就能处理不规则间隔的序列。
+
+**后果二：陈旧标记（staleness marker）失效了。** 正常抓取时，如果某条序列在这一轮抓取中消失了，Prometheus 会写入一个特殊的「陈旧标记」，让这条序列在查询中立刻表现为「不存在」，而不是靠 5 分钟的回溯窗口慢慢过期。
+
+但**联邦场景下这个机制不能正常工作**。原因是：带显式时间戳的样本被认为是「有权威时间的外部数据」，Prometheus 不会为它们生成陈旧标记。所以当叶子上某条序列消失时（比如一个 job 被下线了），全局端不会立刻知道，那条序列会在图上一直「拖」到 5 分钟的回溯窗口耗尽为止。
+
+实际影响通常不大（就是告警恢复和图形消失会晚 5 分钟），但如果你的场景对这个敏感，需要提前知道。
+
+<Callout type="warn" title="不要为了「修」这个问题去关 honor_timestamps">
+把 `honor_timestamps: false` 设上去确实能恢复陈旧标记，但代价更大：全局端会用**抓取时刻**替换掉所有样本的原始时间戳，导致全局端的时间轴和叶子完全对不上。排障时你会发现「全局图上 10:05 的尖刺，在叶子上怎么找都找不到」——因为叶子上它其实发生在 10:04:12。
+
+**保持默认的 `honor_timestamps: true`。** 时间语义的一致性比 5 分钟的陈旧延迟重要得多。
+</Callout>
+
+### 数据延迟是层层叠加的
+
+从「一个请求实际发生」到「它反映在全局大盘上」，中间要经过好几层延迟：
+
+```text
+请求发生
+  ↓ 最多 1 个 scrape_interval（叶子抓取，15s）
+指标进入叶子 TSDB
+  ↓ 最多 1 个 evaluation_interval（recording rule 计算，30s）
+聚合结果生成
+  ↓ 最多 1 个联邦 scrape_interval（全局抓取，60s）
+数据出现在全局端
+```
+
+最坏情况下总延迟约 105 秒，加上 `rate(...[5m])` 本身自带的平滑效应，全局大盘上看到的数值实际反映的是**大约两分钟前的状态**。
+
+这个数字直接决定了两件事：**全局告警的 `for` 不应该短于这个延迟**（否则告警会因为数据还没到而反复抖动），以及**全局大盘不适合用于实时应急指挥**（真出事的时候，要去叶子上看）。
+
+### 必须监控的联邦链路指标
+
+联邦是一条容易「安静地断掉」的链路——它断了不会有任何报错，只是全局图上的线慢慢变平。下面这几条监控是必需的：
+
+```promql
+# 1. 联邦抓取是否成功（最基础）
+up{job="federate"}
+
+# 2. 联邦抓取耗时，接近 scrape_timeout 说明快撑不住了
+scrape_duration_seconds{job="federate"}
+
+# 3. 每次联邦拿回来多少条序列，突增说明有人加了不该加的 match[]
+scrape_samples_scraped{job="federate"}
+
+# 4. 全局端接收到的样本时间落后多久（秒）
+time() - timestamp(up{job="federate"})
+```
+
+对应的告警规则：
+
+```yaml
+groups:
+  - name: federation-health
+    rules:
+      - alert: FederationDown
+        expr: 'up{job="federate"} == 0'
+        for: 5m
+        labels:
+          severity: 'critical'
+        annotations:
+          summary: '无法从 {{ $labels.instance }} 联邦数据'
+
+      # 抓取耗时超过 timeout 的 80%，提前预警
+      - alert: FederationScrapeSlow
+        expr: |
+          scrape_duration_seconds{job="federate"}
+          > 0.8 * scrape_timeout_seconds{job="federate"}
+        for: 15m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '联邦 {{ $labels.instance }} 抓取接近超时，检查 match[] 是否过宽'
+
+      # 单次联邦序列数超过 5 万，说明 match[] 写得太宽
+      - alert: FederationTooManySeries
+        expr: 'scrape_samples_scraped{job="federate"} > 50000'
+        for: 15m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: '联邦 {{ $labels.instance }} 单次拉回 {{ $value }} 条序列，请收窄 match[]'
+```
+
+第三条特别值得配。联邦配置的退化几乎总是以同一种方式发生：某个同事想在全局看一个新指标，图省事在 `match[]` 里加了一条宽泛的正则，序列数悄悄从 3000 涨到 8 万，然后某天叶子在联邦请求时内存突增被 OOM Kill。有了这条告警，问题在变成事故之前就会被发现。
+
+### 叶子端也要设防
+
+从叶子的角度看，`/federate` 是一个「外部可以触发的重操作」端点。任何人都能构造一个 `match[]` 让它去扫全量序列。生产环境建议做两层防护：
+
+1. **网络层限制。** 用防火墙或 Kubernetes NetworkPolicy 限制 `/federate` 只对全局 Prometheus 的 IP 开放。
+2. **反向代理限流。** 在叶子前面放一层 nginx，对 `/federate` 路径做并发限制和请求频率限制，避免多个客户端同时发起大查询。
+
+```text
+location /federate {
+    limit_req zone=federate burst=2 nodelay;
+    limit_conn federate_conn 2;
+    proxy_pass http://127.0.0.1:9090;
+    proxy_read_timeout 60s;
+}
+```
+
+## 七、联邦的真实限制
+
+用了几个月联邦之后，团队通常会撞上下面这些墙。提前知道它们，能帮你更早做出正确的架构决策。
+
+**限制一：全局端的数据是不完整的。** 这是设计使然，不是缺陷。但它意味着任何「需要下钻到明细」的排障流程，最终都得跳回到叶子 Prometheus 上去查。工程师需要在多个 Grafana 数据源之间来回切换，体验并不好。
+
+**限制二：叶子的可用性直接决定全局视图的完整性。** 叶子挂了，全局端就断了那部分数据。而且叶子重启后，它在宕机期间的数据**不会**被补回到全局端——联邦只拉「当前最新值」，没有任何回填机制。
+
+**限制三：拉取模式的规模瓶颈。** 每一次联邦抓取，叶子都要执行一次全量的序列选择和序列化。当叶子上的聚合序列达到几万条、或者联邦目标数达到几十个时，这个开销会变得显著。你会开始看到叶子的内存出现周期性尖峰，正好对应联邦抓取的节奏。
+
+**限制四：没有解决长期存储问题。** 全局 Prometheus 用的还是本地 TSDB，还是那个默认 15 天的保留期。你只是把「聚合数据」集中起来了，并没有让它们存得更久。想存一年？还得另想办法。
+
+**限制五：跨机房网络的脆弱性。** 联邦请求是一个持续几秒到几十秒的大 HTTP 响应，对跨地域专线的稳定性很敏感。抖动一下就是一次抓取失败，全局端图上就是一个洞。
+
+<Callout type="info" title="一句话判断你该不该继续用联邦">
+如果你的需求是「**少量聚合指标 + 全局大盘 + 跨集群告警**」，联邦是最简单、依赖最少、运维成本最低的方案，用它就对了。
+
+如果你的需求里出现了「**长期存储**」「**全局查询要能下钻到明细**」「**跨集群去重**」「**多租户**」中的任何一个，联邦就已经不够了，该看下一章的 Thanos / Mimir 了。
+</Callout>
+
+<Callout type="exercise" title="练习 4：联邦还是别的方案">
+针对下面四个需求，判断联邦是否合适，并说明理由；如果不合适，指出应该往什么方向走。
+
+1. 「我们需要把所有集群的监控数据保存 2 年，用于容量规划和年度复盘。」
+2. 「SRE 想在一块大盘上看到 8 个集群的总 QPS 和总错误率。」
+3. 「我们的 Prometheus 是一主一备两台，希望备机在主机挂掉时数据不丢。」
+4. 「排障时希望在一个 Grafana 里就能查到任意集群里任意一个 Pod 的明细指标，不用切数据源。」
+
+<Answer>
+**1. 保存 2 年 —— 联邦不合适。**
+
+联邦完全没有触及存储层。全局 Prometheus 用的依然是本地 TSDB，你把 `--storage.tsdb.retention.time` 设成 `2y` 理论上能跑，但实际上会出问题：本地磁盘要几个 TB、没有降采样导致查询一年跨度的数据极慢、单机磁盘故障就全丢了、也没法做冷热分层。
+
+**方向：远程存储。** 用 `remote_write` 把数据写到 Thanos Receive / Mimir / VictoriaMetrics，或者用 Thanos Sidecar 把 TSDB 块上传到对象存储。对象存储便宜、可靠，而且 Thanos Compact 会做 5 分钟和 1 小时两级降采样，查一整年的趋势图速度很快。详见第 15 章。
+
+**2. 8 个集群的总 QPS 和总错误率 —— 联邦非常合适。**
+
+这是联邦的标准用例：需要的是**少量聚合指标**、需要的是**全局大盘**、不需要明细、不需要长期存储。在每个集群的 Prometheus 上写两条 recording rule（`cluster:http_requests:rate5m` 和 `cluster:http_requests_errors:rate5m`），全局端联邦 `{__name__=~"cluster:.*"}`，一共就传几十条序列。方案简单、依赖少、运维成本几乎为零。
+
+**3. 一主一备数据不丢 —— 联邦完全不适用，这是理解错了。**
+
+联邦是「汇聚」不是「复制」。全局端拿到的是采样后的聚合子集，主机挂了备机上不会有明细数据，全局端更不会有。
+
+**方向：高可用双副本。** 正确做法是两台 Prometheus 用**完全相同的配置**独立抓取同一批目标（注意是「双抓」不是「主备」，两台都是活的），`external_labels` 里用 `replica: A` 和 `replica: B` 区分。告警侧两台都发给 Alertmanager 集群，由 Alertmanager 做去重；查询侧用负载均衡或 Thanos Query 的去重能力。第 15 章会详细讲，包括 `alert_relabel_configs` 去掉 `replica` 标签这个关键步骤。
+
+顺带一提：「数据不丢」这个诉求本身在双副本方案里也只是**近似**满足的——两个副本的抓取时刻有偏移，样本值不会逐点相同，只是覆盖同一段时间。真要保证持久性，还是得靠远程存储。
+
+**4. 一个 Grafana 查任意 Pod 明细 —— 联邦不适用。**
+
+这是「全局查询下钻」需求。联邦传的是聚合值，Pod 级别的明细压根不在全局端。硬要联邦全量明细，就会撞上练习 1 里那个 `{__name__=~".+"}` 的灾难。
+
+**方向：全局查询层。** 用 Thanos Query 或 Mimir 这类方案——它们提供一个统一的 PromQL 查询端点，背后**扇出**到所有集群的数据源（Thanos 是通过 Sidecar 的 StoreAPI 和 Store Gateway，Mimir 是通过统一的后端存储）。Grafana 只连这一个数据源，就能查到任意集群、任意 Pod 的原始明细，而且数据本身还留在各自的集群里（Thanos 模式），没有大规模搬运。
+
+**总结这四道题的判断标准：** 需求里只要出现「长期」「明细」「去重」「多租户」，联邦就该让位；只有「少量聚合 + 全局视图」时，联邦才是那个最优解。
+</Answer>
+</Callout>
+
+## 小结
+
+联邦是 Prometheus 生态里一个「小而精确」的工具：
+
+- 它的机制很简单——`/federate` 端点按 `match[]` 筛选序列，用标准 exposition 格式（带原始时间戳、类型为 `untyped`）暴露出去，另一个 Prometheus 用普通的 scrape job 抓它。
+- 全局端**必须**开 `honor_labels: true`，叶子端**必须**配有区分度的 `external_labels`，这两点缺一不可。
+- 核心纪律是**只联邦 recording rules 聚合后的结果**。用 `<level>:<metric>:<operations>` 的命名规范，配合 `{__name__=~"job:.*"}` 这样的 `match[]`，能让联邦配置一次写好长期不用改。
+- 告警尽量下沉到叶子做，全局端只做真正跨集群的告警，外加一条监控叶子存活的元告警。
+- 联邦不提供高可用、不提供长期存储、不提供全局下钻能力。碰到这三类需求，就该转向下一章的 Thanos / Cortex / Mimir。
+
+下一章我们就来把这些方案一一拆开看：双副本高可用怎么做才不会告警重复，`remote_write` 的工作原理，以及 Thanos、Cortex、Mimir 三者到底该怎么选。

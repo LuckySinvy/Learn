@@ -1,0 +1,1212 @@
+---
+title: PromQL 基础
+order: 6
+description: 即时/区间向量、选择器、匹配器与 offset
+---
+
+# PromQL 基础
+
+PromQL（Prometheus Query Language）是 Prometheus 的查询语言。它和 SQL 完全不同——SQL 查的是「表里的行」，PromQL 查的是「时间轴上的序列」。
+
+这一章只讲**最基础的一层**：怎么把想要的序列挑出来。运算符和函数留到后两章。听起来很简单，但恰恰是这一层的两个概念——**即时向量 vs 区间向量**——是 90% 新手困惑的根源。
+
+## 1. PromQL 的四种数据类型
+
+先建立全局认知。PromQL 的每个表达式都会求值成以下四种类型之一：
+
+| 类型 | 英文 | 是什么 | 例子 |
+|---|---|---|---|
+| **即时向量** | instant vector | 一组序列，每条序列在**同一时刻**有**一个**样本 | `up` |
+| **区间向量** | range vector | 一组序列，每条序列有一段**时间窗口内的多个**样本 | `up[5m]` |
+| **标量** | scalar | 一个单独的浮点数 | `3.14` |
+| **字符串** | string | 一个字符串（几乎用不到） | `"foo"` |
+
+<Callout type="warn" title="这是整个 PromQL 最重要的类型系统">
+每个函数都对输入类型有严格要求，弄错就报错：
+
+```promql
+rate(http_requests_total)        # ❌ rate 要区间向量，给了即时向量
+sum(http_requests_total[5m])     # ❌ sum 要即时向量，给了区间向量
+```
+
+绝大多数「表达式解析错误」都源于此。养成习惯：**写每个函数前先问自己「它吃什么类型？」**
+</Callout>
+
+## 2. 即时向量：某一刻的快照
+
+### 2.1 最简单的查询
+
+在 Prometheus Web UI 的查询框里输入一个指标名，就是一个即时向量查询：
+
+```promql
+up
+```
+
+结果类似：
+
+```text
+up{job="prometheus", instance="localhost:9090"}   1
+up{job="node",       instance="10.0.1.5:9100"}    1
+up{job="node",       instance="10.0.1.6:9100"}    0
+up{job="api",        instance="10.0.2.11:8080"}   1
+```
+
+这就是即时向量：**N 条序列，每条序列在「查询时刻」有一个值**。
+
+`up` 是 Prometheus 自动生成的指标——每次抓取一个目标，它就写一个 `up` 样本：抓取成功为 1，失败为 0。这是最常用的健康检查指标：
+
+```promql
+# 找出所有挂掉的目标
+up == 0
+```
+
+### 2.2 「查询时刻」到底取哪个样本
+
+这里有个细节值得讲清楚。假设你在 `10:00:07` 执行 `up`，但抓取间隔是 15 秒，样本落在 `10:00:00` 和 `10:00:15`。这时返回什么？
+
+Prometheus 的规则是：**向前回溯，取查询时刻之前最近的一个样本**。
+
+```text
+样本:      10:00:00 (1)          10:00:15 (1)
+                │                     │
+查询时刻:       │      10:00:07       │
+                └──────────┘
+                返回 10:00:00 的样本，但时间戳标记为 10:00:07
+```
+
+回溯有个上限，叫 **lookback delta**，默认 **5 分钟**：
+
+```text
+如果查询时刻往前 5 分钟内都没有样本 → 这条序列不出现在结果里
+```
+
+<Callout type="info" title="5 分钟回溯窗口的两个实际影响">
+**影响一：目标下线后，图表还会「拖」5 分钟。**
+一个实例挂了，抓取失败，不再有新样本。但接下来 5 分钟内查询它仍会返回最后一个值（一条水平直线），5 分钟后才彻底消失。
+
+（例外：如果是「序列在抓取结果中消失」而非「抓取失败」，Prometheus 会写入 staleness marker，线会立刻断掉。详见第 4 章。）
+
+**影响二：抓取间隔不能超过 5 分钟。**
+如果 `scrape_interval: 10m`，那么每次抓取后的第 5 分钟到第 10 分钟之间，查询会返回空——你的监控图会变成虚线。**抓取间隔请保持在 1 分钟以内**，除非你同时调大了 `--query.lookback-delta`。
+</Callout>
+
+## 3. 区间向量：一段时间的样本序列
+
+### 3.1 语法与含义
+
+在选择器后面加 `[时长]`，就得到区间向量：
+
+```promql
+http_requests_total[5m]
+```
+
+它返回的是**每条序列在最近 5 分钟内的所有样本**。假设抓取间隔 15 秒，5 分钟就是约 20 个样本：
+
+```text
+http_requests_total{job="api", instance="10.0.2.11:8080"} =>
+    1203441 @1714540800
+    1203987 @1714540815
+    1204512 @1714540830
+    ... （共约 20 个样本）
+```
+
+对比一下，即时向量只有一个值：
+
+```text
+http_requests_total{job="api", instance="10.0.2.11:8080"}  1204512
+```
+
+### 3.2 时长单位
+
+```text
+ms  毫秒
+s   秒
+m   分钟
+h   小时
+d   天    （= 24h，不考虑夏令时）
+w   周    （= 7d）
+y   年    （= 365d，不考虑闰年）
+```
+
+可以组合书写，但**必须从大到小、不能重复**：
+
+```promql
+http_requests_total[1h30m]    # ✅ 1 小时 30 分
+http_requests_total[1d12h]    # ✅ 1 天 12 小时
+http_requests_total[30m1h]    # ❌ 顺序错了
+http_requests_total[1h1h]     # ❌ 单位重复
+```
+
+### 3.3 区间向量不能直接画图
+
+这是新手最容易撞的墙：
+
+```promql
+http_requests_total[5m]
+```
+
+在 Web UI 的 **Table** 标签页能看到一堆样本，但切到 **Graph** 标签页会报错：
+
+```text
+Error executing query: invalid expression type "range vector" for range query,
+must be Scalar or instant Vector
+```
+
+**为什么？** 因为画图需要「每个时间点一个值」，而区间向量每个时间点是「一堆值」。你必须先用函数把它**压缩成一个值**：
+
+```promql
+rate(http_requests_total[5m])           # 区间 → 速率（一个值）
+avg_over_time(node_load1[5m])           # 区间 → 平均值（一个值）
+max_over_time(go_goroutines[1h])        # 区间 → 最大值（一个值）
+count_over_time(up[1h])                 # 区间 → 样本个数
+```
+
+<Callout type="tip" title="区间向量的唯一用途：喂给函数">
+记住这条规则就不会错：
+
+> **区间向量永远不会单独出现在最终结果里，它一定被某个函数包裹着。**
+
+反过来说，看到 `[5m]` 就应该去找它外面的那个函数。找不到？那这个查询画不出图。
+</Callout>
+
+### 3.4 区间长度怎么选
+
+这是个需要判断力的问题。核心约束：
+
+> **区间长度必须至少能容纳 2 个样本，否则函数返回空。**
+
+```text
+scrape_interval = 15s
+rate(x[15s])  → 区间内可能只有 1 个样本 → 返回空 ❌
+rate(x[1m])   → 约 4 个样本            → 可以，但抖动大
+rate(x[5m])   → 约 20 个样本           → ✅ 推荐
+```
+
+**经验法则：区间长度 ≥ 抓取间隔 × 4。**
+
+| 抓取间隔 | 建议最小区间 | 常用值 |
+|---|---|---|
+| 15s | 1m | `[5m]` |
+| 30s | 2m | `[5m]` |
+| 1m | 4m | `[10m]` |
+
+区间越长越平滑（抹平毛刺），越短越灵敏（能看到突刺）。告警一般用 `[5m]`，看趋势大盘可以用 `[30m]` 甚至 `[1h]`。
+
+<Callout type="warn" title="Grafana 里更好的做法是用变量">
+面板里硬编码 `[5m]` 有个问题：当你把时间范围拉到「最近 30 天」时，Grafana 的步长会变成几十分钟，而 `[5m]` 的窗口小于步长，会**跳过大量数据点**，图表出现锯齿甚至空洞。
+
+Grafana 提供了两个内置变量：
+
+```text
+rate(http_requests_total[$__rate_interval])   ← 推荐，专为 rate 设计
+rate(http_requests_total[$__interval])        ← 等于当前步长，可能太小
+```
+
+`$__rate_interval` 会自动取 `max(4 × 抓取间隔, 步长 + 抓取间隔)`，保证任何时间范围下都有足够样本。**在 Grafana 里写 rate，优先用它。**
+</Callout>
+
+## 4. 选择器与匹配器
+
+### 4.1 基本形式
+
+一个完整的即时向量选择器长这样：
+
+```promql
+http_requests_total{job="api", status="200"}
+```
+
+拆开看：
+
+```text
+http_requests_total  {  job="api"  ,  status="200"  }
+       │                   │                │
+    指标名             匹配器 1          匹配器 2
+```
+
+多个匹配器之间是 **AND** 关系——必须**全部满足**才会被选中。
+
+### 4.2 四种匹配器
+
+| 匹配器 | 名称 | 含义 |
+|---|---|---|
+| `=` | 相等 | 标签值精确等于给定字符串 |
+| `!=` | 不等 | 标签值不等于给定字符串 |
+| `=~` | 正则匹配 | 标签值匹配给定正则 |
+| `!~` | 正则不匹配 | 标签值不匹配给定正则 |
+
+逐个看例子：
+
+```promql
+# = 精确匹配
+http_requests_total{status="200"}
+
+# != 排除
+http_requests_total{status!="200"}
+
+# =~ 正则：所有 5xx
+http_requests_total{status=~"5.."}
+
+# !~ 正则排除：排除所有健康检查路径
+http_requests_total{path!~"/health.*"}
+
+# 多条件组合（AND）
+http_requests_total{job="api", method="POST", status=~"5..", region!="test"}
+```
+
+### 4.3 正则匹配的三个坑
+
+**坑一：正则是「完全匹配」的。**
+
+Prometheus 使用 RE2 正则，并且会**自动在两端加上 `^` 和 `$`**：
+
+```promql
+# ❌ 匹配不到 500、503
+http_requests_total{status=~"5"}
+# 因为它等价于 status=~"^5$"，要求整个值就是 "5"
+
+# ✅ 正确写法
+http_requests_total{status=~"5.."}      # 5 开头的三位数
+http_requests_total{status=~"5.*"}      # 5 开头的任意长度
+```
+
+这是新手最常见的困惑，没有之一。
+
+**坑二：`|` 表示「或」，用来枚举多个值。**
+
+```promql
+# 匹配 GET 或 POST
+http_requests_total{method=~"GET|POST"}
+
+# 匹配多个 job
+up{job=~"api|web|worker"}
+
+# 等价的排除写法
+up{job!~"test|staging"}
+```
+
+**坑三：空值匹配有特殊语义。**
+
+```promql
+# 匹配「没有 env 标签」或「env 标签为空」的序列
+http_requests_total{env=""}
+
+# 匹配「有 env 标签且非空」的序列
+http_requests_total{env!=""}
+```
+
+在 Prometheus 的模型里，「标签不存在」和「标签值为空字符串」是**等价的**。这个特性很有用——比如筛出那些还没打上 `team` 标签的服务：
+
+```promql
+count by (job) (up{team=""})
+```
+
+<Callout type="info" title="正则的性能考虑">
+`=~` 需要对**所有候选序列**逐个跑正则，比 `=` 慢得多。在大规模环境里：
+
+```promql
+# 🐢 慢：要扫描所有指标的所有序列
+{__name__=~"node_.*"}
+
+# 🚀 快：先用精确匹配缩小范围，再用正则
+node_cpu_seconds_total{mode=~"user|system"}
+```
+
+**原则：至少有一个精确匹配器（通常是指标名）来缩小候选集，再用正则做细筛。**
+
+另外，`status=~"200|404|500"` 这类纯枚举的正则，Prometheus 会自动优化成集合查找，性能接近精确匹配，不用担心。
+</Callout>
+
+### 4.4 指标名也是标签
+
+第 4 章提过：指标名存储为特殊标签 `__name__`。所以这两个查询完全等价：
+
+```promql
+http_requests_total{status="200"}
+
+{__name__="http_requests_total", status="200"}
+```
+
+这带来一个实用能力——**对指标名做正则匹配**：
+
+```promql
+# 所有 node_exporter 的 CPU 相关指标
+{__name__=~"node_cpu.*"}
+
+# 所有以 _total 结尾的指标（找出所有 Counter）
+{__name__=~".*_total"}
+```
+
+<Callout type="warn" title="选择器至少要有一个非空匹配器">
+```promql
+{}                    # ❌ 报错：至少需要一个匹配器
+{job!=""}             # ✅ 合法
+{__name__=~".*"}      # ⚠️ 语法合法，但会尝试返回全部序列 —— 别在生产环境执行
+```
+
+Prometheus 要求选择器**必须至少有一个能选中非空值的匹配器**，防止你不小心把整个数据库拉出来。
+
+即便如此，`{__name__=~".+"}` 这样的查询依然是合法的，在有几百万条序列的实例上执行会直接把 Prometheus 打挂。**探索数据请用 `/api/v1/label/__name__/values` 接口或 Web UI 的指标下拉框，不要用通配查询。**
+</Callout>
+
+## 5. offset：查询过去的数据
+
+### 5.1 基本用法
+
+`offset` 修饰符把查询的「时间基准」往前挪：
+
+```promql
+# 当前的请求总数
+http_requests_total
+
+# 1 小时前的请求总数
+http_requests_total offset 1h
+
+# 1 天前的 QPS
+rate(http_requests_total[5m] offset 1d)
+```
+
+注意区间向量的写法：`offset` 放在 `[5m]` **后面**：
+
+```promql
+rate(http_requests_total[5m] offset 1d)    # ✅
+rate(http_requests_total offset 1d [5m])   # ❌ 语法错误
+```
+
+### 5.2 offset 的经典用途：同比 / 环比
+
+`offset` 最大的价值是**做对比**。因为它返回的还是即时向量，可以直接和当前值做运算：
+
+```promql
+# 环比：现在的 QPS 相对 1 小时前的变化率
+(
+  sum(rate(http_requests_total[5m]))
+  -
+  sum(rate(http_requests_total[5m] offset 1h))
+)
+/
+sum(rate(http_requests_total[5m] offset 1h))
+```
+
+```promql
+# 同比：现在 vs 上周同一时刻（避开工作日/周末的差异）
+sum(rate(http_requests_total[5m]))
+/
+sum(rate(http_requests_total[5m] offset 7d))
+```
+
+同比对比在告警里特别有用：
+
+```yaml
+- alert: TrafficDropAnomaly
+  # 当前流量不到上周同期的 50% → 可能是上游故障或 DNS 问题
+  expr: |
+    sum(rate(http_requests_total[10m]))
+    /
+    sum(rate(http_requests_total[10m] offset 7d))
+    < 0.5
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "流量相比上周同期下跌超过 50%"
+```
+
+**为什么用「上周同期」而不是「1 小时前」？** 因为业务流量有明显的日周期和周周期。凌晨 3 点的流量本来就只有下午的 10%，用「1 小时前」做基线会在每天早高峰和晚低谷时疯狂误报。用 `offset 7d` 比较的是「上周同一个星期几的同一时刻」，基线最稳。
+
+### 5.3 offset 的限制
+
+**限制一：offset 必须是正数常量。**
+
+```promql
+http_requests_total offset 1h      # ✅
+http_requests_total offset -1h     # ❌ 老版本报错
+```
+
+（Prometheus 2.26+ 开启 `--enable-feature=promql-negative-offset` 后支持负 offset，用于查询「未来」的数据——只在有远程写回填数据时才有意义。）
+
+**限制二：offset 只能修饰选择器，不能修饰表达式。**
+
+```promql
+# ❌ 错误：offset 不能加在函数结果上
+rate(http_requests_total[5m]) offset 1h
+
+# ✅ 正确：offset 加在选择器上
+rate(http_requests_total[5m] offset 1h)
+
+# ❌ 错误
+sum(http_requests_total) offset 1h
+
+# ✅ 正确
+sum(http_requests_total offset 1h)
+```
+
+**限制三：offset 受数据保留期限制。**
+
+`offset 30d` 在一个 `--storage.tsdb.retention.time=15d` 的实例上永远返回空。做长周期同比要先确认保留期够长，或者接了 Thanos / VictoriaMetrics 这类长期存储。
+
+### 5.4 @ 修饰符：锚定到绝对时间
+
+Prometheus 2.25+ 引入了 `@`，可以把求值时刻锚定到一个**绝对的 Unix 时间戳**：
+
+```promql
+# 查询 2024-05-01 00:00:00 UTC 那一刻的值
+http_requests_total @ 1714521600
+
+# 配合 offset 使用（先 @ 后 offset）
+http_requests_total @ 1714521600 offset 5m
+```
+
+两个特别有用的内置写法：
+
+```promql
+# 查询范围的起点 / 终点
+http_requests_total @ start()
+http_requests_total @ end()
+```
+
+一个非常实用的场景——**在 Grafana 面板上算「相比时间范围起点增长了多少」**：
+
+```promql
+sum(http_requests_total) - sum(http_requests_total @ start())
+```
+
+<Callout type="info" title="offset 和 @ 的区别">
+| | 基准 | 典型用途 |
+|---|---|---|
+| `offset 1h` | **相对**当前求值时刻往前推 | 同比环比，随图表时间轴滑动 |
+| `@ 1714521600` | **绝对**时间点，固定不动 | 定位某次事故时刻，做基线对照 |
+
+在 Grafana 画图时，`offset` 的效果是「整条曲线整体左移」，`@` 的效果是「一条水平直线」（因为每个点取的都是同一时刻的值）。
+</Callout>
+
+## 6. 在 Web UI 里试跑
+
+理论讲完了，最快的学习方式是打开 Prometheus 自带的 Web UI 亲手试。
+
+### 6.1 打开 Graph 页面
+
+```bash
+# 假设 Prometheus 跑在本机
+open http://localhost:9090/graph
+```
+
+界面上有几个关键元素：
+
+```text
+┌──────────────────────────────────────────────────┐
+│ [ 查询输入框                          ] [Execute]│
+│  ▸ Metrics explorer（指标下拉，可搜索）           │
+├──────────────────────────────────────────────────┤
+│  [ Table ]  [ Graph ]      ← 两个标签页          │
+│  时间范围: [1h ▾]  分辨率: [auto]  Stacked □     │
+└──────────────────────────────────────────────────┘
+```
+
+- **Table 标签页**：执行的是**即时查询**（instant query），显示某一时刻的值。区间向量只能在这里看。
+- **Graph 标签页**：执行的是**区间查询**（range query），在时间轴上每隔一个步长求值一次，画成曲线。
+
+### 6.2 循序渐进的试跑路径
+
+```promql
+# ① 最简单：看所有目标的健康状态
+up
+
+# ② 加匹配器：只看某个 job
+up{job="node"}
+
+# ③ 找异常：哪些目标挂了
+up == 0
+
+# ④ 数一数：一共有多少个目标
+count(up)
+
+# ⑤ 换个 Counter，先看原始值（Table 页）
+prometheus_http_requests_total
+
+# ⑥ 切到 Graph 页，你会看到一堆上升的斜线 —— 这就是「Counter 不套 rate」的样子
+
+# ⑦ 套上 rate，再看 Graph —— 这才是有意义的图
+rate(prometheus_http_requests_total[5m])
+
+# ⑧ 加个 offset 做对比
+rate(prometheus_http_requests_total[5m] offset 1h)
+
+# ⑨ 试试区间向量直接查（Table 页可以，Graph 页会报错）
+prometheus_http_requests_total[2m]
+```
+
+### 6.3 用 API 做同样的事
+
+Web UI 背后就是 HTTP API，用 `curl` 也可以：
+
+```bash
+# 即时查询
+curl -s 'http://localhost:9090/api/v1/query?query=up' | jq
+
+# 带 URL 编码的复杂查询
+curl -s --data-urlencode 'query=rate(prometheus_http_requests_total[5m])' \
+  http://localhost:9090/api/v1/query | jq '.data.result[0]'
+
+# 区间查询（画图用的那种）
+curl -s 'http://localhost:9090/api/v1/query_range' \
+  --data-urlencode 'query=up' \
+  --data-urlencode 'start=2024-05-01T00:00:00Z' \
+  --data-urlencode 'end=2024-05-01T01:00:00Z' \
+  --data-urlencode 'step=60s' | jq
+
+# 列出所有指标名（探索数据的正确姿势）
+curl -s http://localhost:9090/api/v1/label/__name__/values | jq -r '.data[]' | head -30
+
+# 查看某个指标有哪些标签值
+curl -s 'http://localhost:9090/api/v1/label/job/values' | jq
+```
+
+<Callout type="tip" title="三个提高效率的 Web UI 技巧">
+**技巧一：`Ctrl + Enter` 执行查询**，不用去点 Execute 按钮。
+
+**技巧二：Metrics explorer（输入框旁的图标）** 可以模糊搜索所有指标名，比自己猜名字快得多。输入 `cpu` 就能看到所有含 cpu 的指标。
+
+**技巧三：出错时看 `/targets` 和 `/tsdb-status`**。
+- `/targets`：所有抓取目标的状态和最后一次抓取的错误信息。查不到数据先看这里。
+- `/tsdb-status`：序列数 Top10 的指标和标签，排查基数问题的第一站。
+</Callout>
+
+---
+
+<Callout type="exercise" title="练习 1：判断类型与合法性">
+判断下列每个表达式的**结果类型**（即时向量 / 区间向量 / 标量 / 报错），如果报错说明原因：
+
+```text
+1.  node_load1
+2.  node_load1[10m]
+3.  rate(node_load1[10m])
+4.  rate(node_load1)
+5.  sum(node_load1[10m])
+6.  avg_over_time(node_load1[10m])
+7.  up{job="api"} offset 30m
+8.  rate(http_requests_total offset 1h [5m])
+9.  http_requests_total[5m] offset 1h
+10. 42
+```
+
+<Answer>
+**参考答案：**
+
+| # | 表达式 | 结果类型 | 说明 |
+|---|---|---|---|
+| 1 | `node_load1` | 即时向量 | 每条序列一个当前值 |
+| 2 | `node_load1[10m]` | 区间向量 | 每条序列 10 分钟内的所有样本 |
+| 3 | `rate(node_load1[10m])` | 即时向量 | 类型合法，但**语义错误**（见下） |
+| 4 | `rate(node_load1)` | ❌ 报错 | `rate` 要区间向量，给了即时向量 |
+| 5 | `sum(node_load1[10m])` | ❌ 报错 | 聚合算子要即时向量，给了区间向量 |
+| 6 | `avg_over_time(node_load1[10m])` | 即时向量 | `*_over_time` 系列吃区间向量 |
+| 7 | `up{job="api"} offset 30m` | 即时向量 | `offset` 不改变类型 |
+| 8 | `rate(http_requests_total offset 1h [5m])` | ❌ 报错 | `offset` 必须写在 `[5m]` **之后** |
+| 9 | `http_requests_total[5m] offset 1h` | 区间向量 | 语法正确，但只能在 Table 页看 |
+| 10 | `42` | 标量 | 单个浮点数 |
+
+---
+
+**几个需要展开的点：**
+
+**第 3 题：语法对，语义错。**
+
+```promql
+rate(node_load1[10m])   # 能跑，不报错，但结果是垃圾
+```
+
+`node_load1` 是 Gauge（系统负载，上下波动）。`rate()` 假设输入单调不减，遇到下降就当成「计数器重置」做补偿。结果既不是速率也不是差值。
+
+**这是 PromQL 最危险的一类错误——它不会报错，只会安静地给你一个错误答案。** 想看 Gauge 的变化：
+
+```promql
+delta(node_load1[10m])        # 10 分钟内的变化量
+deriv(node_load1[10m])        # 每秒变化率（最小二乘拟合）
+avg_over_time(node_load1[10m]) # 10 分钟平均值
+```
+
+**第 4、5 题：类型不匹配的两个方向。**
+
+```text
+吃区间向量的:  rate / irate / increase / delta / deriv / *_over_time / predict_linear
+吃即时向量的:  sum / avg / max / min / count / topk / abs / ceil / histogram_quantile
+```
+
+记忆技巧：**名字里带 `_over_time` 或表达「变化」的函数吃区间向量；聚合算子和数学函数吃即时向量。**
+
+**第 8 题：修饰符的顺序。**
+
+正确的书写顺序是：
+
+```text
+指标名 { 匹配器 } [ 区间 ] @ 时间戳 offset 时长
+                    └──── 这三个的顺序固定 ────┘
+```
+
+```promql
+# ✅ 全部正确
+http_requests_total{job="api"}[5m] offset 1h
+http_requests_total{job="api"}[5m] @ 1714521600
+http_requests_total{job="api"}[5m] @ 1714521600 offset 5m
+```
+
+**第 9 题：合法但画不了图。**
+
+它是区间向量，Graph 页会报 `invalid expression type "range vector" for range query`。要画图必须套一个函数：
+
+```promql
+rate(http_requests_total[5m] offset 1h)
+```
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：写出正确的选择器">
+根据描述写出对应的 PromQL 选择器：
+
+1. 选出 `job` 为 `api` 或 `web` 的所有 `up` 序列
+2. 选出所有 4xx 和 5xx 的 HTTP 请求（指标 `http_requests_total`，状态码在 `status` 标签）
+3. 选出 `api` job 中，实例 IP 以 `10.0.2.` 开头的请求指标
+4. 选出所有没有打 `team` 标签的目标
+5. 选出所有文件系统指标，但排除 `tmpfs` 和 `overlay` 类型（标签 `fstype`）
+6. 选出指标名以 `go_gc` 开头的所有指标
+7. 选出 `api` job 中，路径不是健康检查（`/health`、`/healthz`、`/ready`）的请求
+
+<Answer>
+**参考答案：**
+
+---
+
+**1. job 为 api 或 web 的 up 序列**
+
+```promql
+up{job=~"api|web"}
+```
+
+正则里的 `|` 表示「或」。这种纯枚举的正则 Prometheus 会优化成集合查找，性能很好。
+
+也可以写成排除形式（如果只有三个 job 且要排除第三个）：
+
+```promql
+up{job!="worker"}
+```
+
+但枚举形式更明确——新增 job 时不会意外被包含进来。
+
+---
+
+**2. 所有 4xx 和 5xx 请求**
+
+```promql
+http_requests_total{status=~"[45].."}
+```
+
+拆解：`[45]` 匹配 4 或 5，`..` 匹配任意两个字符，合起来就是「4 或 5 开头的三位数」。
+
+也可以写：
+
+```promql
+http_requests_total{status=~"4..|5.."}
+```
+
+**常见错误：**
+
+```promql
+# ❌ 匹配不到任何东西
+http_requests_total{status=~"4|5"}
+```
+
+因为正则是完全匹配的，`4|5` 等价于 `^(4|5)$`，要求整个值就是 "4" 或 "5"。
+
+**更好的设计**：如果这个查询用得频繁，考虑在埋点时多加一个 `status_class` 标签：
+
+```text
+http_requests_total{status="404", status_class="4xx"}
+```
+
+这样查询变成 `http_requests_total{status_class=~"4xx|5xx"}`，可读性和性能都更好。
+
+---
+
+**3. api job 中 IP 以 10.0.2. 开头的实例**
+
+```promql
+http_requests_total{job="api", instance=~"10\\.0\\.2\\..*"}
+```
+
+**关键点：点号要转义。** 在正则里 `.` 匹配任意字符，想匹配字面的点必须写 `\.`。而在 PromQL 的字符串字面量里，反斜杠本身也要转义，所以是 `\\.`。
+
+如果嫌麻烦，可以用反引号原始字符串（Prometheus 支持）：
+
+```promql
+http_requests_total{job="api", instance=~`10\.0\.2\..*`}
+```
+
+不转义会怎样？`10.0.2..*` 里的 `.` 匹配任意字符，所以 `100012345:8080` 也会被匹配上——通常不会真的出问题，但在严谨场景下会出错。
+
+---
+
+**4. 没有打 team 标签的目标**
+
+```promql
+up{team=""}
+```
+
+在 Prometheus 的数据模型里，「标签不存在」和「标签值为空」是等价的。这个查询非常适合做**元数据治理**：
+
+```promql
+# 统计每个 job 有多少目标缺少 team 标签
+count by (job) (up{team=""})
+```
+
+反过来，选出**有** team 标签的：
+
+```promql
+up{team!=""}
+```
+
+---
+
+**5. 文件系统指标，排除 tmpfs 和 overlay**
+
+```promql
+node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+```
+
+这是磁盘监控的标准写法。为什么要排除？
+
+- `tmpfs` 是内存文件系统，「磁盘满了」对它没有意义，而且它天然接近满载。
+- `overlay` 是容器的联合文件系统，在宿主机上会重复计算已经统计过的空间。
+
+生产环境常见的完整排除列表：
+
+```promql
+node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|iso9660|devtmpfs|ramfs"}
+```
+
+更好的做法是在采集侧就过滤掉，避免这些序列进入 TSDB：
+
+```yaml
+# node_exporter 启动参数
+--collector.filesystem.fs-types-exclude='^(tmpfs|overlay|squashfs|devtmpfs)$'
+```
+
+---
+
+**6. 指标名以 go_gc 开头的所有指标**
+
+```promql
+{__name__=~"go_gc.*"}
+```
+
+利用了「指标名是 `__name__` 标签」这一点。
+
+⚠️ **注意性能**：这类查询没有精确的指标名做索引筛选，需要扫描所有序列的 `__name__` 标签。在小实例上无所谓，在有几百万序列的生产实例上要谨慎。
+
+**探索数据的更好方式**是用 API：
+
+```bash
+curl -s http://localhost:9090/api/v1/label/__name__/values \
+  | jq -r '.data[]' | grep '^go_gc'
+```
+
+---
+
+**7. api job 中排除健康检查路径**
+
+```promql
+http_requests_total{job="api", path!~"/health|/healthz|/ready"}
+```
+
+如果健康检查路径有后缀变化（比如 `/healthz?detail=1`）：
+
+```promql
+http_requests_total{job="api", path!~"/health.*|/ready.*"}
+```
+
+**为什么要排除健康检查？** 因为 K8s 的 liveness/readiness 探针每隔几秒就打一次，这些请求：
+
+- 数量大且恒定，会稀释真实业务的 QPS 曲线
+- 永远是 200 且极快，会把错误率和 P99 延迟「洗白」
+
+举个例子：真实业务 10 QPS 错误率 20%，健康检查 90 QPS 全成功 → 混在一起算出的错误率只有 2%，告警根本不会触发。
+
+**根治办法**：在埋点中间件里就跳过健康检查路径，不给它们记录指标。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：用 offset 做同比分析">
+你负责一个电商网站的监控。需求如下：
+
+1. 写一个查询，显示当前 QPS 和 1 天前同一时刻的 QPS 的比值。
+2. 解释为什么用 `offset 1d` 比 `offset 1h` 更适合做流量异常检测。
+3. 写一条告警规则：当前订单创建速率（`orders_created_total`）不到上周同期的 60% 时告警。
+4. 上面的告警在什么情况下会误报？如何改进？
+
+<Answer>
+**参考答案：**
+
+---
+
+**1. 当前 QPS 与 1 天前的比值**
+
+```promql
+sum(rate(http_requests_total[5m]))
+/
+sum(rate(http_requests_total[5m] offset 1d))
+```
+
+结果解读：
+
+```text
+= 1.0   与昨天同期持平
+> 1.0   比昨天同期高（1.5 = 增长 50%）
+< 1.0   比昨天同期低（0.6 = 下跌 40%）
+```
+
+想直接显示百分比变化：
+
+```promql
+100 * (
+  sum(rate(http_requests_total[5m]))
+  / sum(rate(http_requests_total[5m] offset 1d))
+  - 1
+)
+```
+
+**注意 `offset` 的位置**：必须紧跟在 `[5m]` 后面，写在选择器内部。
+
+```promql
+# ✅
+rate(http_requests_total[5m] offset 1d)
+# ❌ 语法错误
+rate(http_requests_total[5m]) offset 1d
+```
+
+---
+
+**2. 为什么 `offset 1d` 优于 `offset 1h`**
+
+因为**业务流量有强烈的日周期性**。
+
+```text
+典型电商网站一天的流量曲线：
+
+QPS
+ │           ╭──╮        ╭────╮
+ │          ╱    ╲      ╱      ╲
+ │    ╭────╯      ╰────╯        ╲
+ │───╯                            ╰────
+ └────┴────┴────┴────┴────┴────┴────┴───
+     3h   6h   9h   12h  15h  18h  21h  0h
+```
+
+**用 `offset 1h` 的问题**：早上 8 点到 9 点流量自然翻倍，`offset 1h` 会显示「增长 100%」；晚上 11 点到 12 点自然腰斩，会显示「下跌 50%」。这些都是**正常业务节奏**，但基于「1 小时前」的告警会天天在这两个时段炸开。
+
+**用 `offset 1d` 的优势**：比较的是「昨天同一时刻」。昨天 8 点也在爬坡，今天 8 点也在爬坡，两者相除接近 1.0。只有真正的异常（服务挂了、上游断流、大促）才会偏离。
+
+**`offset 7d` 更进一步**：解决**周周期**问题。周一的流量和周日完全不同——如果周日有活动流量特别高，周一用 `offset 1d` 会显示「暴跌 40%」，纯属误报。用 `offset 7d` 比较的是「上周一同一时刻」，把星期几这个变量也控制住了。
+
+**选择建议：**
+
+| offset | 适用场景 |
+|---|---|
+| `1h` | 无明显周期的内部服务（后台任务、消息队列） |
+| `1d` | 有日周期但无明显周末差异的服务 |
+| `7d` | 面向 C 端用户的业务（周末/工作日差异大） |
+
+---
+
+**3. 订单速率跌破上周同期 60% 的告警**
+
+```yaml
+groups:
+  - name: business-anomaly
+    rules:
+      - alert: OrderRateDropVsLastWeek
+        expr: |
+          sum(rate(orders_created_total[10m]))
+          /
+          sum(rate(orders_created_total[10m] offset 7d))
+          < 0.6
+        for: 15m
+        labels:
+          severity: critical
+          team: order
+        annotations:
+          summary: "订单创建速率跌至上周同期的 60% 以下"
+          description: "当前订单速率为上周同期的 {{ $value | humanizePercentage }}，请检查下单链路"
+```
+
+---
+
+**4. 误报场景与改进**
+
+这条告警至少有 **4 种误报可能**：
+
+**误报场景 A：上周同期是异常高峰（基线被污染）**
+
+上周同一时刻正好在做大促，订单量是平时的 5 倍。这周正常流量除以那个畸高的基线，必然小于 0.6，触发误报。
+
+**改进**：不要只和一个时间点比，取多周的中位数做基线。PromQL 没有原生的多周中位数，可以用记录规则预先算好：
+
+```yaml
+# recording rule
+- record: job:orders_created:rate10m
+  expr: sum(rate(orders_created_total[10m]))
+
+# 告警时对比多周（取最大值作为基线更保守，取中位数更平衡）
+- alert: OrderRateDropVsBaseline
+  expr: |
+    job:orders_created:rate10m
+    <
+    0.6 * quantile(0.5, label_replace(
+          job:orders_created:rate10m offset 7d,  "w", "1", "", "")
+        or label_replace(
+          job:orders_created:rate10m offset 14d, "w", "2", "", "")
+        or label_replace(
+          job:orders_created:rate10m offset 21d, "w", "3", "", ""))
+```
+
+（这个写法比较绕；实践中更常见的是用 Thanos / VictoriaMetrics 的 `*_over_time` 长窗口函数，或者直接在告警里同时和 7d、14d 比，两者都跌破才告警。）
+
+**误报场景 B：低流量时段样本太少**
+
+凌晨 4 点上周有 5 单，这周有 2 单 → 比值 0.4 → 告警。但 5 单和 2 单的差异纯属随机波动，没有任何意义。
+
+**改进**：加一个**绝对量下限**。
+
+```promql
+sum(rate(orders_created_total[10m])) / sum(rate(orders_created_total[10m] offset 7d)) < 0.6
+and
+sum(rate(orders_created_total[10m] offset 7d)) > 0.5     # 上周同期至少 0.5 单/秒
+```
+
+**误报场景 C：分母为 0**
+
+上周同期系统在维护，订单速率是 0。`x / 0` 在 PromQL 里得到 `+Inf`（`0/0` 得到 `NaN`）。
+
+- `+Inf < 0.6` → false，不会告警（这次侥幸没事）
+- 但反过来如果做「增长告警」，`+Inf > 2` → true，必然误报
+
+场景 B 的 `> 0.5` 条件同时也解决了这个问题——分母为 0 时整条规则直接不成立。
+
+**误报场景 D：节假日**
+
+春节期间订单量本来就低，和「上周同期」（节前）比必然大跌。
+
+**改进**：这类问题 PromQL 解决不了，需要业务层配合。常见做法是维护一个「特殊日期」的静默规则，在 Alertmanager 里配置 silence，或者用一个人工维护的 Gauge 指标做开关：
+
+```promql
+# 只在非特殊日期告警
+(
+  sum(rate(orders_created_total[10m]))
+  / sum(rate(orders_created_total[10m] offset 7d)) < 0.6
+)
+and on()
+  business_special_day == 0
+```
+
+---
+
+**最终版本：**
+
+```yaml
+- alert: OrderRateDropVsLastWeek
+  expr: |
+    (
+      sum(rate(orders_created_total[10m]))
+      /
+      sum(rate(orders_created_total[10m] offset 7d))
+    ) < 0.6
+    and
+    sum(rate(orders_created_total[10m] offset 7d)) > 0.5
+  for: 15m
+  labels:
+    severity: critical
+    team: order
+  annotations:
+    summary: "订单速率跌至上周同期 60% 以下"
+    description: "当前 {{ $value | humanizePercentage }}，持续 15 分钟"
+    runbook_url: "https://wiki.internal/runbooks/order-rate-drop"
+```
+
+**通用经验：所有「比值型」告警都必须配一个「绝对量下限」条件。** 这是防止低流量误报最有效的一招，没有之一。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 4：在 Web UI 中排查一个查不到数据的问题">
+你在 Grafana 里写了这个查询，但面板一片空白：
+
+```promql
+rate(myapp_http_requests_total{job="myapp", env="prod", status=~"5"}[30s])
+```
+
+已知：应用确实在运行，Prometheus 抓取间隔是 `15s`，应用确实有 5xx 错误。
+
+请列出排查步骤，找出所有可能的问题并给出修正后的查询。
+
+<Answer>
+**参考答案：**
+
+## 排查思路：从外往内逐层剥离
+
+调试 PromQL 的黄金法则是**逐层删掉条件，看在哪一步开始有数据**。
+
+### 第 1 步：确认指标本身存在
+
+在 Prometheus Web UI（不是 Grafana，排除 Grafana 数据源配置问题）执行：
+
+```promql
+myapp_http_requests_total
+```
+
+**如果空**：指标名错了，或者根本没被采集。
+
+```bash
+# 搜一下真实的指标名
+curl -s http://localhost:9090/api/v1/label/__name__/values \
+  | jq -r '.data[]' | grep -i http_requests
+
+# 检查目标是否 UP
+curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | {job:.labels.job, health, lastError}'
+```
+
+也可以直接看 `/targets` 页面。
+
+**如果有数据**：继续下一步。
+
+### 第 2 步：逐个去掉标签匹配器
+
+```promql
+myapp_http_requests_total{job="myapp"}
+myapp_http_requests_total{job="myapp", env="prod"}
+myapp_http_requests_total{job="myapp", env="prod", status=~"5"}
+```
+
+哪一步开始变空，问题就在那个匹配器上。
+
+### 第 3 步：确认标签的真实取值
+
+```bash
+# job 的所有取值
+curl -s 'http://localhost:9090/api/v1/label/job/values' | jq
+
+# env 的所有取值
+curl -s 'http://localhost:9090/api/v1/label/env/values' | jq
+
+# 该指标实际有哪些 status 取值
+curl -s --data-urlencode 'match[]=myapp_http_requests_total' \
+  'http://localhost:9090/api/v1/series' | jq '.data[].status' | sort -u
+```
+
+在 Web UI 里更快的办法：直接执行 `myapp_http_requests_total` 看返回结果里的标签。
+
+---
+
+## 这个查询实际存在的问题
+
+### 问题 1：`status=~"5"` 匹配不到任何 5xx（最可能的元凶）
+
+**Prometheus 的正则是完全匹配的**——`=~` 会自动在两端加 `^` 和 `$`。所以 `status=~"5"` 等价于 `status=~"^5$"`，它要求 status 标签的值**恰好就是字符串 "5"**。
+
+而实际的值是 `"500"`、`"502"`、`"503"`，一个都匹配不上。
+
+**修正**：
+
+```promql
+status=~"5.."      # 5 开头的三位数
+status=~"5.*"      # 5 开头的任意长度
+```
+
+### 问题 2：`[30s]` 窗口太小
+
+抓取间隔是 15 秒，`[30s]` 的窗口内**最多只有 2 个样本，经常只有 1 个**（因为抓取时刻和查询时刻的对齐存在抖动）。
+
+`rate()` 至少需要 2 个样本才能算出速率，只有 1 个样本时**返回空**——不报错，就是空。
+
+**修正**：
+
+```promql
+[5m]                    # 约 20 个样本，稳
+[$__rate_interval]      # Grafana 里的最佳实践
+```
+
+**经验法则：区间长度 ≥ 抓取间隔 × 4。**
+
+### 问题 3：`env="prod"` 标签可能根本不存在
+
+很多团队的环境标签是在 Prometheus 侧通过 relabel 打上的，而不是应用自己暴露的。名字也可能不一样：`environment`、`stage`、`env_name` 都很常见。
+
+**验证**：
+
+```promql
+myapp_http_requests_total{job="myapp"}
+```
+
+看返回结果里到底有没有 `env` 标签、值是什么（可能是 `production` 而不是 `prod`）。
+
+### 问题 4（Grafana 特有）：面板时间范围内确实没有 5xx
+
+如果时间范围选的是「最近 5 分钟」，而 5xx 发生在 1 小时前，那当然是空的。
+
+**验证**：把时间范围拉大到 24 小时，或者去掉 `rate` 直接看原始 Counter 值：
+
+```promql
+myapp_http_requests_total{job="myapp", status=~"5.."}
+```
+
+---
+
+## 修正后的查询
+
+```promql
+rate(myapp_http_requests_total{job="myapp", env="prod", status=~"5.."}[5m])
+```
+
+Grafana 里的推荐写法（自适应窗口 + 聚合掉实例维度）：
+
+```promql
+sum by (status) (
+  rate(myapp_http_requests_total{job="myapp", env="prod", status=~"5.."}[$__rate_interval])
+)
+```
+
+再进一步，通常你真正想看的是**错误率**而不是错误的绝对速率：
+
+```promql
+sum(rate(myapp_http_requests_total{job="myapp", env="prod", status=~"5.."}[$__rate_interval]))
+/
+sum(rate(myapp_http_requests_total{job="myapp", env="prod"}[$__rate_interval]))
+```
+
+---
+
+## 通用排查清单
+
+遇到「PromQL 查不到数据」，按顺序检查：
+
+```text
+1. 指标名对吗？          → /api/v1/label/__name__/values 搜一下
+2. 目标 UP 吗？          → /targets 页面
+3. 标签名和值对吗？       → 去掉所有匹配器，看真实返回的标签
+4. 正则完全匹配了吗？     → "5" 匹配不到 "500"，要写 "5.."
+5. 区间窗口够大吗？       → ≥ 抓取间隔 × 4
+6. 时间范围内有数据吗？   → 拉大时间范围试试
+7. 数据超过保留期了吗？   → offset 30d 在 15d 保留期上必空
+8. Grafana 数据源选对了吗？→ 到 Prometheus 原生 UI 里跑一遍对照
+```
+
+**最有效的单条建议**：把查询拆到最简（只留指标名），然后一个条件一个条件地加回去。90% 的问题在第二步就能定位。
+</Answer>
+</Callout>
+
+## 小结
+
+- PromQL 有四种类型：**即时向量**（每序列一个值）、**区间向量**（每序列一段样本）、标量、字符串。类型不匹配是最常见的报错来源。
+- 即时向量按「向前回溯最近一个样本」取值，回溯上限默认 **5 分钟**（lookback delta）——这解释了目标下线后图表为何还会拖 5 分钟。
+- **区间向量不能直接画图**，它的唯一用途是喂给 `rate` / `increase` / `*_over_time` 这类函数。区间长度建议 ≥ 抓取间隔 × 4，Grafana 里优先用 `$__rate_interval`。
+- 四种匹配器 `=` / `!=` / `=~` / `!~`，多个匹配器之间是 AND 关系。**正则是完全匹配的**（自动加 `^$`），`status=~"5"` 匹配不到 `500`。
+- 标签值为空 `label=""` 同时匹配「标签不存在」，可用于找出缺失元数据的目标。指标名等价于 `__name__` 标签，可对它做正则。
+- **`offset`** 把求值时刻相对往前推，是同比环比的基础；**`@`** 锚定到绝对时间点。两者都只能修饰选择器，且要写在 `[区间]` 之后。
+- 所有「比值型」告警都应配一个**绝对量下限**条件，防止低流量时段的除法误报。
+- 遇到查不到数据，去 Web UI 把查询拆到最简，再逐个条件加回去。
