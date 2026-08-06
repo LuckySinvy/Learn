@@ -1,0 +1,157 @@
+---
+title: 过渡与动画
+order: 18
+description: Transition 的 6 个 CSS 类名、TransitionGroup 列表过渡、JS 钩子，以及和动画库的配合
+---
+
+# 过渡与动画
+
+Vue 内置 `<Transition>` / `<TransitionGroup>` 组件，在元素「进入/离开/列表移动」时自动切换 CSS 类名或调用 JS 钩子，无需手动管定时器。
+
+## 1. `<Transition>`：单元素进入/离开
+
+```vue
+<template>
+  <button @click="show = !show">切换</button>
+  <Transition name="fade">
+    <p v-if="show">我会淡入淡出</p>
+  </Transition>
+</template>
+
+<style>
+.fade-enter-active, .fade-leave-active { transition: opacity 0.5s; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+</style>
+```
+
+`name="fade"` 会拼出 6 个类名，在对应阶段自动加/删：
+
+| 类名 | 时机 |
+|---|---|
+| `.fade-enter-from` | 进入开始（首帧） |
+| `.fade-enter-active` | 进入过程中（挂 transition 的地方） |
+| `.fade-enter-to` | 进入结束（末帧） |
+| `.fade-leave-from` | 离开开始 |
+| `.fade-leave-active` | 离开过程中 |
+| `.fade-leave-to` | 离开结束 |
+
+只给 `-active` 加 `transition`，给 `-from`/`-to` 设「起始/结束状态」，Vue 负责在下一帧切走 `-from` 触发过渡。
+
+## 2. 列表过渡：`<TransitionGroup>`
+
+```vue
+<template>
+  <TransitionGroup name="list" tag="ul">
+    <li v-for="item in items" :key="item.id">{{ item.text }}</li>
+  </TransitionGroup>
+</template>
+
+<style>
+.list-enter-active, .list-leave-active { transition: all 0.4s; }
+.list-enter-from, .list-leave-to { opacity: 0; transform: translateX(30px); }
+.list-move { transition: transform 0.4s; } /* 其余项平滑让位 */
+</style>
+```
+
+`<TransitionGroup>` 给每个子项套过渡，并用 `.list-move` 让「被顶替位置的项」平滑移动。注意每个子项要**有 `key`**（和 v-for 一样），否则无法追踪位移。
+
+## 3. JS 钩子（更精细控制）
+
+不用 CSS，可在 `<Transition>` 上写 JS 钩子：
+
+```vue
+<Transition
+  @before-enter="(el) => (el.style.opacity = '0')"
+  @enter="(el, done) => { /* 用 GSAP 等动画库，结束后调 done() */ }"
+  @leave="(el, done) => { /* ... */ done(); }"
+>
+  <p v-if="show">受 JS 控制</p>
+</Transition>
+```
+
+`@enter` / `@leave` 回调的第二个参数 `done` 必须调用，Vue 才知道动画结束（或者给元素加 CSS `transition` 让它自动感知）。
+
+## 4. 首次渲染也动画：appear
+
+默认元素首次出现不播动画。加 `appear` 可在挂载时也播一次：
+
+```vue
+<Transition name="fade" appear>...</Transition>
+```
+
+## 5. 与动画库配合
+
+`<Transition>` 的 JS 钩子天然适配 GSAP、anime.js、@vueuse/motion 等。常见模式：`@enter` 里调用动画库，动画结束调 `done()`。
+
+## 小结
+
+- `<Transition name="x">` 自动切 6 个类名（enter/leave × from/active/to）
+- 过渡写在 `-active`，起始/结束状态写在 `-from`/`-to`
+- `<TransitionGroup>` 做列表过渡，`.move` 让其余项平滑让位，子项必须 `key`
+- JS 钩子 `@enter`/`@leave`（`done()` 通知结束）对接动画库
+- `appear` 让首次挂载也播动画
+
+<Callout type="exercise" title="练习 1：写一个滑入过渡">
+给一个 `v-if` 的弹窗加「从右侧滑入」过渡，类名 `slide`。写出需要的 CSS。
+
+<Answer>
+**参考答案：**
+
+```vue
+<Transition name="slide">
+  <div v-if="show" class="modal">...</div>
+</Transition>
+
+<style>
+.slide-enter-active, .slide-leave-active { transition: transform 0.3s ease; }
+.slide-enter-from, .slide-leave-to { transform: translateX(100%); }
+</style>
+```
+
+`-active` 上 `transition: transform`，`-from`/`-leave-to` 设起始位置 `translateX(100%)`（屏幕右侧外）。Vue 在插入后下一帧移除 `-from` 触发从右滑入；离开时加到 `-leave-to` 滑出。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：列表项删除动画">
+一个 `items` 列表用 `<TransitionGroup>` 渲染，要求「删除某项时该项淡出、其余项平滑上移」。写出模板与关键 CSS。
+
+<Answer>
+**参考答案：**
+
+```vue
+<TransitionGroup name="list" tag="ul">
+  <li v-for="it in items" :key="it.id">
+    {{ it.text }} <button @click="remove(it.id)">x</button>
+  </li>
+</TransitionGroup>
+
+<style>
+.list-enter-active, .list-leave-active { transition: all 0.3s; }
+.list-enter-from, .list-leave-to { opacity: 0; }
+.list-move { transition: transform 0.3s; } /* 关键：其余项让位时平滑移动 */
+.list-leave-active { position: absolute; } /* 离开项脱离文档流，避免占位抖动 */
+</style>
+```
+
+`.list-move` 让没被删的项平滑平移；离去项常加 `position: absolute` 让它脱离流，避免其它项「先跳再动」。子项 `:key` 必须有。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：用 GSAP 做进入动画">
+用 `<Transition>` 的 JS 钩子，在元素进入时用 GSAP 做「从下弹入」动画。写出 `@enter` 写法（假设已 `import gsap`）。
+
+<Answer>
+**参考答案：**
+
+```vue
+<Transition
+  @enter="(el, done) => gsap.from(el, { y: 40, opacity: 0, duration: 0.4, onComplete: done })"
+  @leave="(el, done) => gsap.to(el, { y: 40, opacity: 0, duration: 0.3, onComplete: done })"
+>
+  <p v-if="show">弹入</p>
+</Transition>
+```
+
+`@enter` 的 `el` 是真实 DOM，`done` 必须在动画结束（`onComplete`）调用，Vue 才知道过渡完成、才移除元素。这是 `<Transition>` JS 钩子对接动画库的标准写法。
+</Answer>
+</Callout>

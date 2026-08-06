@@ -15,6 +15,7 @@ export type Language =
   | 'clickhouse'
   | 'kafka'
   | 'react'
+  | 'vue'
   | 'linux'
   | 'git'
   | 'http'
@@ -26,7 +27,7 @@ export type Language =
 // 跑完即销毁，天然隔离无状态残留。Grafana / Kafka / ClickHouse / MongoDB 等暂不支持在线执行。
 // linux / git / http 三门课共用 learn-shell:1 沙箱（alpine + bash + git + curl + python3），
 // 容器内 loopback 可用，HTTP 课能在同一容器里起本地服务再 curl。
-// React 课的 Playground 直接用 language="typescript"（手写 hooks/diff 等核心机制），无独立沙箱。
+// React / Vue 课的 Playground 直接用 language="typescript"（手写 hooks / 响应式系统等核心机制），无独立沙箱。
 export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust' | 'typescript' | 'redis' | 'mysql' | 'linux' | 'git' | 'http';
 
 export type ExecuteRequest = {
@@ -77,6 +78,7 @@ export const LANG_META: Record<Language, { label: string; color: string; emoji: 
   clickhouse: { label: 'ClickHouse', color: 'bg-amber-500/10 text-amber-600 dark:text-amber-300', emoji: '🧮' },
   kafka: { label: 'Kafka', color: 'bg-slate-500/10 text-slate-600 dark:text-slate-300', emoji: '🌊' },
   react: { label: 'React', color: 'bg-sky-400/10 text-sky-600 dark:text-sky-300', emoji: '⚛️' },
+  vue: { label: 'Vue', color: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300', emoji: '💚' },
   linux: { label: 'Linux', color: 'bg-yellow-500/10 text-yellow-700 dark:text-yellow-300', emoji: '🐧' },
   git: { label: 'Git', color: 'bg-orange-600/10 text-orange-700 dark:text-orange-300', emoji: '🌿' },
   http: { label: 'HTTP', color: 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-300', emoji: '🌐' },

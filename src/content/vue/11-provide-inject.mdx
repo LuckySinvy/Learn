@@ -1,0 +1,210 @@
+---
+title: provide / inject 跨层级状态
+order: 11
+description: 用 provide/inject 跨越多层组件传递数据（避免 props 透传），类型安全的 InjectionKey，以及「提供响应式状态」与「只读暴露」的实践
+---
+
+# provide / inject 跨层级状态
+
+当数据要在「祖 → 孙」甚至更深层传递时，一层层 `props` 往下传（props 透传 / prop drilling）既啰嗦又脆弱。`provide` / `inject` 让祖先直接把数据「注入」到任意后代，跳过中间层。
+
+## 1. 基本用法
+
+```vue
+<!-- 祖先 Ancestor.vue -->
+<script setup lang="ts">
+import { provide, ref } from 'vue';
+const theme = ref('dark');
+provide('theme', theme); // 第一个参数是 key（字符串或 Symbol）
+</script>
+```
+
+```vue
+<!-- 后代（任意深度）Descendant.vue -->
+<script setup lang="ts">
+import { inject } from 'vue';
+const theme = inject('theme'); // 拿到的类型和 provide 时一致（这里是 Ref<string>）
+</script>
+```
+
+`inject` 的第二个参数是**默认值**（找不到 provider 时用）：
+
+```ts
+const theme = inject('theme', ref('light'));
+```
+
+## 2. 类型安全：用 InjectionKey
+
+字符串 key 容易拼写错且丢失类型。推荐用 `InjectionKey` 把 key 和值类型绑在一起：
+
+```ts
+// keys.ts
+import { inject, provide, type InjectionKey, ref } from 'vue';
+const ThemeKey: InjectionKey<ReturnType<typeof ref<string>>> = Symbol('theme');
+
+// 提供方
+provide(ThemeKey, ref('dark'));
+// 使用方：自动推断出 Ref<string>，无需默认值也能拿到正确类型
+const theme = inject(ThemeKey)!;
+```
+
+`!` 表示你确信上层一定提供了。若想更稳妥，给默认值：`inject(ThemeKey, ref('light'))`。
+
+## 3. 提供响应式状态
+
+`provide` 一个 `ref` / `reactive`，后代 `inject` 拿到的是**同一个引用**——祖先改了，后代自动更新：
+
+```ts
+// 祖先
+const user = reactive({ name: 'Ada', age: 20 });
+provide(UserKey, user);
+
+// 后代
+const user = inject(UserKey)!;
+user.age++; // 祖先的 user 同步变化（共享同一 reactive）
+```
+
+⚠️ 这让后代也能**直接改**祖先状态。若想「只读暴露」，用 `readonly` 包一层再 provide：
+
+```ts
+import { provide, reactive, readonly } from 'vue';
+const user = reactive({ name: 'Ada' });
+provide(UserKey, readonly(user)); // 后代只能读，改会报警
+```
+
+## 4. provide 一个修改函数（受控写入）
+
+更清晰的「只读数据 + 显式方法」模式，类似 store 的 action：
+
+```ts
+// 祖先
+const count = ref(0);
+provide(CounterKey, {
+  count: readonly(count),
+  inc: () => count.value++,
+});
+
+// 后代
+const { count, inc } = inject(CounterKey)!;
+inc(); // 通过提供的方法修改，而非直接碰 state
+```
+
+## 5. 什么时候用、什么时候不用
+
+| 场景 | 选择 |
+|---|---|
+| 父子直接通信 | `props` + `emit` |
+| 祖孙 / 跨多层、且不常变 | `provide` / `inject` |
+| 全局、多组件共享、需要 DevTools/持久化/严格管控 | **Pinia**（下一章） |
+| 仅某一处 UI 主题 | `provide` 一个 `readonly` 主题对象 |
+
+`provide/inject` 不是「全局状态」的替代品：它绑定在组件树的一条路径上，卸载即消失，也没有 Pinia 的调试能力。需要真正的全局共享状态时用 Pinia。
+
+## 小结
+
+- `provide(key, value)` 在祖先注入，`inject(key, 默认值?)` 在后代取出，跳过中间层 props 透传
+- 用 `InjectionKey<T>` 获得类型安全，避免字符串 key 拼写错
+- `provide` 响应式对象（`ref`/`reactive`）时后代共享同一引用；想只读用 `readonly` 包一层
+- 推荐「`readonly(state)` + 提供修改函数」的受控模式
+- 全局强共享状态交给 Pinia，别滥用 provide/inject
+
+<Callout type="exercise" title="练习 1：主题切换">
+用 `provide/inject` + `InjectionKey` 实现祖先提供一个 `theme`（'light' | 'dark'）的 ref，后代一个按钮切换主题，并让后代的文字颜色随主题变化。
+
+<Answer>
+**参考答案：**
+
+```ts
+// theme.ts
+import { inject, provide, ref, type InjectionKey } from 'vue';
+export type Theme = 'light' | 'dark';
+export const ThemeKey: InjectionKey<ReturnType<typeof ref<Theme>>> = Symbol('theme');
+export function provideTheme() {
+  const theme = ref<Theme>('light');
+  provide(ThemeKey, theme);
+  return theme;
+}
+```
+
+```vue
+<!-- 祖先 -->
+<script setup lang="ts">
+import { provideTheme } from './theme';
+provideTheme();
+</script>
+
+<!-- 后代 -->
+<script setup lang="ts">
+import { inject } from 'vue';
+import { ThemeKey } from './theme';
+const theme = inject(ThemeKey)!;
+</script>
+
+<template>
+  <button @click="theme = theme === 'light' ? 'dark' : 'light'">
+    当前：{{ theme }}
+  </button>
+  <p :style="{ color: theme === 'dark' ? '#fff' : '#000' }">文字</p>
+</template>
+```
+
+祖先 `provide` 一个响应式 `theme`，后代 `inject` 拿到同一 ref，按钮改它，所有后代同步。用 `InjectionKey` 保证类型推断为 `Ref<Theme>`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：只读暴露 + 方法修改">
+把上一题改成「后代不能直接改 theme，只能通过祖先提供的 `toggle()` 方法切换」，用 `readonly` + 函数实现。
+
+<Answer>
+**参考答案：**
+
+```ts
+// theme.ts
+import { inject, provide, ref, readonly, type InjectionKey } from 'vue';
+export type Theme = 'light' | 'dark';
+export interface ThemeApi {
+  theme: Readonly<ReturnType<typeof ref<Theme>>>;
+  toggle: () => void;
+}
+export const ThemeKey: InjectionKey<ThemeApi> = Symbol('theme');
+export function provideTheme() {
+  const theme = ref<Theme>('light');
+  provide(ThemeKey, {
+    theme: readonly(theme),
+    toggle: () => { theme.value = theme.value === 'light' ? 'dark' : 'light'; },
+  });
+}
+```
+
+```vue
+<!-- 后代 -->
+<script setup lang="ts">
+import { inject } from 'vue';
+import { ThemeKey } from './theme';
+const { theme, toggle } = inject(ThemeKey)!;
+</script>
+
+<template>
+  <button @click="toggle">切换（当前 {{ theme }}）</button>
+</template>
+```
+
+`theme` 是 `readonly` 包装后的 ref，后代只能读、不能直接赋；想改必须走 `toggle()`。这就是「只读数据 + action」的受控模式，避免任意后代偷偷改全局状态。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：provide/inject 还是 Pinia？">
+下面两个场景分别该用 provide/inject 还是 Pinia？说明理由。
+（a）一个深色模式开关，整站组件都要读，少数地方能切换。
+（b）一个电商购物车，多页共享、需要持久化到 localStorage、需要 DevTools 调试。
+
+<Answer>
+**参考答案：**
+
+- **(a) provide/inject**。它绑定在组件树路径上、随祖先卸载而消失，且「读多写少、范围就是这棵子树」——正是 provide/inject 的甜区。用 `readonly` 暴露、提供切换方法即可。
+
+- **(b) Pinia**。购物车是真正的**全局**共享状态，跨路由页面都要用，还要求持久化、时间旅行调试、严格管控写入。Pinia 自带 store 模块化、`$subscribe` 持久化钩子、DevTools 集成，远比 provide/inject 合适。
+
+经验：provide/inject 解决「跨层传递」，Pinia 解决「全局共享 + 管控」。别用 provide/inject 硬撑全局 store。
+</Answer>
+</Callout>

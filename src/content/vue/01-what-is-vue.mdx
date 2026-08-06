@@ -1,0 +1,272 @@
+---
+title: Vue 是什么
+order: 1
+description: 从命令式 DOM 同步的痛点出发，理解 Vue 的「响应式 + 模板编译」双引擎设计，以及它与 React 在心智模型上的根本分歧
+---
+
+# Vue 是什么
+
+如果你写过 jQuery，或者用原生 API 手动拼过一个稍微复杂点的页面，一定经历过这样的场景：数据变了，你要记得去改标题；列表多了一项，你要记得插入节点；用户点了删除，你要记得同时更新数组、移除元素、刷新计数器。**只要漏掉一处，界面就和数据对不上了。**
+
+Vue 给出的答案和 React 是同一个方向：**别去改界面，去改数据；界面由数据算出来。** 但 Vue 走到这一步用的「引擎」和 React 不太一样，理解这个差异，是学懂 Vue 3 的关键。
+
+## 1. 命令式 UI 的困境
+
+### 1.1 一个计数器的两种写法
+
+先看原生写法。需求很简单：一个数字，两个按钮，还有一行「当前是奇数/偶数」的提示。
+
+```js
+let count = 0;
+
+const valueEl = document.querySelector("#value");
+const parityEl = document.querySelector("#parity");
+const decBtn = document.querySelector("#dec");
+
+function render() {
+  valueEl.textContent = String(count);
+  parityEl.textContent = count % 2 === 0 ? "偶数" : "奇数";
+  decBtn.disabled = count === 0;
+}
+
+document.querySelector("#inc").addEventListener("click", () => {
+  count += 1;
+  render();
+});
+
+decBtn.addEventListener("click", () => {
+  count -= 1;
+  render();
+});
+
+render();
+```
+
+这段代码本身没什么问题，但请注意它的结构：**每次改完数据，你必须手动调用一次同步函数**。现在假设需求增加了——加一个「重置」按钮、加一个历史记录列表、加一个动画。每加一处，你都要问自己：这里改完之后，还有哪些地方需要跟着变？
+
+这类 bug 有个共同特征：**它不是逻辑错误，而是遗漏**。你写的每一行代码都对，只是少写了一行。
+
+### 1.2 状态与视图的同步成本
+
+问题的本质在于，命令式代码里存在两份「真相」：
+
+| 真相 | 存在于 | 谁负责更新 |
+|---|---|---|
+| 数据状态 | JS 变量 | 业务代码 |
+| 界面状态 | DOM 树 | 手写的同步代码 |
+
+两份真相必须靠人力保持一致，而人力是不可靠的。随着交互路径增多，需要维护的同步关系呈组合爆炸增长：3 个状态、5 个界面区域，理论上就有 15 条同步关系要照顾。
+
+Vue 的做法同样是**消灭第二份真相**。DOM 不再是你维护的对象，而是一个由状态推导出来的结果。
+
+## 2. Vue 的心智模型：细粒度依赖追踪
+
+### 2.1 UI 也是状态的函数，但「函数」不一样
+
+React 的公式是 `UI = f(state)`，状态一变，组件函数整体重跑，再靠虚拟 DOM diff 出要改的 DOM。Vue 3 也认同「UI 由状态算出来」，但它的实现路径是另一条：
+
+> **编译期做静态分析 + 运行时做细粒度依赖追踪。**
+
+什么意思？看一段 Vue 模板：
+
+```vue
+<script setup>
+import { ref } from 'vue';
+
+const count = ref(0);
+const parity = () => (count.value % 2 === 0 ? "偶数" : "奇数");
+</script>
+
+<template>
+  <p>{{ count }}</p>
+  <p>{{ parity() }}</p>
+  <button @click="count++">+1</button>
+</template>
+```
+
+注意这里**完全没有更新界面的代码**，也没有 `render()`。你只描述了「界面和 `count` 的关系」。当你点 `+1`，`count.value` 从 0 变成 1，Vue 会**精确知道**：只有 `{{ count }}` 和 `{{ parity() }}` 这两处依赖了 `count`，于是只去更新这两处对应的真实 DOM 文本——它**不会**重新跑整个组件、也不会把整棵 DOM 树再 diff 一遍。
+
+这是 Vue 和 React 在「重渲染粒度」上的根本差异：
+
+| 维度 | React | Vue 3 |
+|---|---|---|
+| 状态变化后 | 组件函数整体重跑 | 只重跑依赖该状态的「渲染副作用」 |
+| 比对单元 | 虚拟 DOM 树（运行时 diff） | 编译期标记的「动态节点」+ 依赖收集 |
+| 是否需要 memo 来跳过子组件 | 经常需要（`React.memo`） | 基本不需要（子组件没读到的状态变化不会触发它） |
+
+<Callout type="info" title="Vue 也有虚拟 DOM，只是用得更聪明">
+Vue 3 仍然有虚拟 DOM 和 diff，但它的 diff 不是「全树逐节点比较」。编译器在编译模板时已经分析出哪些节点是动态的、动态在哪（文本？class？props？），并打上 **PatchFlag**。运行时 diff 时只看这些被标记过的节点，静态节点直接跳过。第 2 章会详细讲 PatchFlag。
+</Callout>
+
+### 2.2 渐进式框架
+
+Vue 官方的定位是「渐进式框架」——你可以只取你需要的部分：
+
+1. **CDN 引入**：一个 `<script>` 标签，在现有页面里渐进增强，`createApp` 挂载到某个 DOM 节点。不需要构建工具。
+2. **SFC + Vite**：写单文件组件（`.vue`），用 Vite 做开发服务器和打包。这是日常开发的主流形态。
+3. **Nuxt**：全栈元框架，内置路由、SSR、服务端、自动导入。一套代码覆盖从 SPA 到全栈。
+
+三档用的都是同一套 Composition API，学习成本平滑上升。
+
+### 2.3 三种写法
+
+Vue 3 在生产里主流是三种写法，本课程**只用第一种**：
+
+```vue
+<!-- ① 选项式 API（Vue 2 时代，简单组件仍可用）-->
+<script>
+export default {
+  data() { return { count: 0 }; },
+  methods: { inc() { this.count++; } },
+};
+</script>
+
+<!-- ② setup() 函数 -->
+<script>
+import { ref } from 'vue';
+export default {
+  setup() {
+    const count = ref(0);
+    return { count };
+  },
+};
+</script>
+
+<!-- ③ <script setup>（本课程唯一主线）-->
+<script setup>
+import { ref } from 'vue';
+const count = ref(0);
+</script>
+```
+
+`<script setup>` 是编译时的语法糖：顶层声明的变量和函数**自动暴露给模板**，不用手写 `return`。它写起来最短，类型推导最好，是 Vue 3 官方推荐的写法。后面所有章节都用它。
+
+## 3. 全家桶 vs 渲染库
+
+React 常说「React 只是个库，路由/状态管理都要自己选型」。Vue 的边界更接近「全家桶」：
+
+- `vue` 核心负责响应式 + 组件 + 渲染
+- `vue-router` 官方路由
+- `pinia` 官方状态管理（替代老的 Vuex）
+- `vue-tsc` 官方类型检查（对 `.vue` 文件做类型检查）
+- Vue DevTools 官方调试工具
+
+这些都是 Vue 团队维护、版本同步、文档一体的。好处是「选型的纠结」少很多；代价是 Vue 的「官方意志」更强，你不太需要像 React 那样在十几个状态库里挑。第 21 章会系统梳理整个生态。
+
+<Callout type="warn" title="别把 Vue 当成「更简单版的 React」">
+两者解决问题的思路不同：React 倾向「函数整体重跑 + 运行时 diff」，Vue 倾向「编译期分析 + 细粒度依赖追踪」。很多 React 的优化技巧（`React.memo`、`useCallback`）在 Vue 里根本没有对应物，因为不需要。反过来，Vue 的 `computed` 缓存、`watch` 副作用、`<script setup>` 的编译魔法，也有 React 里不太一样的思考方式。建议学的时候多对照、少套用。
+</Callout>
+
+## 4. 心智模型练习
+
+理解 Vue 最好的方式是练习「把命令式需求翻译成状态」。看几个例子：
+
+| 命令式描述 | 状态化描述 |
+|---|---|
+| 点击后隐藏弹窗 | 加 `isOpen` 状态，弹窗在 `isOpen` 为 true 时才渲染 |
+| 请求时禁用按钮 | 加 `isLoading` 状态，按钮的 `disabled` 绑定它 |
+| 切换 tab 时高亮当前项 | 加 `activeTab` 状态，每项的 class 由「自己是否等于 activeTab」决定 |
+| 表单校验失败时显示红框 | 加 `errors` 状态，输入框的样式由自己是否在 `errors` 里决定 |
+
+规律很清晰：**每一个「界面上会变的东西」，背后都对应一个状态；界面的每一处细节，都是从状态计算出来的表达式。** 在 Vue 里，这些表达式要么写在模板里，要么写成 `computed`。
+
+<Callout type="exercise" title="练习 1：翻译成状态">
+一个商品详情页有这些交互：切换主图（缩略图点击）、加减购买数量（数量为 1 时禁用减号）、加入购物车（点击后按钮变成「已加入」并禁用 3 秒）、展开/收起商品详情。
+
+请列出你需要哪些状态变量，并写出每个界面元素是如何从这些状态计算出来的。不用写代码，用中文描述即可。
+
+<Answer>
+**参考答案：**
+
+需要 4 个状态变量：
+
+| 状态 | 含义 | 初始值 |
+|---|---|---|
+| `mainIndex` | 当前主图在图片数组中的下标 | `0` |
+| `quantity` | 购买数量 | `1` |
+| `isAdded` | 是否处于「刚加入购物车」的 3 秒窗口内 | `false` |
+| `isDetailOpen` | 商品详情是否展开 | `false` |
+
+每个界面元素都是从状态**算**出来的，没有一处需要手动改 DOM：
+
+- **主图** — `src` 取 `images[mainIndex]`
+- **缩略图高亮** — 每张缩略图判断「自己的下标是否等于 `mainIndex`」，是就加高亮 class
+- **数量文本** — 直接显示 `quantity`
+- **减号按钮** — `disabled` 绑定 `quantity <= 1`
+- **加入购物车按钮** — 文案是 `isAdded ? "已加入" : "加入购物车"`，`disabled` 绑定 `isAdded`
+- **详情区域** — `isDetailOpen` 为 true 时才渲染；旁边的箭头图标方向同样由它决定
+
+**关键点：**
+
+1. 「点击缩略图切主图」不是「把主图的 src 改掉」，而是「把 `mainIndex` 改掉」，主图自然跟着变。
+2. 「3 秒后恢复」是一个**副作用**（定时器），不能写在渲染里。正确做法是把 `isAdded` 置为 true，再用 `setTimeout` 在 3 秒后置回 false（第 6 章会讲 `onMounted`/`onUnmounted` 与定时器的清理）。
+3. 不需要为「减号是否禁用」单独建状态——它可以从 `quantity` 推导。**能推导出来的东西就不要存成状态**，否则又回到「两份真相」的老问题。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：判断题">
+判断下面几句话的对错，并说明理由：
+
+1. Vue 3 没有虚拟 DOM，比 React 快
+2. Vue 的组件重渲染粒度和 React 一样，都是「父组件重渲染子组件必然跟着重渲染」
+3. `<script setup>` 是一种新的响应式 API
+4. 选项式 API（Options API）已经被废弃，新项目不能用
+
+<Answer>
+**参考答案：**
+
+**1. Vue 3 没有虚拟 DOM，比 React 快 —— ❌ 错**
+
+Vue 3 仍然有虚拟 DOM，也仍然会做 diff，只是 diff 被编译期的 PatchFlag 优化过，只比较被标记的动态节点。说「Vue 没有虚拟 DOM」是误解。性能上 Vue 和 React 同量级，差异更多体现在重渲染粒度和编译期优化上，而不是「谁绝对更快」。
+
+**2. 重渲染粒度一样，父重渲染子必然跟着重渲染 —— ❌ 错**
+
+这是 React 的默认行为（除非用 `React.memo`）。Vue 的渲染副作用是**按依赖收集**的：子组件没读取某个状态，那个状态变化就不会触发子组件重渲染。所以 Vue 基本不需要 `React.memo` 这种手动跳过机制。
+
+**3. `<script setup>` 是一种新的响应式 API —— ❌ 错**
+
+`<script setup>` 只是**编译期语法糖**，让顶层绑定自动暴露给模板、少写 `return`。响应式能力来自 `ref`/`reactive`/`computed` 这些 API，跟它无关。把 `<script setup>` 换成 `setup()` 函数，响应式行为完全一样。
+
+**4. 选项式 API 已废弃 —— ❌ 错**
+
+选项式 API 没有被废弃，仍然完全支持，适合简单场景或老项目维护。Vue 官方推荐新项目用 `<script setup>` 是因为类型推导和代码组织更好，但不是「旧的就不能用了」。
+
+这四个判断里，「Vue 比 React 快」和「父子必然联动重渲染」是最容易踩的两个误区。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：选技术栈">
+给三个场景各选一档 Vue 技术栈（CDN 引入 / Vite SPA / Nuxt），并说明理由：
+
+1. 一个营销活动落地页，要嵌进现有老站点，只做一小块交互
+2. 一个企业内部后台管理系统，功能多、路由复杂、要登录鉴权
+3. 一个内容型站点，重视 SEO 和首屏速度，文章量大且常更新
+
+<Answer>
+**参考答案：**
+
+**1. 营销落地页嵌进老站点 —— CDN 引入**
+
+只做一小块交互、要嵌进现有页面，用 CDN `<script>` 引入 Vue，挂到某个 div 即可，不需要引入整套构建工具，改造成本最低。注意：老站点如果本身用了别的框架或 jQuery，要注意挂载节点和全局变量别冲突。
+
+**2. 企业内部后台 —— Vite SPA（或 Nuxt）**
+
+功能多、路由复杂、要登录鉴权，标准 SPA 形态最合适：`vue-router` 管路由、`pinia` 管共享状态、`vite` 做开发体验。如果还需要 SSR（比如首屏要快、或要做一点 SEO），也可以上 Nuxt；但大多数内部后台不需要 SSR，纯 SPA 更简单。
+
+**3. 内容型站点 —— Nuxt（SSR/SSG）**
+
+重视 SEO 和首屏速度、文章量大，这正是 SSR/SSG 的强项。Nuxt 的 `useFetch`/`useAsyncData` 能在服务端把数据取好、首屏直接拿到 HTML，SEO 友好，配合 `routeRules` 还能对文章页做静态生成。
+
+**规律：** 越少依赖构建、越要嵌入现有页面 → CDN；越要工程化、越纯前端 → Vite SPA；越要首屏/SEO/全栈 → Nuxt。
+</Answer>
+</Callout>
+
+## 小结
+
+- 命令式 UI 的根本问题是**存在两份真相**，需要人力维护同步，遗漏即 bug
+- Vue 同样用「UI 由状态算出来」消灭第二份真相，但靠**编译期静态分析 + 运行时细粒度依赖追踪**，重渲染粒度是「依赖该状态的渲染副作用」而非整个组件树
+- Vue 3 仍有虚拟 DOM，但靠 PatchFlag 让 diff 只比较动态节点（第 2 章展开）
+- Vue 是渐进式框架：CDN → SFC+Vite → Nuxt 三档平滑上升
+- 本课程主线是 `<script setup>`，它是语法糖不是新 API
+- Vue 更接近官方全家桶（router/pinia/vue-tsc/devtools 官方维护），选型纠结少
+- 下一章我们拆开模板，看看它被编译器编译成了什么 →

@@ -1,0 +1,141 @@
+---
+title: SSR 与 Nuxt
+order: 19
+description: 服务端渲染的原理与收益、createSSRApp + renderToString、 hydration、SSR 下的坑，以及 Nuxt 这个元框架帮你做了什么
+---
+
+# SSR 与 Nuxt
+
+默认 Vue 应用是 **CSR（客户端渲染）**：浏览器拿到空壳 HTML，JS 下载后才渲染内容。SSR 则是**服务器先把组件渲染成 HTML 字符串**发给浏览器，再「注水」（hydrate）成可交互应用。
+
+## 1. 为什么用 SSR
+
+| 关注点 | CSR | SSR |
+|---|---|---|
+| 首屏白屏 | 有（等 JS） | 几乎无（HTML 直接有内容） |
+| SEO | 差（爬虫拿到空壳） | 好（HTML 含内容） |
+| 服务器压力 | 小 | 大（每次请求都渲染） |
+| 复杂度 | 低 | 高（要处理服务端环境） |
+
+适合：内容站、电商、博客（要 SEO + 快首屏）。不适合：强交互后台、纯内部工具。
+
+## 2. 核心 API
+
+```ts
+// entry-server.ts
+import { createSSRApp } from 'vue';
+import { renderToString } from 'vue/server-renderer';
+import App from './App.vue';
+
+export async function render() {
+  const app = createSSRApp(App);
+  const html = await renderToString(app);
+  return `<!DOCTYPE html><div id="app">${html}</div>`;
+}
+```
+
+`createSSRApp` 和 `createApp` 几乎一样，但为 SSR 设计了「每次请求新建实例」（避免跨请求状态污染）。`renderToString` 把组件树渲染成 HTML。
+
+## 3. Hydration（注水）
+
+服务器发的 HTML 是「死的」。浏览器加载 JS 后，Vue 会把**同一套组件**「贴」到已有 DOM 上，绑定事件、恢复响应式——这过程叫 hydration。只要 SSR 和客户端渲染结果一致，Vue 就能复用现有 DOM，不重绘。
+
+## 4. SSR 的坑
+
+```ts
+// ❌ 服务端没有 window / document / localStorage
+onMounted(() => {
+  console.log(window.innerWidth); // 只在客户端安全
+});
+
+// ✅ 需要区分环境
+if (typeof window !== 'undefined') { /* 客户端才跑 */ }
+```
+
+- 生命周期：服务端只跑 `setup` + `onBeforeMount`/`onMounted` **不跑**（没有真实 DOM）。
+- 数据获取：`onServerPrefetch` 是服务端专属钩子，用来在渲染前把数据准备好。
+- 单例危险：模块级 `const store = reactive(...)` 会被所有请求共享 → 必须用 `createSSRApp` 每次请求新建。
+
+## 5. Nuxt：SSR 的元框架
+
+自己搭 SSR 要处理路由、数据获取、构建、部署、静态生成……非常繁琐。**Nuxt** 把这些都包好了：
+
+- 基于文件的路由（`pages/` 目录自动生成路由）
+- 内置 SSR / SSG（静态站点生成）/ 混合渲染
+- 服务端数据获取 `useFetch` / `useAsyncData`（自动在 SSR 预取、序列化到 HTML）
+- 约定式布局、中间件、模块生态
+
+```ts
+// Nuxt 里：组件内一行搞定「SSR 预取 + 客户端复用」
+const { data } = await useFetch('/api/user');
+```
+
+对大多数需要 SSR 的项目，直接用 Nuxt 而不是手写 SSR 管线。
+
+## 小结
+
+- SSR：服务器先渲染 HTML，浏览器 hydration 成可交互应用 → 快首屏 + 好 SEO
+- `createSSRApp` + `renderToString`；每次请求新建实例防跨请求污染
+- 坑：`window`/`document` 服务端不存在、`onMounted` 不在服务端跑、`onServerPrefetch` 预取数据
+- Nuxt 把 SSR/SSG/路由/数据获取一站式封装，是 Vue SSR 的事实标准选择
+
+<Callout type="exercise" title="练习 1：找出 SSR 不安全的代码">
+下面哪行在服务端会报错？怎么修？
+
+```ts
+const width = ref(0);
+onMounted(() => { width.value = window.innerWidth; });
+```
+
+<Answer>
+**问题：** `window` 在服务端（Node）不存在，`onMounted` 虽只在客户端跑，但这段代码本身在服务端构建/执行路径上若被误触发会崩；更稳妥的是显式判环境。
+
+**修法：**
+
+```ts
+const width = ref(0);
+onMounted(() => {
+  if (typeof window !== 'undefined') width.value = window.innerWidth;
+});
+```
+
+`onMounted` 本来就不会在服务端执行，所以多数情况没问题；但凡在 `setup` 顶层直接碰 `window`/`document`/`localStorage` 的代码必然在服务端报错，必须包进 `onMounted` 或加环境判断。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：服务端预取数据">
+一个用户页要在 SSR 阶段就把用户信息取好，写进 HTML，避免客户端「先白再闪」。用 Vue 的哪个钩子？写出写法。
+
+<Answer>
+**参考答案：用 `onServerPrefetch`：**
+
+```ts
+import { ref, onServerPrefetch } from 'vue';
+const user = ref(null);
+onServerPrefetch(async () => {
+  user.value = await fetch('/api/user').then((r) => r.json());
+});
+```
+
+`onServerPrefetch` 只在服务端执行，渲染前把 `user` 填好，HTML 里就有内容；客户端 hydration 时复用这份数据，不会「白屏再请求」。Nuxt 里则直接用 `await useFetch('/api/user')` 一行搞定。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：CSR / SSR / SSG 怎么选">
+给三个场景各选一种渲染方式并说理由：
+（a）公司官网博客，要 SEO、更新不频繁。
+（b）实时协作白板（强交互、无需 SEO）。
+（c）电商商品详情页（要 SEO、又要快、但数据来自 API）。
+
+<Answer>
+**参考答案：**
+
+- **（a）博客** → **SSG（静态站点生成）**。内容更新不频繁，构建时把页面渲染成静态 HTML，CDN 直接分发，SEO 好、最快、最省服务器。Nuxt 的 `nuxt generate` 或 `ssr: false` + 预渲染即可。
+
+- **（b）协作白板** → **CSR（纯客户端渲染）**。几乎不要 SEO，全是强交互、实时 WebSocket，SSR 没收益还增加复杂度。直接用 Vite + Vue SPA 即可。
+
+- **（c）商品详情** → **SSR（或 ISR 增量静态再生成）**。要 SEO + 快首屏，但数据来自 API 需实时。SSR 每次请求渲染（或 Nuxt 的混合渲染/ISR 缓存一段时间），兼顾 SEO 与新鲜度。
+
+一句话：要 SEO 且变化慢 → SSG；不要 SEO 且重交互 → CSR；要 SEO 且数据活 → SSR/ISR。
+</Answer>
+</Callout>

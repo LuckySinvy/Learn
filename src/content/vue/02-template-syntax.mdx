@@ -1,0 +1,368 @@
+---
+title: 模板语法与渲染
+order: 2
+description: 插值、指令、修饰符与 v-for 的 key，以及模板到底被编译器编译成了什么——PatchFlag 与静态提升
+---
+
+# 模板语法与渲染
+
+React 用 JSX 描述 UI（本质是 JavaScript 函数调用），Vue 用**模板（template）**描述 UI（本质是 HTML 的超集）。模板看起来像 HTML，但编译器会把它**编译成渲染函数**，并且在这个过程中做大量静态分析。
+
+这一章先讲模板「能写什么」，再讲它「被编译成了什么」——后者是理解 Vue 性能模型的关键。
+
+## 1. 插值、绑定与事件
+
+### 1.1 文本与属性
+
+```vue
+<script setup>
+const msg = "Hello Vue";
+const count = 0;
+const isActive = true;
+</script>
+
+<template>
+  <p>{{ msg }}</p>
+  <p>{{ count + 1 }}</p>
+  <!-- 属性绑定用 v-bind，简写 : -->
+  <a :href="'https://' + msg">链接</a>
+  <!-- class / style 支持对象与数组语法 -->
+  <div :class="{ active: isActive }"></div>
+  <div :style="{ color: 'red' }"></div>
+</template>
+```
+
+`{{ }}` 里可以放任意 JS 表达式，但**只能是表达式，不能是语句**（不能写 `if`/`for`）。这和 JSX 里的 `{expr}` 是一样的限制。
+
+### 1.2 事件
+
+```vue
+<template>
+  <button @click="count++">+1</button>
+  <button @click="handleClick">点我</button>
+  <form @submit.prevent="onSubmit">提交</form>
+</template>
+```
+
+`@click` 是 `v-on:click` 的简写。事件处理函数可以直接写内联表达式（`count++`），也可以写函数名（Vue 会自动帮你调用，不用 `() =>`）。`.prevent` 是**事件修饰符**，等价于 `e.preventDefault()`，是在编译期生成的包装函数里做的。
+
+**动态参数**：属性名或事件名本身也可以是动态的，用方括号包住一个表达式。
+
+```vue
+<template>
+  <a :[attrName]="url">动态属性名</a>
+  <button @[eventName]="handler">动态事件名</button>
+</template>
+```
+
+## 2. 条件与列表
+
+### 2.1 v-if vs v-show
+
+```vue
+<template>
+  <p v-if="score >= 60">及格</p>
+  <p v-else-if="score >= 0">不及格</p>
+  <p v-else>未考试</p>
+
+  <p v-show="isVisible">频繁切换我</p>
+</template>
+```
+
+| | v-if | v-show |
+|---|---|---|
+| 切换开销 | 高（真正销毁/重建 DOM） | 低（只切 `display`） |
+| 初始开销 | 条件为假则不渲染，低 | 无论真假都渲染，高 |
+| 适用 | 不常切换 | 频繁切换 |
+| 能否配合 v-else | 能 | 不能 |
+
+### 2.2 v-for 与 key
+
+```vue
+<template>
+  <ul>
+    <li v-for="item in items" :key="item.id">{{ item.name }}</li>
+  </ul>
+</template>
+```
+
+`key` 必须**稳定且唯一**（用数据的 id，不要用数学下标 `index`）。原因和 React 的 `key` 完全一样：Vue 用 `key` 判断「前后两次渲染里，哪个节点对应哪个节点」。用 `index` 当 key，在列表头部插入一项后，所有节点的 key 都错位了，Vue 会错误地复用 DOM，导致输入框内容错位、状态串台。
+
+<Callout type="warn" title="v-if 和 v-for 不要写在同一元素上">
+在 Vue 3 里，如果 `v-if` 和 `v-for` 写在同一个元素上，`v-if` 的优先级更高，它会在 `v-for` 的变量还没定义时就求值，结果拿到 `undefined` 甚至报错。需要条件渲染列表时，用 `<template v-for>` 包一层，把 `v-if` 放到内层：
+
+```vue
+<template>
+  <ul>
+    <template v-for="item in items" :key="item.id">
+      <li v-if="item.visible">{{ item.name }}</li>
+    </template>
+  </ul>
+</template>
+```
+</Callout>
+
+## 3. 模板被编译成了什么
+
+这是本章最重要的部分。下面这段模板：
+
+```vue
+<template>
+  <div id="app" class="box">
+    <span>{{ msg }}</span>
+  </div>
+</template>
+```
+
+并不会被「当成 HTML 解析」。Vue 的编译器（@vue/compiler-dom）会把它编译成一个 JS 渲染函数，大致长这样：
+
+```js
+import { createElementVNode as _createElementVNode, toDisplayString as _toDisplayString, openBlock as _openBlock, createElementBlock as _createElementBlock } from "vue";
+
+export function render(_ctx, _cache) {
+  return (_openBlock(), _createElementBlock("div", { id: "app", class: "box" }, [
+    _createElementVNode("span", null, _toDisplayString(_ctx.msg), 1 /* TEXT */)
+  ]));
+}
+```
+
+注意两点：
+
+### 3.1 PatchFlag（编译期动态标记）
+
+`span` 末尾那个 `1 /* TEXT */` 就是 **PatchFlag**。编译器分析出这个 `span` 内部只有文本是动态的，于是打上 `TEXT` 标记。运行时 diff 时，Vue 看到这个标记，就**只更新它的文本内容**，不会去比对它的 class、不会去比对它的子结构——那些是静态的，编译期已经确定。
+
+常见的 PatchFlag：
+
+| 值 | 含义 |
+|---|---|
+| `TEXT (1)` | 文本内容是动态的 |
+| `CLASS (2)` | class 是动态的 |
+| `STYLE (4)` | style 是动态的 |
+| `PROPS (8)` | 某些 props 是动态的 |
+| `FULL_PROPS (16)` | props 完全动态（无法静态分析，要全量比较） |
+| `NEED_PATCH` | 需要打补丁（如 `ref`） |
+
+这就是为什么 Vue 的 diff 比「全树逐节点比较」快：它只在**编译期标记过的动态节点**上做工作。
+
+### 3.2 静态提升（hoistStatic）
+
+`<div id="app" class="box">` 这整个节点没有任何动态内容，编译器会把它的 VNode 提到渲染函数外面，**只创建一次**，之后每次渲染都复用同一个引用。这省掉了反复创建静态节点的开销。
+
+下面这个 Playground 用手写一个 mini 编译器产物，直观对比「朴素 diff 全树」和「带 PatchFlag 只比对动态部分」的检查次数差异。
+
+<Playground
+  language="typescript"
+  title="手写 h() 与 PatchFlag：模板到底编译成了什么"
+  id="vue-02-1"
+  code={`type VChild = string | VNode;
+
+interface VNode {
+  type: string;
+  props: Record<string, unknown>;
+  children: VChild[];
+  patchFlag: number;
+}
+
+const PatchFlags = {
+  TEXT: 1,
+  CLASS: 2,
+  PROPS: 8,
+  FULL_PROPS: 16,
+};
+
+// 模拟编译器产物：<div id="app" class="box"><span>{{ msg }}</span></div>
+function compile(): VNode {
+  return {
+    type: "div",
+    props: { id: "app", class: "box" },
+    patchFlag: 0,
+    children: [
+      {
+        type: "span",
+        props: {},
+        patchFlag: PatchFlags.TEXT,
+        children: ["__MSG__"],
+      },
+    ],
+  };
+}
+
+// 朴素 diff：遍历全部 props + 全部 children
+function naiveCount(n: VNode): number {
+  let c = 1;
+  for (const k in n.props) {
+    c++;
+  }
+  for (const ch of n.children) {
+    if (typeof ch === "string") {
+      c++;
+    } else {
+      c += naiveCount(ch);
+    }
+  }
+  return c;
+}
+
+// 带 patchFlag 的 diff：只数 patchFlag 非 0 节点的动态检查
+function flaggedCount(n: VNode): number {
+  let c = 0;
+  if (n.patchFlag !== 0) {
+    c += 1;
+  }
+  for (const ch of n.children) {
+    if (typeof ch !== "string") {
+      c += flaggedCount(ch);
+    }
+  }
+  return c;
+}
+
+const vnode = compile();
+console.log("朴素 diff 检查处数: " + naiveCount(vnode));
+console.log("带 patchFlag 检查处数: " + flaggedCount(vnode));
+
+// 静态提升：同一份静态 vnode 引用复用，只创建一次
+const hoisted = { type: "span", props: { class: "title" }, children: ["标题"], patchFlag: 0 };
+const ref1 = hoisted;
+const ref2 = hoisted;
+console.log("静态节点引用复用: " + (ref1 === ref2));`}
+  expectedOutput={`朴素 diff 检查处数: 5\n带 patchFlag 检查处数: 1\n静态节点引用复用: true\n`}
+/>
+
+`naiveCount` 数了 5 处（div 本身 + 2 个静态属性 + span 本身 + 1 个文本），而 `flaggedCount` 只数了 1 处（span 的 TEXT 标记）。真实模板里静态节点远多于动态节点，这个差距会非常悬殊——这就是编译期优化带来的收益。
+
+### 3.3 渲染函数与 JSX 作为逃生舱
+
+如果模板的表达力不够（比如要动态生成大量不同的标签），可以直接写渲染函数，或用 `@vitejs/plugin-vue-jsx` 写 JSX：
+
+```tsx
+import { h } from 'vue';
+
+// 渲染函数写法
+function render() {
+  return h('div', { class: 'box' }, [
+    h('span', count.value),
+  ]);
+}
+```
+
+绝大多数业务场景用模板就够了，渲染函数和 JSX 是「实在需要时才用」的逃生舱。
+
+## 4. 其他指令与陷阱
+
+```vue
+<template>
+  <!-- v-html：直接插入 HTML，有 XSS 风险 -->
+  <div v-html="rawHtml"></div>
+
+  <!-- v-once：只渲染一次，之后跳过更新 -->
+  <p v-once>{{ expensive }}</p>
+
+  <!-- v-memo：依赖数组不变就跳过更新（长列表行首选） -->
+  <div v-for="item in list" :key="item.id" v-memo="[item.id, item.price]">
+    {{ item.name }} {{ item.price }}
+  </div>
+
+  <!-- v-pre：跳过编译，原样输出（用于展示 {{ }} 本身） -->
+  <p v-pre>{{ 这段不会被编译 }}</p>
+</template>
+```
+
+`v-html` 会绕过 Vue 的转义，永远不要把用户输入直接塞进 `v-html`，否则就是 XSS 漏洞。
+
+<Callout type="exercise" title="练习 1：写出编译产物与 PatchFlag">
+对下面四段模板，请写出它们编译后大致的 VNode 结构，并标出每个动态节点应该打上哪个 PatchFlag（TEXT / CLASS / STYLE / PROPS / FULL_PROPS）：
+
+1. `<p>{{ title }}</p>`
+2. `<div :class="cls">文本固定</div>`
+3. `<button :style="btnStyle">{{ label }}</button>`
+4. `<input :[dynAttr]="val">`（属性名是动态的）
+
+<Answer>
+**参考答案：**
+
+1. `<p>{{ title }}</p>`
+   - VNode：`createElementVNode("p", null, toDisplayString(title), 1)`
+   - PatchFlag：**TEXT (1)**——只有文本动态。
+
+2. `<div :class="cls">文本固定</div>`
+   - VNode：`createElementVNode("div", { class: cls }, "文本固定", 2)`
+   - PatchFlag：**CLASS (2)**——只有 class 动态，文本是写死的（静态）。
+
+3. `<button :style="btnStyle">{{ label }}</button>`
+   - VNode：`createElementVNode("button", { style: btnStyle }, toDisplayString(label), 1 | 4)` 即 `TEXT | STYLE`
+   - PatchFlag：**TEXT + STYLE**——文本和 style 都动态，所以两个标记按位或（值为 5）。运行时只更新这两处。
+
+4. `<input :[dynAttr]="val">`
+   - 属性名是运行时才知道的，编译器无法静态分析到底会动哪个属性
+   - PatchFlag：**FULL_PROPS (16)**——props 完全动态，运行时只能全量比较这个节点的所有属性。
+
+**规律**：编译器能静态确定「动了哪」，就打精确的标记（TEXT/CLASS/STYLE/PROPS）；确定不了（属性名都动态了），就打 FULL_PROPS，退回全量比较。表达式越少越静态，Vue 优化得越彻底。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：key 用错的后果">
+一个列表 `v-for="(item, i) in list" :key="i"`，初始是 `[A, B, C]`。现在在头部插入一项变成 `[X, A, B, C]`。请说明：如果用 index 当 key，会发生什么视觉/状态错误？正确做法是什么？
+
+<Answer>
+**参考答案：**
+
+**用 index 当 key 时：**
+
+插入前：`key=0→A, key=1→B, key=2→C`
+插入后：`key=0→X, key=1→A, key=2→B, key=3→C`
+
+Vue 的复用逻辑是「key 相同就复用同一个 DOM 节点」。于是它认为：
+- `key=0` 还是那个节点，只是把内容从 A 改成 X
+- `key=1` 还是那个节点，内容 A→B
+- `key=2` 还是那个节点，内容 B→C
+- `key=3` 是新增，渲染 X... 实际因为 key 错位，复用的结果完全错乱
+
+**后果**：如果列表项里有输入框、选中状态、动画等「节点自身携带的状态」，这些状态会跟着节点（即跟着 key）走，而不是跟着数据走。比如你在 A 的输入框里打了字，插入 X 后，那个字会「跑到 X 上」，因为它绑的是 `key=0` 这个 DOM 节点，而不是 A 这条数据。
+
+**正确做法**：用数据自身的稳定 id 当 key：
+
+```vue
+<li v-for="item in list" :key="item.id">{{ item.name }}</li>
+```
+
+这样插入后：`id=A` 的节点原地不动，`id=X` 的节点才是真正新增的，状态正确跟随数据，不会串台。
+
+**一句话记忆**：key 是「数据的身份证」，要用数据里稳定唯一的字段，永远不要用会在增删时变化的数组下标。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：v-if 还是 v-show？">
+三段需求，分别该用 `v-if` 还是 `v-show`？并说明理由：
+
+1. 一个 Tab 面板的三个内容区，用户频繁点击切换
+2. 一个只有管理员才看得到的「管理后台入口」按钮，绝大多数用户永远看不到
+3. 一个表单的「错误提示」区域，提交失败时短暂出现、平时隐藏
+
+<Answer>
+**参考答案：**
+
+**1. Tab 内容区频繁切换 —— v-show**
+
+切换非常频繁，用 `v-show` 只切 `display`，DOM 节点始终保留，切换开销极低。如果用 `v-if`，每次切换都要销毁+重建整个 Tab 内容（含里面的子组件、状态、可能有的输入框内容），卡顿且状态丢失。
+
+**2. 管理员入口按钮 —— v-if**
+
+这个分支**几乎不切换**（要么你是管理员要么不是），而且非管理员根本不需要它在 DOM 里。用 `v-if` 直接不渲染，DOM 更干净、不泄露结构。即使偶尔切（登出/切换账号），重建一次代价也可忽略。
+
+**3. 错误提示区 —— 都可以，但 v-if 更常见**
+
+错误提示「平时隐藏、出错短暂出现」，切换不算频繁，用 `v-if` 更贴合语义（出错才创建节点）。但如果这个提示区内部有复杂组件、且切换较频繁（比如连续多次提交失败），`v-show` 体验更好。这道题没有唯一答案，关键看「切换频率」和「是否需要保留内部状态」——这正是 v-if/v-show 的选择标准。
+</Answer>
+</Callout>
+
+## 小结
+
+- 模板是 HTML 超集，被编译器编译成渲染函数；`{{ }}` 里只能放表达式
+- `:` 是 `v-bind`、 `@` 是 `v-on` 的简写；事件修饰符（`.prevent` 等）是编译期生成的包装
+- `v-if`（真销毁/重建，适合不常切换）与 `v-show`（切 `display`，适合频繁切换）开销不同
+- `v-for` 的 `key` 必须用数据稳定 id，绝不用 `index`；`v-if` 与 `v-for` 不要同级
+- 编译器给动态节点打 **PatchFlag**，运行时只 diff 被标记的部分；静态节点会被**静态提升**复用
+- `v-html` 有 XSS 风险，用户输入绝不直塞
+- 下一章我们进入组件与 props，看 `<script setup>` 是怎么把状态暴露给模板的 →

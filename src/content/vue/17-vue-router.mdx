@@ -1,0 +1,255 @@
+---
+title: Vue Router
+order: 17
+description: 路由配置、动态/嵌套/命名路由、编程式导航，以及用手写「匹配器」和「导航守卫流水线」理解路由内核
+---
+
+# Vue Router
+
+Vue 的官方路由。它把「URL ↔ 组件」映射起来，并提供 `<router-link>` / `<router-view>`、动态路由、嵌套路由、导航守卫。
+
+## 1. 基本配置
+
+```ts
+import { createRouter, createWebHistory } from 'vue-router';
+import Home from './pages/Home.vue';
+
+const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    { path: '/', component: Home },
+    { path: '/users/:id', component: () => import('./pages/User.vue'), name: 'user' },
+  ],
+});
+```
+
+```vue
+<template>
+  <nav>
+    <router-link to="/">首页</router-link>
+    <router-link :to="{ name: 'user', params: { id: 42 } }">用户 42</router-link>
+  </nav>
+  <router-view />   <!-- 匹配到的组件渲染在这里 -->
+</template>
+```
+
+`<router-link>` 渲染成 `<a>` 但做 SPA 跳转（不刷新页面）；`<router-view>` 是「路由出口」，根据当前 URL 显示对应组件。
+
+## 2. 动态 / 嵌套 / 命名路由
+
+```ts
+routes: [
+  { path: '/users/:id', component: User, name: 'user' },   // :id 是参数
+  {
+    path: '/dashboard',
+    component: Dashboard,
+    children: [                                            // 嵌套：出口在 Dashboard 内部
+      { path: 'stats', component: Stats },
+      { path: 'settings', component: Settings },
+    ],
+  },
+]
+```
+
+在组件里读参数：`const route = useRoute(); route.params.id`。编程式导航：`router.push('/users/42')` 或 `router.push({ name: 'user', params: { id: 42 } })`。
+
+## 3. 导航守卫
+
+守卫是「导航前/后」的钩子，可做权限、埋点、取消导航：
+
+```ts
+// 全局前置守卫
+router.beforeEach((to, from) => {
+  if (to.meta.requiresAuth && !isLoggedIn()) {
+    return '/login';   // 返回路径 = 重定向
+    // return false;   // 或取消导航
+  }
+});
+// 路由级 / 组件级：在 route 配置里写 beforeEnter，或在组件里用 beforeRouteEnter
+```
+
+`beforeEach` 返回：`true`/不返回 = 放行；`false` = 取消；字符串/对象 = 重定向到该路径；也可返回 `Promise`（异步校验）。
+
+## 4. 手搓路由匹配器
+
+`/users/:id` 这类带参数的路径，本质是「把 `:xxx` 编译成正则 + 捕获组」。下面 Playground 实现匹配：
+
+<Playground
+  language="typescript"
+  title="路由匹配器：把 :param 编译成正则"
+  id="vue-17-1"
+  code={`type RouteRecord = { path: string; name: string };
+type MatchResult = { name: string; params: Record<string, string> } | null;
+
+function compile(path: string): { regex: RegExp; keys: string[] } {
+  const keys: string[] = [];
+  const pattern = path.replace(/:([^/]+)/g, (_m, k) => {
+    keys.push(k as string);
+    return '([^/]+)';
+  });
+  return { regex: new RegExp('^' + pattern + '$'), keys };
+}
+
+function matchRoute(routes: RouteRecord[], location: string): MatchResult {
+  for (const r of routes) {
+    const { regex, keys } = compile(r.path);
+    const m = location.match(regex);
+    if (m) {
+      const params: Record<string, string> = {};
+      keys.forEach((k, i) => { params[k] = m[i + 1]; });
+      return { name: r.name, params };
+    }
+  }
+  return null;
+}
+
+const routes: RouteRecord[] = [
+  { path: '/', name: 'home' },
+  { path: '/users/:id', name: 'user' },
+  { path: '/users/:id/posts/:pid', name: 'post' },
+];
+console.log(JSON.stringify(matchRoute(routes, '/')));
+console.log(JSON.stringify(matchRoute(routes, '/users/42')));
+console.log(JSON.stringify(matchRoute(routes, '/users/42/posts/7')));
+console.log(JSON.stringify(matchRoute(routes, '/nope')));`}
+  expectedOutput={`{"name":"home","params":{}}\n{"name":"user","params":{"id":"42"}}\n{"name":"post","params":{"id":"42","pid":"7"}}\nnull\n`}
+/>
+
+`/users/42/posts/7` 匹配到 `post` 路由，`params` 正确拆出 `id=42`、`pid=7`。这就是 Vue Router 把路径「编译成正则」做匹配的核心思路（真实实现还处理正则编码、可选参数、星号通配等）。
+
+## 5. 手搓导航守卫流水线
+
+多个 `beforeEach` 守卫按顺序跑，前一个返回「重定向/取消」就短路；都放行才导航成功：
+
+<Playground
+  language="typescript"
+  title="导航守卫流水线：顺序执行 + 短路"
+  id="vue-17-2"
+  code={`type To = { path: string; meta?: { requiresAuth?: boolean } };
+type From = { path: string };
+type GuardResult = true | false | string;
+type Guard = (to: To, from: From) => GuardResult;
+
+function runGuards(guards: Guard[], to: To, from: From): { ok: boolean; redirect: string | null } {
+  for (const g of guards) {
+    const res = g(to, from);
+    if (res === true) continue;
+    if (res === false) return { ok: false, redirect: null };
+    return { ok: false, redirect: res as string };
+  }
+  return { ok: true, redirect: null };
+}
+
+let loggedIn = false;
+const requireAuth: Guard = (to) => {
+  if (to.meta && to.meta.requiresAuth && !loggedIn) return '/login';
+  return true;
+};
+const noGuest: Guard = (to) => {
+  if (to.path === '/login' && loggedIn) return '/';
+  return true;
+};
+const guards: Guard[] = [requireAuth, noGuest];
+
+const fromHome: From = { path: '/' };
+const toProfile: To = { path: '/profile', meta: { requiresAuth: true } };
+
+console.log('未登录访问 /profile -> ' + JSON.stringify(runGuards(guards, toProfile, fromHome)));
+loggedIn = true;
+console.log('已登录访问 /profile -> ' + JSON.stringify(runGuards(guards, toProfile, fromHome)));
+console.log('已登录访问 /login -> ' + JSON.stringify(runGuards(guards, { path: '/login' }, fromHome)));`}
+  expectedOutput={`未登录访问 /profile -> {"ok":false,"redirect":"/login"}\n已登录访问 /profile -> {"ok":true,"redirect":null}\n已登录访问 /login -> {"ok":false,"redirect":"/"}\n`}
+/>
+
+流水线依次跑 `requireAuth` → `noGuest`：未登录访问需鉴权的 `/profile` 被 `requireAuth` 重定向到 `/login`；已登录后放行；已登录却访问 `/login` 被 `noGuest` 弹回首页。真实 Vue Router 的守卫还支持**异步返回值（Promise）**，但「顺序执行、可短路重定向/取消」的骨架和这里完全一致。
+
+## 小结
+
+| 概念 | 说明 |
+|---|---|
+| `createRouter` + `routes` | 路由表：`path` / `component` / `name` / `children` |
+| `:id` 动态段 | 编译成正则 + 捕获组，匹配后落入 `route.params` |
+| `<router-link>` / `<router-view>` | 声明式跳转 / 路由出口 |
+| `beforeEach` 守卫 | 返回 `true` 放行、`false` 取消、路径重定向 |
+| 嵌套路由 | 父组件内再放 `<router-view>` 承接 `children` |
+
+<Callout type="exercise" title="练习 1：加一个动态路由">
+现有路由表，新增「文章详情」路由，路径 `/posts/:year/:slug`，在 `Post` 组件里读出 `year` 和 `slug`。
+
+<Answer>
+**参考答案：**
+
+```ts
+const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    { path: '/', component: Home },
+    { path: '/posts/:year/:slug', component: Post, name: 'post' },
+  ],
+});
+```
+
+```vue
+<!-- Post.vue -->
+<script setup lang="ts">
+import { useRoute } from 'vue-router';
+const route = useRoute();
+// route.params.year / route.params.slug
+</script>
+```
+
+`/posts/2024/hello` 会匹配，`route.params` 为 `{ year: '2024', slug: 'hello' }`。这就是第 4 节 Playground 匹配器的真实用途。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：写权限守卫">
+写一个 `beforeEach` 守卫：访问 `meta.requiresAuth` 为真的路由时，若 `localStorage` 没有 `token` 就重定向到 `/login`，并把原目标存到 `redirect` 查询参数。
+
+<Answer>
+**参考答案：**
+
+```ts
+router.beforeEach((to, from) => {
+  if (to.meta.requiresAuth && !localStorage.getItem('token')) {
+    return { path: '/login', query: { redirect: to.fullPath } };
+  }
+  return true;
+});
+```
+
+返回对象即「重定向到该路径」，这里带上 `redirect` 查询参数，登录成功后可 `router.push(route.query.redirect || '/')` 跳回原目标。返回 `true` 表示其余情况放行。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：嵌套路由出口">
+`/dashboard` 页面内要再显示 `stats` 和 `settings` 两个子页，且 URL 分别是 `/dashboard/stats`、`/dashboard/settings`。写出路由配置，并说明 `Dashboard.vue` 里需要什么。
+
+<Answer>
+**参考答案：**
+
+```ts
+const routes = [
+  {
+    path: '/dashboard',
+    component: Dashboard,
+    children: [
+      { path: 'stats', component: Stats },
+      { path: 'settings', component: Settings },
+    ],
+  },
+];
+```
+
+`Dashboard.vue` 里必须再放一个 `<router-view />` 作为子路由出口：
+
+```vue
+<!-- Dashboard.vue -->
+<template>
+  <aside><router-link to="/dashboard/stats">统计</router-link></aside>
+  <router-view />   <!-- stats / settings 渲染在这里 -->
+</template>
+```
+
+`children` 里的 `path` 不带前导 `/`（相对父路径）。访问 `/dashboard/stats` 时，`Dashboard` 在外层 `<router-view>`，`Stats` 在内层 `<router-view>`。
+</Answer>
+</Callout>

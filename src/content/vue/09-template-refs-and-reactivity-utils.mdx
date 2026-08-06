@@ -1,0 +1,310 @@
+---
+title: 模板引用与响应式工具
+order: 9
+description: 模板 ref、shallowRef / markRaw / customRef / toRef 等响应式工具，以及它们分别解决的「大对象性能」「跳过代理」「自定义 getter/setter」问题
+---
+
+# 模板引用与响应式工具
+
+前几章的响应式都发生在「数据 → 视图」方向。本章补上两个方向：
+
+1. **视图 → 数据**：用 **模板 ref** 拿到真实 DOM / 组件实例。
+2. **更精细的数据控制**：`shallowRef` / `shallowReactive` / `markRaw` / `customRef` / `toRef` / `readonly` 等工具，分别解决不同的性能与语义问题。
+
+## 1. 模板 ref
+
+想在 JS 里操作某个 DOM 节点（聚焦输入框、量宽高、调用第三方库），给元素加 `ref` 属性，并用同名的 `ref()` 接住：
+
+```vue
+<script setup lang="ts">
+import { ref, onMounted } from 'vue';
+
+const inputRef = ref<HTMLInputElement | null>(null);
+
+onMounted(() => {
+  inputRef.value?.focus(); // 挂载后自动聚焦
+});
+</script>
+
+<template>
+  <input ref="inputRef" />
+</template>
+```
+
+规则：
+
+- `ref="inputRef"` 的 `inputRef` 必须和 `<script setup>` 里声明的变量**同名**。
+- 组件挂载前 `inputRef.value` 是 `null`；只能在 `onMounted` 之后用。
+- 给**子组件**加 `ref`，拿到的是组件**实例**（公开了 `defineExpose` 的成员），不是 DOM。
+
+Vue 3.5+ 还提供 `useTemplateRef('inputRef')`，把字符串名字传进去，语义更清晰：
+
+```ts
+const inputRef = useTemplateRef<HTMLInputElement>('inputRef');
+```
+
+## 2. shallowRef / shallowReactive：跳过深层代理
+
+默认 `ref` / `reactive` 会**递归**把每一层都变成响应式的。这对大对象（比如一个 10 万节点的树、一个从 canvas 库拿到的结构）很浪费，而且你根本不需要深层响应——你只关心「整个换掉」。
+
+```ts
+import { shallowRef, shallowReactive, triggerRef } from 'vue';
+
+// shallowRef：只有 .value 整体替换才触发更新
+const bigList = shallowRef([/* 一万个元素 */]);
+bigList.value.push(1);        // ❌ 不触发（改的是内部数组，没换 .value）
+bigList.value = [...bigList.value, 1]; // ✅ 换引用才触发
+
+// 想就地改又想通知，用 triggerRef 手动触发
+bigList.value.push(2);
+triggerRef(bigList);          // ✅ 手动触发一次
+
+// shallowReactive：只有根属性替换才触发
+const state = shallowReactive({ nested: { count: 0 } });
+state.nested.count++;         // ❌ 不触发（nested 不是深层代理）
+state.nested = { count: 1 };  // ✅ 触发
+```
+
+**经验法则**：数据来自「外部命令式库」（地图、图表、音频上下文）或体积极大且整块替换时，用 `shallowRef`。
+
+## 3. markRaw：明确不要代理
+
+有些对象**永远不该**被代理（第三方类实例、`window`、函数）。`reactive` 遇到它们会报警或行为异常，用 `markRaw` 标记后 `reactive` 直接原样返回：
+
+```ts
+import { reactive, markRaw } from 'vue';
+import ThirdPartyChart from 'some-lib';
+
+const state = reactive({
+  chart: markRaw(new ThirdPartyChart()), // 不代理，原样存
+});
+```
+
+`markRaw` 永久生效：被标记的对象无论放进哪个 `reactive` 都不会再被代理。
+
+## 4. customRef：自定义 getter/setter
+
+`customRef` 让你完全接管「读 / 写」逻辑——读写时做什么、何时 `track` / `trigger`，由你定。最经典的用途是 **防抖 ref**。
+
+<Playground
+  language="typescript"
+  title="customRef + fake timer：手写防抖 ref"
+  id="vue-09-1"
+  code={`// ---- 极简响应系统（与第 7 章同源） ----
+type Dep = Set<Effect>;
+const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
+let activeEffect: Effect | null = null;
+interface Effect { deps: Dep[]; run: () => void; }
+function effect(fn: () => void): Effect {
+  const e: Effect = {
+    deps: [],
+    run: () => {
+      for (const d of e.deps) d.delete(e);
+      e.deps.length = 0;
+      activeEffect = e;
+      try { fn(); } finally { activeEffect = null; }
+    },
+  };
+  e.run();
+  return e;
+}
+function track(t: object, k: PropertyKey): void {
+  if (!activeEffect) return;
+  let m = targetMap.get(t);
+  if (!m) { m = new Map(); targetMap.set(t, m); }
+  let dep = m.get(k);
+  if (!dep) { dep = new Set(); m.set(k, dep); }
+  dep.add(activeEffect);
+  activeEffect.deps.push(dep);
+}
+function trigger(t: object, k: PropertyKey): void {
+  const m = targetMap.get(t);
+  if (!m) return;
+  const dep = m.get(k);
+  if (!dep) return;
+  for (const e of [...dep]) if (e !== activeEffect) e.run();
+}
+
+// ---- 可手动推进的 fake timer（保证输出确定） ----
+let now = 0, tid = 0;
+const timers: { id: number; due: number; cb: () => void }[] = [];
+function fakeSetTimeout(cb: () => void, delay: number): number {
+  const id = ++tid; timers.push({ id, due: now + delay, cb }); return id;
+}
+function fakeClear(id: number): void {
+  const i = timers.findIndex((t) => t.id === id);
+  if (i >= 0) timers.splice(i, 1);
+}
+function flush(ms: number): void {
+  const end = now + ms;
+  while (timers.length) {
+    timers.sort((a, b) => a.due - b.due);
+    const job = timers[0];
+    if (job.due > end) break;
+    timers.shift(); now = job.due; job.cb();
+  }
+  now = end;
+}
+
+// ---- customRef：把 track / trigger 交给使用者 ----
+interface Ref<T> { get value(): T; set value(v: T); }
+function customRef<T>(factory: (track: () => void, trigger: () => void) => { get: () => T; set: (v: T) => void }): Ref<T> {
+  const ref: { value: T } = {} as any;
+  const impl = factory(
+    () => track(ref, 'value'),
+    () => trigger(ref, 'value'),
+  );
+  Object.defineProperty(ref, 'value', {
+    get() { return impl.get(); },
+    set(v: T) { impl.set(v); },
+    configurable: true,
+  });
+  return ref as Ref<T>;
+}
+
+// ---- 防抖 ref：300ms 内的连续写入只生效最后一次 ----
+function debouncedRef(initial: string, delay = 300): Ref<string> {
+  let _v = initial;
+  let timer: number | null = null;
+  return customRef<string>((track, trigger) => ({
+    get() { track(); return _v; },
+    set(nv: string) {
+      if (timer !== null) fakeClear(timer);          // 取消上一次待触发的定时器
+      timer = fakeSetTimeout(() => { _v = nv; timer = null; trigger(); }, delay);
+    },
+  }));
+}
+
+const text = debouncedRef('', 300);
+let runs = 0;
+effect(() => { runs++; console.log("[effect] text=" + text.value); });
+console.log("--- 连续输入 a b c（每 100ms），debounce 300ms ---");
+text.value = 'a'; flush(100);
+text.value = 'b'; flush(100);
+text.value = 'c'; flush(400);
+console.log("runs = " + runs);`}
+  expectedOutput={`[effect] text=\n--- 连续输入 a b c（每 100ms），debounce 300ms ---\n[effect] text=c\nruns = 2\n`}
+/>
+
+`customRef` 把响应式系统的「仪表盘」交给你：`track()` 在 getter 里声明依赖，`trigger()` 在 setter 里广播变更。上面的 `debouncedRef` 在 setter 里用 fake timer 把多次写入合并成一次 `trigger`——effect 从初始的 1 次，到防抖结束后只再跑 1 次（共 2 次），而不是每次按键都跑。`useVModel`、`useStorage`、各类「写入落库」的 ref 都基于它。
+
+## 5. toRef / toRefs / isRef / unref / readonly
+
+```ts
+import { reactive, toRef, toRefs, isRef, unref, readonly } from 'vue';
+
+const state = reactive({ x: 1, y: 2 });
+
+// toRef：给某个属性单独造一个「会随源更新」的 ref（属性可能原本不存在也好用）
+const xRef = toRef(state, 'x');
+xRef.value++;          // state.x 变成 2
+state.x = 10;          // xRef.value 变成 10（双向）
+
+// toRefs：解构 reactive 而不丢响应（见第 8 章 Playground）
+const { x, y } = toRefs(state);
+
+// isRef / unref：运行时判断与取值
+isRef(x);              // true
+unref(x);              // 等价于 isRef(x) ? x.value : x，拿到 10
+
+// readonly：包装成只读，改它会报警（用于把 store 状态对外暴露时防误改）
+const locked = readonly(state);
+locked.x = 5;          // ⚠ 开发环境下警告，不生效
+```
+
+## 小结
+
+| 工具 | 解决什么 |
+|---|---|
+| 模板 `ref` / `useTemplateRef` | 从视图拿 DOM / 组件实例 |
+| `shallowRef` / `shallowReactive` | 大对象只关心整体替换，省去深层代理开销 |
+| `triggerRef` | 就地改 shallowRef 后手动通知 |
+| `markRaw` | 明确某个对象永远不该被代理 |
+| `customRef` | 自定义 getter/setter（防抖、落库、v-model 桥接） |
+| `toRef` / `toRefs` | 不丢响应地解构 |
+| `isRef` / `unref` / `readonly` | 运行时判断、安全取值、只读保护 |
+
+<Callout type="exercise" title="练习 1：聚焦输入框">
+组件挂载后自动让输入框获得焦点，并提供一个按钮「重新聚焦」。用模板 ref 实现（不需要真实 DOM 环境，写出 `<script setup>` 即可）。
+
+<Answer>
+**参考答案：**
+
+```vue
+<script setup lang="ts">
+import { ref } from 'vue';
+
+const inputRef = ref<HTMLInputElement | null>(null);
+
+function focus() {
+  inputRef.value?.focus();
+}
+</script>
+
+<template>
+  <input ref="inputRef" />
+  <button @click="focus">重新聚焦</button>
+</template>
+```
+
+要点：`ref="inputRef"` 与脚本里的 `inputRef` 同名；DOM 只在挂载后存在，所以聚焦操作通过点击事件（必然在挂载后）或 `onMounted` 触发。`inputRef.value` 类型是 `HTMLInputElement | null`，取成员前用可选链 `?.`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：为什么 shallowRef 下 push 不更新？">
+下面代码为什么界面不更新？给出两种修复方式。
+
+```ts
+const list = shallowRef<number[]>([]);
+list.value.push(1); // 视图没变
+```
+
+<Answer>
+**原因：** `shallowRef` 只对 `.value` **整体替换**响应。`.push` 改的是内部数组，没有换 `.value` 引用，所以不触发。
+
+**修复 1 — 换引用（推荐，函数式）：**
+```ts
+list.value = [...list.value, 1];
+```
+
+**修复 2 — 就地改 + 手动触发：**
+```ts
+list.value.push(1);
+triggerRef(list);
+```
+
+如果数据要频繁就地改且必须响应，那其实不该用 `shallowRef`，应该改用普通 `ref`（`ref` 默认深层响应）。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：用 customRef 写 useLocalStorage">
+写一个 `useLocalStorage(key, default)`：返回一个 ref，读时从 `localStorage` 取值、写时同步写回。用 `customRef` 实现（不需要真 `localStorage`，可以假定一个 `store` 对象模拟）。
+
+<Answer>
+**参考答案（用 `store` 对象模拟 localStorage）：**
+
+```ts
+const store: Record<string, string> = {};
+
+function useLocalStorage(key: string, fallback: string) {
+  return customRef<string>((track, trigger) => ({
+    get() {
+      track();
+      return key in store ? store[key] : fallback;
+    },
+    set(v: string) {
+      store[key] = v;     // 写回「存储」
+      trigger();          // 通知依赖
+    },
+  }));
+}
+
+const name = useLocalStorage('name', 'guest');
+console.log(name.value); // 'guest'
+name.value = 'Ada';      // 写入 store.name
+console.log(store.name); // 'Ada'
+```
+
+这就是 `customRef` 的第二个经典场景：把「读/写」桥接到外部存储（localStorage、sessionStorage、IndexedDB）。VueUse 的 `useStorage` 内部正是 `customRef` + 序列化。
+</Answer>
+</Callout>

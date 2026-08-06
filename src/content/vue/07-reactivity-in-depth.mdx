@@ -1,0 +1,471 @@
+---
+title: 响应式原理：Proxy、依赖收集与 effect
+order: 7
+description: 手写 reactive 与 effect，弄清 targetMap 的三层结构、嵌套 effect 栈、依赖清理与 stop
+---
+
+# 响应式原理：Proxy、依赖收集与 effect
+
+前几章我们一直「在用」响应式，这一章我们**亲手实现**它。理解原理后，很多「为什么这样设计」的问题会豁然开朗：为什么 `reactive` 不能整体替换、为什么解构会丢响应、为什么 Vue 3 比 Vue 2 强。
+
+Vue 3 的响应式核心是四个东西：
+
+1. **`reactive`**：用 `Proxy` 包裹对象，拦截读写
+2. **`track`**：读的时候，把「当前正在运行的副作用」收集到这个属性的依赖集合里
+3. **`trigger`**：写的时候，找出这个属性的依赖集合，挨个重新运行
+4. **`effect`**：一个会收集依赖、发生变化时重跑的函数
+
+## 1. 三层依赖表 targetMap
+
+Vue 用一张三层表维护「谁依赖了谁」：
+
+```
+targetMap: WeakMap<原始对象, Map<属性名, Set<副作用>>>
+             ① 对象       ② 属性        ③ 订阅该属性的副作用集合
+```
+
+读 `obj.x` 时：在 ① 找到 `obj` 的表，在 ② 找到 `x` 的依赖集合，把「当前 effect」加进去。
+写 `obj.x` 时：在 ② 找到 `x` 的依赖集合，把里面的 effect 全部重跑。
+
+## 2. Proxy 的 get/set 陷阱
+
+`Proxy` 让我们能拦截对象的所有读写：
+
+```ts
+const proxy = new Proxy(raw, {
+  get(obj, key, receiver) {
+    track(obj, key);                       // 读时收集依赖
+    return Reflect.get(obj, key, receiver);
+  },
+  set(obj, key, value, receiver) {
+    const old = obj[key];
+    const result = Reflect.set(obj, key, value, receiver);
+    if (!Object.is(old, value)) trigger(obj, key); // 变了才通知
+    return result;
+  },
+});
+```
+
+要点：
+
+- 用 `Reflect.get/set` 而不是 `obj[key]`，并且把 `receiver` 传进去——这样当对象有继承（如 `extends`、或属性来自原型）时，`this` 指向正确，原型上的 getter 也能正常工作
+- `Reflect.set` 返回布尔值，表示设置是否成功，原样返回
+- **同值不触发**：`Object.is(old, value)` 为 true 就跳过，这就是 Vue 避免无谓重渲染的第一道关卡（第 4 章见过）
+
+### 2.1 惰性深度代理
+
+`get` 里发现读到的属性是个对象，才递归 `reactive()` 它。好处：只有真正被读到的嵌套对象才被代理，大对象不用的部分不会被深度遍历。而且用 `reactiveMap` 缓存，保证**同一个原始对象永远对应同一个代理**（否则 `a.b === a.b` 会 false）。
+
+### 2.2 嵌套 effect 用栈
+
+如果 effect 里又运行了另一个 effect（组合式函数很常见），`activeEffect` 不能只是单个变量，否则内层 effect 会把外层的依赖搞乱。用**栈**：进内层前 push，出内层后 pop 还原。
+
+## 3. 依赖清理与 stop
+
+每次 effect 重跑前，要先把上一次收集的依赖**全部删掉**，再重新收集。为什么？看一个分支：
+
+```ts
+effect(() => {
+  document.title = state.ok ? state.text : 'nothing';
+});
+```
+
+- 第一次 `ok=false`：只读了 `ok`，依赖是 `{ ok }`，**没读 `text`**
+- 后来 `ok=true`：这次读了 `text`，依赖应是 `{ ok, text }`
+- 如果**不清理**旧依赖，`text` 被加上了，但 `ok=false` 时的依赖残留还在——之后 `text` 变不相关了，effect 却还会被 `text` 的变化错误触发
+
+所以每次重跑都要 `cleanup`（从所有依赖集合里删掉自己），再重新 track。`stop()` 则是彻底卸载：清理依赖 + 标记 `active=false`，之后任何写入都不再触发它。
+
+## 4. 亲手实现 reactive + effect
+
+下面两个 Playground 把整套机制写出来跑一遍。
+
+<Playground
+  language="typescript"
+  title="reactive() 的 Proxy 陷阱：track / trigger 全过程"
+  id="vue-07-1"
+  code={`type Dep = Set<ReactiveEffect>;
+type KeyToDepMap = Map<PropertyKey, Dep>;
+
+const targetMap = new WeakMap<object, KeyToDepMap>();
+let activeEffect: ReactiveEffect | null = null;
+const effectStack: ReactiveEffect[] = [];
+
+interface ReactiveEffect {
+  deps: Dep[];
+  active: boolean;
+  run: () => void;
+  stop: () => void;
+}
+
+function cleanup(e: ReactiveEffect): void {
+  for (const dep of e.deps) {
+    dep.delete(e);
+  }
+  e.deps.length = 0;
+}
+
+function effect(fn: () => void): ReactiveEffect {
+  const e: ReactiveEffect = {
+    deps: [],
+    active: true,
+    run: () => {
+      if (!e.active) {
+        fn();
+        return;
+      }
+      if (!effectStack.includes(e)) {
+        cleanup(e);
+        try {
+          effectStack.push(e);
+          activeEffect = e;
+          fn();
+        } finally {
+          effectStack.pop();
+          activeEffect = effectStack[effectStack.length - 1] ?? null;
+        }
+      }
+    },
+    stop: () => {
+      if (e.active) {
+        cleanup(e);
+        e.active = false;
+      }
+    },
+  };
+  e.run();
+  return e;
+}
+
+function track(target: object, key: PropertyKey): void {
+  if (!activeEffect) return;
+  let depsMap = targetMap.get(target);
+  if (!depsMap) {
+    depsMap = new Map();
+    targetMap.set(target, depsMap);
+  }
+  let dep = depsMap.get(key);
+  if (!dep) {
+    dep = new Set();
+    depsMap.set(key, dep);
+  }
+  dep.add(activeEffect);
+  activeEffect.deps.push(dep);
+}
+
+function trigger(target: object, key: PropertyKey): void {
+  const depsMap = targetMap.get(target);
+  if (!depsMap) return;
+  const dep = depsMap.get(key);
+  if (!dep) return;
+  const effects = new Set(dep);
+  for (const e of effects) {
+    if (e !== activeEffect) e.run();
+  }
+}
+
+const RAW = Symbol('raw');
+
+function isObject(v: unknown): v is object {
+  return typeof v === 'object' && v !== null;
+}
+
+const reactiveMap = new WeakMap<object, object>();
+
+function reactive<T extends object>(target: T): T {
+  if (!isObject(target)) return target;
+  if ((target as Record<symbol, unknown>)[RAW]) return target;
+  const existing = reactiveMap.get(target);
+  if (existing) return existing as T;
+
+  const proxy = new Proxy(target, {
+    get(obj: object, key: string | symbol, receiver: any) {
+      if (key === RAW) return target;
+      const res = Reflect.get(obj, key, receiver);
+      track(obj, key);
+      if (isObject(res)) return reactive(res as object) as object;
+      return res;
+    },
+    set(obj: object, key: string | symbol, value: any, receiver: any) {
+      const oldVal = (obj as Record<string | symbol, unknown>)[key];
+      const hadKey = Object.prototype.hasOwnProperty.call(obj, key);
+      const result = Reflect.set(obj, key, value, receiver);
+      if (!hadKey) {
+        trigger(obj, key);
+      } else if (!Object.is(oldVal, value)) {
+        trigger(obj, key);
+      }
+      return result;
+    },
+  });
+
+  reactiveMap.set(target, proxy);
+  return proxy as T;
+}
+
+// ---- 测试 ----
+const state = reactive({ count: 1, user: { name: 'Ada' } });
+
+let aRuns = 0;
+let bRuns = 0;
+
+const effA = effect(() => {
+  aRuns++;
+  console.log("effectA: " + state.count);
+});
+const effB = effect(() => {
+  bRuns++;
+  console.log("effectB: " + state.user.name);
+});
+
+console.log("--- 改 count ---");
+state.count = 2;
+
+console.log("--- 改 user.name ---");
+state.user.name = 'Grace';
+
+console.log("--- 赋相同值 ---");
+state.count = 2;
+
+console.log("aRuns=" + aRuns + " bRuns=" + bRuns);
+
+const raw = (state as unknown as Record<symbol, unknown>)[RAW] as object;
+const userProxy = state.user;
+const userRaw = (userProxy as unknown as Record<symbol, unknown>)[RAW] as object;
+const depsForCount = targetMap.get(raw)?.get('count');
+const depsForName = targetMap.get(userRaw)?.get('name');
+console.log("count 的依赖数: " + (depsForCount ? depsForCount.size : 0));
+console.log("user.name 的依赖数: " + (depsForName ? depsForName.size : 0));
+
+const r1 = reactive(state);
+const r2 = reactive(state);
+console.log("reactive(o) === reactive(o): " + (r1 === r2));`}
+  expectedOutput={`effectA: 1\neffectB: Ada\n--- 改 count ---\neffectA: 2\n--- 改 user.name ---\neffectB: Grace\n--- 赋相同值 ---\naRuns=2 bRuns=2\ncount 的依赖数: 1\nuser.name 的依赖数: 1\nreactive(o) === reactive(o): true\n`}
+/>
+
+输出证明：改 `count` 只触发 effectA，改 `user.name` 只触发 effectB（惰性深度代理生效，两个属性各自有独立依赖集合），赋相同值不触发。`reactive(o) === reactive(o)` 为 true 证明代理身份唯一。
+
+<Playground
+  language="typescript"
+  title="依赖清理与 stop()：分支切换的过期依赖"
+  id="vue-07-2"
+  code={`type Dep = Set<ReactiveEffect>;
+const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
+let activeEffect: ReactiveEffect | null = null;
+
+interface ReactiveEffect {
+  deps: Dep[];
+  active: boolean;
+  run: () => void;
+  stop: () => void;
+}
+
+function cleanup(e: ReactiveEffect): void {
+  for (const dep of e.deps) dep.delete(e);
+  e.deps.length = 0;
+}
+
+function effect(fn: () => void, doCleanup = true): ReactiveEffect {
+  const e: ReactiveEffect = {
+    deps: [],
+    active: true,
+    run: () => {
+      if (!e.active) { fn(); return; }
+      if (doCleanup) cleanup(e);
+      activeEffect = e;
+      try { fn(); } finally { activeEffect = null; }
+    },
+    stop: () => { if (e.active) { cleanup(e); e.active = false; } },
+  };
+  e.run();
+  return e;
+}
+
+function track(target: object, key: PropertyKey): void {
+  if (!activeEffect) return;
+  let m = targetMap.get(target);
+  if (!m) { m = new Map(); targetMap.set(target, m); }
+  let dep = m.get(key);
+  if (!dep) { dep = new Set(); m.set(key, dep); }
+  dep.add(activeEffect);
+  activeEffect.deps.push(dep);
+}
+
+function trigger(target: object, key: PropertyKey): void {
+  const m = targetMap.get(target);
+  if (!m) return;
+  const dep = m.get(key);
+  if (!dep) return;
+  for (const e of new Set(dep)) if (e !== activeEffect) e.run();
+}
+
+function isObject(v: unknown): v is object { return typeof v === 'object' && v !== null; }
+const reactiveMap = new WeakMap<object, object>();
+const RAW = Symbol('raw');
+function reactive<T extends object>(target: T): T {
+  if (!isObject(target)) return target;
+  if ((target as Record<symbol, unknown>)[RAW]) return target;
+  const existing = reactiveMap.get(target);
+  if (existing) return existing as T;
+  const proxy = new Proxy(target, {
+    get(obj: object, key: string | symbol, receiver: any) {
+      if (key === RAW) return target;
+      const res = Reflect.get(obj, key, receiver);
+      track(obj, key);
+      if (isObject(res)) return reactive(res as object) as object;
+      return res;
+    },
+    set(obj: object, key: string | symbol, value: any, receiver: any) {
+      const oldVal = (obj as Record<string | symbol, unknown>)[key];
+      const hadKey = Object.prototype.hasOwnProperty.call(obj, key);
+      const result = Reflect.set(obj, key, value, receiver);
+      if (!hadKey || !Object.is(oldVal, value)) trigger(obj, key);
+      return result;
+    },
+  });
+  reactiveMap.set(target, proxy);
+  return proxy as T;
+}
+
+// ===== 场景：分支切换导致依赖变化 =====
+const stateA = reactive({ ok: false, text: 'hi' });
+
+// 版本一：开启 cleanup（正确行为）
+let runCount1 = 0;
+const eff1 = effect(() => {
+  runCount1++;
+  const v = stateA.ok ? stateA.text : 'nothing';
+  console.log("[cleanup] #" + runCount1 + " ok=" + stateA.ok + " -> " + v);
+});
+// ok=false 时依赖只有 {ok}
+stateA.ok = true;   // 触发，依赖变 {ok, text}
+stateA.text = 'a';  // 触发（ok=true 依赖 text）
+stateA.ok = false;  // 触发，依赖变回 {ok}（text 被清理）
+stateA.text = 'b';  // 不触发（ok=false 不读 text）
+console.log("开启 cleanup 时总 runCount = " + runCount1);
+
+// 版本二：关闭 cleanup（残留过期依赖，错误行为），用独立对象避免互相干扰
+const stateB = reactive({ ok: false, text: 'hi' });
+let runCount2 = 0;
+const eff2 = effect(() => {
+  runCount2++;
+  const v = stateB.ok ? stateB.text : 'nothing';
+  console.log("[no-cleanup] #" + runCount2 + " ok=" + stateB.ok + " -> " + v);
+}, false);
+stateB.ok = true;
+stateB.text = 'a';
+stateB.ok = false;
+stateB.text = 'b';  // 错误地触发了！因为 text 仍残留在 deps 里（此时 ok=false，本不该读 text）
+console.log("关闭 cleanup 时总 runCount = " + runCount2);
+
+// ===== stop 演示 =====
+const stateC = reactive({ n: 1 });
+let runCount3 = 0;
+const eff3 = effect(() => {
+  runCount3++;
+  console.log("[stop-demo] #" + runCount3 + " n = " + stateC.n);
+});
+stateC.n = 2;
+eff3.stop();
+stateC.n = 3; // 不再触发
+console.log("stop 后 runCount = " + runCount3);`}
+  expectedOutput={`[cleanup] #1 ok=false -> nothing\n[cleanup] #2 ok=true -> hi\n[cleanup] #3 ok=true -> a\n[cleanup] #4 ok=false -> nothing\n开启 cleanup 时总 runCount = 4\n[no-cleanup] #1 ok=false -> nothing\n[no-cleanup] #2 ok=true -> hi\n[no-cleanup] #3 ok=true -> a\n[no-cleanup] #4 ok=false -> nothing\n[no-cleanup] #5 ok=false -> nothing\n关闭 cleanup 时总 runCount = 5\n[stop-demo] #1 n = 1\n[stop-demo] #2 n = 2\nstop 后 runCount = 2\n`}
+/>
+
+关键对比：`ok` 切回 `false` 后，`state.text` 已不再被读取。开启 cleanup 的版本**不再**因 `text` 变化而重跑（runCount 停在 4）；关闭 cleanup 的版本因为 `text` 依赖残留，错误地多跑了一次（runCount = 5，多打印了一行 `[no-cleanup] render: b`）。这正是 Vue 每次重跑 effect 前必须 `cleanup` 的原因。
+
+<Callout type="exercise" title="练习 1：画出 targetMap">
+对 `reactive({ a: 1, b: { c: 2 } })`，注册两个 effect：
+- eff1 读 `a`
+- eff2 读 `b.c`
+
+写出此时 `targetMap` 的完整结构（用 `{ 原始对象 → { 属性 → [effect] } }` 表示）。
+
+<Answer>
+**参考答案：**
+
+```
+targetMap = WeakMap {
+  原始对象{ a, b } → Map {
+    'a' → Set { eff1 },
+    'b' → Set { eff2 },        // 因为读 b 时也访问了 b，b 被 track
+  },
+  原始对象 b(即 { c: 2 }) → Map {
+    'c' → Set { eff2 },
+  }
+}
+```
+
+注意两点：
+1. `b` 本身也被 track（eff2 读 `state.b.c`，先访问 `state.b` 触发了 `b` 的 track），所以外层对象的 `b` 键依赖里也有 eff2。这意味着「把整个 `b` 替换成新对象」也会触发 eff2（因为 `b` 的 set 触发了）。
+2. `eff2` 同时出现在**两个**对象的两个属性依赖里（外层 `b`、内层 `c`）——这是嵌套 effect / 嵌套代理的正常结果。改 `a` 只触发 eff1，改 `b.c` 触发 eff2（通过内层 `c` 的 Set）。
+
+这正解释了第 7 章开篇说的「三层表」：对象 → 属性 → effect 集合。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：新增 key 与修改 key 的触发差异">
+在 `reactive({})` 上，分别执行 `obj.x = 1`（新增 key）和 `obj.x = 2`（修改已有 key）。两者都会触发 `trigger(obj, 'x')` 吗？为什么 `set` 陷阱里要区分 `hadKey`？提示：考虑 `for...in`、数组 `length`、以及 `ITERATE_KEY` 这种「集合级依赖」。
+
+<Answer>
+**参考答案：**
+
+**两者都会触发 `trigger(obj, 'x')`（属性级依赖）。** 但 Vue 还要区分「新增」和「修改」，因为有一类**集合级依赖**只在「新增/删除 key」时才需要触发：
+
+- 读对象时用 `for...in` / `Object.keys` / `Object.values` 的代码，本质是依赖了「这个对象有哪些 key」。这类依赖在 Vue 里登记在一个特殊 key 上（常叫 `ITERATE_KEY`）。
+- **新增 key**：key 的数量变了，依赖 `ITERATE_KEY` 的 effect 必须重跑（否则 `for...in` 遍历出来的内容没更新）。
+- **修改已有 key（值变了但 key 数量不变）**：`ITERATE_KEY` 的 effect 不需要重跑——遍历出来的 key 集合没变。
+
+所以 `set` 陷阱里：
+- `!hadKey`（新增）→ 既要 `trigger(obj, key)`（属性级），也要 `trigger(obj, ITERATE_KEY)`（集合级）
+- `hadKey && 值变了` → 只 `trigger(obj, key)`（属性级）
+
+这就是为什么要用 `hadKey`（即 `Object.prototype.hasOwnProperty.call(obj, key)`）区分。数组也有类似逻辑：`arr.push` 会同时改 `length` 和新增下标，需要触发 `length` 的依赖。Vue 2 用 `Vue.set` 手动触发这些集合级依赖，Vue 3 在 `set`/`deleteProperty` 陷阱里自动处理。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：手写 readonly">
+实现一个 `readonly(obj)`：读时照常 track，但写/删只 warn 不生效。并说明它为什么**不需要** track（即只读数据为什么通常不会被当作响应式依赖的来源，除非你主动读它）。
+
+<Answer>
+**参考答案：**
+
+```ts
+function readonly<T extends object>(target: T): T {
+  return new Proxy(target, {
+    get(obj, key, receiver) {
+      const res = Reflect.get(obj, key, receiver);
+      track(obj, key);                       // 读时仍收集依赖（如果你读了只读数据，当然要被通知）
+      return isObject(res) ? readonly(res as object) : res;
+    },
+    set() {
+      console.warn('readonly: 不能修改');
+      return true;                            // 不真正设置，返回成功避免抛错
+    },
+    deleteProperty() {
+      console.warn('readonly: 不能删除');
+      return true;
+    },
+  }) as T;
+}
+```
+
+**为什么不「需要」track（更准确说：只读数据也会被 track，只是它永远不会变）：**
+
+`readonly` 的 `set`/`deleteProperty` 不真正修改数据，所以**永远不会 `trigger`**。因此即便 effect 读了 `readonly` 对象并把自己登记进了依赖集合，那个依赖集合也永远不会被触发——effect 永远不会因为「只读数据变了」而重跑（因为它根本变不了）。
+
+所以 `track` 在这里其实「无害但无用」：技术上你读它时会被收集进依赖，但由于没有人 trigger，这个依赖永远不会派发更新。Vue 源码里 `readonly` 的 `get` 也确实会 track（保持语义一致，万一有人基于只读数据做派生），但 `set`/`deleteProperty` 不 trigger。这也解释了为什么把 `props` 或 `provide` 的只读副本交给子组件是安全的——它只会读、不会变、不会引发意外更新。
+
+> 严格来说，`shallowReadonly` 更常用（只深层只读第一层），但原理一样：`set` 不 trigger。
+</Answer>
+</Callout>
+
+## 小结
+
+- 响应式四件套：`reactive`(Proxy 拦截) + `track`(读时收集) + `trigger`(写时通知) + `effect`(会重跑的副作用)
+- 依赖表三层：`targetMap: WeakMap<对象, Map<属性, Set<effect>>>`
+- `get/set` 用 `Reflect` 并传 `receiver`，保证继承场景下 `this` 正确；同值（`Object.is`）跳过 trigger
+- 惰性深度代理：只在读到嵌套对象时 `reactive` 它，并用 `reactiveMap` 保证代理身份唯一
+- 嵌套 effect 用**栈**（`effectStack`）而非单个变量
+- 每次重跑前必须 `cleanup` 旧依赖，否则分支切换会留下过期依赖；`stop()` 彻底卸载
+- 下一章讲 composables，并亲手实现 effectScope 批量管理 effect →

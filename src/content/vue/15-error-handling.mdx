@@ -1,0 +1,166 @@
+---
+title: 错误处理
+order: 15
+description: 全局错误捕获 app.config.errorHandler、组件级 onErrorCaptured、和 React 错误边界的对比，以及异步/watch 错误的坑
+---
+
+# 错误处理
+
+Vue 把「渲染期 / 生命周期 / 监听器」里的同步错误自动收集起来，交给你统一处理。和 React 的 Error Boundary 思路类似，但 Vue 用「钩子 + 全局处理器」而非组件。
+
+## 1. 全局捕获：app.config.errorHandler
+
+应用里任何组件渲染、生命周期、事件处理器抛出的错误，都会冒泡到这：
+
+```ts
+import { createApp } from 'vue';
+import App from './App.vue';
+
+const app = createApp(App);
+app.config.errorHandler = (err, instance, info) => {
+  // err: 错误对象；instance: 出错组件实例；info: 出错阶段（'render'/'setup'/'watcher' 等）
+  console.error('[全局错误]', err, info);
+  reportToSentry(err, info);
+};
+```
+
+`info` 很有用：能区分是「渲染时」还是「watcher 回调里」出的错。
+
+## 2. 组件级捕获：onErrorCaptured
+
+某个祖先组件用 `onErrorCaptured` 能「截住」**后代组件**抛出的错误，避免它一路冒泡到全局：
+
+```vue
+<script setup lang="ts">
+import { onErrorCaptured, ref } from 'vue';
+const err = ref<Error | null>(null);
+onErrorCaptured((e) => {
+  err.value = e as Error;
+  return false; // 返回 false 表示「已处理，停止向上传播」
+});
+</script>
+
+<template>
+  <div v-if="err" class="banner">出错了：{{ err.message }}</div>
+  <slot v-else />
+</template>
+```
+
+`onErrorCaptured` 回调返回 `false` 会**阻止错误继续向上冒泡**（类似 React 里不 rethrow）。返回 `true` / 不返回则继续向上。
+
+## 3. 和 React 错误边界对比
+
+| | Vue | React |
+|---|---|---|
+| 全局捕获 | `app.config.errorHandler` | `window.onerror` / 框架无内置全局 handler |
+| 局部捕获 | `onErrorCaptured` 钩子 | `componentDidCatch` / `ErrorBoundary` 组件 |
+| 阻止冒泡 | 返回 `false` | 不 rethrow |
+| 渲染兜底 UI | 在捕获组件里 `v-if` 显示错误态 | `this.state.hasError` 渲染 fallback |
+
+React 必须用「类组件 ErrorBoundary」包一层（函数组件没有 error boundary 能力）；Vue 用组合式钩子 `onErrorCaptured` 即可，任何组件都能当边界。
+
+## 4. 异步错误 / watch 错误
+
+`async` 函数里的错误**不会**被 `errorHandler` 自动捕获（Promise  rejection 走的是微任务，不在 Vue 的同步错误收集范围）：
+
+```ts
+// ❌ 下面的 await 报错不会进 errorHandler
+async function load() {
+  const d = await fetch('/api/x').then((r) => r.json());
+}
+
+// ✅ 自己 try/catch 或在调用处接住
+async function load() {
+  try { /* ... */ } catch (e) { app.config.errorHandler?.(e, null, 'async'); }
+}
+```
+
+`watch` / `watchEffect` 的回调里抛错**会**被捕获并走 `errorHandler`（Vue 包了回调）。所以「在 watcher 里同步抛错」能进全局处理，但「async 函数里的 rejection」要自己接。
+
+## 小结
+
+- `app.config.errorHandler`：全局兜底，拿到 `err / instance / info`
+- `onErrorCaptured`：祖先组件截住后代错误，返回 `false` 阻止冒泡
+- 比 React：Vue 用钩子即可当边界，无需类组件
+- 异步函数里的 rejection 不在 Vue 同步收集范围，要自己 try/catch
+
+<Callout type="exercise" title="练习 1：写个错误边界组件">
+写一个 `ErrorBoundary.vue`：用 `onErrorCaptured` 捕获后代错误，显示「出错」兜底 UI，并**不**向上冒泡（自己吞掉）。
+
+<Answer>
+**参考答案：**
+
+```vue
+<script setup lang="ts">
+import { onErrorCaptured, ref } from 'vue';
+const err = ref<Error | null>(null);
+onErrorCaptured((e) => {
+  err.value = e as Error;
+  return false; // 吞掉，不向上传播
+});
+</script>
+
+<template>
+  <div v-if="err" class="error-box">组件出错：{{ err.message }}</div>
+  <slot v-else />
+</template>
+```
+
+后代任意组件渲染/生命周期抛错都会被这里截住，`v-if="err"` 显示兜底，返回 `false` 阻止冒泡到全局 handler。这等价于 React 的 ErrorBoundary。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：全局上报错误">
+在应用入口配置 `errorHandler`，把错误上报到一个虚构的 `reportError` 函数，并附上出错阶段 `info`。
+
+<Answer>
+**参考答案：**
+
+```ts
+import { createApp } from 'vue';
+import App from './App.vue';
+
+const app = createApp(App);
+app.config.errorHandler = (err, instance, info) => {
+  reportError({ message: (err as Error).message, stack: (err as Error).stack, phase: info });
+};
+app.mount('#app');
+```
+
+`info` 是出错阶段（`'render'`/`'setup'`/`'watcher'`/`'event handler'` 等），上报时带上它，定位问题快得多。注意 `errorHandler` 自身别再抛错，否则会进入无限循环。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：为什么 async 错误抓不到？">
+下面代码里 `fetch` 失败后，为什么不会进全局 `errorHandler`？怎么修？
+
+```ts
+async function loadUser() {
+  const r = await fetch('/api/user');
+  return r.json(); // 若 /api/user 404，r.json 抛错
+}
+```
+
+<Answer>
+**原因：** `errorHandler` 只能收集**同步**渲染/生命周期/事件里的错误。`loadUser` 是 `async` 函数，`await` 之后的报错发生在微任务（Promise rejection）里，不在 Vue 的同步执行栈，所以 Vue 收集不到。
+
+**修法：** 在自己的 async 流程里 try/catch，把错误显式交给全局 handler：
+
+```ts
+import { getCurrentInstance } from 'vue';
+async function loadUser() {
+  try {
+    const r = await fetch('/api/user');
+    return await r.json();
+  } catch (e) {
+    const inst = getCurrentInstance();
+    // 手动交给全局 errorHandler（这里简化为 console + 上报）
+    console.error(e);
+    throw e; // 或在调用处用 .catch 接住
+  }
+}
+```
+
+要点：async 函数内的 rejection，要么 `.catch` 接，要么 try/catch 后手动处理；别指望 Vue 自动兜底。
+</Answer>
+</Callout>

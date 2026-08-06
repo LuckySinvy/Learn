@@ -1,0 +1,290 @@
+---
+title: 生命周期与 nextTick
+order: 6
+description: 组合式 API 的生命周期钩子、父子挂载卸载顺序、异步更新队列与 pre/render/post 刷新时机
+---
+
+# 生命周期与 nextTick
+
+React 用 `useEffect` 处理「挂载后、更新后、卸载前」三类时机。Vue 3 用一组**生命周期钩子**，语义更细分，而且因为是「组合式」的，可以在 `setup` 里多次调用、按需组合。
+
+## 1. 生命周期钩子
+
+```vue
+<script setup lang="ts">
+import { onMounted, onUpdated, onUnmounted } from 'vue';
+
+onMounted(() => {
+  console.log('组件挂载完成，DOM 已就绪');
+});
+
+onUpdated(() => {
+  console.log('响应式数据变化导致的重新渲染完成');
+});
+
+onUnmounted(() => {
+  console.log('组件即将销毁，清理定时器/监听');
+});
+</script>
+```
+
+完整清单：
+
+| 钩子 | 触发时机 |
+|---|---|
+| `onBeforeMount` | 组件挂载前（DOM 还没创建） |
+| `onMounted` | 挂载完成（DOM 可用，适合发请求、拿 ref、起定时器） |
+| `onBeforeUpdate` | 数据变了、重新渲染前 |
+| `onUpdated` | 重新渲染完成（DOM 已更新） |
+| `onBeforeUnmount` | 组件卸载前 |
+| `onUnmounted` | 组件卸载后（清理副作用） |
+| `onActivated` / `onDeactivated` | 被 `<KeepAlive>` 缓存的组件切回/切走 |
+| `onErrorCaptured` | 捕获后代组件的错误（第 15 章） |
+
+### 1.1 钩子必须在 setup 同步期注册
+
+和 React Hooks「不能在条件/循环里调用」是同源约束，但 Vue 的原因不同：钩子靠一个**全局指针 `currentInstance`** 找到「当前正在初始化的组件」，把回调函数挂上去。所以钩子必须在 `setup` 的同步执行期间调用：
+
+```ts
+// ❌ 在 setTimeout / .then 里调用 —— 此时 currentInstance 已经是 null
+setTimeout(() => {
+  onMounted(() => {}); // 报错或静默失效
+}, 0);
+```
+
+## 2. 父子组件的生命周期顺序
+
+父子嵌套时，顺序是：
+
+- **挂载**：父 `onBeforeMount` → 子 `onBeforeMount` → 子 `onMounted` → 父 `onMounted`
+- **更新**：父 `onBeforeUpdate` → 子 `onBeforeUpdate` → 子 `onUpdated` → 父 `onUpdated`
+- **卸载**：父 `onBeforeUnmount` → 子 `onBeforeUnmount` → 子 `onUnmounted` → 父 `onUnmounted`
+
+记忆口诀：**挂载时「父先子后」但「子 mounted 先于父 mounted」**（因为父要等子都好了才算好）；卸载完全反过来。
+
+## 3. nextTick：等 DOM 更新完
+
+第 4 章说过，状态变更后界面是**异步批量**更新的。改完状态立刻读 DOM，拿到的是旧值：
+
+```vue
+<script setup>
+import { ref, nextTick } from 'vue';
+
+const show = ref(false);
+const inputRef = ref<HTMLInputElement | null>(null);
+
+async function open() {
+  show.value = true;
+  // ❌ 这里 inputRef.value 还是 null（DOM 还没渲染出输入框）
+  await nextTick();
+  // ✅ 现在输入框已挂载，可以聚焦
+  inputRef.value?.focus();
+}
+</script>
+
+<template>
+  <input v-if="show" ref="inputRef" />
+</template>
+```
+
+`nextTick()` 返回一个 Promise，在「本次所有响应式更新都 flush 完、DOM 都更新好」之后才 resolve。
+
+## 4. 调度器：pre / render / post
+
+Vue 的更新不是「改一个就立刻渲染一个」，而是收集成一个**异步队列**，在同一个微任务里一次性 flush，避免同一事件里改 3 次状态就渲染 3 次。flush 时还分三段：
+
+- **pre 回调**：`watch` 默认、`onBeforeUpdate` —— 在渲染前
+- **render**：真正执行组件的渲染副作用
+- **post 回调**：`onUpdated`、`flush: 'post'` 的 watch —— 在 DOM 更新后
+
+队列里的 job 按组件 `uid` 排序（父先于子）。同一个 job 如果本次被多次入队，只会执行一次（去重）。
+
+下面这个 Playground 亲手实现一个带去重的异步刷新调度器，并展示 `pre → render → post` 的顺序与父先于子的排序。
+
+<Playground
+  language="typescript"
+  title="手写 nextTick：pre / render / post 三段刷新队列"
+  id="vue-06-1"
+  code={`let isFlushPending = false;
+const queue = new Set<Job>();
+const p = Promise.resolve();
+
+interface Job {
+  id: number;
+  run: () => void;
+}
+
+function queueJob(job: Job): void {
+  queue.add(job); // Set 去重：同一 job 只进一次
+  queueFlush();
+}
+
+function flushJobs(): void {
+  isFlushPending = false;
+  const jobs = Array.from(queue).sort((a, b) => a.id - b.id);
+  queue.clear();
+  for (const j of jobs) console.log("pre: render #" + j.id);
+  for (const j of jobs) {
+    console.log("render #" + j.id);
+    j.run();
+  }
+  for (const j of jobs) console.log("post: render #" + j.id);
+}
+
+function queueFlush(): void {
+  if (isFlushPending) return;
+  isFlushPending = true;
+  p.then(flushJobs);
+}
+
+function nextTick(fn?: () => void): Promise<void> {
+  return p.then(() => {
+    if (fn) fn();
+  });
+}
+
+const parentJob: Job = { id: 1, run: () => console.log("  [parent] 更新 DOM") };
+const childJob: Job = { id: 2, run: () => console.log("  [child] 更新 DOM") };
+
+// 同步连改 3 次状态 -> 同一 job 入队 3 次
+queueJob(parentJob);
+queueJob(parentJob);
+queueJob(parentJob);
+queueJob(childJob);
+
+console.log("同步阶段已入队，render 还没发生");
+console.log("队列里待渲染 job 数（去重后）: " + queue.size);
+
+// nextTick 的回调在「所有渲染 flush 完成后」才执行
+let state = 0;
+const stateJob: Job = { id: 3, run: () => { state = 100; } };
+
+nextTick(() => {
+  console.log("--- 微任务后，一次性 flush 完成 ---");
+  queueJob(stateJob);
+  console.log("flush 前 state = " + state);
+  nextTick(() => {
+    console.log("nextTick 后 state = " + state);
+  });
+});`}
+  expectedOutput={`同步阶段已入队，render 还没发生\n队列里待渲染 job 数（去重后）: 2\npre: render #1\npre: render #2\nrender #1\n  [parent] 更新 DOM\nrender #2\n  [child] 更新 DOM\npost: render #1\npost: render #2\n--- 微任务后，一次性 flush 完成 ---\nflush 前 state = 0\npre: render #3\nrender #3\npost: render #3\nnextTick 后 state = 100\n`}
+/>
+
+注意两点：**队列去重后只有 2 个 job**（连改 3 次只渲染 1 次），且 flush 顺序是 `pre → render → post` 三段、父子按 id 排序（父 #1 先于子 #2）。`nextTick` 回调在全部渲染完成后执行，此时 `state` 已经是 100——这正是「`await nextTick()` 后才能读到更新后 DOM」的底层原理。
+
+<Callout type="exercise" title="练习 1：写出生命周期打印顺序">
+父组件 Parent 包子组件 Child，Parent 和 Child 都注册了全部四个钩子（onBeforeMount / onMounted / onBeforeUpdate / onUpdated / onBeforeUnmount / onUnmounted）。请写出下面三种操作的完整打印顺序：
+1. 首次挂载
+2. 父组件一个只影响父自己的状态变化（触发更新）
+3. 父组件卸载
+
+<Answer>
+**参考答案：**
+
+**1. 首次挂载：**
+```
+Parent onBeforeMount
+Child onBeforeMount
+Child onMounted
+Parent onMounted
+```
+（父先进入挂载前，但子要先「就绪」，所以子的 mounted 先于父的 mounted）
+
+**2. 父更新（只影响父自己）：**
+```
+Parent onBeforeUpdate
+Child onBeforeUpdate
+Child onUpdated
+Parent onUpdated
+```
+（即使变化只影响父，Vue 的更新也是从父到子统一走一遍更新流程；子没变也会走 onBeforeUpdate/onUpdated 的钩子调用——不过子组件的实际渲染副作用不会重跑，因为子没读到变化的依赖。这是 Vue「按组件粒度 + 依赖收集」的体现。）
+
+**3. 父卸载：**
+```
+Parent onBeforeUnmount
+Child onBeforeUnmount
+Child onUnmounted
+Parent onUnmounted
+```
+（卸载顺序和挂载相反，子先于父真正销毁）
+
+**记忆口诀**：挂载「父 before 先、子 mounted 先」；卸载「父 before 先、子 unmounted 先」。核心是「父要等所有子都好了/都没了才算完成」。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：为什么必须 await nextTick？">
+一个需求：弹窗打开后自动 focus 输入框。有人写成：
+
+```ts
+function open() {
+  show.value = true;
+  inputRef.value?.focus(); // 不生效
+}
+```
+
+说明为什么这样不生效，并给出两种修法（nextTick 与 flush:'post' 的 watch）。
+
+<Answer>
+**参考答案：**
+
+**为什么不生效：** `show.value = true` 只是把状态标记为「需要更新」，Vue 会把渲染推入异步队列，并不会立刻创建 DOM。此时 `v-if="show"` 的输入框还不存在，`inputRef.value` 是 `null`，`?.focus()` 直接跳过。等到微任务里队列 flush、DOM 创建好，这行 `focus()` 早执行完了。
+
+**修法一：`await nextTick()`**
+```ts
+async function open() {
+  show.value = true;
+  await nextTick();            // 等队列 flush、DOM 就绪
+  inputRef.value?.focus();     // 此时 inputRef.value 有值
+}
+```
+`nextTick()` 的回调/promise 在「本次所有更新 flush 完」之后才执行，所以这时 DOM 已存在。
+
+**修法二：`flush: 'post'` 的 watch**
+```ts
+watch(show, (v) => {
+  if (v) inputRef.value?.focus();
+}, { flush: 'post' });
+```
+`flush: 'post'` 让 watcher 在「DOM 更新后」触发，天然拿得到更新后的 ref。适合「状态变化后就想操作 DOM」的场景，比手动 await 更声明式。
+
+**两种区别**：`nextTick` 是「等一次 flush 后我想做点事」的一次性等待；`flush:'post'` 是把「状态→操作 DOM」固化成一个监听关系，每次该状态变化都自动在 DOM 就绪后执行。前者适合触发式的一次动作，后者适合长期的依赖关系。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：为什么在 setTimeout 里 onMounted 会失效？">
+下面代码为什么拿不到组件实例、钩子不生效？
+
+```ts
+import { onMounted } from 'vue';
+setTimeout(() => {
+  onMounted(() => console.log('挂载了'));
+}, 0);
+```
+
+<Answer>
+**参考答案：**
+
+`onMounted`（以及所有生命周期钩子）在调用时，会从全局指针 `currentInstance` 读取「当前正在初始化的组件实例」，把回调挂到它身上。这个指针只在 `setup()` 的**同步执行期间**才指向当前组件，执行完就复位成 `null`。
+
+上面的代码把 `onMounted` 放在 `setTimeout` 回调里，运行时机是 0ms 之后的宏任务——此时组件的 `setup` 早就执行完了，`currentInstance` 已经是 `null`。结果：要么 Vue 直接警告「onMounted 只能在 setup 中调用」，要么钩子被挂到一个不存在的实例上、永远不触发。
+
+**正确做法**：在 `setup` 同步期注册钩子，把「需要延迟执行的逻辑」放进回调内部，而不是把「钩子注册」本身延迟：
+
+```ts
+onMounted(() => {
+  // 这里才是组件挂载后，可以安全地起定时器、拿 ref
+  setTimeout(() => { /* ... */ }, 0);
+});
+```
+
+规律和 React Hooks 的「不能在条件/循环/异步里调用」同源但原因不同：React 靠调用顺序，Vue 靠 `currentInstance` 全局指针。两者都要求钩子/组合式 API 在 setup 同步期调用。
+</Answer>
+</Callout>
+
+## 小结
+
+- 生命周期钩子（`onMounted` 等）必须在 `setup` 同步期调用，靠全局 `currentInstance` 挂载到当前组件
+- 父子顺序：挂载「父 before 先、子 mounted 先」，卸载完全相反
+- 状态变更是**异步批量**的，改完立刻读 DOM 拿到旧值；`await nextTick()` 后才能拿到更新后的 DOM
+- 调度器分 pre / render / post 三段；队列按组件 uid 排序（父先于子），同一 job 去重只跑一次
+- 下一章我们深入响应式原理：Proxy、依赖收集与 effect →

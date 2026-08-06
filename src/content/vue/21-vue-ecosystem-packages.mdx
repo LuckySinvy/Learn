@@ -1,0 +1,175 @@
+---
+title: Vue 开发生态 npm 包
+order: 21
+description: 分类列举 Vue 开发生态的主流 npm 包（路由/状态/数据/组合式/UI/SSR/构建/表单/测试/类型/Lint/i18n/可视化），并附 React 生态对照表
+---
+
+# Vue 开发生态 npm 包
+
+这是 Vue 开发生态里**最常用**的 npm 包一览。配合第 3、12、16、17 章用过的具体库，这里把它们按用途分类，并给出 **React 生态对照**——方便你从 React 迁移时快速找到等价物。
+
+## 1. 路由
+
+| 用途 | Vue 生态 | React 对照 |
+|---|---|---|
+| 官方路由 | `vue-router` | `react-router` / `react-router-dom` |
+| 基于文件的路由（元框架内） | Nuxt 内置 | Next.js 内置 / `react-router` |
+
+## 2. 状态管理
+
+| 用途 | Vue 生态 | React 对照 |
+|---|---|---|
+| 官方 Store | `pinia` | `zustand` / Redux Toolkit / `jotai` |
+| 轻量原子状态 | `vue-reactivity` | `jotai` / `recoil` |
+| 全局响应式原语 | `vue`（`reactive`/`ref` 本身即可导出复用） | — |
+
+> Pinia 是 Vue 事实标准；React 那边没有官方状态库，社区选择分散（Redux / Zustand / Jotai）。
+
+## 3. 服务端数据 / 请求
+
+| 用途 | Vue 生态 | React 对照 |
+|---|---|---|
+| 服务端状态（缓存/失效/重试） | `@tanstack/vue-query`（原 Vue Query） | `@tanstack/react-query` |
+| GraphQL | `@vue/apollo-composable` / `villus` | `@apollo/client` / `urql` |
+| 轻量 fetch 封装 | 自己写 `useFetch`（见第 16 章） | `swr` / `react-query` |
+
+## 4. 组合式工具集（VueUse）
+
+`#vueuse` 是 Vue 版的「lodash for composition」——几百个即用组合式函数：
+
+| 包 | 说明 | React 对照 |
+|---|---|---|
+| `@vueuse/core` | `useStorage` / `useDark` / `useMouse` / `useFetch` / `useIntersectionObserver` 等 | `ahooks` / `react-use` |
+| `@vueuse/head` | 管理 `<head>`（title/meta，利于 SEO） | `react-helmet` |
+| `@vueuse/router` | 把路由 query 绑定成 ref | — |
+
+## 5. UI 组件库
+
+| 包 | 特点 | React 对照 |
+|---|---|---|
+| `element-plus` | 国内最流行，中后台利器 | Ant Design |
+| `naive-ui` | TypeScript 优先、轻量 | Ant Design |
+| `vuetify` | Material Design 风格 | MUI |
+| `primevue` | 企业级、组件全 | `primereact` |
+| `ant-design-vue` | Ant Design 的 Vue 版 | Ant Design |
+| `headlessui`（`@headlessui/vue`） | 无样式、可访问性优先 | `@headlessui/react` |
+| `radix-vue` | 无样式原语（类 Radix） | `@radix-ui/react` |
+
+## 6. SSR / 元框架
+
+| 包 | 说明 | React 对照 |
+|---|---|---|
+| `nuxt` | Vue 的 SSR/SSG 元框架 | `next` |
+| `vite-ssr` / `@vue/server-renderer` | 手写 SSR 底层 | `react-dom/server` |
+| `vitepress` | Vue 驱动的文档/静态站（本站点底层思路类似） | `nextra` / Docusaurus |
+
+## 7. 构建 / 脚手架
+
+| 包 | 说明 | React 对照 |
+|---|---|---|
+| `vite` | 官方推荐构建工具（极快 HMR） | `vite` / `webpack` / `next` 内置 |
+| `@vitejs/plugin-vue` | Vite 的 Vue 插件 | `@vitejs/plugin-react` |
+| `vue-tsc` | Vue 模板的 TypeScript 类型检查 | `tsc` / `fork-ts-checker` |
+| `@vue/cli`（旧） | 老脚手架，新项目请用 Vite | `create-react-app`（已不推荐） |
+
+## 8. 表单
+
+| 包 | 说明 | React 对照 |
+|---|---|---|
+| `vee-validate` | 表单校验 + 提交 | `react-hook-form` / Formik |
+| `yup` / `zod` | Schema 校验（配合 vee-validate） | `yup` / `zod` |
+| `@vueuse/integrations` | 接 ``` `useForm` ``` 等 | — |
+
+## 9. 测试
+
+| 包 | 说明 | React 对照 |
+|---|---|---|
+| `@vue/test-utils` | 组件测试工具 | `@testing-library/react` |
+| `vitest` | 单元测试（与 Vite 同源） | `vitest` / `jest` |
+| `@testing-library/vue` | DOM 行为测试 | `@testing-library/react` |
+| `cypress` / `playwright` | E2E（通用） | `cypress` / `playwright` |
+
+## 10. 类型 / Lint / 格式化
+
+| 包 | 说明 | React 对照 |
+|---|---|---|
+| `vue-tsc` | `<script setup>` + 模板类型检查 | `tsc` |
+| `eslint-plugin-vue` | Vue 专属 ESLint 规则 | `eslint-plugin-react` |
+| `@typescript-eslint/*` | TS 规则 | 同左 |
+| `prettier` | 格式化（通用） | `prettier` |
+
+## 11. 国际化 i18n
+
+| 包 | 说明 | React 对照 |
+|---|---|---|
+| `vue-i18n` | Vue 官方国际化 | `react-i18next` / `i18next` |
+| `@vueuse/i18n` | 组合式封装 | — |
+
+## 12. 动画 / 可视化
+
+| 包 | 说明 | React 对照 |
+|---|---|---|
+| `@vueuse/motion` | 声明式动画 | `framer-motion` |
+| `gsap` | 通用动画引擎（配合 `<Transition>` JS 钩子） | `gsap` |
+| `echarts` / `vue-echarts` | 图表 | `recharts` / `echarts` |
+| `d3` | 底层可视化（通用） | `d3` |
+
+## 13. 一个「最小生产栈」建议
+
+```
+vite + vue-tsc          # 构建 + 类型
+vue-router              # 路由
+pinia                   # 状态
+@tanstack/vue-query     # 服务端数据
+element-plus / naive-ui # UI
+vee-validate + zod      # 表单
+vue-i18n                # 国际化
+vitest + @vue/test-utils# 测试
+eslint-plugin-vue       # 规范
+```
+
+从 React 过来的人可以这么记：**`vue-router`↔`react-router`、`pinia`↔`zustand`、`@tanstack/vue-query`↔`react-query`、`@vueuse/core`↔`ahooks`、`element-plus`↔Ant Design、`nuxt`↔`next`、`vue-i18n`↔`react-i18next`**。心智模型一致，只是 API 风格从「Hook + 依赖数组」变成「组合式函数 + 无依赖数组」。
+
+## 小结
+
+- Vue 生态覆盖路由(Pinia/vue-router)、数据(Vue Query)、组合式(VueUse)、UI(Element Plus 等)、SSR(Nuxt)、构建(Vite)、表单(vee-validate)、测试(vitest)、i18n(vue-i18n)、动画等
+- 与 React 生态高度同构，绝大多数场景都能找到一对一等价包
+- 新项目推荐 Vite + Pinia + Vue Query + Element Plus/Naive UI 这一组合
+
+<Callout type="exercise" title="练习 1：迁移对照">
+你有一个 React 项目用了 `zustand` + `react-query` + `react-hook-form` + `next`。要迁到 Vue，分别用什么包？
+
+<Answer>
+**参考答案：**
+
+| React | Vue |
+|---|---|
+| `zustand` | `pinia` |
+| `react-query` | `@tanstack/vue-query` |
+| `react-hook-form` | `vee-validate`（配 `zod`/`yup`） |
+| `next` | `nuxt` |
+
+外加路由 `vue-router`、组合式工具 `@vueuse/core`、UI 用 `element-plus`/`naive-ui`。API 风格会从「Hook + 依赖数组」变成「组合式函数（无依赖数组）」，但职责划分一一对应。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：选 UI 库">
+要做一个国内中后台系统，看重「组件全、中文文档好、团队熟悉」。从生态里选哪个 UI 库最合适？说明理由。
+
+<Answer>
+**参考答案：** 选 **`element-plus`**（或 `ant-design-vue`）。理由：国内最流行、中后台组件最全（表格/表单/弹窗/树等开箱即用）、中文文档和社区完善、团队上手成本低。`naive-ui` 也很棒（TS 优先、轻量），但中后台老项目迁移时 Element Plus 的生态契合度通常更高。若要做 Material 风格则选 `vuetify`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：最小栈里为什么有 vue-tsc 也要 vite？">
+「最小生产栈」里同时列了 `vite` 和 `vue-tsc`，它们职责有何不同？漏掉 `vue-tsc` 会怎样？
+
+<Answer>
+**参考答案：**
+
+- `vite` 负责**构建与开发服务器**（转译、HMR、打包），它用 esbuild 做快速转译，但**不做模板的类型检查**。
+- `vue-tsc` 负责**类型检查**（尤其是 `.vue` 模板里 `<script setup>` 与模板表达式的类型），是 CI/构建前把关。
+
+漏掉 `vue-tsc`：项目仍能跑、能打包，但**模板里的类型错误不会被发现**（比如模板引用了不存在的变量、`:value` 类型不对），类型安全出现盲区。所以生产栈通常 `vue-tsc --noEmit` 跑在 `vite build` 之前。
+</Answer>
+</Callout>

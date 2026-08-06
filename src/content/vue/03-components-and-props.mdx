@@ -1,0 +1,373 @@
+---
+title: 组件与 props
+order: 3
+description: SFC 结构、defineProps/defineEmits/defineSlots 的类型化写法、插槽与透传属性，以及组件契约设计
+---
+
+# 组件与 props
+
+React 用「函数接收 props 返回 JSX」来定义组件。Vue 的组件是一个 **单文件组件（Single File Component，`.vue` 文件）**，把模板、逻辑、样式收在一个文件里：
+
+```vue
+<script setup lang="ts">
+import { ref } from 'vue';
+
+const count = ref(0);
+</script>
+
+<template>
+  <button @click="count++">点了 {{ count }} 次</button>
+</template>
+
+<style scoped>
+button { color: teal; }
+</style>
+```
+
+`lang="ts"` 开启 TypeScript；`<style scoped>` 让样式只作用于当前组件。这种「三块合一」的结构是 Vue 的标志性写法。
+
+## 1. `<script setup>` 的编译结果
+
+`<script setup>` 是语法糖，编译器会把它编译成一个 `setup()` 函数，**顶层声明的变量和函数自动暴露给模板**：
+
+```vue
+<script setup>
+const msg = "hi";
+function greet() { return msg; }
+</script>
+
+<template>
+  <p>{{ msg }}</p>
+  <p>{{ greet() }}</p>
+</template>
+```
+
+你不需要手写 `return { msg, greet }`。编译后大致是：
+
+```js
+setup(__props, { expose }) {
+  const msg = "hi";
+  const greet = () => msg;
+  return { msg, greet, ... }; // 编译器自动帮你 return
+}
+```
+
+这就是为什么 `<script setup>` 里写的东西能直接在模板里用——省掉了手动导出这一步。
+
+## 2. props：父传子的数据
+
+### 2.1 类型化声明
+
+```vue
+<script setup lang="ts">
+interface Props {
+  title: string;
+  size?: "sm" | "md" | "lg";
+  disabled?: boolean;
+}
+
+const props = defineProps<Props>();
+</script>
+
+<template>
+  <button :class="size" :disabled="disabled">{{ title }}</button>
+</template>
+```
+
+`defineProps<Props>()` 是**编译期宏**，直接吃一个类型，模板里就能用 `props.title`。注意：它是类型层面的，运行时没有这个对象（类型被擦除），是纯类型约束。
+
+### 2.2 默认值与响应式解构
+
+给 props 设默认值，3.5+ 推荐用**响应式 props 解构**：
+
+```vue
+<script setup lang="ts">
+interface Props {
+  title: string;
+  size?: "sm" | "md" | "lg";
+}
+
+// 解构的同时给默认值，且 size 仍然是响应式的
+const { title, size = "md" } = defineProps<Props>();
+</script>
+
+<template>
+  <button :class="size">{{ title }}</button>
+</template>
+```
+
+旧版本（3.4 及以前）要用 `withDefaults`：
+
+```ts
+const props = withDefaults(defineProps<Props>(), {
+  size: "md",
+  disabled: false,
+});
+```
+
+<Callout type="info" title="props 是只读的，单向数据流">
+父组件传给子组件的 props，子组件**不能修改**。这是 Vue 和 React 一样的「单向数据流」原则：数据从父流向子，子想改，应该通过**事件**通知父组件去改（见第 4 章的 `defineEmits` 和第 10 章的 `v-model`）。
+
+如果你在子组件里写 `props.size = "lg"`，开发模式下 Vue 会警告。
+
+确实需要在子组件里「持有」一个基于 props 的本地状态时，正确的做法是复制一份到 `ref`：
+
+```ts
+const props = defineProps<{ initialCount: number }>();
+const count = ref(props.initialCount); // 之后改 count，不影响父的 initialCount
+```
+</Callout>
+
+## 3. 子传父：emits
+
+```vue
+<script setup lang="ts">
+interface Emits {
+  (e: "change", id: number): void;
+  (e: "submit", payload: { name: string }): void;
+}
+
+const emit = defineEmits<Emits>();
+
+function onClick() {
+  emit("change", 42);
+}
+</script>
+
+<template>
+  <button @click="onClick">通知父组件</button>
+</template>
+```
+
+父组件监听：
+
+```vue
+<template>
+  <Child @change="handleChange" />
+</template>
+```
+
+`defineEmits` 用**函数签名式**声明事件名和载荷类型，类型推导非常干净。
+
+## 4. 插槽：组件的内容分发
+
+当需要让父组件往子组件里「塞一段自己的模板」时，用插槽。
+
+### 4.1 默认插槽与具名插槽
+
+```vue
+<!-- Card.vue -->
+<template>
+  <div class="card">
+    <header><slot name="header">默认标题</slot></header>
+    <main><slot>默认内容</slot></main>
+    <footer><slot name="footer" /></footer>
+  </div>
+</template>
+
+<!-- 父组件 -->
+<Card>
+  <template #header>我的标题</template>
+  主体内容（进默认插槽）
+  <template #footer>页脚</template>
+</Card>
+```
+
+`#header` 是 `v-slot:header` 的简写。
+
+### 4.2 作用域插槽
+
+子组件可以把自己的数据「反向传回」给插槽内容：
+
+```vue
+<!-- List.vue -->
+<template>
+  <ul>
+    <li v-for="item in items" :key="item.id">
+      <slot name="item" :row="item">{{ item.name }}</slot>
+    </li>
+  </ul>
+</template>
+
+<!-- 父组件可完全自定义每一行的渲染 -->
+<List :items="users">
+  <template #item="{ row }">
+    <span :class="{ off: !row.active }">{{ row.name }}（{{ row.age }} 岁）</span>
+  </template>
+</List>
+```
+
+`#item="{ row }"` 解构出子组件通过 `:row="item"` 传出来的数据。这是 Vue 做「通用列表/表格组件」的核心机制。
+
+## 5. 透传属性与多根节点
+
+子组件没有显式声明 props / emits 的属性（如 `class`、`id`、自定义 `data-*`），会**自动透传（fallthrough）**到根元素上：
+
+```vue
+<!-- 父 -->
+<MyButton class="big" data-testid="ok" />
+
+<!-- MyButton 根元素会自动带上 class="big" data-testid="ok" -->
+```
+
+如果组件有**多个根节点**，Vue 不知道透传属性该放哪，必须手动指定：
+
+```vue
+<template>
+  <header v-bind="$attrs">...</header>
+  <main>...</main>
+</template>
+```
+
+`inheritAttrs: false` + 手动 `v-bind="$attrs"` 是控制透传行为的标准做法。
+
+## 6. 组件注册
+
+`<script setup>` 里**导入即注册**——只要 `import` 了一个组件，就能在模板里直接用，不用额外声明：
+
+```vue
+<script setup>
+import Child from './Child.vue';
+</script>
+
+<template>
+  <Child />
+</template>
+```
+
+全局注册（在 `main.ts` 里 `app.component('Child', Child)`）则用在不方便局部导入的场景，配合 `unplugin-vue-components` 还能做到「用到才自动导入、自动注册」。
+
+<Callout type="exercise" title="练习 1：设计组件契约">
+为一个通用的 `<DataTable>` 组件设计 props / emits / slots 的类型声明。需求：传入行数据数组 `rows`（元素类型泛型 `T`）、列定义 `columns`（含 `key`、标题、是否可排序）、当前排序列 `sortKey` 与方向 `sortDir`；暴露 `sort-change` 事件（载荷为新的 key 与方向）；提供默认插槽放表格内容、具名插槽 `cell` 让父组件自定义每个单元格（能拿到当前行 `row` 与列 `col`）。
+
+<Answer>
+**参考答案：**
+
+```ts
+interface Column<T> {
+  key: keyof T;
+  title: string;
+  sortable?: boolean;
+}
+
+interface Props<T> {
+  rows: T[];
+  columns: Column<T>[];
+  sortKey?: keyof T | null;
+  sortDir?: "asc" | "desc";
+}
+
+interface Emits<T> {
+  (e: "sort-change", payload: { key: keyof T; dir: "asc" | "desc" }): void;
+}
+
+// 泛型组件
+const props = defineProps<Props<Row>>();
+const emit = defineEmits<Emits<Row>>();
+
+// 模板里
+// <table>
+//   <th v-for="col in columns" @click="col.sortable && emit('sort-change', { key: col.key, dir: ... })">
+//     {{ col.title }}
+//   </th>
+//   <tr v-for="row in rows" :key="row.id">
+//     <slot name="cell" :row="row" :col="col">{{ row[col.key] }}</slot>
+//   </tr>
+// </table>
+```
+
+要点：
+1. 用泛型 `T` 让行数据类型可配置，整个组件类型安全。
+2. `sortKey`/`sortDir` 是父控制的「受控」状态，子组件不直接改，而是 `emit('sort-change', ...)` 让父去改——典型单向数据流。
+3. `cell` 作用域插槽把 `row` 和 `col` 反向传出来，父组件才能完全自定义单元格渲染。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：找出直接改 props 的写法">
+下面这段代码有 4 处「在子组件里直接改 props」的写法，逐一指出，并分别给出用 `emit` / `defineModel`（第 10 章）/ 本地副本 的修复方式。
+
+```vue
+<script setup>
+const props = defineProps<{ count: number; user: { name: string }; list: string[]; visible: boolean }>();
+function add() { props.count++; }                       // ①
+function rename() { props.user.name = "new"; }           // ②
+function pushItem() { props.list.push("x"); }            // ③
+function hide() { props.visible = false; }               // ④
+</script>
+```
+
+<Answer>
+**参考答案：**
+
+**① `props.count++`**：基本类型的 props，子组件不能改。
+- `emit` 方案：子 `emit('update:count', props.count + 1)`，父用 `v-model:count` 接住去改。
+- `defineModel` 方案（第 10 章）：直接 `const count = defineModel<number>('count')`，然后 `count.value++`，Vue 自动 emit `update:count`。
+- 本地副本方案：若只是内部草稿，`const local = ref(props.count)`，改 `local`。
+
+**② `props.user.name = "new"`**：虽然在改对象的属性、不直接改引用，但**仍然违反了单向数据流**——父组件的对象被悄悄改了，父不知道。
+- 正确方案：要么 `emit('update:user', { ...props.user, name: 'new' })` 让父整体换一个新对象（不可变更新），要么子组件 `const user = ref({ ...props.user })` 复制一份本地副本再改。
+
+**③ `props.list.push("x")`**：数组的原地修改，同样会污染父的数组，且引用没变 Vue 可能感知不到。
+- 正确方案：`emit('update:list', [...props.list, "x"])`，或本地副本 `const list = ref([...props.list])` 后 `list.value.push("x")`。
+
+**④ `props.visible = false`**：同 ①，基本类型用 `defineModel` 或 `emit('update:visible', false)`。
+
+**规律**：子组件里只要出现 `props.xxx = ...` 或 `props.xxx.yyy = ...`（原地改对象/数组），就是违反单向数据流。基本类型用 `defineModel`/emit，对象/数组用「emit 新对象」或「复制本地副本」。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：用作用域插槽改造死板列表">
+有一个写死的列表组件：
+
+```vue
+<template>
+  <ul>
+    <li v-for="u in users" :key="u.id">{{ u.name }} - {{ u.email }}</li>
+  </ul>
+</template>
+```
+
+请把它改造成「可完全自定义每一行渲染」的通用列表：父组件能拿到每行 `user` 决定怎么渲染。
+
+<Answer>
+**参考答案：**
+
+把固定的 `<li>` 内容换成默认插槽 + 作用域插槽：
+
+```vue
+<!-- UserList.vue -->
+<template>
+  <ul>
+    <li v-for="u in users" :key="u.id">
+      <slot name="item" :user="u">{{ u.name }} - {{ u.email }}</slot>
+    </li>
+  </ul>
+</template>
+```
+
+默认内容（`{{ u.name }} - {{ u.email }}`）保留，作为不传插槽时的兜底；父组件需要时自定义：
+
+```vue
+<UserList :users="users">
+  <template #item="{ user }">
+    <span class="avatar">{{ user.name[0] }}</span>
+    <span :class="{ muted: !user.active }">{{ user.name }}</span>
+    <button @click="remove(user.id)">删除</button>
+  </template>
+</UserList>
+```
+
+关键点：`<slot name="item" :user="u">` 通过 `:user="u"` 把行数据反向传给插槽内容，父组件 `#item="{ user }"` 解构出来就能自由渲染。这正是 Vue 通用列表/表格组件的标准做法。`#item` 是 `v-slot:item` 简写，`{ user }` 是解构 slot props。
+</Answer>
+</Callout>
+
+## 小结
+
+- `.vue` 单文件组件 = 模板 + `<script setup>` + 可选的 `scoped` 样式，是 Vue 的标志性结构
+- `<script setup>` 顶层绑定自动暴露给模板，省去手写 `return`
+- `defineProps<Props>()` 吃类型做约束；默认值用响应式 props 解构（`const { x = d } = defineProps()`）或旧版 `withDefaults`
+- props 只读、单向数据流；子改父数据要靠 `emit` 或 `defineModel`
+- `defineEmits<Emits>()` 用函数签名声明事件与载荷类型
+- 插槽分默认/具名/作用域三种；作用域插槽把子数据反向传回，用于通用列表/表格
+- 多根节点时透传属性要手动 `v-bind="$attrs"`；`inheritAttrs: false` 控制行为
+- 下一章我们讲响应式状态 `ref`/`reactive` 与事件，并亲手写一个迷你 `ref` →

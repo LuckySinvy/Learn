@@ -2,6 +2,7 @@ import Link from 'next/link';
 import {
   Code2, Terminal, Coffee, BarChart3, Brain, Link2, Blocks, Boxes, Flame,
   FileCode2, Database, Zap, Leaf, Gauge, Waves, Atom, Squirrel, GitBranch, Globe,
+  Component,
 } from 'lucide-react';
 import { LanguageCard } from '@/components/layout/LanguageCard';
 import { getChapters } from '@/lib/content';
@@ -18,7 +19,7 @@ export default function HomePage() {
           编程 · 数据 · AI 工程 · 云原生 交互式学习
         </h1>
         <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
-          从零掌握 Python、Go、Java、Rust、TypeScript、React，以及 MySQL、Redis、MongoDB、ClickHouse、Kafka、Linux、Git、HTTP、Grafana、RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
+          从零掌握 Python、Go、Java、Rust、TypeScript、React、Vue，以及 MySQL、Redis、MongoDB、ClickHouse、Kafka、Linux、Git、HTTP、Grafana、RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
         </p>
       </section>
 
@@ -79,6 +80,14 @@ export default function HomePage() {
           icon={<Atom className="w-8 h-8" />}
           accent="from-sky-400 to-cyan-500"
           chapters={count('react')}
+        />
+        <LanguageCard
+          href="/vue"
+          title="Vue"
+          description="组合式 API、响应式原理手写、Pinia、Vue Router、Nuxt 与生态选型。"
+          icon={<Component className="w-8 h-8" />}
+          accent="from-emerald-400 to-green-500"
+          chapters={count('vue')}
         />
       </Category>
 

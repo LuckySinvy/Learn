@@ -1,0 +1,449 @@
+---
+title: 计算属性与侦听器
+order: 5
+description: computed 的惰性缓存机制、watch 与 watchEffect 的取舍、深浅侦听与清理回调，以及大多数时候你不需要 watch
+---
+
+# 计算属性与侦听器
+
+React 里「状态变了，某些值要跟着算」要么写个函数每次重算，要么用 `useMemo` 缓存。Vue 有两个专门的 API：**`computed`（推导值，自动缓存）** 和 **`watch` / `watchEffect`（状态变了，去做点副作用）**。它们分工明确，混淆是新手最常见的 bug 来源。
+
+## 1. computed：能推导的就用它
+
+### 1.1 基本用法
+
+```vue
+<script setup lang="ts">
+import { ref, computed } from 'vue';
+
+const firstName = ref('Ada');
+const lastName = ref('Lovelace');
+const fullName = computed(() => firstName.value + ' ' + lastName.value);
+
+console.log(fullName.value); // "Ada Lovelace"
+firstName.value = 'Grace';
+console.log(fullName.value); // "Grace Lovelace"
+</script>
+```
+
+`computed` 接收一个 getter，返回一个**只读的响应式 ref**。它有两个关键性质：
+
+1. **缓存**：依赖没变时，多次读 `fullName.value` 只算一次
+2. **惰性**：依赖变了也不会立刻算，等「你真正读它」时才算
+
+### 1.2 可写 computed
+
+```ts
+const firstName = ref('Ada');
+const lastName = ref('Lovelace');
+const fullName = computed({
+  get: () => firstName.value + ' ' + lastName.value,
+  set: (v: string) => {
+    const [first, last] = v.split(' ');
+    firstName.value = first;
+    lastName.value = last;
+  },
+});
+```
+
+### 1.3 getter 必须是纯函数
+
+computed 的 getter 里**不能有副作用**（不能发请求、不能改其他状态）。它只是「根据依赖算出一个值」，调用次数、调用时机都不由你控制。
+
+### 1.4 对比 React useMemo
+
+| | Vue computed | React useMemo |
+|---|---|---|
+| 缓存条件 | 依赖自动追踪 | 依赖数组手动声明 |
+| 语法 | `computed(() => ...)` | `useMemo(() => ..., [deps])` |
+| 遗忘 deps 的后果 | 不会忘（自动） | 漏写会导致拿到旧值 |
+
+Vue 的 computed 依赖是**自动收集**的，不用像 `useMemo` 那样手维护依赖数组——这是响应式的红利。
+
+## 2. watch / watchEffect：状态变了去做副作用
+
+### 2.1 什么时候用 watch
+
+`watch` 的语义是「**当某件事变化时，执行副作用**」——发请求、写 localStorage、路由跳转、打日志。它**不**用来「推导一个新值」（那该用 computed）。
+
+```ts
+import { ref, watch } from 'vue';
+
+const userId = ref(1);
+const user = ref(null);
+
+watch(userId, async (newId, oldId) => {
+  user.value = await fetchUser(newId); // 副作用：发请求
+});
+```
+
+### 2.2 watch vs watchEffect
+
+```ts
+// watchEffect：立即执行 + 自动收集依赖
+watchEffect(() => {
+  console.log('userId = ' + userId.value); // 读到的 userId 被自动监听
+});
+
+// watch：明确指定「监听谁」
+watch(userId, (n, o) => {
+  console.log('userId 从 ' + o + ' 变成 ' + n);
+});
+```
+
+| | watchEffect | watch |
+|---|---|---|
+| 依赖来源 | 函数体内读到的所有响应式值 | 显式传入的 `source`（ref/getter/reactive） |
+| 立即执行 | 是 | 否（`immediate: true` 可开启） |
+| 拿到新旧值 | 拿不到 | 拿得到 `(newVal, oldVal)` |
+| 用在哪里 | 「用到啥监听啥」的副作用 | 需要新旧值对比、需要精准控制监听源的副作用 |
+
+经验法则：**能 `computed` 推导的就别 `watch`**；`watch` 只用于「状态变化时做副作用」。
+
+### 2.3 清理副作用（竞态）
+
+`watch` 的回调能拿到第三个参数 `onCleanup`，用来在「下一次触发前」清理上一次的副作用（典型场景：取消过期的请求）。Vue 3.5+ 也有顶层的 `onWatcherCleanup`。
+
+```ts
+import { watch, onWatcherCleanup } from 'vue';
+
+watch(keyword, async (kw) => {
+  const controller = new AbortController();
+  onWatcherCleanup(() => controller.abort()); // 下次变化或卸载时取消
+  const res = await fetch('/search?q=' + kw, { signal: controller.signal });
+  results.value = await res.json();
+});
+```
+
+### 2.4 配置项
+
+```ts
+watch(source, cb, {
+  immediate: true,   // 立即跑一次
+  deep: true,        // 深度监听（对 reactive 对象默认深度，对 getter 默认浅）
+  once: true,        // 只触发一次（3.4+）
+  flush: 'post',     // 在 DOM 更新后触发（能拿到更新后的 DOM）
+});
+```
+
+> `deep: true` 会递归遍历整个对象，开销大。多数情况应该用「**精确监听某个字段**」而不是对整个大对象开 deep。
+
+下面两个 Playground 亲手实现 computed 的「惰性缓存」和 watch/watchEffect 的「依赖收集差异 + 清理时机」。
+
+<Playground
+  language="typescript"
+  title="computed 是带 dirty 标记的惰性 effect"
+  id="vue-05-1"
+  code={`let activeEffect: (() => void) | null = null;
+
+function effect(fn: () => void): void {
+  activeEffect = fn;
+  fn();
+  activeEffect = null;
+}
+
+function miniRef<T>(init: T): { value: T } {
+  let _value = init;
+  const subs = new Set<() => void>();
+  return {
+    get value(): T {
+      if (activeEffect) subs.add(activeEffect);
+      return _value;
+    },
+    set value(nv: T) {
+      if (Object.is(nv, _value)) return;
+      _value = nv;
+      for (const s of subs) s();
+    },
+  };
+}
+
+type EffectFn = () => void;
+
+// computed：带 dirty 标记的惰性 effect
+function computed<T>(getter: () => T): { value: T } {
+  let dirty = true;
+  let cache!: T;
+  const subs = new Set<EffectFn>();
+
+  const scheduler: EffectFn = () => {
+    if (!dirty) {
+      dirty = true;
+      for (const s of subs) s();
+    }
+  };
+
+  const runner: EffectFn = () => {
+    activeEffect = scheduler;
+    cache = getter();
+    activeEffect = null;
+    dirty = false;
+  };
+
+  return {
+    get value(): T {
+      if (activeEffect) subs.add(activeEffect);
+      if (dirty) runner();
+      return cache;
+    },
+  };
+}
+
+const base = miniRef(1);
+const computeCount = { n: 0 };
+
+const double = computed(() => {
+  computeCount.n++;
+  return base.value * 2;
+});
+
+console.log("read1 = " + double.value);
+console.log("read2 = " + double.value);
+console.log("read3 = " + double.value);
+console.log("连读3次 computeCount = " + computeCount.n);
+
+base.value = 2; // 改依赖但没读
+console.log("改依赖但不读 computeCount = " + computeCount.n);
+
+console.log("read4 = " + double.value);
+console.log("最终 computeCount = " + computeCount.n);
+
+// 对照组：普通函数每次都重算
+const computeCount2 = { n: 0 };
+function plainDouble(): number {
+  computeCount2.n++;
+  return base.value * 2;
+}
+plainDouble();
+plainDouble();
+plainDouble();
+console.log("普通函数读3次 computeCount = " + computeCount2.n);`}
+  expectedOutput={`read1 = 2\nread2 = 2\nread3 = 2\n连读3次 computeCount = 1\n改依赖但不读 computeCount = 1\nread4 = 4\n最终 computeCount = 2\n普通函数读3次 computeCount = 3\n`}
+/>
+
+注意 `连读3次 computeCount = 1`：依赖没变，`computed` 只算了一次。再看 `改依赖但不读 computeCount = 1`：改了 `base` 但没读 `double`，所以**没有重算**（惰性）。等到 `read4` 才真正重算，总数变成 2。普通函数对照组读 3 次算 3 次，对比鲜明。
+
+<Playground
+  language="typescript"
+  title="watch 与 watchEffect：依赖来源与清理时机"
+  id="vue-05-2"
+  code={`let activeEffect: (() => void) | null = null;
+let cleanupSlot: { fn: (() => void) | null } | null = null;
+
+function effect(fn: () => void): void {
+  activeEffect = fn;
+  fn();
+  activeEffect = null;
+}
+
+function miniRef<T>(init: T): { value: T } {
+  let _value = init;
+  const subs = new Set<() => void>();
+  return {
+    get value(): T {
+      if (activeEffect) subs.add(activeEffect);
+      return _value;
+    },
+    set value(nv: T) {
+      if (Object.is(nv, _value)) return;
+      _value = nv;
+      for (const s of subs) s();
+    },
+  };
+}
+
+type EffectFn = () => void;
+
+function onCleanup(fn: () => void): void {
+  if (cleanupSlot) cleanupSlot.fn = fn;
+}
+
+function watchEffect(fn: EffectFn): void {
+  const runner: EffectFn = () => {
+    activeEffect = runner;
+    fn();
+    activeEffect = null;
+  };
+  runner();
+}
+
+function watch<T>(source: () => T, cb: (n: T, o: T) => void): void {
+  let oldValue: T;
+  let pending: (() => void) | null = null;
+
+  const runner: EffectFn = () => {
+    activeEffect = runner;
+    const nv = source();
+    activeEffect = null;
+    if (pending) {
+      pending();
+      pending = null;
+    }
+    const ov = oldValue;
+    oldValue = nv;
+    const holder = { fn: null as (() => void) | null };
+    cleanupSlot = holder;
+    cb(nv, ov);
+    cleanupSlot = null;
+    if (holder.fn) pending = holder.fn;
+  };
+
+  activeEffect = runner;
+  oldValue = source();
+  activeEffect = null;
+}
+
+const a = miniRef(1);
+const b = miniRef(10);
+
+console.log("--- watchEffect 收集全部依赖 ---");
+watchEffect(() => {
+  console.log("watchEffect run: a=" + a.value + " b=" + b.value);
+});
+
+console.log("--- watch 只收集 source getter 的依赖 ---");
+watch(
+  () => a.value,
+  (n: number, o: number) => {
+    console.log("watch cb: n=" + n + " o=" + o);
+    onCleanup(() => console.log("  cleanup for a=" + n));
+    console.log("  cb 里读了 b=" + b.value);
+  }
+);
+
+console.log("--- 改 a（source 里的 ref）---");
+a.value = 2;
+
+console.log("--- 改 b（只在 cb 体里用到的 ref）---");
+b.value = 99;
+
+console.log("--- 连续改 a 两次，看 cleanup 时机 ---");
+a.value = 3;
+a.value = 4;`}
+  expectedOutput={`--- watchEffect 收集全部依赖 ---\nwatchEffect run: a=1 b=10\n--- watch 只收集 source getter 的依赖 ---\n--- 改 a（source 里的 ref）---\nwatchEffect run: a=2 b=10\nwatch cb: n=2 o=1\n  cb 里读了 b=10\n--- 改 b（只在 cb 体里用到的 ref）---\nwatchEffect run: a=2 b=99\n--- 连续改 a 两次，看 cleanup 时机 ---\nwatchEffect run: a=3 b=99\n  cleanup for a=2\nwatch cb: n=3 o=2\n  cb 里读了 b=99\nwatchEffect run: a=4 b=99\n  cleanup for a=3\nwatch cb: n=4 o=3\n  cb 里读了 b=99\n`}
+/>
+
+三个结论一目了然：
+1. 改 `a` 时 `watchEffect` 和 `watch` 都触发（两者都监听了 `a`）
+2. 改 `b` 时只有 `watchEffect` 触发——`watch` 的 source 只读 `a`，`b` 只在 cb 体里出现，不会被监听
+3. 连续改 `a` 时，`cleanup for a=2` 出现在 `watch cb: n=3` 之前，证明**上一次的清理先于本次回调执行**（取消过期请求正是靠这个时序）
+
+## 3. 反模式：用 watch 同步两个状态
+
+最常见的误用：
+
+```ts
+// ❌ 用 watch 把 A 同步到 B
+const a = ref(1);
+const b = ref(0);
+watch(a, (v) => { b.value = v * 2; });
+
+// ✅ 用 computed 推导 B
+const b = computed(() => a.value * 2);
+```
+
+`computed` 是「声明式推导」，永远最新、零样板；`watch` 是「命令式副作用」，容易漏、容易竞态。只有「状态变化要做**副作用**（请求、DOM、路由、日志）」才用 `watch`。
+
+<Callout type="exercise" title="练习 1：computed 还是 watch？">
+下面三段代码，哪些该改成 `computed`？哪一段确实必须用 `watch`？
+
+```ts
+// ①
+const price = ref(10);
+const qty = ref(2);
+const total = ref(0);
+watch([price, qty], ([p, q]) => { total.value = p * q; });
+
+// ②
+const token = ref('');
+watch(token, (t) => { localStorage.setItem('token', t); });
+
+// ③
+const list = ref<Item[]>([]);
+const filtered = ref<Item[]>([]);
+watch(list, (l) => { filtered.value = l.filter((x) => x.active); }, { deep: true });
+```
+
+<Answer>
+**参考答案：**
+
+**① 改成 computed**：`total` 完全由 `price` 和 `qty` 算出，应该用 `const total = computed(() => price.value * qty.value)`。用 watch 不仅多写、还有「首次没触发导致 total 一直是 0」的坑（除非加 `immediate`），而且 price/qty 都变时可能漏算。
+
+**② 必须用 watch**：写 `localStorage` 是**副作用**，不是推导值。没有任何「响应式值」可以替代它，必须用 `watch`（或 `watchEffect`）。注意这里 token 是字符串，变化即触发，不需要 deep。
+
+**③ 改成 computed**：`filtered` 是 `list` 的派生值，用 `const filtered = computed(() => list.value.filter(x => x.active))` 更干净。原代码 `{ deep: true }` 还会递归遍历整个 `list`，性能差；computed 同样会追踪 `list` 内部变化。
+
+**规律**：凡是「B 永远等于 f(A)」——用 `computed`。凡是「A 变了要去执行一个动作（写存储/发请求/跳转）」——用 `watch`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：可写 computed 拆分 fullName">
+写一个可写 `computed` 实现 `fullName`：读时拼接 `firstName + ' ' + lastName`，写时按空格拆回 `firstName` 和 `lastName`。并说明为什么「直接存 fullName 字符串」不如这种方案。
+
+<Answer>
+**参考答案：**
+
+```ts
+const firstName = ref('Ada');
+const lastName = ref('Lovelace');
+
+const fullName = computed({
+  get: () => firstName.value + ' ' + lastName.value,
+  set: (v: string) => {
+    const parts = v.split(' ');
+    firstName.value = parts[0] ?? '';
+    lastName.value = parts.slice(1).join(' ') ?? '';
+  },
+});
+
+// 读
+console.log(fullName.value); // "Ada Lovelace"
+// 写：反向同步回两个源
+fullName.value = 'Grace Hopper';
+console.log(firstName.value); // "Grace"
+console.log(lastName.value);  // "Hopper"
+```
+
+**为什么不存一个 fullName 字符串：**
+
+如果直接 `const fullName = ref('Ada Lovelace')`，那么当 `firstName` 单独变化时（比如用户改了名），`fullName` 不会自动跟着变——你又得用 watch 去同步，回到「两份真相」。更糟的是，`firstName` 和 `fullName` 会变成两个独立真相，改其中一个另一个就过期。
+
+正确模型是：**`firstName` / `lastName` 是「真相」（state），`fullName` 是「推导」（computed）**。读时拼、写时拆，所有修改最终都落到两个 state 上，界面永远一致。这是「能推导就不存」原则的经典应用。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：用 onCleanup 修复搜索竞态">
+一个搜索框：`watch(keyword, async (kw) => { results.value = await search(kw); })`。用户输入 "ap"、"app"、"apple" 触发三次请求，但 "app" 的响应比 "apple" 晚到，导致最终界面显示的是 "app" 的结果（竞态）。请用 `AbortController` + 清理回调修复，并说明为什么这里 `flush: 'post'` 不合适。
+
+<Answer>
+**参考答案：**
+
+```ts
+import { watch, onWatcherCleanup } from 'vue';
+
+watch(keyword, async (kw) => {
+  const controller = new AbortController();
+  onWatcherCleanup(() => controller.abort()); // 下次变化/卸载时取消本次请求
+  try {
+    const res = await search(kw, { signal: controller.signal });
+    results.value = res;
+  } catch (e) {
+    if ((e as any).name !== 'AbortError') throw e; // 忽略被取消的请求
+  }
+});
+```
+
+**原理**：每次 `keyword` 变化，上一次 watcher 的清理回调会 `abort()` 掉还没完成的请求。于是 "app" 的请求被取消，它的响应（即使是晚到的）会抛 `AbortError`，被 catch 忽略，不会覆盖 `results`。只有最后一次 "apple" 的请求能成功写入。这正是 vue-05-2 Playground 里演示的「cleanup 在下次 cb 前执行」的实战价值。
+
+**为什么 `flush: 'post'` 不合适**：`flush` 控制的是 watcher **回调本身的执行时机**（pre / sync / post，相对于组件渲染）。它和「取消过期请求」是完全不同的两件事——`flush: 'post'` 只是让你在回调里能拿到更新后的 DOM，并不能解决「先发的请求后到、覆盖最新结果」的竞态。竞态靠 `AbortController` 取消，而不是靠刷新时机。两者经常一起出现但可以独立理解。
+</Answer>
+</Callout>
+
+## 小结
+
+- `computed` 用于「推导值」：自动收集依赖、**惰性**且**缓存**，getter 必须纯函数；可写 computed 用 get/set
+- `watch` 用于「状态变化做副作用」：拿到新旧值、可精准指定 source、可 `immediate`/`deep`/`once`/`flush`
+- `watchEffect`：立即执行 + 自动收集体内依赖；和 `watch` 的核心区别是依赖来源与是否立即执行
+- 清理副作用用 `onCleanup`（或 `onWatcherCleanup`），在下次触发前执行，用来取消过期请求
+- **反模式**：能用 `computed` 推导的别用 `watch` 同步；`watch` 只做副作用
+- 下一章讲生命周期与 nextTick，并亲手实现一个带 pre/render/post 的刷新调度器 →

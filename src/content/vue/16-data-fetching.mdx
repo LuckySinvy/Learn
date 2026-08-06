@@ -1,0 +1,147 @@
+---
+title: 数据请求
+order: 16
+description: 手写 fetch composable 与 TanStack Query（Vue Query）的 useQuery，缓存/重试/竞态/loading-error 状态管理
+---
+
+# 数据请求
+
+组件里发请求谁都会写，难的是**缓存、重试、竞态、loading/error 状态**这些横切问题。Vue 生态用 **TanStack Query（原 Vue Query）** 统一解决；也常自己封一个 `useFetch` composable。
+
+## 1. 手写 useFetch（最小可用）
+
+回顾第 8 章的 `useFetch`：用 `watchEffect` + `toValue` 自动响应参数变化。
+
+```ts
+import { ref, watchEffect, toValue, type MaybeRefOrGetter } from 'vue';
+export function useFetch<T>(url: MaybeRefOrGetter<string>) {
+  const data = ref<T | null>(null);
+  const error = ref<unknown>(null);
+  const loading = ref(true);
+  watchEffect((onCleanup) => {
+    const u = toValue(url);
+    const ctrl = new AbortController();
+    onCleanup(() => ctrl.abort()); // 竞态：新请求到来时取消旧的
+    loading.value = true;
+    fetch(u, { signal: ctrl.signal })
+      .then((r) => r.json())
+      .then((d) => { data.value = d; })
+      .catch((e) => { if (e.name !== 'AbortError') error.value = e; })
+      .finally(() => { loading.value = false; });
+  });
+  return { data, error, loading };
+}
+```
+
+关键是 `onCleanup(() => ctrl.abort())`：参数变化触发新请求时，旧的 `AbortController` 被取消，避免「慢响应覆盖快响应」的竞态。
+
+## 2. TanStack Query：useQuery
+
+手写版能跑，但缓存、后台刷新、重试、分页、mutation 全得自己写。TanStack Query 把这些变成声明式：
+
+```ts
+import { useQuery } from '@tanstack/vue-query';
+import { toValue } from 'vue';
+
+const props = defineProps<{ id: string }>();
+const { data, error, isLoading, refetch } = useQuery({
+  queryKey: ['user', toValue(() => props.id)], // key 变了自动重新请求
+  queryFn: () => fetch('/api/user/' + props.id).then((r) => r.json()),
+  staleTime: 30_000,                            // 30s 内视为新鲜，不发请求
+});
+```
+
+`queryKey` 是缓存的钥匙：`props.id` 变 → key 变 → 自动重新拉取；相同 key 直接复用缓存。`staleTime` 控制「新鲜期」。还有 `useMutation` 处理写操作、`useInfiniteQuery` 处理分页。
+
+## 3. 为什么用 Query 而不是只靠 Pinia
+
+| 关注点 | 仅 Pinia | Pinia + TanStack Query |
+|---|---|---|
+| 缓存（避免重复请求） | 手动 | 内置（按 key） |
+| 后台/聚焦刷新 | 手动 | 内置 |
+| 重试 / 重试退避 | 手动 | 内置 |
+| loading/error 状态 | 手动 | 内置 |
+| 写后失效 | 手动 | `invalidateQueries` |
+
+经验：Pinia 管「客户端状态」（UI 偏好、表单草稿）；Query 管「服务端状态」（来自 API、需缓存与失效）。别把服务端数据塞进 Pinia 当缓存用。
+
+## 4. 配合 Suspense
+
+`useQuery` 返回的 `data` 是响应式 ref，组件里可直接用；若想用 `<Suspense>` 等待，可把 query 包成 async setup 读取 `data.value` 的 Promise 形态（TanStack Query 提供 `useQuery` 的 `promise` 形态配合 Suspense）。
+
+## 小结
+
+- 手写 `useFetch`：`watchEffect` + `toValue` 响应参数，`AbortController` 处理竞态
+- TanStack Query `useQuery`：`queryKey` 驱动缓存与重取，`staleTime` 控新鲜期
+- `useMutation` 处理写、`useInfiniteQuery` 分页、`invalidateQueries` 失效
+- 分工：Pinia 管客户端状态，Query 管服务端状态
+
+<Callout type="exercise" title="练习 1：给 useFetch 加 staleTime 概念（伪代码）">
+现有手写 `useFetch` 每次参数变化都发请求。说明如何用「上一次成功时间戳」避免 30 秒内的重复请求（写出核心逻辑即可）。
+
+<Answer>
+**参考答案（核心逻辑）：**
+
+```ts
+let lastSuccess = 0;
+let cached: T | null = null;
+watchEffect((onCleanup) => {
+  const u = toValue(url);
+  const now = Date.now();
+  if (cached && now - lastSuccess < 30_000) {
+    data.value = cached;          // 新鲜期内直接用缓存，不发请求
+    loading.value = false;
+    return;
+  }
+  const ctrl = new AbortController();
+  onCleanup(() => ctrl.abort());
+  loading.value = true;
+  fetch(u, { signal: ctrl.signal })
+    .then((r) => r.json())
+    .then((d) => { cached = d; lastSuccess = Date.now(); data.value = d; })
+    .catch((e) => { if (e.name !== 'AbortError') error.value = e; })
+    .finally(() => { loading.value = false; });
+});
+```
+
+这就是 TanStack Query `staleTime` 的极简版：用「上次成功时间 + 阈值」判断是否复用缓存。真实 Query 还处理了多组件共享同一 key、后台刷新等，手写要补很多边角。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：用 useQuery 改写">
+把练习 1 的手写 `useFetch` 用 TanStack Query 的 `useQuery` 改写，要求「`id` 变化时自动重新请求且复用缓存」。
+
+<Answer>
+**参考答案：**
+
+```ts
+import { useQuery } from '@tanstack/vue-query';
+import { toValue } from 'vue';
+
+const props = defineProps<{ id: string }>();
+const { data, error, isLoading, refetch } = useQuery({
+  queryKey: ['user', toValue(() => props.id)],
+  queryFn: () => fetch('/api/user/' + props.id).then((r) => r.json()),
+  staleTime: 30_000,
+});
+```
+
+`queryKey` 第二项是 `props.id` 的 getter：id 变 → key 变 → 自动重取；同一 id 的两次挂载直接命中缓存、不发请求（`staleTime` 内甚至不重新拉）。比手写少了大量缓存/失效的样板。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：Pinia 还是 Query？">
+判断下面两种数据分别该放 Pinia 还是 TanStack Query，并说明原因：
+（a）当前登录用户的「深色模式偏好」。
+（b）商品列表（来自 /api/products，多页面共用，需缓存）。
+
+<Answer>
+**参考答案：**
+
+- **（a）深色模式偏好** → **Pinia**（客户端状态）。它不来自服务端、不需要缓存/失效、跟着用户操作变，是典型「UI 状态」。可再 `localStorage` 持久化。
+
+- **（b）商品列表** → **TanStack Query**（服务端状态）。它来自 API、多页面共用、需要缓存避免重复请求、数据过期要重新拉取。用 Query 的 `queryKey: ['products']` 自动共享缓存，`invalidateQueries` 在写操作后失效。
+
+一句话：**来自服务器的、要缓存与失效的 → Query；纯客户端 UI 状态 → Pinia**。把（b）塞进 Pinia 当缓存是常见反模式。
+</Answer>
+</Callout>

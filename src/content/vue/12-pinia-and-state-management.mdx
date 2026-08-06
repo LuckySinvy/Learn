@@ -1,0 +1,333 @@
+---
+title: Pinia 与状态管理
+order: 12
+description: 为什么需要状态管理、Pinia 的 defineStore（setup / options 两种写法）、state/getters/actions、$patch/$subscribe，以及用「自包含迷你 Pinia」手搓核心机制
+---
+
+# Pinia 与状态管理
+
+当状态要在**多个不相邻的组件**间共享、还要持久化、要能被 DevTools 追踪时，`provide/inject` 就不够了。Vue 的官方状态管理库是 **Pinia**——一个「集中式 store + 响应式 + 严格管控写入」的方案。
+
+## 1. 为什么不直接用 reactive 全局对象？
+
+```ts
+// store/counter.ts
+import { reactive } from 'vue';
+export const store = reactive({ count: 0, inc() { this.count++; } });
+```
+这能跑，但缺三样东西：① 任何组件都能随意改 `store.count`（无管控）；② 没有 DevTools 时间线；③ 没有模块化的「按名装载 / 热更新」。Pinia 在此基础上补上这些，并让 store 像 composable 一样用。
+
+## 2. 定义 store：setup 写法（推荐）
+
+和写 composable 一模一样——`ref` 当 state、`computed` 当 getter、函数当 action：
+
+```ts
+// stores/counter.ts
+import { defineStore } from 'pinia';
+import { ref, computed } from 'vue';
+
+export const useCounterStore = defineStore('counter', () => {
+  const count = ref(0);                       // state
+  const double = computed(() => count.value * 2); // getter
+  function inc() { count.value++; }            // action
+  function reset() { count.value = 0; }
+  return { count, double, inc, reset };
+});
+```
+
+```vue
+<script setup lang="ts">
+import { useCounterStore } from '@/stores/counter';
+const counter = useCounterStore(); // 拿到的就是响应式 store
+</script>
+
+<template>
+  <p>{{ counter.count }} / {{ counter.double }}</p>
+  <button @click="counter.inc()">+1</button>
+</template>
+```
+
+## 3. options 写法
+
+```ts
+export const useCounterStore = defineStore('counter', {
+  state: () => ({ count: 0 }),
+  getters: { double: (s) => s.count * 2 },
+  actions: { inc() { this.count++; } },
+});
+```
+两种写法等价。setup 写法更灵活（能在 action 里用任意 JS、组合其他 store）；options 写法对 Vue 2 迁移更友好。
+
+## 4. 改 state 与 $patch
+
+```ts
+const s = useCounterStore();
+s.count = 1;                 // 直接改（字段级响应）
+s.$patch({ count: 2, name: 'Ada' }); // 批量改，内部合并
+s.$patch((state) => { state.count++; }); // 函数式批量改
+```
+
+## 5. 订阅变化：$subscribe
+
+```ts
+s.$subscribe((mutation, state) => {
+  // 任何 state 变动都触发，适合做持久化
+  localStorage.setItem('counter', JSON.stringify(state));
+});
+```
+
+## 6. 解构不丢响应：storeToRefs
+
+直接 `const { count } = useCounterStore()` 会丢响应（解构出裸值）。用 `storeToRefs` 只取 ref：
+
+```ts
+import { storeToRefs } from 'pinia';
+const { count, double } = storeToRefs(useCounterStore()); // 都是 ref，保持响应
+const { inc } = useCounterStore(); // action 直接拿，不是 ref
+```
+
+## 7. 手搓迷你 Pinia
+
+下面在 Playground 里**从零实现一个迷你 Pinia**：先有极简响应核心（`ref`/`reactive`/`computed`/`effect`），再用一个 `defineStore` + 自动解包把 store 包成「像 Pinia 一样」的对象。`store.xxx` 读写会自动解包 ref，`$patch` 同时驱动响应式与 `$subscribe` 订阅者。
+
+<Playground
+  language="typescript"
+  title="迷你 Pinia：state / getter / action / $patch / $subscribe"
+  id="vue-12-1"
+  code={`// ============ 迷你响应核心 ============
+type Dep = Set<Effect>;
+const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
+let activeEffect: Effect | null = null;
+interface Effect { deps: Dep[]; scheduler?: () => void; run: () => void; }
+function cleanup(e: Effect): void {
+  for (const d of e.deps) d.delete(e);
+  e.deps.length = 0;
+}
+function effect(fn: () => void, options?: { scheduler?: () => void }): Effect {
+  const e: Effect = {
+    deps: [],
+    scheduler: options?.scheduler,
+    run: () => {
+      cleanup(e);
+      activeEffect = e;
+      try { fn(); } finally { activeEffect = null; }
+    },
+  };
+  e.run();
+  return e;
+}
+function track(target: object, key: PropertyKey): void {
+  if (!activeEffect) return;
+  let m = targetMap.get(target);
+  if (!m) { m = new Map(); targetMap.set(target, m); }
+  let dep = m.get(key);
+  if (!dep) { dep = new Set(); m.set(key, dep); }
+  dep.add(activeEffect);
+  activeEffect.deps.push(dep);
+}
+function trigger(target: object, key: PropertyKey): void {
+  const m = targetMap.get(target);
+  if (!m) return;
+  const dep = m.get(key);
+  if (!dep) return;
+  for (const e of [...dep]) {
+    if (e === activeEffect) continue;
+    if (e.scheduler) e.scheduler(); // 依赖变了：只翻脏标记+通知订阅者，不重跑 getter
+    else e.run();
+  }
+}
+function isObject(v: unknown): v is object { return typeof v === 'object' && v !== null; }
+
+const REF = Symbol('ref');
+function isRef(v: any): boolean { return v != null && typeof v === 'object' && v[REF] === true; }
+
+function reactive<T extends object>(target: T): T {
+  if (!isObject(target)) return target;
+  return new Proxy(target, {
+    get(obj: any, key: PropertyKey, receiver: any) {
+      const res = Reflect.get(obj, key, receiver);
+      if (isRef(res)) return res.value; // 自动解包 ref
+      track(obj, key);
+      return isObject(res) ? reactive(res) : res;
+    },
+    set(obj: any, key: PropertyKey, value: any, receiver: any) {
+      const old = obj[key];
+      if (isRef(old) && !isRef(value)) { old.value = value; return true; }
+      const had = Object.prototype.hasOwnProperty.call(obj, key);
+      const r = Reflect.set(obj, key, value, receiver);
+      if (!had || !Object.is(old, value)) trigger(obj, key);
+      return r;
+    },
+  });
+}
+interface Ref<T> { get value(): T; set value(v: T); }
+function ref<T>(initial: T): Ref<T> {
+  const r = reactive({ value: initial });
+  (r as any)[REF] = true;
+  return r as unknown as Ref<T>;
+}
+function computed<T>(getter: () => T): Ref<T> {
+  let value: T;
+  let dirty = true;
+  const subs = new Set<Effect>();
+  // runner 才是真正跑 getter 的 effect；它的 scheduler 在「依赖变了」时只翻脏标记并通知订阅者
+  const runner = effect(
+    () => { value = getter(); dirty = false; },
+    {
+      scheduler: () => {
+        if (!dirty) { dirty = true; for (const e of [...subs]) e.run(); }
+      },
+    },
+  );
+  const c: any = {
+    get value() {
+      if (activeEffect) { subs.add(activeEffect); activeEffect.deps.push(subs); }
+      if (dirty) runner.run(); // 读时才重算，并重新收集依赖
+      return value;
+    },
+    set value(_v: T) { throw new Error('computed is readonly'); },
+  };
+  c[REF] = true;
+  return c as Ref<T>;
+}
+
+// ============ 迷你 Pinia ============
+function defineStore(id: string, setup: () => Record<string, any>): () => any {
+  let instance: any = null;
+  return () => {
+    if (instance) return instance;
+    const raw = setup();
+    const subs: (() => void)[] = [];
+    instance = reactive({
+      ...raw,
+      $patch(partial: Record<string, any>) {
+        Object.assign(instance, partial);
+        for (const cb of subs) cb();
+      },
+      $subscribe(cb: () => void) { subs.push(cb); },
+    });
+    return instance;
+  };
+}
+
+// ===== 测试：一个购物车 store =====
+const useCart = defineStore('cart', () => {
+  const items = ref<{ name: string; price: number }[]>([]);
+  const total = computed(() => items.value.reduce((s, i) => s + i.price, 0));
+  function add(name: string, price: number) { items.value = [...items.value, { name, price }]; }
+  return { items, total, add };
+});
+
+const cart = useCart();
+let runs = 0;
+effect(() => { runs++; console.log("[cart] total=" + cart.total); });
+let subRuns = 0;
+cart.$subscribe(() => { subRuns++; console.log("[sub] total now " + cart.total); });
+
+cart.add('apple', 3);
+cart.add('banana', 2);
+cart.$patch({ items: [...cart.items, { name: 'cherry', price: 4 }] });
+console.log("subRuns = " + subRuns);
+console.log("runs = " + runs);`}
+  expectedOutput={`[cart] total=0\n[cart] total=3\n[cart] total=5\n[cart] total=9\n[sub] total now 9\nsubRuns = 1\nruns = 4\n`}
+/>
+
+Playground 里 `reactive` 的 `get` 对 ref 自动解包（`store.count` 等价于读 `ref.value`），`set` 遇到 ref 自动写到 `.value`——这正是 Pinia「访问 store 字段像普通属性」的底层。`computed` 用「脏标记 + 调度 effect」实现懒计算，`$patch` 既走响应式（`Object.assign` 触发 `set`）又显式通知 `$subscribe` 订阅者。一个 120 行的迷你 Pinia，把「集中式 store」的精髓全演示了。
+
+## 小结
+
+| 概念 | 说明 |
+|---|---|
+| `defineStore(id, setup)` | setup 写法最推荐：`ref`=state、`computed`=getter、函数=action |
+| options 写法 | `{ state, getters, actions }`，对 Vue 2 迁移友好 |
+| 改 state | `store.x = 1` 或 `store.$patch({...})` 批量合并 |
+| `$subscribe` | 监听任意 state 变动，适合持久化 / 埋点 |
+| `storeToRefs` | 解构 state/getter 而不丢响应（action 直接解构） |
+
+<Callout type="exercise" title="练习 1：写一个 useUserStore">
+用 setup 写法写一个 `useUserStore`：state 有 `name`（默认 ''）、`age`（默认 0）；getter `isAdult`（age>=18）；action `grow()` 让 age+1、`setName(n)` 改名。
+
+<Answer>
+**参考答案：**
+
+```ts
+import { defineStore } from 'pinia';
+import { ref, computed } from 'vue';
+
+export const useUserStore = defineStore('user', () => {
+  const name = ref('');
+  const age = ref(0);
+  const isAdult = computed(() => age.value >= 18);
+  function grow() { age.value++; }
+  function setName(n: string) { name.value = n; }
+  return { name, age, isAdult, grow, setName };
+});
+```
+
+setup 写法下，store 的「字段」其实就是 composable 里的 `ref`/`computed`/函数。`isAdult` 是派生值，用 `computed`；`grow`/`setName` 是 action，直接改 ref。组件里 `const user = useUserStore()` 后即可 `user.age`、`user.grow()`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：storeToRefs 解构">
+为什么 `const { count } = useCounterStore()` 会丢响应？写出正确写法，并说明 action 该怎么拿。
+
+<Answer>
+**原因：** Pinia 的 state/getter 本质是 `ref` 包裹的。直接解构 `const { count } = store` 会把 `count` 这个 ref **拆成当时的裸值**，后续 store 变化与这个局部变量再无关联 → 丢响应。
+
+**正确写法：** 用 `storeToRefs` 只抽取 state/getter（保留 ref 包装）：
+
+```ts
+import { storeToRefs } from 'pinia';
+const store = useCounterStore();
+const { count, double } = storeToRefs(store); // count、double 仍是 ref，保持响应
+```
+
+**action 直接拿**（action 不是 ref，不需要 `storeToRefs`）：
+
+```ts
+const { inc } = store; // 或 const { inc } = useCounterStore();
+inc();
+```
+
+总结：`storeToRefs` 拿 state/getter，`useStore()` 直接拿 action，两者分开解构。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：用 $subscribe 做持久化">
+写一个 `useCartStore`，并在某组件里用 `$subscribe` 把它每次变动都存到 `localStorage`（key 为 `'cart'`）。说明为什么用 `$subscribe` 而不是 `watch`。
+
+<Answer>
+**参考答案：**
+
+```ts
+// stores/cart.ts
+import { defineStore } from 'pinia';
+import { ref } from 'vue';
+export const useCartStore = defineStore('cart', () => {
+  const items = ref<string[]>([]);
+  function add(i: string) { items.value = [...items.value, i]; }
+  return { items, add };
+});
+```
+
+```vue
+<script setup lang="ts">
+import { onMounted } from 'vue';
+import { useCartStore } from '@/stores/cart';
+const cart = useCartStore();
+
+// 每次 state 变动都持久化
+cart.$subscribe((_mutation, state) => {
+  localStorage.setItem('cart', JSON.stringify(state.items));
+});
+
+onMounted(() => {
+  const saved = localStorage.getItem('cart');
+  if (saved) cart.items = JSON.parse(saved);
+});
+</script>
+```
+
+为什么用 `$subscribe` 而不是 `watch`：`$subscribe` 是 Pinia 专为「state 变动」设计，回调第二个参数直接给**整个 state 快照**，且默认在「state 真正变更」时触发（带 mutation 信息，便于调试）；`watch` 要自己选源、自己深监听、自己拼 state。做「全局持久化」这种关心「任意字段变动」的场景，`$subscribe` 更省心、语义更准。
+</Answer>
+</Callout>

@@ -1,0 +1,300 @@
+---
+title: 响应式状态与事件
+order: 4
+description: ref 与 reactive 的选择、为什么需要 .value、解构丢失响应性的情形，以及事件处理与异步批量更新
+---
+
+# 响应式状态与事件
+
+props 是从外面传进来的、只读的数据（第 3 章）。**状态（state）**是组件自己拥有、可以变化的数据。Vue 里让数据「变 → 界面自动跟着变」的能力，来自两个 API：`ref` 和 `reactive`。
+
+## 1. ref 与 reactive
+
+### 1.1 基本用法
+
+```vue
+<script setup lang="ts">
+import { ref, reactive } from 'vue';
+
+const count = ref(0);
+const user = reactive({ name: 'Ada', age: 36 });
+
+console.log(count.value);   // 读要 .value
+console.log(user.name);     // reactive 对象直接读属性
+
+function inc() {
+  count.value++;            // 写也要 .value
+  user.age++;
+}
+</script>
+
+<template>
+  <p>{{ count }}</p>        <!-- 模板里自动解包，不用 .value -->
+  <p>{{ user.name }}</p>
+  <button @click="inc">+1</button>
+</template>
+```
+
+### 1.2 为什么 `ref` 要有 `.value`
+
+这是新手最不习惯的地方。原因很硬：**JavaScript 无法拦截「原始值（number/string/boolean）的读写」**。
+
+```js
+let count = 0;
+// 当你写 count = 1，JS 引擎只做了一次赋值，没有任何「钩子」能让 Vue 知道「count 变了」
+```
+
+Vue 要「在数据变化时自动更新界面」，就必须有个地方能拦截读写。对原始值，唯一可行的办法是把它**装进一个对象里**，用 `get`/`set` 拦截器：
+
+```js
+const count = { get value() { /* 拦截读 */ }, set value(v) { /* 拦截写 */ } };
+```
+
+所以 `ref` 本质上就是一个**带 `.value` 的盒子**。模板里 `{{ count }}` 之所以不用写 `.value`，是因为编译器在编译模板时自动帮你补上了 `.value`（只对**顶层**绑定生效；如果在数组、`Map` 里，ref 不会被自动解包，还是要手动 `.value`）。
+
+<Callout type="info" title="为什么不用 reactive 统一就行？">
+`reactive` 用 `Proxy` 拦截对象，对对象很自然。但 `Proxy` **只能包对象**，不能包原始值（`new Proxy(0, ...)` 直接报错）。原始值必须用 `ref` 这个盒子装起来。Vue 的默认建议是：**统一用 `ref`**——无论原始值还是对象，`ref` 都能装（对象会被 `ref` 内部转成 `reactive`），心智负担最小。
+</Callout>
+
+### 1.3 ref 还是 reactive？
+
+| | ref | reactive |
+|---|---|---|
+| 能包什么 | 原始值 + 对象 | 只能对象/数组 |
+| 读取 | 要 `.value` | 直接读属性 |
+| 整体替换 | 可以 `count = ref(x)` | **不能**整体替换（`user = {...}` 会断掉响应性） |
+| 解构 | 解构会丢响应（要用 `toRefs`，第 9 章） | 直接解构直接丢响应 |
+| 模板里 | 顶层自动解包 | 直接用 |
+
+**结论：默认用 `ref`。** 只有在「明确一个对象且永远不会整体替换」时，才用 `reactive`。
+
+### 1.4 Vue 3 的 Proxy 比 Vue 2 强在哪
+
+`reactive` 基于 `Proxy`，所以这些写法**天然支持**，不需要 Vue 2 的 `Vue.set`：
+
+```ts
+const state = reactive({ list: [] as number[] });
+state.list[0] = 1;        // 索引赋值 ✅
+state.list.push(2);       // 数组方法 ✅
+state.list.length = 0;    // 改长度 ✅
+state.map = new Map();    // Map ✅
+state.map.set('k', 1);    // Set / Map 也被代理 ✅
+```
+
+Vue 2 用 `Object.defineProperty`，对新增属性、数组索引、`length` 都无能为力，必须 `Vue.set`。Vue 3 彻底解决了。
+
+## 2. 事件处理
+
+### 2.1 三种写法
+
+```vue
+<template>
+  <!-- 内联表达式 -->
+  <button @click="count++">+1</button>
+
+  <!-- 函数名（Vue 自动调用，不用 () =>）-->
+  <button @click="inc">加</button>
+
+  <!-- 内联里访问事件对象用 $event -->
+  <input @input="onInput($event)" />
+
+  <!-- 自定义事件（子传父，见第 3 章 defineEmits）-->
+  <Child @change="onChange" />
+</template>
+```
+
+### 2.2 修饰符
+
+```vue
+<template>
+  <form @submit.prevent="onSubmit">提交</form>   <!-- preventDefault -->
+  <button @click.stop="close">关闭</button>       <!-- stopPropagation -->
+  <a @click.once="track">只触发一次</a>
+  <input @keyup.enter="submit" />                  <!-- 回车 -->
+  <div @click.self="onlySelf">只点自己</div>       <!-- 自己不是子元素才触发 -->
+</template>
+```
+
+修饰符是编译期生成的包装，等价于手写 `e.preventDefault()` 等。
+
+## 3. 更新是异步批量的
+
+和 React 类似，同一轮事件里多次改状态，**界面只重渲染一次**：
+
+```vue
+<script setup>
+const count = ref(0);
+const double = ref(0);
+
+function handleClick() {
+  count.value++;
+  double.value = count.value * 2;
+  // 这里立即读 DOM，拿到的还是「旧值」——因为渲染还没发生
+}
+</script>
+```
+
+改完状态后立刻读 DOM 或读依赖它的计算值，拿到的可能是旧的。需要「等渲染完」用 `nextTick`（第 6 章）。
+
+下面这个 Playground 亲手实现一个迷你 `ref`，看清「盒子 + 订阅者集合 + 同值短路」这套机制——这正是 Vue 响应式的最小内核。
+
+<Playground
+  language="typescript"
+  title="迷你 ref：一个带 .value 的盒子"
+  id="vue-04-1"
+  code={`// 全局「当前正在运行的副作用」，用来收集依赖
+let activeEffect: (() => void) | null = null;
+
+// 副作用：运行 fn，期间读取到的 ref 会把自己登记到 activeEffect
+function effect(fn: () => void): void {
+  activeEffect = fn;
+  fn();
+  activeEffect = null;
+}
+
+// 迷你 ref：一个带 .value 的盒子
+function miniRef<T>(init: T): { value: T } {
+  let _value = init;
+  const subs = new Set<() => void>();
+  return {
+    get value(): T {
+      if (activeEffect) {
+        subs.add(activeEffect);
+      }
+      return _value;
+    },
+    set value(nv: T) {
+      if (Object.is(nv, _value)) return; // 同值短路，不触发
+      _value = nv;
+      for (const sub of subs) {
+        sub();
+      }
+    },
+  };
+}
+
+const c = miniRef(0);
+let renderCount = 0;
+
+// 第一次运行 effect：读取 c.value -> 建立订阅，并打印
+effect(() => {
+  renderCount++;
+  console.log("渲染: count = " + c.value);
+});
+
+c.value = 0; // 赋相同值，不触发
+console.log("赋相同值后 renderCount = " + renderCount);
+
+c.value = 5; // 赋新值，触发重新渲染
+console.log("最终 renderCount = " + renderCount);
+
+// 对照组：普通变量，赋值无法被拦截
+let plain = 0;
+let plainCount = 0;
+effect(() => {
+  plainCount++;
+  console.log("普通变量渲染: " + plain);
+});
+plain = 9; // 不会被拦截，plainCount 不变
+console.log("改普通变量后 plainCount = " + plainCount);`}
+  expectedOutput={`渲染: count = 0\n赋相同值后 renderCount = 1\n渲染: count = 5\n最终 renderCount = 2\n普通变量渲染: 0\n改普通变量后 plainCount = 1\n`}
+/>
+
+第一组输出最值得琢磨：**赋相同值（0）时 `renderCount` 没变**——`Object.is` 同值短路，这正是 Vue 避免无谓重渲染的第一道关卡。第二组则证明：普通变量的赋值根本无法被「拦截」，所以 Vue 必须用 `ref` 这个盒子把原始值包起来才能追踪。
+
+## 4. 设计状态的原则
+
+和 React 一样，Vue 也遵循：
+
+1. **不存冗余数据**：能从其他状态算出来的，用 `computed`（第 5 章），不要存成 state
+2. **避免深层嵌套**：扁平结构更新简单
+3. **相关的放一起**：两个状态总是一起变，考虑合并成一个 `reactive` 对象
+4. **能推导就不存**：列表里「还剩几项」、`isAllDone` 这类都该现算
+
+<Callout type="exercise" title="练习 1：ref 还是 reactive？">
+下面 5 个场景，分别用 `ref` 还是 `reactive` 更合适？并说明理由：
+
+1. 一个计数器数字
+2. 一个用户的完整信息对象（name/age/email），且不会整体替换
+3. 一个「当前选中的标签页 id」，会被整体替换
+4. 表单的多个字段（username/password），需要整体重置
+5. 一个由其他状态算出来的「是否全选」标志
+
+<Answer>
+**参考答案：**
+
+1. **计数器数字** → `ref`。原始值只能用 `ref`。
+2. **用户信息对象，不整体替换** → `reactive` 可以，但 `ref` 也行。因为明确不整体替换，`reactive({ name, age, email })` 很自然。不过用 `ref(user)` 也完全没问题，Vue 内部会把对象转成 reactive。
+3. **当前选中 tab id** → `ref`。它会被「整体替换」（从 'a' 改成 'b'），而 `reactive` 不能整体替换（替换会断响应）。原始值也只能用 `ref`。
+4. **表单多字段** → 用 `reactive` 或 `ref` 都行，但常见写法是用 `reactive({ username, password })`，重置时 `Object.assign(form, initialState)`（注意**不要整体替换** `form = {...}`，那会断响应）。也可以 `ref` 包一个对象。
+5. **是否全选标志** → **都不用**。它是计算出来的（`todos.every(t => t.done)`），应该用 `computed`（第 5 章），不是 state。存成 ref/reactive 就又回到「两份真相」问题。
+
+**规律**：原始值→`ref`；会被整体替换→`ref`；对象且不替换→`reactive` 或 `ref` 皆可（默认推荐 `ref`）；「算出来的」→`computed` 而不是状态。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：为什么 .value 绕不开">
+解释为什么 Vue 不能让 `const count = ref(0)` 直接写成 `count++` 而不用 `.value`，并保证仍然能触发更新？如果不用盒子，有没有别的语言机制能做到？
+
+<Answer>
+**参考答案：**
+
+**为什么必须 `.value`：**
+
+JS 的赋值 `count = 1` 是语言内置操作，**没有任何钩子**能在赋值发生时被调用。要让 Vue 在「值变了」时自动更新界面，就必须有一个能拦截读写的东西。Vue 选中了「对象 + get/set 访问器」这条路，于是值必须住在对象里，通过 `.value` 这个访问器进/出——读 `.value` 时收集依赖，写 `.value` 时触发更新。
+
+所以 `.value` 不是语法糖，而是「把原始值装进可拦截的盒子」这一设计的直接后果。
+
+**别的机制有没有？**
+
+- 编译期改写：`count++` 可以被编译器自动改写成 `count.value++`。事实上 Svelte 就是这么做的——它在编译期分析出 `count` 是个响应式变量，直接改写赋值语句。代价是依赖编译器深度重写，且对「值从哪来」有强约束。
+- `Proxy`：只能包对象，包不了原始值（`new Proxy(0, handler)` 直接抛错），所以单独用不上。
+- 赋值操作符重载：JS 没有运算符重载，做不到。
+
+Vue 选了「运行时盒子 + 显式 `.value`」，好处是**语义透明、不依赖编译期魔法**（`<script setup>` 的模板会自动补 `.value`，但纯 JS 逻辑里你写得很清楚在干什么）。代价就是 `.value` 这个额外书写。这是设计取舍，不是疏忽。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：预测输出">
+```vue
+<script setup>
+const n = ref(0);
+function click() {
+  n.value++;
+  n.value = n.value + 10;
+  n.value = 5;
+}
+</script>
+```
+点击一次后，`n.value` 是多少？逐步说明三次赋值分别发生了什么（对照 React 那道题里「传值覆盖」的机制，Vue 这里没有批处理队列的问题，因为 ref 的 set 是立即触发的）。
+
+<Answer>
+**参考答案：**
+
+点击一次后 `n.value` 是 **5**。
+
+和 React 的 `setState` 不同，Vue 的 `ref.value =` 是**立即同步修改并触发依赖**的（没有「把更新函数排队、下次渲染才消费」的机制）。所以三次赋值就是三次普通的同步赋值：
+
+| 步骤 | 语句 | 结果 |
+|---|---|---|
+| ① | `n.value++` | `n.value` 变成 1，触发一次渲染 |
+| ② | `n.value = n.value + 10` | 读到当前值 1，赋成 11，触发一次渲染 |
+| ③ | `n.value = 5` | 赋成 5，触发一次渲染 |
+
+最终 `n.value = 5`。
+
+**和 React 的关键区别**：React 的 `setN(n + 1); setN(n + 100); setN(v => v + 10)` 会把三次更新排进一个队列，下一轮渲染才消费，且有「传值覆盖 / 传函数累积」的微妙差别。Vue 的 `ref` 没有队列，`set` 就是立刻改+立刻触发。所以这道题在 Vue 里是直白的：「每次 `=` 都是真实赋值」，不会有 React 那种「闭包快照 + 批处理」的坑。
+
+（注意：虽然 set 立即触发，但**界面渲染本身仍是异步批量的**——多个 set 在本次事件里触发多次 effect，但 DOM 更新会被调度器合并成一次，第 6 章会讲。）
+</Answer>
+</Callout>
+
+## 小结
+
+- `ref` 是带 `.value` 的盒子，用来把 JS 无法拦截的原始值「装起来」以便追踪；模板里顶层自动解包
+- `reactive` 基于 `Proxy`，能装对象，支持索引/数组方法/`length`/Map/Set，无需 `Vue.set`
+- **默认用 `ref`**：原始值只能 `ref`，整体替换只能 `ref`，对象 `ref`/`reactive` 皆可
+- 事件：`@click` 写内联表达式或函数名；修饰符（`.prevent .stop .once .enter .self`）是编译期包装
+- 状态更新会**异步批量**渲染：同一轮事件里改多次，DOM 只刷新一次
+- 能推导出来的值用 `computed` 而不存成 state
+- 下一章讲 `computed` 与 `watch`，并亲手看 computed 的「惰性缓存」与 watch 的取舍 →

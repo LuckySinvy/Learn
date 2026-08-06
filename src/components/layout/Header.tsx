@@ -7,7 +7,7 @@ import type { Language } from '@/lib/types';
 
 const CATEGORIES: { label: string; items: Language[] }[] = [
   { label: '编程语言', items: ['python', 'go', 'java', 'rust', 'typescript'] },
-  { label: '前端', items: ['react'] },
+  { label: '前端', items: ['react', 'vue'] },
   { label: '数据库', items: ['mysql', 'redis', 'mongodb', 'clickhouse'] },
   { label: '中间件', items: ['kafka', 'grafana', 'prometheus'] },
   { label: '工程基础', items: ['linux', 'git', 'http'] },

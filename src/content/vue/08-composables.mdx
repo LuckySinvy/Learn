@@ -1,0 +1,438 @@
+---
+title: 组合式函数
+order: 8
+description: 用 composable 抽取可复用逻辑、命名与返回值约定、effectScope 统一销毁，以及和 mixin / 自定义 Hook 的区别
+---
+
+# 组合式函数
+
+React 用「自定义 Hook」抽复用逻辑，Vue 的对应物叫 **组合式函数（composable）**：一个 `use` 前缀的普通函数，内部调用响应式 API 和生命周期钩子。
+
+```ts
+// useCounter.ts
+import { ref } from 'vue';
+
+export function useCounter(initial = 0) {
+  const count = ref(initial);
+  const inc = () => count.value++;
+  const dec = () => count.value--;
+  return { count, inc, dec };
+}
+```
+
+使用时：
+
+```vue
+<script setup lang="ts">
+import { useCounter } from './useCounter';
+
+const { count, inc, dec } = useCounter(0);
+</script>
+
+<template>
+  <button @click="dec">-</button>
+  <span>{{ count }}</span>
+  <button @click="inc">+</button>
+</template>
+```
+
+`useCounter` 内部用 `ref` 创建了响应式状态，返回出来；调用方解构后，这些 ref 仍然保持响应——这就是组合式函数的核心：**复用的是「逻辑」，不是「副本」**。
+
+## 1. 约定
+
+### 1.1 返回一组 ref，不要返回 reactive 对象
+
+```ts
+// ✅ 返回 ref，调用方解构后仍响应
+export function useMouse() {
+  const x = ref(0);
+  const y = ref(0);
+  return { x, y };
+}
+const { x, y } = useMouse(); // x、y 都是 ref，保持响应
+
+// ❌ 返回 reactive 对象，调用方一解构就丢响应
+export function useMouseBad() {
+  const pos = reactive({ x: 0, y: 0 });
+  return pos;
+}
+const { x, y } = useMouseBad(); // x、y 变成普通数字，不再响应
+```
+
+### 1.2 入参用 MaybeRefOrGetter + toValue
+
+Vue 3.3+ 提供 `toValue()`，让 composable 同时接受「裸值、ref、getter」：
+
+```ts
+import { ref, toValue, type MaybeRefOrGetter } from 'vue';
+
+export function useFetch(url: MaybeRefOrGetter<string>) {
+  const data = ref(null);
+  watchEffect(() => {
+    fetch(toValue(url)).then((r) => r.json()).then((d) => (data.value = d));
+  });
+  return { data };
+}
+
+// 三种调用都行
+useFetch('/api/a');
+useFetch(urlRef);
+useFetch(() => `/user/${id.value}`);
+```
+
+`toValue(x)` 的行为：`x` 是 ref → 取 `.value`；是函数 → 调用它；否则原样返回。一个函数统一处理三种形态。
+
+### 1.3 副作用自清理
+
+composable 里加了事件监听、定时器等，要在 `onUnmounted` 里移除：
+
+```ts
+export function useWindowSize() {
+  const width = ref(window.innerWidth);
+  const onResize = () => (width.value = window.innerWidth);
+  onMounted(() => window.addEventListener('resize', onResize));
+  onUnmounted(() => window.removeEventListener('resize', onResize));
+  return { width };
+}
+```
+
+## 2. effectScope：脱离组件的批量管理
+
+多数 composable 在组件 `setup` 里调用，组件卸载时 Vue 自动清理里面的 effect。但有时你想**在组件外**（比如一个共享 store、一个轮询器）持有一些 effect，并统一管理它们的生命周期——这时用 `effectScope`：
+
+```ts
+const scope = effectScope();
+scope.run(() => {
+  // 这里创建的 effect / 计算属性 / 监听，都被 scope 收集
+  const state = reactive({ n: 0 });
+  watch(state, () => console.log('changed'));
+});
+// 想销毁时一次性停掉里面的所有东西
+scope.stop();
+```
+
+`scope.stop()` 会递归停止 scope 内所有 effect 和子 scope，是「批量卸载响应式副作用」的利器。
+
+## 3. 和 React 自定义 Hook、Vue 2 mixin 的区别
+
+| | Vue composable | React 自定义 Hook | Vue 2 mixin |
+|---|---|---|---|
+| 复用单元 | 函数 | 函数 | 对象 |
+| 依赖数组 | 无 | 有（易漏写） | 无 |
+| 闭包陷阱 | 无（`setup` 只跑一次） | 有 | 无 |
+| 命名冲突 | 无（显式解构） | 无 | 有（同名覆盖） |
+| 来源可见 | 清晰（函数调用） | 清晰 | 隐晦（混入全局） |
+
+Vue composable **没有依赖数组、不会重复执行**——因为 `setup` 只跑一次。这消除了 React 自定义 Hook 最常见的两类坑（依赖数组漏写、闭包拿到旧值）。
+
+<Playground
+  language="typescript"
+  title="effectScope：组合式函数的批量销毁"
+  id="vue-08-1"
+  code={`type Dep = Set<ReactiveEffect>;
+const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
+let activeEffect: ReactiveEffect | null = null;
+
+interface ReactiveEffect {
+  deps: Dep[];
+  active: boolean;
+  run: () => void;
+  stop: () => void;
+}
+
+function cleanup(e: ReactiveEffect): void {
+  for (const d of e.deps) d.delete(e);
+  e.deps.length = 0;
+}
+
+function effect(fn: () => void): ReactiveEffect {
+  const e: ReactiveEffect = {
+    deps: [],
+    active: true,
+    run: () => {
+      if (!e.active) { fn(); return; }
+      cleanup(e);
+      activeEffect = e;
+      try { fn(); } finally { activeEffect = null; }
+    },
+    stop: () => { if (e.active) { cleanup(e); e.active = false; } },
+  };
+  e.run();
+  if (activeScope) activeScope.effects.push(e);
+  return e;
+}
+
+function track(target: object, key: PropertyKey): void {
+  if (!activeEffect) return;
+  let m = targetMap.get(target);
+  if (!m) { m = new Map(); targetMap.set(target, m); }
+  let dep = m.get(key);
+  if (!dep) { dep = new Set(); m.set(key, dep); }
+  dep.add(activeEffect);
+  activeEffect.deps.push(dep);
+}
+
+function trigger(target: object, key: PropertyKey): void {
+  const m = targetMap.get(target);
+  if (!m) return;
+  const dep = m.get(key);
+  if (!dep) return;
+  for (const e of new Set(dep)) if (e !== activeEffect) e.run();
+}
+
+function isObject(v: unknown): v is object { return typeof v === 'object' && v !== null; }
+const reactiveMap = new WeakMap<object, object>();
+const RAW = Symbol('raw');
+function reactive<T extends object>(target: T): T {
+  if (!isObject(target)) return target;
+  if ((target as Record<symbol, unknown>)[RAW]) return target;
+  const existing = reactiveMap.get(target);
+  if (existing) return existing as T;
+  const proxy = new Proxy(target, {
+    get(obj: object, key: string | symbol, receiver: any) {
+      if (key === RAW) return target;
+      const res = Reflect.get(obj, key, receiver);
+      track(obj, key);
+      if (isObject(res)) return reactive(res as object) as object;
+      return res;
+    },
+    set(obj: object, key: string | symbol, value: any, receiver: any) {
+      const oldVal = (obj as Record<string | symbol, unknown>)[key];
+      const hadKey = Object.prototype.hasOwnProperty.call(obj, key);
+      const result = Reflect.set(obj, key, value, receiver);
+      if (!hadKey || !Object.is(oldVal, value)) trigger(obj, key);
+      return result;
+    },
+  });
+  reactiveMap.set(target, proxy);
+  return proxy as T;
+}
+
+interface EffectScope {
+  effects: ReactiveEffect[];
+  scopes: EffectScope[];
+  cleanups: (() => void)[];
+  parent: EffectScope | null;
+  active: boolean;
+  run: <T>(fn: () => T) => T;
+  stop: (fromParent?: boolean) => void;
+}
+
+let activeScope: EffectScope | null = null;
+
+function effectScope(detached = false): EffectScope {
+  const scope: EffectScope = {
+    effects: [],
+    scopes: [],
+    cleanups: [],
+    parent: null,
+    active: true,
+    run<T>(fn: () => T): T {
+      const prev = activeScope;
+      activeScope = this;
+      try { return fn(); } finally { activeScope = prev; }
+    },
+    stop() {
+      if (this.active) {
+        this.active = false;
+        for (const e of this.effects) e.stop();
+        for (const s of this.scopes) s.stop(true);
+        for (const c of this.cleanups) c();
+      }
+    },
+  };
+  if (!detached && activeScope) {
+    activeScope.scopes.push(scope);
+    scope.parent = activeScope;
+  }
+  return scope;
+}
+
+function toRefs<T extends object>(obj: T): Record<string, { value: any }> {
+  const result: Record<string, { value: any }> = {};
+  for (const key in obj) {
+    result[key] = {
+      get value() { return (obj as Record<string, any>)[key]; },
+      set value(v: any) { (obj as Record<string, any>)[key] = v; },
+    };
+  }
+  return result;
+}
+
+// ===== 测试 =====
+const s = reactive({ count: 0, name: 'Ada' });
+
+const scope = effectScope();
+let runs = 0;
+scope.run(() => {
+  effect(() => { runs++; console.log("[scope] count=" + s.count); });
+  effect(() => { runs++; console.log("[scope] name=" + s.name); });
+  const child = effectScope();
+  child.run(() => {
+    effect(() => { runs++; console.log("[child] count*2=" + (s.count * 2)); });
+  });
+});
+
+console.log("--- 改 count：触发 2 个 scope effect + 1 个 child effect ---");
+s.count = 1;
+console.log("runs 已 = " + runs);
+
+scope.stop();
+console.log("--- scope.stop() 后 ---");
+s.count = 2;
+s.name = 'Grace';
+console.log("stop 后 runs 仍 = " + runs);
+
+// toRefs 演示
+const state = reactive({ x: 1, y: 2 });
+const { x } = state;
+let directRuns = 0;
+effect(() => { directRuns++; console.log("[direct] x=" + x); });
+state.x = 99;
+console.log("直接解构后 directRuns = " + directRuns + " (x 仍是 " + x + ")");
+
+const refs = toRefs(state);
+let refRuns = 0;
+effect(() => { refRuns++; console.log("[toRefs] x=" + refs.x.value); });
+state.x = 100;
+console.log("toRefs 后 refRuns = " + refRuns);`}
+  expectedOutput={`[scope] count=0\n[scope] name=Ada\n[child] count*2=0\n--- 改 count：触发 2 个 scope effect + 1 个 child effect ---\n[scope] count=1\n[child] count*2=2\nruns 已 = 5\n--- scope.stop() 后 ---\nstop 后 runs 仍 = 5\n[direct] x=1\n直接解构后 directRuns = 1 (x 仍是 1)\n[toRefs] x=99\n[toRefs] x=100\ntoRefs 后 refRuns = 2\n`}
+/>
+
+第一段证明 `scope.stop()` 一次性停掉了 3 个 effect（含嵌套子 scope 的 1 个）——改 `count`/`name` 后 `runs` 仍停在 5。第二段对比两种解构：直接解构 `const { x } = state` 拿到的是**快照数值**，effect 只跑一次；`toRefs` 返回的 `refs.x` 仍是响应式的 `ref`，`state.x` 变化后 effect 正确重跑（refRuns 从 1 变 2）。
+
+<Callout type="exercise" title="练习 1：抽 useWindowSize">
+把下面这段在组件里直接写的逻辑，抽成一个 `useWindowSize()` composable（返回 `width` / `height` 两个 ref，并在卸载时移除监听）：
+
+```ts
+const width = ref(window.innerWidth);
+const height = ref(window.innerHeight);
+function onResize() {
+  width.value = window.innerWidth;
+  height.value = window.innerHeight;
+}
+window.addEventListener('resize', onResize);
+```
+
+<Answer>
+**参考答案：**
+
+```ts
+import { ref, onMounted, onUnmounted } from 'vue';
+
+export function useWindowSize() {
+  const width = ref(window.innerWidth);
+  const height = ref(window.innerHeight);
+
+  function onResize() {
+    width.value = window.innerWidth;
+    height.value = window.innerHeight;
+  }
+
+  onMounted(() => window.addEventListener('resize', onResize));
+  onUnmounted(() => window.removeEventListener('resize', onResize));
+
+  return { width, height };
+}
+```
+
+要点：
+1. 返回**一组 ref**（`{ width, height }`），调用方解构后仍是响应式的。
+2. 副作用（事件监听）在 `onMounted` 注册、`onUnmounted` 移除。因为 composable 在 `setup` 同步期调用，`onUnmounted` 能正确绑到当前组件实例上，组件卸载时自动清理。
+3. `onResize` 是普通函数，不需要 `useCallback`——Vue 的 `setup` 只跑一次，没有 React 那种「每次渲染重建函数」的问题。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：用 toValue 写 useFetch">
+用 `MaybeRefOrGetter` + `toValue` 写一个 `useFetch(url)`，使它同时支持：
+
+```ts
+useFetch('/api/a');
+useFetch(urlRef);                 // urlRef 是 ref<string>
+useFetch(() => '/user/' + id.value);  // getter
+```
+
+<Answer>
+**参考答案：**
+
+```ts
+import { ref, watchEffect, toValue, type MaybeRefOrGetter } from 'vue';
+
+export function useFetch(url: MaybeRefOrGetter<string>) {
+  const data = ref<unknown>(null);
+  const loading = ref(true);
+  const error = ref<unknown>(null);
+
+  watchEffect(() => {
+    const u = toValue(url);          // ref -> .value；getter -> 调用；裸串 -> 原值
+    loading.value = true;
+    error.value = null;
+    fetch(u)
+      .then((r) => r.json())
+      .then((d) => { data.value = d; })
+      .catch((e) => { error.value = e; })
+      .finally(() => { loading.value = false; });
+  });
+
+  return { data, loading, error };
+}
+```
+
+关键点：`toValue(url)` 一行统一处理三种形态——`url` 是 `ref` 时取 `.value`，是函数时调用它（于是 watchEffect 会自动收集 getter 里读到的 `id` 依赖），是裸字符串时原样返回。这就是为什么「getter 形式」能自动响应 `id` 的变化：watchEffect 在跑 getter 时读到了 `id.value`，依赖就被收集了。
+
+对比 React：`url` 变化时重新请求，在 React 里要写 `useEffect(() => {...}, [url])`，并小心依赖数组。Vue 用 `toValue` + watchEffect 没有依赖数组。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：effectScope 还是组件卸载？">
+说明什么时候该用 `effectScope` 而不是依赖组件卸载来清理，并给出一个「多个组件共享同一份轮询逻辑，最后一个卸载时才停止」的场景的实现思路。
+
+<Answer>
+**参考答案：**
+
+**什么时候用 effectScope：** 当响应式副作用**不属于任何单一组件的生命周期**时。典型场景：
+- 全局 store / 单例里的轮询、订阅
+- 在组件外（如模块顶层、测试里）临时创建 effect 并要手动控制销毁
+- 多个组件共享一份副作用，想「按引用计数」统一销毁
+
+如果副作用**明确属于某个组件**（组件卸载就该没），直接用 `onUnmounted` 即可，不需要 effectScope——Vue 已经帮你用组件级的 effectScope 管理了。
+
+**共享轮询 + 引用计数的思路：**
+
+```ts
+import { effectScope, ref } from 'vue';
+
+let scope: ReturnType<typeof effectScope> | null = null;
+let refCount = 0;
+const ticks = ref(0);
+
+export function useSharedPolling() {
+  refCount++;
+  if (!scope) {
+    scope = effectScope();
+    scope.run(() => {
+      setInterval(() => { ticks.value++; }, 1000); // 只起一个定时器
+    });
+  }
+  function dispose() {
+    refCount--;
+    if (refCount === 0 && scope) {
+      scope.stop();   // 最后一个组件卸载才停
+      scope = null;
+    }
+  }
+  return { ticks, dispose };
+}
+```
+
+每个组件在 `onUnmounted` 调 `dispose()`。只有当 `refCount` 归零（最后一个使用者走了）才 `scope.stop()` 真正停掉定时器。这正是「`effectScope` 用于脱离组件、按引用计数统一销毁」的实战价值——单纯靠某个组件的 `onUnmounted` 做不到「最后一个才停」。
+</Answer>
+</Callout>
+
+## 小结
+
+- 组合式函数 = `use` 前缀的普通函数，内部用响应式 API + 生命周期钩子抽复用逻辑
+- 返回**一组 ref**（调用方可解构且保持响应）；入参用 `MaybeRefOrGetter` + `toValue` 兼容裸值/ref/getter
+- 副作用在 composable 内 `onUnmounted` 清理；组件外的副作用用 `effectScope` 批量管理，`scope.stop()` 递归停止所有 effect 和子 scope
+- 相比 React Hook：无依赖数组、无闭包陷阱；相比 mixin：来源清晰、无命名冲突
+- 下一章讲模板引用与响应式工具（shallowRef / toRefs / customRef 等）→

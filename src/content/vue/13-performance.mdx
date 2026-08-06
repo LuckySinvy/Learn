@@ -1,0 +1,249 @@
+---
+title: 性能优化
+order: 13
+description: computed 的缓存vs方法、v-once/v-memo、稳定的 key、大对象用 shallowRef/markRaw，以及用迷你响应系统证明「computed 只在依赖变时才重算」
+---
+
+# 性能优化
+
+Vue 的细粒度响应式已经很快，但仍有几处「人为拖慢」的高频坑。本章按收益排序讲清楚。
+
+## 1. computed 缓存 vs 方法：最大的误区
+
+模板里常有人写「方法」代替 computed：
+
+```vue
+<template>
+  <!-- ❌ 每次渲染都重新拼接、重新过滤 -->
+  <p>{{ fullName() }}</p>
+  <li v-for="u in filterUsers()">{{ u.name }}</li>
+
+  <!-- ✅ 依赖没变就直接用缓存，不重算 -->
+  <p>{{ fullName }}</p>
+  <li v-for="u in filterUsers">{{ u.name }}</li>
+</template>
+
+<script setup lang="ts">
+const first = ref('Ada');
+const last = ref('Lovelace');
+// 方法：每次渲染调用一次，无缓存
+function fullName() { return first.value + ' ' + last.value; }
+// computed：依赖（first/last）不变就返回上次结果
+const fullNameComputed = computed(() => first.value + ' ' + last.value);
+</script>
+```
+
+**关键区别**：computed 的依赖（这里 `first`、`last`）没变时，多次读取返回缓存、不重跑 getter；方法每次调用都重跑。列表过滤、复杂派生一定要用 computed。
+
+<Playground
+  language="typescript"
+  title="computed 缓存：依赖没变就不重算"
+  id="vue-13-1"
+  code={`// ---- 迷你响应核心（computed 用 scheduler 设计，见第 12 章） ----
+type Dep = Set<Effect>;
+const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
+let activeEffect: Effect | null = null;
+interface Effect { deps: Dep[]; scheduler?: () => void; run: () => void; }
+function cleanup(e: Effect): void { for (const d of e.deps) d.delete(e); e.deps.length = 0; }
+function effect(fn: () => void, options?: { scheduler?: () => void }): Effect {
+  const e: Effect = { deps: [], scheduler: options?.scheduler, run: () => { cleanup(e); activeEffect = e; try { fn(); } finally { activeEffect = null; } } };
+  e.run(); return e;
+}
+function track(t: object, k: PropertyKey): void {
+  if (!activeEffect) return;
+  let m = targetMap.get(t); if (!m) { m = new Map(); targetMap.set(t, m); }
+  let dep = m.get(k); if (!dep) { dep = new Set(); m.set(k, dep); }
+  dep.add(activeEffect); activeEffect.deps.push(dep);
+}
+function trigger(t: object, k: PropertyKey): void {
+  const m = targetMap.get(t); if (!m) return;
+  const dep = m.get(k); if (!dep) return;
+  for (const e of [...dep]) { if (e === activeEffect) continue; if (e.scheduler) e.scheduler(); else e.run(); }
+}
+function isObject(v: unknown): v is object { return typeof v === 'object' && v !== null; }
+const REF = Symbol('ref');
+function isRef(v: any): boolean { return v != null && typeof v === 'object' && v[REF] === true; }
+function reactive<T extends object>(target: T): T {
+  if (!isObject(target)) return target;
+  return new Proxy(target, {
+    get(obj: any, key: PropertyKey, r: any) {
+      const res = Reflect.get(obj, key, r);
+      if (isRef(res)) return res.value;
+      track(obj, key);
+      return isObject(res) ? reactive(res) : res;
+    },
+    set(obj: any, key: PropertyKey, value: any, r: any) {
+      const old = obj[key];
+      if (isRef(old) && !isRef(value)) { old.value = value; return true; }
+      const had = Object.prototype.hasOwnProperty.call(obj, key);
+      const res = Reflect.set(obj, key, value, r);
+      if (!had || !Object.is(old, value)) trigger(obj, key);
+      return res;
+    },
+  });
+}
+interface Ref<T> { get value(): T; set value(v: T); }
+function ref<T>(initial: T): Ref<T> { const r = reactive({ value: initial }); (r as any)[REF] = true; return r as unknown as Ref<T>; }
+function computed<T>(getter: () => T): Ref<T> {
+  let value: T; let dirty = true;
+  const subs = new Set<Effect>();
+  const runner = effect(() => { value = getter(); dirty = false; }, {
+    scheduler: () => { if (!dirty) { dirty = true; for (const e of [...subs]) e.run(); } },
+  });
+  const c: any = { get value() { if (activeEffect) { subs.add(activeEffect); activeEffect.deps.push(subs); } if (dirty) runner.run(); return value; }, set value(_v: T) { throw new Error('ro'); } };
+  c[REF] = true; return c as Ref<T>;
+}
+
+// ===== 演示：computed 缓存 vs 方法 =====
+const first = ref('Ada');
+const last = ref('Lovelace');
+let computedCalls = 0;
+const fullName = computed(() => { computedCalls++; return first.value + ' ' + last.value; });
+let methodCalls = 0;
+function fullNameMethod() { methodCalls++; return first.value + ' ' + last.value; }
+
+// 模拟「渲染」：每次渲染都读一次 computed 与方法
+function render(tag: string): void {
+  const c = fullName.value;
+  const m = fullNameMethod();
+  console.log("[" + tag + "] computed=" + c + " method=" + m);
+}
+
+render('render1');          // 首次渲染
+render('render2');          // 依赖没变再渲染一次：computed 命中缓存，方法仍重算
+last.value = 'Byron';       // 改依赖 -> computed 必须重算
+render('render3');
+console.log("computedCalls=" + computedCalls + " methodCalls=" + methodCalls);`}
+  expectedOutput={`[render1] computed=Ada Lovelace method=Ada Lovelace\n[render2] computed=Ada Lovelace method=Ada Lovelace\n[render3] computed=Ada Byron method=Ada Byron\ncomputedCalls=2 methodCalls=3\n`}
+/>
+
+渲染 3 次：第 2 次改了 `last`（computed 依赖之一），computed 重算（calls=2）；第 3 次只改 `theme`，名字没变——computed **命中缓存**（calls 停在 2），而方法照算（calls=3）。在一个长列表里，这个差异就是「卡」与「流畅」的分界。
+
+## 2. v-once 与 v-memo：跳过静态/可预测子树
+
+```vue
+<!-- 一次性渲染，之后永不更新 -->
+<h1 v-once>{{ expensiveStaticTitle }}</h1>
+
+<!-- 只有依赖变化才更新；签名数组里的项变了才重渲染该 li -->
+<li v-for="item in list" v-memo="[item.id]">{{ item.text }}</li>
+
+<!-- 整个大列表只有 selectedId 变才重算 -->
+<div v-memo="[selectedId]">
+  <HeavyChart :data="data" />
+</div>
+```
+
+`v-once` 适合纯静态内容；`v-memo` 适合「依赖明确、其余不变」的子树，能跳过整片 diff。
+
+## 3. v-for 的 key 要稳定
+
+```vue
+<!-- ❌ 用 index 当 key：列表增删/排序时会错配节点、丢失状态 -->
+<li v-for="(u, i) in users" :key="i">
+
+<!-- ✅ 用稳定唯一 id -->
+<li v-for="u in users" :key="u.id">
+```
+
+用 `index` 当 key，在「中间插入/删除/重新排序」时会复用错误的 DOM 节点，导致输入框内容错位、动画错乱。`id` 才是正确身份标识。
+
+## 4. 大对象 / 外部库对象：shallowRef 与 markRaw
+
+第 9 章讲过：`reactive` 会递归代理每一层。一棵 10 万节点的树、一个地图/图表实例，用 `shallowRef` 包起来，只在「整体替换」时更新，省掉海量无意义代理。
+
+```ts
+import { shallowRef, markRaw } from 'vue';
+const bigTree = shallowRef(loadHugeTree());   // 不递归代理内部
+const chart = markRaw(new ThirdPartyChart());  // 第三方实例永不代理
+```
+
+## 5. 组件级：defineAsyncComponent 与懒加载
+
+```ts
+import { defineAsyncComponent } from 'vue';
+const HeavyModal = defineAsyncComponent(() => import('./HeavyModal.vue'));
+```
+把不常出现的重组件拆成异步块，首屏只加载必要代码（配合路由懒加载，见第 14 章）。
+
+## 小结
+
+| 手段 | 解决什么 |
+|---|---|
+| `computed` 代替方法 | 避免派生值每次渲染重算 |
+| `v-once` / `v-memo` | 跳过静态/可预测子树的 diff |
+| 稳定 `:key` | 正确的节点复用与状态保持 |
+| `shallowRef` / `markRaw` | 大对象/外部库避免深层代理开销 |
+| `defineAsyncComponent` | 重组件拆块，减小首屏体积 |
+
+<Callout type="exercise" title="练习 1：方法改成 computed">
+下面模板每次渲染都会重新过滤 1 万条数据。改成 computed，并说明为什么这样更快。
+
+```vue
+<script setup lang="ts">
+import { ref } from 'vue';
+const users = ref(Array.from({ length: 10000 }, (_, i) => ({ id: i, active: i % 2 === 0 })));
+function activeUsers() { return users.value.filter((u) => u.active); }
+</script>
+<template>
+  <li v-for="u in activeUsers()" :key="u.id">{{ u.id }}</li>
+</template>
+```
+
+<Answer>
+**参考答案：**
+
+```vue
+<script setup lang="ts">
+import { ref, computed } from 'vue';
+const users = ref(Array.from({ length: 10000 }, (_, i) => ({ id: i, active: i % 2 === 0 })));
+const activeUsers = computed(() => users.value.filter((u) => u.active));
+</script>
+<template>
+  <li v-for="u in activeUsers" :key="u.id">{{ u.id }}</li>
+</template>
+```
+
+`computed` 缓存结果：只有当 `users` 里影响过滤的字段变化时才重跑 `filter`；方法 `activeUsers()` 在每次渲染（父组件任何状态变动导致的重渲染）都会重跑一次 1 万条过滤。把「派生且昂贵」的计算交给 computed，是性能第一招。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：v-memo 优化大列表">
+有一个大列表 `items`，父组件有个 `selectedId` 频繁变化，但列表数据本身很少变。用 `v-memo` 让列表只在数据变化时重渲染，而不是每次 selectedId 变都重渲染整个列表。
+
+<Answer>
+**参考答案：**
+
+```vue
+<template>
+  <ul v-memo="[items]">
+    <li v-for="it in items" :key="it.id">{{ it.text }}</li>
+  </ul>
+  <p>当前选中：{{ selectedId }}</p>
+</template>
+```
+
+`v-memo="[items]"` 告诉 Vue：只要 `items` 这个引用没变，整个 `<ul>` 子树就跳过 diff/重渲染。`selectedId` 变化只影响下方的 `<p>`，不会再重新处理整个大列表。注意 `v-memo` 要放在「依赖稳定」的那一层；若把 `selectedId` 也放进 memo 数组，选中态就不会更新了。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：为什么 key 不能用 index？">
+解释「用 `v-for` 的 `index` 当 key」在「列表头部插入一项」时会发生什么错乱，并给出正确写法。
+
+<Answer>
+**参考答案：**
+
+Vue 用 `key` 来匹配「新旧虚拟节点是不是同一个」。若用 `index`：
+- 原列表 `[A, B, C]`，key 分别是 `0,1,2`。
+- 头部插入 `X` → 新列表 `[X, A, B, C]`，key 仍是 `0,1,2,3`。
+- Vue 比对：key=0 旧是 A、新是 X，但「key 相同就复用同一 DOM 节点」——于是把原本 A 的 `<input>` 内容错误地保留给了 X。结果是**输入框内容错位、组件内部状态串台**。
+
+正确写法用稳定唯一 id 当 key：
+
+```vue
+<li v-for="u in users" :key="u.id">{{ u.name }}</li>
+```
+
+`u.id` 跟随数据本身，头部插入 X（新 id）后，X 是全新 key，A/B/C 的 key 不变，节点正确复用、状态不丢。
+</Answer>
+</Callout>

@@ -1,0 +1,174 @@
+---
+title: 异步组件与代码分割
+order: 14
+description: defineAsyncComponent、加载/错误/超时态、Suspense、路由懒加载，以及它们如何借助打包工具把首屏体积拆成多个 chunk
+---
+
+# 异步组件与代码分割
+
+首屏不需要把所有组件都下载下来。Vue 提供 `defineAsyncComponent` 把「不常出现 / 很重」的组件拆成**独立 chunk**，用到时才加载。
+
+## 1. defineAsyncComponent 基本用法
+
+```ts
+import { defineAsyncComponent } from 'vue';
+
+const HeavyModal = defineAsyncComponent(() => import('./HeavyModal.vue'));
+```
+
+`() => import('./HeavyModal.vue')` 是**动态导入**，打包工具（Vite/webpack）会把它单独切成一个 chunk 文件。只有当 `HeavyModal` 真正要渲染时，浏览器才去请求这个 chunk。
+
+## 2. 高级配置：加载态 / 错误态 / 超时
+
+```ts
+const HeavyModal = defineAsyncComponent({
+  loader: () => import('./HeavyModal.vue'),
+  loadingComponent: Spinner,     // 加载中显示的占位
+  errorComponent: ErrorBox,      // 加载失败显示
+  delay: 200,                    // 加载快于 200ms 就不闪 loading
+  timeout: 5000,                 // 超时报错
+});
+```
+
+`delay` 避免「闪一下 loading 又立刻消失」的抖动；`timeout` 防止网络挂起时一直转圈。
+
+## 3. Suspense：等待异步 setup / 异步组件
+
+如果组件的 `setup` 是异步的（`async setup`），或用 `<script setup>` 里 `await` 了什么，可以用 `<Suspense>` 包一层，统一展示加载态：
+
+```vue
+<template>
+  <Suspense>
+    <template #default>
+      <UserProfile />   <!-- 内部有 await -->
+    </template>
+    <template #fallback>
+      <Spinner />
+    </template>
+  </Suspense>
+</template>
+```
+
+`<Suspense>` 会等 `#default` 里的异步依赖都 settle 后再显示内容，期间展示 `#fallback`。它一次只能有一个根节点，且目前主要配合路由/异步组件使用。
+
+## 4. 路由懒加载
+
+和组件异步加载同理，路由也用动态导入拆块：
+
+```ts
+// router.ts
+const routes = [
+  { path: '/', component: () => import('./pages/Home.vue') },
+  { path: '/admin', component: () => import('./pages/Admin.vue') },
+];
+```
+
+访问 `/admin` 时才去下载 `Admin.vue` 的 chunk。首屏只加载 `Home` 相关代码。
+
+## 5. 和打包工具的关系
+
+`defineAsyncComponent` / 路由懒加载本身不负责切分，真正切分是**打包工具**做的事：它看到 `import()` 动态导入，就生成独立 chunk。所以这套机制和 Vite/Rollup/webpack 强相关——写法是 Vue 的，切分是工具链的。
+
+| 写法 | 生成的 chunk 时机 |
+|---|---|
+| 静态 `import Comp from './C.vue'` | 合并进当前 chunk |
+| `defineAsyncComponent(() => import('./C.vue'))` | 独立 chunk，渲染时才请求 |
+| 路由 `component: () => import('./Page.vue')` | 独立 chunk，进入路由才请求 |
+
+## 小结
+
+- `defineAsyncComponent(() => import(...))` 把重组件拆成独立 chunk，按需加载
+- 配置项：`loadingComponent` / `errorComponent` / `delay` / `timeout` 处理各种加载态
+- `<Suspense>` 统一等待异步 `setup` / 异步组件，期间显示 `#fallback`
+- 路由懒加载 `component: () => import(...)` 同理拆首屏
+- 真正切分由打包工具（Vite/Rollup）完成
+
+<Callout type="exercise" title="练习 1：把弹窗改成异步组件">
+有个很重的 `ReportModal.vue`，只在用户点「导出报表」时才可能用到。把它从静态 import 改成异步组件，并加上「加载中」占位（用现成的 `Spinner` 组件）。
+
+<Answer>
+**参考答案：**
+
+```vue
+<script setup lang="ts">
+import { defineAsyncComponent } from 'vue';
+import Spinner from './Spinner.vue';
+
+// 原来是 import ReportModal from './ReportModal.vue'
+const ReportModal = defineAsyncComponent({
+  loader: () => import('./ReportModal.vue'),
+  loadingComponent: Spinner,
+  delay: 150,
+});
+</script>
+
+<template>
+  <button @click="show = true">导出报表</button>
+  <ReportModal v-if="show" />
+</template>
+```
+
+`defineAsyncComponent(() => import('./ReportModal.vue'))` 让打包工具把 `ReportModal` 单独切成 chunk，只有 `show` 变 true、组件真正渲染时才去请求。加 `loadingComponent: Spinner` + `delay: 150` 避免快速加载时 loading 闪烁。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：Suspense 包裹异步页">
+一个 `Dashboard` 组件在 `<script setup>` 里 `await fetch('/api/metrics')`，首屏期间想显示骨架屏。用 `<Suspense>` 实现。
+
+<Answer>
+**参考答案：**
+
+```vue
+<!-- 父 -->
+<template>
+  <Suspense>
+    <template #default>
+      <Dashboard />
+    </template>
+    <template #fallback>
+      <Skeleton />
+    </template>
+  </Suspense>
+</template>
+```
+
+```vue
+<!-- Dashboard.vue -->
+<script setup lang="ts">
+const metrics = await fetch('/api/metrics').then((r) => r.json()); // 顶层 await
+</script>
+
+<template>
+  <div>{{ metrics.title }}</div>
+</template>
+```
+
+`Dashboard` 的 `setup` 是异步的（顶层 `await`），`<Suspense>` 会等它 resolve 后再显示 `#default`，期间显示 `#fallback`（骨架屏）。注意 `<Suspense>` 顶层只能有一个根节点。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：路由懒加载改造">
+把下面的路由配置改成「每个页面一个独立 chunk」，使首屏只加载首页代码。
+
+```ts
+import Home from './pages/Home.vue';
+import Admin from './pages/Admin.vue';
+const routes = [
+  { path: '/', component: Home },
+  { path: '/admin', component: Admin },
+];
+```
+
+<Answer>
+**参考答案：**
+
+```ts
+const routes = [
+  { path: '/', component: () => import('./pages/Home.vue') },
+  { path: '/admin', component: () => import('./pages/Admin.vue') },
+];
+```
+
+把静态 `import` 换成动态 `import()`，Vue Router 会在进入对应路由时才去请求该页面的 chunk。首屏只需下载 `Home.vue` 的 chunk，访问 `/admin` 才额外下载 `Admin.vue` 的 chunk——首屏体积明显变小。
+</Answer>
+</Callout>

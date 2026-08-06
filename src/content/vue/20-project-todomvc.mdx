@@ -1,0 +1,247 @@
+---
+title: 项目实战 TodoMVC
+order: 20
+description: 用前面学到的 ref/reactive/computed/组合式函数，从零实现一个 TodoMVC，并在 Playground 里手搓一个带过滤与统计的迷你 Todo store
+---
+
+# 项目实战 TodoMVC
+
+把前面 19 章串起来：一个经典 TodoMVC，用 `reactive` 存列表、`computed` 做派生（剩余/已完成/过滤）、组合式函数抽逻辑、`watch` 做持久化。
+
+## 1. 状态与派生
+
+```ts
+import { reactive, computed } from 'vue';
+import { ref } from 'vue';
+
+const state = reactive({
+  todos: [] as { id: number; text: string; done: boolean }[],
+  filter: 'all' as 'all' | 'active' | 'completed',
+});
+let nextId = 1;
+
+const visibleTodos = computed(() => {
+  if (state.filter === 'active') return state.todos.filter((t) => !t.done);
+  if (state.filter === 'completed') return state.todos.filter((t) => t.done);
+  return state.todos;
+});
+const remaining = computed(() => state.todos.filter((t) => !t.done).length);
+const allDone = computed({
+  get: () => state.todos.length > 0 && state.todos.every((t) => t.done),
+  set: (v) => state.todos.forEach((t) => (t.done = v)),
+});
+```
+
+## 2. 动作（actions）
+
+```ts
+function add(text: string) {
+  const t = text.trim();
+  if (!t) return;
+  state.todos.push({ id: nextId++, text: t, done: false });
+}
+function toggle(id: number) {
+  const t = state.todos.find((x) => x.id === id);
+  if (t) t.done = !t.done;
+}
+function remove(id: number) {
+  state.todos = state.todos.filter((x) => x.id !== id);
+}
+```
+
+## 3. 持久化与组合式封装
+
+```ts
+import { watch } from 'vue';
+// 抽成 composable，并自动存 localStorage
+export function useTodos() {
+  watch(() => state.todos, (val) => {
+    localStorage.setItem('todos', JSON.stringify(val));
+  }, { deep: true });
+  return { state, visibleTodos, remaining, allDone, add, toggle, remove };
+}
+```
+
+## 4. 手搓迷你 Todo store
+
+下面 Playground 用一个**自包含迷你响应系统**（复用第 12/13 章的 `ref`/`reactive`/`computed`/`effect` + 自动解包）实现上面的 store 核心，并模拟「渲染」观察每次操作后的列表与统计：
+
+<Playground
+  language="typescript"
+  title="迷你 Todo store：add / toggle / remove / 过滤 / 统计"
+  id="vue-20-1"
+  code={`// ---- 迷你响应核心（与第 12/13 章同源） ----
+type Dep = Set<Effect>;
+const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
+let activeEffect: Effect | null = null;
+interface Effect { deps: Dep[]; scheduler?: () => void; run: () => void; }
+function cleanup(e: Effect): void { for (const d of e.deps) d.delete(e); e.deps.length = 0; }
+function effect(fn: () => void, options?: { scheduler?: () => void }): Effect {
+  const e: Effect = { deps: [], scheduler: options?.scheduler, run: () => { cleanup(e); activeEffect = e; try { fn(); } finally { activeEffect = null; } } };
+  e.run(); return e;
+}
+function track(t: object, k: PropertyKey): void {
+  if (!activeEffect) return;
+  let m = targetMap.get(t); if (!m) { m = new Map(); targetMap.set(t, m); }
+  let dep = m.get(k); if (!dep) { dep = new Set(); m.set(k, dep); }
+  dep.add(activeEffect); activeEffect.deps.push(dep);
+}
+function trigger(t: object, k: PropertyKey): void {
+  const m = targetMap.get(t); if (!m) return;
+  const dep = m.get(k); if (!dep) return;
+  for (const e of [...dep]) { if (e === activeEffect) continue; if (e.scheduler) e.scheduler(); else e.run(); }
+}
+function isObject(v: unknown): v is object { return typeof v === 'object' && v !== null; }
+const REF = Symbol('ref');
+function isRef(v: any): boolean { return v != null && typeof v === 'object' && v[REF] === true; }
+function reactive<T extends object>(target: T): T {
+  if (!isObject(target)) return target;
+  return new Proxy(target, {
+    get(obj: any, key: PropertyKey, r: any) {
+      const res = Reflect.get(obj, key, r);
+      if (isRef(res)) return res.value;
+      track(obj, key);
+      return isObject(res) ? reactive(res) : res;
+    },
+    set(obj: any, key: PropertyKey, value: any, r: any) {
+      const old = obj[key];
+      if (isRef(old) && !isRef(value)) { old.value = value; return true; }
+      const had = Object.prototype.hasOwnProperty.call(obj, key);
+      const res = Reflect.set(obj, key, value, r);
+      if (!had || !Object.is(old, value)) trigger(obj, key);
+      return res;
+    },
+  });
+}
+interface Ref<T> { get value(): T; set value(v: T); }
+function ref<T>(initial: T): Ref<T> { const r = reactive({ value: initial }); (r as any)[REF] = true; return r as unknown as Ref<T>; }
+function computed<T>(getter: () => T): Ref<T> {
+  let value: T; let dirty = true;
+  const subs = new Set<Effect>();
+  const runner = effect(() => { value = getter(); dirty = false; }, {
+    scheduler: () => { if (!dirty) { dirty = true; for (const e of [...subs]) e.run(); } },
+  });
+  const c: any = { get value() { if (activeEffect) { subs.add(activeEffect); activeEffect.deps.push(subs); } if (dirty) runner.run(); return value; }, set value(_v: T) { throw new Error('ro'); } };
+  c[REF] = true; return c as Ref<T>;
+}
+
+// ===== 迷你 Todo store =====
+interface Todo { id: number; text: string; done: boolean; }
+const state = reactive({ todos: [] as Todo[], filter: 'all' as string });
+let nextId = 1;
+function add(text: string): void {
+  const t = text.trim();
+  if (!t) return;
+  state.todos = [...state.todos, { id: nextId++, text: t, done: false }];
+}
+function toggle(id: number): void {
+  const todo = state.todos.find((x) => x.id === id);
+  if (todo) todo.done = !todo.done;
+}
+function remove(id: number): void { state.todos = state.todos.filter((x) => x.id !== id); }
+
+const remaining = computed(() => state.todos.filter((t) => !t.done).length);
+const completed = computed(() => state.todos.filter((t) => t.done).length);
+const visible = computed(() => {
+  if (state.filter === 'active') return state.todos.filter((t) => !t.done);
+  if (state.filter === 'completed') return state.todos.filter((t) => t.done);
+  return state.todos;
+});
+
+function render(tag: string): void {
+  const line = visible.value.map((t) => (t.done ? '[x] ' : '[ ] ') + t.text).join(', ');
+  console.log("[" + tag + "] remain=" + remaining.value + " done=" + completed.value + " | " + line);
+}
+
+render('init');
+add('learn Vue'); render('add A');
+add('write code'); render('add B');
+toggle(1); render('toggle 1');
+add('ship it'); render('add C');
+remove(2); render('remove 2');
+toggle(3); render('toggle 3');
+state.filter = 'completed'; render('filter=completed');
+console.log("final remaining=" + remaining.value + " completed=" + completed.value);`}
+  expectedOutput={`[init] remain=0 done=0 | \n[add A] remain=1 done=0 | [ ] learn Vue\n[add B] remain=2 done=0 | [ ] learn Vue, [ ] write code\n[toggle 1] remain=1 done=1 | [x] learn Vue, [ ] write code\n[add C] remain=2 done=1 | [x] learn Vue, [ ] write code, [ ] ship it\n[remove 2] remain=1 done=1 | [x] learn Vue, [ ] ship it\n[toggle 3] remain=0 done=2 | [x] learn Vue, [x] ship it\n[filter=completed] remain=0 done=2 | [x] learn Vue, [x] ship it\nfinal remaining=0 completed=2\n`}
+/>
+
+这个 90 行的迷你 Todo store 把全书核心都用上了：`reactive` 存状态、`computed` 派生（剩余/已完成/可见列表，且带缓存）、`effect` 驱动「渲染」、`add/toggle/remove` 是 action。最后切到 `filter='completed'`，`visible` 这个 computed 立刻只显示已完成项——这就是第 5/13 章讲「computed 只在依赖变时重算」的真实落地。
+
+## 5. 完整组件长什么样
+
+```vue
+<script setup lang="ts">
+import { useTodos } from './useTodos';
+const { state, visibleTodos, remaining, allDone, add, toggle, remove } = useTodos();
+const draft = ref('');
+</script>
+
+<template>
+  <input v-model="draft" @keyup.enter="add(draft); draft = ''" />
+  <label><input type="checkbox" v-model="allDone" /> 全部完成</label>
+  <ul>
+    <li v-for="t in visibleTodos" :key="t.id">
+      <input type="checkbox" :checked="t.done" @change="toggle(t.id)" />
+      <span :style="{ textDecoration: t.done ? 'line-through' : 'none' }">{{ t.text }}</span>
+      <button @click="remove(t.id)">x</button>
+    </li>
+  </ul>
+  <p>剩余 {{ remaining }} 项</p>
+  <button @click="state.filter = 'all'">全部</button>
+  <button @click="state.filter = 'active'">进行中</button>
+  <button @click="state.filter = 'completed'">已完成</button>
+</template>
+```
+
+## 小结
+
+- `reactive` 集中存状态、`computed` 派生统计与过滤列表（缓存、响应）
+- action（`add`/`toggle`/`remove`）是普通函数，改 `reactive` 即触发更新
+- `watch` 做持久化；逻辑抽成 `useTodos` composable
+- 一个 Playground 把 ref/reactive/computed/effect 全部串起来
+
+<Callout type="exercise" title="练习 1：加「清空已完成」">
+给 useTodos 加一个 `clearCompleted()` action：移除所有 `done` 为真的项。
+
+<Answer>
+**参考答案：**
+
+```ts
+function clearCompleted(): void {
+  state.todos = state.todos.filter((t) => !t.done);
+}
+```
+
+直接 `filter` 出未完成的重新赋值（走 `state.todos = ...` 整体替换，响应式触发）。在 `useTodos` 里 `return { ..., clearCompleted }` 即可在模板用 `<button @click="clearCompleted">清空已完成</button>`。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 2：用 computed 做「编辑中」计数">
+加一个 `editing` 统计：当前正在编辑（未保存草稿）的数量。假设有个 `editingIds: number[]`，写出 `editingCount` computed。
+
+<Answer>
+**参考答案：**
+
+```ts
+const state = reactive({
+  todos: [] as Todo[],
+  editingIds: [] as number[],   // 正在编辑的 todo id
+});
+const editingCount = computed(() => state.editingIds.length);
+```
+
+`editingCount` 依赖 `state.editingIds`，它变化（开始/结束编辑）时自动重算。这正是「派生状态用 computed」的范式——不要手写 `let editingCount` 去手动增减，让 computed 从源数据推导。
+</Answer>
+</Callout>
+
+<Callout type="exercise" title="练习 3：为什么 filter 用 computed 而不是方法？">
+`visibleTodos` 写成 `computed` 而不是模板里调方法 `filterTodos()`，差别在哪？
+
+<Answer>
+**参考答案：**
+
+`visibleTodos` 是 computed，依赖 `state.todos` 和 `state.filter`。只要这两个没变，无论模板/父组件重渲染多少次，`visibleTodos` 都返回**缓存**结果，不重新 `filter` 整个列表。若写成方法 `filterTodos()`，每次渲染（父组件任何状态变化导致的重渲染）都会重新跑一遍 `filter`——列表大时就是性能浪费。
+
+这也呼应第 13 章：派生且可能昂贵的计算，一律用 `computed`。Playground 里切 `filter='completed'` 时 `visible` 立刻重算，正是 computed 在依赖变化时才工作的表现。
+</Answer>
+</Callout>

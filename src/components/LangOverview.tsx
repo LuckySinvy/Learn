@@ -31,6 +31,7 @@ export function LangOverview({ lang }: { lang: Language }) {
         {lang === 'clickhouse' && '从列式存储原理到 MergeTree、物化视图与分布式集群，玩转 OLAP 分析。'}
         {lang === 'kafka' && '从分区副本到消费组、事务与流处理，构建高吞吐的事件驱动架构。'}
         {lang === 'react' && '从组件与 JSX 到 Hooks 原理、状态管理与 Server Components，构建现代前端应用。'}
+        {lang === 'vue' && '从模板语法与组合式 API 到手写响应式系统、Pinia、Vue Router 与 Nuxt，吃透 Vue 3。'}
         {lang === 'linux' && '从文件系统到进程、权限、文本三剑客与 Shell 脚本，命令行即生产力。'}
         {lang === 'git' && '从提交与分支到 rebase、冲突处理与团队工作流，版本控制融会贯通。'}
         {lang === 'http' && '从 TCP 握手到 HTTP/2/3、缓存、CORS 与 HTTPS，吃透前后端之间的每一个字节。'}
