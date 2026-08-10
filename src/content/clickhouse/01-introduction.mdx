@@ -6,8 +6,8 @@ description: 认识 OLAP 与列式存储，理解 ClickHouse 为什么比 MySQL 
 
 # ClickHouse 概览
 
-<Callout type="tip" title="🤖 AI 时代，为什么还要学 ClickHouse？">
-AI 能写出一行聚合 SQL，却没法替你判断分区键选得对不对、为什么扫描了 10 亿行却只用了 2 列。ClickHouse 的列式存储、向量化执行与稀疏索引，是海量日志与指标分析、以及 AI 可观测性的底座。在 AI 系统需要分析自身行为（调用量、延迟、错误率）的今天，懂 OLAP 才能把「可观测」真正做扎实。
+<Callout type="tip" title="🤖 AI 时代，还要学 ClickHouse 吗？学到什么程度？">
+必要但概念级即可。建表 DDL 和聚合 SQL 可以让 AI 辅助写，但列式存储、物化视图、稀疏索引与查询优化是性能关键，这些不懂时 AI 生成的查询扫了 10 亿行你也发现不了。语法不必死记，用时让 AI 生成并人工核对；但你要能判断「一条查询是否合理、为什么慢」，否则扫描量与费用会失控。
 </Callout>
 
 

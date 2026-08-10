@@ -6,8 +6,8 @@ description: 认识 GitHub Actions——事件驱动的自动化流水线，理�
 
 # 什么是 GitHub Actions
 
-<Callout type="tip" title="🤖 AI 时代，为什么还要学 GitHub Actions？">
-AI 能写出功能代码，但把这段代码变成可信、可重复、可部署的流水线，是工程化的最后一环，得靠你自己。GitHub Actions 这类自动化工具承载的是工程纪律与协作信任：每次 push 自动测试、每次发布有迹可循，让团队敢于频繁交付。让 AI 当你的"代码工"，而把"如何可靠交付"的流水线握在自己手里，才是人机协作的正确分工。
+<Callout type="tip" title="🤖 AI 时代，还要学 GitHub Actions 吗？学到什么程度？">
+workflow 的 YAML 可以直接让 AI 生成，不必背字段；但触发条件、矩阵策略、缓存、密钥和权限这些安全边界必须懂——AI 写的流水线很容易因权限过大或 secrets 泄露而失控。定架构和保安全是 AI 替代不了的，样板配置则已经被替代。建议学到「能审 AI 生成的 workflow、判断权限与 secrets 是否安全」，具体的 YAML 细节让 AI 补并人工核对。
 </Callout>
 
 你有没有过这样的经历：每次把代码推到 GitHub，都要手动跑一遍测试；或者每次发布，都要本地打包、上传、重启服务，整个过程又臭又长？如果这些琐事能"代码一推上去就自动搞定"，那该多省心。

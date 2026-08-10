@@ -6,8 +6,8 @@ description: 理解容器编排为什么需要 Kubernetes，以及它与 Docker 
 
 # 什么是 Kubernetes
 
-<Callout type="tip" title="🤖 AI 时代，为什么还要学 Kubernetes？">
-AI 能写出 YAML，但它生成的部署配置对不对、副本数该怎么设、探针阈值该怎么配，仍要靠你理解调度与自愈才能真正审查与调优。当你的 AI 推理服务需要稳定跑在多台机器上、节点宕机能自动重建、流量高峰能弹性扩缩时，Kubernetes 就是它的运行基座。掌握它，你才不是把 AI 应用随便扔到一台机器上听天由命。
+<Callout type="tip" title="🤖 AI 时代，还要学 Kubernetes 吗？学到什么程度？">
+必要，而且建议学到能独立排障的程度。Deployment / Service 的 YAML 完全可以交给 AI 写，但调度、自愈、存储与网络模型以及排障思路必须自己懂——否则集群一出问题你只能干瞪眼，况且 AI 生成的 YAML 也可能埋着隐患，得由你来审。建议目标：吃透核心对象（Pod / Deployment / Service / PV 等）的语义与相互关系，遇到 CrashLoop、网络不通、调度失败时能独立定位根因。
 </Callout>
 
 
