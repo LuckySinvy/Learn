@@ -2,7 +2,7 @@ import Link from 'next/link';
 import {
   Code2, Terminal, Coffee, BarChart3, Brain, Link2, Blocks, Boxes, Flame,
   FileCode2, Database, Zap, Leaf, Gauge, Waves, Atom, Squirrel, GitBranch, Globe,
-  Component,
+  Component, Workflow,
 } from 'lucide-react';
 import { LanguageCard } from '@/components/layout/LanguageCard';
 import { getChapters } from '@/lib/content';
@@ -19,7 +19,7 @@ export default function HomePage() {
           编程 · 数据 · AI 工程 · 云原生 交互式学习
         </h1>
         <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
-          从零掌握 Python、Go、Java、Rust、TypeScript、React、Vue，以及 MySQL、Redis、MongoDB、ClickHouse、Kafka、Linux、Git、HTTP、Grafana、RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
+          从零掌握 Python、Go、Java、Rust、TypeScript、React、Vue，以及 MySQL、Redis、MongoDB、ClickHouse、Kafka、Linux、Git、HTTP、GitHub Actions、Grafana、RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
         </p>
       </section>
 
@@ -118,6 +118,14 @@ export default function HomePage() {
           icon={<Globe className="w-8 h-8" />}
           accent="from-indigo-400 to-violet-500"
           chapters={count('http')}
+        />
+        <LanguageCard
+          href="/github-actions"
+          title="GitHub Actions"
+          description="从 Workflow 语法到矩阵、缓存、复用工作流与安全实践，把 CI/CD 自动化跑起来。"
+          icon={<Workflow className="w-8 h-8" />}
+          accent="from-zinc-400 to-slate-500"
+          chapters={count('github-actions')}
         />
       </Category>
 
