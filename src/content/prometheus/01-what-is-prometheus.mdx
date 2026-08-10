@@ -6,6 +6,11 @@ description: 监控的演进、Pull 模型与核心概念，理解 Prometheus �
 
 # 什么是 Prometheus
 
+<Callout type="tip" title="🤖 AI 时代，为什么还要学 Prometheus？">
+AI 应用跑起来后，它的 QPS、延迟、错误率、GPU 显存占用这些指标，直接决定了服务等级（SLO）和推理成本，而 Prometheus 正是采集与告警这些指标的事实标准。AI 可以帮你写 PromQL，但什么该做成指标、基数爆炸为何会打崩集群、告警阈值怎么定，需要你真正弄懂时序监控的边界。不懂 Prometheus，你就既不能保障 AI 服务的稳定，也算不清它烧了多少钱。
+</Callout>
+
+
 **Prometheus** 是一个开源的**监控系统 + 时序数据库（TSDB）**，2012 年诞生于 SoundCloud，2016 年成为 CNCF 继 Kubernetes 之后的第二个毕业项目。今天它几乎是云原生世界里指标监控的事实标准。
 
 一句话概括它的工作方式：**周期性地去目标服务的 HTTP 接口把指标「拉」回来，存进本地时序数据库，然后用 PromQL 查询、画图和告警。**

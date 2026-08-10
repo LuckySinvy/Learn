@@ -6,6 +6,11 @@ description: 理解 Redis 的内存数据库定位、典型应用场景、单线
 
 # Redis 概览：定位、场景与为什么快
 
+<Callout type="tip" title="🤖 AI 时代，为什么还要学 Redis？">
+AI 能帮你写一段 SET/GET 代码，却不知道你的热点 key 会不会把实例打挂、大 key 删除会不会阻塞整条命令执行链路。Redis 作为高并发缓存与实时状态的基石，其数据结构选择与缓存策略（击穿、穿透、雪崩）决定了系统的稳定性上限。不懂这些底层，AI 给出的「能跑」的方案在生产洪峰下随时可能雪崩。
+</Callout>
+
+
 如果你只把 Redis 当作"一个用来做缓存的键值存储"，那你大概只用到了它 20% 的能力。Redis 是一个**内存数据结构服务器**（in-memory data structure server）——它提供的不是简单的 key-value，而是 String、Hash、List、Set、ZSet、Stream 等丰富的数据结构，以及围绕这些结构的原子操作。理解这一点，是从"会用 Redis"到"用好 Redis"的第一步。
 
 ## 1. Redis 的定位

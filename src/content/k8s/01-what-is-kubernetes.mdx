@@ -6,6 +6,11 @@ description: 理解容器编排为什么需要 Kubernetes，以及它与 Docker 
 
 # 什么是 Kubernetes
 
+<Callout type="tip" title="🤖 AI 时代，为什么还要学 Kubernetes？">
+AI 能写出 YAML，但它生成的部署配置对不对、副本数该怎么设、探针阈值该怎么配，仍要靠你理解调度与自愈才能真正审查与调优。当你的 AI 推理服务需要稳定跑在多台机器上、节点宕机能自动重建、流量高峰能弹性扩缩时，Kubernetes 就是它的运行基座。掌握它，你才不是把 AI 应用随便扔到一台机器上听天由命。
+</Callout>
+
+
 **Kubernetes**（常缩写为 k8s，k 与 s 之间有 8 个字母）是一个开源的**容器编排（Orchestration）平台**。当你只有一两个容器时，手动 `docker run` 就够了；但当应用拆成几十个服务、需要在多台机器上调度、自愈、扩缩容时，就需要一个"调度大脑"来统一管理。Kubernetes 就是这个大脑。
 
 <Callout type="info" title="Kubernetes 不负责构建镜像">
