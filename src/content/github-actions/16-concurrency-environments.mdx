@@ -1,0 +1,195 @@
+---
+title: 并发控制与环境审批
+order: 16
+description: 用 concurrency 避免重复部署相互覆盖，用 Environments 与审批门禁保护生产环境。
+---
+
+# 并发控制与环境审批
+
+当你把一条流水线真正接到生产环境之后，会遇到两个新问题：**同一个 workflow 被频繁触发时，多个运行会不会互相打架？** 以及 **部署生产这种高危操作，能不能在真正执行前加一道人工确认？**
+
+本章就来解决这两个问题。前半部分讲 `concurrency`（并发控制），让你能限制"同一时间只跑一个部署"；后半部分讲 **Environments（环境）与审批门禁**，把"部署生产"变成一件需要人工点头的严肃事情。
+
+## 1. concurrency：让同一时刻只跑一个
+
+设想这样一个场景：你正在向 `main` 分支连续推送两次提交。第一次推送触发的部署还在跑，第二次推送又触发了一次。如果两次部署都往同一台服务器写文件，它们可能会**相互覆盖**，甚至留下一个"一半新一半旧"的坏状态。
+
+`concurrency` 的作用就是：**同一组运行里，只允许一个在跑，其余的要么排队、要么被取消。**
+
+最基础的写法是在 workflow 顶层声明一个并发组：
+
+```yaml
+concurrency: deploy-production
+```
+
+这表示：只要属于 `deploy-production` 这个组的运行，同一时间最多只有一个在执行。当新运行进来时，默认行为是**让旧的运行继续跑完，新运行排队等待**。
+
+### 1.1 group 可以用表达式，让不同分支互不干扰
+
+`concurrency` 真正强大的地方在于，`group` 的值可以是一个**动态表达式**。比如你想让每个分支各自独立、互不阻塞：
+
+```yaml
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+```
+
+这里 `group` 的值是 `deploy-${{ github.ref }}`。比如 `main` 分支的运行属于 `deploy-refs/heads/main` 组，`dev` 分支的运行属于 `deploy-refs/heads/dev` 组，二者**互不影响**，各自排队。而同一个分支的多次推送，则会在组内进行并发控制。
+
+<Callout type="tip" title="用表达式拆分并发组">
+把 `${{ github.ref }}` 这类动态值拼进 `group`，是 GitHub Actions 里非常常见的技巧：它让"不同分支/不同 PR 各自独立、同一条线内串行"成为可能，既不会让无关的分支互相阻塞，又能防止同一条线上的部署打架。
+
+类似的写法还有 `group: ci-${{ github.head_ref || github.run_id }}`，PR 用 head 分支名分组，普通 push 用 run_id 兜底，避免分组冲突。
+</Callout>
+
+### 1.2 cancel-in-progress：新运行来了就取消旧的
+
+如果你希望"最新的提交才是我想要的"，可以开启 `cancel-in-progress`：
+
+```yaml
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+```
+
+开启后，**当新的运行被触发时，同一个组里还在跑的旧运行会被直接取消**，资源让给最新的那次。这对"快速迭代的预览环境"很友好——你只关心最新状态。
+
+<Callout type="warn" title="cancel-in-progress 会中断正在进行的部署">
+`cancel-in-progress: true` 会把尚未完成的旧运行硬生生中断。如果你的部署是**幂等可重入**的（比如重新跑一次就能恢复一致），那没什么问题；但如果部署是一个"写一半不能停"的过程，中途取消可能把环境留在半坏状态。
+
+因此：**预览/测试环境可以放心开启，生产环境要谨慎**，必要时宁可排队等待，也不要贸然中断线上部署。
+</Callout>
+
+## 2. Environments：为部署环境加一道审批门禁
+
+`concurrency` 解决的是"会不会同时跑"，而 **Environments（环境）** 解决的是"能不能随便部署到生产"。
+
+在仓库的 **Settings > Environments** 里，你可以定义命名环境，例如 `staging`（预发）和 `production`（生产）。每个环境可以单独配置：
+
+- **环境变量与 secrets**：只在进入该环境时才注入，job 之外拿不到。
+- **必需审查者（Required reviewers）**：配置一个或多个 GitHub 账号/团队，进入该环境前必须有人**手动审批**通过。
+
+这就构成了一道**审批门禁**：当某个 job 关联了带审批的环境，它会先停在 `pending` 状态，等待审查者点击"Approve"，通过后才真正执行部署步骤。
+
+### 2.1 在 job 里关联环境
+
+用 `environment:` 字段把一个 job 绑定到某个环境：
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production   # 关联名为 production 的环境
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./deploy.sh
+```
+
+一旦这个 job 运行，GitHub 会在执行 `steps` 之前先检查 `production` 环境是否配置了审批。如果有，流水线会**暂停并等待审批**，审批通过的邮件/界面提示点了 Approve，部署才会继续。
+
+## 3. 组合拳：CI 前置 + 并发控制 + 环境审批
+
+下面是一个"接近真实"的部署 job：它要求 CI 先通过（`needs`），保证同一时间只有一个生产部署（`concurrency`），并且必须经过人工审批（`environment: production`）。
+
+```yaml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    needs: ci                      # 前置：CI 必须通过
+    runs-on: ubuntu-latest
+    environment: production        # 关联生产环境（含审批门禁）
+    concurrency: deploy-production # 同一时间只跑一个生产部署
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./deploy.sh
+```
+
+这段配置串起来就是：**CI 挂了就不部署；部署时如果有更新的推送进来，由 `concurrency` 决定排队还是取消；真正动生产之前，必须由审批人点一下确认。** 这正是很多团队保护生产环境的标配组合。
+
+<Callout type="info" title="concurrency 与 environment 职责不同">
+- `concurrency`：控制"时间维度"——同一时刻会不会打架。
+- `environment`：控制"权限维度"——进这个环境要不要审批、能拿到哪些 secret。
+
+二者可以、也经常**一起用**：一个管"不要撞车"，一个管"不要乱进"。
+</Callout>
+
+## 4. 小结
+
+本章我们学习了如何给流水线加上"安全护栏"：
+
+- **`concurrency`** 通过 `group` 把一组运行标记为互斥，同一时间只跑一个，避免重复部署互相覆盖。
+- `group` 可以内嵌 `${{ }}` 表达式（如 `deploy-${{ github.ref }}`），让不同分支各自独立、同一条线内串行。
+- `cancel-in-progress: true` 会在新运行到来时取消旧运行，适合预览环境，但**生产环境要谨慎**，避免中断进行中的部署。
+- **Environments** 在仓库 Settings 中定义，可为每个环境配置专属 secret 与**必需审查者（审批门禁）**。
+- job 用 `environment:` 关联环境，从而进入审批流程，实现"部署生产前人工确认"。
+- 把 `needs` + `concurrency` + `environment` 组合，即可得到一条"CI 通过 → 不撞车 → 人工审批"的稳健部署链。
+
+并发和审批守住了"怎么跑、谁批准"，但还有一个绕不开的话题：**流水线自身的安全**。下一章我们会讲 `permissions` 最小权限、如何用 OIDC 免密钥访问云、以及如何防止 secret 泄漏——这些正是把 GitHub Actions 用在生产里最关键的防线。
+
+## 5. 练习
+
+<Callout type="exercise" title="练习">
+
+**1.** 你的团队有 `main` 和 `feature/*` 两类分支，希望"同一分支的部署串行、不同分支互不阻塞"。请写出 `concurrency` 的 `group` 配置。
+
+**2.** `cancel-in-progress: true` 在什么场景下很合适？在什么场景下会带来风险？请各举一个例子。
+
+**3.** 在仓库的哪个菜单路径下创建环境与配置审批人？job 里用哪个字段去关联这个环境？
+
+**4.** 下面这段配置缺少一环，导致生产部署可能被并发触发而互相覆盖。请补上 `concurrency` 让它安全：
+
+```yaml
+deploy:
+  needs: ci
+  runs-on: ubuntu-latest
+  environment: production
+  steps:
+    - run: ./deploy.sh
+```
+
+<Answer>
+
+**1.** 使用表达式分组即可：
+
+```yaml
+concurrency:
+  group: deploy-${{ github.ref }}
+```
+
+`main` 与 `feature/x` 的 `github.ref` 不同，自然分属不同组，互不阻塞；同一分支内则串行。
+
+**2.**
+- 合适：预览/测试环境、快速迭代的 PR 预览部署——你只关心最新状态，旧的运行被取消无所谓。
+- 风险：生产环境或"非幂等"的部署——中途取消可能让环境停在半坏状态，应当宁可排队也别中断。
+
+**3.** 路径是 **仓库 Settings > Environments**；job 中用 `environment: <环境名>` 字段关联，例如 `environment: production`。
+
+**4.** 补上并发组（可按需决定是否取消旧运行）：
+
+```yaml
+deploy:
+  needs: ci
+  runs-on: ubuntu-latest
+  environment: production
+  concurrency: deploy-production
+  steps:
+    - run: ./deploy.sh
+```
+
+</Answer>
+</Callout>

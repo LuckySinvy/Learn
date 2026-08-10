@@ -1,0 +1,273 @@
+---
+title: Job 间数据传递
+order: 13
+description: 通过 job 级 outputs 与 needs，把上游 job 计算出的数据（如版本号、镜像 tag）传递给下游 job
+---
+
+# Job 间数据传递
+
+在 [第 12 章](./12-parallel-matrix.mdx) 里我们讲过，用 `needs` 可以建立 **job 之间的依赖关系**——它决定的是"谁先跑、谁后跑"。但很多时候，光有执行顺序还不够：上游 job 跑完会产出一些"值"，比如算出来的 **版本号**、构建出的 **镜像 tag**、或者某个测试结果，下游 job 需要拿着这些值继续干活。
+
+本章就来讲：**数据如何沿着 `needs` 的依赖关系，从上游 job 流向下游 job**。
+
+## 1. `needs` 管顺序，outputs 管数据
+
+回顾一下最简的依赖写法：
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "假装构建了一个产物"
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build          # deploy 等 build 成功后再跑
+    steps:
+      - run: echo "用 build 的产物部署"
+```
+
+上面 `needs: build` 只保证了**顺序**：`deploy` 一定在 `build` 之后执行。但 `deploy` 并不知道 `build` 内部到底干了什么、产出了什么。
+
+要让 `deploy` 真正拿到 `build` 的产出，需要两步：
+
+1. 在 `build` job 上声明 `outputs`，并把它和某个 step 写入的值绑定。
+2. 在 `deploy` 里通过 `${{ needs.build.outputs.xxx }}` 读取这个值。
+
+## 2. step 如何写入值：`GITHUB_OUTPUT`
+
+GitHub Actions 提供了一系列特殊的"环境变量文件"，其中 `GITHUB_OUTPUT` 就是专门用来**把 step 的值输出出去**的。
+
+在 step 里，你只要向 `$GITHUB_OUTPUT` 追加一行 `name=value` 格式的文本，就定义了一个输出：
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 计算版本号
+        id: calc            # 给 step 一个 id，便于引用（虽然 job outputs 不强制）
+        run: |
+          VERSION="v1.2.3"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+```
+
+<Callout type="tip" title="新语法 vs 旧语法">
+旧的写法（已弃用）是 `echo "::set-output name=version::$VERSION"`，请一律改用 `>> $GITHUB_OUTPUT` 的新语法。两者效果相同，但旧语法会在日志里报警告。
+</Callout>
+
+如果值来自命令结果，也很自然——直接把命令的 stdout 捕获后写进去：
+
+```yaml
+      - name: 从 package.json 读取版本
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+```
+
+<Callout type="warn" title="等号周围不要加空格">
+写 `echo "version = 1.2.3"` 会把 ` version`（带前导空格）当成名字。正确写法是没有空格：`echo "version=1.2.3"`。多行内容可用 heredoc：`echo "body<<EOF" >> $GITHUB_OUTPUT`。
+</Callout>
+
+## 3. job 级 `outputs`：把 step 的值"升格"为 job 输出
+
+上面 step 写入的是这个 job 内部的临时值。要**跨 job** 传递，必须再在 job 上声明 `outputs`，并用 `needs.*.outputs.*` 表达式把它接到刚才那个 step 的输出上。
+
+注意：job 级 `outputs` 的值是**通过 step 的 id 引用的**，格式是 `${{ steps.<step_id>.outputs.<name> }}`。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}   # 接住 step 写入的 version
+    steps:
+      - name: 计算版本号
+        id: calc
+        run: |
+          VERSION="v1.2.3"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+```
+
+这样，`build` 这个 job 就对外暴露了一个名为 `version` 的输出。
+
+<Callout type="info" title="outputs 写在 job 下，不是 step 下">
+`outputs` 是 **job 级别** 的字段，和 `runs-on`、`steps` 平级。它引用的是 `steps.<id>.outputs.<name>`，所以那个被引用的 step **必须有 `id`**，否则表达式取不到值。
+</Callout>
+
+## 4. 下游 job 读取：`${{ needs.<job>.outputs.<name> }}`
+
+下游 job 通过 `needs.<上游job名>.outputs.<输出名>` 读取。注意，这个表达式**必须**用 `${{ }}` 包起来，并作为行内代码写在正文里（避免被 MDX 当成 JSX）。
+
+```yaml
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: 用上游版本号打标签部署
+        run: |
+          echo "即将部署版本：${{ needs.build.outputs.version }}"
+          docker tag myapp:latest myapp:${{ needs.build.outputs.version }}
+          docker push myapp:${{ needs.build.outputs.version }}
+```
+
+完整流程就是：`build` 的 step 写 `$GITHUB_OUTPUT` → `build.outputs` 接住它 → `deploy` 用 `needs.build.outputs.version` 读出来用。
+
+## 5. 完整示例：build 算版本，deploy 用版本
+
+把上面串起来，一个常见的"统一版本号"场景长这样：
+
+```yaml
+name: 跨 job 传递版本号
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 计算版本号
+        id: calc
+        run: |
+          # 真实项目里可以读 package.json / git tag 等
+          VERSION="v$(date +%Y%m%d)-${GITHUB_SHA::7}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "算出的版本是 $VERSION"
+      - name: 构建镜像
+        run: docker build -t myapp:latest .
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: 用上游版本部署
+        run: |
+          TAG="${{ needs.build.outputs.version }}"
+          echo "部署版本：$TAG"
+          docker tag myapp:latest myapp:$TAG
+          docker push myapp:$TAG
+```
+
+这里 `build` 算出一个带日期和 commit 短哈希的版本号（例如 `v20260810-a1b2c3d`），`deploy` 不关心它是怎么算的，只管从 `needs.build.outputs.version` 拿来用。两个 job 干净解耦，版本号只有"一处真相"。
+
+## 6. 同 job vs 跨 job：该用哪个通道？
+
+这是最容易混淆的点，记住一句话：
+
+- **同一个 job 内部**，step 与 step 之间传递数据：用 `GITHUB_ENV`（环境变量）或 `GITHUB_OUTPUT`（输出），直接在同 job 后续的 step 里读。
+- **跨 job**（不同 job 之间）：必须用 **job 级 `outputs` + `needs`**，没有任何别的捷径。
+
+```yaml
+# 同 job 内：step A 写，step B 读（用 GITHUB_ENV）
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "GREETING=hello" >> "$GITHUB_ENV"
+      - run: echo "$GREETING"      # 同一 job 内可见
+
+# 跨 job：必须用 outputs + needs（见第 4 节）
+```
+
+<Callout type="tip" title="一张表记住">
+| 场景 | 通道 | 读取方式 |
+|---|---|---|
+| 同 job，step 间 | `GITHUB_ENV` | 直接 `$VAR` |
+| 同 job，step 间（结构化输出） | `GITHUB_OUTPUT` | `${{ steps.id.outputs.x }}` |
+| 跨 job | job `outputs` + `needs` | `${{ needs.job.outputs.x }}` |
+</Callout>
+
+为什么跨 job 不能复用 `GITHUB_ENV`？因为每个 job 运行在**独立的 runner（独立机器/容器）** 上，环境彼此隔离，上游的进程环境变量根本传不到下游。这也是 `outputs` 机制存在的意义——它把值序列化成 workflow 元数据，由 GitHub 平台在 job 之间搬运。
+
+## 7. 常见坑
+
+- **输出为空**：先检查被引用的 step 有没有 `id`，再检查写入时是不是 `>> $GITHUB_OUTPUT`，而不是 `echo` 给了普通 stdout。
+- **下游读不到**：下游 job 必须写 `needs: <上游job名>`，否则 `needs.<job>` 是 undefined，表达式会被替换成空字符串。
+- **值里有换行/特殊字符**：普通 `name=value` 只适合单行；多行请用 heredoc 形式 `name<<EOF ... EOF`。
+- **敏感信息别走 outputs**：`outputs` 会原样出现在日志和依赖图里。密钥请走 `secrets`，不要通过 `outputs` 传递 token。
+
+<Callout type="warn" title="outputs 不是给秘密用的">
+把 `GITHUB_TOKEN`、密码之类写进 `GITHUB_OUTPUT` 再当 output 传，会明文出现在 UI 和日志中。机密永远用 `secrets`。
+</Callout>
+
+## 8. 小结
+
+- `needs` 决定 job 的**执行顺序**；job 级 `outputs` 决定 **job 间的数据流动**。
+- 数据链路：step 用 `echo "x=val" >> $GITHUB_OUTPUT` 写入 → job 用 `outputs: { x: ${{ steps.id.outputs.x }} }` 暴露 → 下游用 `${{ needs.<job>.outputs.x }}` 读取。
+- 同 job 内用 `GITHUB_ENV`/`GITHUB_OUTPUT`，跨 job 只能用 `outputs + needs`。
+- 经典用途：build job 算版本号/镜像 tag，deploy job 读取后打标签部署。
+
+读到这里你可能会想：如果我在好几个仓库里都要写"build 算版本 → deploy 用版本"这种流程，难道每次都复制一遍？下一章我们就来解决**复用**的问题——把整段 workflow 抽成可复用的"可复用工作流"。
+
+<Callout type="exercise" title="练习">
+1. 写一个 workflow：包含一个 `prepare` job，用 step 把一个字符串 `msg=hello-from-build` 写入 `GITHUB_OUTPUT`，并在 job 级 `outputs` 暴露为 `message`；再写一个 `use` job，`needs: prepare`，打印 `${{ needs.prepare.outputs.message }}`。
+2. 改造上面的"完整示例"：让 `build` 再额外输出一个 `image_name`（如 `myapp`），`deploy` 用 `${{ needs.build.outputs.image_name }}:${{ needs.build.outputs.version }}` 拼出完整镜像地址。
+3. 判断并说明理由：同一个 job 里，step A 想把一个计算结果传给 step B，应该用 `GITHUB_OUTPUT` 还是 job `outputs`？为什么？
+4. 小陷阱：下面这段为什么 `version` 会是空？指出问题并改正。
+```yaml
+jobs:
+  build:
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - run: echo "version=1.0.0" >> "$GITHUB_OUTPUT"
+```
+</Callout>
+
+<Answer>
+**1. 参考答案：**
+
+```yaml
+name: prepare-and-use
+
+on: [push]
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      message: ${{ steps.set.outputs.message }}
+    steps:
+      - id: set
+        run: echo "message=hello-from-build" >> "$GITHUB_OUTPUT"
+  use:
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - run: echo "收到消息：${{ needs.prepare.outputs.message }}"
+```
+
+**2. 参考答案（节选）：** 在 `build.outputs` 里加一项：
+
+```yaml
+outputs:
+  version: ${{ steps.calc.outputs.version }}
+  image_name: ${{ steps.calc.outputs.image_name }}
+steps:
+  - id: calc
+    run: |
+      echo "version=v1.2.3" >> "$GITHUB_OUTPUT"
+      echo "image_name=myapp" >> "$GITHUB_OUTPUT"
+# deploy 中：
+run: docker push ${{ needs.build.outputs.image_name }}:${{ needs.build.outputs.version }}
+```
+
+**3. 参考答案：** 应该用 `GITHUB_OUTPUT`（或 `GITHUB_ENV`）。因为 job 级 `outputs` 是为**跨 job** 传递设计的；同 job 内部的 step 之间用 `outputs + needs` 既没必要也取不到（下游 step 不在另一个 job 里，没有 `needs` 可引用）。
+
+**4. 参考答案：** 问题出在被写入的 step 没有 `id`。`outputs.version` 引用的是 `steps.calc.outputs.version`，但那个 `run` step 没有 `id: calc`，所以表达式取不到值，`version` 为空。改正：
+
+```yaml
+jobs:
+  build:
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - id: calc                       # 补上 id
+        run: echo "version=1.0.0" >> "$GITHUB_OUTPUT"
+```
+</Answer>

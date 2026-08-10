@@ -1,0 +1,179 @@
+---
+title: 什么是 GitHub Actions
+order: 1
+description: 认识 GitHub Actions——事件驱动的自动化流水线，理解 CI/CD 与 workflow、job、step 的核心概念。
+---
+
+# 什么是 GitHub Actions
+
+你有没有过这样的经历：每次把代码推到 GitHub，都要手动跑一遍测试；或者每次发布，都要本地打包、上传、重启服务，整个过程又臭又长？如果这些琐事能"代码一推上去就自动搞定"，那该多省心。
+
+**GitHub Actions** 就是帮你做这件事的工具。它是 GitHub 官方提供的**自动化平台**：你写一份"剧本"（一个 YAML 文件），告诉它"当某件事发生时，去执行哪些任务"，剩下的就交给它自动完成。
+
+在这一章里，我们会先建立几个最重要的认知：CI/CD 到底是什么意思、GitHub Actions 是怎么被"事件"触发的，以及它的核心概念体系（workflow、job、step、action、runner）。读完这一章，你会明白 GitHub Actions 到底在帮你做什么，以及下一章为什么那样写代码。
+
+## 1. CI/CD：让代码交付不再手忙脚乱
+
+GitHub Actions 最常见的用途是实现 **CI/CD**。这三个字母其实是三件相关但不同的事，理解它们的区别，能帮你更清楚地知道自己想用 Actions 解决哪一类问题。
+
+**持续集成（Continuous Integration，CI）**
+
+"持续集成"强调的是**频繁合并 + 自动构建测试**。在团队开发中，大家都在往同一个仓库推代码。如果每个人都在本地默默改很久，最后再合并，往往会撞出一大堆冲突和 bug。CI 的思路是：每次有人 `push` 或开 `pull_request`，系统就自动把代码拉下来、安装依赖、编译、跑测试。一旦有人提交了会破坏构建的代码，立刻就能发现。
+
+换句话说，CI 回答的是："**这次改动，能不能安全地合进来？**"
+
+**持续交付（Continuous Delivery，CD）**
+
+"持续交付"比 CI 再进一步：代码不仅通过了测试，而且**随时处于一个可以发布的状态**。也就是说，构建产物（比如一个 Docker 镜像、一个可安装的包）已经准备好，只要产品经理说"发吧"，按一下就能上线，不需要再临时打包。
+
+CD（Delivery）回答的是："**我们是不是已经准备好发布了？**"
+
+**持续部署（Continuous Deployment，CD）**
+
+"持续部署"是更激进的版本：一旦通过了测试，就**自动发布上线**，连"按一下"这一步都省了。适合一些追求快速迭代、回滚机制完善的项目。
+
+<Callout type="info" title="CI 与 CD 的关系">
+CI 是地基，CD 是建立在 CI 之上的能力。通常你会先用 GitHub Actions 做 CI（自动测试），等业务稳定了，再逐步加上持续交付、持续部署。这也是为什么很多教程都从"跑测试"这个最简单的工作流讲起。
+</Callout>
+
+三者的关系可以这样理解：**集成**保证代码能合、能跑；**交付**保证能发；**部署**保证自动发。它们一层层递进，而 GitHub Actions 可以同时胜任这三个角色。
+
+## 2. 事件驱动的自动化：有事它才动
+
+GitHub Actions 的运行方式是**事件驱动（event-driven）**。它平时安静地待着，一旦仓库里发生了你关心的"事件"，就会触发对应的自动化任务。
+
+常见的触发事件包括：
+
+- **代码推送（push）**：你把代码 `git push` 到某个分支。
+- **开合并请求（pull_request）**：有人发起 PR，或者往 PR 里追加提交。
+- **定时触发（schedule）**：像闹钟一样，在每天的某个时刻自动跑（用 cron 表达式定义时间）。
+- **手动触发（workflow_dispatch）**：你主动在 GitHub 网页上点一下"Run workflow"按钮来运行。
+- 还有更多：有人提了 issue、有人打了标签（label）、发布了 release、甚至别的 workflow 调用（`workflow_call`）等等。
+
+<Callout type="tip" title="不只是 CI/CD">
+虽然 GitHub Actions 最常用来做 CI/CD，但它本质上是"事件 → 自动任务"的引擎。你完全可以用它做别的事：比如有人提了 issue 就自动回复一条欢迎语，或者每周定时生成一个项目周报。只要能被事件触发，就都能自动化。
+</Callout>
+
+这种"事件一响，自动化就跑"的模型，是理解 GitHub Actions 的关键。后面你写的每一个 workflow，第一件事就是在回答：**"什么事件才能让它启动？"**
+
+## 3. 核心概念：从大到小的包含关系
+
+GitHub Actions 的概念有一个清晰的层级结构。理解"谁包含谁"，你就不会把字段写错地方。
+
+它们是这样的包含关系：
+
+```
+workflow（工作流）
+ └── job（作业）            ← 多个 job 默认并行运行
+      └── step（步骤）      ← job 里的最小执行单元
+           ├── run          ← 执行一条命令
+           └── uses         ← 调用一个 action
+```
+
+下面逐个解释。
+
+### workflow（工作流）
+
+**workflow** 就是你写在仓库里的一个 YAML 文件，放在 `.github/workflows/` 目录下。一个 workflow 定义了两件事：
+
+1. **什么事件触发它**（比如 `push` 时）；
+2. **要跑哪些 job**（比如"构建"和"测试"两个作业）。
+
+一个仓库可以有多个 workflow 文件，彼此独立。比如一个负责测试，一个负责发布。
+
+### job（作业）
+
+**job** 是 workflow 里的一个"作业"，它会运行在某一台 **runner**（执行机器）上，包含一组有序的 **step**。同一个 workflow 里的多个 job **默认是并行执行**的——除非你用 `needs` 显式声明依赖关系（"等 A 跑完再跑 B"）。
+
+### step（步骤）
+
+**step** 是 job 内部最小的执行单元。每个 step 要么是：
+
+- `run`：执行一条**命令**（比如 `run: npm test`），在 runner 的命令行里运行；
+- `uses`：调用一个 **action**（比如 `uses: actions/checkout@v4`，用来把仓库代码拉到 runner 上）。
+
+一个 job 里的 step 是**按顺序从上往下**执行的。
+
+### action（动作）
+
+**action** 是一个**可复用的自动化单元**。它可以由 GitHub 官方提供（如 `actions/checkout`）、社区贡献（在 Marketplace 上发布），也可以是你自己写的。step 通过 `uses` 来引用一个 action，避免每次都重复写一堆命令。
+
+### runner（执行器）
+
+**runner** 是真正干活的"机器"。它可以是 GitHub 免费提供的**托管 runner**（如 Ubuntu、Windows、macOS 虚拟机），也可以是你自己搭建的**自托管 runner**（比如公司内网的某台服务器）。job 通过 `runs-on` 字段指定要跑在哪种 runner 上。
+
+下面用一张表总结它们的层级与含义：
+
+| 概念 | 中文 | 包含关系 | 说明 |
+| --- | --- | --- | --- |
+| workflow | 工作流 | 包含多个 job | 一个 YAML 文件，定义"何时触发 + 跑哪些 job" |
+| job | 作业 | 包含多个 step | 跑在某台 runner 上的一组步骤，多个 job 默认并行 |
+| step | 步骤 | 是 `run` 或 `uses` | job 内最小执行单元，按序执行 |
+| action | 动作 | — | 可复用的自动化单元，被 `uses` 引用 |
+| runner | 执行器 | — | 真正执行 job 的机器（托管或自托管） |
+
+<Callout type="warn" title="别把 step 和 job 搞混">
+新手最容易犯的错误，是把所有命令都写成 job，或者反过来把多个 step 平铺成多个 job。记住：**job 是"在哪台机器上跑"的边界，step 是"这台机器上先后做什么"的单元。** 想并行就用多个 job；想在同一台机器上按顺序做几件事，就把它们放进同一个 job 的多个 step。
+</Callout>
+
+## 4. 一个生活化的类比
+
+如果还是觉得抽象，不妨把 GitHub Actions 想成：**你的仓库雇了一个"自动化流水线管家"**。
+
+- 你提前写好一份《工作手册》（workflow），告诉他："有人推代码（事件）时，你就去这台机器（runner）上，先把它 checkout（step/uses），再跑测试（step/run）。"
+- 平时管家在打盹。
+- 一旦有人 `push` 代码（事件触发），管家立刻醒来，照着手册一步步干活。
+- 干完了，他会在 GitHub 的 Actions 页面上给你贴一张"执行报告"（绿色对勾表示成功，红色叉号表示失败）。
+- 你完全不用盯着他，该干嘛干嘛。
+
+这就是 GitHub Actions 的精髓：**用一份声明式的配置文件，把重复、机械、容易出错的活儿，交给机器按时按点、稳定可靠地完成。**
+
+## 5. 一个最简 workflow 预览
+
+铺垫了这么多概念，先看一眼"成品"长什么样。下面是一段最简化的 workflow，它会在你每次 `push` 代码时，打印一句问候语：
+
+```yaml
+name: CI
+
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Hello Actions"
+```
+
+看不懂没关系——`name`、`on`、`jobs`、`runs-on`、`steps` 这些字段，我们都会在**下一章《第一个 Workflow》**里逐行拆开讲。你现在只需要建立这样一个印象：GitHub Actions 的配置，就是这样一个结构清晰的 YAML 文件。
+
+<Callout type="info" title="为什么用 YAML？">
+YAML 是一种对人类很友好的配置文件格式，用缩进表达层级关系（和 Python 类似）。GitHub Actions 选择它，是因为工作流天然是"嵌套结构"（workflow 包 job，job 包 step），而 YAML 的缩进恰好能直观地表达这种层级。后面你会越来越习惯它。
+</Callout>
+
+## 6. 小结
+
+这一章我们建立了理解 GitHub Actions 的基础认知：
+
+- **CI/CD** 是三层递进的能力：持续集成（频繁合并+自动测试）、持续交付（随时可发布）、持续部署（自动上线）。GitHub Actions 可以同时胜任。
+- GitHub Actions 是**事件驱动**的：代码 `push`、开 `pull_request`、定时 `schedule`、手动 `workflow_dispatch` 等事件都能触发自动化任务。
+- 核心概念有清晰的层级：**workflow > job > step**，step 要么是 `run`（执行命令）要么是 `uses`（调用 action）；action 是可复用单元，runner 是真正执行任务的机器。
+- 它就像一个"自动化流水线管家"：你写一份剧本，事件一响它就按时按点地把活干完。
+
+下一章，我们就动手写出并真正跑通上面那段预览代码，让你在 GitHub 上亲眼看到 workflow 运行起来的样子。
+
+<Callout type="exercise" title="练习">
+1. 下面哪个场景属于"持续集成（CI）"，哪个属于"持续部署（CD）"？
+   - A. 每次有人推代码，系统自动跑单元测试。
+   - B. 测试通过后，系统自动把新版本发布到生产环境。
+2. 在 GitHub Actions 的层级关系中，谁是"真正执行 job 的机器"？
+3. step 这个最小执行单元，可能是哪两种形式之一？
+4. 一个 workflow 文件应该放在仓库的哪个目录下？
+
+<Answer>
+1. A 属于 CI（持续集成，自动构建测试）；B 属于 CD（持续部署，自动上线）。
+2. runner（执行器）是真正执行 job 的机器，可以是 GitHub 托管的，也可以是自托管的。
+3. step 要么是 `run`（执行一条命令），要么是 `uses`（调用一个 action）。
+4. 放在仓库的 `.github/workflows/` 目录下。
+</Answer>
+</Callout>

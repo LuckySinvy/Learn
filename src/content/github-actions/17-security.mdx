@@ -1,0 +1,186 @@
+---
+title: 安全最佳实践
+order: 17
+description: 用最小权限 permissions、OIDC 免密钥访问云、secret 防护与 fork PR 陷阱守住流水线安全。
+---
+
+# 安全最佳实践
+
+GitHub Actions 跑在别人的仓库里、连着你的云账号和发布权限，一旦配置不当，后果可能很严重：**有人能在你的 CI 里偷走生产 secret，或者用你的身份发一个恶意版本。**
+
+本章聚焦"把攻击面降到最小"的几个核心手段：最小权限的 `permissions`、用 OIDC 免密钥访问云、secret 防泄漏、以及 fork PR 场景下的经典陷阱。把这些吃透，你的流水线才算真正"能上生产"。
+
+## 1. 最小权限：收紧 GITHUB_TOKEN
+
+GitHub Actions 在每次运行时都会自动提供一个 `GITHUB_TOKEN`，它默认拥有相当宽的仓库权限（如读写 `contents`、`pull-requests` 等）。**默认权限过宽，是很多安全事件的根源。**
+
+你可以用 `permissions:` 显式声明每个 job 需要的最小权限。最佳实践是：**在 workflow 顶层先整体收窄，再在需要的 job 里按需放宽。**
+
+```yaml
+permissions:
+  contents: read   # 整个 workflow 默认只给读权限
+
+jobs:
+  build:
+    runs-on: ubuntu-listed
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm run build
+```
+
+上面这个 workflow 全程只有"读代码"的权限，就算某个 step 被篡改，也**无法用它来推送代码或发版**。
+
+### 1.1 按需放宽：发版要写权限
+
+当某个 job 确实需要写操作（例如创建 Release、推送 tag），只在那个 job 里单独放开，而不是全局放开：
+
+```yaml
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 仅此 job 需要写权限
+    steps:
+      - uses: actions/checkout@v4
+      - run: gh release create v1.0.0
+```
+
+<Callout type="tip" title="permissions 可以细到作用域">
+`permissions` 支持很多作用域：`contents`、`pull-requests`、`issues`、`id-token`、`packages` 等。原则是：**只给 job 真正用到的那几项，且级别（read/write）能低则低。** 顶层先 `read`，需要时才在 job 内 `write`。
+</Callout>
+
+## 2. OIDC：免密钥访问云，告别长期 secret
+
+传统做法是在仓库里存一份云厂商的长期密钥（如 AWS Access Key），通过 `secrets` 注入。问题是：**长期密钥一旦泄漏，危害持久且难察觉。**
+
+**OIDC（OpenID Connect）** 的思路是：GitHub 作为身份提供方，让 job 在运行时向云厂商"证明自己的身份"，由云厂商返回一个**短期临时凭证**。整个过程**不需要在仓库里存任何长期密钥**。
+
+核心三步：
+
+1. 在云厂商侧配置一个"信任 GitHub 身份"的角色（比如 AWS IAM Role，信任条件限定你的仓库与分支）。
+2. 在 workflow 里给 token 开放 `id-token: write` 权限，并通常还需要 `contents: read`。
+3. 用官方 action（如 `aws-actions/configure-aws-credentials`）去换取临时凭证。
+
+```yaml
+permissions:
+  id-token: write   # 允许申请 OIDC 身份令牌
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 用 OIDC 换取云临时凭证
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-deploy
+          aws-region: ap-east-1
+      - run: aws s3 sync ./dist s3://my-bucket
+```
+
+<Callout type="info" title="OIDC 的关键收益">
+- **无长期密钥**：仓库里不存云 secret，泄漏面直接归零。
+- **短期凭证**：每次运行拿到的 token 几分钟就过期，即使被截获也很快失效。
+- **条件可控**：云侧角色可以限定"只信任某仓库的 main 分支"，从源头缩小可被冒充的范围。
+
+这只是一个机制示意，具体字段请以各云厂商官方 action 文档为准。
+</Callout>
+
+## 3. secret 防泄漏：别亲手把密钥亮出来
+
+即使 secret 被安全存储，使用方式不当也会功亏一篑。牢记几条铁律：
+
+- **绝不要 `echo` 打印 secret。** 哪怕只是"调试一下"，日志会原样记录，任何人都能在历史里翻到。正确做法是相信它已注入，只在真正调用命令时使用。
+- **不要上传含 secret 的 artifact。** 比如把 `.env` 连同构建产物一起 `upload-artifact`，等于把密钥公开发布。
+- **第三方 action 用 commit SHA 锁定。** 写成 `uses: some-org/some-action@a1b2c3d...`（完整 commit SHA）而非 `@v1`，可避免作者突然改了 `v1` 指向的版本、在你不知情时注入恶意代码（供应链攻击）。
+
+```yaml
+# 推荐：用完整 commit SHA 锁定，防止上游被篡改
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+```
+
+<Callout type="warn" title="第三方 action 是供应链风险点">
+`uses: owner/action@v1` 这种"浮动标签"很方便，但 `v1` 指向的 commit 可能被维护者悄悄更新。对于生产流水线，**锁定到具体 commit SHA** 能固定行为、防止意外的代码变更。代价是你需要手动跟进安全更新——这正是下一节 Dependabot 的用武之地。
+</Callout>
+
+## 4. fork PR 的安全陷阱：默认不暴露 secret
+
+这是 GitHub Actions 里**最容易踩、也最危险**的坑。
+
+当外部贡献者从 fork 仓库提交 PR 时，GitHub 出于安全考虑，**默认不会把仓库的 secret 暴露给这些 PR 的运行**，也不会给写权限。这是保护你的：否则陌生人就能借你的 CI 把 secret 偷出去。
+
+但很多人会"图省事"改用 `pull_request_target` 事件来触发，想让 fork PR 也能跑完整流水线。问题在于：`pull_request_target` 运行在**目标仓库的上下文**里，**它会暴露仓库 secret，并且会执行 PR 里携带的不受信任代码**。如果直接用这个事件去 `checkout` 并运行 PR 的代码，攻击者在 fork 里塞一段"读取 secret 并外传"的脚本，就能得手。
+
+<Callout type="warn" title="pull_request_target 是高危事件">
+`pull_request_target` 与 `pull_request` 最大的区别：它跑在**基础仓库**上下文，能拿到仓库 secret 和写权限，但执行的代码来自**不受信任的 PR**。
+
+安全底线：
+- 不要在 `pull_request_target` 里直接 `checkout` PR 的 HEAD 并运行其代码。
+- 如果必须用，确保敏感步骤只在受信任的代码上跑，且对 PR 来源做严格校验。
+- 优先考虑用 `pull_request` 事件（默认无 secret、只读），配合 `permissions` 收紧。
+</Callout>
+
+## 5. 保持 action 不过时：Dependabot 自动更新
+
+action 和依赖一样会过版本、修漏洞。与其手动盯，不如让 Dependabot 帮你自动提 PR：
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+```
+
+这样 Dependabot 会定期检查你 `uses:` 的 action 有没有新版本，并自动开 PR 更新。配合前面"锁 SHA"的做法，你可以先锁 SHA，再让 Dependabot 把 SHA 一并升级——**既稳又新**。
+
+## 6. 小结
+
+本章把流水线最关键的几道安全防线串了起来：
+
+- **最小权限**：用 `permissions:` 先把 `GITHUB_TOKEN` 整体收窄（如 `contents: read`），只在需要的 job 内按需 `write`。
+- **OIDC 免密钥**：用 `permissions: id-token: write` + 官方 action 向云厂商换取**短期临时凭证**，仓库里不再存长期密钥，泄漏面归零。
+- **secret 防泄漏**：不 `echo`、不上传含 secret 的 artifact、第三方 action **锁定 commit SHA** 防供应链篡改。
+- **fork PR 陷阱**：来自 fork 的 PR 默认不暴露 secret；警惕 `pull_request_target` 会暴露 secret 并运行不受信代码。
+- **自动更新**：用 `dependabot.yml` 的 `github-actions` 生态保持 action 不过时。
+
+权限收紧了、密钥不落地了、secret 不外漏了——至此你已经掌握了把 GitHub Actions 安全用在生产的核心能力。下一章，我们将**串起全书所有知识点**，以一个真实的前端项目为例，写出一条"接近生产"的完整 CI/CD 流水线，给这门课收官。
+
+## 7. 练习
+
+<Callout type="exercise" title="练习">
+
+**1.** 一个 workflow 只需要"读取代码并构建"，不需要任何写操作。请用顶层 `permissions:` 把它收窄到最小。
+
+**2.** 相比在仓库里存 AWS 长期 Access Key，OIDC 方案解决了哪两个核心安全问题？
+
+**3.** 为什么说 `echo ${{ secrets.API_KEY }}` 是危险写法？（注意：表达式本身在正文里要写成行内代码）
+
+**4.** `pull_request_target` 相比 `pull_request`，在 secret 暴露与代码信任上有什么区别？给出一条安全使用建议。
+
+<Answer>
+
+**1.** 整体只给读权限即可：
+
+```yaml
+permissions:
+  contents: read
+```
+
+**2.**
+- 仓库里**不再存储长期密钥**，消除了"密钥泄漏即长期失守"的风险。
+- 运行时拿到的是**短期临时凭证**，几分钟过期，即使被截获也很快失效。
+
+**3.** `echo ${{ secrets.API_KEY }}` 会把密钥明文写进**运行日志**，任何人只要能看 workflow 历史就能复制走这个 secret。secret 应当只在真正调用命令时由运行环境注入，绝不打印。
+
+**4.** 区别：
+- `pull_request`：跑在 PR 来源上下文，**默认不暴露仓库 secret、只读**，较安全。
+- `pull_request_target`：跑在基础仓库上下文，**会暴露仓库 secret 且有写权限**，但执行的是**不受信任的 PR 代码**。
+
+安全建议：不要在其中直接 `checkout` PR 的 HEAD 并运行其代码；优先用 `pull_request` 事件，必要时对 PR 来源做严格校验，敏感步骤只在受信任代码上执行。
+
+</Answer>
+</Callout>

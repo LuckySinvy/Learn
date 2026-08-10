@@ -19,7 +19,8 @@ export type Language =
   | 'linux'
   | 'git'
   | 'http'
-  | 'prometheus';
+  | 'prometheus'
+  | 'github-actions';
 
 // 可在 Docker 沙箱中执行的语言。Rust 用 rustc 单文件编译后运行；
 // TypeScript 先 tsc --strict 类型检查再用 node --experimental-transform-types 运行；
@@ -83,4 +84,5 @@ export const LANG_META: Record<Language, { label: string; color: string; emoji: 
   git: { label: 'Git', color: 'bg-orange-600/10 text-orange-700 dark:text-orange-300', emoji: '🌿' },
   http: { label: 'HTTP', color: 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-300', emoji: '🌐' },
   prometheus: { label: 'Prometheus', color: 'bg-fuchsia-500/10 text-fuchsia-600 dark:text-fuchsia-300', emoji: '🔥' },
+  'github-actions': { label: 'GitHub Actions', color: 'bg-zinc-700/10 text-zinc-700 dark:text-zinc-300', emoji: '⚙️' },
 };

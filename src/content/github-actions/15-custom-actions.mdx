@@ -1,0 +1,291 @@
+---
+title: 自定义 Action
+order: 15
+description: 掌握三种 Action 类型（JavaScript / Composite / Docker），学会用 action.yml 自研并复用团队内部动作
+---
+
+# 自定义 Action
+
+前面两章，我们分别解决了 job 间传数据、以及整条 workflow 的复用。但还有一种更细、更高频的复用需求：**把一组 step 封装成一个可复用的"积木"**，在任意 job 里一行 `uses:` 调用。这个"积木"就是 **Action**。
+
+GitHub 官方市场（Marketplace）里已经有成千上万的 action（`actions/checkout`、`actions/setup-node` 等）。但当你有**团队内部约定**（比如"必须先登录内网镜像仓库再构建"），或需要市场没有的专用逻辑时，就得自己写。本章讲三种自定义 Action 的写法与取舍。
+
+## 1. Action 是什么
+
+Action 是一个**可复用的命令单元**，由 `action.yml`（或 `action.yaml`）描述元数据，再配合执行逻辑。它在 workflow 里通过 `uses:` 引用，例如：
+
+```yaml
+steps:
+  - uses: actions/checkout@v4          # 官方 action
+  - uses: ./.github/actions/setup/     # 本仓库里的自定义 action（指向目录）
+```
+
+`action.yml` 里至少要写 `name`、`description`、`runs`；按需写 `inputs`、`outputs`。`runs` 字段决定这个 action 是哪种类型——这正是三种 action 的分水岭。
+
+## 2. 三种 Action 类型一览
+
+| 类型 | `runs.using` | 执行环境 | 启动速度 | 适用场景 |
+|---|---|---|---|---|
+| JavaScript action | `node20`（旧为 `node16`） | 宿主 runner，用 Node 跑 | 快 | 逻辑复杂、需要调用 API、跨平台 |
+| Composite action | `composite` | 复用一组 `run` step | 最快 | 把多个 shell 步骤封装成一个动作 |
+| Docker action | `docker` | 独立容器 | 慢（要拉/建镜像） | 需要完全隔离、特定系统环境 |
+
+<Callout type="tip" title="日常优先 composite action">
+绝大多数"团队内部约定"其实就是几行 shell 命令的组合（装依赖、配缓存、跑 lint）。用 composite action 封装**最简单、启动最快**，不需要 Node 工程、不需要写 Dockerfile。除非需要复杂逻辑或强隔离，否则先选 composite。
+</Callout>
+
+## 3. `action.yml` 元数据通用结构
+
+不管哪种类型，`action.yml` 的公共字段一致：
+
+```yaml
+name: "动作名称"
+description: "一句话说明这个动作做什么"
+inputs:
+  token:
+    description: "GitHub token"
+    required: true
+    default: ${{ github.token }}
+outputs:
+  result:
+    description: "输出结果"
+runs:
+  using: composite          # 或 node20 / docker，决定类型
+  # 下面的内容随类型不同（见各节）
+```
+
+- `inputs`：`name` / `description` / `required` / `default`。默认值里可以用 `${{ }}` 表达式（如 `${{ github.token }}`）。
+- `outputs`：声明这个动作会输出什么，供调用方 `${{ steps.<id>.outputs.x }}` 读取（注意 composite 的 outputs 需由内部 step 写入 `GITHUB_OUTPUT`）。
+- `runs`：核心，类型分水岭。
+
+## 4. Composite action：封装一组 step
+
+`runs.using: composite`，然后在 `runs.steps` 里写若干 `run` 步骤，就像把 job 里的 steps 搬进了 action。这是复用 step 序列最方便的方式。
+
+下面把"安装依赖 + 跑 lint"封装成一个一键 action：
+
+```yaml
+# .github/actions/setup-and-lint/action.yml
+name: "安装依赖并 Lint"
+description: "npm ci 后跑 eslint，团队统一约定封装"
+inputs:
+  node-version:
+    description: "Node 版本"
+    required: false
+    default: "20"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+    - name: 安装依赖
+      run: npm ci
+      shell: bash
+    - name: Lint
+      run: npm run lint
+      shell: bash
+```
+
+注意 composite action 里**每个 `run` 都必须显式写 `shell:`**（不能用默认 shell）。然后在业务 workflow 里一行引用：
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-and-lint/   # 指向目录即可
+        with:
+          node-version: "20"
+```
+
+<Callout type="warn" title="composite 的 run 必须带 shell">
+composite action 不像普通 job 那样有"默认 bash"，每个 `run:` 都要写 `shell: bash`（或 `pwsh`/`sh` 等），漏写会直接报错。另外 composite action 内部**不能再嵌套 `uses:` 调用另一个 composite 的 steps**——但可以直接 `uses:` 普通 action（如上面的 `actions/setup-node`）。
+</Callout>
+
+如果 composite action 要输出值，和 job 一样：内部 step 写 `GITHUB_OUTPUT`，再在 `action.yml` 的 `outputs` 声明：
+
+```yaml
+outputs:
+  lint-exit:
+    description: "lint 退出码"
+runs:
+  using: composite
+  steps:
+    - id: lint
+      run: |
+        npm run lint && echo "lint-exit=0" >> "$GITHUB_OUTPUT" || echo "lint-exit=1" >> "$GITHUB_OUTPUT"
+      shell: bash
+```
+
+调用方：`${{ steps.my-step.outputs.lint-exit }}`（step 需有 `id`）。
+
+## 5. JavaScript action：用 actions/toolkit
+
+当逻辑复杂（要调用 GitHub API、解析 JSON、做条件分支），用 Node 写更顺手。它依赖官方 `@actions/core`、`@actions/github` 等 toolkit 包，有 `action.yml` + 一个 JS 入口。
+
+`action.yml`：
+
+```yaml
+# .github/actions/hello-js/action.yml
+name: "JS 问候"
+description: "用 actions/toolkit 读取输入并打印"
+inputs:
+  name:
+    description: "名字"
+    required: true
+runs:
+  using: node20
+  main: index.js          # 入口文件
+```
+
+入口 `index.js`（片段）：
+
+```js
+const core = require("@actions/core");
+const name = core.getInput("name");        // 读取 action.yml 里声明的 inputs.name
+core.info(`Hello, ${name}`);
+core.setOutput("greeting", `Hello, ${name}`);   // 写回 output
+```
+
+构建发布前通常用 `ncc` 把依赖打包成单个 `dist/index.js`，避免运行时再 `npm install`。优势：跨平台（Windows/Linux/macOS 都能跑 Node）、启动快、能用成熟 JS 生态。缺点：需要 Node 工程与打包步骤，比 composite 重。
+
+<Callout type="info" title="何时选 JS action">
+需要：调用 REST/GraphQL API、读写 PR/Issue、复杂字符串与文件处理、强类型逻辑——选 JavaScript。纯 shell 能搞定的，优先 composite。
+</Callout>
+
+## 6. Docker action：容器化隔离
+
+当你的动作依赖特定系统库、特定 Linux 发行版，或希望**环境与宿主完全隔离**，用 Docker action：`runs.using: docker`，由 `Dockerfile` + 入口脚本执行。
+
+目录结构（简要）：
+
+```
+.github/actions/my-docker-action/
+├── action.yml
+├── Dockerfile
+└── entrypoint.sh
+```
+
+`action.yml` 片段：
+
+```yaml
+name: "Docker 动作"
+description: "在隔离容器里执行"
+runs:
+  using: docker
+  image: Dockerfile          # 用仓库内的 Dockerfile 构建；也可直接写镜像地址
+  args:
+    - ${{ inputs.arg }}      # 把输入当作容器启动参数
+```
+
+`entrypoint.sh` 里用 `INPUT_<NAME>` 环境变量读取输入（GitHub 会把 `inputs.name` 转成大写下划线形式 `INPUT_NAME` 注入容器）。Docker action 环境最干净、可复现性最好，但**启动最慢**（要拉取/构建镜像），且默认只支持 Linux 容器。一般只在"必须隔离"时才用。
+
+<Callout type="tip" title="三种类型怎么选（速记）">
+- 一组 shell 步骤 → **composite**（快、简单）
+- 复杂逻辑 / 调 API → **JavaScript**（快、跨平台、强逻辑）
+- 强隔离 / 特殊环境 → **Docker**（慢但干净）
+</Callout>
+
+## 7. 何时自己写，何时用市场
+
+市场里现成的 action 通常更成熟、有人维护。自研只在以下情况划算：
+
+- **市场没有**：你的业务逻辑非常专有（对接公司内部平台）。
+- **团队内部约定**：把"登录内网镜像、配代理、装私有工具链"等固定步骤统一封装，避免每人各写一遍、行为漂移。
+- **统一版本与审计**：锁定团队用同一套动作，便于统一升级。
+
+如果只是"检出代码""装 Node""缓存依赖"，直接用 `actions/checkout`、`actions/setup-node`、`actions/cache` 即可，**不要重复造轮子**。
+
+<Callout type="warn" title="自研 action 也要版本化">
+在 workflow 里引用自定义 action 时，最好用 **tag 或 commit SHA** 而不是分支名（`uses: ./.github/actions/xxx` 同仓库无所谓，但发布到市场/跨仓库时务必锁版本）。用分支名会导致上游一改，所有调用方行为突变，难以排查。
+</Callout>
+
+## 8. 小结
+
+- Action 是**可复用的 step 积木**，由 `action.yml` 描述；`runs.using` 决定类型。
+- **Composite**：`using: composite`，封装一组 `run` step，最简单最快，日常首选；每个 `run` 必须写 `shell`。
+- **JavaScript**：`using: node20` + 入口 JS，用 `@actions/core` 等 toolkit，适合复杂逻辑、跨平台、调 API。
+- **Docker**：`using: docker` + Dockerfile，环境完全隔离但启动慢，仅用于强隔离场景。
+- 引用自研 action 指向目录 `./.github/actions/xxx/`；发布到市场时锁定 tag/SHA。
+- 自研原则：市场没有 / 团队内部约定才写，通用动作直接用现成的。
+
+本章我们让"动作"本身也能被复用和自研。但在真正跑 CI/CD 时，还有两个绕不开的工程问题：**并发控制**（避免多次推送把部署搅成一团）与**部署环境 / 审批**（生产发布要人工确认）。下一章就来聊 GitHub Actions 的并发与部署环境（Environments）机制。
+
+<Callout type="exercise" title="练习">
+1. 写一个 composite action：放在 `.github/actions/prepare/action.yml`，封装"setup-node（默认 20）+ `npm ci`"两步；并在一个 workflow 的 job 里用 `uses:` 引用它。
+2. 给上面的 composite action 加一个 `inputs.cache-key`（可选），用于在安装前 `echo` 打印出缓存 key。说明 composite 里 `run` 为什么必须写 `shell`。
+3. 判断：下面哪种需求更适合用 JavaScript action 而非 composite action？(a) 把 `npm ci && npm run build` 封装；(b) 调用 GitHub API 自动给 PR 加 label。简述理由。
+4. 小陷阱：下面 `action.yml` 的 composite 定义里，哪一行会导致运行报错？改正它。
+```yaml
+runs:
+  using: composite
+  steps:
+    - run: echo "hello"
+    - run: npm test
+```
+</Callout>
+
+<Answer>
+**1. 参考答案：**
+
+```yaml
+# .github/actions/prepare/action.yml
+name: "准备环境"
+description: "setup-node + npm ci"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+    - run: npm ci
+      shell: bash
+```
+
+```yaml
+# 调用方 workflow
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare/
+```
+
+**2. 参考答案：** `action.yml`：
+
+```yaml
+inputs:
+  cache-key:
+    description: "缓存 key"
+    required: false
+    default: "default"
+runs:
+  using: composite
+  steps:
+    - run: echo "cache key = ${{ inputs.cache-key }}"
+      shell: bash
+    - uses: actions/setup-node@v4
+      with: { node-version: "20" }
+    - run: npm ci
+      shell: bash
+```
+
+composite action 不像普通 job 那样有"默认 shell"，每个 `run` **必须显式声明 `shell`**，否则 runner 不知道用什么解释器执行，会直接报错。
+
+**3. 参考答案：** (b) 更适合 JavaScript action。给 PR 自动加 label 需要调用 GitHub API（`@actions/github` 的 `octokit`/REST），shell 很难优雅处理；而 (a) 只是两条 shell 命令，用 **composite** 最合适、最简单。
+
+**4. 参考答案：** 两个 `run` 都**缺少 `shell:` 字段**，composite action 会报错。改正：
+
+```yaml
+runs:
+  using: composite
+  steps:
+    - run: echo "hello"
+      shell: bash
+    - run: npm test
+      shell: bash
+```
+</Answer>

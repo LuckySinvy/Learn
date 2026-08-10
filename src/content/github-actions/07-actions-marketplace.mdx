@@ -1,0 +1,230 @@
+---
+title: 使用 Action 与官方动作
+order: 7
+description: 理解 uses 语法与 Action 版本固定，掌握官方常用动作 checkout / setup-* 的用法与供应链安全
+---
+
+# 使用 Action 与官方动作
+
+在第 6 章里，我们已经能让一个 workflow 跑起来执行 `run:` 命令。但 **GitHub Actions 真正的威力，在于直接复用社区和官方已经写好的"动作"（Action）**——几乎不需要自己写 Shell 就能完成拉代码、装运行时、缓存依赖等脏活累活。
+
+本章我们就来看：**什么是 Action、`uses` 语法怎么写、为什么几乎每个 workflow 第一步都是 `actions/checkout`，以及官方最常用的几个动作该怎么用**。
+
+## 1. 什么是 Action 与 `uses` 语法
+
+**Action** 是一个可复用的单元，封装了一组逻辑（通常是一段 JavaScript 或一段 Docker 容器里的脚本）。你可以在 step 里通过 `uses` 引用它，而不用自己把每一步逻辑都写成 `run:`。
+
+引用一个 Action 的语法只有一句话：
+
+```yaml
+uses: owner/repo@ref
+```
+
+这里有三个部分：
+
+- **`owner`**：发布这个 Action 的 GitHub 账号或组织，例如 `actions` 是 GitHub 官方组织。
+- **`repo`**：Action 所在的仓库名，例如 `checkout`。
+- **`ref`**：要使用的版本引用，可以是下面三种之一：
+  - **tag（标签）**，如 `v4`——最常用，可读性最好。
+  - **branch（分支）**，如 `main`——指向分支最新提交，会随时间变化。
+  - **commit SHA（提交哈希）**，如 `a12a394...`——锁定到某一次确切提交，最安全。
+
+一个完整的例子：
+
+```yaml
+steps:
+  - uses: actions/checkout@v4      # 使用官方 checkout 动作的第 4 大版本
+  - uses: actions/setup-node@v4    # 使用官方 setup-node 动作
+    with:
+      node-version: 18
+```
+
+<Callout type="tip" title="uses 和 run 二选一">
+在**同一个 step** 里，你要么写 `uses`（调用一个动作），要么写 `run`（执行命令），两者不能同时出现。需要"先调用动作再执行命令"，就把它们拆成两个 step。
+</Callout>
+
+## 2. 为什么几乎每个 workflow 都要先 `actions/checkout`
+
+这是新手最容易困惑的一点：**当你在一个 GitHub 托管的 runner 上启动 job 时，这台机器上默认并没有你的仓库代码。**
+
+runner 只是一个干净的操作系统环境（带好各种工具链），它连你的 Git 仓库都没有拉下来。如果你的 workflow 需要"编译我的项目""跑我的测试"，第一步就必须先把代码拉到 runner 上——这就是 `actions/checkout` 做的事。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4   # 把当前仓库代码 checkout 到 runner 的工作目录
+      - run: ls -la                 # 现在才能看到你的文件
+```
+
+如果少了这一步，紧接着的 `run: npm test` 会因为根本找不到 `package.json` 而失败。因此你会发现，**绝大多数 workflow 的第一个 step 都是 `actions/checkout@v4`**。
+
+`actions/checkout` 还有一些常用可选参数，通过 `with:` 传入：
+
+| 参数 | 作用 | 示例 |
+|---|---|---|
+| `fetch-depth` | 浅克隆深度，`0` 表示拉全部分支历史 | `fetch-depth: 0` |
+| `ref` | 指定要检出的分支/标签/SHA | `ref: main` |
+| `token` | 使用的凭证（默认 `GITHUB_TOKEN`） | `token: ${{ secrets.MY_TOKEN }}` |
+
+**浅克隆**是个常见需求：默认情况下 `checkout` 只拉最近一次提交（`fetch-depth: 1`），速度更快、占用更小。但如果你是做版本号自动生成、需要完整的 Git 历史标签，就要用 `fetch-depth: 0`：
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0   # 拉取完整历史，便于读取 tag / 提交数
+```
+
+## 3. 安装运行时的官方动作：`setup-*`
+
+不同项目需要不同版本的语言运行时。GitHub 官方提供了一组 `setup-*` 动作，用来在 runner 上安装并切换指定版本：
+
+- **`actions/setup-node`**：安装 Node.js（并自带 npm/yarn/pnpm 缓存）。
+- **`actions/setup-python`**：安装 Python（自带 pip 缓存）。
+- **`actions/setup-go`**：安装 Go。
+- **`actions/setup-java`**：安装 JDK（支持 Maven/Gradle 缓存）。
+
+它们的共同点是：通过 `with:` 的 `node-version` / `python-version` / `go-version` / `java-version` 指定版本，并且**内部通常会自动帮你缓存依赖**，让后续安装更快。
+
+```yaml
+- uses: actions/setup-node@v4
+  with:
+    node-version: 20          # 安装 Node.js 20
+    cache: npm                # 自动缓存 npm 依赖（对应 package-lock.json）
+```
+
+<Callout type="tip" title="setup-node 的 cache 真香">
+给 `setup-node` 加上 `cache: npm`（或 `yarn` / `pnpm`），它会根据锁文件自动缓存 `~/.npm`，后面的 `npm ci` 会显著提速，你甚至不用再单独写 `actions/cache`。
+</Callout>
+
+其他语言也类似：
+
+```yaml
+- uses: actions/setup-python@v5
+  with:
+    python-version: '3.12'
+    cache: pip
+
+- uses: actions/setup-go@v5
+  with:
+    go-version: '1.22'
+```
+
+## 4. 给 Action 传参：`with:`
+
+`uses` 负责"调用哪个动作"，`with:` 负责"给它传什么参数"。每个 Action 在自己的仓库 README 里都会说明它支持哪些 `with` 输入项。
+
+以 `setup-node` 为例，`node-version` 就是它定义的一个输入：
+
+```yaml
+steps:
+  - uses: actions/setup-node@v4
+    with:
+      node-version: 18      # 这就是传给 setup-node 的参数
+      cache: npm
+```
+
+记住一个心智模型：**`uses` 像"函数名"，`with` 像"函数参数"**。不同 Action 的参数名各不相同，写之前查一下它的文档即可。
+
+## 5. 版本固定：tag、SHA 与供应链安全
+
+`uses` 里的 `ref` 看起来只是"版本号"，但它直接关系到你的 CI 安全性。
+
+- 用 **tag（如 `v4`）**：方便、可读。但 tag 在 Git 里是可以被**重新指向**的——恶意维护者（或账号被盗者）可以把 `v4` 指向一段新的、含后门的代码，而你的 workflow 会在不知情的情况下用上它。
+- 用 **commit SHA（如 `692973e3...`）**：完全锁定到某一次确切提交，任何人都无法悄悄改动它指向的内容。**这是最安全的方式，能有效防范供应链攻击。**
+- 用 **branch（如 `main`）**：最不推荐，内容随时会变，结果不可复现。
+
+<Callout type="warn" title="第三方 Action 的供应链风险">
+你引用的每一个 Action 都会在你的 runner 上执行代码，并可能读取你的仓库内容、密钥（secrets）和环境变量。**不要随意引用不知名作者发布的第三方 Action**。优先使用官方（`actions/*`）、知名组织、或经过审计的动作；对关键流水线，强烈建议把 `ref` 固定到具体的 commit SHA，并配合 Dependabot 监控变动。
+</Callout>
+
+一个"安全优先"的写法示例（用完整 SHA 锁定）：
+
+```yaml
+steps:
+  # 注意：这里是真实的 commit SHA，而非可移动的 tag
+  - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+  - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f
+    with:
+      node-version: 18
+```
+
+<Callout type="tip" title="日常权衡">
+完全用 SHA 虽然最安全，但可读性差、升级麻烦。实际项目中常见做法是：**核心/敏感流水线用 SHA 锁定；普通项目用 `v4` 这种 major tag，并开启 Dependabot 自动提 PR 升级**。安全要求和可维护性之间自己权衡。
+</Callout>
+
+## 6. 完整示例：Node 项目的标准起步
+
+把上面学到的拼起来，一个 Node.js 项目最常见的 CI 配置长这样：
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4          # 1. 拉代码
+      - uses: actions/setup-node@v4        # 2. 装 Node 18 并缓存 npm
+        with:
+          node-version: 18
+          cache: npm
+      - run: npm ci                        # 3. 干净地安装依赖（依据 lock 文件）
+      - run: npm test                      # 4. 跑测试
+```
+
+逐行解释：
+
+1. `actions/checkout@v4` 把仓库拉到 runner。
+2. `setup-node@v4` 安装 Node 18，并因为 `cache: npm` 自动缓存 `node_modules` 相关下载。
+3. `npm ci` 依据 `package-lock.json` 精确安装（比 `npm install` 更适合 CI，且要求有 lock 文件）。
+4. `npm test` 执行测试脚本。
+
+这就是一个**可复用的、标准的 Node CI 模板**，你几乎可以原样拷到任何 Node 项目里。
+
+## 7. 小结
+
+本章你学到了：
+
+- Action 通过 `uses: owner/repo@ref` 引用，`ref` 可以是 **tag / branch / commit SHA** 三种。
+- runner 默认没有你的代码，所以几乎每个 workflow 第一步都是 **`actions/checkout@v4`**；`fetch-depth` 控制浅克隆。
+- 官方 `setup-node` / `setup-python` / `setup-go` / `setup-java` 用来安装指定版本运行时，且常自带依赖缓存。
+- `with:` 给 Action 传参，例如 `node-version`。
+- **版本固定很重要**：tag 方便但可被挪动，commit SHA 最安全，能防供应链攻击；引用第三方 Action 要警惕风险。
+
+到这里，我们一份配置只能针对"一个 Node 版本 + 一个操作系统"跑测试。下一章（矩阵构建）会告诉你，**如何用一套配置，同时覆盖多个 Node 版本和多个操作系统**，彻底消灭重复 YAML。
+
+<Callout type="exercise" title="练习">
+1. 下面哪一个是"最安全"的 Action 版本引用方式？为什么？
+   - A. `uses: actions/checkout@main`
+   - B. `uses: actions/checkout@v4`
+   - C. `uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11`
+
+2. 为什么如果 workflow 里没有 `actions/checkout`，紧接着写 `run: cat README.md` 也会失败？
+
+3. 写一个 step，使用 `actions/setup-python@v5` 安装 Python 3.11，并开启 pip 缓存。
+
+4. （开放题）除了 `node-version`，你还能举出一个 `setup-node` 的常见 `with` 参数吗？它有什么用？
+<Answer>
+1. **选 C（commit SHA）**。因为 SHA 指向一次确切的提交，无法被悄悄改动；tag（`v4`）可以被维护者重新指向新提交，branch（`main`）内容随时变化，二者都可能导致你 unknowingly 用上被篡改的代码——这正是供应链攻击的风险点。
+
+2. 因为 GitHub 托管的 runner 上**默认不包含你的仓库代码**。`actions/checkout` 负责把代码拉到工作目录，没这一步，`README.md` 根本不存在，所以 `cat` 会报"文件不存在"。
+
+3. 写法如下：
+   ```yaml
+   - uses: actions/setup-python@v5
+     with:
+       python-version: '3.11'
+       cache: pip
+   ```
+
+4. 例如 `cache: npm`（或 `yarn`/`pnpm`），用于指定依赖缓存策略；还有 `registry-url` 可设置 npm 镜像源，`cache-dependency-path` 可指定自定义锁文件路径等。
+</Answer>
+</Callout>

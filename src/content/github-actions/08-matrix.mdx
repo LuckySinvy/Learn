@@ -1,0 +1,229 @@
+---
+title: 矩阵构建 Matrix
+order: 8
+description: 用 strategy.matrix 一套配置覆盖多版本多操作系统，掌握 exclude/include 与失败控制
+---
+
+# 矩阵构建 Matrix
+
+上一章我们写了一个 Node 项目的 CI：在 `ubuntu-latest` 上、用 Node 18 跑测试。可现实里你往往想要更多：
+
+- "我的库要同时支持 Node 18 / 20 / 22。"
+- "我得确认它在 Linux、Windows、macOS 上都能跑。"
+- "最好这些组合都能**并行**测一遍。"
+
+如果为每个组合都手写一个 job，YAML 会膨胀得没法维护。GitHub Actions 给出的答案就是 **矩阵（matrix）**：用一份配置，自动展开成多个并行 job 实例。
+
+## 1. 矩阵的基本心智模型
+
+`strategy.matrix` 定义在 **job** 上（不是 step 上）。你声明若干"维度"，每个维度是一个取值列表；GitHub Actions 会做**笛卡尔积**，把每种组合都生成一个独立的 job 实例并并行运行。
+
+最简单的单维度例子——在三个 Node 版本上各跑一遍：
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - run: npm test
+```
+
+这里 `matrix.node-version` 是一个占位符：对 `18`、`20`、`22` 三个值，GitHub 会分别启动 3 个 job 实例，每个实例里 `${{ matrix.node-version }}` 被替换成对应的值。于是你**只写了 1 个 job 定义，却得到了 3 次测试**。
+
+<Callout type="tip" title="matrix 是 job 级别的配置">
+`strategy.matrix` 只能写在 `jobs.<job_id>` 下面，不能写在某个 step 里。矩阵决定的是"这个 job 被复制成几份"，而不是"某个 step 怎么变"。
+</Callout>
+
+## 2. 多维度：版本 × 操作系统
+
+矩阵真正的威力在多维度。下面同时指定 `node-version` 和 `os` 两个维度：
+
+```yaml
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - run: npm test
+```
+
+注意这里 `runs-on` 也用了 `${{ matrix.os }}`，因为不同操作系统要在不同 runner 上跑。
+
+组合数量 = `os` 取值数 × `node-version` 取值数 = 3 × 3 = **9 个并行 job**。也就是说，**9 种"操作系统 × Node 版本"组合，你只写了 1 份配置**。
+
+在 step 中引用矩阵值的方式始终是：`${{ matrix.维度名 }}`。例如：
+
+- `${{ matrix.node-version }}`
+- `${{ matrix.os }}`
+
+<Callout type="info" title="维度名是你自己起的">
+`node-version`、`os` 只是约定俗成的名字，你可以任意命名维度（比如 `python-version`、`browser`）。引用时只要 `${{ matrix.你的维度名 }}` 对得上即可。
+</Callout>
+
+## 3. `fail-fast`：一个失败要不要连累其他
+
+默认情况下矩阵的 `fail-fast` 为 `true`：**只要任意一个组合失败，GitHub 会尽快取消其余还在排队的组合**。这能节省资源，但在"我想看清楚到底哪些组合挂了"的调试阶段会很烦——因为看到一个失败，其他还没跑出来的结果就被取消了。
+
+把它设为 `false` 可以关闭这种行为：所有组合都会**跑完**，互不cancel：
+
+```yaml
+strategy:
+  fail-fast: false
+  matrix:
+    node-version: [18, 20, 22]
+```
+
+<Callout type="tip" title="调试时关掉 fail-fast">
+当你在排查"到底哪个版本不兼容"时，把 `fail-fast: false` 打开（设为 false），让所有组合都跑完，你就能在结果页一次看到完整的兼容性矩阵，而不是反复重试。
+</Callout>
+
+## 4. `continue-on-error`：允许某些组合失败
+
+有时你想表达"这个组合是实验性的，挂了也不要阻断整个 workflow"。比如"正式支持到 Node 20，但想顺带在 Node 22 上探探路，挂了无所谓"——这时给那个组合单独标 `continue-on-error: true`：
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+        include:
+          # 给 Node 22 这个组合打上"允许失败"标记
+          - node-version: 22
+            experimental: true
+    continue-on-error: ${{ matrix.experimental || false }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm test
+```
+
+这里我们用到了 `include`（见下节）给 Node 22 追加了一个 `experimental: true` 变量，再在 job 级别用 `continue-on-error: ${{ matrix.experimental || false }}` 让它"允许失败"。即使这个组合测试挂了，整个 workflow 仍标记为成功。
+
+<Callout type="warn" title="continue-on-error 不等于 ignore">
+`continue-on-error: true` 的组合失败了，workflow 整体仍算"成功"，但它**依然会在结果里标记为失败（黄色）**，方便你事后查看。别把它当成"悄无声息忽略错误"的开关。
+</Callout>
+
+## 5. `exclude` 与 `include`：精细裁剪组合
+
+笛卡尔积有时候会生成你**不想要**的组合，或者**想额外补充**的组合。这就是 `exclude` 和 `include` 的用武之地。
+
+- **`exclude`**：从笛卡尔积里**剔除**指定组合。
+- **`include`**：向结果里**追加**组合（或给已有组合补充额外变量）。
+
+经典例子：我们不想在 Windows 上测老旧的 Node 18（比如某依赖在 Windows 上只支持新 Node），就从矩阵里去掉 `windows-latest + node-version 18`：
+
+```yaml
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node-version: [18, 20, 22]
+        exclude:
+          # 去掉 "Windows + Node 18" 这个我们不需要的组合
+          - os: windows-latest
+            node-version: 18
+        include:
+          # 额外追加一个组合：在 ubuntu 上用 Node 20 跑，并标记它是"带覆盖率"的变体
+          - os: ubuntu-latest
+            node-version: 20
+            coverage: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - run: npm test
+      # coverage 变量只在 include 追加的组合上为 true
+      - run: npx nyc report --reporter=lcov
+        if: ${{ matrix.coverage }}
+```
+
+<Callout type="tip" title="exclude 与 include 怎么记">
+- 想"减掉某些组合" → `exclude`（写你要删掉的那组维度值）。
+- 想"加组合 / 给某组合塞额外变量" → `include`（写完整的一组维度值，可多带字段）。
+- 二者常配合：先用大矩阵铺开，再用 `exclude` 删冗余，用 `include` 补特例。
+</Callout>
+
+## 6. 矩阵的最大扇出与可维护性
+
+矩阵让"多版本 × 多 OS"变得轻而易举，但也要有节制：
+
+- GitHub 对每个 workflow 的并发 job 数、矩阵总组合数有上限（默认单次运行矩阵展开的 job 受账户配额限制）。
+- 维度不要贪多：3 个维度各 3 个值就是 27 个 job，跑得慢、还烧配额。
+- 把"必然一起失败"的组合用 `exclude` 砍掉，省时间也省钱。
+
+<Callout type="info" title="矩阵值也可以是对象">
+高级用法里，矩阵的某个维度可以取"对象列表"，而不只是标量。例如 `node-version: [{node: 18, npm: 9}, {node: 20, npm: 10}]`，这样每个组合能同时携带多个相关字段。入门阶段用标量列表就够。
+</Callout>
+
+## 7. 小结
+
+本章你学到了：
+
+- `strategy.matrix` 写在 **job** 上，多个维度做**笛卡尔积**，自动展开成多个并行 job 实例。
+- 在 step / `runs-on` 中用 `${{ matrix.维度名 }}` 引用当前实例的矩阵值。
+- `fail-fast: false`：一个组合失败**不取消**其他组合（调试友好）；默认 `fail-fast` 为 `true`。
+- `continue-on-error: true`：允许某些组合失败而不阻断整体 workflow。
+- `exclude` 删除不需要的组合，`include` 追加额外组合或补充变量。
+- 矩阵让我们用**一套配置覆盖"多版本 × 多 OS"**，极大减少重复 YAML。
+
+到目前为止，每个 job 都是"自给自足"——自己 checkout、自己跑。但真实项目里常常需要 **job A 产出文件、job B 接着用**（比如先构建出 `dist/`，再部署）。下一章（Artifacts 构件传递）就来讲：**job 之间如何传递文件**。
+
+<Callout type="exercise" title="练习">
+1. 下面这段矩阵的 `node-version: [16, 18, 20]` 与 `os: [ubuntu-latest, macos-latest]`，最终会展开成几个 job？分别是什么组合？
+   ```yaml
+   strategy:
+     matrix:
+       node-version: [16, 18, 20]
+       os: [ubuntu-latest, macos-latest]
+   ```
+
+2. 我想"只要有一个组合失败，就立刻取消其余组合"，矩阵里的 `fail-fast` 应该设成 `true` 还是 `false`？默认是什么？
+
+3. 写出一段矩阵配置：在 `ubuntu-latest` 和 `windows-latest` 上测 Node 18 和 20，但**排除** `windows-latest + node-version 18` 这个组合。
+
+4. `exclude` 和 `include` 各自用来干什么？请用一句话分别概括。
+<Answer>
+1. 共 **6 个 job**（3 × 2 的笛卡尔积）：
+   - ubuntu-latest + 16、ubuntu-latest + 18、ubuntu-latest + 20
+   - macos-latest + 16、macos-latest + 18、macos-latest + 20
+
+2. 应该设成 `fail-fast: true`。默认值就是 `true`（即默认"一个失败就尽快取消其余"）。若想让所有组合都跑完，才设 `false`。
+
+3. 示例：
+   ```yaml
+   strategy:
+     matrix:
+       os: [ubuntu-latest, windows-latest]
+       node-version: [18, 20]
+       exclude:
+         - os: windows-latest
+           node-version: 18
+   ```
+
+4. `exclude` 用来**从笛卡尔积中剔除**不需要的组合；`include` 用来**向结果中追加**额外组合（或给已有组合补充额外变量）。
+</Answer>
+</Callout>

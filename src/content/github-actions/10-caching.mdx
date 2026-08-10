@@ -1,0 +1,348 @@
+---
+title: 缓存依赖提速
+order: 10
+description: 用 actions/cache 缓存 node_modules、pip、go mod 等依赖目录，避免每次运行都重新下载安装
+---
+
+# 缓存依赖提速
+
+你有没有发现，CI 跑一次，光是 `npm install` 就要花一两分钟，Python 项目 `pip install` 更久，Go 项目第一次拉 `go mod download` 同样枯燥。这些依赖其实**每次运行都差不多**，但 GitHub Actions 默认每次都在一个全新的干净环境里启动，所有依赖都要从头下载——这是巨大的浪费。
+
+本章介绍官方提供的缓存动作 **`actions/cache`**，它能在多次运行之间保存和恢复目录（最典型的就是各种**依赖缓存目录**），把"每次重装"变成"第一次装、之后复用"，常能把构建时间从几分钟压到几十秒。
+
+## 1. 为什么需要缓存
+
+先理解 GitHub Actions 的运行模型：**每一次 workflow 运行，runner 都是一个几乎全新的环境**（除非你用自托管 runner 并特意保留了磁盘）。这意味着：
+
+- 上一次运行安装的 `node_modules`、`~/.cache/pip`、Go 的模块缓存，下一次运行时默认都不在了。
+- 一个典型的 Node 项目，`npm ci` 在冷环境里要下载并解析全部依赖，经常耗时 1–3 分钟。
+- 一个 Python 项目，`pip install -r requirements.txt` 可能要 2–5 分钟，还受 PyPI 网络波动影响。
+
+缓存要解决的，就是"**这些不变或很少变的东西，能不能别每次都重新下载**"。
+
+<Callout type="info" title="缓存 ≠ 产物（artifact）">
+很多人一开始分不清 `actions/cache` 和 `actions/upload-artifact`，这俩名字像、用法也像，但目的完全不同。本章第 6 节有一张对比表专门讲清区别。一句话先记住：**缓存是为了"加速、跨次运行复用"，产物是为了"在 job/运行之间传递或留存文件"。**
+</Callout>
+
+## 2. `actions/cache` 的基本三要素
+
+`actions/cache` 的核心就是三个参数：
+
+| 参数 | 含义 | 例子 |
+|---|---|---|
+| `path` | 要缓存（保存/恢复）的目录或文件 | `node_modules` |
+| `key` | 本次缓存的唯一标识（键） | `npm-${{ hashFiles('package-lock.json') }}` |
+| `restore-keys` | 没精确命中 `key` 时的前缀回退键列表 | `npm-` |
+
+最简形式：
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+
+  - name: 缓存 node_modules
+    uses: actions/cache@v4
+    with:
+      path: node_modules
+      key: npm-${{ hashFiles('package-lock.json') }}
+      restore-keys: npm-
+```
+
+这一行 `uses: actions/cache@v4` 的 step 本身**不会安装任何东西**，它只负责"尝试恢复缓存"。真正的安装命令（比如 `npm ci`）要放在它后面、单独的 step 里——这正是下一节要讲的"命中机制"。
+
+## 3. `key` 怎么设计：让依赖变了缓存就失效
+
+`key` 是缓存的"身份证"。**相同 `key` 才会命中同一份缓存**。设计 `key` 的核心是：**把"能反映依赖内容是否变化"的信息编进 `key` 里**。
+
+最常用也最准的做法——用依赖清单文件的哈希：
+
+```yaml
+key: npm-${{ hashFiles('package-lock.json') }}
+```
+
+`hashFiles('package-lock.json')` 会计算 `package-lock.json` 的哈希值。于是：
+
+- 你**没改**依赖清单 → 哈希不变 → `key` 不变 → 命中上次缓存 → 直接复用 `node_modules`。
+- 你**改了**依赖（新增/升级/删除包）→ `package-lock.json` 哈希变了 → `key` 变了 → 旧缓存失效，走全新安装。
+
+为了让 `key` 更具辨识度，通常会再加一个固定前缀和操作系统维度（不同 OS 的依赖二进制不通用）：
+
+```yaml
+key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+```
+
+`runner.os` 是 `Linux` / `macOS` / `Windows`，避免把 macOS 的缓存错用到 Linux runner 上。
+
+<Callout type="tip" title="缓存键的常见分层命名">
+推荐用 `层级-工具-维度` 的结构，例如：
+
+```text
+Linux-npm-a1b2c3d4   <- runner.os + 工具 + lock 文件哈希
+Linux-pip-requirements.txt-9f8e7d6c
+```
+
+层级越细，`key` 越精确；配合 `restore-keys` 做回退，既精准又不会"一点小改动就全盘重装"。
+</Callout>
+
+## 4. `restore-keys`：前缀匹配回退
+
+现实中，依赖清单哈希一变，`key` 就全盘变了，如果只有精确 `key`，那每次加一个包就彻底冷启动。这时候 `restore-keys` 出场——它提供"**前缀匹配的最近缓存**"作为回退。
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: node_modules
+    key: npm-${{ hashFiles('package-lock.json') }}
+    restore-keys: |
+      npm-
+```
+
+查找逻辑是这样的：
+
+1. 先找 `key` 精确匹配。命中 → 用这份缓存，`cache-hit` 输出为 `true`。
+2. 没精确命中 → 拿 `restore-keys` 里的每个前缀（`npm-`）去做**前缀匹配**，找最近的一份旧缓存恢复。
+3. 旧缓存恢复后，再跑 `npm ci`/`npm install`，npm 会发现大部分包已经在 `node_modules` 里，只**增量更新**变化的那部分。
+
+`restore-keys` 可以写多个，按列表顺序从前到后尝试：
+
+```yaml
+restore-keys: |
+  npm-${{ runner.os }}-
+  npm-
+```
+
+<Callout type="warn" title="lock 文件改了，缓存会自动失效，这是好事情">
+有些同学担心"我改了 `package-lock.json` 怎么办"。答案是：**不用管，哈希变了 `key` 自然就变了**，旧缓存不会再被精确命中，最多通过 `restore-keys` 回退一份"近似的旧缓存"做增量更新。这正是预期行为，不要为了"保住缓存"而故意把 `key` 写死成固定字符串——那会导致改了依赖却还在用旧 `node_modules`，引发诡异的 bug。
+</Callout>
+
+## 5. 缓存命中机制：`cache-hit` 与"装还是不装"
+
+`actions/cache` 运行后，会输出一个 `cache-hit`：
+
+- **精确命中**（`key` 匹配）：`cache-hit == 'true'`，目录已被完整恢复。
+- **未命中或仅回退命中**：`cache-hint == 'false'`（或回退命中时为 `true` 但非精确），目录要么为空、要么是近似旧缓存。
+
+关键实践：**安装依赖的命令要放在 cache step 之后，并且不要给它加 `if: cache-hit != 'true'` 这样的条件**。为什么？
+
+- 精确命中时，`node_modules` 已是完整的，再跑 `npm ci` 其实也没坏处（npm 会校验并直接复用），只是多花一点点时间。
+- 回退命中时，`node_modules` 是旧的不完整的，必须跑安装来补齐。
+- 完全未命中时，`node_modules` 为空，必须跑安装。
+
+所以最稳妥的写法是：**无条件在 cache 之后跑安装**，让 npm/pip/go 自己决定"复用还是下载"：
+
+```yaml
+- name: 缓存依赖
+  uses: actions/cache@v4
+  with:
+    path: node_modules
+    key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-npm-
+
+- name: 安装依赖
+  run: npm ci
+```
+
+如果你确实想利用 `cache-hit` 做精细控制（比如命中时跳过耗时的预构建），可以这样：
+
+```yaml
+- name: 缓存依赖
+  id: cache-node
+  uses: actions/cache@v4
+  with:
+    path: node_modules
+    key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+
+- name: 命中缓存时跳过安装（可选）
+  if: steps.cache-node.outputs.cache-hit != 'true'
+  run: npm ci
+```
+
+## 6. 各语言的缓存实战片段
+
+不同生态"该缓存哪个目录"各不相同。下面列出常见组合（只看 `with` 部分，外层照旧包 `uses: actions/cache@v4`）：
+
+**npm：**
+
+```yaml
+path: node_modules
+key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+restore-keys: ${{ runner.os }}-npm-
+```
+
+**yarn（经典 v1，缓存 `node_modules`）：**
+
+```yaml
+path: node_modules
+key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+restore-keys: ${{ runner.os }}-yarn-
+```
+
+**pnpm（注意 pnpm 缓存的是 store 目录）：**
+
+```yaml
+path: ~/.pnpm-store
+key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+restore-keys: ${{ runner.os }}-pnpm-
+```
+
+**pip（缓存 pip 下载缓存目录）：**
+
+```yaml
+path: ~/.cache/pip
+key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+restore-keys: ${{ runner.os }}-pip-
+```
+
+**Go（`go mod` 缓存）：**
+
+```yaml
+path: ~/go/pkg/mod
+key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+restore-keys: ${{ runner.os }}-go-
+```
+
+**Maven（缓存本地仓库）：**
+
+```yaml
+path: ~/.m2/repository
+key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+restore-keys: ${{ runner.os }}-maven-
+```
+
+<Callout type="tip" title="pnpm 别缓存 node_modules">
+pnpm 的依赖不是直接放在 `node_modules` 里的（它用硬链接指向全局 store）。所以 pnpm 缓存 `node_modules` 是错的，要缓存 `~/.pnpm-store`，再在后续 step 里 `pnpm install --frozen-lockfile` 重建链接。这是 pnpm 初学者最容易踩的坑。
+</Callout>
+
+## 7. 一个完整的 npm 缓存示例
+
+```yaml
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 缓存 node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建
+        run: npm run build
+
+      - name: 测试
+        run: npm test
+```
+
+## 8. 一个完整的 pip 缓存示例
+
+```yaml
+name: Python CI
+
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行测试
+        run: pytest
+```
+
+## 9. 缓存 vs 产物：再看一眼区别
+
+| 维度 | `actions/cache`（缓存） | `actions/upload-artifact`（产物） |
+|---|---|---|
+| 主要目的 | 加速：跨次运行复用不变的文件 | 传递/留存：把构建结果交给别的 job 或留存查看 |
+| 典型内容 | `node_modules`、`~/.cache/pip`、`go/pkg/mod` | 打包后的 `dist/`、测试报告、日志 |
+| 生命周期 | 有大小上限（默认约 10GB 仓库级）和保留期（默认 7 天起，按分支/PR） | 有保留期（默认 90 天），可下载 |
+| 是否跨 job | 同一 workflow 内各 job 独立，需各自恢复 | 专门设计用来跨 job 传递 |
+| 失效方式 | `key` 变了即失效 | 运行结束即落盘，不自动"失效" |
+
+一句话：**要加速用 cache，要传文件用 artifact。** 别用缓存去"保存测试报告给人看"，也别用产物去"缓存依赖提速"——方向反了。
+
+<Callout type="warn" title="不要缓存含密钥或频繁变化的文件">
+- 不要把 `.env`、`credentials.json`、含 token 的文件放进缓存路径——缓存可能被同一仓库的分支/PR 读取，存在泄露风险。
+- 不要缓存会随每次提交频繁变化的目录（比如 `build/` 输出、日志目录），它们的 `key` 几乎每次都变，缓存永远命不中，纯属浪费配额。
+- 缓存有仓库级容量上限，过期缓存会自动清理，不要指望它永久保存。
+</Callout>
+
+## 10. 小结
+
+- `actions/cache` 通过 `path` + `key` + `restore-keys` 在多次运行间保存/恢复目录，核心用途是**缓存依赖以加速**。
+- `key` 应包含依赖清单的哈希（如 `hashFiles('package-lock.json')`），依赖变了 `key` 就变、缓存自然失效。
+- `restore-keys` 提供前缀回退，没命中精确 `key` 时恢复最近的旧缓存，再靠包管理器**增量更新**。
+- 安装命令放在 cache step 之后、可无条件执行，让 npm/pip/go 自己决定复用还是下载；需要精细控制时可用 `cache-hit` 输出。
+- npm/yarn/pnpm/pip/go/maven 各有"该缓存哪个目录"的约定，pnpm 缓存的是 store 而非 `node_modules`。
+- 缓存用于"加速"，产物用于"传递/留存"，二者目的不同，别混用；也不要缓存含密钥或频繁变化的文件。
+- 下一章：环境变量与 Secrets → 我们将学习用 `env` 配置公开变量、用 `secrets` 注入机密，并了解 GitHub 如何自动给日志打码。
+
+<Callout type="exercise" title="练习">
+1. 有一个 Node 项目，你只把 `key` 写成固定字符串 `my-cache`，不引用 `package-lock.json` 哈希。这样会有什么问题？请说明后果。
+2. 给出一段 `actions/cache` 配置，用于缓存 yarn 的依赖，要求 `key` 包含 `runner.os` 和 `yarn.lock` 的哈希，并配置 `restore-keys` 做前缀回退。
+3. 为什么说"安装依赖的 step 最好无条件执行，不要加 `if: cache-hit` 才安装"？在回退命中的场景下，如果跳过安装会发生什么？
+4. 判断：把单元测试生成的 HTML 测试报告用 `actions/cache` 缓存起来给同事下载查看，合适吗？应该改用哪个动作？
+
+<Answer>
+**参考答案：**
+
+**1. 固定 `key` 的后果**
+
+如果把 `key` 写成固定字符串 `my-cache`，那么无论你新增、升级、删除任何依赖，`key` 都不变，GitHub Actions 永远精确命中**第一份**缓存。后果是：你改了 `package-lock.json`，但 `node_modules` 里还是旧的包，构建用的是过时的依赖，可能出现"本地能跑、CI 报错"或反之的诡异问题，而且极难排查——因为你看不出依赖没更新。正确做法是用 `hashFiles('package-lock.json')` 把依赖清单哈希编进 `key`。
+
+**2. yarn 缓存配置**
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: node_modules
+    key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+    restore-keys: |
+      ${{ runner.os }}-yarn-
+```
+
+之后接 `run: yarn install --frozen-lockfile` 即可。
+
+**3. 为什么安装 step 应无条件执行**
+
+`actions/cache` 的输出 `cache-hit` 只在"精确命中"时为 `true`。当通过 `restore-keys` 回退命中时，`node_modules` 里是**旧的不完整的**依赖，此时 `cache-hit` 为 `false`。如果这时用 `if: steps.cache.outputs.cache-hit == 'true'` 才安装，就会**跳过安装**，导致后续构建/测试在一个残缺的 `node_modules` 上运行而失败。让安装命令无条件执行，npm/yarn 会复用已存在的包、只补齐变化的部分，最稳妥。
+
+**4. 测试报告不该用缓存**
+
+不合适。测试报告是"运行产出的结果"，目的是给人查看或跨 job 传递，这正是 `actions/upload-artifact` 的用途，而不是 `actions/cache` 的"加速复用"用途。应改用 `actions/upload-artifact` 上传 `dist/` 或报告目录，并设置合适的 `retention-days`。
+</Answer>
+</Callout>

@@ -36,6 +36,7 @@ export function LangOverview({ lang }: { lang: Language }) {
         {lang === 'git' && '从提交与分支到 rebase、冲突处理与团队工作流，版本控制融会贯通。'}
         {lang === 'http' && '从 TCP 握手到 HTTP/2/3、缓存、CORS 与 HTTPS，吃透前后端之间的每一个字节。'}
         {lang === 'prometheus' && '从时序数据库与 PromQL 到抓取、relabel、记录/告警规则与 Alertmanager，搭建云原生监控体系。'}
+        {lang === 'github-actions' && '从 Workflow 语法到矩阵构建、缓存、复用工作流与安全实践，用 GitHub Actions 把 CI/CD 自动化跑起来。'}
       </p>
       <ul className="space-y-1">
         {chapters.map((c, i) => (

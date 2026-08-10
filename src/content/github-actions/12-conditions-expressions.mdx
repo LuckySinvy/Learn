@@ -1,0 +1,296 @@
+---
+title: 条件与表达式
+order: 12
+description: 用 if 配合 github/needs 等上下文和 success/failure 等函数，精确控制 job 与 step 是否执行
+---
+
+# 条件与表达式
+
+前几章的 workflow 大多是"事件一触发，所有 job、所有 step 无脑全跑"。但真实 CI/CD 需要更聪明的调度：只在推到 `main` 时部署、只在 PR 事件里跑检查、某步失败后还要发钉钉/Slack 通知、提交信息带 `[skip ci]` 就跳过。这些"**要不要跑**"的判断，靠的就是 `if:` 条件与 `${{ }}` 表达式。
+
+## 1. `if:` 控制 job 或 step 是否执行
+
+`if:` 可以写在 **job 级**（控制整个 job 跑不跑）或 **step 级**（控制单个 step 跑不跑）。条件为"真"才执行，为假就跳过（在界面上显示为灰色 "skipped"）。
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'   # job 级：只有 PR 事件才跑测试
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm test
+
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'        # job 级：只有推到 main 才部署
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./deploy.sh
+```
+
+`if:` 的值是一个表达式（写在 `${{ }}` 里，不过 `if:` 比较特殊，**可以省略外层 `${{ }}`**，直接写表达式体）。两种写法等价：
+
+```yaml
+if: github.ref == 'refs/heads/main'
+if: ${{ github.ref == 'refs/heads/main' }}
+```
+
+<Callout type="tip" title="`if:` 里可以不写 `${{ }}`">
+`if:`、`env:`、`with:` 等本身就是"表达式上下文"，GitHub 会自动按表达式解析。所以 `if: github.ref == 'refs/heads/main'` 已经够了，再包一层 `${{ }}` 反而冗余。但正文里提到 `github.ref` 这类写法时，仍要用反引号包成行内代码，避免被当标签解析。
+</Callout>
+
+## 2. 上下文对象：从运行环境里读信息
+
+条件判断需要"读取当前运行的信息"，这些信息的来源就是**上下文对象（context）**。常用几个：
+
+| 上下文 | 关键字段 | 含义 |
+|---|---|---|
+| `github` | `github.ref`、`github.sha`、`github.event_name`、`github.actor`、`github.repository` | 触发本次运行的仓库/事件信息 |
+| `inputs` | `inputs.xxx` | workflow_dispatch 等手动触发时传入的参数 |
+| `needs` | `needs.<job_id>.outputs.xxx` | 被依赖 job 的输出（配合 `needs:` 依赖） |
+| `env` | `env.FOO` | 当前可用的环境变量 |
+| `matrix` | `matrix.os` 等 | 矩阵策略里当前这次迭代的取值 |
+| `steps` | `steps.<id>.outputs.xxx` | 同 job 内某 step 的输出（呼应第 11 章 `GITHUB_OUTPUT`） |
+
+重点看 `github` 的几个字段：
+
+- `github.ref`：触发事件对应的引用。推到 `main` 时是 `refs/heads/main`，打 tag `v1.0` 时是 `refs/tags/v1.0`，PR 事件里通常是 `refs/pull/123/merge`。
+- `github.sha`：触发提交的完整 commit SHA。
+- `github.event_name`：事件名，如 `push`、`pull_request`、`issues`、`workflow_dispatch`。
+- `github.actor`：触发本次运行的人（用户名）。
+- `github.repository`：仓库名，形如 `owner/repo`。
+
+示例：根据事件名和分支组合判断。
+
+```yaml
+steps:
+  - name: 仅 main 上的 push 才执行
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    run: echo "这是 main 的 push"
+```
+
+## 3. 状态检查函数：`success()` / `failure()` / `always()` / `cancelled()`
+
+默认情况下，一个 step 只有当**它前面的 step 都成功**时才执行（等价于隐式 `if: success()`）。但有时你需要打破这个默认：失败后还要清理、无论成败都要发通知。这就需要状态函数。
+
+| 函数 | 含义 | 典型用途 |
+|---|---|---|
+| `success()` | 前面所有 step 都成功 | 默认行为，通常不用显式写 |
+| `failure()` | 前面有任意 step 失败 | 失败时才跑：发告警、上传错误日志 |
+| `always()` | 无论前面成功失败都跑 | 清理资源、归档产物 |
+| `cancelled()` | 工作流被取消时 | 取消时的善后 |
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 构建
+        run: ./build.sh
+
+      - name: 失败通知
+        if: failure()            # 只有构建失败才发
+        run: curl -X POST ${{ secrets.DINGTALK_WEBHOOK }} -d '{"msg":"构建挂了"}'
+
+      - name: 清理（无论成败）
+        if: always()             # 成功失败都跑
+        run: ./cleanup.sh
+```
+
+<Callout type="tip" title="`failure()` + `always()` 的清理/通知组合">
+常见组合拳：正常步骤之后，用 `if: failure()` 发"失败告警"，用 `if: always()` 做"无论结果都清理"。这样哪怕中间某步崩了，你既能收到通知，临时文件/容器/云资源也被回收，不会留下"半截"的脏状态。注意 `always()` 不等于"忽略错误继续执行后面的 step"——它只是决定"这个 step 本是否运行"，step 内部该失败还是失败。
+</Callout>
+
+## 4. 表达式语法 `${{ }}` 与常用函数
+
+在 `if:` 之外的很多地方（如 `with:`、`name:`、组合表达式），也要用 `${{ }}` 包裹表达式。常用函数：
+
+| 函数 | 作用 | 例子 |
+|---|---|---|
+| `contains(needle, haystack)` | 是否包含子串 | `contains(github.event.head_commit.message, '[skip ci]')` |
+| `startsWith(str, prefix)` | 是否以某前缀开头 | `startsWith(github.ref, 'refs/tags/')` |
+| `format(str, args...)` | 格式化字符串 | `format('{0}-{1}', github.run_id, github.sha)` |
+| `toJson(value)` | 序列化成 JSON（调试上下文很有用） | `toJson(github.event)` |
+
+比较运算 `==`、`!=`、以及逻辑 `&&`、`||`、`!` 都支持。字符串字面量用单引号。
+
+```yaml
+- name: 打印整个 event 调试
+  run: echo "${{ toJson(github.event) }}"
+```
+
+<Callout type="info" title="`toJson` 是调试神器">
+当你不确定某个上下文里到底有什么字段时，临时加一个 `run: echo "${{ toJson(github.event) }}"`，把整个事件对象打印成 JSON，肉眼就能看清有哪些可用字段。调试完记得删掉，避免把敏感信息（虽然 GitHub 会打码 secret，但 event 里可能有别的敏感内容）留在日志里。
+</Callout>
+
+## 5. 实例一：只在 push 到 main 时部署
+
+这是最常见的"保护主干"模式——feature 分支的 push 只跑测试，只有合进 `main` 才部署。
+
+```yaml
+name: CI/CD
+
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci && npm test
+
+  deploy:
+    needs: test                 # 先测试通过
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'   # 仅 main
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./deploy.sh
+```
+
+注意 `github.ref` 是完整引用名 `refs/heads/main`，不要写成 `main` 去比较，否则永远不相等。
+
+## 6. 实例二：只有 PR 事件才跑检查
+
+有些检查（比如"要求 PR 描述非空"）只该在 PR 时跑，push 到分支时没必要。
+
+```yaml
+jobs:
+  pr-check:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验 PR 描述
+        run: |
+          if [ -z "${{ github.event.pull_request.body }}" ]; then
+            echo "PR 描述不能为空" && exit 1
+          fi
+```
+
+## 7. 实例三：某 step 失败仍跑通知
+
+配合 `failure()`，构建/测试挂了也要第一时间通知到人。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 测试
+        run: npm test
+
+      - name: 飞书/钉钉告警
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+        run: |
+          curl -X POST "$WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"⚠️ 测试失败，请查看运行日志"}'
+```
+
+<Callout type="warn" title="`failure()` 的判定范围">
+`failure()` 看的是"当前 job 里位于它之前的 step"是否有失败。如果你在中间插了一个 `if: always()` 的 step，该 step 本身的成功失败也会纳入后续 `failure()` 的判定。通知 step 一般放在最后，且自身不要失败（否则可能连环告警），必要时给它加 `continue-on-error: true`。
+</Callout>
+
+## 8. 实例四：用 `contains` 跳过 `[skip ci]`
+
+团队协作时常约定：提交信息里带 `[skip ci]` 就不跑 CI（比如只改了文档）。
+
+```yaml
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm test
+```
+
+注意这里表达式前加了 `!` 取反，且整个 `if` 用引号包起来（因为字符串里含 `[]` 等字符，加引号更稳妥）。含义：提交信息**不包含** `[skip ci]` 时才跑。
+
+也可以用 `startsWith` 判断分支前缀——比如只对 `release/` 开头的分支做发布准备：
+
+```yaml
+if: startsWith(github.ref, 'refs/heads/release/')
+```
+
+## 9. 小结
+
+- `if:` 写在 job 级或 step 级控制是否执行；`if:` 是表达式上下文，可省略外层 `${{ }}`。
+- 条件判断的数据来自**上下文对象**：`github`（ref/sha/event_name/actor/repository）、`inputs`、`needs`、`env`、`matrix`、`steps`。
+- 状态函数 `success()`（默认）、`failure()`、`always()`、`cancelled()` 用来打破"前面成功才跑"的默认，常见于失败通知与清理善后。
+- 表达式支持 `==`、`!=`、`&&`、`||`、`!` 与函数 `contains()`、`startsWith()`、`format()`、`toJson()`；字符串用单引号。
+- `failure()` + `always()` 组合是"失败告警 + 必清理"的标准套路。
+- `github.ref` 是完整引用名（如 `refs/heads/main`），比较时要写全，别只写 `main`。
+- 下一章：job 之间传数据 → 我们将用 `needs`、`outputs` 和 artifact，把上游 job 的计算结果/产物可靠地交给下游 job。
+
+<Callout type="exercise" title="练习">
+1. 写一个 job 级 `if:`，要求"仅在 push 事件且推到 `main` 分支"时执行。给出完整的条件表达式。
+2. 下面这个通知 step 有什么问题？应该怎么改？
+
+```yaml
+steps:
+  - name: 构建
+    run: ./build.sh
+  - name: 不论成败都通知
+    if: failure()
+    run: echo "done"
+```
+
+3. 你希望"提交信息以 `[docs]` 开头时跳过测试"。用 `startsWith` 写出该 `if:` 条件（取反形式）。
+4. 有一个 step 会打印整个 event 用于调试：
+
+```yaml
+- run: echo "${{ toJson(github.event) }}"
+```
+
+它有什么潜在风险？调试完应如何处理？
+
+<Answer>
+**参考答案：**
+
+**1. push 到 main 才执行**
+
+job 级：
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - run: ./deploy.sh
+```
+
+注意 `github.ref` 必须写完整的 `refs/heads/main`，不能只写 `main`。
+
+**2. 通知 step 的问题**
+
+原写法 `if: failure()` 表示"只有前面失败才跑"，所以"不论成败都通知"的意图写错了——成功时它会被跳过。应改为 `if: always()`：
+
+```yaml
+- name: 不论成败都通知
+  if: always()
+  run: echo "done"
+```
+
+若想"失败才通知、成功不通知"，那 `failure()` 是对的；但题干说"不论成败"，所以要用 `always()`。另外若该通知很关键，还可加 `continue-on-error: true` 防止通知 step 自身失败影响判定。
+
+**3. `[docs]` 开头跳过测试**
+
+"以 `[docs]` 开头时跳过"= 提交信息**不**以 `[docs]` 开头才跑：
+
+```yaml
+if: "!startsWith(github.event.head_commit.message, '[docs]')"
+```
+
+整体加引号，前面 `!` 取反。
+
+**4. 打印整个 event 的风险**
+
+`github.event` 包含触发事件的完整负载，可能含有敏感内容（如某些 webhook 携带的 token、用户邮箱、内部 URL 等），打印到公开可读的 CI 日志会扩大暴露面。虽然 GitHub 会对已知 secret 打码，但 event 里的"非 registered secret"内容不会被打码。调试完应**删除该 step**，不要长期保留把完整 event 打印到日志的行为。
+</Answer>
+</Callout>

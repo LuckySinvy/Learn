@@ -1,0 +1,166 @@
+---
+title: Runner 与运行环境
+order: 5
+description: 认识真正执行 job 的机器 runner，掌握 GitHub 托管 runner 的 OS 标签、版本锁定、容器与自托管 runner 的概念。
+---
+
+# Runner 与运行环境
+
+上一章我们反复提到 `runs-on`，说它决定 job 跑在哪台机器上。这台"机器"在 GitHub Actions 里有个正式名字——**Runner（运行器）**。这一章我们就揭开它的面纱：runner 到底是什么、有哪些种类、又该怎么选。
+
+一句话概括：**runner 是真正动手执行 job 的那台计算机，而 `runs-on` 就是你在菜单里点选"我要哪一类机器"的字段。**
+
+## 1. 什么是 runner
+
+当你触发一个 workflow，GitHub Actions 会为每一个 job 分配一台 runner。这台机器上装好了操作系统、常见的开发工具链（Git、Node.js、Python、Docker 等），然后按 `steps` 的顺序一步步执行你的命令。
+
+这里有个很关键的认知：**runner 是 job 级别的**——一个 job 独占一台机器（一个 runner），job 里所有的 step 都跑在同一台机器上。step 本身没有"自己的机器"，它只是这台机器上按顺序执行的一个动作。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest   # build 这一整个 job 都在同一台 ubuntu 机器上跑
+    steps:
+      - run: pwd
+      - run: echo "这两个 step 在同一台机器上"
+```
+
+<Callout type="info" title="一个 job 一台机器">
+正因为 runner 是 job 级而非 step 级，所以同一个 job 里前面 step 生成的文件、装好的依赖，后面的 step 都能直接用。但**不同 job 之间默认不共享磁盘**——想共享产物得用 `actions/upload-artifact` 和 `download-artifact`（后续章节会讲）。
+</Callout>
+
+## 2. GitHub 托管的 runner 与 OS 标签
+
+GitHub 提供了一批"**GitHub 托管 runner**"——也就是 GitHub 替你维护的云上虚拟机，你不用装系统、不用打补丁，开箱即用。你只需要用 `runs-on` 指定一个 **OS 标签**即可。常见的标签有：
+
+- `ubuntu-latest`：最新的 Ubuntu（Linux）
+- `ubuntu-22.04` / `ubuntu-24.04`：指定版本的 Ubuntu
+- `windows-latest`：最新的 Windows Server
+- `macos-latest`：最新的 macOS
+- `macos-14`：指定版本的 macOS（常用于 Apple Silicon 构建）
+
+```yaml
+jobs:
+  linux-job:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "我在 Linux 上"
+
+  windows-job:
+    runs-on: windows-latest
+    steps:
+      - run: echo "我在 Windows 上"
+
+  mac-job:
+    runs-on: macos-latest
+    steps:
+      - run: echo "我在 macOS 上"
+```
+
+注意：`runs-on` 的值可以是**单个标签字符串**，也可以是一个标签**数组**（数组表示"满足其中任一标签即可"，GitHub 会从匹配的池中挑一台）。对初学者来说，先用单个标签就够了。
+
+## 3. latest 还是具体版本：可复现性之争
+
+这里有个特别容易踩的坑，必须单独拿出来说。
+
+`ubuntu-latest` 这种带 `latest` 的标签，会**随着时间自动指向更新的系统版本**。今天可能是 Ubuntu 22.04，某次 GitHub 升级后可能悄悄变成 24.04。这看起来很方便，但也埋下了隐患：
+
+- 某天你没改任何代码，CI 却突然红了——因为底层系统被自动升级了。
+- 别人 fork 你的项目，跑出来的结果和你当初不一样——因为"latest"对他来说已经是另一个版本。
+
+相比之下，`ubuntu-22.04` 这种**具体版本标签**永远指向固定的系统，**保证可复现**：今天跑、半年后跑、别人跑，环境都一模一样。
+
+<Callout type="tip" title="生产环境锁定具体版本">
+如果你做的是正经项目、尤其是要持续维护的仓库，**强烈建议把 `runs-on` 锁成具体版本**（如 `ubuntu-22.04`），而不是 `ubuntu-latest`。这样 CI 环境稳定可复现，避免"无改动却突然失败"的玄学问题。个人练手玩具用 `latest` 图省事则无妨。
+</Callout>
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-22.04   # 锁定具体版本，环境可复现
+    steps:
+      - run: cat /etc/os-release | head -n 2
+```
+
+## 4. 容器 runner：直接在镜像里跑
+
+除了直接用整台虚拟机，GitHub Actions 还支持 **容器 runner**——你可以用 `container:` 字段指定一个 Docker 镜像，让 job 直接跑在这个镜像的容器里。这对于"需要特定语言/依赖版本"的场景特别方便，比如"就要 node:18 的环境"。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: node:18   # 整个 job 跑在 node:18 的容器里
+    steps:
+      - run: node --version   # 会输出 v18.x
+      - run: npm ci
+      - run: npm test
+```
+
+`container:` 写在 job 层级，意味着这个 job 里的所有 step 都在该容器中执行。此外，GitHub Actions 还支持 `services:` 字段来启动**配套服务容器**（比如一个 PostgreSQL、Redis），方便你跑需要数据库的集成测试——这个思路你先有个印象即可，具体用法我们在后续数据库/集成测试相关章节再展开。
+
+<Callout type="warn" title="容器与 runner 的关系">
+`runs-on` 决定"宿主机"是什么系统（比如 Ubuntu 虚拟机），`container` 决定"在这台宿主机里再套一层什么容器"。两者配合：先在 Ubuntu 上起容器，再在容器里跑 step。如果只写 `runs-on` 不写 `container`，step 就直接跑在宿主机系统里。
+</Callout>
+
+## 5. 自托管 runner：用自己的机器
+
+前面说的都是 GitHub 替你准备的机器。那如果 GitHub 提供的机器满足不了你呢？比如：
+
+- 你需要**特定硬件**（GPU、超大内存、某款稀有架构）；
+- 你要访问**公司内网**的资源（内网数据库、私有制品库）；
+- 你对**数据合规**有要求，不能把代码送到公有云上跑。
+
+这时候就可以用 **自托管 runner（self-hosted runner）**：你把自己的机器（物理机、虚拟机、甚至树莓派）注册到仓库里，GitHub 把 job 派发到这台机器上执行。`runs-on` 写成 `self-hosted` 一类标签即可。
+
+```yaml
+jobs:
+  heavy-build:
+    runs-on: [self-hosted, linux, gpu]   # 用带 gpu 标签的自托管机器
+    steps:
+      - run: echo "在自家 GPU 机器上训练模型"
+```
+
+<Callout type="info" title="自托管 runner 仅了解概念即可">
+自托管 runner 涉及机器注册、标签管理、以及非常重要的**安全考量**（因为是你自己的机器在执行别人可能提交的任务）。它的详细配置步骤和安全注意事项，我们会留到专门的"安全"章节系统讲解，这里你只需要知道"有这回事、适合什么场景"就够了。
+</Callout>
+
+## 6. 小结
+
+这一章我们认识了真正干活的 runner：
+
+- **runner 是执行 job 的机器**，`runs-on` 用来挑选用哪一类。
+- **runner 是 job 级别**：一个 job 一台机器，step 都跑在这台机器/容器上；不同 job 默认不共享磁盘。
+- GitHub 托管 runner 用 **OS 标签**选择：`ubuntu-latest`、`ubuntu-22.04`、`windows-latest`、`macos-latest` 等。
+- **`latest` 会自动升级，可能引入破坏性变化**；生产环境建议锁定具体版本以保证可复现。
+- **容器 runner** 用 `container: 镜像名` 让 job 直接跑在指定镜像里，并可用 `services:` 启动配套服务。
+- **自托管 runner** 适合特定硬件/内网/合规场景，配置与安全细节留到安全章。
+
+现在我们既知道 job 由谁执行（runner），也知道 step 是具体动作。下一个问题很实际：**step 里的命令到底怎么写？怎么切换目录、指定解释器、控制超时？** 下一章就来讲——如何运行 Shell 命令。
+
+<Callout type="exercise" title="练习">
+1. 我在 `runs-on: ubuntu-latest` 的 job 里第一个 step 生成了一个 `dist/` 目录，第二个 step 想用它。第二个 step 能直接用吗？如果换成一个新的 job 呢？
+
+2. 为什么说生产项目用 `ubuntu-latest` 可能"埋雷"？正确的做法是什么？
+
+3. 下面这段配置会让 job 跑在哪里？
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: node:18
+    steps:
+      - run: node --version
+```
+
+4. 什么场景下你会考虑用 `self-hosted` runner？举一个具体例子。
+<Answer>
+1. **同一个 job 内**：能直接用，因为 runner 是 job 级别的，所有 step 共享这台机器的磁盘。但**换成一个新 job**：默认不能直接用，不同 job 不共享磁盘，需要用 artifact 上传/下载来传递。
+
+2. 因为 `latest` 会随 GitHub 升级自动指向更新的系统版本，可能在你没改代码的情况下突然引入破坏性变化，导致 CI 无故变红或结果不可复现。正确做法是把 `runs-on` 锁成具体版本，如 `ubuntu-22.04`。
+
+3. job 会先在 `ubuntu-latest` 这台 Ubuntu 虚拟机上启动一个 `node:18` 的容器，然后 step 跑在这个容器里，`node --version` 输出的是 v18.x。
+
+4. 例子：需要用 GPU 训练大模型、需要连公司内网的私有数据库做测试、或者因合规要求代码不能出内网。这些 GitHub 公开托管 runner 都满足不了，就用自己的机器做 self-hosted runner。
+</Answer>
+</Callout>

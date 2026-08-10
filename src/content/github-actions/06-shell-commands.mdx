@@ -1,0 +1,269 @@
+---
+title: 运行 Shell 命令
+order: 6
+description: 掌握 step 中 run 的多行命令、shell 解释器选择、工作目录切换、超时与容错等常用技巧。
+---
+
+# 运行 Shell 命令
+
+前面几章我们已经用过不少 `run:` 来执行命令了。但 `run` 的能力远不止"写一行 echo"——它能跑多行脚本、切换解释器、换工作目录、设超时、容错继续。这一章就把 `run` 这个最常用的字段讲透，让你写得又稳又灵活。
+
+## 1. 多行命令：YAML 块标量
+
+最基础的形式，`run:` 后面跟一行命令：
+
+```yaml
+steps:
+  - run: echo "你好，GitHub Actions"
+```
+
+想写**多行命令**，就要用到 YAML 的 **块标量（block scalar）**，最常见的是竖线 `|`。它表示"保留换行符"，后面缩进的内容会被原样当成多行脚本体执行：
+
+```yaml
+steps:
+  - name: 多行构建脚本
+    run: |
+      echo "第一步：安装依赖"
+      npm install
+      echo "第二步：跑测试"
+      npm test
+      echo "全部完成"
+```
+
+<Callout type="tip" title="| 与 > 的小区别">
+`|` 保留每行的换行（多行变多行命令）；`>` 会把换行折叠成空格（多行变一行）。写 shell 脚本一般用 `|` 最直观，每一行就是一条独立命令。
+
+另外提醒：YAML 对**缩进非常敏感**，块标量里的命令必须统一缩进，且不能用 Tab，要用空格。
+</Callout>
+
+## 2. 指定解释器：shell
+
+默认情况下，Linux/macOS 的 runner 用 `bash`（实际是 `sh` 的 POSIX 模式）执行 `run`，Windows runner 用 `pwsh`（PowerShell）。但你可以显式用 `shell:` 指定别的解释器：
+
+- `bash`：Linux/macOS 默认，跨平台也好用
+- `sh`：更严格的 POSIX shell
+- `pwsh` / `powershell`：Windows 的 PowerShell（Core / 桌面版）
+- `python`：直接用 Python 解释器跑脚本
+- `cmd`：Windows 的命令行
+
+```yaml
+steps:
+  - name: 用 bash 跑
+    shell: bash
+    run: echo "这是 bash"
+
+  - name: 用 python 跑
+    shell: python
+    run: |
+      import sys
+      print("Python 版本:", sys.version)
+      print("你好 from Python")
+```
+
+<Callout type="info" title="为什么有时要显式写 shell">
+当你在 Linux runner 上想跑 PowerShell 逻辑、或在 Windows 上强制用 bash（借助 Git 自带的 bash），都需要显式指定 `shell:`。显式声明也让 workflow 在不同 OS 上行为更可预测。
+</Callout>
+
+## 3. 切换目录：working-directory
+
+有时命令不是在项目根目录跑，而是在某个子目录（比如 `client/`、`packages/api/`）里。用 `working-directory:` 就能切换该 step 的执行目录：
+
+```yaml
+steps:
+  - name: 在前端目录安装并构建
+    working-directory: client
+    run: |
+      npm install
+      npm run build
+
+  - name: 在后端目录测试
+    working-directory: packages/api
+    run: |
+      npm install
+      npm test
+```
+
+<Callout type="tip" title="working-directory 是 step 级生效">
+`working-directory:` 写在某个 step 下，只对该 step 生效。如果多个 step 都要在同一目录，要么每个都写，要么把相关 step 合并、或用 `cd 目录 && 命令` 的方式。注意它**不会**影响别的 step。
+</Callout>
+
+## 4. 访问变量与表达式
+
+在 `run` 里，你可以访问两类"值"：
+
+- **环境变量**：用 shell 原生语法读取，Linux/macOS 是 `$变量名`，Windows pwsh 是 `$env:变量名`。这些变量来自 `env:` 定义，或 runner 预置的 `GITHUB_*` 等。
+- **GitHub 表达式**：格式是 `${{ 表达式 }}`，比如 `${{ github.sha }}`（本次提交的 SHA）、`${{ env.FOO }}`（读 env 里的 FOO）。它是在"YAML 被解析之前"由 GitHub Actions 引擎求值替换的。
+
+注意：把表达式写进正文时，像 `${{ github.sha }}`、`${{ env.FOO }}` 这种含 `{` 的文本**必须用反引号包成行内代码**，不能裸写。
+
+```yaml
+steps:
+  - name: 打印环境变量与表达式
+    env:
+      MY_NAME: sinvy
+    run: |
+      echo "环境变量 MY_NAME = $MY_NAME"
+      echo "当前提交: ${{ github.sha }}"
+      echo "读取 env 里的 FOO = ${{ env.FOO }}"
+```
+
+<Callout type="warn" title="区分 $VAR 和 ${{ }}">
+`$MY_NAME` 是 shell 在执行时才替换的环境变量；`${{ github.sha }}` 是 GitHub Actions 在**把 YAML 交给 shell 之前**就替换好的。前者 shell 认识，后者 GitHub 引擎认识。混用是新手常犯的错——记住：要在 YAML 层面取值（如读上下文）就用 `${{ }}`，在命令里读已存在的环境变量就用 `$`。
+</Callout>
+
+## 5. 容错：continue-on-error
+
+默认情况下，某条命令的退出码非零（失败），整个 step 就失败，job 随之中断。但有时你想"失败了也接着跑"——比如某个非关键的检查挂了，不影响后面真正重要的步骤。这时候用 `continue-on-error: true`：
+
+```yaml
+steps:
+  - name: 可有可无的代码风格检查
+    continue-on-error: true
+    run: npx eslint . || true
+
+  - name: 关键测试
+    run: npm test
+```
+
+加上后，这个 step 即使命令失败，job 也会继续往下走（界面上该 step 会显示为黄色"跳过/通过但有误"的状态，而不是红色失败）。
+
+<Callout type="tip" title="continue-on-error vs || true">
+`continue-on-error: true` 是"GitHub 层面的容错"——step 标记为允许失败；`|| true` 是"shell 层面的容错"——命令本身返回 0，step 根本不知道它失败过。前者会保留"这里其实出错了"的信号，更适合做非阻断性检查。
+</Callout>
+
+## 6. 超时：timeout-minutes
+
+怕某个命令卡死把 job 一直挂着？用 `timeout-minutes:` 可以给 job 或 step 设超时（分钟）。超过时间还没结束，GitHub 会强制终止并报错。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # 整个 job 最多跑 30 分钟
+    steps:
+      - name: 可能很慢的集成测试
+        timeout-minutes: 10   # 这个 step 最多 10 分钟
+        run: npm run integration-test
+```
+
+<Callout type="warn" title="默认超时要小心">
+如果不设 `timeout-minutes`，GitHub 对 job 有默认的 6 小时上限（不同计划略有差异）。长任务务必显式设一个合理的超时，既能早点暴露卡死，也避免白白消耗运行额度。
+</Callout>
+
+## 7. 命令失败与 set -e 行为
+
+需要特别理解的是：**GitHub Actions 默认会像 `set -e` 一样，任何一条命令失败（退出码非 0）就立刻让 step 失败**。所以下面这段，第二条命令失败时，第三条**不会执行**：
+
+```yaml
+run: |
+  echo "开始"
+  false          # 这条失败，step 立刻中断
+  echo "这行不会打印"
+```
+
+如果你想自己控制流程，可以显式用 `||`：
+
+```yaml
+run: |
+  echo "开始"
+  false || echo "上一条失败了，但我想继续"
+  echo "这行会打印"
+```
+
+也可以手动 `set +e` 关掉自动中断（不推荐新手常用，了解即可）。
+
+## 8. 条件跳过：if
+
+有些 step 只想在特定条件下执行，比如"只在 main 分支上部署"。这用 `if:` 实现。`if:` 接受 GitHub 表达式，条件为真才跑该 step（或 job）。这里只演示最简单的用法，详细的条件语法我们放到第 12 章专门讲。
+
+```yaml
+steps:
+  - name: 仅 main 分支部署
+    if: github.ref == 'refs/heads/main'
+    run: echo "在 main 分支，执行部署"
+```
+
+<Callout type="info" title="if 不止能用在 step">
+`if:` 既能写在 step 上，也能写在 job 上（控制整个 job 是否执行）。表达式里可以读 `github.*`、`env.*`、`needs.*` 等上下文。第 12 章我们再系统展开。
+</Callout>
+
+## 9. 综合示例
+
+把上面学到的串起来，看一个较完整的 step 配置：
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 在子目录用 python 跑脚本
+        shell: python
+        working-directory: scripts
+        run: |
+          import os
+          print("工作目录:", os.getcwd())
+          print("提交:", "${{ github.sha }}")
+
+      - name: 非阻断的风格检查
+        continue-on-error: true
+        run: npx prettier --check .
+
+      - name: 关键测试（带超时）
+        timeout-minutes: 10
+        run: |
+          npm ci
+          npm test
+```
+
+## 10. 小结
+
+这一章我们把 `run` 相关的常用技巧过了一遍：
+
+- 多行命令用 YAML 块标量 `|`；YAML **缩进敏感**，别用 Tab。
+- 用 `shell:` 指定解释器：`bash`、`sh`、`pwsh`/`powershell`、`python`、`cmd` 等。
+- `working-directory:` 切换 step 的执行目录（仅对该 step 生效）。
+- 命令里读环境变量用 `$VAR`，读 GitHub 上下文用 `${{ github.sha }}` / `${{ env.FOO }}`（正文里这些含 `{` 的必须包反引号）。
+- `continue-on-error: true` 让 step 失败也不中断 job；`timeout-minutes:` 给 job/step 设超时。
+- 命令失败默认像 `set -e` 中断 step，可用 `||` 自行兜底；`if:` 可条件跳过 step/job（详细放第 12 章）。
+
+我们已经能熟练地"自己写命令"了。但聪明的做法是——**能复用别人写好的 action，就别重复造轮子**。下一章我们就来讲：如何用现成的 action（以及 `uses` 的更多玩法）把 workflow 写得更短更稳。
+
+<Callout type="exercise" title="练习">
+1. 我想在 step 里写三行命令（装依赖、跑测试、打印完成），应该怎样用 YAML 块标量写出来？
+
+2. 下面这个 step 在 Windows runner 上默认会用哪个 shell？如果想强制用 bash，该怎么改？
+```yaml
+- run: echo hello
+```
+
+3. `continue-on-error: true` 和 `run: 某命令 || true` 在"容错信号"上有什么区别？
+
+4. 我想让某个 step 只在 `main` 分支上执行，应该怎么写？
+<Answer>
+1. 用 `|` 块标量：
+```yaml
+- run: |
+    npm install
+    npm test
+    echo "完成"
+```
+
+2. Windows runner 上 `run` 默认用 `pwsh`（PowerShell）。强制用 bash 改为：
+```yaml
+- shell: bash
+  run: echo hello
+```
+
+3. `continue-on-error: true` 是 GitHub 层面的容错：step 会被标记为"允许失败"，界面保留"这里其实出错了"的黄色信号，job 继续。而 `|| true` 是 shell 层面：命令本身返回 0，GitHub 根本不知道它失败过，界面显示完全正常（绿色）。前者更适合做"非阻断但可见"的检查。
+
+4. 用 `if:` 读分支上下文：
+```yaml
+- if: github.ref == 'refs/heads/main'
+  run: echo "只在 main 执行"
+```
+</Answer>
+</Callout>

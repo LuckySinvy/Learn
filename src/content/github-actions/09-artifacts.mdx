@@ -1,0 +1,238 @@
+---
+title: Artifacts 构件传递
+order: 9
+description: 用 upload/download-artifact 在 job 间传递构建产物，区分 artifact 与 cache 的用途边界
+---
+
+# Artifacts 构件传递
+
+前面两章里，每个 job 都"单打独斗"：自己 checkout、自己装环境、自己跑完。可真实工作流往往是**流水线**式的——比如：一个 job 负责"构建"，产出 `dist/` 目录；另一个 job 负责"部署"，需要拿到这个 `dist/`。
+
+问题是：**job 之间默认是互相隔离的，一个 job 在工作目录里生成的文件，另一个 job 根本看不到。** 怎么办？答案就是 **Artifacts（构件）**：把文件上传，再让下游 job 下载下来。
+
+## 1. 什么是 Artifact
+
+**Artifact（构件）** 是 workflow 在运行期间生成、可被上传并在之后下载的文件。典型例子：
+
+- 构建产物：`dist/`、`build/`、打包好的 `*.zip` / `*.jar`。
+- 测试报告：JUnit 报告、覆盖率 `lcov.info`。
+- 失败截图：端到端测试（E2E）失败时保存的 PNG 截图，方便人眼排查。
+
+Artifact 有两个关键特征：
+
+1. **可跨 job 传递**：上游 job 上传，下游 job 下载后接着用。
+2. **运行结束后仍可留存/下载**：在 GitHub 仓库的 Actions 页面里，你能直接点开某次运行的 Artifacts 把文件下载到本地查看，默认保留 **90 天**。
+
+## 2. 上传：`actions/upload-artifact`
+
+上传动作的核心是两个参数：
+
+- **`name`**：构件的名字（下游要靠这个名字来下载）。
+- **`path`**：要上传的文件或目录路径，支持 **glob 通配符**，如 `dist/**`、`**/*.log`。
+
+```yaml
+- uses: actions/upload-artifact@v4
+  with:
+    name: dist-files          # 构件名，下游下载时要用同一个名字
+    path: dist/               # 上传整个 dist 目录
+```
+
+`retention-days` 可以调整留存天数（不写则默认 90 天）：
+
+```yaml
+- uses: actions/upload-artifact@v4
+  with:
+    name: coverage-report
+    path: coverage/lcov.info
+    retention-days: 30        # 这个报告只保留 30 天
+```
+
+<Callout type="tip" title="path 支持 glob">
+`path` 可以写通配符，例如 `path: dist/**` 上传 `dist` 下所有内容，`path: '**/*.log'` 收集所有日志。多个 pattern 可以用 YAML 列表传多个值。
+</Callout>
+
+## 3. 下载：`actions/download-artifact`
+
+下游 job 用 `actions/download-artifact` 把同名构件下载回来继续处理：
+
+```yaml
+- uses: actions/download-artifact@v4
+  with:
+    name: dist-files          # 必须与上游上传时的 name 一致
+    path: ./dist-downloaded   # 下载到哪个目录，不写则默认当前目录
+```
+
+下载后，文件就出现在 `path` 指定的目录里，后续 step 可以正常读取、部署。
+
+## 4. 典型场景：构建 → 部署的跨 job 传递
+
+最经典的流水线：**build job 构建出 `dist/`，deploy job `needs: build` 之后下载并部署**。注意 `needs` 保证顺序——deploy 一定在 build 成功后才运行。
+
+```yaml
+# .github/workflows/deploy.yml
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build          # 产出 dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-files
+          path: dist/               # 把构建产物上传
+
+  deploy:
+    needs: build                    # 必须等 build 成功
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-files
+          path: ./dist              # 把产物下载到 ./dist
+      - run: ls -la dist            # 确认文件到了
+      - run: ./scripts/deploy.sh    # 用这份 dist 去部署
+```
+
+这样即使 `deploy` job 是一个全新的、干净的 runner，它也能通过 artifact 拿到 `build` job 辛苦编译出来的文件。
+
+<Callout type="info" title="为什么不直接在一个 job 里又 build 又 deploy？">
+可以，但拆成两个 job 好处明显：build 可以放进**矩阵**（多版本各构建一份）、可以并行、失败隔离；deploy 单独一个 job 逻辑更清晰，且只有 build 成功才触发。Artifacts 正是连接它们的"传送带"。
+</Callout>
+
+## 5. 另一个场景：上传测试报告/失败截图供人查看
+
+即使下游不需要这些文件，上传 artifact 也很有价值——让人能在 Actions 页面直接下载查看：
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      # 不管测试成败，都把覆盖率报告上传，方便查看
+      - uses: actions/upload-artifact@v4
+        if: always()                # 即使前面 npm test 失败也执行上传
+        with:
+          name: coverage-report
+          path: coverage/
+```
+
+`if: always()` 是个实用技巧：默认 step 在前序失败时会被跳过，加上 `if: always()` 能保证"无论如何都把产物传上去"，特别适合"收集失败证据"。
+
+## 6. Artifact 与 Cache 的区别（重要）
+
+初学者极易把 **artifact** 和 **cache** 搞混。它们都涉及"文件持久化"，但目的完全不同。下一章才会细讲 cache，这里先用一张表划清边界：
+
+| 维度 | Artifact（构件） | Cache（缓存） |
+|---|---|---|
+| 主要目的 | **跨 job / 跨次运行传递产物**，并在运行后留存供人下载 | **加速依赖安装**（如 `node_modules`），不给人看 |
+| 典型内容 | `dist/`、`coverage/`、截图 | `node_modules`、`~/.npm`、`~/.cache/pip` |
+| 谁下载 | 下游 job 或人类在页面手动下载 | 同一个 workflow 后续 step/job 自动复用 |
+| 默认保留 | 90 天（可调） | 有上限，按命中率清理，非长期留存 |
+| 是否给人看 | 是，可在 UI 下载 | 否，纯粹给机器加速用 |
+
+一句话记忆：**artifact 是"产物传递 + 运行后留存"，cache 是"加速依赖安装"。** 别把依赖目录当 artifact 上传（那是 cache 的活），也别把构建产物当 cache 用（那是 artifact 的活）。
+
+<Callout type="warn" title="不要把含 secret 的文件当 artifact 上传">
+artifact 会保存在 workflow 运行记录里，**任何能看这次运行的人都能下载**。切勿把含密钥、token、`.env`、私钥的文件上传为 artifact——它们可能因此泄露。同样，测试日志里如果打印了 secret，上传前也要脱敏。
+</Callout>
+
+## 7. 进阶：`needs` + 矩阵时的 artifact 命名
+
+当上游 job 是矩阵（多个实例）时，每个实例都会上传同名 artifact，GitHub 会自动把它们归并。如果你需要区分，可在 `name` 里拼入矩阵值：
+
+```yaml
+- uses: actions/upload-artifact@v4
+  with:
+    name: dist-${{ matrix.os }}-${{ matrix.node-version }}
+    path: dist/
+```
+
+这样不同组合的产物不会互相覆盖，下游按需用 `name` 下载对应那份。
+
+<Callout type="tip" title="v3 与 v4 的差异">
+`actions/upload-artifact` 和 `download-artifact` 的 **v4** 要求每个 artifact 的 `name` 在单次运行内**唯一**（不再支持同名覆盖合并）。如果你在矩阵里用固定 `name` 上传，记得在名字里带上矩阵维度，避免冲突。
+</Callout>
+
+## 8. 小结
+
+本章你学到了：
+
+- **Artifact** 是 workflow 期间生成、可上传下载的文件（构建产物、测试报告、截图等）。
+- `actions/upload-artifact` 用 `name` + `path`（支持 glob）上传，`retention-days` 控制留存（默认 90 天）。
+- `actions/download-artifact` 用同名 `name` 让下游 job 下载继续处理。
+- 典型流水线：**build 上传 `dist/` → deploy 用 `needs: build` 下载并部署**；也可单纯上传报告/截图供人查看（`if: always()`）。
+- **Artifact ≠ Cache**：artifact 是"产物传递 + 运行后留存"，cache 是"加速依赖安装"（下一章详讲）。
+- **安全提醒**：别把含 secret 的文件当 artifact 上传，运行记录里人人可下载。
+
+现在我们的 job 已经能"分工协作、传递产物"了。但每次都 `npm ci` 重装依赖很慢——下一章（缓存依赖）就来讲：**如何用 `actions/cache` 把 `node_modules` 这类依赖缓存下来，让 CI 快上几倍**。
+
+<Callout type="exercise" title="练习">
+1. 我想让 job B 在 job A 成功之后才运行，并且能用上 job A 上传的 `dist/` 文件。job B 里需要写哪两样东西？
+   ```yaml
+   jobs:
+     A:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         - run: npm run build
+         - uses: actions/upload-artifact@v4
+           with:
+             name: my-dist
+             path: dist/
+     B:
+       runs-on: ubuntu-latest
+       # 这里要补两行，分别是什么？
+   ```
+
+2. 下面哪一个是 artifact 的合适用途，哪一个是 cache 的合适用途？
+   - A. 把 `node_modules` 缓存起来加速 `npm ci`
+   - B. 把 E2E 测试失败时截的图上传，让人能在页面下载查看
+
+3. 为什么"不要把 `.env` 文件上传为 artifact"？
+
+4. 用 `upload-artifact@v4` 写一个 step：把当前目录下所有 `*.log` 文件上传，构件名为 `run-logs`，保留 15 天。
+<Answer>
+1. job B 需要写：
+   - `needs: A`（保证在 A 成功后才运行）
+   - 一个 `download-artifact` 的 step，且 `name: my-dist`（要与 A 上传时的 name 一致）：
+   ```yaml
+   needs: A
+   steps:
+     - uses: actions/download-artifact@v4
+       with:
+         name: my-dist
+         path: ./dist
+   ```
+
+2. A 是 **cache** 的用途（缓存依赖加速安装）；B 是 **artifact** 的用途（上传产物供人查看）。两者不能混用。
+
+3. 因为 artifact 会保存在 workflow 运行记录中，**任何能访问这次运行的人都能直接下载**。`.env` 里通常含密钥、token 等敏感信息，上传后会泄露。必要时先脱敏或根本不上传。
+
+4. 写法如下：
+   ```yaml
+   - uses: actions/upload-artifact@v4
+     with:
+       name: run-logs
+       path: '*.log'
+       retention-days: 15
+   ```
+</Answer>
+</Callout>

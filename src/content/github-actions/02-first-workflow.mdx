@@ -1,0 +1,207 @@
+---
+title: 第一个 Workflow
+order: 2
+description: 亲手创建并运行你的第一个 GitHub Actions 工作流，逐行理解 name、on、jobs、runs-on、steps 各字段。
+---
+
+# 第一个 Workflow
+
+上一章我们认识了 GitHub Actions 的核心概念，还预览了一段最简 workflow。这一章，我们要**真的把它写出来、跑起来**。你会创建第一个 YAML 文件，推到 GitHub，然后在 Actions 页面上亲眼看到它执行成功。
+
+跟着做一遍，比读十遍都管用。
+
+## 1. 文件放在哪
+
+GitHub Actions 的工作流文件必须放在仓库的固定位置：
+
+```
+.github/workflows/
+```
+
+这个目录名是**固定的**——必须是 `.github`（前面有个点）下面再套一个 `workflows`。GitHub 会自动扫描这个目录下的所有 YAML 文件，把它们当成工作流。
+
+文件名和扩展名相对自由：
+
+- 文件名你可以随意起，比如 `ci.yml`、`build.yml`、`my-first-workflow.yaml`。
+- 扩展名用 `.yml` 或 `.yaml` 都可以，GitHub 都认。
+
+<Callout type="info" title="一个目录，多个工作流">
+`.github/workflows/` 里可以放多个 YAML 文件，每个文件就是一个独立的工作流。它们互不干扰，可以各自响应不同的事件。我们第一个工作流就起名叫 `ci.yml`。
+</Callout>
+
+## 2. 最小可用 workflow
+
+下面这段，就是我们要写的第一份完整工作流。把它原样复制到 `.github/workflows/ci.yml` 里即可：
+
+```yaml
+name: CI
+
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Hello Actions"
+```
+
+它做的事情非常简单：每次你 `push` 代码到仓库，GitHub 就会启动一台 Ubuntu 机器，先把你的仓库代码拉下来，然后打印一句 `Hello Actions`。
+
+接下来我们**逐行**拆解每个字段的含义。
+
+## 3. 逐行解释每个字段
+
+```yaml
+name: CI
+```
+
+`name` 是这个工作流的**显示名称**。它会出现在 GitHub 仓库的 Actions 标签页里，方便你一眼认出是哪个工作流。不写的话，GitHub 会用文件名代替。
+
+```yaml
+on: push
+```
+
+`on` 定义**触发事件**。这里写 `push`，意思是"只要有人往仓库 `push` 代码，就触发这个工作流"。上一章讲过，`on` 还能写 `pull_request`、`schedule`、`workflow_dispatch` 等，下一章我们会专门展开讲它的各种写法。
+
+```yaml
+jobs:
+  build:
+```
+
+`jobs` 下面是**作业列表**。这里我们只定义了一个作业，名字叫 `build`（作业名你可以随便取，比如 `test`、`deploy`）。一个 workflow 可以定义多个 job，它们默认并行，但这里我们先保持最简单的一个。
+
+```yaml
+    runs-on: ubuntu-latest
+```
+
+`runs-on` 指定这个 job 要跑在**哪种 runner** 上。`ubuntu-latest` 是 GitHub 提供的最新版 Ubuntu 托管虚拟机，免费额度内就能用。其他常见选项还有 `windows-latest`、`macos-latest`。这就是"在哪台机器上干活"的开关。
+
+```yaml
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Hello Actions"
+```
+
+`steps` 是 job 内部的**步骤列表**，按顺序从上往下执行：
+
+- 第一个 step 用 `uses: actions/checkout@v4`，调用官方提供的 `actions/checkout` 这个 action。`@v4` 是版本号。它的作用是**把你的仓库代码拉取到 runner 上**。这一步非常关键——runner 初始是一台"空白"机器，不主动拉代码的话，后面根本访问不到你的源码。`actions/checkout` 几乎是每个工作流的第一步。
+- 第二个 step 用 `run: echo "Hello Actions"`，即执行一条命令：在命令行里打印 `Hello Actions`。这里换成 `npm test`、`python --version` 之类的任何命令都可以。
+
+<Callout type="tip" title="checkout 几乎必不可少">
+你可能会想："我推的就是这个仓库的代码，runner 上怎么可能没有？"其实，runner 是临时启动的一台全新机器，跟你的仓库毫无关系。所以**几乎每个工作流的第一步都是 `actions/checkout`**，先把代码弄到机器上，后续的 `run` 命令才能操作你的文件。
+</Callout>
+
+## 4. 提交并查看运行结果
+
+写好后，把它提交并推送到 GitHub：
+
+```bash
+git add .github/workflows/ci.yml
+git commit -m "add my first workflow"
+git push
+```
+
+由于这个工作流 `on: push`，你这次 `push` 本身就会触发它。
+
+然后打开你的 GitHub 仓库页面，点击顶部的 **Actions** 标签页。你会看到一条运行记录（run），标题就是提交信息 "add my first workflow"。
+
+运行视图里你能看到：
+
+- 左侧/上方列出这个 workflow 包含的 **job**（这里只有一个 `build`）。
+- 每个 job、每个 step 前面有一个**状态图标**：黄色圆圈表示正在跑，绿色对勾表示成功，红色叉号表示失败。
+- 点击某次运行，再点开某个 job，就能看到它下面每个 step 的**日志（log）**。点开 `run: echo "Hello Actions"` 这一步，你应该能看到输出了一行 `Hello Actions`。
+
+<Callout type="info" title="怎么看懂运行视图">
+Actions 页面的层级是：一次"运行（run）" → 多个"job" → 每个 job 下的多个"step"。点开 step 就能看它的日志。绿色代表成功，红色代表失败。第一次跑通时，盯着那个绿色对勾看一会儿，成就感满满。
+</Callout>
+
+## 5. 重新运行一次失败的任务
+
+实际使用中，工作流难免失败（比如测试没过）。GitHub 允许你**手动重跑**某次运行，而不必再改代码重新 `push`。
+
+方法有两种：
+
+1. 在 Actions 页面进入某次运行，右上角有一个 **"Re-run jobs"**（重跑作业）按钮，点开可以选择重跑全部、或只重跑失败的部分。
+2. 如果只想重跑某个具体 job，可以在该 job 的右上角找到重跑的小按钮。
+
+<Callout type="tip" title="只重跑失败的部分更省时">
+如果一次运行里有 10 个 job、其中 9 个都成功了，只有 1 个因为环境问题挂了，选"Re-run failed jobs"只重跑那 1 个，既快又不浪费免费额度。
+</Callout>
+
+## 6. 一个常见坑：YAML 的缩进
+
+在正式收尾前，必须强调新手最高频的翻车点。
+
+**YAML 用缩进表达层级关系，而缩进必须用空格，不能用 Tab。** 很多编辑器默认按 Tab 键会插入制表符，一旦混进 Tab，workflow 就可能整体失效，或者字段被解析到错误层级，GitHub 直接报"工作流语法错误"或干脆不触发。
+
+下面是一段**错误**示范（假设其中用了 Tab 缩进）：
+
+```yaml
+jobs:
+	build:          # ❌ 这里用了 Tab，会报错
+    runs-on: ubuntu-latest
+```
+
+正确写法是全部用空格：
+
+```yaml
+jobs:
+  build:           # ✅ 两个空格缩进
+    runs-on: ubuntu-latest
+```
+
+经验法则：
+
+- 统一用 **2 个空格**作为一级缩进（这是 GitHub Actions 示例的惯例）。
+- 在编辑器里把"Tab 自动转成空格"（Insert spaces for tabs）打开。
+- 提交前，先确认文件没有被混进 Tab 字符。
+
+<Callout type="warn" title="缩进错了，workflow 不生效">
+YAML 没有大括号或 `end` 来界定层级，全靠缩进。一个不该有的 Tab、或多/少一个空格，都会让 GitHub 解析出错。如果你的工作流"怎么推都不触发"，第一反应就该检查缩进。大多数编辑器都能显示不可见字符，遇到诡异问题时打开它看一眼。
+</Callout>
+
+## 7. 小结
+
+这一章你亲手跑通了第一个工作流：
+
+- 工作流文件要放在 **`.github/workflows/`** 目录下，文件名随意，扩展名用 `.yml` 或 `.yaml`。
+- 最小工作流包含 `name`（显示名）、`on: push`（触发事件）、`jobs.build`（作业）、`runs-on`（runner 类型）、`steps`（步骤列表）。
+- `steps` 里常见的第一步是 **`actions/checkout@v4`**（拉取代码），之后用 `run` 执行命令。
+- 在 GitHub 的 **Actions 标签页**查看运行，绿色成功、红色失败，点开 step 看日志。
+- 失败的运行可以**手动重跑**全部或只重跑失败部分。
+- **致命坑：YAML 必须用空格缩进，绝不能混用 Tab。**
+
+你已经迈出了最关键的一步。不过现在我们的工作流只会 `echo` 一句问候——触发条件也只有一个 `push`。下一章，我们就专门深挖 `on` 的多种写法：如何只在 `main` 分支被推送时触发、如何定时运行、如何手动触发并传参数。
+
+<Callout type="exercise" title="练习">
+1. 你的工作流文件必须放在仓库的哪个具体路径下？扩展名可以用什么？
+2. 下面这段 workflow 有一个语法问题，请指出并改正：
+   ```yaml
+   name: demo
+   on: push
+   jobs:
+     build:
+       runs-on: ubuntu-latest
+          steps:
+            - run: echo hi
+   ```
+3. 为什么几乎每个 workflow 的第一步都是 `actions/checkout@v4`？如果去掉它，后面的 `run: cat README.md` 还能读到你的文件吗？
+4. 工作流运行失败了，但你想在不改代码的情况下重试，应该怎么做？
+
+<Answer>
+1. 必须放在 `.github/workflows/` 目录下；扩展名可以用 `.yml` 或 `.yaml`。
+2. 问题是 `steps:` 前面多缩进了（用了比 `runs-on` 更深的缩进，且混入了不该有的缩进层级），正确写法是 `steps:` 与 `runs-on` 同级、统一 2 空格缩进：
+   ```yaml
+   name: demo
+   on: push
+   jobs:
+     build:
+       runs-on: ubuntu-latest
+       steps:
+         - run: echo hi
+   ```
+3. 因为 runner 是临时启动的空白机器，不会自带你的代码，`actions/checkout@v4` 负责把仓库拉下来。如果去掉它，`cat README.md` 会找不到文件而失败。
+4. 在 Actions 页面进入该次运行，点右上角的 "Re-run jobs"，可选择重跑全部或只重跑失败的部分；也可以用该 job 右上角的重跑按钮。
+</Answer>
+</Callout>

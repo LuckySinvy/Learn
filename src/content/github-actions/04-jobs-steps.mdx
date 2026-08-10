@@ -1,0 +1,225 @@
+---
+title: Jobs 与 Steps
+order: 4
+description: 理解 workflow 中 jobs 与 steps 的结构、作用域、依赖关系，掌握并行与串行的编排方式。
+---
+
+# Jobs 与 Steps
+
+在上一章里，我们已经动手写了一个最简单的 workflow 文件。你一定注意到了，文件里最显眼的两个词就是 `jobs` 和 `steps`。这一章我们就把这两个核心概念彻底讲清楚——它们决定了"**在什么机器上、按什么顺序、执行哪些动作**"。
+
+简单来说：**job 是 workflow 的基本执行单元，而 step 是 job 内部的具体动作**。一个 workflow 可以有多个 job，而每个 job 又由一串 step 组成。下面我们一层一层拆开看。
+
+## 1. jobs：workflow 的基本单元
+
+在最外层，`jobs` 是一个 **map（映射表）**，也就是说，它的键是 job 的名字，值是这个 job 的配置对象。job 名字可以是任意合法的字符串，比如 `build`、`test`、`lint`、`deploy`，你甚至可以用中文（虽然不推荐）。
+
+每个 job 至少包含两个东西：
+
+- `runs-on`：指定这个 job 跑在哪类 **runner**（运行机器）上。这一章先记住它是必填项，runner 的详细内容我们放到第 5 章讲。
+- `steps`：这个 job 要执行的一连串动作。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 打印问候
+        run: echo "开始构建啦！"
+```
+
+上面的例子里，`jobs` 下只有一个叫 `build` 的 job。注意：job 名字 `build` 是你自己起的，`runs-on` 和 `steps` 才是 GitHub Actions 认识的"保留字"。
+
+<Callout type="tip" title="给 job 起个好名字">
+虽然 job 键名只能用字母、数字和 `-` 这类字符，但你可以通过 `name:` 字段给它一个好看的中文显示名，它会显示在 Actions 运行界面上，方便团队成员一眼看懂。
+</Callout>
+
+## 2. steps：job 内部的动作列表
+
+`steps` 是一个 **数组**，数组里的每一项就是一个 step。每个 step 二选一——**要么是 `uses`，要么是 `run`**：
+
+- `uses`：引用一个现成的 **action**（别人写好的可复用逻辑，比如 `actions/checkout@v4`），适合"拿来就用"的场景。
+- `run`：直接执行一段 **shell 命令**，适合你自己写的小脚本。
+
+一个 step 也可以同时带上 `name`，作为它在界面上的显示名；不写 `name` 的话，界面就直接展示 `run` 的命令或 `uses` 的 action 名。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 用 uses 引用官方 action 拉取代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 用 run 执行命令
+      - name: 安装依赖
+        run: npm install
+
+      - name: 构建
+        run: npm run build
+```
+
+这里有个常见的疑问：**一个 step 能不能同时有 `uses` 和 `run`？** 答案是不行。GitHub Actions 规定 step 要么引用 action，要么执行命令，二者只能选其一。如果你想先 checkout 再 build，那就写成两个独立的 step，就像上面这样。
+
+<Callout type="warn" title="uses 和 run 二选一">
+一个 step 同时写 `uses` 和 `run` 会导致 workflow 校验失败。如果你既想用某个 action 又想跑命令，请拆成两个 step。另外，`name` 虽然可选，但强烈建议写上——出问题时排查日志会轻松很多。
+</Callout>
+
+## 3. env：三层作用域的环境变量
+
+`env` 用来定义 **环境变量**。它最妙的地方在于可以写在三个不同的层级，并且**范围越小，优先级越高**：
+
+1. **workflow 层级**：写在文件最顶层，对所有 job 生效。
+2. **job 层级**：写在某个 `job` 下面，只对该 job 生效，会覆盖 workflow 层同名的变量。
+3. **step 层级**：写在某个 `step` 下面，只对该 step 生效，会覆盖上面两层同名的变量。
+
+```yaml
+name: env 作用域演示
+env:
+  LEVEL: workflow层的默认值
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    env:
+      LEVEL: job层的值
+    steps:
+      - name: 打印 job 层变量
+        run: echo "当前 LEVEL 是 $LEVEL"   # 输出：job层的值
+
+      - name: 打印 step 层变量
+        env:
+          LEVEL: step层的值
+        run: echo "当前 LEVEL 是 $LEVEL"   # 输出：step层的值
+```
+
+这种"**就近覆盖**"的机制非常实用：你可以在 workflow 顶层设一个通用配置，再在某个 job 或 step 里针对特殊情况覆盖它，而不用改动别处。
+
+<Callout type="info" title="怎么在命令里读环境变量">
+在 `run` 里，Linux/macOS 用 `$变量名`（如 `$LEVEL`），Windows 的 pwsh 用 `$env:变量名`。至于表达式 `${{ env.LEVEL }}` 则是给 GitHub Actions 引擎在"解析 YAML 之前"用的，二者场景不同，第 6 章会细说。
+</Callout>
+
+## 4. needs：用依赖关系串起 job
+
+默认情况下，一个 workflow 里的**所有 job 是并行执行的**——它们同时启动，互相等待。但现实中我们经常需要"先 A 成功，再做 B"。这时就用 `needs` 来声明依赖。
+
+`needs` 接受一个 job 名，或一组 job 名组成的数组。被 `needs` 的 job 会**等依赖的 job 全部成功完成**后才开始运行。从图论的角度看，jobs 之间因此构成了一个 **有向无环图（DAG）**：箭头表示"依赖于"，且不能出现环（否则 workflow 永远跑不起来）。
+
+```yaml
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "linting..."
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "testing..."
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [lint, test]   # 等 lint 和 test 都成功后才执行
+    steps:
+      - run: echo "deploying..."
+```
+
+上面这个例子里，`lint` 和 `test` 同时并行跑；`deploy` 则挂着 `needs: [lint, test]`，要等它俩都绿了才会启动。如果 `lint` 或 `test` 任何一个失败，`deploy` 就**根本不会执行**——这正是我们想要的"测试不过不发布"的效果。
+
+<Callout type="tip" title="用 needs 实现「门禁」">
+把 `deploy` 这类有风险的操作放在依赖链的末端，是 CI/CD 里非常经典的模式。配合 `if: failure()` 之类的条件（后面章节会讲），你还能在失败时自动通知，而不是默默跳过。
+</Callout>
+
+## 5. 并行 vs 串行（needs）：一表看懂
+
+为了更直观，我们用一张表对比两种编排方式：
+
+| 对比项 | 并行（默认，无 needs） | 串行（使用 needs） |
+| --- | --- | --- |
+| 启动时机 | 所有 job 同时启动 | 被依赖的 job 先跑完，依赖方才启动 |
+| 声明方式 | 不加 `needs` 字段 | `needs: 其他job名` 或 `needs: [a, b]` |
+| 失败影响 | 一个失败不影响其他 job 继续 | 上游失败，下游 job 直接被取消/跳过 |
+| 适用场景 | 互相独立的任务（lint、test 分开） | 有先后依赖的任务（先构建后部署） |
+| 总耗时 | 约等于最慢的那个 job | 约等于各 job 耗时之和 |
+
+可以看到：**并行能缩短总耗时，串行能保证先后顺序**。实际项目里往往是两者结合——互相独立的检查并行跑，最终的上线动作串行挂在它们后面。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "构建产物..."
+
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "单元测试..."
+
+  e2e-test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "端到端测试..."
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [build, unit-test, e2e-test]
+    steps:
+      - run: echo "三个都过了，发布！"
+```
+
+## 6. 小结
+
+这一章我们搞清楚了 workflow 的骨架：
+
+- `jobs` 是一个 **map**，键是 job 名，每个 job 必须有 `runs-on` 和 `steps`。
+- `steps` 是数组，每个 step 二选一：**`uses` 引用 action** 或 **`run` 执行命令**，可加 `name` 显示名。
+- `env` 有三层作用域（workflow / job / step），**范围越小优先级越高**。
+- `needs` 声明 job 间依赖，形成 **DAG**：默认所有 job 并行，`needs` 让下游等上游成功后才跑，上游失败则下游不执行。
+- 并行省时间、串行保顺序，真实场景常把"高风险动作"串在依赖链末端当门禁。
+
+理解了 job 由谁在什么机器上执行，下一个自然的问题是：**`runs-on` 里写的 `ubuntu-latest` 到底是什么？Runner 到底是台什么机器？** 下一章我们就来认识真正的执行者——Runner 与运行环境。
+
+<Callout type="exercise" title="练习">
+1. 下面这段 workflow 有几个 job？它们之间是并行还是串行？
+```yaml
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+  b:
+    runs-on: ubuntu-latest
+    needs: a
+    steps:
+      - run: echo b
+```
+
+2. 我想让 `deploy` 这个 job 同时等 `build` 和 `test` 都成功后再跑，应该怎么写 `needs`？
+
+3. 我在 workflow 顶层设了 `env: TOKEN: abc`，又在某个 step 里设了 `env: TOKEN: xyz`，这个 step 运行时 `$TOKEN` 的值是什么？为什么？
+
+4. 一个 step 能不能同时写 `uses: actions/checkout@v4` 和 `run: npm install`？如果不能，该怎么改？
+<Answer>
+1. 有 `a` 和 `b` 两个 job。`b` 通过 `needs: a` 依赖 `a`，所以是**串行**的：`a` 先跑，`a` 成功后再跑 `b`。
+
+2. 写为：
+```yaml
+deploy:
+  runs-on: ubuntu-latest
+  needs: [build, test]
+  steps:
+    - run: echo deploy
+```
+
+3. 值是 `xyz`。因为 `env` 是"范围越小优先级越高"，step 层的 `TOKEN: xyz` 覆盖了 workflow 顶层的 `TOKEN: abc`。
+
+4. 不能。一个 step 的 `uses` 和 `run` 只能二选一。应拆成两个 step：
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - run: npm install
+```
+</Answer>
+</Callout>

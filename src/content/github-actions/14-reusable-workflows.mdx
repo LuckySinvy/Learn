@@ -1,0 +1,292 @@
+---
+title: 复用工作流 Reusable Workflows
+order: 14
+description: "用 on: workflow_call 把整段 workflow 抽成可复用单元，通过 inputs/secrets/outputs 与调用方双向传参"
+---
+
+# 复用工作流 Reusable Workflows
+
+上一章我们让数据在 job 之间流动。但还有一类更常见的"重复"：你在公司里有 10 个仓库，每个仓库都想跑一套几乎一样的 **CI**——检出代码、装依赖、跑测试、构建镜像。如果每处都复制粘贴同一段 YAML，一旦要改一条规则（比如把 Node 版本从 18 升到 20），就得改 10 个地方，迟早漏改、迟早出错。
+
+**可复用工作流（Reusable Workflows）** 就是用来解决这个问题的：把"一整套 workflow"抽成一个独立文件，别处用一行 `uses:` 就能调用它。
+
+## 1. 动机：别再复制粘贴
+
+没有复用前，仓库 A、B、C 各有一份差不多的 `ci.yml`：
+
+```yaml
+# 仓库 A / .github/workflows/ci.yml
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+      - run: npm test
+```
+
+仓库 B、C 把这个文件原样再抄一遍。问题：
+
+- **维护爆炸**：改一处逻辑要同步改 N 个仓库。
+- **容易漂移**：各仓库悄悄改出差异，CI 行为不再一致。
+- **审计困难**：无法保证"所有服务都跑了同样的检查"。
+
+解决方案：把这段 CI 抽成一个**可复用工作流**，集中放一个仓库（或同仓库的固定位置），大家 `uses:` 调用。
+
+## 2. 被调用方：用 `on: workflow_call` 声明
+
+一个 workflow 文件，只要把触发事件写成 `on: workflow_call`，就变成"可被调用"的。它用 `inputs` 接收参数、`secrets` 接收密钥、`outputs` 返回结果——这三者和我们熟悉的 `on: push` workflow 写法很像，只是语义变成"被别人传进来 / 传出去"。
+
+```yaml
+# .github/workflows/ci-reusable.yml
+name: 可复用 CI
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node 版本"
+        required: false
+        default: "20"
+        type: string
+    secrets:
+      NPM_TOKEN:
+        required: false
+    outputs:
+      test-result:
+        description: "测试是否通过"
+        value: ${{ jobs.test.outputs.passed }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.run.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}   # 读入调用方传来的参数
+      - run: npm ci
+      - id: run
+        run: |
+          npm test && echo "passed=true" >> "$GITHUB_OUTPUT"
+```
+
+要点：
+
+- `on: workflow_call` 是开关，没有它就只能被事件触发，不能 `uses:` 调用。
+- `inputs.*.type` 支持 `string` / `number` / `boolean` / `choice` 等，类型不对调用方会报错。
+- `${{ inputs.node-version }}` 在被调用方内部读取入参（注意是 `inputs`，不是 `github`）。
+- `secrets` 段声明"我需要哪些密钥"，值由调用方提供。
+- `outputs` 段把某个 job 的输出再"升格"为整个 workflow 的返回值，供调用方的下游 job 使用。
+
+<Callout type="info" title="inputs 是有类型的">
+`workflow_call.inputs` 的 `type` 必填（`string`/`number`/`boolean`/`choice` 等）。传错类型 GitHub 会直接拒绝调用，这比"全当字符串"更安全，能在入口拦住脏数据。
+</Callout>
+
+## 3. 调用方：用 `uses:` + `with:` / `secrets:`
+
+在调用方 workflow 里，把"调用可复用工作流"当成**一个 job** 来写。这个 job 没有自己的 `steps`，只有 `uses:` 指向被调用文件，并用 `with:` 传参、`secrets:` 传密钥。
+
+```yaml
+# .github/workflows/caller.yml
+name: 调用 CI
+on: [push]
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci-reusable.yml    # 同仓库内的相对路径
+    with:
+      node-version: "20"
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  report:
+    runs-on: ubuntu-latest
+    needs: ci
+    steps:
+      - run: echo "CI 结果：${{ needs.ci.outputs.test-result }}"
+```
+
+关键点：
+
+- `uses: ./.github/workflows/ci-reusable.yml` 是**相对本仓库根目录**的路径（注意开头的 `./`）。
+- 也可以跨仓库调用：`uses: owner/repo/.github/workflows/ci.yml@ref`（`ref` 可以是分支/tag/commit，强烈建议锁定到 tag 或 commit 以保证可复现）。
+- `with:` 对应被调用方的 `inputs`；`secrets:` 对应其 `secrets`。
+- 调用产生的 job（上例 `ci`）同样可以被 `needs:` 引用，并通过 `needs.ci.outputs.*` 读取返回值。
+
+## 4. `secrets: inherit`：一键透传全部密钥
+
+如果你的可复用工作流需要**调用方拥有的几乎所有密钥**，一个个列举很麻烦，而且调用方改了密钥名还得同步。可以用 `secrets: inherit` 把调用方所有 `secrets` **原样透传**给被调用工作流：
+
+```yaml
+jobs:
+  ci:
+    uses: ./.github/workflows/ci-reusable.yml
+    secrets: inherit          # 调用方全部 secrets 自动可见
+```
+
+<Callout type="warn" title="inherit 是把双刃剑">
+`secrets: inherit` 会暴露调用方的**所有**密钥给被调用工作流。如果被调用方来自外部仓库、或你不完全信任它的实现，这就是过度授权。最小权限原则：能只传 `NPM_TOKEN` 就别 `inherit`。另外注意，被调用方 `workflow_call.secrets` 里**声明了 `required: true` 的密钥必须提供**，否则调用失败。
+</Callout>
+
+## 5. 双向传参完整示例
+
+把被调用方和调用方拼在一起看最清楚。下面假设一个"统一部署"可复用工作流：
+
+```yaml
+# .github/workflows/deploy-reusable.yml  （被调用方）
+name: 可复用部署
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "目标环境"
+        required: true
+        type: string
+    secrets:
+      DEPLOY_TOKEN:
+        required: true
+    outputs:
+      url:
+        description: "部署后的访问地址"
+        value: ${{ jobs.deploy.outputs.url }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.done.outputs.url }}
+    steps:
+      - id: done
+        run: |
+          echo "部署到 ${{ inputs.environment }}，使用令牌 ${DEPLOY_TOKEN:0:4}****"
+          echo "url=https://${{ inputs.environment }}.example.com" >> "$GITHUB_OUTPUT"
+```
+
+```yaml
+# .github/workflows/release.yml  （调用方）
+name: 发布
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  deploy-staging:
+    uses: ./.github/workflows/deploy-reusable.yml
+    with:
+      environment: staging
+    secrets:
+      DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+
+  deploy-prod:
+    needs: deploy-staging
+    uses: ./.github/workflows/deploy-reusable.yml
+    with:
+      environment: production
+    secrets:
+      DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: deploy-prod
+    steps:
+      - run: echo "生产环境地址：${{ needs.deploy-prod.outputs.url }}"
+```
+
+`release.yml` 自己没有任何部署逻辑，全部委托给 `deploy-reusable.yml`，并通过 `with`/`secrets` 传入差异化的环境和密钥，通过 `needs.*.outputs.url` 拿回结果。以后部署流程要升级，只改 `deploy-reusable.yml` 一个文件即可。
+
+## 6. 与 composite action 的区别（先铺垫）
+
+你可能会问：这和后面要讲的 **composite action** 听起来很像——都是"复用"。先给一句定位，下一章再展开：
+
+- **可复用工作流（本章）**：复用的是**一整套 workflow**，内部可以包含**多个 job**、有独立触发与权限模型。适合"统一 CI/CD 流水线"这种粒度的复用。
+- **composite action（下章）**：复用的是**一组 step**，本身只是单个 job 里的一个步骤。适合"安装依赖 + 跑 lint"这种步骤序列的封装。
+
+一句话：**workflow 复用"流程"，action 复用"步骤"**。它们可以组合使用——可复用工作流内部也能调用 action。
+
+## 7. 嵌套与层级限制
+
+可复用工作流**可以调用另一个可复用工作流**（嵌套），但 GitHub 对层级有上限：**最多 4 层**嵌套（直接调用算一层）。更深会直接报错。日常实践中，把"统一 CI"做成一层、业务仓库调用它，就足够了，不必追求层层套娃。
+
+<Callout type="tip" title="复用粒度建议">
+- 跨仓库、跨团队的"公司级统一流水线" → 可复用工作流（`workflow_call`）。
+- 单仓库内"每个 job 都要做的固定准备动作" → 更轻量的 composite action（下章）。
+- 两者都走版本化（锁 tag/commit），避免上游一改全崩。
+</Callout>
+
+## 8. 小结
+
+- 用 `on: workflow_call` 声明可复用工作流；通过 `inputs` 收参、`secrets` 收密钥、`outputs` 返回结果。
+- 调用方把"调用"当成一个 job：`uses: 路径` + `with:` + `secrets:`；`secrets: inherit` 可透传全部密钥（慎用）。
+- 调用产生的 job 可被 `needs:` 引用，结果用 `needs.<job>.outputs.*` 读取；支持跨仓库调用（建议锁 tag）。
+- 与 composite action 的区别：**workflow 复用流程（含多 job），action 复用步骤**。
+- 嵌套最多约 4 层，别过度套娃。
+
+可复用工作流很强大，但它复用的是"整条流水线"。如果我们只想复用一小段 step 序列（比如"装好依赖并跑 lint"），用 workflow 反而太重。下一章我们就来自己写 **Action**——尤其是最轻量好用的 composite action。
+
+<Callout type="exercise" title="练习">
+1. 写一个被调用工作流 `greet-reusable.yml`：声明 `workflow_call`，入参 `name`（string，必填），step 里打印 `Hello, ${{ inputs.name }}`。再写一个调用方 `call.yml`，传 `name: "GitHub"`。
+2. 在调用方里，用 `secrets: inherit` 调用一个需要密钥的可复用工作流。说明什么场景下你**不应该**用 `inherit`。
+3. 判断：可复用工作流能否在内部包含多个 job？能否被另一个可复用工作流调用？嵌套层数有上限吗？
+4. 下面调用方为什么可能报错？如何改正（假设被调用方要求 `environment` 必填）？
+```yaml
+jobs:
+  d:
+    uses: ./.github/workflows/deploy-reusable.yml
+    secrets:
+      DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+```
+</Callout>
+
+<Answer>
+**1. 参考答案：**
+
+```yaml
+# .github/workflows/greet-reusable.yml
+name: 可复用问候
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: "名字"
+        required: true
+        type: string
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Hello, ${{ inputs.name }}"
+```
+
+```yaml
+# .github/workflows/call.yml
+name: 调用问候
+on: [push]
+jobs:
+  call:
+    uses: ./.github/workflows/greet-reusable.yml
+    with:
+      name: "GitHub"
+```
+
+**2. 参考答案：** `secrets: inherit` 会把调用方全部密钥透传给被调用方。当被调用方来自**外部/不完全可信的仓库**，或只需要其中一两个密钥时，**不应**用 `inherit`——应只显式传必需的密钥（最小权限），避免泄露无关密钥。
+
+**3. 参考答案：** 可以包含多个 job（可复用工作流就是完整 workflow）；可以被另一个可复用工作流调用（嵌套）；有层级上限，最多约 **4 层**嵌套。
+
+**4. 参考答案：** 被调用方要求 `environment` 为必填 `inputs`，但调用方没传 `with:`，所以会因缺必填入参报错。改正：
+
+```yaml
+jobs:
+  d:
+    uses: ./.github/workflows/deploy-reusable.yml
+    with:
+      environment: production        # 补上必填入参
+    secrets:
+      DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+```
+</Answer>

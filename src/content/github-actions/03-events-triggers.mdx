@@ -1,0 +1,292 @@
+---
+title: 触发事件：on 的写法
+order: 3
+description: 深入讲解 GitHub Actions 的 on 字段——push、pull_request、schedule、workflow_dispatch 及分支/路径过滤。
+---
+
+# 触发事件：on 的写法
+
+上一章我们写出了第一个 workflow，触发条件只写了最朴素的一句 `on: push`。但在真实项目里，你很少会"任何分支、任何文件一改动就无脑触发"。比如：只有推到 `main` 分支才跑完整测试；只有前端文件改动时才跑前端测试，省下后端 CI 的时间；或者希望每天凌晨自动跑一次构建检查。
+
+这些精细控制，全都靠 **`on` 字段的各种写法**来实现。这一章我们就把 `on` 讲透。
+
+## 1. on 的基本写法
+
+`on` 可以是**一个简单的事件名**（字符串），也可以是**一个事件列表**（数组），还可以是**一个事件到配置的映射**（对象，用来给某个事件加过滤条件）。
+
+最简单的写法，上一章见过：
+
+```yaml
+on: push
+```
+
+这表示"任意分支被 `push` 时触发"。
+
+也可以并列写多个事件：
+
+```yaml
+on: [push, pull_request]
+```
+
+这表示"push 或开 pull_request 都触发"。当多个事件不需要额外过滤时，用这种数组写法最简洁。
+
+<Callout type="info" title="事件触发的来源">
+`push` 和 `pull_request` 来自仓库自身的 Git 活动；`schedule` 来自你配置的定时器；`workflow_dispatch` 来自你手动点击。理解"事件从哪来"，有助于你判断自己的 workflow 为什么（没）被触发。
+</Callout>
+
+## 2. push 的细化过滤
+
+很多时候你不想"任何 push 都触发"。比如你有个 `dev` 分支天天在改，但不想每次都跑昂贵的 CI。`push` 事件支持几种过滤维度：
+
+- `branches`：只在推到指定分支时触发。
+- `tags`：只在打了指定标签（tag）时触发。
+- `paths`：只在指定路径的文件发生变动时触发。
+
+**按分支过滤**：只在本仓库的 `main` 分支被推送时触发。
+
+```yaml
+on:
+  push:
+    branches: ['main']
+```
+
+**按路径过滤**：只有 `frontend/` 目录下的文件被改动时，才跑这段前端测试。
+
+```yaml
+on:
+  push:
+    paths:
+      - 'frontend/**'
+```
+
+**组合使用**：推到 `main` 且动了 `frontend/` 才触发。
+
+```yaml
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'frontend/**'
+```
+
+<Callout type="tip" title="用 paths 省 CI 时长">
+这是实战中非常实用的优化。举例：一个全栈仓库，后端同学改了 `server/` 的代码，其实没必要触发前端的 lint 和单测。给前端 workflow 加上 `paths: ['frontend/**']`，只有前端文件变动时才跑，能明显节省运行分钟数（尤其对免费额度紧张的项目很友好）。
+</Callout>
+
+<Callout type="warn" title="branches 与 paths 是「与」的关系">
+注意：当 `branches` 和 `paths` 同时写在一个 `push` 下时，它们是**同时满足**才触发（逻辑与）。如果你想要"分支满足 或 路径满足"就触发，那需要拆成两个独立的 `on` 事件块。
+</Callout>
+
+## 3. pull_request 的 types
+
+`pull_request` 事件比 `push` 更细腻：一个 PR 的生命周期里会发生很多动作（opened、synchronize、closed 等等）。你可以用 `types` 指定"只在哪些动作发生时触发"。
+
+常见 types：
+
+- `opened`：PR 被创建时。
+- `synchronize`：PR 里追加了新提交（最常见，每次 push 到 PR 分支都会触发）。
+- `reopened`：PR 被重新打开。
+- `closed`：PR 被关闭（注意：合并也是一种 closed）。
+
+示例：只在 PR 被打开或追加提交时跑测试，不在关闭时跑。
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize]
+```
+
+指定监听的目标分支：
+
+```yaml
+on:
+  pull_request:
+    branches: ['main']
+    types: [opened, synchronize]
+```
+
+这意味着"有人往 `main` 分支开 PR（或往该 PR 追加提交）时"才触发。
+
+<Callout type="info" title="synchronize 是 PR CI 的主力">
+在 GitHub 的协作流里，CI 大多挂在 PR 上。因为开发者会反复往 PR 分支提交，所以 `synchronize` 类型会频繁触发，确保每次最新代码都通过了测试，才允许合并。
+</Callout>
+
+## 4. workflow_dispatch：手动触发 + 输入参数
+
+有些工作流你不想自动跑，而是想"需要的时候我自己点一下"。这时用 **`workflow_dispatch`**，它会在 Actions 页面给你一个 **"Run workflow"** 按钮。
+
+你还可以给它定义 `inputs`，让点击时填参数（比如选环境、填版本号）。
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '选择部署环境'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+```
+
+提交后，在 Actions 页面选中这个 workflow，点 **Run workflow**，会弹出一个表单让你填 `environment`（下拉选择 `staging` 或 `production`），确认后工作流就以你选的参数启动。
+
+在工作流内部，可以通过表达式读取这个输入：
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "部署到 ${{ inputs.environment }}"
+```
+
+注意这里用到了 GitHub Actions 的表达式语法 `${{ ... }}`，它在运行时被替换成实际值。
+
+<Callout type="tip" title="手动触发的典型场景">
+`workflow_dispatch` 常用来做"手动部署""手动清理数据""手动跑一次全量回归"等不需要自动执行、但又要一键可触发的任务。配合 `inputs`，你能把同一个工作流复用到不同环境，而不必为 staging / production 各写一份。
+</Callout>
+
+## 5. schedule：定时触发（cron）
+
+有些任务需要"准点自动跑"，比如每天凌晨构建一次、每周生成报表。`schedule` 用 **POSIX cron 表达式**定义时间。
+
+cron 表达式分五个字段：`分 时 日 月 星期`。
+
+```yaml
+on:
+  schedule:
+    - cron: '0 2 * * *'
+```
+
+意思是"每天 UTC 时间 02:00:00 触发一次"。
+
+每小时的第 17 分钟跑：
+
+```yaml
+on:
+  schedule:
+    - cron: '17 * * * *'
+```
+
+<Callout type="warn" title="cron 时区是 UTC！">
+这是一个极易踩的坑：**GitHub Actions 的 `schedule` 一律按 UTC（世界协调时）计算，不按你本地时区。** 如果你在国内（UTC+8），想"每天北京时间上午 10 点"跑，应该写成 UTC 的凌晨 2 点，即 `cron: '0 2 * * *'`。直接写 `0 10 * * *` 会变成北京时间 18:00，差了 8 个小时。算不准时务必先换算时区。
+</Callout>
+
+另外提醒：GitHub 对 `schedule` 触发有"仓库活跃度"约束——长期不活跃的仓库，定时任务可能会被暂停，需要时去 Actions 页面手动启用。
+
+## 6. 多事件并列与 map 形式
+
+回顾一下，`on` 的三种写法可以自由组合：
+
+**数组形式**（事件并列，无额外配置）：
+
+```yaml
+on: [push, pull_request]
+```
+
+**map 形式**（对每个事件单独配置）：
+
+```yaml
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['main']
+    types: [opened, synchronize]
+  workflow_dispatch:
+```
+
+**混合**：既能并列多个简单事件，又能给其中某个事件加详细配置。下面这个例子中，`schedule` 和 `workflow_dispatch` 各自带配置，`push` 用简单写法：
+
+```yaml
+on:
+  push:
+    branches: ['main']
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+```
+
+<Callout type="info" title="选择哪种写法">
+规则很简单：事件不需要过滤 → 用数组 `[a, b]`；某个事件需要加 `branches`/`paths`/`types`/`inputs` 等配置 → 就用 map 形式给那个事件单独写块。两者可以混用。
+</Callout>
+
+## 7. 完整示例串讲
+
+把本章提到的几个触发方式，拼成一个常见的真实配置，帮助你建立整体感：
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'frontend/**'
+  pull_request:
+    branches: ['main']
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "前端代码有改动或定时触发，开始构建"
+```
+
+它的含义是：推到 `main` 且动了前端文件、或往 `main` 开 PR、或每天 UTC 02:00、或你手动点 Run workflow——任一条件满足就触发。
+
+## 8. 小结
+
+这一章我们把 `on` 的写法彻底讲清了：
+
+- `on` 可写成单事件字符串（`push`）、事件数组（`[push, pull_request]`）或事件 map（给每个事件单独配置）。
+- `push` 可用 `branches` / `tags` / `paths` 过滤；`paths` 过滤能显著**省 CI 时长**。
+- `pull_request` 用 `types`（如 `opened`、`synchronize`）控制生命周期阶段的触发。
+- `workflow_dispatch` 支持**手动触发**，并可定义 `inputs` 参数，在网页点 "Run workflow" 时填写。
+- `schedule` 用 **POSIX cron** 定时触发，但**时区永远是 UTC**，换算要小心。
+- 多个事件可并列，也可混用简单写法与 map 写法。
+
+你已经能精确控制"什么时候让工作流跑起来"了。但 `on` 只解决了"何时触发"，工作流真正干活的骨架——`jobs` 与 `steps` 的内部结构、job 之间如何串行或并行——我们留到**下一章《Job 与 Step 结构》**详细展开。
+
+<Callout type="exercise" title="练习">
+1. 想让工作流"只在推送到 `main` 分支时触发"，`on` 该怎么写？（写出 map 形式）
+2. 一个全栈仓库，你希望"只有 `server/` 目录下的 Go 文件改动时"才跑后端测试。请用 `paths` 写出对应的 `on` 配置（提示：可用 `server/**`）。
+3. `pull_request` 的 `types` 里，`synchronize` 表示什么？为什么它在实际协作中最常用？
+4. 你想让工作流"每天北京时间上午 9 点"自动跑一次，cron 应该怎么写？（注意时区）
+5. 想给手动触发的 workflow 加一个必填的 `version` 文本输入，让点击 Run workflow 时能填版本号，请写出 `workflow_dispatch` 的配置片段。
+
+<Answer>
+1. map 形式：
+   ```yaml
+   on:
+     push:
+       branches: ['main']
+   ```
+2. 用 paths 过滤：
+   ```yaml
+   on:
+     push:
+       paths:
+         - 'server/**'
+   ```
+3. `synchronize` 表示"PR 里追加了新提交"。因为开发者会反复往 PR 分支提交代码，每次提交都会触发 `synchronize`，从而保证最新代码始终经过 CI 检查，所以它在 PR 协作流中最常用。
+4. 北京时间是 UTC+8，上午 9 点 = UTC 凌晨 1 点，因此写：`cron: '0 1 * * *'`（注意 GitHub 用 UTC，不能直接写 9）。
+5. 配置片段：
+   ```yaml
+   on:
+     workflow_dispatch:
+       inputs:
+         version:
+           description: '填写要发布的版本号'
+           required: true
+           type: string
+   ```
+</Answer>
+</Callout>
