@@ -19,11 +19,8 @@ sed 's/旧/新/2' file       # 只替换每行的第 2 处
 sed 's/旧/新/gi' file      # i 标志：忽略大小写
 ```
 
-<Playground
-  language="linux"
-  title="s 命令与 g 标志"
-  id="linux-08-1"
-  code={`cat > greet.txt << 'EOF'
+```bash title="s 命令与 g 标志"
+cat > greet.txt << 'EOF'
 hello world, hello linux
 HELLO again
 goodbye world
@@ -39,8 +36,8 @@ echo '$ sed "s/hello/hi/gi" greet.txt   # 大小写通吃'
 sed 's/hello/hi/gi' greet.txt
 
 echo '$ cat greet.txt   # 原文件没有变！sed 默认只改输出流'
-cat greet.txt`}
-/>
+cat greet.txt
+```
 
 模式部分是正则表达式（加 `-E` 用扩展正则，与 grep -E 同一套）。分隔符不是必须用 `/`——处理路径、URL 时换个分隔符可读性天差地别：
 
@@ -74,11 +71,8 @@ sed -n '/ERROR/p' file      # 等价于 grep ERROR
 
 `-n` 加 `p` 的组合要理解：sed 默认把每行处理完都打印一遍，`-n` 关掉这个默认行为，只有被 `p` 命令点名的行才输出——这就变成了"精确取行"工具，比 head+tail 组合更直接。
 
-<Playground
-  language="linux"
-  title="清洗配置：删注释、删空行、取区间"
-  id="linux-08-2"
-  code={`cat > app.conf << 'EOF'
+```bash title="清洗配置：删注释、删空行、取区间"
+cat > app.conf << 'EOF'
 # main config
 port = 8080
 
@@ -100,8 +94,8 @@ echo '$ sed -n "4,6p" app.conf   # 只看 4 到 6 行'
 sed -n '4,6p' app.conf
 
 echo '$ sed -n "/^db_/p" app.conf   # 只看 db 开头的配置项'
-sed -n '/^db_/p' app.conf`}
-/>
+sed -n '/^db_/p' app.conf
+```
 
 ## 4. -i：原地编辑
 
@@ -113,11 +107,8 @@ sed -i.bak 's/8080/9090/' app.conf       # 修改前先留一份 app.conf.bak（
 sed -i '/^debug/d' /etc/app/*.conf       # 批量修改多个文件
 ```
 
-<Playground
-  language="linux"
-  title="sed -i 原地修改（带备份）"
-  id="linux-08-3"
-  code={`printf 'env = dev\nport = 8080\nhost = dev.example.com\n' > app.conf
+```bash title="sed -i 原地修改（带备份）"
+printf 'env = dev\nport = 8080\nhost = dev.example.com\n' > app.conf
 
 echo '$ sed -i.bak "s/dev/prod/g" app.conf'
 sed -i.bak 's/dev/prod/g' app.conf
@@ -133,8 +124,8 @@ echo 'api = http://old-api' > srcs/a.cfg
 echo 'cdn = http://old-cdn' > srcs/b.cfg
 find srcs -name '*.cfg' -exec sed -i 's|http://old|https://new|' {} +
 echo '--- 批量替换后 ---'
-cat srcs/a.cfg srcs/b.cfg`}
-/>
+cat srcs/a.cfg srcs/b.cfg
+```
 
 <Callout type="warn" title="GNU sed 与 BSD/macOS sed 的 -i 不兼容">
 Linux（GNU sed）：`sed -i 's/a/b/' f` 直接可用，`-i.bak` 表示留备份。macOS（BSD sed）：`-i` 后面**必须**跟备份后缀参数，不留备份要写 `sed -i '' 's/a/b/' f`（注意空字符串）。跨平台脚本要么统一装 gsed，要么用 `sed 's/a/b/' f > tmp && mv tmp f` 的通用写法。本课沙箱是 GNU sed。

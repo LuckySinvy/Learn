@@ -20,11 +20,8 @@ HTTP 是无状态的：每个请求相互独立，服务器天然"脸盲"。可�
 
 关键点：**下发用响应头 Set-Cookie（可多条），回传用请求头 Cookie（合并成一条）**。浏览器是自动执行的；curl 需要 `-c`（保存）和 `-b`（携带）模拟。
 
-<Playground
-  language="http"
-  title="Cookie 的一来一回"
-  id="http-08-1"
-  code={`python3 -c '
+```http title="Cookie 的一来一回"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -61,8 +58,8 @@ echo "== 再访问 /me：curl 自动带上 Cookie =="
 curl -s -b /work/jar.txt -c /work/jar.txt http://127.0.0.1:8000/me
 
 echo "== Cookie Jar 文件内容 =="
-cat /work/jar.txt`}
-/>
+cat /work/jar.txt
+```
 
 注意两条 Set-Cookie 是**两个独立的响应头**（Cookie 是少数允许同名重复的头），而回传时合并进一个 `Cookie` 头、分号分隔。
 
@@ -92,11 +89,8 @@ Set-Cookie: sid=abc123; Max-Age=86400; Domain=example.com; Path=/;
 
 SameSite=Lax 成为默认后，传统 CSRF 攻击（诱导用户浏览器向银行发 POST）大幅失效——这是近年 Web 安全最重要的默认值变化之一。
 
-<Playground
-  language="http"
-  title="观察各属性与'篡改 Cookie'"
-  id="http-08-2"
-  code={`python3 -c '
+```http title="观察各属性与'篡改 Cookie'"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -127,8 +121,8 @@ echo "== 下发的原始 Set-Cookie 头 =="
 curl -sv http://127.0.0.1:8000/issue 2>&1 | grep -i "set-cookie"
 
 echo "== 客户端可以随便伪造 Cookie 头 =="
-curl -s http://127.0.0.1:8000/check -b "sid=i-am-admin; role=root"`}
-/>
+curl -s http://127.0.0.1:8000/check -b "sid=i-am-admin; role=root"
+```
 
 最后一行说明：**Cookie 的值完全由客户端回传，可任意伪造**。所以 Cookie 里要么只放"无意义的随机会话 ID"（Session 方案），要么放"带签名的自包含凭证"（JWT，第 16 章），绝不能放裸的 `role=admin`。
 
@@ -143,11 +137,8 @@ Cookie: sid=R7f3...           session 表
                               9k2Q... -> { user: "bob", role: "user"  }
 ```
 
-<Playground
-  language="http"
-  title="完整会话机制：登录、识别、登出"
-  id="http-08-3"
-  code={`python3 -c '
+```http title="完整会话机制：登录、识别、登出"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlsplit, parse_qs
 import secrets
@@ -199,8 +190,8 @@ curl -s -b $A http://127.0.0.1:8000/me
 curl -s -b $B http://127.0.0.1:8000/me
 echo "-- alice 登出后再问 --"
 curl -s -b $A -c $A http://127.0.0.1:8000/logout
-curl -s -b $A http://127.0.0.1:8000/me`}
-/>
+curl -s -b $A http://127.0.0.1:8000/me
+```
 
 两个 cookie jar 模拟两台浏览器：同一服务器凭 sid 区分出 alice 和 bob。注意登出的实现细节——**删除 Cookie 没有专门指令，靠下发同名 Cookie 且 Max-Age=0**，同时服务端删掉会话记录（后者才是真正的安全保障）。
 

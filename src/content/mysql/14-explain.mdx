@@ -12,11 +12,8 @@ description: EXPLAIN 各列含义、type 等级、Extra 关键字、EXPLAIN ANAL
 
 几行数据的表优化器一律选全表扫描，所以先把 orders 灌大一点再看计划：
 
-<Playground
-  language="mysql"
-  id="mysql-14-1"
-  title="EXPLAIN 基本用法"
-  code={`-- 造数：把订单表放大到约 700 行
+```sql title="EXPLAIN 基本用法"
+-- 造数：把订单表放大到约 700 行
 INSERT INTO orders (order_no, user_id, status, total_amount, created_at)
 SELECT CONCAT(o.order_no, '-', d1.n, d2.n),
        o.user_id, o.status, o.total_amount, o.created_at
@@ -30,8 +27,8 @@ ANALYZE TABLE orders;
 EXPLAIN SELECT o.order_no, u.username
 FROM orders o
 JOIN users u ON u.id = o.user_id
-WHERE o.user_id = 1;`}
-/>
+WHERE o.user_id = 1;
+```
 
 每行代表访问一张表（或物化结果），从上往下就是访问顺序（id 相同时）。上例中 users 因为按主键常量定位是 `const`，orders 走 `idx_user_created` 的 `ref`。
 
@@ -70,11 +67,8 @@ WHERE o.user_id = 1;`}
 
 把五个等级挨个跑一遍，对照 type 与 key_len：
 
-<Playground
-  language="mysql"
-  id="mysql-14-2"
-  title="type 等级实测"
-  code={`-- const：主键常量
+```sql title="type 等级实测"
+-- const：主键常量
 EXPLAIN SELECT * FROM orders WHERE id = 1;
 
 -- eq_ref：被驱动表按主键匹配
@@ -87,8 +81,8 @@ EXPLAIN SELECT * FROM orders WHERE user_id = 1;
 EXPLAIN SELECT * FROM orders WHERE user_id IN (1, 2, 3);
 
 -- ALL：没有索引可用
-EXPLAIN SELECT * FROM orders WHERE total_amount > 100;`}
-/>
+EXPLAIN SELECT * FROM orders WHERE total_amount > 100;
+```
 
 ## 4. Extra 关键字解读
 
@@ -103,11 +97,8 @@ EXPLAIN SELECT * FROM orders WHERE total_amount > 100;`}
 
 `Using filesort` + `Using temporary` 同时出现的 GROUP BY/ORDER BY 大查询，通常就是慢查询榜单的常客——解法多半是让联合索引同时满足过滤和排序（第 13 章）。
 
-<Playground
-  language="mysql"
-  id="mysql-14-3"
-  title="Extra 关键字与索引提示"
-  code={`-- Using index：三列全在 idx_user_created 里，不回表
+```sql title="Extra 关键字与索引提示"
+-- Using index：三列全在 idx_user_created 里，不回表
 EXPLAIN SELECT id, user_id, created_at FROM orders WHERE user_id = 1;
 
 -- Using filesort：排序列没被索引的有序性覆盖
@@ -118,8 +109,8 @@ EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status;
 
 -- 索引提示：强制走 / 禁止走 idx_user_created，对比 key 与 rows
 EXPLAIN SELECT * FROM orders FORCE INDEX (idx_user_created) WHERE user_id = 1;
-EXPLAIN SELECT * FROM orders IGNORE INDEX (idx_user_created) WHERE user_id = 1;`}
-/>
+EXPLAIN SELECT * FROM orders IGNORE INDEX (idx_user_created) WHERE user_id = 1;
+```
 
 ## 5. EXPLAIN ANALYZE（8.0.18+）：看真实执行
 

@@ -17,20 +17,16 @@ Go 是一门**编译型**语言：源代码被编译成机器码后执行，启�
 
 每个 Go 程序都属于一个**包（package）**，可执行入口是 `package main` 中的 `func main()`。
 
-<Playground
-  language="go"
-  id="go-01-hello"
-  title="Hello World"
-  code={`package main
+```go title="Hello World"
+package main
 
 import "fmt"
 
 func main() {
     fmt.Println("Hello, 世界！")
     fmt.Println("Go version:", "1.22")
-}`}
-  expectedOutput={`Hello, 世界！\nGo version: 1.22`}
-/>
+}
+```
 
 <Callout type="tip" title="运行方式">
 - `go run main.go`：编译并直接运行
@@ -48,11 +44,8 @@ import (
 )
 ```
 
-<Playground
-  language="go"
-  id="go-01-import"
-  title="多包导入"
-  code={`package main
+```go title="多包导入"
+package main
 
 import (
     "fmt"
@@ -64,9 +57,8 @@ func main() {
     fmt.Println(math.Pi)
     fmt.Println(strings.ToUpper("hello go"))
     fmt.Printf("圆周率 ≈ %.2f\\n", math.Pi)
-}`}
-  expectedOutput={`3.141592653589793\nHELLO GO\n圆周率 ≈ 3.14`}
-/>
+}
+```
 
 ## 3. `Print` vs `Printf` vs `Println`
 
@@ -84,11 +76,8 @@ func main() {
 | `%T` | 类型 |
 | `\\n` | 换行符 |
 
-<Playground
-  language="go"
-  id="go-01-printf"
-  title="Printf 格式化"
-  code={`package main
+```go title="Printf 格式化"
+package main
 
 import "fmt"
 
@@ -100,9 +89,8 @@ func main() {
     fmt.Printf("布尔：%v\\n", true)
     fmt.Printf("二进制：%b\\n", 10)
     fmt.Printf("十六进制：%x\\n", 255)
-}`}
-  expectedOutput={`姓名：Alice，年龄：30\n类型：string int\n布尔：true\n二进制：1010\n十六进制：ff`}
-/>
+}
+```
 
 ## 4. 注释
 
@@ -125,11 +113,8 @@ func Add(a, b int) int { return a + b }
 
 ## 5. 命令行参数
 
-<Playground
-  language="go"
-  id="go-01-args"
-  title="os.Args"
-  code={`package main
+```go title="os.Args"
+package main
 
 import (
     "fmt"
@@ -141,16 +126,13 @@ func main() {
     for i, a := range os.Args {
         fmt.Printf("  [%d] %s\\n", i, a)
     }
-}`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-01-exercise"
-  title="自我介绍"
-  code={`// 任务：使用 Printf 输出你的自我介绍
+```go title="自我介绍"
+// 任务：使用 Printf 输出你的自我介绍
 // 期望效果：
 //   姓名：XXX
 //   年龄：XX
@@ -166,8 +148,7 @@ func main() {
     city := "上海"
     // 补全输出
 }
-`}
-/>
+```
 
 ## 小结
 

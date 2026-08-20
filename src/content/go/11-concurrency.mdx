@@ -14,11 +14,8 @@ Go 的并发模型基于 **CSP（Communicating Sequential Processes）**：gorou
 
 `go` 关键字启动一个 goroutine——比线程轻量得多（初始栈 2KB）。
 
-<Playground
-  language="go"
-  id="go-11-goroutine"
-  title="启动 goroutine"
-  code={`package main
+```go title="启动 goroutine"
+package main
 
 import (
     "fmt"
@@ -39,15 +36,8 @@ func main() {
     // 等待 50ms 让另一个 goroutine 完成
     time.Sleep(50 * time.Millisecond)
     fmt.Println("结束")
-}`}
-  expectedOutput={`main 0
-goroutine 0
-main 1
-goroutine 1
-main 2
-goroutine 2
-结束`}
-/>
+}
+```
 
 <Callout type="warn" title={`主 goroutine 退出 = 整个程序退出`}>
 `main()` 返回时，**所有其他 goroutine 立刻终止**。需要用 `sync.WaitGroup` 或 channel 等待。
@@ -57,11 +47,8 @@ goroutine 2
 
 channel 是 goroutine 之间的类型化管道。`<-` 方向：`ch <- v` 发送，`v := <-ch` 接收。
 
-<Playground
-  language="go"
-  id="go-11-channel"
-  title="channel 基础"
-  code={`package main
+```go title="channel 基础"
+package main
 
 import "fmt"
 
@@ -82,20 +69,15 @@ func main() {
     buf <- "b"
     // buf <- "c"   // 这里会阻塞
     fmt.Println(<-buf, <-buf)
-}`}
-  expectedOutput={`收到： 42
-a b`}
-/>
+}
+```
 
 ### 单向 channel
 
 为 API 表达"只能发"或"只能收"的约束。
 
-<Playground
-  language="go"
-  id="go-11-direction"
-  title="单向 channel"
-  code={`package main
+```go title="单向 channel"
+package main
 
 import (
     "fmt"
@@ -122,11 +104,8 @@ func main() {
     go producer(ch)
     consumer(ch)
     time.Sleep(10 * time.Millisecond)
-}`}
-  expectedOutput={`消费： 1
-消费： 2
-消费： 3`}
-/>
+}
+```
 
 <Callout type="tip" title="close 的作用">
 - 发送方 `close(ch)` 表示"不会再发了"
@@ -139,11 +118,8 @@ func main() {
 
 `select` 让 goroutine 等待多个 channel 操作。
 
-<Playground
-  language="go"
-  id="go-11-select"
-  title="select 多路复用"
-  code={`package main
+```go title="select 多路复用"
+package main
 
 import (
     "fmt"
@@ -165,18 +141,13 @@ func main() {
             fmt.Println("收到 b:", msg)
         }
     }
-}`}
-  expectedOutput={`收到 b: B
-收到 a: A`}
-/>
+}
+```
 
 ### 超时模式
 
-<Playground
-  language="go"
-  id="go-11-timeout"
-  title="超时控制"
-  code={`package main
+```go title="超时控制"
+package main
 
 import (
     "fmt"
@@ -196,19 +167,15 @@ func main() {
     case <-time.After(30 * time.Millisecond):
         fmt.Println("超时！")
     }
-}`}
-  expectedOutput={`超时！`}
-/>
+}
+```
 
 ## 4. sync 包：`WaitGroup` 和 `Mutex`
 
 ### `WaitGroup`：等待一组 goroutine
 
-<Playground
-  language="go"
-  id="go-11-waitgroup"
-  title="WaitGroup"
-  code={`package main
+```go title="WaitGroup"
+package main
 
 import (
     "fmt"
@@ -230,14 +197,8 @@ func main() {
     }
     wg.Wait()             // 阻塞直到计数为 0
     fmt.Println("全部完成")
-}`}
-  expectedOutput={`worker 3 完成
-worker 5 完成
-worker 1 完成
-worker 4 完成
-worker 2 完成
-全部完成`}
-/>
+}
+```
 
 <Callout type="info" title="输出顺序是随机的">
 goroutine 由调度器决定先后，所以完成顺序不固定。
@@ -245,11 +206,8 @@ goroutine 由调度器决定先后，所以完成顺序不固定。
 
 ### `Mutex`：互斥锁
 
-<Playground
-  language="go"
-  id="go-11-mutex"
-  title="Mutex"
-  code={`package main
+```go title="Mutex"
+package main
 
 import (
     "fmt"
@@ -282,9 +240,8 @@ func main() {
     }
     wg.Wait()
     fmt.Println("结果：", c.Value())   // 1000
-}`}
-  expectedOutput={`结果： 1000`}
-/>
+}
+```
 
 <Callout type="warn" title="race 警告">
 没有 `Lock/Unlock` 时，并发写会丢失更新。运行 `go run -race main.go` 可检测数据竞争。
@@ -294,11 +251,8 @@ func main() {
 
 固定数量的 worker 反复从任务 channel 取任务。
 
-<Playground
-  language="go"
-  id="go-11-workerpool"
-  title="Worker Pool"
-  code={`package main
+```go title="Worker Pool"
+package main
 
 import (
     "fmt"
@@ -339,17 +293,13 @@ func main() {
         sum += r
     }
     fmt.Println("总和：", sum)   // 1+2+...+9 × 2 = 90
-}`}
-  expectedOutput={`总和： 90`}
-/>
+}
+```
 
 ## 6. 并发安全的"任务并发执行器"
 
-<Playground
-  language="go"
-  id="go-11-fanin"
-  title="Fan-in 合并"
-  code={`package main
+```go title="Fan-in 合并"
+package main
 
 import (
     "fmt"
@@ -391,25 +341,13 @@ func main() {
     for msg := range out {
         fmt.Println(msg)
     }
-}`}
-  expectedOutput={`A-0
-C-0
-B-0
-A-1
-B-1
-C-1
-A-2
-B-2
-C-2`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-11-exercise"
-  title="并发求和"
-  code={`// 任务：把 [1, 2, 3, ..., 100] 分给 4 个 worker 求和，最后合并
+```go title="并发求和"
+// 任务：把 [1, 2, 3, ..., 100] 分给 4 个 worker 求和，最后合并
 // 1. 用 jobs channel 派发任务（每个 worker 拿到一段区间）
 // 2. 用 results channel 收集部分和
 // 3. 主 goroutine 求总和并打印
@@ -464,9 +402,7 @@ func main() {
     }
     fmt.Println("sum =", sum)
 }
-`}
-  expectedOutput={`sum = 5050`}
-/>
+```
 
 ## 小结
 

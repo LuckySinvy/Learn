@@ -31,11 +31,8 @@ Git 在关键动作前后会调用 `.git/hooks/` 里的脚本，这就是 **hook
 
 钩子脚本从标准输入/参数拿到信息，靠**退出码**决定放行（0）还是拦截（非 0）。
 
-<Playground
-  language="git"
-  title="pre-commit 钩子拦截含禁用词的提交"
-  id="git-16-1"
-  code={`echo '===== pre-commit 钩子：拦截含禁用词的提交 ====='
+```bash title="pre-commit 钩子拦截含禁用词的提交"
+echo '===== pre-commit 钩子：拦截含禁用词的提交 ====='
 git init -q -b main hk && cd hk
 echo 'hello' > app.txt && git add . && git commit -q -m "init"
 
@@ -60,18 +57,15 @@ echo 'some FORBIDDEN stuff' > app.txt && git add .
 git commit -m "feat: 偷偷加点东西" 2>&1 | head -3
 echo "提交是否被拦下（git log 条数应为 2）："
 git log --oneline | wc -l
-cd ..`}
-/>
+cd ..
+```
 
 逻辑拆解：钩子用 `git diff --cached` 只看**已暂存**的内容（避免漏网），`grep -l 'FORBIDDEN'` 找到就 `exit 1` 中断提交。注意它读的是暂存区而非工作区——这正是钩子该有的正确视角。
 
 再写一个 `commit-msg` 钩子，强制提交信息符合 **Conventional Commits** 规范（第 3 章提过）：
 
-<Playground
-  language="git"
-  title="commit-msg 钩子校验提交信息格式"
-  id="git-16-2"
-  code={`echo '===== commit-msg 钩子：校验 Conventional Commits ====='
+```bash title="commit-msg 钩子校验提交信息格式"
+echo '===== commit-msg 钩子：校验 Conventional Commits ====='
 git init -q -b main cm && cd cm
 echo 'hi' > a.txt && git add . && git commit -q -m "init"
 
@@ -97,8 +91,8 @@ echo 'b' > b.txt && git add .
 git commit -m "随便写写" 2>&1 | head -3
 echo "提交是否被拦下（git log 条数应为 2）："
 git log --oneline | wc -l
-cd ..`}
-/>
+cd ..
+```
 
 `commit-msg` 钩子通过第一个参数 `$1` 拿到**存放提交信息的临时文件路径**，读取后校验。格式用正则匹配 `type(scope): description`，团队可在 CI 端用同样的规则做二次把关。
 

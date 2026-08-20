@@ -25,11 +25,8 @@ Git 本身只提供分支、合并这些原语，**怎么用**是团队约定的
 
 每个功能从 `main` 切一个 `feature/xxx` 分支，在上面开发、提交，完成后 `--no-ff` 合并回 `main` 再删除分支。好处：main 永远是可发布状态；并行功能互不干扰；合并时的 merge commit 保留"这次合入了一个功能"的痕迹。
 
-<Playground
-  language="git"
-  title="功能分支工作流完整演练"
-  id="git-15-1"
-  code={`echo '===== 功能分支工作流（Feature Branch）====='
+```bash title="功能分支工作流完整演练"
+echo '===== 功能分支工作流（Feature Branch）====='
 git init -q --bare /tmp/up.git
 git clone -q /tmp/up.git proj && cd proj
 echo 'init' > app.txt && git add . && git commit -q -m "init"
@@ -51,8 +48,8 @@ git branch -d feature/login
 git push -q origin main 2>/dev/null
 echo 'main 最终历史：'
 git log --oneline
-cd ..`}
-/>
+cd ..
+```
 
 `--no-ff` 在这里很重要：它强制生成一个 merge commit，让"哪些提交属于同一个功能"在历史上清晰可辨。如果允许 fast-forward，功能提交会直接贴到 main 上，丢失分组信息。
 
@@ -84,11 +81,8 @@ hotfix/*    —— 从 main 切出，紧急修生产 bug，合回 main + develop
 
 开源项目里陌生人不能直接 push 官方仓库。机制是：**贡献者先 fork（复制）官方仓库到自己的空间，在自己的 fork 上开发，然后向官方发一个 Pull Request（请求官方拉取自己的改动）**。官方维护者审查、讨论、合并。下面用两个本地裸仓库完整模拟这一机制。
 
-<Playground
-  language="git"
-  title="Fork + PR 机制的本地完整模拟"
-  id="git-15-2"
-  code={`echo '===== Fork + Pull Request 机制的本地模拟 ====='
+```bash title="Fork + PR 机制的本地完整模拟"
+echo '===== Fork + Pull Request 机制的本地模拟 ====='
 git init -q --bare /tmp/up.git
 git init -q --bare /tmp/fork.git
 git clone -q /tmp/up.git mainline && cd mainline
@@ -123,8 +117,8 @@ git merge --no-ff -m "merge PR#1: 修正拼写" contributor/fix/typo
 git push -q origin main 2>/dev/null
 echo '官方最终历史：'
 git log --oneline --graph --all
-cd ..`}
-/>
+cd ..
+```
 
 关键认知：
 

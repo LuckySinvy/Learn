@@ -90,11 +90,8 @@ const { inc } = useCounterStore(); // action 直接拿，不是 ref
 
 下面在 Playground 里**从零实现一个迷你 Pinia**：先有极简响应核心（`ref`/`reactive`/`computed`/`effect`），再用一个 `defineStore` + 自动解包把 store 包成「像 Pinia 一样」的对象。`store.xxx` 读写会自动解包 ref，`$patch` 同时驱动响应式与 `$subscribe` 订阅者。
 
-<Playground
-  language="typescript"
-  title="迷你 Pinia：state / getter / action / $patch / $subscribe"
-  id="vue-12-1"
-  code={`// ============ 迷你响应核心 ============
+```ts title="迷你 Pinia：state / getter / action / $patch / $subscribe"
+// ============ 迷你响应核心 ============
 type Dep = Set<Effect>;
 const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
 let activeEffect: Effect | null = null;
@@ -228,9 +225,8 @@ cart.add('apple', 3);
 cart.add('banana', 2);
 cart.$patch({ items: [...cart.items, { name: 'cherry', price: 4 }] });
 console.log("subRuns = " + subRuns);
-console.log("runs = " + runs);`}
-  expectedOutput={`[cart] total=0\n[cart] total=3\n[cart] total=5\n[cart] total=9\n[sub] total now 9\nsubRuns = 1\nruns = 4\n`}
-/>
+console.log("runs = " + runs);
+```
 
 Playground 里 `reactive` 的 `get` 对 ref 自动解包（`store.count` 等价于读 `ref.value`），`set` 遇到 ref 自动写到 `.value`——这正是 Pinia「访问 store 字段像普通属性」的底层。`computed` 用「脏标记 + 调度 effect」实现懒计算，`$patch` 既走响应式（`Object.assign` 触发 `set`）又显式通知 `$subscribe` 订阅者。一个 120 行的迷你 Pinia，把「集中式 store」的精髓全演示了。
 

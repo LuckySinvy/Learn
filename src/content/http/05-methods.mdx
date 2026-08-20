@@ -44,11 +44,8 @@ description: GET/POST/PUT/PATCH/DELETE 语义、安全性与幂等性、HEAD 与
 
 起一个支持全套方法的小服务（数据存内存 dict），用 curl 逐个体验：
 
-<Playground
-  language="http"
-  title="GET / POST / PUT / DELETE 全家桶"
-  id="http-05-1"
-  code={`python3 -c '
+```http title="GET / POST / PUT / DELETE 全家桶"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 
@@ -101,8 +98,8 @@ echo
 echo "== DELETE 删除 =="
 curl -s -X DELETE http://127.0.0.1:8000/users/42
 echo
-curl -s http://127.0.0.1:8000/users`}
-/>
+curl -s http://127.0.0.1:8000/users
+```
 
 POST 由**服务器分配 ID**（201 + 新 ID），PUT 由**客户端指定 ID**（URL 里就是身份）——这是两者选型的核心分水岭。
 
@@ -110,11 +107,8 @@ POST 由**服务器分配 ID**（201 + 新 ID），PUT 由**客户端指定 ID**
 
 同一请求各发 3 次，对比 POST 和 PUT 对服务器状态的影响：
 
-<Playground
-  language="http"
-  title="POST 重复三次 vs PUT 重复三次"
-  id="http-05-2"
-  code={`python3 -c '
+```http title="POST 重复三次 vs PUT 重复三次"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 
@@ -158,8 +152,8 @@ for i in 1 2 3; do
   echo
 done
 echo "== 最终状态 =="
-curl -s http://127.0.0.1:8000/orders | python3 -m json.tool`}
-/>
+curl -s http://127.0.0.1:8000/orders | python3 -m json.tool
+```
 
 结果一目了然：3 次 POST 造出 3 条订单（灾难），3 次 PUT 始终只有 1 条 A1。**"网络会超时、客户端会重试"是常态，接口必须为重试而设计。**
 
@@ -168,11 +162,8 @@ curl -s http://127.0.0.1:8000/orders | python3 -m json.tool`}
 - **HEAD**：与 GET 完全相同，但响应**只有头没有体**。用于探测资源是否存在、看 Content-Length 决定要不要下载；
 - **OPTIONS**：询问目标资源支持哪些方法（响应的 `Allow` 头），CORS 预检请求（第 15 章）就是 OPTIONS。
 
-<Playground
-  language="http"
-  title="HEAD 只取头，OPTIONS 询问能力"
-  id="http-05-3"
-  code={`python3 -c '
+```http title="HEAD 只取头，OPTIONS 询问能力"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -201,8 +192,8 @@ for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break
 echo "== HEAD（curl -I）：只有头，Content-Length 说体有 1000 字节 =="
 curl -si http://127.0.0.1:8000/bigfile
 echo "== OPTIONS：Allow 头列出支持的方法 =="
-curl -si -X OPTIONS http://127.0.0.1:8000/ | grep -iE "HTTP/|Allow"`}
-/>
+curl -si -X OPTIONS http://127.0.0.1:8000/ | grep -iE "HTTP/|Allow"
+```
 
 <Callout type="tip" title="GET 能带请求体吗？">
 协议没有禁止，但语义未定义：大量代理、服务器会忽略甚至拒绝 GET 的体。Elasticsearch 曾因查询 DSL 太复杂而在 GET 里塞体，争议多年后也提供了 POST 等价接口。实践准则：GET 的参数放 URL，复杂查询用 POST。

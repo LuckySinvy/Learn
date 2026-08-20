@@ -12,11 +12,8 @@ description: git log 的各种姿势、定位一行代码的来历、写出可�
 
 裸的 `git log` 输出很啰嗦，每个提交占五六行。真正日常用的是各种参数组合：
 
-<Playground
-  language="git"
-  title="log 的常用格式"
-  id="git-03-1"
-  code={`git init -q
+```bash title="log 的常用格式"
+git init -q
 for m in "feat: 初始化项目骨架" "feat(auth): 增加登录接口" "fix(auth): 修复 token 过期判断" "docs: 补充 README" "refactor: 抽取公共校验函数"; do
   echo "$m" >> log.txt
   git add . && git commit -q -m "$m"
@@ -36,8 +33,8 @@ echo
 echo
 
 echo '===== --stat：附带文件改动统计 ====='
-git log --stat -1`}
-/>
+git log --stat -1
+```
 
 ### 1.1 输出格式参数
 
@@ -77,11 +74,8 @@ Git 区分 **author**（写代码的人）和 **committer**（把提交放进历
 
 真实项目有几万个提交，能筛选才有意义：
 
-<Playground
-  language="git"
-  title="按文件、信息、代码内容筛选历史"
-  id="git-03-2"
-  code={`git init -q
+```bash title="按文件、信息、代码内容筛选历史"
+git init -q
 echo 'def login(): pass' > auth.py
 git add . && git commit -q -m "feat(auth): 增加登录函数"
 echo 'MAX_RETRY = 3' > config.py
@@ -110,8 +104,8 @@ echo
 echo '===== 相对引用：HEAD~n ====='
 echo "HEAD    -> $(git log -1 --format=%s HEAD)"
 echo "HEAD~1  -> $(git log -1 --format=%s HEAD~1)"
-echo "HEAD~3  -> $(git log -1 --format=%s HEAD~3)"`}
-/>
+echo "HEAD~3  -> $(git log -1 --format=%s HEAD~3)"
+```
 
 | 筛选方式 | 命令 |
 |---|---|
@@ -160,11 +154,8 @@ git show HEAD:src/a.py # 看某个提交时刻的文件全文（不是 diff！�
 
 `git blame` 逐行标注：这行是谁、在哪个提交、什么时候写的。
 
-<Playground
-  language="git"
-  title="blame 定位每一行的出处"
-  id="git-03-3"
-  code={`git init -q
+```bash title="blame 定位每一行的出处"
+git init -q
 echo 'a = 1' > calc.py
 echo 'b = 2' >> calc.py
 git add . && git commit -q -m "feat: 初始变量"
@@ -185,8 +176,8 @@ echo
 echo '===== 拿到提交号后用 git show 追完整上下文 ====='
 SHA=$(git blame -L 2,2 --porcelain calc.py | head -1 | cut -d' ' -f1)
 echo "第 2 行来自提交 $SHA"
-git show --oneline --stat $SHA | head -5`}
-/>
+git show --oneline --stat $SHA | head -5
+```
 
 输出格式：`^31662b4 (learner 2026-07-31 10:55:07 +0800 1) a = 1`。开头的 `^` 表示这行来自仓库的**初始提交**（边界提交）。
 

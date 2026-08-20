@@ -35,11 +35,8 @@ const fullNameComputed = computed(() => first.value + ' ' + last.value);
 
 **关键区别**：computed 的依赖（这里 `first`、`last`）没变时，多次读取返回缓存、不重跑 getter；方法每次调用都重跑。列表过滤、复杂派生一定要用 computed。
 
-<Playground
-  language="typescript"
-  title="computed 缓存：依赖没变就不重算"
-  id="vue-13-1"
-  code={`// ---- 迷你响应核心（computed 用 scheduler 设计，见第 12 章） ----
+```ts title="computed 缓存：依赖没变就不重算"
+// ---- 迷你响应核心（computed 用 scheduler 设计，见第 12 章） ----
 type Dep = Set<Effect>;
 const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
 let activeEffect: Effect | null = null;
@@ -113,9 +110,8 @@ render('render1');          // 首次渲染
 render('render2');          // 依赖没变再渲染一次：computed 命中缓存，方法仍重算
 last.value = 'Byron';       // 改依赖 -> computed 必须重算
 render('render3');
-console.log("computedCalls=" + computedCalls + " methodCalls=" + methodCalls);`}
-  expectedOutput={`[render1] computed=Ada Lovelace method=Ada Lovelace\n[render2] computed=Ada Lovelace method=Ada Lovelace\n[render3] computed=Ada Byron method=Ada Byron\ncomputedCalls=2 methodCalls=3\n`}
-/>
+console.log("computedCalls=" + computedCalls + " methodCalls=" + methodCalls);
+```
 
 渲染 3 次：第 2 次改了 `last`（computed 依赖之一），computed 重算（calls=2）；第 3 次只改 `theme`，名字没变——computed **命中缓存**（calls 停在 2），而方法照算（calls=3）。在一个长列表里，这个差异就是「卡」与「流畅」的分界。
 

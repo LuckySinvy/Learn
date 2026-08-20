@@ -29,11 +29,8 @@ Git 的提交构成一条（或一张）链：每个提交记录着自己的父�
 
 提交一次，发生的事情是：创建新提交 D（父提交是 C）→ 把 `main` 文件的内容改成 D 的哈希。就这么简单。
 
-<Playground
-  language="git"
-  title="拆开看：分支就是一个文件"
-  id="git-05-1"
-  code={`git init -q
+```bash title="拆开看：分支就是一个文件"
+git init -q
 echo 'main-1' > app.txt && git add . && git commit -q -m "feat: 主线提交1"
 echo 'main-2' >> app.txt && git add . && git commit -q -m "feat: 主线提交2"
 
@@ -63,8 +60,8 @@ echo
 echo '===== 切回 main：工作区立刻变回去 ====='
 git switch main
 echo '目录内容：' && ls
-echo '(login.txt 不见了 —— 它只存在于 feature/login 分支)'`}
-/>
+echo '(login.txt 不见了 —— 它只存在于 feature/login 分支)'
+```
 
 <Callout type="info" title="切分支为什么这么快">
 `git switch` 做两件事：改写 `.git/HEAD` 的一行文本，然后把工作区更新成目标提交的快照。第二步只需要处理**两个提交之间有差异的文件**，其余文件一个字节都不动。所以哪怕仓库有 10 万个文件，切换一个只改了 3 个文件的分支，也是瞬间完成的。
@@ -99,11 +96,8 @@ git branch -d feature/login       # 安全删：未合并会拒绝
 git branch -D feature/login       # 强制删
 ```
 
-<Playground
-  language="git"
-  title="分支管理：merged 检查、安全删除、重命名"
-  id="git-05-2"
-  code={`git init -q
+```bash title="分支管理：merged 检查、安全删除、重命名"
+git init -q
 echo 'base' > app.txt && git add . && git commit -q -m "init"
 git switch -qc done-work && echo x > x.txt && git add . && git commit -q -m "feat: 已完成的活"
 git switch -q main && git merge -q done-work
@@ -132,8 +126,8 @@ echo
 
 echo '===== 重命名 ====='
 git branch -m wip-work feature/wip
-git branch`}
-/>
+git branch
+```
 
 <Callout type="tip" title="分支命名约定">
 团队里常见的命名规范：
@@ -188,11 +182,8 @@ git merge feature
 
 跑一遍看差别：
 
-<Playground
-  language="git"
-  title="Fast-forward vs 三方合并"
-  id="git-05-3"
-  code={`echo '################ A. Fast-forward ################'
+```bash title="Fast-forward vs 三方合并"
+echo '################ A. Fast-forward ################'
 git init -q ff && cd ff
 echo 'base' > app.txt && git add . && git commit -q -m "init"
 git switch -qc hotfix
@@ -223,8 +214,8 @@ echo '合并后：'
 git log --oneline --graph --all
 echo '合并提交的两个父提交：'
 git log -1 --format='%h 的父提交是: %p'
-cd ..`}
-/>
+cd ..
+```
 
 注意 B 段输出里的 `Merge made by the 'ort' strategy`。ort 是 Git 2.34 起的默认合并策略（Ostensibly Recursive's Twin），比老的 recursive 更快、对重命名的处理更准。
 

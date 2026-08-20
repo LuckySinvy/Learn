@@ -12,11 +12,8 @@ description: unittest、assert 风格、unittest.mock、参数化
 
 每个测试都是一个**方法名以 `test_` 开头**的方法。
 
-<Playground
-  language="python"
-  id="py-15-unittest-basic"
-  title="unittest 起步"
-  code={`import unittest
+```python title="unittest 起步"
+import unittest
 
 def add(a, b):
     return a + b
@@ -39,9 +36,8 @@ class TestMath(unittest.TestCase):
             divide(1, 0)
 
 # 把 unittest 当主程序跑
-unittest.main(argv=[''], exit=False, verbosity=2)`}
-  expectedOutput={`test_add (__main__.TestMath) ... ok\ntest_divide_by_zero (__main__.TestMath) ... ok\ntest_divide_ok (__main__.TestMath) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK`}
-/>
+unittest.main(argv=[''], exit=False, verbosity=2)
+```
 
 <Callout type="info" title="常用的断言方法">
 - `assertEqual(a, b)` / `assertNotEqual`
@@ -56,11 +52,8 @@ unittest.main(argv=[''], exit=False, verbosity=2)`}
 
 每个测试方法前/后自动调用：
 
-<Playground
-  language="python"
-  id="py-15-setup"
-  title="setUp / tearDown"
-  code={`import unittest
+```python title="setUp / tearDown"
+import unittest
 import tempfile, os
 
 class FileTest(unittest.TestCase):
@@ -85,9 +78,8 @@ class FileTest(unittest.TestCase):
             content = f.read()
         self.assertIn("hello", content)
 
-unittest.main(argv=[''], exit=False, verbosity=2)`}
-  expectedOutput={`test_contains_hello (__main__.FileTest) ... ok\ntest_read_line_count (__main__.FileTest) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK`}
-/>
+unittest.main(argv=[''], exit=False, verbosity=2)
+```
 
 ## 3. 单纯 `assert` 风格（pytest 风格）
 
@@ -120,11 +112,8 @@ def test_add_strings():
 
 不依赖 pytest，也能参数化：
 
-<Playground
-  language="python"
-  id="py-15-subtest"
-  title="subTest 参数化"
-  code={`import unittest
+```python title="subTest 参数化"
+import unittest
 
 def slugify(s):
     return s.lower().strip().replace(" ", "-")
@@ -141,9 +130,8 @@ class TestSlugify(unittest.TestCase):
             with self.subTest(input=input_):
                 self.assertEqual(slugify(input_), expected)
 
-unittest.main(argv=[''], exit=False, verbosity=2)`}
-  expectedOutput={`test_cases (__main__.TestSlugify) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nOK`}
-/>
+unittest.main(argv=[''], exit=False, verbosity=2)
+```
 
 <Callout type="info" title="pytest 的 parametrize 等价">
 ```python
@@ -162,11 +150,8 @@ def test_slugify(input, expected):
 
 测试时不想真发邮件、查数据库、调网络？用 `unittest.mock` 替换掉。
 
-<Playground
-  language="python"
-  id="py-15-mock"
-  title="Mock 替换函数"
-  code={`import unittest
+```python title="Mock 替换函数"
+import unittest
 from unittest.mock import patch, MagicMock
 
 # 被测代码：从一个 dict 拿用户
@@ -193,9 +178,8 @@ class TestGetUserEmail(unittest.TestCase):
 class FakeDB: pass
 db = FakeDB()
 
-unittest.main(argv=[''], exit=False, verbosity=2)`}
-  expectedOutput={`test_existing_user (__main__.TestGetUserEmail) ... ok\ntest_missing_user (__main__.TestGetUserEmail) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK`}
-/>
+unittest.main(argv=[''], exit=False, verbosity=2)
+```
 
 <Callout type="tip" title="Mock 三件套">
 - `@patch("module.func")`：测试期间把 `func` 替换成 MagicMock
@@ -205,11 +189,8 @@ unittest.main(argv=[''], exit=False, verbosity=2)`}
 
 ## 6. 进阶：模拟 `time.sleep`
 
-<Playground
-  language="python"
-  id="py-15-mock-sleep"
-  title="mock 掉 time.sleep"
-  code={`import unittest
+```python title="mock 掉 time.sleep"
+import unittest
 from unittest.mock import patch
 import time
 
@@ -224,19 +205,15 @@ class TestWait(unittest.TestCase):
         wait_then_print()
         mock_sleep.assert_called_once_with(10)
 
-unittest.main(argv=[''], exit=False, verbosity=2)`}
-  expectedOutput={`done!\ntest_does_not_sleep (__main__.TestWait) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nOK`}
-/>
+unittest.main(argv=[''], exit=False, verbosity=2)
+```
 
 ## 🎯 练习
 
 为下面这个 `clamp(x, lo, hi)` 函数（把 `x` 限制在 `[lo, hi]` 区间内）写至少 3 个测试：① 在区间内；② 低于下界；③ 高于上界；④ lo == hi。
 
-<Playground
-  language="python"
-  id="py-15-exercise"
-  title="clamp 测试"
-  code={`import unittest
+```python title="clamp 测试"
+import unittest
 
 def clamp(x, lo, hi):
     if x < lo: return lo
@@ -253,9 +230,8 @@ class TestClamp(unittest.TestCase):
     def test_equal(self):
         pass
 
-unittest.main(argv=[''], exit=False, verbosity=2)`}
-  expectedOutput={`test_above (__main__.TestClamp) ... ok\ntest_below (__main__.TestClamp) ... ok\ntest_equal (__main__.TestClamp) ... ok\ntest_inside (__main__.TestClamp) ... ok\n\n----------------------------------------------------------------------\nRan 4 tests in 0.000s\n\nOK`}
-/>
+unittest.main(argv=[''], exit=False, verbosity=2)
+```
 
 <Callout type="exercise" title="提示">
 - `inside`：`clamp(5, 0, 10) == 5`

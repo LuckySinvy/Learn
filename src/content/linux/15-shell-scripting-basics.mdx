@@ -43,11 +43,8 @@ echo "$NAME"        # 更稳妥：加双引号（后面讲为什么）
 - 变量默认是字符串，没有类型；算术要用 `$(( ))`：`NEXT=$((PORT + 1))`；
 - 命令的输出赋给变量用 `$(命令)`（命令替换）：`TODAY=$(date +%F)`。
 
-<Playground
-  language="linux"
-  title="变量、算术与命令替换"
-  id="linux-15-1"
-  code={`NAME=ada
+```bash title="变量、算术与命令替换"
+NAME=ada
 PORT=8080
 echo "hello, $NAME! port=$PORT"
 
@@ -65,8 +62,8 @@ echo "undefined: [$NOT_SET]"
 
 # 环境变量：export 后子进程才能看到
 export APP_ENV=prod
-bash -c 'echo "child sees: $APP_ENV"'`}
-/>
+bash -c 'echo "child sees: $APP_ENV"'
+```
 
 ## 3. 引号三兄弟：脚本可靠性的分水岭
 
@@ -78,11 +75,8 @@ bash -c 'echo "child sees: $APP_ENV"'`}
 
 为什么"变量要用双引号包住"是铁律：
 
-<Playground
-  language="linux"
-  title="不加引号的惨案现场"
-  id="linux-15-2"
-  code={`FILE='my report.txt'
+```bash title="不加引号的惨案现场"
+FILE='my report.txt'
 touch "$FILE"
 
 echo '$ ls -l $FILE   # 不加引号：被拆成 my 和 report.txt 两个参数'
@@ -102,8 +96,8 @@ echo ''
 echo '$ 通配符也会在不加引号时抢跑：'
 MSG='files: *'
 echo $MSG
-echo "$MSG"`}
-/>
+echo "$MSG"
+```
 
 结论先背再理解：**脚本里的变量引用，默认写 `"$VAR"`**，只有明确需要拆词/通配时才裸写。
 
@@ -152,11 +146,8 @@ fi
 
 bash 还提供增强版 `[[ ]]`：内部不拆词（变量可以不加引号）、支持 `==` 通配匹配和 `=~` 正则。写 bash 专用脚本时推荐 `[[ ]]`，但要理解老脚本里满地的 `[ ]`。
 
-<Playground
-  language="linux"
-  title="if / test 实战：一个部署前检查脚本"
-  id="linux-15-3"
-  code={`cat > check.sh << 'EOF'
+```bash title="if / test 实战：一个部署前检查脚本"
+cat > check.sh << 'EOF'
 #!/bin/bash
 CONF=$1
 
@@ -197,8 +188,8 @@ echo ''
 printf 'env = prod\nport = 80\n' > app.conf
 echo '$ 正常运行：'
 ./check.sh app.conf
-echo "exit code = $?"`}
-/>
+echo "exit code = $?"
+```
 
 注意脚本中的几个细节：`$1` 是第一个命令行参数（下一章详讲）；`exit N` 主动结束脚本并设定退出码——**不同错误用不同退出码**，调用方才能区分失败原因；`grep -q` 静默模式不输出只给退出码，专为条件判断而生。
 

@@ -29,25 +29,19 @@ INNER JOIN：丢弃 order 4        LEFT JOIN：保留 order 4，用户列补 NUL
 
 ### 2.1 INNER JOIN：只保留两边都匹配的行
 
-<Playground
-  language="mysql"
-  id="mysql-09-1"
-  title="INNER JOIN：只留匹配行"
-  code={`SELECT o.order_no, o.total_amount, u.username
+```sql title="INNER JOIN：只留匹配行"
+SELECT o.order_no, o.total_amount, u.username
 FROM orders o
 INNER JOIN users u ON o.user_id = u.id
-WHERE o.status = 1;`}
-/>
+WHERE o.status = 1;
+```
 
 `INNER` 可省略，`JOIN` 默认就是内连接。
 
 ### 2.2 LEFT JOIN：左表全保留，右表没匹配补 NULL
 
-<Playground
-  language="mysql"
-  id="mysql-09-2"
-  title="LEFT JOIN 统计与反连接"
-  code={`-- 所有用户及其订单数（包括从没下过单的用户）
+```sql title="LEFT JOIN 统计与反连接"
+-- 所有用户及其订单数（包括从没下过单的用户）
 SELECT u.id, u.username, COUNT(o.id) AS order_count
 FROM users u
 LEFT JOIN orders o ON o.user_id = u.id
@@ -63,8 +57,8 @@ GROUP BY u.id, u.username;
 SELECT u.id, u.username
 FROM users u
 LEFT JOIN orders o ON o.user_id = u.id
-WHERE o.id IS NULL;`}
-/>
+WHERE o.id IS NULL;
+```
 
 注意 `COUNT(o.id)` 而不是 `COUNT(*)`：没订单的用户，o.id 是 NULL，COUNT(o.id) 正确计为 0；COUNT(*) 会把那行 NULL 也数成 1——上面第二条语句可以直观看到差异。
 
@@ -84,11 +78,8 @@ INNER JOIN 里条件放 ON 或 WHERE 结果一样；LEFT JOIN 里不一样：ON 
 
 亲手跑一遍，对比两者行数差异：
 
-<Playground
-  language="mysql"
-  id="mysql-09-3"
-  title="ON 与 WHERE 的差别"
-  code={`-- 条件放 ON：所有用户都在，没有已支付订单的补 NULL
+```sql title="ON 与 WHERE 的差别"
+-- 条件放 ON：所有用户都在，没有已支付订单的补 NULL
 SELECT u.username, o.order_no, o.status
 FROM users u
 LEFT JOIN orders o ON o.user_id = u.id AND o.status = 1;
@@ -97,18 +88,15 @@ LEFT JOIN orders o ON o.user_id = u.id AND o.status = 1;
 SELECT u.username, o.order_no, o.status
 FROM users u
 LEFT JOIN orders o ON o.user_id = u.id
-WHERE o.status = 1;`}
-/>
+WHERE o.status = 1;
+```
 
 ## 3. 自连接与多表 JOIN
 
 自连接：同一张表用两个别名，当两张表用，分类的父子关系是典型场景；多表 JOIN 则能串起完整业务链路。下面两条一起跑：
 
-<Playground
-  language="mysql"
-  id="mysql-09-4"
-  title="自连接与五表 JOIN 报表"
-  code={`-- 自连接：分类的父子关系
+```sql title="自连接与五表 JOIN 报表"
+-- 自连接：分类的父子关系
 SELECT c.name AS child, p.name AS parent
 FROM categories c
 LEFT JOIN categories p ON c.parent_id = p.id;
@@ -121,8 +109,8 @@ JOIN users u        ON u.id = o.user_id
 JOIN order_items oi ON oi.order_id = o.id
 JOIN products p     ON p.id = oi.product_id
 JOIN categories c   ON c.id = p.category_id
-WHERE o.status IN (1, 2, 3);`}
-/>
+WHERE o.status IN (1, 2, 3);
+```
 
 ## 4. 驱动表与 JOIN 顺序
 

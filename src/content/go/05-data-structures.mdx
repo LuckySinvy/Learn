@@ -29,11 +29,8 @@ fmt.Println(len(s), cap(s))  // 长度、容量
 s2 := s[1:4]                 // 切片 [1,4)
 ```
 
-<Playground
-  language="go"
-  id="go-05-slice"
-  title="切片基本操作"
-  code={`package main
+```go title="切片基本操作"
+package main
 
 import "fmt"
 
@@ -46,9 +43,8 @@ func main() {
     fmt.Println(s[1:3])  // [2 3]
     fmt.Println(s[:2])   // [1 2]
     fmt.Println(s[2:])   // [3 4 5]
-}`}
-  expectedOutput={`[1 2 3 4 5] len: 5 cap: 6\n[2 3]\n[1 2]\n[3 4 5]`}
-/>
+}
+```
 
 <Callout type="warn" title="append 可能生成新底层数组">
 `append` 在容量不足时会分配新数组。引用旧底层数组的切片不会受影响。
@@ -56,11 +52,8 @@ func main() {
 
 ### `make` 创建切片
 
-<Playground
-  language="go"
-  id="go-05-make"
-  title="make 创建"
-  code={`package main
+```go title="make 创建"
+package main
 
 import "fmt"
 
@@ -70,19 +63,15 @@ func main() {
         s = append(s, i*i)
     }
     fmt.Println(s)
-}`}
-  expectedOutput={`[1 4 9 16 25]`}
-/>
+}
+```
 
 ## 3. `map`
 
 无序键值对。**引用类型**，零值是 `nil`（不可直接写入）。
 
-<Playground
-  language="go"
-  id="go-05-map"
-  title="map"
-  code={`package main
+```go title="map"
+package main
 
 import "fmt"
 
@@ -112,17 +101,13 @@ func main() {
 
     delete(m, "Bob")
     fmt.Println("删除后：", len(m), "项")
-}`}
-  expectedOutput={`0\n30\nDave 不存在\nCarol: 28  Alice: 30  Bob: 25  \n删除后： 2 项`}
-/>
+}
+```
 
 ## 4. 结构体（Struct）
 
-<Playground
-  language="go"
-  id="go-05-struct"
-  title="结构体"
-  code={`package main
+```go title="结构体"
+package main
 
 import "fmt"
 
@@ -142,17 +127,13 @@ func main() {
         X, Y int
     }{3, 4}
     fmt.Println(p)
-}`}
-  expectedOutput={`{Alice 30 [vip]}\nAlice\n{3 4}`}
-/>
+}
+```
 
 ## 5. 实战：词频统计
 
-<Playground
-  language="go"
-  id="go-05-wordcount"
-  title="词频统计"
-  code={`package main
+```go title="词频统计"
+package main
 
 import (
     "fmt"
@@ -181,17 +162,13 @@ func main() {
     for _, p := range ss {
         fmt.Printf("%-6s %d\\n", p.Key, p.Count)
     }
-}`}
-  expectedOutput={`the    3\nquick  1\nbrown  1\nfox    1\njumps  1\nover   1\nlazy   1\ndog    1`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-05-exercise"
-  title="去重并保序"
-  code={`// 任务：给定 nums := []int{3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5}
+```go title="去重并保序"
+// 任务：给定 nums := []int{3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5}
 // 输出 []int{3, 1, 4, 5, 9, 2, 6}（保序去重）
 
 package main
@@ -202,8 +179,7 @@ func main() {
     nums := []int{3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5}
     // 补全代码
 }
-`}
-/>
+```
 
 ## 小结
 

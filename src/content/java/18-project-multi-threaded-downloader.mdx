@@ -129,11 +129,8 @@ public class Main {
 
 下面这一份 Playground 把所有类合并到**一个 `Main`**，使用内部类，依然保持清晰的层次。
 
-<Playground
-  language="java"
-  id="java-18-full"
-  title="多线程下载器整合"
-  code={`import java.util.*;
+```java title="多线程下载器整合"
+import java.util.*;
 import java.util.concurrent.*;
 
 public class Main {
@@ -232,9 +229,8 @@ public class Main {
         }
         System.out.printf("%n成功 %d / 失败 %d / 耗时 %.2fs%n", ok, fail, seconds);
     }
-}`}
-  expectedOutput={`=== progress ===\n  [a.txt] 20%\n  [b.txt] 20%\n  [c-fail.txt] 20%\n  [a.txt] 40%\n  [b.txt] 40%\n  [c-fail.txt] 40%\n  [a.txt] 60%\n  [b.txt] 60%\n  [c-fail.txt] 60%\n  [a.txt] 80%\n  [b.txt] 80%\n  [c-fail.txt] 80%\n  [a.txt] 100%\n  [b.txt] 100%\n  [c-fail.txt] 100%\n  [c-fail.txt] 20%\n  [c-fail.txt] 40%\n  [c-fail.txt] 60%\n  [c-fail.txt] 80%\n  [c-fail.txt] 100%\n  [c-fail.txt] 20%\n  [c-fail.txt] 40%\n  [c-fail.txt] 60%\n  [c-fail.txt] 80%\n  [c-fail.txt] 100%\n  [d.txt] 20%\n  [d.txt] 40%\n  [d.txt] 60%\n  [d.txt] 80%\n  [d.txt] 100%\n  [e.txt] 20%\n  [e.txt] 40%\n  [e.txt] 60%\n  [e.txt] 80%\n  [e.txt] 100%\n\n=== results ===\n  ✓ a.txt  <<content of a.txt>>\n  ✓ b.txt  <<content of b.txt>>\n  ✗ c-fail.txt  after 3 retries: simulated 404\n  ✓ d.txt  <<content of d.txt>>\n  ✓ e.txt  <<content of e.txt>>\n\n成功 4 / 失败 1 / 耗时 依赖运行速度 s`}
-/>
+}
+```
 
 > 实际进度顺序因线程调度而异，但 `c-fail.txt` 一定会有**三次**（重试三次）进度输出。
 
@@ -242,11 +238,8 @@ public class Main {
 
 ### 4.1 基础：`Future` 拿到结果
 
-<Playground
-  language="java"
-  id="java-18-future"
-  title="Future 收集结果"
-  code={`import java.util.*;
+```java title="Future 收集结果"
+import java.util.*;
 import java.util.concurrent.*;
 
 public class Main {
@@ -267,17 +260,13 @@ public class Main {
         }
         pool.shutdown();
     }
-}`}
-  expectedOutput={`downloaded a\ndownloaded b\ndownloaded c`}
-/>
+}
+```
 
 ### 4.2 进度回调
 
-<Playground
-  language="java"
-  id="java-18-progress"
-  title="进度回调"
-  code={`import java.util.concurrent.*;
+```java title="进度回调"
+import java.util.concurrent.*;
 
 public class Main {
     public static void main(String[] args) throws Exception {
@@ -293,17 +282,13 @@ public class Main {
         pool.shutdown();
         System.out.println("done, bytes = " + bytes);
     }
-}`}
-  expectedOutput={`  progress: 25%\n  progress: 50%\n  progress: 75%\n  progress: 100%\ndone, bytes = 1024`}
-/>
+}
+```
 
 ### 4.3 失败重试
 
-<Playground
-  language="java"
-  id="java-18-retry"
-  title="失败重试"
-  code={`import java.util.concurrent.atomic.AtomicInteger;
+```java title="失败重试"
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Main {
     public static void main(String[] args) throws Exception {
@@ -327,9 +312,8 @@ public class Main {
             }
         }
     }
-}`}
-  expectedOutput={`尝试第 1 次\n失败: 还没好\n尝试第 2 次\n成功！`}
-/>
+}
+```
 
 <Callout type="tip" title="真实场景的重试要点">
 - 退避策略：**指数退避** + 抖动（`sleep(base * 2^attempt + random)`）
@@ -351,11 +335,8 @@ public class Main {
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-18-exercise"
-  title="限流下载"
-  code={`// 任务：在前面的下载器基础上，给 Downloader 增加
+```java title="限流下载"
+// 任务：在前面的下载器基础上，给 Downloader 增加
 // 「最多同时进行 N 个任务」的能力。
 // 提示：用 Semaphore(N)，每个任务开始前 acquire，结束 release
 // 用 3 个线程但同时只能跑 2 个任务（Semaphore = 2），
@@ -398,8 +379,7 @@ public class Main {
         pool.shutdown();
     }
 }
-`}
-/>
+```
 
 ## 小结
 

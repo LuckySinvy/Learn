@@ -55,11 +55,8 @@ type Readonly<T> = { readonly [K in keyof T]: T[K] };
 当映射的是 `keyof T` 时，TypeScript 会保留原类型的 `readonly` 与 `?` 修饰符（除非你显式增删）。这种映射叫**同态映射**，也是它能正确处理数组和元组的原因——`Partial<string[]>` 得到的还是数组而不是普通对象。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-11-mapped"
-  title="映射类型与修饰符"
-  code={`interface User {
+```ts title="映射类型与修饰符"
+interface User {
   readonly id: number;
   name: string;
   email?: string;
@@ -100,9 +97,8 @@ console.log("惰性求值: " + lazyUser.name() + " " + lazyUser.score());
 // 值类型统一改写
 type Flags<T> = { [K in keyof T]: boolean };
 const dirty: Flags<{ name: string; email: string }> = { name: true, email: false };
-console.log("name 改过? " + dirty.name + "，email 改过? " + dirty.email);`}
-  expectedOutput={`更新后 name = Ada L.，id = 1\n必选版 email = alan@x.com\n可写版 id = 30\n惰性求值: Grace 91\nname 改过? true，email 改过? false`}
-/>
+console.log("name 改过? " + dirty.name + "，email 改过? " + dirty.email);
+```
 
 ## 2. key remapping：改键名
 
@@ -126,11 +122,8 @@ type OnlyStrings<T> = {
 };
 ```
 
-<Playground
-  language="typescript"
-  id="ts-11-remapping"
-  title="key remapping 与键过滤"
-  code={`interface Person {
+```ts title="key remapping 与键过滤"
+interface Person {
   name: string;
   age: number;
   email: string;
@@ -164,9 +157,8 @@ console.log("去掉 email 后: " + Object.keys(noEmail).join(","));
 function summarize(x: Without<Person, "email">): string {
   return x.name + " / " + x.age;
 }
-console.log(summarize(noEmail));`}
-  expectedOutput={`as 原样映射保留全部键: name,age,email\n只剩字符串字段: name,email\n去掉 email 后: name,age\nGrace / 45`}
-/>
+console.log(summarize(noEmail));
+```
 
 ### 2.2 配合模板字面量类型改名
 
@@ -247,11 +239,8 @@ type NoDist<T> = [T] extends [string] ? true : false;
 `ToArray<never>` 的结果是 `never`，而不是 `never[]`。因为 `never` 是「空联合」，分发时没有任何成员可以遍历，结果自然是空。这个行为经常让人一头雾水，遇到「明明写了条件类型却得到 never」时先想想是不是它。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-11-conditional"
-  title="条件类型与分发"
-  code={`// 基本条件类型
+```ts title="条件类型与分发"
+// 基本条件类型
 type IsString<T> = T extends string ? true : false;
 
 const yes: IsString<"hi"> = true;
@@ -290,17 +279,13 @@ console.log(alarm("warn"));
 type NoDist<T> = [T] extends [string] ? "全是字符串" : "不全是";
 const r1: NoDist<string> = "全是字符串";
 const r2: NoDist<string | number> = "不全是";
-console.log(r1 + " / " + r2);`}
-  expectedOutput={`IsString 字符串 = true，数字 = false\n分发结果可以装字符串: 文本\n也可以装数字: 42\n严重级别: error，安静级别: debug\n触发告警: warn\n全是字符串 / 不全是`}
-/>
+console.log(r1 + " / " + r2);
+```
 
 ## 4. infer 实战
 
-<Playground
-  language="typescript"
-  id="ts-11-infer"
-  title="用 infer 拆解类型"
-  code={`// 1) 取函数返回类型
+```ts title="用 infer 拆解类型"
+// 1) 取函数返回类型
 type ReturnOf<F> = F extends (...args: any[]) => infer R ? R : never;
 
 function loadUser(id: number) {
@@ -350,9 +335,8 @@ type Cached<F> = F extends (...args: infer P) => infer R
 
 const cachedSend: Cached<typeof send> = (url, retries, silent) =>
   send(url, retries, silent);
-console.log(cachedSend("/api/ping", 1, false));`}
-  expectedOutput={`从函数推出的类型: Ada / admin\n/api/user 重试 3 次（静默）\n涂上green\n第一项是字符串，剩下 2 项: 7,false\n/api/ping 重试 1 次`}
-/>
+console.log(cachedSend("/api/ping", 1, false));
+```
 
 ## 5. 组合起来看内置工具类型
 

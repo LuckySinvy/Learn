@@ -23,11 +23,8 @@ curl -X POST -H 'Content-Type: application/json' -d '{"name":"ada"}' https://api
 curl -s -w '%{http_code}\n' -o /dev/null https://example.com   # 只要状态码（健康检查）
 ```
 
-<Playground
-  language="linux"
-  title="本地起服务，curl 完整体验"
-  id="linux-14-1"
-  code={`# 用 python 在 127.0.0.1:8000 起一个静态文件服务
+```bash title="本地起服务，curl 完整体验"
+# 用 python 在 127.0.0.1:8000 起一个静态文件服务
 mkdir -p www
 echo '{"service":"demo","status":"ok"}' > www/health.json
 echo '<h1>hello</h1>' > www/index.html
@@ -47,18 +44,15 @@ echo '$ 只取状态码（脚本健康检查的标准写法）：'
 curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/index.html
 echo ''
 curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/missing.html
-echo ' <- 404'`}
-/>
+echo ' <- 404'
+```
 
 <Callout type="tip" title="curl 配 jq：接口调试黄金组合">
 JSON 接口的返回配合 jq 格式化与提取：`curl -s api/users | jq .`（美化全文）、`| jq '.data[0].name'`（取字段）、`| jq length`（数组长度）。jq 沙箱已预装，值得单独花一小时学。
 </Callout>
 
-<Playground
-  language="linux"
-  title="curl + jq 处理 JSON 接口"
-  id="linux-14-2"
-  code={`mkdir -p www && cd www
+```bash title="curl + jq 处理 JSON 接口"
+mkdir -p www && cd www
 cat > users.json << 'EOF'
 {"code":0,"data":[{"id":1,"name":"ada","role":"admin"},{"id":2,"name":"bob","role":"dev"}]}
 EOF
@@ -76,8 +70,8 @@ echo '$ 提取所有用户名：'
 curl -s http://127.0.0.1:8001/users.json | jq -r '.data[].name'
 
 echo '$ 过滤 role 为 admin 的：'
-curl -s http://127.0.0.1:8001/users.json | jq '.data[] | select(.role == "admin")'`}
-/>
+curl -s http://127.0.0.1:8001/users.json | jq '.data[] | select(.role == "admin")'
+```
 
 ## 2. 端口检查：ss 与 netstat
 
@@ -91,11 +85,8 @@ netstat -tlnp   # 老系统等价写法
 
 输出关键看两列：`Local Address:Port`（0.0.0.0:80 表示监听所有网卡，127.0.0.1:3306 表示只有本机能连——这是"本机能连、外面连不上"的头号原因）和进程名。
 
-<Playground
-  language="linux"
-  title="netstat 观察监听端口"
-  id="linux-14-3"
-  code={`# 起两个服务：一个只绑回环，一个绑所有地址
+```bash title="netstat 观察监听端口"
+# 起两个服务：一个只绑回环，一个绑所有地址
 mkdir -p www && cd www && echo ok > ping.txt
 python3 -m http.server 9001 --bind 127.0.0.1 > /dev/null 2>&1 &
 python3 -m http.server 9002 --bind 0.0.0.0 > /dev/null 2>&1 &
@@ -110,8 +101,8 @@ echo '$ 验证连通性：'
 curl -s -o /dev/null -w '9001 -> %{http_code}' http://127.0.0.1:9001/ping.txt
 echo ''
 curl -s -o /dev/null -w '9002 -> %{http_code}' http://127.0.0.1:9002/ping.txt
-echo ''`}
-/>
+echo ''
+```
 
 ## 3. ping：连通性第一步
 

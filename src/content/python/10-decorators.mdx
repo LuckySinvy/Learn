@@ -12,11 +12,8 @@ description: 函数装饰器、functools.wraps、带参装饰器、堆叠与类�
 
 Python 中函数是对象：可以赋值给变量、作为参数传递、作为返回值。
 
-<Playground
-  language="python"
-  id="py-10-first-class"
-  title="函数是一等公民"
-  code={`def add(a, b):
+```python title="函数是一等公民"
+def add(a, b):
     return a + b
 
 # 函数赋给变量
@@ -36,19 +33,15 @@ def make_greeter(prefix):
     return greeter
 
 hi = make_greeter("Hi")
-print(hi("Alice"))`}
-  expectedOutput={`8\n30\nHi, Alice!`}
-/>
+print(hi("Alice"))
+```
 
 ## 2. 第一个装饰器
 
 装饰器本质上是一个**接收函数、返回函数**的可调用对象。
 
-<Playground
-  language="python"
-  id="py-10-decorator-basic"
-  title="手写装饰器"
-  code={`import time
+```python title="手写装饰器"
+import time
 
 def timer(func):
     """统计函数耗时的装饰器"""
@@ -67,9 +60,8 @@ def slow_sum(n):
         total += i
     return total
 
-print("结果:", slow_sum(100000))`}
-  expectedOutput={`[slow_sum] 耗时 0.0010s\n结果: 4999950000`}
-/>
+print("结果:", slow_sum(100000))
+```
 
 执行 `@timer` 等价于 `slow_sum = timer(slow_sum)`，所以 `slow_sum` 之后指向的是 `wrapper`。
 
@@ -77,11 +69,8 @@ print("结果:", slow_sum(100000))`}
 
 不写 `@functools.wraps` 会让被装饰函数的 `__name__`、`__doc__`、`__module__` 全部变成 `wrapper` 的——调试和文档都乱套。
 
-<Playground
-  language="python"
-  id="py-10-wraps"
-  title="functools.wraps 的作用"
-  code={`from functools import wraps
+```python title="functools.wraps 的作用"
+from functools import wraps
 
 # 没加 wraps 的版本
 def bad_timer(func):
@@ -107,9 +96,8 @@ def f2(x):
     return x
 
 print("bad  f1.__name__:", f1.__name__, " | doc:", f1.__doc__)
-print("good f2.__name__:", f2.__name__, " | doc:", f2.__doc__)`}
-  expectedOutput={`bad  f1.__name__: wrapper  | doc: None\ngood f2.__name__: f2  | doc: 这是 f2 的文档`}
-/>
+print("good f2.__name__:", f2.__name__, " | doc:", f2.__doc__)
+```
 
 <Callout type="tip" title="wraps 的本质">
 `@wraps(func)` 等价于 `wrapper.__name__ = func.__name__`、`wrapper.__doc__ = func.__doc__` 等一系列赋值。调试、签名检查（`inspect.signature`）都依赖这些。
@@ -119,11 +107,8 @@ print("good f2.__name__:", f2.__name__, " | doc:", f2.__doc__)`}
 
 要写一个**可配置**的装饰器，再嵌套一层：
 
-<Playground
-  language="python"
-  id="py-10-decorator-factory"
-  title="@repeat(n) 装饰器"
-  code={`from functools import wraps
+```python title="@repeat(n) 装饰器"
+from functools import wraps
 
 def repeat(n):
     """把函数结果重复 n 次（用列表返回）"""
@@ -138,9 +123,8 @@ def repeat(n):
 def greet(name):
     return f"Hello, {name}!"
 
-print(greet("Alice"))`}
-  expectedOutput={`['Hello, Alice!', 'Hello, Alice!', 'Hello, Alice!']`}
-/>
+print(greet("Alice"))
+```
 
 执行顺序：`@repeat(3)` 先调用 → 返回 `decorator` → `decorator(greet)` 返回 `wrapper`。三层层叠，记住这个模板就够用。
 
@@ -148,11 +132,8 @@ print(greet("Alice"))`}
 
 多个装饰器**自下而上**应用：
 
-<Playground
-  language="python"
-  id="py-10-stack"
-  title="堆叠装饰器"
-  code={`from functools import wraps
+```python title="堆叠装饰器"
+from functools import wraps
 
 def bold(func):
     @wraps(func)
@@ -172,17 +153,13 @@ def greet(name):
     return f"Hi, {name}"
 
 # 实际等价于 greet = bold(italic(greet))
-print(greet("Alice"))`}
-  expectedOutput={`<b><i>Hi, Alice</i></b>`}
-/>
+print(greet("Alice"))
+```
 
 ## 6. 实用装饰器三件套
 
-<Playground
-  language="python"
-  id="py-10-retry"
-  title="@retry 失败重试"
-  code={`import random
+```python title="@retry 失败重试"
+import random
 from functools import wraps
 import time
 
@@ -214,15 +191,11 @@ random.seed(42)
 try:
     print(flaky())
 except RuntimeError as e:
-    print("最终失败:", e)`}
-  expectedOutput={`  第 1 次失败: 随机失败\n  第 2 次失败: 随机失败\n  第 3 次失败: 随机失败\n成功！`}
-/>
+    print("最终失败:", e)
+```
 
-<Playground
-  language="python"
-  id="py-10-validate"
-  title="@validate_types 类型校验"
-  code={`from functools import wraps
+```python title="@validate_types 类型校验"
+from functools import wraps
 
 def validate_types(**expected):
     """按签名校验关键字参数类型"""
@@ -244,19 +217,15 @@ print(register(name="Alice", age=30))
 try:
     register(name="Bob", age="三十")
 except TypeError as e:
-    print("校验失败:", e)`}
-  expectedOutput={`Alice 已注册（30 岁）\n校验失败: age 应为 int, 收到 str`}
-/>
+    print("校验失败:", e)
+```
 
 ## 7. 类装饰器
 
 装饰器不一定非得是函数。**任何接收函数并返回可调用对象的东西**都是装饰器。
 
-<Playground
-  language="python"
-  id="py-10-class-decorator"
-  title="用类实现的装饰器：调用计数"
-  code={`from functools import wraps
+```python title="用类实现的装饰器：调用计数"
+from functools import wraps
 
 class CountCalls:
     """统计函数被调用几次"""
@@ -277,9 +246,8 @@ def hello(name):
 print(hello("Alice"))
 print(hello("Bob"))
 print(hello("Carol"))
-print("总调用次数:", hello.count)`}
-  expectedOutput={`[hello] 第 1 次调用\n[hello] 第 2 次调用\n[hello] 第 3 次调用\nHi, Alice\nHi, Bob\nHi, Carol\n总调用次数: 3`}
-/>
+print("总调用次数:", hello.count)
+```
 
 <Callout type="info" title="带参的类装饰器">
 要"带参"的类装饰器，外面再包一层函数即可（和带参函数装饰器一样）：
@@ -294,11 +262,8 @@ def CountCalls(max_count=10):
 
 实现一个 `@cached` 装饰器：相同参数第二次调用时**直接返回上次结果**，不再执行函数。用字典以参数元组作 key 存储。
 
-<Playground
-  language="python"
-  id="py-10-exercise"
-  title="@cached 缓存装饰器"
-  code={`from functools import wraps
+```python title="@cached 缓存装饰器"
+from functools import wraps
 
 def cached(func):
     # 补全
@@ -313,9 +278,8 @@ def slow_square(x):
 print(slow_square(4))   # 真的计算
 print(slow_square(4))   # 命中缓存
 print(slow_square(5))   # 真的计算
-print(slow_square(5))   # 命中缓存`}
-  expectedOutput={`  正在计算 4*4 ...\n16\n16\n  正在计算 5*5 ...\n25\n25`}
-/>
+print(slow_square(5))   # 命中缓存
+```
 
 <Callout type="exercise" title="提示">
 内部维护 `cache = {}`，key 用 `(*args, sorted(kwargs.items()))` 这样就能区分位置参数和关键字参数。返回前把结果存进字典。

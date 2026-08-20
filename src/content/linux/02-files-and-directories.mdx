@@ -18,11 +18,8 @@ touch note.txt          # 文件不存在则创建空文件；已存在则只更
 
 `mkdir -p` 是实际工作里的标准姿势：它既能一次建多层，又不会因目录已存在而报错，脚本里可以放心重复执行（这种"重复执行结果一致"的性质叫**幂等**）。
 
-<Playground
-  language="linux"
-  title="mkdir 与 touch"
-  id="linux-02-1"
-  code={`echo '$ mkdir -p app/src app/config app/logs'
+```bash title="mkdir 与 touch"
+echo '$ mkdir -p app/src app/config app/logs'
 mkdir -p app/src app/config app/logs
 
 echo '$ touch app/src/main.py app/config/dev.yaml'
@@ -37,8 +34,8 @@ echo '$ mkdir x/y/z'
 mkdir x/y/z || echo '失败了：父目录 x/y 不存在'
 
 echo '$ mkdir -p x/y/z && tree x'
-mkdir -p x/y/z && tree x`}
-/>
+mkdir -p x/y/z && tree x
+```
 
 ## 2. 复制：cp
 
@@ -66,11 +63,8 @@ mv docs archive          # 目录同理：archive 不存在则是改名
 
 `mv` 与 `cp` 不同，移动目录**不需要** `-r`；同一文件系统内 `mv` 只是改目录项，瞬间完成，与文件大小无关。
 
-<Playground
-  language="linux"
-  title="cp 与 mv 实战"
-  id="linux-02-2"
-  code={`mkdir -p site/css
+```bash title="cp 与 mv 实战"
+mkdir -p site/css
 echo 'body: none' > site/style.css
 echo '<h1>hi</h1>' > site/index.html
 
@@ -94,8 +88,8 @@ echo 'v2' > new.txt
 echo 'v1' > old.txt
 cp -n new.txt old.txt
 echo '$ cat old.txt  # 仍是 v1，-n 阻止了覆盖'
-cat old.txt`}
-/>
+cat old.txt
+```
 
 ## 4. 删除：rm 与 rmdir
 
@@ -129,11 +123,8 @@ rmdir empty_dir          # 只能删空目录，删非空目录会报错（更�
 | `[0-9]` | 范围 | `log[0-9].txt` |
 | `{a,b}` | 花括号展开（不算 glob，但常配合用） | `cp app.{yaml,yaml.bak}` |
 
-<Playground
-  language="linux"
-  title="通配符实战"
-  id="linux-02-3"
-  code={`mkdir -p logs
+```bash title="通配符实战"
+mkdir -p logs
 touch logs/app.log logs/app.log.1 logs/app.log.2
 touch logs/error.log logs/access.log logs/readme.md
 
@@ -154,8 +145,8 @@ echo logs/*.log
 mkdir archive
 mv logs/*.log archive/
 echo '--- 移动后 ---'
-tree logs archive`}
-/>
+tree logs archive
+```
 
 理解"**Shell 先展开、命令后执行**"很重要：`rm *.log` 里 rm 收到的不是 `*.log` 这个模式，而是展开后的一串文件名。如果没有任何匹配，bash 默认把 `*.log` 原样传给命令（通常导致"文件不存在"报错）。
 

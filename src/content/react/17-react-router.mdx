@@ -37,11 +37,8 @@ function App() {
 
 React Router 把模式编译成正则：`/users/:id` 变成 `^/users/([^/]+)$`，再按参数名把捕获组回填。亲手写一个最小版本就一目了然：
 
-<Playground
-  language="typescript"
-  title="手写路由匹配器：模式编译与优先级排序"
-  id="react-17-1"
-  code={`type Params = Record<string, string>;
+```ts title="手写路由匹配器：模式编译与优先级排序"
+type Params = Record<string, string>;
 
 // 把 "/users/:id" 这种模式编译成正则 + 参数名列表
 function compile(pattern: string): { regex: RegExp; keys: string[] } {
@@ -88,9 +85,8 @@ patterns.forEach((p) => { console.log("  " + p + "  score=" + score(p) + "  matc
 const winner = patterns
   .filter((p) => match(p, "/users/new") !== null)
   .sort((a, b) => score(b) - score(a))[0];
-console.log("胜出的是: " + winner + "  <- 静态段最具体，不会被 :id 抢走");`}
-  expectedOutput={`== 基本匹配 ==\n/users/:id  vs  /users/42        -> {"id":"42"}\n/posts/:pid/comments/:cid        -> {"pid":"3","cid":"7"}\n/posts/:pid vs  /users/42        -> null\n/files/*    vs  /files/a/b.txt   -> {"*":"a/b.txt"}\n== 访问 /users/new，三个模式都能匹配 ==\n  /users/*  score=11  match={"*":"new"}\n  /users/:id  score=13  match={"id":"new"}\n  /users/new  score=20  match={}\n胜出的是: /users/new  <- 静态段最具体，不会被 :id 抢走`}
-/>
+console.log("胜出的是: " + winner + "  <- 静态段最具体，不会被 :id 抢走");
+```
 
 打分排序这一步很关键：路由表的**书写顺序不重要**，React Router 会按具体程度排序后再匹配。这就是为什么 `/users/new` 不会被 `/users/:id` 误吞——你不需要小心翼翼地调整顺序（这一点和 Express 等按顺序匹配的服务端框架相反）。
 
@@ -136,11 +132,8 @@ function RootLayout() {
 
 所以一个 URL 匹配出的不是"一个组件"，而是**一条组件链**：
 
-<Playground
-  language="typescript"
-  title="嵌套路由匹配：从 URL 到组件链"
-  id="react-17-2"
-  code={`// 嵌套路由：URL 匹配出的不是"一个组件"，而是"一条组件链"
+```ts title="嵌套路由匹配：从 URL 到组件链"
+// 嵌套路由：URL 匹配出的不是"一个组件"，而是"一条组件链"
 type Route = { path: string; component: string; children?: Route[] };
 
 const routes: Route[] = [
@@ -209,9 +202,8 @@ if (a !== null && b !== null) {
   console.log("组件链是否相同: " + String(a.chain.join(">") === b.chain.join(">")));
   console.log("变化的只有 params: " + JSON.stringify(a.params) + " -> " + JSON.stringify(b.params));
   console.log("外层 RootLayout / UsersLayout 状态保留，UserProfile 拿到新 id 更新");
-}`}
-  expectedOutput={`/  ->  RootLayout > Home  params={}\n/about  ->  RootLayout > About  params={}\n/users  ->  RootLayout > UsersLayout > UserList  params={}\n/users/42  ->  RootLayout > UsersLayout > UserProfile  params={"id":"42"}\n/nope  ->  404\n== 切换 /users/42 -> /users/7 时会发生什么 ==\n组件链是否相同: true\n变化的只有 params: {"id":"42"} -> {"id":"7"}\n外层 RootLayout / UsersLayout 状态保留，UserProfile 拿到新 id 更新`}
-/>
+}
+```
 
 最后那段输出点出了嵌套路由最大的实用价值：**外层复用**。从 `/users/42` 切到 `/users/7`，组件链完全相同，React 按第 2 章的协调规则复用这些节点——侧栏的滚动位置、展开状态全部保留，只有 `UserProfile` 因为 params 变化而更新。
 
@@ -274,11 +266,8 @@ function TodoList() {
 
 `setParams` 默认是 push（进历史）；输入框实时搜索这种高频更新要传 `{ replace: true }`，否则用户敲十个字符就在历史里塞了十条记录，后退键彻底不可用：
 
-<Playground
-  language="typescript"
-  title="手写 mini history：push、replace 与后退语义"
-  id="react-17-3"
-  code={`// URL 就是状态：把筛选条件放进 search params，而不是 useState
+```ts title="手写 mini history：push、replace 与后退语义"
+// URL 就是状态：把筛选条件放进 search params，而不是 useState
 // 这里手写一个 mini history + searchParams，体会"可分享、可后退"的含义
 type Entry = { path: string; search: string };
 
@@ -359,9 +348,8 @@ history.replace("/todos?status=active&page=1&q=react");
 render(history);
 console.log("后退一次就回到列表初始态，而不是逐字符回退：");
 history.back();
-render(history);`}
-  expectedOutput={`用户打开列表页\n  URL /todos\n     界面渲染: 状态=all 第1页\n点了筛选 active（push：进历史，可后退）\n  URL /todos?status=active&page=1\n     界面渲染: 状态=active 第1页\n翻到第 2 页\n  URL /todos?status=active&page=2\n     界面渲染: 状态=active 第2页\n按浏览器后退\n  URL /todos?status=active&page=1\n     界面渲染: 状态=active 第1页\n再后退\n  URL /todos\n     界面渲染: 状态=all 第1页\n前进\n  URL /todos?status=active&page=1\n     界面渲染: 状态=active 第1页\n输入框实时搜索用 replace（不污染历史，避免后退要按十几次）\n  URL /todos?status=active&page=1&q=re\n     界面渲染: 状态=active 第1页\n  URL /todos?status=active&page=1&q=react\n     界面渲染: 状态=active 第1页\n后退一次就回到列表初始态，而不是逐字符回退：\n  URL /todos\n     界面渲染: 状态=all 第1页`}
-/>
+render(history);
+```
 
 这个 mini history 就是浏览器 `history.pushState` / `replaceState` 的行为模型：一个带游标的栈，push 会截断前进分支。React Router 在其上包了一层订阅机制，URL 变化时通知组件重渲染。
 

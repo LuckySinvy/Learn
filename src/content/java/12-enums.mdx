@@ -10,11 +10,8 @@ description: enum 基础、字段/方法/构造器、接口实现、values/value
 
 ## 1. 最简单的枚举
 
-<Playground
-  language="java"
-  id="java-12-basic"
-  title="基础枚举"
-  code={`public class Main {
+```java title="基础枚举"
+public class Main {
     enum Color { RED, GREEN, BLUE }
 
     public static void main(String[] args) {
@@ -32,9 +29,8 @@ description: enum 基础、字段/方法/构造器、接口实现、values/value
         Color g = Color.valueOf("GREEN");
         System.out.println("valueOf(GREEN) = " + g);
     }
-}`}
-  expectedOutput={`c = RED\nordinal = 0\nname = RED\n  RED (ord=0)\n  GREEN (ord=1)\n  BLUE (ord=2)\nvalueOf(GREEN) = GREEN`}
-/>
+}
+```
 
 <Callout type="tip" title="switch 用枚举">
 Java 14+ switch 表达式对枚举特别优雅：
@@ -51,11 +47,8 @@ String cn = switch (c) {
 
 枚举可以有**字段、构造器、方法**——但构造器必须是 `private`（或默认）。
 
-<Playground
-  language="java"
-  id="java-12-fields"
-  title="枚举字段"
-  code={`public class Main {
+```java title="枚举字段"
+public class Main {
     enum Planet {
         MERCURY(3.30e23, 2.44e6),
         EARTH  (5.97e24, 6.37e6),
@@ -80,19 +73,15 @@ String cn = switch (c) {
             System.out.printf("%-7s gravity = %.2f m/s²%n", p, p.surfaceGravity());
         }
     }
-}`}
-  expectedOutput={`MERCURY gravity = 3.70 m/s²\nEARTH   gravity = 9.80 m/s²\nJUPITER gravity = 24.79 m/s²`}
-/>
+}
+```
 
 ## 3. 枚举实现接口
 
 枚举常量可以**分别**实现抽象方法——这是 enum 最强大的特性之一。
 
-<Playground
-  language="java"
-  id="java-12-interface"
-  title="枚举实现接口"
-  code={`public class Main {
+```java title="枚举实现接口"
+public class Main {
     interface Operation {
         double apply(double a, double b);
         String symbol();
@@ -124,17 +113,13 @@ String cn = switch (c) {
             }
         }
     }
-}`}
-  expectedOutput={`10.0 + 3.0 = 13.00\n10.0 - 3.0 = 7.00\n10.0 * 3.0 = 30.00\n10.0 / 3.0 = 3.33`}
-/>
+}
+```
 
 ## 4. 常用方法：`values()` / `valueOf()` / `ordinal()`
 
-<Playground
-  language="java"
-  id="java-12-methods"
-  title="枚举 API"
-  code={`public class Main {
+```java title="枚举 API"
+public class Main {
     enum Status {
         NEW, IN_PROGRESS, DONE, CANCELED
     }
@@ -156,9 +141,8 @@ String cn = switch (c) {
         // compareTo：按 ordinal 比
         System.out.println("NEW compareTo DONE = " + Status.NEW.compareTo(Status.DONE));
     }
-}`}
-  expectedOutput={`count = 4\nvalueOf = DONE\n  NEW = 0\n  IN_PROGRESS = 1\n  DONE = 2\n  CANCELED = 3\nNEW compareTo DONE = -2`}
-/>
+}
+```
 
 <Callout type="warn" title="别用 ordinal() 当持久化字段">
 `ordinal()` 是声明顺序——一旦调整枚举顺序就乱。数据库或文件里存**名字**或**显式 code**，不要存 `ordinal`。
@@ -169,11 +153,8 @@ String cn = switch (c) {
 - `EnumSet`：枚举的**高性能 Set**，底层是位向量
 - `EnumMap`：以枚举为 Key 的**专用 Map**
 
-<Playground
-  language="java"
-  id="java-12-collections"
-  title="EnumSet & EnumMap"
-  code={`import java.util.*;
+```java title="EnumSet & EnumMap"
+import java.util.*;
 
 public class Main {
     enum Day { MON, TUE, WED, THU, FRI, SAT, SUN }
@@ -197,9 +178,8 @@ public class Main {
             System.out.printf("  %s: %s%n", d, todos.getOrDefault(d, "休息"));
         }
     }
-}`}
-  expectedOutput={`工作日: [MON, TUE, WED, THU, FRI]\n周末:   [SAT, SUN]\n  MON: 周会\n  WED: 代码评审\n  FRI: 周报\n  TUE: 休息\n  THU: 休息\n  SAT: 休息\n  SUN: 休息`}
-/>
+}
+```
 
 <Callout type="tip" title="为什么 EnumSet/EnumMap 更快">
 `EnumSet` 内部用一个 `long`（最多 64 个枚举）位掩码表示集合，操作是位运算，**O(1)** 完成 add/remove/contains。`HashSet` 至少需要算 hash。
@@ -209,11 +189,8 @@ public class Main {
 
 枚举天生适合实现有限状态机：每个状态自己知道「下一个合法状态」。
 
-<Playground
-  language="java"
-  id="java-12-fsm"
-  title="订单状态机"
-  code={`import java.util.*;
+```java title="订单状态机"
+import java.util.*;
 
 public class Main {
     enum OrderState {
@@ -244,17 +221,13 @@ public class Main {
         System.out.println("after pay = " + s);
         System.out.println("PAID -> SHIPPED? " + s.canTransitTo(OrderState.SHIPPED));
     }
-}`}
-  expectedOutput={`start = CREATED\nCREATED -> PAID? true\nCREATED -> SHIPPED? false\nafter pay = PAID\nPAID -> SHIPPED? true`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-12-exercise"
-  title="交通灯状态机"
-  code={`// 任务：实现交通灯状态机
+```java title="交通灯状态机"
+// 任务：实现交通灯状态机
 // - 三种状态 RED, GREEN, YELLOW
 // - 每个状态有 duration(int 秒) 和 next() 返回下一个状态
 // - 转换顺序：RED -> GREEN -> YELLOW -> RED
@@ -284,8 +257,7 @@ public class Main {
         // 补全：从 RED 出发连续转 3 次并打印
     }
 }
-`}
-/>
+```
 
 ## 小结
 

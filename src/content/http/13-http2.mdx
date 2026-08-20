@@ -48,11 +48,8 @@ description: 帧结构、流与多路复用、HPACK 头部压缩、服务器推�
 
 亲手构造并解析一个 DATA 帧：
 
-<Playground
-  language="http"
-  title="手工构造与解析 HTTP/2 帧"
-  id="http-13-1"
-  code={`python3 -c '
+```http title="手工构造与解析 HTTP/2 帧"
+python3 -c '
 import struct
 
 FRAME_TYPES = {0: "DATA", 1: "HEADERS", 3: "RST_STREAM", 4: "SETTINGS",
@@ -84,8 +81,8 @@ while pos < len(wire):
     print("帧:", ftype, "| 流ID:", sid, "| flags:", hex(flags),
           "| 载荷:", payload if ftype == "DATA" else payload.hex())
     pos += 9 + length
-'`}
-/>
+'
+```
 
 看到了吗：流 1 和流 3 的帧在同一条字节流里**交错**，接收端靠流 ID 各归各位。管线化做不到的"乱序返回"，在这里天然成立。
 
@@ -99,11 +96,8 @@ HTTP/1.x 的头部是明文重复发送的：同一页面 100 个请求，`User-
 
 用实验感受索引机制的威力：
 
-<Playground
-  language="http"
-  title="模拟 HPACK：重复头从几百字节变一字节"
-  id="http-13-2"
-  code={`python3 -c '
+```http title="模拟 HPACK：重复头从几百字节变一字节"
+python3 -c '
 # 简化模拟：首次全量 + 入表，之后只发 1 字节索引
 headers = [
     ("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X) Chrome/126.0"),
@@ -130,8 +124,8 @@ for i in range(1, 101):
 
 print()
 print("100 个请求节省:", round(100 - total_hpack * 100 / total_raw), "%")
-'`}
-/>
+'
+```
 
 第一个请求之后，这三个头每次只花 3 字节。真实 HPACK 还有静态表和哈夫曼，压缩率更高。这就是"HTTP/2 对请求头大户（移动端、重 Cookie 站点）收益最大"的原因。
 

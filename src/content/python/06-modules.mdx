@@ -16,19 +16,15 @@ from math import sqrt       # 引入特定函数
 from math import pi as PI   # 引入并重命名
 ```
 
-<Playground
-  language="python"
-  id="py-06-import"
-  title="import 用法"
-  code={`import math
+```python title="import 用法"
+import math
 from math import sqrt
 from math import pi as PI
 
 print(math.ceil(3.2))       # 4
 print(sqrt(16))              # 4.0
-print(PI)                    # 3.14159...`}
-  expectedOutput={`4\n4.0\n3.141592653589793`}
-/>
+print(PI)                    # 3.14159...
+```
 
 ## 2. `__name__ == "__main__"`
 
@@ -50,46 +46,34 @@ if __name__ == "__main__":
 
 ### 3.1 `random`
 
-<Playground
-  language="python"
-  id="py-06-random"
-  title="random"
-  code={`import random
+```python title="random"
+import random
 print(random.random())             # [0,1) 浮点
 print(random.randint(1, 6))        # 1~6 整数
 print(random.choice(["A", "B", "C"]))   # 随机选一个
 random.seed(42)                    # 固定种子，结果可复现
-print([random.randint(1, 100) for _ in range(5)])`}
-  expectedOutput={`0.6394267984578837\n1\nB\n[82, 15, 4, 95, 36]`}
-/>
+print([random.randint(1, 100) for _ in range(5)])
+```
 
 ### 3.2 `math`
 
-<Playground
-  language="python"
-  id="py-06-math"
-  title="math"
-  code={`import math
+```python title="math"
+import math
 print(math.pi, math.e)
 print(math.factorial(6))      # 720
 print(math.gcd(12, 18))       # 6
-print(math.log(100, 10))      # 2.0（以10为底的对数）`}
-  expectedOutput={`3.141592653589793 2.718281828459045\n720\n6\n2.0`}
-/>
+print(math.log(100, 10))      # 2.0（以10为底的对数）
+```
 
 ### 3.3 `datetime`
 
-<Playground
-  language="python"
-  id="py-06-datetime"
-  title="datetime"
-  code={`from datetime import datetime, timedelta
+```python title="datetime"
+from datetime import datetime, timedelta
 now = datetime.now()
 print(now)
 print(now.strftime("%Y-%m-%d %H:%M:%S"))
-print((now + timedelta(days=7)).strftime("%Y-%m-%d"))`}
-  expectedOutput={`包含当前时间的一行\n格式化的当前时间\n7 天后的日期`}
-/>
+print((now + timedelta(days=7)).strftime("%Y-%m-%d"))
+```
 
 ### 3.4 `os` 与 `sys`
 
@@ -115,11 +99,8 @@ pip list
 
 ## 5. 实战：随机密码生成器
 
-<Playground
-  language="python"
-  id="py-06-pwd"
-  title="随机密码生成"
-  code={`import random
+```python title="随机密码生成"
+import random
 import string
 
 def gen_password(length=12):
@@ -128,17 +109,13 @@ def gen_password(length=12):
 
 random.seed(0)  # 让结果可复现
 for _ in range(3):
-    print(gen_password(10))`}
-  expectedOutput={`Vx7#9Lp!2N\nmK4@tQwR8z\n8gH!2pL$5Y`}
-/>
+    print(gen_password(10))
+```
 
 ## 🎯 练习
 
-<Playground
-  language="python"
-  id="py-06-exercise"
-  title="骰子模拟器"
-  code={`# 任务：模拟掷 1000 次六面骰子，统计每个点数出现的次数与频率
+```python title="骰子模拟器"
+# 任务：模拟掷 1000 次六面骰子，统计每个点数出现的次数与频率
 # 期望输出类似：
 #   1: 168  0.168
 #   2: 159  0.159
@@ -150,8 +127,7 @@ counts = {i: 0 for i in range(1, 7)}
 for _ in range(1000):
     pass
 # 输出统计
-`}
-/>
+```
 
 ## 小结
 

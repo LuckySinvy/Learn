@@ -24,11 +24,8 @@ description: 内置注解、自定义注解、@Target/@Retention、通过反射�
 | `@FunctionalInterface` | 标记函数式接口（只能有一个抽象方法） |
 | `@SafeVarargs` | 泛型可变参数无堆污染 |
 
-<Playground
-  language="java"
-  id="java-11-builtin"
-  title="内置注解"
-  code={`public class Main {
+```java title="内置注解"
+public class Main {
     static class Animal {
         @Deprecated(since = "1.5", forRemoval = true)
         void oldSpeak() { System.out.println("v1 叫"); }
@@ -53,9 +50,8 @@ description: 内置注解、自定义注解、@Target/@Retention、通过反射�
         d.speak();
         rawList();
     }
-}`}
-  expectedOutput={`汪\nraw = [x]`}
-/>
+}
+```
 
 <Callout type="tip" title="看到 @Deprecated 该怎么办">
 编译器只会**警告**，不会报错。但 IDE 会划删除线提示。生产代码应：
@@ -68,11 +64,8 @@ description: 内置注解、自定义注解、@Target/@Retention、通过反射�
 
 用 `@interface` 声明。注解的「属性」通过无参方法定义。
 
-<Playground
-  language="java"
-  id="java-11-custom"
-  title="自定义注解"
-  code={`import java.lang.annotation.*;
+```java title="自定义注解"
+import java.lang.annotation.*;
 
 public class Main {
     // 自定义注解
@@ -100,9 +93,8 @@ public class Main {
         t.testLogin();
         t.testLogout();
     }
-}`}
-  expectedOutput={`running testLogin\nrunning testLogout`}
-/>
+}
+```
 
 ## 3. 元注解：控制自定义注解的「作用域」
 
@@ -132,11 +124,8 @@ public class Main {
 
 `@Retention(RUNTIME)` 的注解可以在运行时通过反射拿到。这是 JUnit、Spring 等框架的基石。
 
-<Playground
-  language="java"
-  id="java-11-reflect"
-  title="反射读取注解"
-  code={`import java.lang.annotation.*;
+```java title="反射读取注解"
+import java.lang.annotation.*;
 import java.lang.reflect.*;
 
 public class Main {
@@ -165,19 +154,15 @@ public class Main {
             }
         }
     }
-}`}
-  expectedOutput={`deleteUser -> role=admin\nviewProfile -> role=user`}
-/>
+}
+```
 
 ## 5. 实战：迷你测试运行器
 
 我们用注解 + 反射实现一个**只有 30 行的 JUnit 雏形**：
 
-<Playground
-  language="java"
-  id="java-11-runner"
-  title="迷你测试运行器"
-  code={`import java.lang.annotation.*;
+```java title="迷你测试运行器"
+import java.lang.annotation.*;
 import java.lang.reflect.*;
 
 public class Main {
@@ -210,17 +195,13 @@ public class Main {
         }
         System.out.printf("%n共 %d 个测试，通过 %d%n", total, ok);
     }
-}`}
-  expectedOutput={`[ok] 登录成功\n[ok] 登出成功\n[ok] 注册成功\n\n共 3 个测试，通过 3`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-11-exercise"
-  title="路由注解"
-  code={`// 任务：定义一个 @Route 注解，运行时通过反射扫描类方法，
+```java title="路由注解"
+// 任务：定义一个 @Route 注解，运行时通过反射扫描类方法，
 // 打印出所有路由信息。期望输出：
 //   GET  /users    -> listUsers
 //   POST /users    -> createUser
@@ -248,8 +229,7 @@ public class Main {
         // 补全：扫描 UserController 的方法，打印所有路由
     }
 }
-`}
-/>
+```
 
 ## 小结
 

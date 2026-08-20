@@ -25,11 +25,8 @@ description: 什么情况会冲突、冲突标记怎么读、三方版本如何�
 
 先看不冲突的情况——很多人以为"改同一个文件就会冲突"，其实不是：
 
-<Playground
-  language="git"
-  title="改同一文件的不同区域不会冲突；merge --abort 一键反悔"
-  id="git-06-1"
-  code={`echo '######## A. 不冲突：两边改同一文件的不同区域 ########'
+```bash title="改同一文件的不同区域不会冲突；merge --abort 一键反悔"
+echo '######## A. 不冲突：两边改同一文件的不同区域 ########'
 git init -q ok && cd ok
 gen() {
   echo "$1" > f.txt
@@ -70,8 +67,8 @@ cat f.txt
 echo '状态：'
 git status --short
 echo '(干净，就像什么都没发生过)'
-cd ..`}
-/>
+cd ..
+```
 
 <Callout type="info" title="Git 判断冲突的粒度是「行」">
 Git 不理解你的代码语义，它只看文本行。这导致两个后果：
@@ -83,11 +80,8 @@ Git 不理解你的代码语义，它只看文本行。这导致两个后果：
 
 ## 2. 制造并读懂冲突
 
-<Playground
-  language="git"
-  title="制造一次真实冲突"
-  id="git-06-2"
-  code={`git init -q
+```bash title="制造一次真实冲突"
+git init -q
 echo 'def greet():' > app.py
 echo '    print("hello")' >> app.py
 git add . && git commit -q -m "init"
@@ -115,8 +109,8 @@ git status
 echo
 
 echo '===== 冲突文件的样子 ====='
-cat app.py`}
-/>
+cat app.py
+```
 
 ### 2.1 冲突标记的结构
 
@@ -159,11 +153,8 @@ git config --global merge.conflictStyle zdiff3
 
 ## 3. 解决冲突的三条路
 
-<Playground
-  language="git"
-  title="三种解决方式：手工合并 / 选一方 / 查看三个版本"
-  id="git-06-3"
-  code={`git init -q
+```bash title="三种解决方式：手工合并 / 选一方 / 查看三个版本"
+git init -q
 echo 'hello' > app.py && git add . && git commit -q -m "init"
 git switch -qc feature && echo 'feature ver' > app.py && git commit -qam "feat"
 git switch -q main && echo 'main ver' > app.py && git commit -qam "main"
@@ -200,8 +191,8 @@ git commit -q --no-edit
 echo '合并完成：'
 git log --oneline --graph
 git status --short
-echo '(工作区干净)'`}
-/>
+echo '(工作区干净)'
+```
 
 ### 3.1 标准流程
 

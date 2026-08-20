@@ -63,11 +63,8 @@ React 17 起引入了新的 JSX 转换，编译产物变成从 `react/jsx-runtim
 
 理解一件事最快的方式是把它实现一遍。下面这段纯 TypeScript 代码复刻了 `createElement` 和一个「渲染成 HTML 字符串」的过程，你能清楚看到 JSX 的产物到底是什么形状。
 
-<Playground
-  language="typescript"
-  title="手写 createElement 与渲染"
-  id="react-02-1"
-  code={`type VChild = VNode | string | number;
+```ts title="手写 createElement 与渲染"
+type VChild = VNode | string | number;
 
 interface VNode {
   type: string;
@@ -113,9 +110,8 @@ const tree = h(
 console.log(JSON.stringify(tree.type));
 console.log(Object.keys(tree.props).join(","));
 console.log("children 数量: " + tree.children.length);
-console.log(render(tree));`}
-  expectedOutput={`"div"\nclass\nchildren 数量: 2\n<div class="card"><h2>标题</h2><p>计数：42</p></div>`}
-/>
+console.log(render(tree));
+```
 
 上面这棵树对应的 JSX 是：
 

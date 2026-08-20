@@ -60,11 +60,8 @@ type User = {
 描述**对象或类的公共契约**时用 `interface`；需要联合、元组、映射、条件类型等类型运算时用 `type`。团队内保持一致比选哪个更重要。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-04-shapes"
-  title="三种对象类型写法"
-  code={`interface User {
+```ts title="三种对象类型写法"
+interface User {
   id: number;
   name: string;
   email: string;
@@ -92,9 +89,8 @@ console.log("距离 = " + distance({ x: 0, y: 0 }, { x: 3, y: 4 }));
 
 // 结构相同即兼容，不需要显式声明关系
 const somePoint = { x: 6, y: 8, label: "P" };
-console.log("到原点 = " + distance({ x: 0, y: 0 }, somePoint));`}
-  expectedOutput={`Hi, Ada (ada@example.com)\n距离 = 5\n到原点 = 10`}
-/>
+console.log("到原点 = " + distance({ x: 0, y: 0 }, somePoint));
+```
 
 ## 3. 可选属性
 
@@ -148,11 +144,8 @@ acc.balance = 200;    // 可以
 `readonly` 只保护这一层属性，嵌套对象内部依然可改。而且它完全是编译期概念，编译后消失，运行时没有任何保护——需要真正冻结请用 `Object.freeze`（也只冻结一层）。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-04-optional-readonly"
-  title="可选属性与 readonly"
-  code={`interface ServerConfig {
+```ts title="可选属性与 readonly"
+interface ServerConfig {
   readonly id: string;
   host: string;
   port?: number;
@@ -178,9 +171,8 @@ console.log(toUrl(dev));
 // ?? 与 || 的区别：配置项显式写了 0
 const configured: number | undefined = 0;
 console.log("用 ?? 得到 " + (configured ?? 8080));
-console.log("用 || 得到 " + (configured || 8080));`}
-  expectedOutput={`http://localhost:3000\nhttps://example.com:443\nhttp://127.0.0.1:3000\n用 ?? 得到 0\n用 || 得到 8080`}
-/>
+console.log("用 || 得到 " + (configured || 8080));
+```
 
 ## 5. 索引签名
 
@@ -223,11 +215,8 @@ type Scores = Record<"math" | "english", number>;   // 两个键都必须有
 `headers["nope"]` 在类型上是 `string`，运行时却是 `undefined`。这和数组越界是同一个问题，同样由 `noUncheckedIndexedAccess` 解决。处理外部数据时要格外小心。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-04-index-signature"
-  title="索引签名与 Record"
-  code={`interface CountMap {
+```ts title="索引签名与 Record"
+interface CountMap {
   [word: string]: number;
 }
 
@@ -252,9 +241,8 @@ let total = 0;
 for (const key of Object.keys(scores) as Subject[]) {
   total += scores[key];
 }
-console.log("平均分 = " + total / 2);`}
-  expectedOutput={`the 出现 3 次\nand 出现 2 次\n不同单词 5 个\n平均分 = 88.5`}
-/>
+console.log("平均分 = " + total / 2);
+```
 
 ## 6. 接口继承与声明合并
 
@@ -290,11 +278,8 @@ interface Window { version: number }
 
 这在给第三方库或全局对象「打补丁」时非常有用（比如给 Express 的 `Request` 加一个 `user` 字段）。反过来说，在自己的业务代码里它也可能让人困惑——你以为接口定义在一处，实际被别的文件悄悄扩展了。
 
-<Playground
-  language="typescript"
-  id="ts-04-extends"
-  title="接口继承与声明合并"
-  code={`interface Animal {
+```ts title="接口继承与声明合并"
+interface Animal {
   name: string;
   age: number;
 }
@@ -328,9 +313,8 @@ console.log(r.name + " 建档于 " + r.createdAt);
 // 用交叉类型表达同样的组合
 type Combined = Animal & Timestamped & { tag: string };
 const c: Combined = { name: "花花", age: 2, createdAt: "2024-05-01", tag: "cat" };
-console.log(c.tag + ": " + c.name);`}
-  expectedOutput={`旺财（3 岁），主人 小明，已接种\n小黑 建档于 2024-01-01\ncat: 花花`}
-/>
+console.log(c.tag + ": " + c.name);
+```
 
 ## 7. 对象字面量的额外属性检查
 

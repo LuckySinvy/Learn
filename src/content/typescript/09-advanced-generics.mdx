@@ -49,11 +49,8 @@ longest([1, 2], [1, 2, 3]);    // 数组有 length
 不会。`T extends { length: number }` 只是准入门槛，函数体内 `T` 依然是「某个具有 length 的未知类型」，你不能凭空创造一个 `T` 的值（`return { length: 0 }` 会报错，因为调用方可能要的是 `string`）。约束限制的是「能传什么进来」，不是「T 是什么」。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-09-constraints"
-  title="extends 约束"
-  code={`// 约束为「有 length 的东西」
+```ts title="extends 约束"
+// 约束为「有 length 的东西」
 function longest<T extends { length: number }>(a: T, b: T): T {
   return a.length >= b.length ? a : b;
 }
@@ -85,9 +82,8 @@ console.log("名字长度 = " + uname.length);
 function twice<T extends (n: number) => number>(fn: T, x: number): number {
   return fn(fn(x));
 }
-console.log("翻倍两次 = " + twice((n) => n * 2, 3));`}
-  expectedOutput={`更长的字符串大写 = HELLO\n更长的数组求和 = 6\nid + 1 = 8\n名字长度 = 5\n翻倍两次 = 12`}
-/>
+console.log("翻倍两次 = " + twice((n) => n * 2, 3));
+```
 
 ## 2. 默认类型参数
 
@@ -122,11 +118,8 @@ function withProp<T, K extends string, V>(
 
 返回类型精确地表达了「原对象 + 新增的这个键」。这类签名在写工具库时非常常见。
 
-<Playground
-  language="typescript"
-  id="ts-09-defaults"
-  title="默认类型参数与多参数关联"
-  code={`interface ApiResponse<TData = unknown, TError = string> {
+```ts title="默认类型参数与多参数关联"
+interface ApiResponse<TData = unknown, TError = string> {
   ok: boolean;
   data?: TData;
   error?: TError;
@@ -164,9 +157,8 @@ function entriesOf<T extends object>(obj: T): [string, unknown][] {
 }
 for (const [k, v] of entriesOf({ a: 1, b: "two" })) {
   console.log(k + " -> " + String(v));
-}`}
-  expectedOutput={`r1.ok = true, 名字 = Ada\nr2.ok = false, 错误 = 网络超时\nraw.data 的类型是 unknown，需要收窄: 任意内容\n合并后: id=1 name=Ada active=true score=95\na -> 1\nb -> two`}
-/>
+}
+```
 
 ## 4. 泛型与联合：分发行为
 
@@ -196,11 +188,8 @@ type C = ToArrayNoDist<string | number>;   // (string | number)[]
 
 下面这些函数在几乎每个项目里都会重新写一遍，是练习泛型的最佳素材。
 
-<Playground
-  language="typescript"
-  id="ts-09-utils"
-  title="手写常见泛型工具函数"
-  code={`// 1) pick：从对象中挑出若干键
+```ts title="手写常见泛型工具函数"
+// 1) pick：从对象中挑出若干键
 function pick<T extends object, K extends keyof T>(obj: T, keys: K[]): Pick<T, K> {
   const out = {} as Pick<T, K>;
   for (const k of keys) out[k] = obj[k];
@@ -257,9 +246,8 @@ const pairs = zip(["a", "b", "c"], [1, 2]);
 console.log("zip 结果长度 = " + pairs.length + "，第一对 = " + pairs[0]?.[0] + pairs[0]?.[1]);
 
 const sorted = sortBy(students, (s) => s.score);
-console.log("按分数升序: " + sorted.map((s) => s.name).join(" < "));`}
-  expectedOutput={`pick: Ada 95\n等级 A 有 2 人\n等级 B 有 1 人\nzip 结果长度 = 2，第一对 = a1\n按分数升序: Alan < Grace < Ada`}
-/>
+console.log("按分数升序: " + sorted.map((s) => s.name).join(" < "));
+```
 
 <Callout type="warn" title="不要滥用 as">
 上面 `pick` 里的 `{} as Pick<T, K>` 是一处必要的妥协：空对象在填充完成前确实不满足目标类型，编译器无法跟踪这个过程。这类断言应当**局部、可审阅**，并且函数对外的签名必须是准确的。如果一个函数需要三四处 `as` 才能通过检查，通常说明类型设计出了问题。

@@ -30,11 +30,8 @@ FHS（Filesystem Hierarchy Standard）规定了各目录的职责，主流发行
 | `/boot` | 内核与引导文件 | 升级内核时涉及 |
 | `/mnt` `/media` | 挂载点 | 临时挂载磁盘、U 盘 |
 
-<Playground
-  language="linux"
-  title="逛一逛根目录"
-  id="linux-04-1"
-  code={`echo '$ ls /'
+```bash title="逛一逛根目录"
+echo '$ ls /'
 ls /
 
 echo '$ ls /etc | head -n 10   # 配置文件大本营（前 10 个）'
@@ -51,8 +48,8 @@ echo something > /dev/null
 echo '$ cat /proc/version'
 cat /proc/version
 echo '$ ls -l /proc/version   # 注意大小是 0'
-ls -l /proc/version`}
-/>
+ls -l /proc/version
+```
 
 记住三个最高频的定位直觉：**配置去 /etc，日志去 /var/log，程序在 /usr/bin 或 /usr/local/bin**。
 
@@ -95,11 +92,8 @@ ln 源文件 硬链接名           # 硬链接：同一 inode 的另一个名�
 ln -s 源文件 软链接名        # 软链接（符号链接）：存着"路径"的特殊文件
 ```
 
-<Playground
-  language="linux"
-  title="硬链接 vs 软链接"
-  id="linux-04-2"
-  code={`echo 'v1 content' > data.txt
+```bash title="硬链接 vs 软链接"
+echo 'v1 content' > data.txt
 
 ln data.txt hard.txt
 ln -s data.txt soft.txt
@@ -120,8 +114,8 @@ echo '- 硬链接仍可读（inode 还有一个名字，数据不会释放）：
 cat hard.txt
 echo '- 软链接失效（指向的路径没了）：'
 cat soft.txt || echo 'soft.txt 已成悬空链接（dangling symlink）'
-ls -l soft.txt`}
-/>
+ls -l soft.txt
+```
 
 两者对比：
 
@@ -145,11 +139,8 @@ ln -s /usr/local/python3.12/bin/python3 /usr/local/bin/python3          # 命令
 `stat 文件` 输出 inode 号、链接数、权限、属主，以及三种时间戳：Access（最近读取）、Modify（内容最近修改）、Change（元数据最近变更，如 chmod）。注意 Linux 默认不记录"创建时间"这一常见误解——多数场景下你能拿到的"最早时间"就是 Modify。
 </Callout>
 
-<Playground
-  language="linux"
-  title="用 stat 观察元数据与链接计数"
-  id="linux-04-3"
-  code={`echo 'hello' > f.txt
+```bash title="用 stat 观察元数据与链接计数"
+echo 'hello' > f.txt
 echo '$ stat f.txt'
 stat f.txt
 
@@ -162,8 +153,8 @@ echo '$ chmod 只改元数据，观察 Change 时间与 Modify 时间分离'
 sleep 1
 chmod 600 f.txt
 stat -c 'Modify=%y' f.txt
-stat -c 'Change=%z' f.txt`}
-/>
+stat -c 'Change=%z' f.txt
+```
 
 ## 5. 磁盘、分区与挂载（概念）
 

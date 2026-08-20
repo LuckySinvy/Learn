@@ -55,11 +55,8 @@ declare global {
 
 下面这个小框架用泛型把「解析器」和「产物类型」绑定在一起：每个环境变量声明一次解析函数和默认值，配置对象的类型就自动推导出来了。
 
-<Playground
-  language="typescript"
-  id="ts-20-env-config"
-  title="类型安全的环境变量解析"
-  code={`type EnvVar<T> = { parse: (raw: string) => T; fallback: T };
+```ts title="类型安全的环境变量解析"
+type EnvVar<T> = { parse: (raw: string) => T; fallback: T };
 
 function envVar<T>(parse: (raw: string) => T, fallback: T): EnvVar<T> {
   return { parse, fallback };
@@ -120,8 +117,8 @@ try {
   loadConfig({ LEVEL: envVar(asEnum(["debug", "info"] as const), "info") }, { LEVEL: "trace" });
 } catch (e) {
   console.log("校验拦截:", (e as Error).message);
-}`}
-/>
+}
+```
 
 <Callout type="tip" title="现实项目里用 zod">
 上面的实现是为了展示原理。真实项目推荐用 `zod` 之类的 schema 库：`z.object({ PORT: z.coerce.number().default(3000) })`，一次声明同时得到运行时校验和 `z.infer` 出来的静态类型。核心思路完全一致——**单一数据源，类型从运行时 schema 推导**。
@@ -211,11 +208,8 @@ export function useTheme(): Theme {
 
 前后端之间最容易出错的地方，是「接口返回什么」这件事只存在于文档里。解决思路是把**路由表建模成一个类型**，请求函数根据路由 key 推导出参数和返回值类型。
 
-<Playground
-  language="typescript"
-  id="ts-20-api-contract"
-  title="用类型描述 API 契约"
-  code={`type Routes = {
+```ts title="用类型描述 API 契约"
+type Routes = {
   "GET /users": {
     params: { page: number };
     result: { id: number; name: string }[];
@@ -269,8 +263,8 @@ async function main(): Promise<void> {
   console.log("契约生效，无需查文档");
 }
 
-void main();`}
-/>
+void main();
+```
 
 <Callout type="info" title="和真实生态的对应关系">
 这套「路由表即类型」的思路，正是 tRPC、`openapi-typescript`、GraphQL Codegen 在做的事情。区别只在于类型的来源：手写、从 OpenAPI 生成、还是从 schema 推导。理解了原理，用哪个库都不会迷失。
@@ -299,11 +293,8 @@ async function getJson<T>(url: string, guard: (v: unknown) => v is T): Promise<T
 
 `userId` 和 `orderId` 都是 `string`，编译器分不清。**品牌类型（Branded Types）**用一个不存在于运行时的幽灵字段区分它们：
 
-<Playground
-  language="typescript"
-  id="ts-20-branded"
-  title="品牌类型"
-  code={`declare const brand: unique symbol;
+```ts title="品牌类型"
+declare const brand: unique symbol;
 
 type Brand<T, B extends string> = T & { readonly [brand]: B };
 
@@ -348,8 +339,8 @@ try {
   toUserId("x-1");
 } catch (e) {
   console.log("构造校验:", (e as Error).message);
-}`}
-/>
+}
+```
 
 <Callout type="warn" title="品牌类型不是银弹">
 品牌只在**编译期**存在，`JSON.parse` 出来的字符串照样能被断言成任何品牌。它的价值在于强制所有值都从校验过的构造函数进入系统。如果到处写 `as UserId`，这层保护就名存实亡了。

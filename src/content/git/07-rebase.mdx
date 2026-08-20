@@ -35,11 +35,8 @@ description: 变基如何"重放"提交、为什么哈希会变、rebase 冲突�
 
 ## 2. merge vs rebase 同场对比
 
-<Playground
-  language="git"
-  title="同一份历史，merge 与 rebase 的不同结果"
-  id="git-07-1"
-  code={`build() {
+```bash title="同一份历史，merge 与 rebase 的不同结果"
+build() {
   git init -q $1 && cd $1
   echo 'base' > app.txt && git add . && git commit -q -m "A: 共同基础"
   git switch -qc feature
@@ -73,8 +70,8 @@ echo '变基后的历史：'
 git log --oneline --graph --all
 echo '变基后 feature 独有提交的哈希（换了一批！）：'
 git log --format='%h %s' main..feature
-cd ..`}
-/>
+cd ..
+```
 
 | | merge | rebase |
 |---|---|---|
@@ -99,11 +96,8 @@ cd ..`}
 
 这是 rebase 最容易把人绕晕的地方。
 
-<Playground
-  language="git"
-  title="rebase 冲突：为什么 ours 变成了主线"
-  id="git-07-2"
-  code={`git init -q
+```bash title="rebase 冲突：为什么 ours 变成了主线"
+git init -q
 echo 'v0' > app.txt && git add . && git commit -q -m "init"
 git switch -qc feature
 echo 'feature-version' > app.txt && git commit -qam "feat: feature 改了这行"
@@ -131,8 +125,8 @@ echo 'merged: main + feature' > app.txt
 git add app.txt
 GIT_EDITOR=true git rebase --continue
 echo
-git log --oneline --graph --all`}
-/>
+git log --oneline --graph --all
+```
 
 记忆方法：**rebase 时你站在目标分支上"接收"自己的补丁**，所以：
 
@@ -169,11 +163,8 @@ git rebase --onto <新基底> <旧基底> <要搬的分支>
 
 典型场景：你从 `feature` 上又开了 `feature-sub`，后来发现 `feature` 那部分不要了，只想把 `feature-sub` 的提交搬到 main 上。
 
-<Playground
-  language="git"
-  title="rebase --onto 精确搬运一段提交"
-  id="git-07-3"
-  code={`git init -q
+```bash title="rebase --onto 精确搬运一段提交"
+git init -q
 echo base > a.txt && git add . && git commit -q -m "A: main 基础"
 git switch -qc feature
 echo f > f.txt && git add . && git commit -q -m "B: feature 基础功能"
@@ -196,8 +187,8 @@ git rebase --onto main feature feature-sub
 echo
 git log --oneline --graph --all
 echo
-echo '(C、D 挂到了 main 后面；B 仍然留在 feature 分支上)'`}
-/>
+echo '(C、D 挂到了 main 后面；B 仍然留在 feature 分支上)'
+```
 
 `--onto` 的另一个常用姿势是**删掉中间的某个提交**：
 

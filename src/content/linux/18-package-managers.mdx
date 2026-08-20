@@ -72,11 +72,8 @@ apk add --virtual .build-deps gcc make    # 打组安装编译依赖
 apk del .build-deps                # 编译完一把删掉，缩小镜像
 ```
 
-<Playground
-  language="linux"
-  title="沙箱侦查：识别发行版与已装软件"
-  id="linux-18-1"
-  code={`echo '$ 判断发行版（决定该用哪个包管理器）：'
+```bash title="沙箱侦查：识别发行版与已装软件"
+echo '$ 判断发行版（决定该用哪个包管理器）：'
 cat /etc/os-release | head -n 3
 
 echo ''
@@ -87,14 +84,11 @@ command -v apk && echo '-> Alpine' || true
 
 echo ''
 echo '$ apk info 列出已安装的包（前 15 个）：'
-apk info 2>/dev/null | head -n 15 || echo '（本环境 apk 数据库不可用）'`}
-/>
+apk info 2>/dev/null | head -n 15 || echo '（本环境 apk 数据库不可用）'
+```
 
-<Playground
-  language="linux"
-  title="查证'命令来自哪个包'"
-  id="linux-18-2"
-  code={`echo '$ which 找到文件路径：'
+```bash title="查证'命令来自哪个包'"
+echo '$ which 找到文件路径：'
 which awk sed jq
 
 echo ''
@@ -104,8 +98,8 @@ apk info --who-owns /usr/bin/jq 2>/dev/null || true
 
 echo ''
 echo '$ 没有包数据库时的土办法——看二进制里的线索：'
-file /usr/bin/jq 2>/dev/null | head -n 1`}
-/>
+file /usr/bin/jq 2>/dev/null | head -n 1
+```
 
 ## 4. 仓库之外：其他安装途径
 

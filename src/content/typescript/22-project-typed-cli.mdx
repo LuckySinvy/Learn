@@ -45,11 +45,8 @@ type AppEvents = {
 - 任何 `(p: E[K]) => void` 都能赋给 `(p: never) => void`（参数逆变，`never` 可赋给一切），所以**存入不需要断言**；
 - 取出调用时才做一次双重断言，且断言被封装在 `emit` 内部，调用方感知不到。
 
-<Playground
-  language="typescript"
-  id="ts-22-eventbus"
-  title="泛型事件总线"
-  code={`type EventMap = Record<string, unknown>;
+```ts title="泛型事件总线"
+type EventMap = Record<string, unknown>;
 
 class EventBus<E extends EventMap> {
   private readonly handlers = new Map<keyof E, ((payload: never) => void)[]>();
@@ -124,8 +121,8 @@ console.log("剩余订阅: login =", bus.count("user:login"), ", metric =", bus.
 // bus.emit("user:login", { id: 3 });     // 缺少 name
 // bus.emit("user:signup", { id: 3 });    // 事件名不存在
 // bus.on("metric", (p) => p.missing);    // 载荷上没有这个字段
-console.log("类型契约生效");`}
-/>
+console.log("类型契约生效");
+```
 
 <Callout type="tip" title="事件名用「域:动作」格式">
 `"task:added"` 这种带命名空间的事件名，在编辑器里输入 `"task:` 就能补全出该领域的全部事件。配合模板字面量类型，还能进一步约束「所有事件名必须符合某个模式」。
@@ -146,11 +143,8 @@ console.log("类型契约生效");`}
 
 注意 `Task` 的 `id` 是 `readonly`，`tags` 是 `readonly string[]`。修改任务时我们不是原地改字段，而是**创建一个新对象**放回 Map。这样任何持有旧引用的代码都不会看到意外变化，也让后续加撤销、加事件溯源变得简单。
 
-<Playground
-  language="typescript"
-  id="ts-22-store"
-  title="Result 化的任务存储"
-  code={`type Task = {
+```ts title="Result 化的任务存储"
+type Task = {
   readonly id: number;
   readonly title: string;
   readonly done: boolean;
@@ -242,8 +236,8 @@ console.log(gone.ok ? "已删除" : "错误: " + gone.error);
 console.log("全部:", store.list().map((t) => t.title).join(" / "));
 console.log("已完成:", store.list({ done: true }).map((t) => t.title).join(" / "));
 console.log("按标签 work:", store.list({ tag: "work" }).map((t) => t.title).join(" / "));
-console.log("统计:", JSON.stringify(store.stats()));`}
-/>
+console.log("统计:", JSON.stringify(store.stats()));
+```
 
 <Callout type="warn" title="Result 不要泄漏到深处">
 `Result` 适合作为**模块边界**的返回类型。如果内部十几个私有方法层层传递 `Result`，代码会被 `if (!r.ok) return r;` 淹没。内部实现可以放心用异常，在公开方法处统一转成 `Result`。
@@ -294,11 +288,8 @@ function defineCommand<A>(spec: CommandSpec<A>): AnyCommand {
 
 下面是把三个组件拼起来的完整实现。它模拟执行一段命令脚本，你可以直接修改 `script` 数组里的命令来试验。
 
-<Playground
-  language="typescript"
-  id="ts-22-cli"
-  title="完整的任务管理 CLI 内核"
-  code={`// ===================== 1. Result =====================
+```ts title="完整的任务管理 CLI 内核"
+// ===================== 1. Result =====================
 type Ok<T> = { ok: true; value: T };
 type Err = { ok: false; error: string };
 type Result<T> = Ok<T> | Err;
@@ -578,8 +569,8 @@ for (const line of script) {
   console.log("$ " + line);
   cli.dispatch(line);
 }
-console.log("脚本执行完毕");`}
-/>
+console.log("脚本执行完毕");
+```
 
 ## 4. 这套设计好在哪
 

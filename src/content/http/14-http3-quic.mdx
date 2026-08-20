@@ -16,11 +16,8 @@ description: 为什么抛弃 TCP、QUIC 用户态可靠传输、0-RTT、连接 I
 
 UDP 只做一件事：把数据报从一个端口扔到另一个端口。不握手、不确认、不重传、不排序：
 
-<Playground
-  language="http"
-  title="UDP：不握手，发了就走"
-  id="http-14-1"
-  code={`python3 -c '
+```http title="UDP：不握手，发了就走"
+python3 -c '
 import socket, threading, time
 
 def server():
@@ -43,8 +40,8 @@ print("首包往返耗时:", round((time.time() - t0) * 1000, 2), "ms —— 0 �
 # 对无人监听的端口发 UDP：不报错，数据静默消失
 cli.sendto(b"into the void", ("127.0.0.1", 9999))
 print("发往无人端口: sendto 正常返回，包丢了也没人告诉你")
-'`}
-/>
+'
+```
 
 对比第 3 章：TCP 发第一个字节前要 1-RTT 握手；UDP 第一个包就是数据。但代价是丢包、乱序、重复全都要**应用自己处理**——QUIC 接下了这全部脏活。
 
@@ -52,11 +49,8 @@ print("发往无人端口: sendto 正常返回，包丢了也没人告诉你")
 
 QUIC 在用户态实现了 TCP 的全套本领：包编号、ACK 确认、超时重传、拥塞控制、流量控制。写一个最小玩具版，直观感受"可靠性是怎么用不可靠的砖头砌出来的"：
 
-<Playground
-  language="http"
-  title="玩具版 QUIC：编号 + ACK + 重传"
-  id="http-14-2"
-  code={`python3 -c '
+```http title="玩具版 QUIC：编号 + ACK + 重传"
+python3 -c '
 import socket, threading, time, random
 
 random.seed(7)
@@ -96,8 +90,8 @@ for seq, chunk in enumerate(chunks):
 
 time.sleep(0.2)
 print("服务端按序重组:", b"".join(received[i] for i in sorted(received)).decode())
-'`}
-/>
+'
+```
 
 丢包被超时检测出来并重传，最终按序重组——TCP 内核里发生的事，就这样搬到了用户态。**搬到用户态的巨大意义：迭代速度**。TCP 改进要等全球操作系统内核升级（十年计），QUIC 改进只需应用/浏览器发个版（几周计）。
 
@@ -128,11 +122,8 @@ TCP 连接由四元组（源 IP、源端口、目的 IP、目的端口）定义�
 
 QUIC 用**连接 ID**（一串随机字节）标识连接，与 IP/端口解耦。换网络后，客户端用新地址继续发同一个连接 ID 的包，服务器验证后无缝续传——**连接迁移**。用实验演示"标识连接的两种方式"：
 
-<Playground
-  language="http"
-  title="四元组标识 vs 连接 ID 标识"
-  id="http-14-3"
-  code={`python3 -c '
+```http title="四元组标识 vs 连接 ID 标识"
+python3 -c '
 import socket, threading, time
 
 # 服务器：按"连接ID"（载荷前8字节）识别会话，而不是按来源地址
@@ -167,8 +158,8 @@ print(c1.recvfrom(2048)[0].decode())
 c2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 c2.sendto(CID + b"after-network-switch", ("127.0.0.1", 9002))
 print(c2.recvfrom(2048)[0].decode(), "<- 端口变了，会话计数却连续！")
-'`}
-/>
+'
+```
 
 第三个包来自全新的源端口（模拟切网），但服务器凭连接 ID 认出"还是那个会话"，计数连续——这就是刷着视频从家走到地铁不卡顿的原理。
 

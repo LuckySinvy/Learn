@@ -50,11 +50,8 @@ GET /list/books?page=2 HTTP/1.1
 
 先起一个"回显服务器"：把收到的请求行和全部头部原样吐回来。这是观察"curl 到底发了什么"的照妖镜：
 
-<Playground
-  language="http"
-  title="回显服务器：看清 curl 发出的每个头"
-  id="http-04-1"
-  code={`python3 -c '
+```http title="回显服务器：看清 curl 发出的每个头"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Echo(BaseHTTPRequestHandler):
@@ -73,8 +70,8 @@ HTTPServer(("127.0.0.1", 8000), Echo).serve_forever()
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 # 一个最普通的 GET，再附加一个自定义头
-curl -s "http://127.0.0.1:8000/books?page=2" -H "X-Debug: 1"`}
-/>
+curl -s "http://127.0.0.1:8000/books?page=2" -H "X-Debug: 1"
+```
 
 即使我们什么头都没写，curl 也自动带上了 `Host`、`User-Agent`、`Accept`——**Host 是 HTTP/1.1 唯一强制的请求头**，同一 IP 上托管多个网站（虚拟主机）全靠它区分。
 
@@ -82,11 +79,8 @@ curl -s "http://127.0.0.1:8000/books?page=2" -H "X-Debug: 1"`}
 
 回显服务器经过了 Python 的解析，我们再降一级——用原生 socket 收下**原始字节**，看 POST 请求在网线上的确切模样：
 
-<Playground
-  language="http"
-  title="字节级抓包：POST 报文的原始字节"
-  id="http-04-2"
-  code={`python3 -c '
+```http title="字节级抓包：POST 报文的原始字节"
+python3 -c '
 import socket, threading
 
 def server():
@@ -114,8 +108,8 @@ import subprocess
 subprocess.run(["curl", "-s", "-X", "POST", "http://127.0.0.1:8001/login",
                 "-H", "Content-Type: application/json",
                 "-d", "{\"user\":\"ada\"}"], check=False)
-'`}
-/>
+'
+```
 
 注意输出中的几个关键点：
 
@@ -131,11 +125,8 @@ Content-Length 比实际体短，服务器会截断数据；比实际长，服�
 
 反过来，我们不用任何 HTTP 库，直接往 socket 里写响应文本，看 curl 能否正常解析：
 
-<Playground
-  language="http"
-  title="手写原始响应报文"
-  id="http-04-3"
-  code={`python3 -c '
+```http title="手写原始响应报文"
+python3 -c '
 import socket, threading, time
 
 RESP = (b"HTTP/1.1 200 OK\r\n"
@@ -159,8 +150,8 @@ threading.Thread(target=server, daemon=True).start()
 time.sleep(0.2)
 import subprocess
 subprocess.run(["curl", "-v", "http://127.0.0.1:8002/"], check=False)
-'`}
-/>
+'
+```
 
 curl 用 `-v` 展示了它成功解析出的状态行、每个头、以及正好 22 字节的体。一份合法的 HTTP 响应，就是这么几行手打的字节。
 

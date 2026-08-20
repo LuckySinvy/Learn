@@ -29,11 +29,8 @@ tar xzf site.tar.gz -C /tmp     # -C：解到指定目录
 
 记忆口诀：**czf 压、tzf 看、xzf 解**，f 永远紧跟文件名放最后。
 
-<Playground
-  language="linux"
-  title="tar 打包、查看、解包全流程"
-  id="linux-13-1"
-  code={`# 造一个小项目
+```bash title="tar 打包、查看、解包全流程"
+# 造一个小项目
 mkdir -p site/css site/js
 echo '<h1>home</h1>' > site/index.html
 echo 'body-styles' > site/css/main.css
@@ -53,8 +50,8 @@ echo '$ 解到另一个目录并验证（权限也被还原）：'
 mkdir restore
 tar xzf site.tar.gz -C restore
 tree restore
-ls -l restore/site/js/app.js`}
-/>
+ls -l restore/site/js/app.js
+```
 
 <Callout type="warn" title="解包前先 tzf，防 tar 炸弹">
 规范的包顶层是一个目录（如 `site/`），解开只多一个目录；不规范的包顶层直接是一堆散文件，解在当前目录会把几百个文件喷得到处都是（俗称 tar 炸弹），和已有文件混在一起极难清理。所以：解陌生的包，先 `tar tzf` 看结构，或干脆 `mkdir x && tar xzf pkg.tar.gz -C x` 隔离解包。
@@ -71,11 +68,8 @@ tar czf - src/ | wc -c        # f 后面的 - 表示 stdout：tar 流可以进�
 
 最后一条揭示了 tar 的管道亲和性——第 19 章会看到 `tar czf - dir | ssh host 'tar xzf -'` 这种不落盘的跨机传输。
 
-<Playground
-  language="linux"
-  title="排除文件与带日期的备份名"
-  id="linux-13-2"
-  code={`mkdir -p logs/cache
+```bash title="排除文件与带日期的备份名"
+mkdir -p logs/cache
 echo 'important' > logs/app.log
 echo 'important2' > logs/err.log
 echo 'junk' > logs/debug.tmp
@@ -89,8 +83,8 @@ echo ''
 echo '$ 备份文件名带上日期（$(date) 命令替换）：'
 NAME=backup-$(date +%Y%m%d).tar.gz
 tar czf $NAME logs/
-ls -lh $NAME`}
-/>
+ls -lh $NAME
+```
 
 ## 4. gzip 家族：单文件压缩与直读
 
@@ -104,11 +98,8 @@ zgrep ERROR app.log.gz   # 不解压直接 grep——查轮转旧日志的神器
 
 日志轮转（logrotate）会把旧日志压成 `access.log.1.gz`、`access.log.2.gz`……排查历史问题时，`zcat`/`zgrep` 免解压直查，配合管道无缝接入三剑客。
 
-<Playground
-  language="linux"
-  title="gzip、zcat 与 zgrep"
-  id="linux-13-3"
-  code={`printf 'INFO ok\nERROR db down\nINFO recovered\n' > app.log
+```bash title="gzip、zcat 与 zgrep"
+printf 'INFO ok\nERROR db down\nINFO recovered\n' > app.log
 cp app.log app.log.1
 
 echo '$ gzip app.log.1 —— 模拟被轮转压缩的旧日志'
@@ -127,8 +118,8 @@ echo ''
 echo '$ 压缩比感受一下：重复内容压缩率极高'
 seq 100000 | tr '0-9' 'a' > big.txt
 gzip -k big.txt 2>/dev/null || gzip big.txt
-ls -lh big.txt* 2>/dev/null || ls -lh big.txt.gz`}
-/>
+ls -lh big.txt* 2>/dev/null || ls -lh big.txt.gz
+```
 
 其他压缩格式速览：`bzip2`（更小更慢，tar 参数 j，后缀 .tar.bz2）、`xz`（压缩率最高，参数 J，.tar.xz，内核源码用它发布）、`zstd`（新一代，速度与压缩率俱佳，容器镜像层广泛使用）。tar 用法完全同构，换个字母而已。
 

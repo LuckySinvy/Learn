@@ -175,11 +175,8 @@ TS 会把上次编译的依赖图写进 `.tsbuildinfo`，下次只重新检查�
 
 下面这段代码在 `strict: true` 下是合法的。试着把某一行改成注释里描述的「非严格写法」，看看编译器如何拦截。
 
-<Playground
-  language="typescript"
-  id="ts-16-strict"
-  title="strict 各开关的实际效果"
-  code={`// strictNullChecks: 必须先处理 null 才能用
+```ts title="strict 各开关的实际效果"
+// strictNullChecks: 必须先处理 null 才能用
 function firstChar(s: string | null): string {
   if (s === null) return "(空)";
   return s.charAt(0);
@@ -225,8 +222,8 @@ try {
 function greet(this: { who: string }, punct: string): string {
   return "hi " + this.who + punct;
 }
-console.log(greet.call({ who: "TS" }, "!"));`}
-/>
+console.log(greet.call({ who: "TS" }, "!"));
+```
 
 <Callout type="exercise" title="练习">
 1. 在本地新建一个空项目，运行 `npx tsc --init --strict`，逐条阅读生成的注释，挑出五个你以前没注意的选项。

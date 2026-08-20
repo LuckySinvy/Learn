@@ -41,11 +41,8 @@ description: Cache-Control 指令、Expires、ETag 与 Last-Modified、完整缓
 
 `Expires: Wed, 21 Oct 2026 07:28:00 GMT` 是 HTTP/1.0 的绝对时间方案，受客户端时钟影响；与 Cache-Control 同时存在时 **max-age 优先**。现代项目写 Cache-Control 即可。
 
-<Playground
-  language="http"
-  title="观察各种 Cache-Control 响应头"
-  id="http-09-1"
-  code={`python3 -c '
+```http title="观察各种 Cache-Control 响应头"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 POLICIES = {
@@ -73,8 +70,8 @@ for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break
 for p in /app.8f3a2c.js /index.html /api/profile /api/token /logo.png; do
   echo "== $p =="
   curl -si http://127.0.0.1:8000$p | grep -i cache-control
-done`}
-/>
+done
+```
 
 这五条正是经典的**工程缓存策略**：带 hash 的静态资源缓存一年 + immutable；HTML 入口 no-cache（保证发版即生效——hash 变了 HTML 里引用也变了）；个人数据 private；凭证类 no-store；图片走 CDN 用 s-maxage 加长边缘缓存。
 
@@ -89,11 +86,8 @@ done`}
 
 python3 内置的文件服务器就支持 If-Modified-Since，先用它体验最原始的协商缓存：
 
-<Playground
-  language="http"
-  title="Last-Modified 与 If-Modified-Since"
-  id="http-09-2"
-  code={`echo "cached content v1" > page.html
+```http title="Last-Modified 与 If-Modified-Since"
+echo "cached content v1" > page.html
 python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
@@ -110,18 +104,15 @@ echo "== 修改文件后再问：文件变新了，回 200 =="
 sleep 1
 echo "cached content v2" > page.html
 curl -s -o /dev/null -w "%{http_code} 下载了 %{size_download} 字节\n" \
-  -H "If-Modified-Since: $LM" http://127.0.0.1:8000/page.html`}
-/>
+  -H "If-Modified-Since: $LM" http://127.0.0.1:8000/page.html
+```
 
 ### 3.2 ETag：更精确的指纹
 
 Last-Modified 有两个弱点：秒级精度（一秒内改两次分辨不出）、"时间变了内容没变"会误判（比如重新部署 touch 了文件）。ETag 直接对**内容**取指纹，彻底解决：
 
-<Playground
-  language="http"
-  title="ETag 与 If-None-Match"
-  id="http-09-3"
-  code={`python3 -c '
+```http title="ETag 与 If-None-Match"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import hashlib
 
@@ -166,8 +157,8 @@ curl -s -o /dev/null -w "%{http_code} 下载 %{size_download} 字节\n" \
 echo "== 内容更新后：指纹不符，回 200 新内容 =="
 curl -s http://127.0.0.1:8000/bump >/dev/null
 curl -s -o /dev/null -w "%{http_code} 下载 %{size_download} 字节\n" \
-  -H "If-None-Match: $ET" http://127.0.0.1:8000/article`}
-/>
+  -H "If-None-Match: $ET" http://127.0.0.1:8000/article
+```
 
 两者同时存在时，**If-None-Match 优先**（服务器应先比 ETag）。ETag 还分强弱：`W/"abc"` 弱 ETag 表示"语义相同即可"（如 gzip 前后），字节级校验（断点续传）必须用强 ETag。
 

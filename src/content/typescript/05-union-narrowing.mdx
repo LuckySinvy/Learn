@@ -70,11 +70,8 @@ type Entity = WithId & WithTime;    // 两个属性都必须有
 `{ a: string } & { a: number }` 里 `a` 的类型是 `string & number`，也就是 `never`——没有任何值能满足。编译器不会在定义处报错，只会在你试图构造这样一个对象时报错，排查起来很绕。用 `interface extends` 则会在定义处就报错。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-05-union-basic"
-  title="联合、字面量与交叉"
-  code={`type Id = string | number;
+```ts title="联合、字面量与交叉"
+type Id = string | number;
 type Align = "left" | "center" | "right";
 
 function showId(id: Id): string {
@@ -101,9 +98,8 @@ type WithTime = { createdAt: string };
 type Entity = WithId & WithTime;
 
 const e: Entity = { id: "u_1", createdAt: "2024-06-01" };
-console.log(e.id + " 创建于 " + e.createdAt);`}
-  expectedOutput={`ID: 101\nID: A-101\n[hi    ]\n[    hi]\n[  hi  ]\nu_1 创建于 2024-06-01`}
-/>
+console.log(e.id + " 创建于 " + e.createdAt);
+```
 
 ## 4. 类型收窄
 
@@ -163,11 +159,8 @@ function move(a: Fish | Bird) {
 
 用于类的实例和内置对象（`Date`、`Error`、`Array` 等）。
 
-<Playground
-  language="typescript"
-  id="ts-05-narrowing"
-  title="四种收窄手段"
-  code={`// typeof 收窄
+```ts title="四种收窄手段"
+// typeof 收窄
 function format(x: string | number | boolean): string {
   if (typeof x === "string") return "字符串: " + x.toUpperCase();
   if (typeof x === "number") return "数字: " + x.toFixed(2);
@@ -205,9 +198,8 @@ function describe(v: Date | Error | string[]): string {
 }
 console.log(describe(new Date("2024-06-01T00:00:00Z")));
 console.log(describe(new Error("出错了")));
-console.log(describe(["a", "b"]));`}
-  expectedOutput={`字符串: TS\n数字: 3.14\n布尔: true\n长度 = 5 / 0\n尼莫 在游泳\n崔弟 在飞\n日期，年份 2024\n错误: 出错了\n数组，共 2 项`}
-/>
+console.log(describe(["a", "b"]));
+```
 
 ## 5. 可辨识联合
 
@@ -237,11 +229,8 @@ type BadShape = { kind: string; radius?: number; side?: number };
 
 配合上一章学过的 `never` 穷尽性检查，新增一个形状时编译器会精确指出所有需要更新的地方。
 
-<Playground
-  language="typescript"
-  id="ts-05-discriminated"
-  title="可辨识联合与穷尽性检查"
-  code={`type Circle = { kind: "circle"; radius: number };
+```ts title="可辨识联合与穷尽性检查"
+type Circle = { kind: "circle"; radius: number };
 type Rect = { kind: "rect"; width: number; height: number };
 type Triangle = { kind: "triangle"; base: number; height: number };
 type Shape = Circle | Rect | Triangle;
@@ -294,9 +283,8 @@ function render(r: Result): string {
 
 console.log(render({ status: "loading" }));
 console.log(render({ status: "success", data: ["a", "b", "c"] }));
-console.log(render({ status: "error", message: "超时" }));`}
-  expectedOutput={`circle 面积 = 12.57\nrect 面积 = 12.00\ntriangle 面积 = 15.00\n加载中...\n拿到 3 条数据\n失败: 超时`}
-/>
+console.log(render({ status: "error", message: "超时" }));
+```
 
 <Callout type="tip" title="用类型让非法状态无法表示">
 遇到「有 A 时一定有 B、有 C 时一定没有 D」这类约束，第一反应应该是拆成可辨识联合，而不是堆一堆可选属性再到处判空。数据结构对了，后面的代码会自动变简单。

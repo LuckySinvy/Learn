@@ -12,11 +12,8 @@ description: Thread/Runnable、synchronized、volatile、wait/notify、ExecutorS
 
 ## 1. 两种创建线程的方式
 
-<Playground
-  language="java"
-  id="java-13-thread"
-  title="Thread 与 Runnable"
-  code={`public class Main {
+```java title="Thread 与 Runnable"
+public class Main {
     public static void main(String[] args) throws InterruptedException {
         // 方式 1：继承 Thread
         Thread t1 = new Thread("worker-1") {
@@ -42,9 +39,8 @@ description: Thread/Runnable、synchronized、volatile、wait/notify、ExecutorS
         t2.join();    // 等待 t2 结束
         System.out.println("done");
     }
-}`}
-  expectedOutput={`worker-1 tick 1\nworker-2 step 1\nworker-1 tick 2\nworker-2 step 2\nworker-1 tick 3\nworker-2 step 3\ndone`}
-/>
+}
+```
 
 <Callout type="warn" title="start() vs run()">
 - `t.start()`：启动**新线程**，由 JVM 调度执行 `run()`
@@ -73,11 +69,8 @@ description: Thread/Runnable、synchronized、volatile、wait/notify、ExecutorS
 
 多个线程同时改共享变量会**竞态**。`synchronized` 给对象/方法加**互斥锁**。
 
-<Playground
-  language="java"
-  id="java-13-sync"
-  title="synchronized 解决竞态"
-  code={`public class Main {
+```java title="synchronized 解决竞态"
+public class Main {
     static class Counter {
         private int n = 0;
         public synchronized void inc() { n++; }   // 等价于 synchronized(this)
@@ -99,9 +92,8 @@ description: Thread/Runnable、synchronized、volatile、wait/notify、ExecutorS
 
         System.out.printf("期望 %d, 实际 %d%n", threads * loops, c.get());
     }
-}`}
-  expectedOutput={`期望 40000, 实际 40000`}
-/>
+}
+```
 
 <Callout type="tip" title="锁的是「对象」不是「代码」">
 - `synchronized` **实例方法** → 锁 `this`
@@ -113,11 +105,8 @@ description: Thread/Runnable、synchronized、volatile、wait/notify、ExecutorS
 
 `volatile` 解决**可见性**（一个线程的修改能被另一个线程立刻看到），但不解决**原子性**。
 
-<Playground
-  language="java"
-  id="java-13-volatile"
-  title="volatile 与可见性"
-  code={`public class Main {
+```java title="volatile 与可见性"
+public class Main {
     static volatile boolean running = true;
 
     public static void main(String[] args) throws InterruptedException {
@@ -135,9 +124,8 @@ description: Thread/Runnable、synchronized、volatile、wait/notify、ExecutorS
         worker.join();
         System.out.println("main exit");
     }
-}`}
-  expectedOutput={`worker stopped, count = 很大一个数\nmain exit`}
-/>
+}
+```
 
 <Callout type="warn" title="volatile ≠ 原子">
 `volatile int n = 0;` 在并发 `n++` 下仍然会丢更新——因为 `n++` 是「读-改-写」三步。
@@ -148,11 +136,8 @@ description: Thread/Runnable、synchronized、volatile、wait/notify、ExecutorS
 
 `wait()` 释放锁并阻塞，`notify()` 唤醒同一个对象上等待的另一个线程。**必须在 `synchronized` 块中调用**。
 
-<Playground
-  language="java"
-  id="java-13-wait"
-  title="wait / notify"
-  code={`import java.util.*;
+```java title="wait / notify"
+import java.util.*;
 
 public class Main {
     static class BoundedQueue {
@@ -188,19 +173,15 @@ public class Main {
         producer.start(); consumer.start();
         producer.join();  consumer.join();
     }
-}`}
-  expectedOutput={`put 1 (size=1)\nput 2 (size=2)\ntake 2 (size=1)\nput 3 (size=2)\ntake 3 (size=1)\nput 4 (size=2)\ntake 4 (size=1)\ntake 1 (size=0)`}
-/>
+}
+```
 
 ## 6. 线程池 `ExecutorService`
 
 频繁 `new Thread()` 浪费资源。线程池复用线程，控制并发上限。
 
-<Playground
-  language="java"
-  id="java-13-pool"
-  title="线程池"
-  code={`import java.util.concurrent.*;
+```java title="线程池"
+import java.util.concurrent.*;
 
 public class Main {
     public static void main(String[] args) throws InterruptedException {
@@ -221,9 +202,8 @@ public class Main {
         pool.awaitTermination(5, TimeUnit.SECONDS); // 等所有任务结束
         System.out.println("all done");
     }
-}`}
-  expectedOutput={`[pool-1-thread-1] task 1 start\n[pool-1-thread-2] task 2 start\n[pool-1-thread-3] task 3 start\n[pool-1-thread-1] task 1 end\n[pool-1-thread-2] task 2 end\n[pool-1-thread-3] task 3 end\n[pool-1-thread-1] task 4 start\n[pool-1-thread-2] task 5 start\n[pool-1-thread-3] task 6 start\n[pool-1-thread-1] task 4 end\n[pool-1-thread-2] task 5 end\n[pool-1-thread-3] task 6 end\nall done`}
-/>
+}
+```
 
 <Callout type="warn" title="生产里别用 Executors.newFixedThreadPool">
 它的内部队列是**无界** `LinkedBlockingQueue`，任务堆积会 OOM。生产用 `new ThreadPoolExecutor(...)` 显式指定队列上限和拒绝策略。
@@ -233,11 +213,8 @@ public class Main {
 
 `Runnable` 没返回值，`Callable<T>` 可以返回结果并抛异常。
 
-<Playground
-  language="java"
-  id="java-13-future"
-  title="Future / Callable"
-  code={`import java.util.concurrent.*;
+```java title="Future / Callable"
+import java.util.concurrent.*;
 
 public class Main {
     public static void main(String[] args) throws Exception {
@@ -257,17 +234,13 @@ public class Main {
 
         pool.shutdown();
     }
-}`}
-  expectedOutput={`任务已提交，主线程做点别的...\nisDone? false\nisDone? true\n7² = 49`}
-/>
+}
+```
 
 ## 8. `AtomicInteger`：无锁原子
 
-<Playground
-  language="java"
-  id="java-13-atomic"
-  title="AtomicInteger"
-  code={`import java.util.concurrent.atomic.*;
+```java title="AtomicInteger"
+import java.util.concurrent.atomic.*;
 
 public class Main {
     public static void main(String[] args) throws InterruptedException {
@@ -284,17 +257,13 @@ public class Main {
         for (Thread t : ts) t.join();
         System.out.printf("期望 %d, AtomicInteger 实际 %d%n", threads * loops, n.get());
     }
-}`}
-  expectedOutput={`期望 200000, AtomicInteger 实际 200000`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-13-exercise"
-  title="并发求和"
-  code={`// 任务：用 ExecutorService + Future 并行计算多个数组之和，再合并
+```java title="并发求和"
+// 任务：用 ExecutorService + Future 并行计算多个数组之和，再合并
 // 期望输出：sum = 1000
 // （把 1..1000 分给 4 个线程并行累加）
 
@@ -311,8 +280,7 @@ public class Main {
         // System.out.println("sum = " + total);
     }
 }
-`}
-/>
+```
 
 ## 小结
 

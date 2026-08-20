@@ -80,11 +80,8 @@ effect(() => {
 
 下面两个 Playground 把整套机制写出来跑一遍。
 
-<Playground
-  language="typescript"
-  title="reactive() 的 Proxy 陷阱：track / trigger 全过程"
-  id="vue-07-1"
-  code={`type Dep = Set<ReactiveEffect>;
+```ts title="reactive() 的 Proxy 陷阱：track / trigger 全过程"
+type Dep = Set<ReactiveEffect>;
 type KeyToDepMap = Map<PropertyKey, Dep>;
 
 const targetMap = new WeakMap<object, KeyToDepMap>();
@@ -239,17 +236,13 @@ console.log("user.name 的依赖数: " + (depsForName ? depsForName.size : 0));
 
 const r1 = reactive(state);
 const r2 = reactive(state);
-console.log("reactive(o) === reactive(o): " + (r1 === r2));`}
-  expectedOutput={`effectA: 1\neffectB: Ada\n--- 改 count ---\neffectA: 2\n--- 改 user.name ---\neffectB: Grace\n--- 赋相同值 ---\naRuns=2 bRuns=2\ncount 的依赖数: 1\nuser.name 的依赖数: 1\nreactive(o) === reactive(o): true\n`}
-/>
+console.log("reactive(o) === reactive(o): " + (r1 === r2));
+```
 
 输出证明：改 `count` 只触发 effectA，改 `user.name` 只触发 effectB（惰性深度代理生效，两个属性各自有独立依赖集合），赋相同值不触发。`reactive(o) === reactive(o)` 为 true 证明代理身份唯一。
 
-<Playground
-  language="typescript"
-  title="依赖清理与 stop()：分支切换的过期依赖"
-  id="vue-07-2"
-  code={`type Dep = Set<ReactiveEffect>;
+```ts title="依赖清理与 stop()：分支切换的过期依赖"
+type Dep = Set<ReactiveEffect>;
 const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
 let activeEffect: ReactiveEffect | null = null;
 
@@ -368,9 +361,8 @@ const eff3 = effect(() => {
 stateC.n = 2;
 eff3.stop();
 stateC.n = 3; // 不再触发
-console.log("stop 后 runCount = " + runCount3);`}
-  expectedOutput={`[cleanup] #1 ok=false -> nothing\n[cleanup] #2 ok=true -> hi\n[cleanup] #3 ok=true -> a\n[cleanup] #4 ok=false -> nothing\n开启 cleanup 时总 runCount = 4\n[no-cleanup] #1 ok=false -> nothing\n[no-cleanup] #2 ok=true -> hi\n[no-cleanup] #3 ok=true -> a\n[no-cleanup] #4 ok=false -> nothing\n[no-cleanup] #5 ok=false -> nothing\n关闭 cleanup 时总 runCount = 5\n[stop-demo] #1 n = 1\n[stop-demo] #2 n = 2\nstop 后 runCount = 2\n`}
-/>
+console.log("stop 后 runCount = " + runCount3);
+```
 
 关键对比：`ok` 切回 `false` 后，`state.text` 已不再被读取。开启 cleanup 的版本**不再**因 `text` 变化而重跑（runCount 停在 4）；关闭 cleanup 的版本因为 `text` 依赖残留，错误地多跑了一次（runCount = 5，多打印了一行 `[no-cleanup] render: b`）。这正是 Vue 每次重跑 effect 前必须 `cleanup` 的原因。
 

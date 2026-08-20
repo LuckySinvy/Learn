@@ -55,11 +55,8 @@ description: Git 的核心心智模型，add / commit / status / diff 与文件�
 
 用 `git status` 观察这套流转：
 
-<Playground
-  language="git"
-  title="三区流转全过程"
-  id="git-02-1"
-  code={`git init -q
+```bash title="三区流转全过程"
+git init -q
 echo 'v1' > a.txt
 git add .
 git commit -q -m "init: a.txt"
@@ -92,8 +89,8 @@ echo '===== 4. commit -> 落入仓库 ====='
 git add a.txt
 git commit -q -m "feat: 更新 a，新增 b"
 git status --short
-echo '(没有输出，又干净了)'`}
-/>
+echo '(没有输出，又干净了)'
+```
 
 `git status --short` 的输出是两列字符：**第一列表示暂存区相对于 HEAD 的状态，第二列表示工作区相对于暂存区的状态**。
 
@@ -119,11 +116,8 @@ echo '(没有输出，又干净了)'`}
    +---------------- (3) git diff HEAD ------------------------------+
 ```
 
-<Playground
-  language="git"
-  title="git diff 的三种视角"
-  id="git-02-2"
-  code={`git init -q
+```bash title="git diff 的三种视角"
+git init -q
 echo 'line1' > code.txt
 echo 'line2' >> code.txt
 echo 'line3' >> code.txt
@@ -153,8 +147,8 @@ git diff HEAD
 echo
 
 echo '===== git diff HEAD --stat：只看统计 ====='
-git diff HEAD --stat`}
-/>
+git diff HEAD --stat
+```
 
 | 命令 | 比较 | 回答的问题 |
 |---|---|---|
@@ -188,11 +182,8 @@ index 83db48f..a00cdb9 100644        <- 两个 blob 的哈希 + 文件权限
 
 真实开发中，你很少会只干一件事再提交。修 bug 的路上顺手改了个变量名，调试时加了段日志，还顺便更新了 README。如果只能全量提交，历史里就会出现一堆 "update stuff" 这样毫无信息量的提交。有了暂存区，你可以把一次混乱的编辑拆成若干个语义清晰的提交：
 
-<Playground
-  language="git"
-  title="用暂存区把一堆改动拆成干净的提交"
-  id="git-02-3"
-  code={`git init -q
+```bash title="用暂存区把一堆改动拆成干净的提交"
+git init -q
 echo 'base' > README.md
 git add .
 git commit -q -m "init"
@@ -220,8 +211,8 @@ git log --oneline
 echo
 
 echo '===== 索引里存的其实是「模式 + 内容哈希 + 路径」====='
-git ls-files --stage`}
-/>
+git ls-files --stage
+```
 
 最后一条 `git ls-files --stage` 揭开了暂存区的真面目：它是一张表，每行记录 **文件模式（100644 普通文件 / 100755 可执行）+ 内容对象的 SHA-1 + 路径**。注意它记的是内容哈希，不是文件路径的引用——这就是为什么 `add` 之后再改文件，暂存区岿然不动。
 

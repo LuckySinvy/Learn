@@ -139,11 +139,8 @@ npx tsc --watch                # 监听改动并增量检查
 
 试着点击「运行」，然后把 `userName` 的类型改成 `number` 看看会发生什么。
 
-<Playground
-  language="typescript"
-  id="ts-01-hello"
-  title="Hello, TypeScript"
-  code={`const userName: string = "Ada";
+```ts title="Hello, TypeScript"
+const userName: string = "Ada";
 const year: number = 1843;
 const isPioneer: boolean = true;
 
@@ -152,19 +149,15 @@ function greet(who: string): string {
 }
 
 console.log(greet(userName));
-console.log("year = " + year + ", pioneer = " + isPioneer);`}
-  expectedOutput={`Hello, Ada!\nyear = 1843, pioneer = true`}
-/>
+console.log("year = " + year + ", pioneer = " + isPioneer);
+```
 
 ## 5. 类型如何帮你把错误挡在前面
 
 下面这个例子里，`formatPrice` 明确声明只接受 `number`。如果你把 `console.log(formatPrice(cents))` 改成 `formatPrice("199")`，页面上的类型检查会立刻失败，代码根本不会被执行。
 
-<Playground
-  language="typescript"
-  id="ts-01-guard"
-  title="编译期拦截"
-  code={`function formatPrice(cents: number): string {
+```ts title="编译期拦截"
+function formatPrice(cents: number): string {
   const yuan = cents / 100;
   return yuan.toFixed(2) + " 元";
 }
@@ -177,19 +170,15 @@ console.log(formatPrice(cents));
 
 const prices: number[] = [1250, 800, 19900];
 const total = prices.reduce((sum, p) => sum + p, 0);
-console.log("合计 " + formatPrice(total));`}
-  expectedOutput={`199.00 元\n合计 219.50 元`}
-/>
+console.log("合计 " + formatPrice(total));
+```
 
 ## 6. 结构化类型：TS 的独特之处
 
 如果你来自 Java 或 C#，会习惯「必须显式 implements 某个接口才算实现它」。TypeScript 不是这样——它采用**结构化类型（structural typing）**，也叫鸭子类型：**只要结构对得上，就是兼容的类型**。
 
-<Playground
-  language="typescript"
-  id="ts-01-structural"
-  title="结构化类型"
-  code={`interface Point2D {
+```ts title="结构化类型"
+interface Point2D {
   x: number;
   y: number;
 }
@@ -206,9 +195,8 @@ console.log(describe(origin));
 const point3d = { x: 3, y: 4, z: 5 };
 console.log(describe(point3d));
 
-console.log("兼容性只看形状，不看名字");`}
-  expectedOutput={`(0, 0)\n(3, 4)\n兼容性只看形状，不看名字`}
-/>
+console.log("兼容性只看形状，不看名字");
+```
 
 <Callout type="info" title="为什么是结构化类型">
 TypeScript 要给已有的海量 JavaScript 代码「事后」加类型。那些代码里的对象都是随手写的字面量，不可能回头去 implements 一个接口。只看结构，才能让类型系统贴合 JS 的真实用法。

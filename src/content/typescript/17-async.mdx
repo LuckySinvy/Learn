@@ -38,11 +38,8 @@ async function getName(): Promise<string> {
 `if (checkAsync())` 里如果 `checkAsync` 是 async 函数，条件永远为真——因为 Promise 对象是真值。TS 本身不会报错，需要靠 ESLint 的 `no-misused-promises` 与 `no-floating-promises` 规则兜底。这两条规则强烈建议开启。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-17-basics"
-  title="async/await 与 Awaited"
-  code={`function delay(ms: number): Promise<void> {
+```ts title="async/await 与 Awaited"
+function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
     setTimeout(() => {
       resolve();
@@ -78,8 +75,8 @@ async function main(): Promise<void> {
   console.log("串行结果:", a.name, b.name);
 }
 
-void main();`}
-/>
+void main();
+```
 
 ## 2. 并发：Promise 的四个组合子
 
@@ -100,11 +97,8 @@ void main();`}
 
 `Promise.all` 会一次性发起所有请求。当任务有几百个时，需要限制并发数。标准做法是开 N 个「worker」共享一个游标：
 
-<Playground
-  language="typescript"
-  id="ts-17-concurrency"
-  title="并发组合子与并发上限"
-  code={`function delay<T>(ms: number, value: T): Promise<T> {
+```ts title="并发组合子与并发上限"
+function delay<T>(ms: number, value: T): Promise<T> {
   return new Promise<T>((resolve) => {
     setTimeout(() => {
       resolve(value);
@@ -167,8 +161,8 @@ async function main(): Promise<void> {
   console.log("mapLimit 结果:", JSON.stringify(squares));
 }
 
-void main();`}
-/>
+void main();
+```
 
 ## 3. 取消：AbortController 与 AbortSignal
 
@@ -194,11 +188,8 @@ for await (const page of pages(3)) {
 
 `AsyncGenerator<Y, R, N>` 的三个类型参数分别是：`yield` 出去的类型、`return` 的类型、外部通过 `next(v)` 传进来的类型。大多数时候只关心第一个。
 
-<Playground
-  language="typescript"
-  id="ts-17-async-iter"
-  title="异步迭代器与取消"
-  code={`function delay(ms: number): Promise<void> {
+```ts title="异步迭代器与取消"
+function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
     setTimeout(() => {
       resolve();
@@ -249,8 +240,8 @@ async function main(): Promise<void> {
   console.log(await waitCancellable(5, ok.signal));
 }
 
-void main();`}
-/>
+void main();
+```
 
 <Callout type="warn" title="别忘了清理监听">
 上面 `signal.addEventListener` 注册的回调，在 Promise 正常完成后仍挂在 signal 上。短生命周期的 signal 无所谓，但如果一个 signal 被复用于成千上万次操作，就会内存泄漏。生产代码应传 `{ once: true }` 并在 `finally` 里 `removeEventListener`。

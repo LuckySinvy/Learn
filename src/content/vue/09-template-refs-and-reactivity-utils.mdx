@@ -86,11 +86,8 @@ const state = reactive({
 
 `customRef` 让你完全接管「读 / 写」逻辑——读写时做什么、何时 `track` / `trigger`，由你定。最经典的用途是 **防抖 ref**。
 
-<Playground
-  language="typescript"
-  title="customRef + fake timer：手写防抖 ref"
-  id="vue-09-1"
-  code={`// ---- 极简响应系统（与第 7 章同源） ----
+```ts title="customRef + fake timer：手写防抖 ref"
+// ---- 极简响应系统（与第 7 章同源） ----
 type Dep = Set<Effect>;
 const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
 let activeEffect: Effect | null = null;
@@ -182,9 +179,8 @@ console.log("--- 连续输入 a b c（每 100ms），debounce 300ms ---");
 text.value = 'a'; flush(100);
 text.value = 'b'; flush(100);
 text.value = 'c'; flush(400);
-console.log("runs = " + runs);`}
-  expectedOutput={`[effect] text=\n--- 连续输入 a b c（每 100ms），debounce 300ms ---\n[effect] text=c\nruns = 2\n`}
-/>
+console.log("runs = " + runs);
+```
 
 `customRef` 把响应式系统的「仪表盘」交给你：`track()` 在 getter 里声明依赖，`trigger()` 在 setter 里广播变更。上面的 `debouncedRef` 在 setter 里用 fake timer 把多次写入合并成一次 `trigger`——effect 从初始的 1 次，到防抖结束后只再跑 1 次（共 2 次），而不是每次按键都跑。`useVModel`、`useStorage`、各类「写入落库」的 ref 都基于它。
 

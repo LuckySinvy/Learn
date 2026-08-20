@@ -340,11 +340,8 @@ python -c "import httpx; print(httpx.get('http://127.0.0.1:8000/tasks').json())"
 
 为了让你体会 FastAPI 帮我们做了多少事（路由分发、JSON 解析、错误码），下面用**纯标准库** `http.server` 实现一个最小任务接口。这段代码可以在沙箱里直接运行：
 
-<Playground
-  language="python"
-  id="py-29-stdlib-server"
-  title="标准库版最小任务接口"
-  code={`from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+```python title="标准库版最小任务接口"
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from urllib.parse import urlparse
 
@@ -398,11 +395,8 @@ _created = json.loads(_req.urlopen(_req.Request(
 print("创建:", _created)
 print("列表:", json.loads(_req.urlopen("http://127.0.0.1:8000/tasks").read()))
 server.shutdown()
-print("演示结束")`}
-  expectedOutput={`创建: {'id': 1, 'title': '写 FastAPI 教程', 'done': False}
-列表: [{'id': 1, 'title': '写 FastAPI 教程', 'done': False}]
-演示结束`}
-/>
+print("演示结束")
+```
 
 <Callout type="exercise" title="动手练">
 把第 3 节的完整 FastAPI CRUD 在本机跑通，并补上：

@@ -253,11 +253,8 @@ func main() {
 
 沙盒不能读真实文件系统，我们用**内存中的"文件"**模拟整个流程。
 
-<Playground
-  language="go"
-  id="go-18-topn"
-  title="单文件：Top-N 行数"
-  code={`package main
+```go title="单文件：Top-N 行数"
+package main
 
 import (
     "container/heap"
@@ -360,28 +357,8 @@ func main() {
     for i, s := range top.Result() {
         fmt.Printf("  %d. %4d 行  %s\\n", i+1, s.Lines, s.Path)
     }
-}`}
-  expectedOutput={`扫描到 7 个文件
-  /src/db.go
-  /src/handler.go
-  /src/main.go
-  /src/middleware.go
-  /src/router.go
-  /src/server.go
-  /src/util.go
-  [worker 1] 统计 /src/db.go
-  [worker 2] 统计 /src/handler.go
-  [worker 3] 统计 /src/main.go
-  [worker 1] 统计 /src/middleware.go
-  [worker 2] 统计 /src/router.go
-  [worker 3] 统计 /src/server.go
-  [worker 1] 统计 /src/util.go
-
-Top 3 行数最多：
-  1.  850 行  /src/server.go
-  2.  350 行  /src/main.go
-  3.  200 行  /src/middleware.go`}
-/>
+}
+```
 
 <Callout type="tip" title="输出顺序">
 - 文件顺序：map 遍历是随机的——`ScanDir` 用 `sort.Strings` 稳定了
@@ -391,11 +368,8 @@ Top 3 行数最多：
 
 ## 7. 性能分析：顺序 vs 并发
 
-<Playground
-  language="go"
-  id="go-18-bench"
-  title="顺序 vs 并发 性能对比"
-  code={`package main
+```go title="顺序 vs 并发 性能对比"
+package main
 
 import (
     "fmt"
@@ -455,18 +429,8 @@ func main() {
     }
     fmt.Printf("平均：Sequential=%v  Parallel=%v\\n",
         seqTotal/3, parTotal/3)
-}`}
-  expectedOutput={`  Sequential  -> total=9900  (24.583µs)
-  Parallel    -> total=9900  (12.625µs)
-
-  Sequential  -> total=9900  (12.541µs)
-  Parallel    -> total=9900  (10.708µs)
-
-  Sequential  -> total=9900  (15.5µs)
-  Parallel    -> total=9900  (8.208µs)
-
-平均：Sequential=17.541µs  Parallel=10.514µs`}
-/>
+}
+```
 
 <Callout type="warn" title="并发不是免费的">
 - 数据规模小时，并发反而慢（goroutine 启动有开销）
@@ -499,11 +463,8 @@ func main() {
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-18-exercise"
-  title="Top-N 最大文件"
-  code={`// 任务：基于上面的 TopN，实现"找 Top-N 最大的文件（按 size）"
+```go title="Top-N 最大文件"
+// 任务：基于上面的 TopN，实现"找 Top-N 最大的文件（按 size）"
 // 1. FileStat 加 Size 字段
 // 2. minHeap 改为按 Size 排序
 // 3. 演示 fakeFiles 改成 [{"path": "a", "size": 1024}, ...] 形式
@@ -561,12 +522,7 @@ func main() {
         fmt.Printf("  %d. %d 字节  %s\\n", i+1, f.Size, f.Path)
     }
 }
-`}
-  expectedOutput={`Top 3 最大文件：
-  1. 536870912 字节  /home/user/big
-  2. 67108864 字节  /tmp/cache
-  3. 12582912 字节  /boot/vmlinuz`}
-/>
+```
 
 ## 小结
 

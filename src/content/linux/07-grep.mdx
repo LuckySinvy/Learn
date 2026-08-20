@@ -27,11 +27,8 @@ ps | grep nginx            # 从进程列表里找 nginx
 history | grep ssh         # 从历史命令里找 ssh 相关
 ```
 
-<Playground
-  language="linux"
-  title="grep 基本选项"
-  id="linux-07-1"
-  code={`cat > app.log << 'EOF'
+```bash title="grep 基本选项"
+cat > app.log << 'EOF'
 2026-07-31 10:00:01 INFO  server started on port 8080
 2026-07-31 10:00:05 DEBUG cache warmed up
 2026-07-31 10:01:12 ERROR db connection refused
@@ -54,8 +51,8 @@ echo '$ grep -c -i error app.log   # 只数个数'
 grep -c -i error app.log
 
 echo '$ grep -v DEBUG app.log   # 排除调试噪音'
-grep -v DEBUG app.log`}
-/>
+grep -v DEBUG app.log
+```
 
 ## 2. 递归搜索目录：-r
 
@@ -68,11 +65,8 @@ grep -rl 'deprecated_api' src/       # -l 只列出含匹配的文件名
 grep -r --include='*.py' 'import requests' .    # 只搜某类文件
 ```
 
-<Playground
-  language="linux"
-  title="grep -r 递归搜索代码"
-  id="linux-07-2"
-  code={`mkdir -p src/api src/web
+```bash title="grep -r 递归搜索代码"
+mkdir -p src/api src/web
 cat > src/api/user.py << 'EOF'
 # TODO: add rate limit
 def get_user(uid):
@@ -92,8 +86,8 @@ echo '$ grep -rl TODO src/   # 只要文件名'
 grep -rl TODO src/
 
 echo '$ grep -rn --include="*.py" def src/   # 只搜 python 文件'
-grep -rn --include='*.py' def src/`}
-/>
+grep -rn --include='*.py' def src/
+```
 
 ## 3. 正则表达式：模式的语言
 
@@ -113,11 +107,8 @@ grep 的"模式"默认就是正则表达式（基础版 BRE）。加 `-E` 启用
 
 注意区分：正则的 `*` 表示"前一项重复任意次"，与 Shell 通配符里"任意字符串"的 `*` 完全是两码事。
 
-<Playground
-  language="linux"
-  title="grep -E 正则实战"
-  id="linux-07-3"
-  code={`cat > access.log << 'EOF'
+```bash title="grep -E 正则实战"
+cat > access.log << 'EOF'
 192.168.1.10 GET /index.html 200 12ms
 192.168.1.11 POST /api/login 401 35ms
 10.0.0.3 GET /api/users 200 210ms
@@ -136,8 +127,8 @@ echo '$ grep -E "(POST|DELETE)" access.log   # 写操作'
 grep -E '(POST|DELETE)' access.log
 
 echo '$ grep -oE "[0-9]+ms" access.log   # -o 只输出匹配片段'
-grep -oE '[0-9]+ms' access.log`}
-/>
+grep -oE '[0-9]+ms' access.log
+```
 
 `-o`（only-matching）值得单独强调：不输出整行、只输出匹配到的片段，一行多个匹配就输出多行。它是"从文本里**提取**信息"的利器，配合 sort/uniq 能做各种统计（第 20 章大量使用）。
 
@@ -151,11 +142,8 @@ grep -B 2 'ERROR' app.log     # Before：前 2 行 + 匹配行
 grep -C 2 'ERROR' app.log     # Context：前后各 2 行
 ```
 
-<Playground
-  language="linux"
-  title="上下文参数还原事故现场"
-  id="linux-07-4"
-  code={`cat > svc.log << 'EOF'
+```bash title="上下文参数还原事故现场"
+cat > svc.log << 'EOF'
 10:00:01 INFO  request id=1001 received
 10:00:01 INFO  querying db for user=42
 10:00:04 WARN  db latency high: 3000ms
@@ -169,8 +157,8 @@ echo '$ grep ERROR svc.log   # 只看这行，不知道为什么超时'
 grep ERROR svc.log
 
 echo '$ grep -B 2 -A 1 ERROR svc.log   # 带上前 2 行后 1 行，原因一目了然'
-grep -B 2 -A 1 ERROR svc.log`}
-/>
+grep -B 2 -A 1 ERROR svc.log
+```
 
 ## 5. 实战套路汇总
 

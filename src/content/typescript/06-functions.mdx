@@ -89,11 +89,8 @@ function draw({ x, y, color = "red" }: { x: number; y: number; color?: string })
 
 类型注解写在解构模式之后，这也是为什么解构参数的类型往往显得笨重——多数情况下会先定义一个 `interface`。
 
-<Playground
-  language="typescript"
-  id="ts-06-params"
-  title="参数的四种形态"
-  code={`// 可选参数
+```ts title="参数的四种形态"
+// 可选参数
 function greet(name: string, title?: string): string {
   return title !== undefined ? title + " " + name : "你好，" + name;
 }
@@ -132,9 +129,8 @@ function draw({ x, y, color = "red" }: DrawOpts): string {
   return "在 (" + x + "," + y + ") 画了一个" + color + "点";
 }
 console.log(draw({ x: 1, y: 2 }));
-console.log(draw({ x: 3, y: 4, color: "blue" }));`}
-  expectedOutput={`你好，Ada\n女士 Ada\na, b, c\na | b | c\na, b, c\nsum = 10\n[INFO] 服务 启动成功\n在 (1,2) 画了一个red点\n在 (3,4) 画了一个blue点`}
-/>
+console.log(draw({ x: 3, y: 4, color: "blue" }));
+```
 
 ## 3. 函数重载
 
@@ -158,11 +154,8 @@ function pick(v: string | number) {    // 实现签名：调用方看不见
 如果不同参数不会影响返回类型，`function f(x: string | number): string` 比两个重载更简单，报错信息也更友好。重载还有一个坑：它不支持「参数为联合」的调用——上面的 `pick` 不能传 `string | number` 类型的变量，因为没有任何一个重载签名能匹配。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-06-overload"
-  title="函数重载"
-  code={`// 参数个数不同，语义也不同
+```ts title="函数重载"
+// 参数个数不同，语义也不同
 function makeDate(timestamp: number): Date;
 function makeDate(year: number, month: number, day: number): Date;
 function makeDate(a: number, b?: number, c?: number): Date {
@@ -192,9 +185,8 @@ console.log("b[0] 加一 = " + (b[0] + 1));
 function describe(v: string | number): string {
   return typeof v === "string" ? "文本 " + v : "数字 " + v;
 }
-console.log(describe("x") + " / " + describe(9));`}
-  expectedOutput={`1970-01-01T00:00:00.000Z\n2024-06-01T00:00:00.000Z\na[0] 大写 = HI\nb[0] 加一 = 43\n文本 x / 数字 9`}
-/>
+console.log(describe("x") + " / " + describe(9));
+```
 
 ## 4. this 类型
 
@@ -223,11 +215,8 @@ const obj = {
 
 开启 `noImplicitThis`（`strict` 已包含）后，`this` 类型无法推断的地方会直接报错，能挡下相当一部分这类问题。
 
-<Playground
-  language="typescript"
-  id="ts-06-this"
-  title="this 类型与调用签名"
-  code={`interface Counter {
+```ts title="this 类型与调用签名"
+interface Counter {
   count: number;
   inc(this: Counter, step: number): number;
 }
@@ -275,9 +264,8 @@ interface PointCtor {
 function build(Ctor: PointCtor, x: number, y: number): Point {
   return new Ctor(x, y);
 }
-console.log("构造出 " + build(Point, 3, 4).toString());`}
-  expectedOutput={`加 3 后 = 3\n再加 5 后 = 8\n72.3 kg\n单位是  kg\n构造出 (3,4)`}
-/>
+console.log("构造出 " + build(Point, 3, 4).toString());
+```
 
 ## 5. 调用签名与构造签名
 

@@ -138,11 +138,8 @@ const sorted = useMemo(() => {
 
 ### 2.2 亲手实现一遍
 
-<Playground
-  language="typescript"
-  title="迷你 useMemo 与 useCallback"
-  id="react-07-1"
-  code={`type Deps = readonly unknown[];
+```ts title="迷你 useMemo 与 useCallback"
+type Deps = readonly unknown[];
 
 interface MemoSlot {
   deps: Deps;
@@ -228,9 +225,8 @@ render(listA, "渲染 2（items 引用未变）");
 render(listA.slice(), "渲染 3（内容相同但是新数组）");
 render(listB, "渲染 4（真的换了数据）");
 
-console.log("结论：useMemo 只认引用，不认内容");`}
-  expectedOutput={`渲染 1（首次）\n  排序结果首项: 鼠标\n  累计计算次数: 1\n  回调引用是否稳定: false\n渲染 2（items 引用未变）\n  排序结果首项: 鼠标\n  累计计算次数: 1\n  回调引用是否稳定: true\n渲染 3（内容相同但是新数组）\n  排序结果首项: 鼠标\n  累计计算次数: 2\n  回调引用是否稳定: true\n渲染 4（真的换了数据）\n  排序结果首项: 音箱\n  累计计算次数: 3\n  回调引用是否稳定: true\n结论：useMemo 只认引用，不认内容`}
-/>
+console.log("结论：useMemo 只认引用，不认内容");
+```
 
 渲染 3 是重点：数组内容一模一样，但引用变了，缓存直接失效。这解释了为什么「父组件每次渲染都新建一个数组传下来」会让所有 memo 优化归零。
 

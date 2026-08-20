@@ -82,47 +82,38 @@ HTTP/1.x 的报文是人类可读的纯文本，这让它极易调试——用 t
 
 先用 `curl -v`（verbose）观察一次完整的请求/响应交换：
 
-<Playground
-  language="http"
-  title="curl -v 观察一次完整的 HTTP 交互"
-  id="http-01-1"
-  code={`# 后台启动一个静态文件服务器，监听 127.0.0.1:8000
+```http title="curl -v 观察一次完整的 HTTP 交互"
+# 后台启动一个静态文件服务器，监听 127.0.0.1:8000
 python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 echo hello-http > index.html
 
 # -v 打印请求头（> 开头的行）和响应头（< 开头的行）
-curl -v http://127.0.0.1:8000/index.html`}
-/>
+curl -v http://127.0.0.1:8000/index.html
+```
 
 输出里以 `*` 开头的行是连接过程，`>` 开头的是我们发出的请求，`<` 开头的是服务器的响应——HTTP 的全部秘密都在这几行文本里。
 
 再用 curl 的 `-w` 参数把一次请求按阶段计时，对应上面的"旅程"步骤：
 
-<Playground
-  language="http"
-  title="分阶段计时：DNS / TCP / 首字节 / 总耗时"
-  id="http-01-2"
-  code={`python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+```http title="分阶段计时：DNS / TCP / 首字节 / 总耗时"
+python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 curl -s -o /dev/null -w 'DNS 解析耗时: %{time_namelookup}s
 TCP 连接完成: %{time_connect}s
 首字节到达:   %{time_starttransfer}s
 总耗时:       %{time_total}s
-' http://127.0.0.1:8000/`}
-/>
+' http://127.0.0.1:8000/
+```
 
 本地回环地址没有真实的 DNS 查询和网络延迟，所以数字都很小；换成公网站点，`time_connect` 里就包含一个 RTT（往返时延）的三次握手成本。
 
 最后证明"HTTP 就是 TCP 之上的文本"：不用任何 HTTP 库，直接用 socket 手写请求字节：
 
-<Playground
-  language="http"
-  title="用原生 socket 手发 HTTP 请求"
-  id="http-01-3"
-  code={`python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+```http title="用原生 socket 手发 HTTP 请求"
+python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 python3 -c '
@@ -138,8 +129,8 @@ while True:
     data += chunk
 s.close()
 print(data.decode(errors="replace")[:500])
-'`}
-/>
+'
+```
 
 我们没有用任何 HTTP 客户端库，只是往 TCP 连接里写了四行文本，就得到了标准的 HTTP 响应。**HTTP 的本质：约定好格式的文本（1.x），跑在 TCP 提供的可靠字节流上。**
 

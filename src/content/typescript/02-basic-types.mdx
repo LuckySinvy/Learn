@@ -56,11 +56,8 @@ let t: string | null = null; // 正确：显式声明可能为空
 
 这是 TypeScript 最有价值的检查之一。关闭 `strictNullChecks` 后，`null` 可以赋给任何类型，类型系统立刻失去一大半意义。
 
-<Playground
-  language="typescript"
-  id="ts-02-primitives"
-  title="七种原始类型"
-  code={`const title: string = "TypeScript";
+```ts title="七种原始类型"
+const title: string = "TypeScript";
 const version: number = 5.6;
 const stable: boolean = true;
 const empty: null = null;
@@ -78,9 +75,8 @@ console.log("bigint: " + huge.toString());
 let nickname: string | null = null;
 console.log("nickname = " + String(nickname));
 nickname = "Ada";
-console.log("nickname = " + nickname);`}
-  expectedOutput={`TypeScript v5.6 stable=true\nnull 的 typeof 是 object\nundefined 的 typeof 是 undefined\nsymbol 描述: userId\nbigint: 9007199254740993\nnickname = null\nnickname = Ada`}
-/>
+console.log("nickname = " + nickname);
+```
 
 ## 3. 四个特殊类型
 
@@ -111,11 +107,8 @@ x = "现在是字符串";
 | 赋给别的类型 | 可以 | 只能赋给 `unknown` 与 `any` |
 | 需要先收窄 | 不需要 | 需要 |
 
-<Playground
-  language="typescript"
-  id="ts-02-unknown"
-  title="unknown 与类型收窄"
-  code={`function describe(value: unknown): string {
+```ts title="unknown 与类型收窄"
+function describe(value: unknown): string {
   if (typeof value === "string") {
     return "字符串，长度 " + value.length;
   }
@@ -138,9 +131,8 @@ console.log(describe(null));
 console.log(describe(true));
 
 // 下面这行会被类型检查拦下，因为 unknown 未收窄不能访问属性
-// function bad(v: unknown) { return v.length; }`}
-  expectedOutput={`字符串，长度 5\n数字，两倍是 42\n数组，元素个数 3\n空值\n其他类型: boolean`}
-/>
+// function bad(v: unknown) { return v.length; }
+```
 
 ### 3.3 void：函数不返回有意义的值
 
@@ -162,11 +154,8 @@ function log(msg: string): void {
 
 `never` 是所有类型的子类型，可以赋给任何类型，但没有任何值能赋给它。这个特性可以用来做**穷尽性检查**：
 
-<Playground
-  language="typescript"
-  id="ts-02-never"
-  title="never 与穷尽性检查"
-  code={`type Shape = "circle" | "square" | "triangle";
+```ts title="never 与穷尽性检查"
+type Shape = "circle" | "square" | "triangle";
 
 function fail(x: never): never {
   throw new Error("未处理的分支: " + String(x));
@@ -198,9 +187,8 @@ try {
   loopForever();
 } catch (e) {
   console.log("捕获到: " + (e instanceof Error ? e.message : "未知"));
-}`}
-  expectedOutput={`circle -> 0\nsquare -> 4\ntriangle -> 3\n捕获到: 这个函数永远不会正常返回`}
-/>
+}
+```
 
 <Callout type="tip" title="穷尽性检查是联合类型的护身符">
 上面 `fail(shape)` 这个模式非常值得养成习惯。只要哪天有人给 `Shape` 加了 `"hexagon"`，编译器会准确告诉你「哪些 switch 忘了更新」，而不是等到运行时返回 `undefined`。
@@ -243,11 +231,8 @@ names.forEach((n) => console.log(n.toUpperCase()));
 - **导出的 API**：显式写返回类型，能防止内部改动悄悄改变对外契约。
 - **推断结果不是你想要的**：例如想要 `string | null` 而不是 `null`。
 
-<Playground
-  language="typescript"
-  id="ts-02-inference"
-  title="类型推断实验"
-  code={`let mutable = "hi";        // string
+```ts title="类型推断实验"
+let mutable = "hi";        // string
 const fixed = "hi";        // 字面量类型 "hi"
 const nums = [1, 2, 3];    // number[]
 const mixed = [1, "two"];  // (string | number)[]
@@ -267,9 +252,8 @@ words.forEach((item, index) => {
 function double(n: number) {
   return n * 2;               // 推断返回 number
 }
-console.log("double(21) = " + double(21));`}
-  expectedOutput={`bye / hi\nnums 求和 = 6\nmixed 长度 = 2\n0: ALPHA\n1: BETA\n2: GAMMA\ndouble(21) = 42`}
-/>
+console.log("double(21) = " + double(21));
+```
 
 <Callout type="warn" title="别给所有变量都加注解">
 `const total: number = prices.reduce(...)` 这类注解是噪音，推断已经给出同样的结果。过度注解还有个隐患：注解会「盖住」推断，一旦实现改了而注解忘了改，反而掩盖问题。原则是**在边界处注解，在内部靠推断**。

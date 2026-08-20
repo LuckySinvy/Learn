@@ -10,11 +10,8 @@ Go 1.18 起支持泛型（Generics）。泛型让"适用于多种类型的算法
 
 ## 1. 第一个泛型函数
 
-<Playground
-  language="go"
-  id="go-12-generic-func"
-  title="泛型 Min"
-  code={`package main
+```go title="泛型 Min"
+package main
 
 import "fmt"
 
@@ -30,11 +27,8 @@ func main() {
     fmt.Println(Min(3, 5))          // int
     fmt.Println(Min(3.14, 2.71))    // float64
     fmt.Println(Min("go", "rust"))  // string
-}`}
-  expectedOutput={`3
-2.71
-go`}
-/>
+}
+```
 
 <Callout type="info" title="语法说明">
 `[T int | float64 | string]` 是**类型参数列表**。`T` 称为类型形参；`int | float64 | string` 称为**类型约束**。
@@ -49,11 +43,8 @@ go`}
 - `any`：等价于 `interface{}`，所有类型
 - `comparable`：支持 `==` 和 `!=` 的类型（map 的 key 必须如此）
 
-<Playground
-  language="go"
-  id="go-12-comparable"
-  title="comparable 约束"
-  code={`package main
+```go title="comparable 约束"
+package main
 
 import "fmt"
 
@@ -71,20 +62,15 @@ func Index[T comparable](s []T, v T) int {
 func main() {
     fmt.Println(Index([]int{10, 20, 30}, 20))
     fmt.Println(Index([]string{"a", "b", "c"}, "d"))
-}`}
-  expectedOutput={`1
--1`}
-/>
+}
+```
 
 ### 自定义约束：用接口
 
 Go 1.18 起，接口可以**包含任意类型**（不只有方法），称为"类型集"。
 
-<Playground
-  language="go"
-  id="go-12-constraint"
-  title="自定义 Number 约束"
-  code={`package main
+```go title="自定义 Number 约束"
+package main
 
 import "fmt"
 
@@ -104,20 +90,15 @@ func Sum[T Number](nums []T) T {
 func main() {
     fmt.Println(Sum([]int{1, 2, 3, 4, 5}))
     fmt.Println(Sum([]float64{1.1, 2.2, 3.3}))
-}`}
-  expectedOutput={`15
-6.6`}
-/>
+}
+```
 
 ### `~` 符号：底层类型
 
 `~T` 表示"所有底层类型是 T 的类型"，包括自定义类型。
 
-<Playground
-  language="go"
-  id="go-12-tilde"
-  title="~T 底层类型"
-  code={`package main
+```go title="~T 底层类型"
+package main
 
 import "fmt"
 
@@ -135,10 +116,8 @@ func Double[T Integer](x T) T {
 func main() {
     fmt.Println(Double(21))
     fmt.Println(Double(MyInt(5)))
-}`}
-  expectedOutput={`42
-10`}
-/>
+}
+```
 
 <Callout type="warn" title="没加 ~ 会怎样">
 没有 `~` 时，自定义类型 `MyInt` **不**满足 `int` 约束。给约束加 `~` 是写泛型时的常见需求。
@@ -146,11 +125,8 @@ func main() {
 
 ## 3. 多类型参数
 
-<Playground
-  language="go"
-  id="go-12-multi"
-  title="Map 函数"
-  code={`package main
+```go title="Map 函数"
+package main
 
 import "fmt"
 
@@ -174,20 +150,15 @@ func main() {
         return len(s)
     })
     fmt.Println(lens)
-}`}
-  expectedOutput={`[#1 #2 #3]
-[2 4 2]`}
-/>
+}
+```
 
 ## 4. 泛型类型
 
 类型本身也可以带类型参数。
 
-<Playground
-  language="go"
-  id="go-12-stack"
-  title="泛型 Stack"
-  code={`package main
+```go title="泛型 Stack"
+package main
 
 import "fmt"
 
@@ -220,21 +191,15 @@ func main() {
         if !ok { break }
         fmt.Println(v)
     }
-}`}
-  expectedOutput={`3
-2
-1`}
-/>
+}
+```
 
 ## 5. 标准库的泛型函数
 
 `golang.org/x/exp/slices`、`maps` 提供大量泛型工具。
 
-<Playground
-  language="go"
-  id="go-12-slices"
-  title="标准库 slices"
-  code={`package main
+```go title="标准库 slices"
+package main
 
 import (
     "fmt"
@@ -256,12 +221,8 @@ func main() {
     // 去重（已排序）
     uniq := slices.Compact(nums)
     fmt.Println(uniq)
-}`}
-  expectedOutput={`true
-true
-[1 1 2 3 4 5 6 9]
-[1 2 3 4 5 6 9]`}
-/>
+}
+```
 
 <Callout type="info" title="Go 1.21+">
 Go 1.21 把 `slices`、`maps` 提升到标准库（`slices` 之前在 `golang.org/x/exp/slices`）。`cmp.Ordered`、`cmp.Compare` 也很常用。
@@ -269,11 +230,8 @@ Go 1.21 把 `slices`、`maps` 提升到标准库（`slices` 之前在 `golang.or
 
 ## 6. 实战：泛型 Set
 
-<Playground
-  language="go"
-  id="go-12-set"
-  title="泛型 Set"
-  code={`package main
+```go title="泛型 Set"
+package main
 
 import "fmt"
 
@@ -298,11 +256,8 @@ func main() {
     fmt.Println("grape:", s.Has("grape"))
     s.Add("grape")
     fmt.Println("size:", s.Size())
-}`}
-  expectedOutput={`apple: true
-grape: false
-size: 4`}
-/>
+}
+```
 
 <Callout type="tip" title="什么时候用泛型">
 - ✅ 类型无关的容器（Stack、Set、Map、Tree）
@@ -313,11 +268,8 @@ size: 4`}
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-12-exercise"
-  title="泛型 Filter"
-  code={`// 任务：实现泛型 Filter 函数
+```go title="泛型 Filter"
+// 任务：实现泛型 Filter 函数
 // 签名：func Filter[T any](s []T, pred func(T) bool) []T
 // 保留满足 pred 的元素
 //
@@ -348,10 +300,7 @@ func main() {
     long := Filter([]string{"go", "rust", "ts"}, func(s string) bool { return len(s) > 2 })
     fmt.Println(long)
 }
-`}
-  expectedOutput={`[2 4]
-[rust]`}
-/>
+```
 
 ## 小结
 

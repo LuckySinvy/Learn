@@ -82,11 +82,8 @@ const Row = React.memo(function Row({ item, onSelect }: RowProps) {
 
 亲手实现一遍就完全清楚了：
 
-<Playground
-  language="typescript"
-  title="React.memo 的浅比较"
-  id="react-12-1"
-  code={`type Props = Record<string, unknown>;
+```ts title="React.memo 的浅比较"
+type Props = Record<string, unknown>;
 
 // React.memo 内部用的比较函数（简化版，真实实现在 shallowEqual.js）
 function shallowEqual(a: Props, b: Props): boolean {
@@ -142,9 +139,8 @@ memoComponent("E1", { user: stableUser });
 memoComponent("E2", { user: stableUser, extra: true });
 
 console.log("总渲染次数: " + renderCount);
-console.log("结论：内联对象与内联函数会让 memo 完全失效");`}
-  expectedOutput={`场景 A：所有 props 引用稳定\nA1 -> 重新渲染（第 1 次）\nA2 -> 跳过渲染\n场景 B：内联对象字面量（父组件每次渲染新建）\nB1 -> 重新渲染（第 2 次）\nB2 -> 重新渲染（第 3 次）\n场景 C：内联箭头函数\nC1 -> 重新渲染（第 4 次）\nC2 -> 重新渲染（第 5 次）\n场景 D：只是原始值变了\nD1 -> 重新渲染（第 6 次）\nD2 -> 重新渲染（第 7 次）\n场景 E：props 数量变了\nE1 -> 重新渲染（第 8 次）\nE2 -> 重新渲染（第 9 次）\n总渲染次数: 9\n结论：内联对象与内联函数会让 memo 完全失效`}
-/>
+console.log("结论：内联对象与内联函数会让 memo 完全失效");
+```
 
 ### 2.3 memo 失效的常见原因
 

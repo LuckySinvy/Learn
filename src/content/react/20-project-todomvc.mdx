@@ -76,11 +76,8 @@ function reducer(state: State, action: Action): State {
 
 为什么不用数组下标？亲手看一个极简协调器就明白了：
 
-<Playground
-  language="typescript"
-  title="极简协调与 key"
-  id="react-20-1"
-  code={`type VNode = {
+```ts title="极简协调与 key"
+type VNode = {
   type: string;
   key?: string;
   children: VNode[];
@@ -125,9 +122,8 @@ const newTree = [make("li", "a", []), make("li", "c", []), make("li", "b", []), 
 
 console.log("旧顺序: a b c，新顺序: a c b d");
 diffChildren(oldTree, newTree).forEach(function (line) { console.log(line); });
-console.log("结论：有稳定 key，节点跨位置也能复用；无 key 只能按位置猜");`}
-  expectedOutput={`旧顺序: a b c，新顺序: a c b d\n复用 li (key=a)\n复用 li (key=c)\n复用 li (key=b)\n新建 li (key=d)\n结论：有稳定 key，节点跨位置也能复用；无 key 只能按位置猜`}
-/>
+console.log("结论：有稳定 key，节点跨位置也能复用；无 key 只能按位置猜");
+```
 
 用下标当 key 时，React 按「位置」匹配：旧的第 0 项是 a，新的第 0 项还是 a 没问题，但如果你删了第一项，后面所有项的下标都前移，React 会误以为「每一项的内容变了」，于是重建整列 DOM——输入框失焦、动画错乱都由此而来。用 `id` 当 key，React 能认出「b 只是挪了位置」，原地复用。
 

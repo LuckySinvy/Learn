@@ -21,11 +21,8 @@ description: BEGIN/COMMIT/ROLLBACK、savepoint、redo log 与 undo log、两阶�
 
 ## 2. 事务的基本使用
 
-<Playground
-  language="mysql"
-  id="mysql-15-1"
-  title="事务：提交与回滚"
-  code={`-- 显式事务：下单三件套
+```sql title="事务：提交与回滚"
+-- 显式事务：下单三件套
 BEGIN;   -- 或 START TRANSACTION
 
 INSERT INTO orders (order_no, user_id, status, total_amount)
@@ -47,8 +44,8 @@ BEGIN;
 UPDATE products SET stock = 0 WHERE id = 2;
 SELECT stock AS stock_in_txn FROM products WHERE id = 2;
 ROLLBACK;
-SELECT stock AS stock_after_rollback FROM products WHERE id = 2;`}
-/>
+SELECT stock AS stock_after_rollback FROM products WHERE id = 2;
+```
 
 ### 2.1 autocommit
 
@@ -65,19 +62,16 @@ SET autocommit = 0;   -- 慎用：之后每条语句都在未提交事务里
 
 ### 2.2 SAVEPOINT：部分回滚
 
-<Playground
-  language="mysql"
-  id="mysql-15-2"
-  title="SAVEPOINT 部分回滚"
-  code={`BEGIN;
+```sql title="SAVEPOINT 部分回滚"
+BEGIN;
 INSERT INTO orders (order_no, user_id) VALUES ('SP-A', 1);
 SAVEPOINT sp1;
 INSERT INTO orders (order_no, user_id) VALUES ('SP-B', 2);
 ROLLBACK TO sp1;   -- 只撤销 SP-B，SP-A 还在事务里
 COMMIT;            -- 最终只有 SP-A 生效
 
-SELECT order_no, user_id FROM orders WHERE order_no LIKE 'SP-%';`}
-/>
+SELECT order_no, user_id FROM orders WHERE order_no LIKE 'SP-%';
+```
 
 适合「批量处理中单条失败跳过」的场景，但逻辑复杂时更推荐拆小事务。
 

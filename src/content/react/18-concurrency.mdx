@@ -24,11 +24,8 @@ setTimeout(() => {
 
 React 18 开始，**任何地方**的连续 setState 都会自动合并成一次重渲染。亲手模拟这个调度器：
 
-<Playground
-  language="typescript"
-  title="自动批处理调度器"
-  id="react-18-1"
-  code={`// 模拟 React 18 的自动批处理调度器
+```ts title="自动批处理调度器"
+// 模拟 React 18 的自动批处理调度器
 type Update = () => void;
 
 let pending: Update[] = [];
@@ -69,9 +66,8 @@ setState(function () { count = 2; });
 queueMicrotask(function () {
   render();
   console.log("批处理效果：3 次 setState 只触发 " + renders + " 次渲染");
-});`}
-  expectedOutput={`render #1 -> count=2, flag=true\n批处理效果：3 次 setState 只触发 1 次渲染`}
-/>
+});
+```
 
 关键在 `scheduled` 标志：第一次 `setState` 排好刷新任务后，后面的更新只入队、不再排队。这就是「批」的由来——不是不执行，而是攒到一个 tick 后统一执行。
 

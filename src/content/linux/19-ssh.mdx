@@ -40,11 +40,8 @@ ssh ada@203.0.113.10
 
 密钥体系对**权限极其苛刻**，权限不对会被 SSH 静默拒绝，这是新手排查密钥登录失败的第一检查点：
 
-<Playground
-  language="linux"
-  title="SSH 目录的权限规范（可在沙箱演练）"
-  id="linux-19-1"
-  code={`# 权限要求：.ssh 目录 700，私钥/authorized_keys 600，公钥 644
+```bash title="SSH 目录的权限规范（可在沙箱演练）"
+# 权限要求：.ssh 目录 700，私钥/authorized_keys 600，公钥 644
 mkdir -p /root/.ssh
 echo 'FAKE-PRIVATE-KEY-FOR-DEMO' > /root/.ssh/id_ed25519
 echo 'ssh-ed25519 AAAA... ada@laptop' > /root/.ssh/id_ed25519.pub
@@ -60,8 +57,8 @@ ls -l /root/.ssh
 
 echo ''
 echo '$ 权限过宽的私钥，真实 ssh 会报 UNPROTECTED PRIVATE KEY 并拒用'
-stat -c '%a %n' /root/.ssh/id_ed25519`}
-/>
+stat -c '%a %n' /root/.ssh/id_ed25519
+```
 
 <Callout type="warn" title="私钥 = 服务器钥匙串，三条红线">
 1. 私钥永不离开你的设备：不进 git 仓库、不发聊天工具、不放服务器上"中转"；
@@ -133,11 +130,8 @@ ssh -N -f -L 13306:10.0.0.5:3306 bastion
 
 记忆锚点：`-L` 的 L 是 Local——**监听在本地**；`-R` 的 R 是 Remote——监听在远端。
 
-<Playground
-  language="linux"
-  title="体会'端口转发'的效果（本地模拟）"
-  id="linux-19-2"
-  code={`# 沙箱无 ssh，但可以模拟隧道的"效果"：
+```bash title="体会'端口转发'的效果（本地模拟）"
+# 沙箱无 ssh，但可以模拟隧道的"效果"：
 # 假设 9000 是"内网服务"，我们用一个转发进程把它映射到 9100
 mkdir -p www && echo 'internal service data' > www/data.txt
 cd www && python3 -m http.server 9000 --bind 127.0.0.1 > /dev/null 2>&1 &
@@ -167,8 +161,8 @@ sleep 1
 echo '$ 访问 9100（转发端口），拿到的是 9000（内网服务）的数据：'
 curl -s http://127.0.0.1:9100/data.txt
 echo '(ssh -L 13306:db:3306 的原理与此相同，只是包在加密通道里)'
-kill $(jobs -p) 2>/dev/null || true`}
-/>
+kill $(jobs -p) 2>/dev/null || true
+```
 
 ## 6. 真机演练清单
 

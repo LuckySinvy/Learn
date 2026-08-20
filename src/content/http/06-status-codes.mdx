@@ -58,11 +58,8 @@ description: 1xx-5xx 分类详解、301/302/307/308 与 401/403 等易混淆状�
 
 ## 3. 动手：一台"状态码自助餐"服务器
 
-<Playground
-  language="http"
-  title="按路径返回各种状态码"
-  id="http-06-1"
-  code={`python3 -c '
+```http title="按路径返回各种状态码"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROUTES = {
@@ -100,18 +97,15 @@ done
 echo "---- 401 必须携带 WWW-Authenticate ----"
 curl -si http://127.0.0.1:8000/unauth | grep -iE "HTTP/|www-auth"
 echo "---- 429 携带 Retry-After ----"
-curl -si http://127.0.0.1:8000/limited | grep -iE "HTTP/|retry"`}
-/>
+curl -si http://127.0.0.1:8000/limited | grep -iE "HTTP/|retry"
+```
 
 ## 4. 实验：301/302 会偷偷改掉你的 POST
 
 历史遗留：大量客户端把 301/302 的重定向**从 POST 降级成 GET**（丢掉请求体）。307/308 就是为堵住这个漏洞而生——**禁止改方法**。用实验说话：
 
-<Playground
-  language="http"
-  title="302 vs 307：重定向后方法变了吗"
-  id="http-06-2"
-  code={`python3 -c '
+```http title="302 vs 307：重定向后方法变了吗"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -146,8 +140,8 @@ for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break
 echo "== POST 遇到 302 + curl -L =="
 curl -sL -d "pay=100" http://127.0.0.1:8000/r302
 echo "== POST 遇到 307 + curl -L =="
-curl -sL -d "pay=100" http://127.0.0.1:8000/r307`}
-/>
+curl -sL -d "pay=100" http://127.0.0.1:8000/r307
+```
 
 结果：302 之后 curl 改用 **GET** 去请求新地址（支付数据没了！），307 之后依然是 **POST**。选型口诀：
 
@@ -171,11 +165,8 @@ curl -sL -d "pay=100" http://127.0.0.1:8000/r307`}
 100 Continue 用于大体积上传前的"预询问"（配合 Expect: 100-continue 请求头，curl 上传大文件时自动使用）；101 Switching Protocols 是 WebSocket 升级握手的应答。它们都是"中间响应"，最终还会跟一个正式状态码。
 </Callout>
 
-<Playground
-  language="http"
-  title="404 也可以有讲究：405 + Allow"
-  id="http-06-3"
-  code={`python3 -c '
+```http title="404 也可以有讲究：405 + Allow"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -210,8 +201,8 @@ for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break
 echo "== 路径不存在：404 =="
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/nope
 echo "== 路径存在但方法不允许：405 + Allow =="
-curl -si -X DELETE http://127.0.0.1:8000/orders | grep -iE "HTTP/|allow"`}
-/>
+curl -si -X DELETE http://127.0.0.1:8000/orders | grep -iE "HTTP/|allow"
+```
 
 ## 小结
 

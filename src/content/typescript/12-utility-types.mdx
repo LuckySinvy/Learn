@@ -32,11 +32,8 @@ type Readonly<T> = { readonly [K in keyof T]: T[K] };
 
 典型用途是「更新补丁」：更新用户时，客户端只传改动的字段。
 
-<Playground
-  language="typescript"
-  id="ts-12-partial"
-  title="Partial / Required / Readonly"
-  code={`type User = { id: number; name: string; email?: string };
+```ts title="Partial / Required / Readonly"
+type User = { id: number; name: string; email?: string };
 
 // 1) Partial: 全部变可选，适合「补丁对象」
 const patch: Partial<User> = { name: "Ada" };
@@ -62,8 +59,8 @@ console.log("MyPartial:", JSON.stringify(mine));
 function applyPatch(base: User, p: Partial<User>): User {
   return Object.assign({}, base, p);
 }
-console.log("merged:", JSON.stringify(applyPatch(full, { name: "Grace" })));`}
-/>
+console.log("merged:", JSON.stringify(applyPatch(full, { name: "Grace" })));
+```
 
 <Callout type="warn" title="Partial 是浅层的">
 `Partial` 只处理第一层属性。嵌套对象里的字段仍然是必填的。需要递归时要自己写 `DeepPartial`，我们在下一章会实现它。
@@ -95,11 +92,8 @@ type Record<K extends keyof any, V> = { [P in K]: V };
 
 `Record` 是构造「字典」最常用的方式。当 `K` 是字面量联合时，它还能强制你**穷尽所有 key**——少写一个就编译不过，这在做多语言文案、状态机配置表时非常有用。
 
-<Playground
-  language="typescript"
-  id="ts-12-pick-omit"
-  title="Pick / Omit / Record"
-  code={`type Todo = { id: number; title: string; done: boolean; owner: string };
+```ts title="Pick / Omit / Record"
+type Todo = { id: number; title: string; done: boolean; owner: string };
 
 type TodoPreview = Pick<Todo, "id" | "title">;
 const preview: TodoPreview = { id: 1, title: "写 TS 教程" };
@@ -132,8 +126,8 @@ function pick<T extends object, K extends keyof T>(obj: T, keys: K[]): Pick<T, K
   return out;
 }
 const t: Todo = { id: 4, title: "运行一下", done: true, owner: "me" };
-console.log("运行时 pick:", JSON.stringify(pick(t, ["id", "done"])));`}
-/>
+console.log("运行时 pick:", JSON.stringify(pick(t, ["id", "done"])));
+```
 
 <Callout type="tip" title="Omit 的类型安全增强版">
 如果你希望排除不存在的键时报错，可以自己写一个更严格的版本：`type StrictOmit<T, K extends keyof T> = Pick<T, Exclude<keyof T, K>>`。在自己的项目里用它替代 `Omit`，能少踩很多重构时的坑。
@@ -170,11 +164,8 @@ type Parameters<T extends (...a: any) => any> = T extends (...a: infer P) => any
 
 `Awaited<T>` 则会递归地剥掉 `Promise`：`Awaited<Promise<Promise<number>>>` 就是 `number`。它取代了早年大家手写的 `UnwrapPromise`。
 
-<Playground
-  language="typescript"
-  id="ts-12-infer-utils"
-  title="ReturnType / Parameters / Awaited"
-  code={`function makeUser(id: number, name: string) {
+```ts title="ReturnType / Parameters / Awaited"
+function makeUser(id: number, name: string) {
   return { id, name, createdAt: "2026-01-01" };
 }
 
@@ -214,8 +205,8 @@ type Kind = "a" | "b" | 1 | 2;
 const onlyStr: Extract<Kind, string> = "a";
 const onlyNum: Exclude<Kind, string> = 2;
 const notNull: NonNullable<string | null | undefined> = "safe";
-console.log(onlyStr, onlyNum, notNull);`}
-/>
+console.log(onlyStr, onlyNum, notNull);
+```
 
 <Callout type="warn" title="ReturnType 需要的是「类型」不是「值」">
 `ReturnType<makeUser>` 是错的，必须写成 `ReturnType<typeof makeUser>`。类型位置上的 `typeof` 是**类型查询**，和 JS 运行时的 `typeof` 运算符是两回事，只是复用了关键字。

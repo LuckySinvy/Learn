@@ -22,31 +22,6 @@ export type Language =
   | 'prometheus'
   | 'github-actions';
 
-// 可在 Docker 沙箱中执行的语言。Rust 用 rustc 单文件编译后运行；
-// TypeScript 先 tsc --strict 类型检查再用 node --experimental-transform-types 运行；
-// redis / mysql 走一次性容器：每次执行现起一个 redis-server / mariadbd（预置电商示例库 shop），
-// 跑完即销毁，天然隔离无状态残留。Grafana / Kafka / ClickHouse / MongoDB 等暂不支持在线执行。
-// linux / git / http 三门课共用 learn-shell:1 沙箱（alpine + bash + git + curl + python3），
-// 容器内 loopback 可用，HTTP 课能在同一容器里起本地服务再 curl。
-// React / Vue 课的 Playground 直接用 language="typescript"（手写 hooks / 响应式系统等核心机制），无独立沙箱。
-export type ExecutableLanguage = 'python' | 'go' | 'java' | 'rust' | 'typescript' | 'redis' | 'mysql' | 'linux' | 'git' | 'http';
-
-export type ExecuteRequest = {
-  language: Language;
-  code: string;
-  stdin?: string;
-};
-
-export type ExecuteResponse = {
-  status: 'success' | 'runtime_error' | 'compile_error' | 'timeout' | 'internal_error';
-  stdout: string;
-  stderr: string;
-  exitCode: number | null;
-  durationMs: number;
-  timedOut: boolean;
-  message?: string;
-};
-
 export type ChapterFrontmatter = {
   title: string;
   order: number;

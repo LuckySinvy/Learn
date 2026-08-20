@@ -138,11 +138,8 @@ function handleClick() {
 
 下面这个 Playground 亲手实现一个迷你 `ref`，看清「盒子 + 订阅者集合 + 同值短路」这套机制——这正是 Vue 响应式的最小内核。
 
-<Playground
-  language="typescript"
-  title="迷你 ref：一个带 .value 的盒子"
-  id="vue-04-1"
-  code={`// 全局「当前正在运行的副作用」，用来收集依赖
+```ts title="迷你 ref：一个带 .value 的盒子"
+// 全局「当前正在运行的副作用」，用来收集依赖
 let activeEffect: (() => void) | null = null;
 
 // 副作用：运行 fn，期间读取到的 ref 会把自己登记到 activeEffect
@@ -196,9 +193,8 @@ effect(() => {
   console.log("普通变量渲染: " + plain);
 });
 plain = 9; // 不会被拦截，plainCount 不变
-console.log("改普通变量后 plainCount = " + plainCount);`}
-  expectedOutput={`渲染: count = 0\n赋相同值后 renderCount = 1\n渲染: count = 5\n最终 renderCount = 2\n普通变量渲染: 0\n改普通变量后 plainCount = 1\n`}
-/>
+console.log("改普通变量后 plainCount = " + plainCount);
+```
 
 第一组输出最值得琢磨：**赋相同值（0）时 `renderCount` 没变**——`Object.is` 同值短路，这正是 Vue 避免无谓重渲染的第一道关卡。第二组则证明：普通变量的赋值根本无法被「拦截」，所以 Vue 必须用 `ref` 这个盒子把原始值包起来才能追踪。
 

@@ -12,11 +12,8 @@ description: Class 对象、字段/方法/构造器、动态调用、动态代�
 
 ## 1. 三种获取 `Class` 对象的方式
 
-<Playground
-  language="java"
-  id="java-14-class"
-  title="Class 对象"
-  code={`import java.util.*;
+```java title="Class 对象"
+import java.util.*;
 
 public class Main {
     public static void main(String[] args) throws Exception {
@@ -34,9 +31,8 @@ public class Main {
         System.out.println("c3 simpleName   = " + c3.getSimpleName());
         System.out.println("c3 isInterface? = " + c3.isInterface());
     }
-}`}
-  expectedOutput={`c1 == c2 ? true\nc1 classLoader = null\nc3 simpleName   = ArrayList\nc3 isInterface? = true`}
-/>
+}
+```
 
 <Callout type="tip" title="基本类型与 void 的 Class">
 - `int.class` → `Class<Integer>` 的「类型对象」  
@@ -46,11 +42,8 @@ public class Main {
 
 ## 2. 检视类的结构
 
-<Playground
-  language="java"
-  id="java-14-inspect"
-  title="检视字段/方法/构造器"
-  code={`import java.lang.reflect.*;
+```java title="检视字段/方法/构造器"
+import java.lang.reflect.*;
 import static java.lang.reflect.Modifier.*;
 
 public class Main {
@@ -90,9 +83,8 @@ public class Main {
             System.out.printf("  ctor(%d 参数)%n", ctor.getParameterCount());
         }
     }
-}`}
-  expectedOutput={`== 字段 ==\n  private final long id\n  public String name\n  protected int age\n  static int count\n  private String[] tags\n== 公有方法（不含 Object） ==\n  long getId\n  void setAge\n== 构造器 ==\n  ctor(1 参数)\n  ctor(2 参数)`}
-/>
+}
+```
 
 <Callout type="info" title="getXxx vs getDeclaredXxx">
 - `getFields()` / `getMethods()`：只看**公有 + 继承**来的
@@ -101,11 +93,8 @@ public class Main {
 
 ## 3. 动态创建对象与读写字段
 
-<Playground
-  language="java"
-  id="java-14-invoke"
-  title="动态创建与字段读写"
-  code={`import java.lang.reflect.*;
+```java title="动态创建与字段读写"
+import java.lang.reflect.*;
 
 public class Main {
     static class User {
@@ -147,9 +136,8 @@ public class Main {
         hello.invoke(u2, 99);
         System.out.println("age = " + ((User) u2).getAge());
     }
-}`}
-  expectedOutput={`u1 = User(name=null, age=0)\nu2 = User(name=Alice, age=0)\nafter set name = User(name=Bob, age=0)\nafter set age  = User(name=Bob, age=28)\nage = 99`}
-/>
+}
+```
 
 <Callout type="warn" title="Java 17+ 的访问警告">
 `setAccessible(true)` 在标准模块（`java.*`）上会抛 `InaccessibleObjectException`。
@@ -160,11 +148,8 @@ public class Main {
 
 JDK 自带的**动态代理**：在运行期为接口生成实现类，把所有方法调用转给 `InvocationHandler`。
 
-<Playground
-  language="java"
-  id="java-14-proxy"
-  title="动态代理"
-  code={`import java.lang.reflect.*;
+```java title="动态代理"
+import java.lang.reflect.*;
 import java.util.*;
 
 public class Main {
@@ -193,9 +178,8 @@ public class Main {
         System.out.println(proxy.say("Alice"));
         System.out.println(proxy.say("Bob"));
     }
-}`}
-  expectedOutput={`[proxy] say took 很大数字 ns\nHello, Alice\n[proxy] say took 很大数字 ns\nHello, Bob`}
-/>
+}
+```
 
 <Callout type="info" title="代理能做什么">
 动态代理是 AOP 的基础——在不修改业务代码的前提下，**横向**插入日志、事务、权限、监控等切面。
@@ -204,11 +188,8 @@ Spring AOP 默认就用 JDK 动态代理（前提是目标实现接口）。
 
 ## 5. 实战：迷你 JSON 序列化器
 
-<Playground
-  language="java"
-  id="java-14-json"
-  title="迷你 JSON 序列化"
-  code={`import java.lang.reflect.*;
+```java title="迷你 JSON 序列化"
+import java.lang.reflect.*;
 import java.util.*;
 import java.util.stream.*;
 
@@ -255,17 +236,13 @@ public class Main {
     public static void main(String[] args) throws Exception {
         System.out.println(toJson(new User()));
     }
-}`}
-  expectedOutput={`{"name":"Alice","age":30,"admin":true,"tags":["vip","beta"],"skills":["Java","Kotlin"]}`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-14-exercise"
-  title="BeanCopier"
-  code={`// 任务：实现一个工具方法 copyProperties(src, dest)，
+```java title="BeanCopier"
+// 任务：实现一个工具方法 copyProperties(src, dest)，
 // 把 src 中所有 String/int 公有字段拷贝到 dest 的同名字段。
 // 期望输出：dest = User(name=Alice, age=30, role=admin)
 import java.lang.reflect.*;
@@ -297,8 +274,7 @@ public class Main {
         System.out.println("dest = " + dest);
     }
 }
-`}
-/>
+```
 
 ## 小结
 

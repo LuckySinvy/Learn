@@ -101,11 +101,8 @@ Vue 的更新不是「改一个就立刻渲染一个」，而是收集成一个*
 
 下面这个 Playground 亲手实现一个带去重的异步刷新调度器，并展示 `pre → render → post` 的顺序与父先于子的排序。
 
-<Playground
-  language="typescript"
-  title="手写 nextTick：pre / render / post 三段刷新队列"
-  id="vue-06-1"
-  code={`let isFlushPending = false;
+```ts title="手写 nextTick：pre / render / post 三段刷新队列"
+let isFlushPending = false;
 const queue = new Set<Job>();
 const p = Promise.resolve();
 
@@ -166,9 +163,8 @@ nextTick(() => {
   nextTick(() => {
     console.log("nextTick 后 state = " + state);
   });
-});`}
-  expectedOutput={`同步阶段已入队，render 还没发生\n队列里待渲染 job 数（去重后）: 2\npre: render #1\npre: render #2\nrender #1\n  [parent] 更新 DOM\nrender #2\n  [child] 更新 DOM\npost: render #1\npost: render #2\n--- 微任务后，一次性 flush 完成 ---\nflush 前 state = 0\npre: render #3\nrender #3\npost: render #3\nnextTick 后 state = 100\n`}
-/>
+});
+```
 
 注意两点：**队列去重后只有 2 个 job**（连改 3 次只渲染 1 次），且 flush 顺序是 `pre → render → post` 三段、父子按 id 排序（父 #1 先于子 #2）。`nextTick` 回调在全部渲染完成后执行，此时 `state` 已经是 100——这正是「`await nextTick()` 后才能读到更新后 DOM」的底层原理。
 

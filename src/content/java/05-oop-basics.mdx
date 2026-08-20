@@ -12,11 +12,8 @@ Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、t
 
 **类（class）** 是模板，**对象（object）** 是实例。
 
-<Playground
-  language="java"
-  id="java-05-class"
-  title="类与对象"
-  code={`public class Main {
+```java title="类与对象"
+public class Main {
     static class Dog {
         String name;
         int age;
@@ -33,19 +30,15 @@ Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、t
         d1.bark();
         System.out.println(d1.name + " 今年 " + d1.age + " 岁");
     }
-}`}
-  expectedOutput={`旺财 汪汪叫\n旺财 今年 3 岁`}
-/>
+}
+```
 
 ## 2. 构造器
 
 构造器是创建对象时自动调用的特殊方法，与类同名、无返回值。
 
-<Playground
-  language="java"
-  id="java-05-ctor"
-  title="构造器"
-  code={`public class Main {
+```java title="构造器"
+public class Main {
     static class User {
         String name;
         int age;
@@ -67,9 +60,8 @@ Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、t
         new User("Alice", 30).info();
         new User("Bob", 25).info();
     }
-}`}
-  expectedOutput={`匿名 (0 岁)\nAlice (30 岁)\nBob (25 岁)`}
-/>
+}
+```
 
 <Callout type="tip" title="this 关键字">
 `this` 指代当前对象，常用于：
@@ -87,11 +79,8 @@ Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、t
 | `protected` | ✅ | ✅ | ✅ | ❌ |
 | `public` | ✅ | ✅ | ✅ | ✅ |
 
-<Playground
-  language="java"
-  id="java-05-encap"
-  title="封装 BankAccount"
-  code={`public class Main {
+```java title="封装 BankAccount"
+public class Main {
     static class BankAccount {
         private double balance;
 
@@ -127,19 +116,15 @@ Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、t
 
         System.out.println(acc.withdraw(10000) ? "成功" : "失败（余额不足）");
     }
-}`}
-  expectedOutput={`存款后余额：1500.0\n取款 200 成功？true\n最终余额：1300.0\n失败（余额不足）`}
-/>
+}
+```
 
 ## 4. `static` 成员
 
 `static` 修饰的成员属于**类**而不是对象，所有实例共享。
 
-<Playground
-  language="java"
-  id="java-05-static"
-  title="static 字段与方法"
-  code={`public class Main {
+```java title="static 字段与方法"
+public class Main {
     static class Counter {
         static int total = 0;       // 类变量
         int id;                     // 实例变量
@@ -156,9 +141,8 @@ Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、t
         new Counter();
         System.out.println("创建了 " + Counter.total + " 个对象");
     }
-}`}
-  expectedOutput={`创建了 3 个对象`}
-/>
+}
+```
 
 <Callout type="warn" title="static 不能访问实例成员">
 静态方法只能访问静态字段和其他静态方法。访问实例字段需要先有对象。
@@ -166,11 +150,8 @@ Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、t
 
 ## 5. 实战：学生类
 
-<Playground
-  language="java"
-  id="java-05-student"
-  title="学生类"
-  code={`public class Main {
+```java title="学生类"
+public class Main {
     static class Student {
         private String name;
         private int[] scores;
@@ -199,17 +180,13 @@ Java 是面向对象语言。本章覆盖**类与对象、构造器、封装、t
         new Student("Bob",   new int[]{90, 88, 95}).report();
         new Student("Carol", new int[]{76, 82, 80}).report();
     }
-}`}
-  expectedOutput={`Alice 平均分 85.00\nBob 平均分 91.00\nCarol 平均分 79.33`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-05-exercise"
-  title="图书类"
-  code={`// 任务：实现 Book 类，包含 title、author、isBorrowed 状态
+```java title="图书类"
+// 任务：实现 Book 类，包含 title、author、isBorrowed 状态
 // 提供 borrow()/returnBook()/status() 方法
 // 期望输出：
 //   《Java 编程》- 凯·霍斯特曼 状态：可借
@@ -230,8 +207,7 @@ public class Main {
         b.status();
     }
 }
-`}
-/>
+```
 
 ## 小结
 

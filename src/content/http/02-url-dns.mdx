@@ -43,11 +43,8 @@ https://alice:secret@shop.example.com:8443/list/books?page=2&sort=price#reviews
 
 URL 只允许有限的 ASCII 字符。空格、中文、`&`、`=` 等出现在参数值里时必须**百分号编码**（Percent-Encoding）：字节值写成 `%XX` 十六进制。
 
-<Playground
-  language="http"
-  title="URL 解析与百分号编码"
-  id="http-02-1"
-  code={`python3 -c '
+```http title="URL 解析与百分号编码"
+python3 -c '
 from urllib.parse import urlsplit, parse_qs, quote, unquote
 
 u = urlsplit("https://shop.example.com:8443/list/books?page=2&sort=price&kw=%E5%9B%BE%E4%B9%A6#reviews")
@@ -61,8 +58,8 @@ print()
 # 编码与解码
 print(quote("北京 hello&world"))
 print(unquote("%E5%9B%BE%E4%B9%A6"))
-'`}
-/>
+'
+```
 
 <Callout type="warn" title="不要手动拼 URL 参数">
 把用户输入直接拼进查询串，`&` 和 `=` 会破坏参数结构，甚至造成参数注入。永远用库函数（JS 的 URLSearchParams、Python 的 urlencode）构造查询串。
@@ -122,11 +119,8 @@ example.com.    86400   IN  A   93.184.216.34
 
 DNS 出现之前，全网就靠一份手工维护的 hosts 文件。它今天仍然是解析的**第一优先级**，常用于本地开发时把域名指向测试机：
 
-<Playground
-  language="http"
-  title="hosts 文件：本地域名映射"
-  id="http-02-2"
-  code={`# 查看容器的 hosts 文件
+```http title="hosts 文件：本地域名映射"
+# 查看容器的 hosts 文件
 cat /etc/hosts
 echo "---"
 
@@ -138,8 +132,8 @@ python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 echo "via-hosts-file" > index.html
 
-curl -s http://myapp.local:8000/index.html`}
-/>
+curl -s http://myapp.local:8000/index.html
+```
 
 解析顺序：hosts 命中就不再查 DNS。这也是它被用于广告屏蔽（把广告域名指向 0.0.0.0）和内网穿透调试的原因。
 
@@ -147,19 +141,16 @@ curl -s http://myapp.local:8000/index.html`}
 
 改 hosts 需要权限且影响全局。curl 提供了更优雅的 `--resolve`，只对本次请求生效——这是排查"域名切换新服务器后是否正常"的标准手法：
 
-<Playground
-  language="http"
-  title="curl --resolve 模拟 DNS 解析结果"
-  id="http-02-3"
-  code={`python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+```http title="curl --resolve 模拟 DNS 解析结果"
+python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 echo "hello from fake-example" > index.html
 
 # 告诉 curl：api.example.com 的 8000 端口就解析到 127.0.0.1
 # 请求里的 Host 头仍然是 api.example.com —— 服务器据此区分虚拟主机
 curl -sv --resolve api.example.com:8000:127.0.0.1 \
-  http://api.example.com:8000/index.html 2>&1 | grep -E "^(> Host|< HTTP|hello)"`}
-/>
+  http://api.example.com:8000/index.html 2>&1 | grep -E "^(> Host|< HTTP|hello)"
+```
 
 注意输出：TCP 连的是 127.0.0.1，但请求头里 `Host: api.example.com` 原样保留。**连接目标（IP）与逻辑目标（Host 头）是两回事**——这个区分在 CDN、虚拟主机、TLS SNI（第 12 章）中反复出现。
 

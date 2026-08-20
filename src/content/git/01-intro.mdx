@@ -132,11 +132,8 @@ fileC(v1)  ->  fileC(v2)  ->  链接到v2
 
 装完验证：
 
-<Playground
-  language="git"
-  title="验证安装与查看当前身份配置"
-  id="git-01-1"
-  code={`echo '$ git --version'
+```bash title="验证安装与查看当前身份配置"
+echo '$ git --version'
 git --version
 echo
 
@@ -146,8 +143,8 @@ git config user.email
 echo
 
 echo '$ git config --list (节选)'
-git config --list | grep -E 'user.|init.'`}
-/>
+git config --list | grep -E 'user.|init.'
+```
 
 ### 4.2 三级配置
 
@@ -198,11 +195,8 @@ git config --list --show-origin
 
 理论讲够了，跑一遍完整流程。下面这段脚本从零建仓库、写文件、提交、看历史，就是你今后每天要重复几十次的动作：
 
-<Playground
-  language="git"
-  title="从零到第一个提交"
-  id="git-01-2"
-  code={`echo '===== 1. 初始化仓库 ====='
+```bash title="从零到第一个提交"
+echo '===== 1. 初始化仓库 ====='
 git init -q demo
 cd demo
 echo '仓库目录内容：'
@@ -227,8 +221,8 @@ git commit -q -m "feat: 增加一行输出"
 echo
 
 echo '===== 5. 查看历史 ====='
-git log --oneline`}
-/>
+git log --oneline
+```
 
 几个值得注意的细节：
 

@@ -62,11 +62,8 @@ TypeScript 内置了四个**内在（intrinsic）**字符串类型，它们由�
 
 它们只在类型层生效，**运行时不会帮你转换字符串**。要让运行时和类型层对上，需要写一个带类型断言的辅助函数。
 
-<Playground
-  language="typescript"
-  id="ts-13-case-utils"
-  title="Capitalize 与运行时对齐"
-  code={`type Ev = "click" | "focus";
+```ts title="Capitalize 与运行时对齐"
+type Ev = "click" | "focus";
 
 type Pretty = Capitalize<Ev>;   // "Click" | "Focus"
 type Loud = Uppercase<Ev>;      // "CLICK" | "FOCUS"
@@ -89,8 +86,8 @@ const handlers: Handlers = {
   Click: (n) => "click:" + n,
   Focus: (n) => "focus:" + n,
 };
-console.log(handlers.Click(1), handlers.Focus(2));`}
-/>
+console.log(handlers.Click(1), handlers.Focus(2));
+```
 
 <Callout type="tip" title="为什么必须加类型断言">
 `s.charAt(0).toUpperCase()` 在运行时确实做了转换，但 TS 只知道它返回 `string`。断言是在告诉编译器「我保证运行时行为与类型层一致」。这类断言应该被严格封装在一个小函数里，而不是散落各处。
@@ -153,11 +150,8 @@ TS 对类型实例化深度有限制（默认 50 层，尾递归条件类型可�
 
 字符串之外，**元组**也是递归的常见载体。这里的技巧是 `[infer Head, ...infer Rest]` 模式匹配。
 
-<Playground
-  language="typescript"
-  id="ts-13-recursive-tuple"
-  title="递归元组类型"
-  code={`// 反转元组
+```ts title="递归元组类型"
+// 反转元组
 type Reverse<T extends readonly unknown[]> =
   T extends readonly [infer H, ...infer R] ? [...Reverse<R>, H] : [];
 
@@ -186,18 +180,15 @@ console.log("Head:", h, "Tail:", JSON.stringify(t));
 function reverse<T extends readonly unknown[]>(arr: T): Reverse<T> {
   return arr.slice().reverse() as unknown as Reverse<T>;
 }
-console.log("运行时:", JSON.stringify(reverse([1, "a", true] as const)));`}
-/>
+console.log("运行时:", JSON.stringify(reverse([1, "a", true] as const)));
+```
 
 ## 5. 递归映射：DeepReadonly 与 DeepPartial
 
 上一章说过 `Partial` 是浅层的。有了递归条件类型，我们可以做深层版本：
 
-<Playground
-  language="typescript"
-  id="ts-13-deep-readonly"
-  title="DeepReadonly 与 DeepPartial"
-  code={`type DeepReadonly<T> =
+```ts title="DeepReadonly 与 DeepPartial"
+type DeepReadonly<T> =
   T extends (infer U)[] ? readonly DeepReadonly<U>[]
   : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
   : T;
@@ -230,8 +221,8 @@ function deepFreeze<T>(o: T): DeepReadonly<T> {
   return o as unknown as DeepReadonly<T>;
 }
 const cfg = deepFreeze({ a: { b: 1 } });
-console.log("已冻结:", Object.isFrozen(cfg.a), cfg.a.b);`}
-/>
+console.log("已冻结:", Object.isFrozen(cfg.a), cfg.a.b);
+```
 
 <Callout type="warn" title="别让类型体操侵入业务代码">
 类型体操应该沉淀在 `types/` 目录或一个内部工具包里，业务代码只消费结果类型。一旦业务文件里出现三层嵌套的条件类型，同事读代码的成本会陡增，编译速度也会下降。

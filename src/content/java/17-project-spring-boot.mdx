@@ -208,11 +208,8 @@ $ curl http://localhost:8080/users/1
 
 为了在 Playground 里也能跑起来，我们用 JDK 自带的 `HttpServer` 写一个**只有 80 行的「迷你 Spring」**——保留 `@RestController` / `@GetMapping` / `@PostMapping` / `@RequestBody` / 依赖注入的概念：
 
-<Playground
-  language="java"
-  id="java-17-mini"
-  title="迷你 Spring：注解 + DI + 路由"
-  code={`import com.sun.net.httpserver.*;
+```java title="迷你 Spring：注解 + DI + 路由"
+import com.sun.net.httpserver.*;
 import java.io.*;
 import java.lang.annotation.*;
 import java.lang.reflect.*;
@@ -423,9 +420,8 @@ public class Main {
         server.stop(0);
         System.out.println("server stopped");
     }
-}`}
-  expectedOutput={`server up on http://127.0.0.1:随机端口\nPOST /users        -> 200 user#1=Alice\nPOST /users        -> 200 user#2=Bob\nGET  /users        -> 200 [Alice, Bob]\nGET  /users/1      -> 200 Alice\nGET  /users/999    -> 500 ERR: user 999\nserver stopped`}
-/>
+}
+```
 
 <Callout type="tip" title="对照 Spring 看这个迷你实现">
 | Spring | 这里 |
@@ -477,11 +473,8 @@ class UserControllerTest {
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-17-exercise"
-  title="补全路由"
-  code={`// 任务：在迷你 Spring 框架下，新增一个 TodoController
+```java title="补全路由"
+// 任务：在迷你 Spring 框架下，新增一个 TodoController
 // 包含 GET /todos（返回所有 todo）和 POST /todos（创建并返回 id）
 // 提示：参考 UserController 的写法，注意 RequestMapping 与 @Autowired
 // 期望输出：
@@ -616,8 +609,7 @@ public class Main {
         server.stop(0);
     }
 }
-`}
-/>
+```
 
 ## 小结
 

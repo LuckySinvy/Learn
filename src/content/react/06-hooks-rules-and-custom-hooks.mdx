@@ -44,11 +44,8 @@ function Form() {
 
 理论说完，直接写代码。下面这段纯 TypeScript 复刻了 `useState` 的核心：一个数组存值、一个游标记位置、每次渲染重置游标。
 
-<Playground
-  language="typescript"
-  title="迷你 useState：游标 + 数组"
-  id="react-06-1"
-  code={`// ——— 迷你 React 运行时 ———
+```ts title="迷你 useState：游标 + 数组"
+// ——— 迷你 React 运行时 ———
 const hookStates: unknown[] = [];
 let cursor = 0;
 let renderFn: () => void = function () {};
@@ -110,9 +107,8 @@ showEmail = true;
 rerender();
 
 console.log("三次渲染 name 都对，因为它永远是第 0 个");
-console.log("一旦某个条件 Hook 之后还有别的 Hook，错位就会发生");`}
-  expectedOutput={`第 1 次渲染（三个 Hook 都调用）\nrender -> name=Ada age=36 email=ada@example.com\n        槽位内容: ["Ada",36,"ada@example.com"]\n第 2 次渲染（条件为 false，只调用了两个 Hook）\nrender -> name=Ada age=36 email=(未渲染)\n        槽位内容: ["Ada",36,"ada@example.com"]\n第 3 次渲染（条件恢复，Hook 数量又变回三个）\nrender -> name=Ada age=36 email=ada@example.com\n        槽位内容: ["Ada",36,"ada@example.com"]\n三次渲染 name 都对，因为它永远是第 0 个\n一旦某个条件 Hook 之后还有别的 Hook，错位就会发生`}
-/>
+console.log("一旦某个条件 Hook 之后还有别的 Hook，错位就会发生");
+```
 
 这个实现只有二十来行，但它解释了 Hooks 的全部核心行为。
 

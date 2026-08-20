@@ -128,11 +128,8 @@ if __name__ == "__main__":
 
 把所有文件合并成一个 Playground，**用模拟数据替代真请求**：
 
-<Playground
-  language="python"
-  id="py-18-scraper-demo"
-  title="异步爬虫：模拟数据演示"
-  code={`import asyncio
+```python title="异步爬虫：模拟数据演示"
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, Dict, List
@@ -202,9 +199,8 @@ async def main():
     print("")
     print(f"已写入: {out} ({out.stat().st_size} bytes)")
 
-asyncio.run(main())`}
-  expectedOutput={`开始抓取 10 个 URL ...\n抓取完成 (并发 50ms × 1 轮)\n成功 10 条, 失败 0 条\n\n--- 汇总 ---\n  count:   10\n  avg_len: 72.5\n  longest: #3 Post #3: 学习 Python 异步\n\n已写入: /tmp/scraper_result.json (2691 bytes)`}
-/>
+asyncio.run(main())
+```
 
 <Callout type="info" title="为什么 avg_len = 72.5？">
 body 长度是 `29 * ((i % 4) + 1)`，10 条分别是 58/87/116/29/58/87/116/29/58/87。`max()` 返回**第一次**出现最大值的那条，所以 longest = #3（116）。手算 (58+87+116+29+58+87+116+29+58+87)/10 = 72.5。
@@ -214,11 +210,8 @@ body 长度是 `29 * ((i % 4) + 1)`，10 条分别是 58/87/116/29/58/87/116/29/
 
 真实爬虫必须考虑**慢请求、连接失败、限流**。给 `fetch` 包一层：
 
-<Playground
-  language="python"
-  id="py-18-scraper-retry"
-  title="带超时 + 重试的 fetch"
-  code={`import asyncio, random
+```python title="带超时 + 重试的 fetch"
+import asyncio, random
 from typing import Any, Dict, List
 
 FAIL_RATE = 0.2
@@ -254,9 +247,8 @@ async def main():
     bad = [r for r in results if isinstance(r, BaseException)]
     print(f"成功 {len(ok)} / 失败 {len(bad)}")
 
-asyncio.run(main())`}
-  expectedOutput={`  http://api.example.com/posts/7 第 1 次失败: RuntimeError: 网络抖动: http://api.example.com/posts/7\n  http://api.example.com/posts/7 第 2 次失败: RuntimeError: 网络抖动: http://api.example.com/posts/7\n  http://api.example.com/posts/3 第 1 次失败: TimeoutError: \n  http://api.example.com/posts/4 第 1 次失败: TimeoutError: \n  http://api.example.com/posts/7 第 3 次失败: RuntimeError: 网络抖动: http://api.example.com/posts/7\n成功 7 / 失败 1`}
-/>
+asyncio.run(main())
+```
 
 <Callout type="tip" title="real-world 三件套">
 1. **超时** `asyncio.wait_for(...)`：避免某个请求挂死拖垮全局
@@ -266,11 +258,8 @@ asyncio.run(main())`}
 
 ## 8. 信号量限流
 
-<Playground
-  language="python"
-  id="py-18-semaphore"
-  title="Semaphore 限制并发数"
-  code={`import asyncio, time
+```python title="Semaphore 限制并发数"
+import asyncio, time
 
 # 同时最多 3 个任务
 sem = asyncio.Semaphore(3)
@@ -286,9 +275,8 @@ async def main():
     results = await asyncio.gather(*(worker(i) for i in range(10)))
     print(f"完成 {len(results)} 个, 总耗时 {time.perf_counter()-start:.2f}s")
 
-asyncio.run(main())`}
-  expectedOutput={`完成 10 个, 总耗时 0.40s`}
-/>
+asyncio.run(main())
+```
 
 <Callout type="info" title="为什么是 0.4s？">
 10 个任务每个 0.1s，但同时只跑 3 个 → 至少要 ⌈10/3⌉ = 4 轮 = 0.4s。如果不限流，10 个并发跑就是 0.1s。**并发太快反而容易触发反爬或被对方封 IP**。
@@ -298,11 +286,8 @@ asyncio.run(main())`}
 
 把"带超时的 fetch"和"Semaphore 限流"组合起来：写一个 `fetch_many(urls, concurrency=5, timeout=0.2)` 函数，要求并发上限 5，每个请求超时 0.2 秒，统计"成功 / 失败 / 超时"各自多少。
 
-<Playground
-  language="python"
-  id="py-18-exercise"
-  title="fetch_many：限流 + 超时"
-  code={`import asyncio, random
+```python title="fetch_many：限流 + 超时"
+import asyncio, random
 from typing import List, Dict, Any
 
 async def raw_fetch(url: str) -> Dict[str, Any]:
@@ -321,9 +306,8 @@ async def main():
     result = await fetch_many(urls)
     print(result)
 
-asyncio.run(main())`}
-  expectedOutput={`{'success': x, 'fail': y, 'timeout': z}  其中 x+y+z=20`}
-/>
+asyncio.run(main())
+```
 
 <Callout type="exercise" title="提示">
 - `sem = asyncio.Semaphore(concurrency)`

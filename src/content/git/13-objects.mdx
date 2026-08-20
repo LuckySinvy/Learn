@@ -19,11 +19,8 @@ Git 的底层是一个简单的**键值数据库**：你存一个对象进去，
 | **commit** | 指向一个 tree、父提交、作者/提交者、提交信息 | 每次 `git commit` |
 | **tag** | 附注标签对象（第 11 章） | `git tag -a` |
 
-<Playground
-  language="git"
-  title="拆解一次提交：blob / tree / commit"
-  id="git-13-1"
-  code={`echo '===== 对象模型：blob / tree / commit ====='
+```bash title="拆解一次提交：blob / tree / commit"
+echo '===== 对象模型：blob / tree / commit ====='
 git init -q -b main obj && cd obj
 echo 'hello' > a.txt
 echo 'world' > b.txt
@@ -53,8 +50,8 @@ echo '三种对象的类型确认：'
 echo "commit -> $(git cat-file -t $COMMIT)"
 echo "tree   -> $(git cat-file -t $TREE)"
 echo "blob   -> $(git cat-file -t $ABLOB)"
-cd ..`}
-/>
+cd ..
+```
 
 一次提交在 `.git` 里是这样串起来的：
 
@@ -72,11 +69,8 @@ commit  ──>  tree  ──>  blob (a.txt 的内容)
 
 blob 的哈希完全由**文件内容**算出，和文件名、路径、历史都无关。两份内容相同的文件会共享**同一个** blob 对象。
 
-<Playground
-  language="git"
-  title="相同内容共享一个 blob，引用只是记录名字"
-  id="git-13-2"
-  code={`echo '===== 内容寻址：相同内容共享一个 blob ====='
+```bash title="相同内容共享一个 blob，引用只是记录名字"
+echo '===== 内容寻址：相同内容共享一个 blob ====='
 git init -q -b main dup && cd dup
 echo 'SAME' > f1.txt
 echo 'SAME' > f2.txt
@@ -111,8 +105,8 @@ git rev-parse HEAD
 echo '标签 v1 同样是一个引用（指向 commit 或 tag 对象）：'
 git tag v1
 echo "refs/tags/v1 内容：$(cat .git/refs/tags/v1)"
-cd ..`}
-/>
+cd ..
+```
 
 ### 由此看懂几个"为什么"
 

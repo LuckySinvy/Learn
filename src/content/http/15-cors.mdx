@@ -33,11 +33,8 @@ CORS（跨源资源共享）的机制：**浏览器带上 Origin 请求头，服
 
 流程：直接发请求（带 Origin 头）→ 浏览器检查响应里的 `Access-Control-Allow-Origin` → 匹配则把响应交给 JS，否则丢弃并报红。
 
-<Playground
-  language="http"
-  title="简单请求：Origin 与 Allow-Origin 的对答"
-  id="http-15-1"
-  code={`python3 -c '
+```http title="简单请求：Origin 与 Allow-Origin 的对答"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ALLOWED = {"http://app.example.com", "http://localhost:3000"}
@@ -67,8 +64,8 @@ curl -si http://127.0.0.1:8000/api -H "Origin: http://app.example.com" \
 
 echo "== 陌生 Origin：注意！响应体照样返回了 =="
 curl -si http://127.0.0.1:8000/api -H "Origin: http://evil.com" \
-  | grep -iE "HTTP/|access-control|data"`}
-/>
+  | grep -iE "HTTP/|access-control|data"
+```
 
 划重点：第二个请求**服务器照样返回了数据**，只是没带许可头。真实浏览器里，是浏览器收到响应后发现没有许可头，才**拦下不给 JS**。curl 没有同源策略，所以照收不误——"CORS 不是服务器防线，只是浏览器的阅后即焚"。**防护数据要靠认证鉴权，不能指望 CORS。**
 
@@ -91,11 +88,8 @@ curl -si http://127.0.0.1:8000/api -H "Origin: http://evil.com" \
 ③ 真实请求  PUT /api/users （带 x-token）
 ```
 
-<Playground
-  language="http"
-  title="完整预检流程"
-  id="http-15-2"
-  code={`python3 -c '
+```http title="完整预检流程"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ORIGIN = "http://app.example.com"
@@ -131,8 +125,8 @@ curl -si -X OPTIONS http://127.0.0.1:8000/api/users \
 echo "== 第二步：预检通过后的真实请求 =="
 curl -si -X PUT http://127.0.0.1:8000/api/users \
   -H "Origin: http://app.example.com" -H "X-Token: abc" \
-  | grep -iE "HTTP/|access-control|updated"`}
-/>
+  | grep -iE "HTTP/|access-control|updated"
+```
 
 `Access-Control-Max-Age` 让预检结果缓存 10 分钟，避免每个请求都翻倍。生产上 JSON API 几乎每个请求都触发预检（Content-Type: application/json 不在白名单），把 Max-Age 配起来是免费的性能优化。
 
@@ -158,11 +152,8 @@ curl -si -X PUT http://127.0.0.1:8000/api/users \
 
 第四条最阴险：接口 500 时错误响应没带许可头，浏览器只报"CORS error"，把后端异常伪装成了跨域问题——**看到 CORS 报错，先查 Network 面板里的真实状态码**。
 
-<Playground
-  language="http"
-  title="经典错误：错误响应忘了带许可头"
-  id="http-15-3"
-  code={`python3 -c '
+```http title="经典错误：错误响应忘了带许可头"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -190,8 +181,8 @@ for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break
 echo "== 正常接口：有许可头 =="
 curl -si http://127.0.0.1:8000/good -H "Origin: http://a.com" | grep -iE "HTTP/|access-control"
 echo "== 报错接口：500 且没有许可头 -> 浏览器只会显示 CORS error =="
-curl -si http://127.0.0.1:8000/bad -H "Origin: http://a.com" | grep -iE "HTTP/|access-control"`}
-/>
+curl -si http://127.0.0.1:8000/bad -H "Origin: http://a.com" | grep -iE "HTTP/|access-control"
+```
 
 <Callout type="tip" title="开发环境的另一条路：代理">
 开发时也可以完全绕开 CORS：前端 dev server（Vite/webpack）把 /api 代理到后端——浏览器眼里一切请求都同源，跨域只发生在服务器之间（服务器间没有同源策略）。生产环境用网关统一域名也是同理。CORS 配置与代理二选一即可，别都上。

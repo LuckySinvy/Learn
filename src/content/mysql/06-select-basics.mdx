@@ -31,14 +31,11 @@ SELECT NOW(), 1 + 1, CONCAT('hello', ' ', 'mysql');
 
 ## 2. WHERE 与比较运算
 
-<Playground
-  language="mysql"
-  id="mysql-06-1"
-  title="WHERE 与比较运算"
-  code={`SELECT id, name, price, stock FROM products WHERE price > 5000;
+```sql title="WHERE 与比较运算"
+SELECT id, name, price, stock FROM products WHERE price > 5000;
 SELECT id, order_no, status, total_amount FROM orders WHERE status = 1;
-SELECT id, order_no, created_at FROM orders WHERE created_at >= '2026-02-01';`}
-/>
+SELECT id, order_no, created_at FROM orders WHERE created_at >= '2026-02-01';
+```
 
 比较运算符：`=`、`!=`（等价于 `<>`）、`>`、`>=`、`<`、`<=`。
 
@@ -67,19 +64,16 @@ WHERE (category_id = 2 OR category_id = 3)
 
 ## 4. IN 与 BETWEEN
 
-<Playground
-  language="mysql"
-  id="mysql-06-2"
-  title="IN 与 BETWEEN"
-  code={`-- IN：离散值集合，等价于一串 OR 但更清晰
+```sql title="IN 与 BETWEEN"
+-- IN：离散值集合，等价于一串 OR 但更清晰
 SELECT id, name, category_id FROM products WHERE category_id IN (2, 3, 5);
 
 -- NOT IN
 SELECT id, order_no, status FROM orders WHERE status NOT IN (3, 4);
 
 -- BETWEEN：闭区间，含两端（等价于 price >= 100 AND price <= 5000）
-SELECT id, name, price FROM products WHERE price BETWEEN 100 AND 5000;`}
-/>
+SELECT id, name, price FROM products WHERE price BETWEEN 100 AND 5000;
+```
 
 日期范围的坑：`created_at BETWEEN '2026-07-01' AND '2026-07-31'` 会**丢掉 7 月 31 日白天的数据**，因为 `'2026-07-31'` 等于 `'2026-07-31 00:00:00'`。正确写法：
 
@@ -112,16 +106,13 @@ SELECT * FROM users    WHERE phone LIKE '138________';  -- 138 开头共 11 位
 
 SQL 的布尔逻辑有三个值：TRUE、FALSE、**UNKNOWN**。任何值与 NULL 做比较，结果都是 UNKNOWN，而 WHERE 只保留 TRUE 的行：
 
-<Playground
-  language="mysql"
-  id="mysql-06-3"
-  title="NULL 的三值逻辑"
-  code={`SELECT NULL = NULL, NULL != 1, NULL IS NULL;
+```sql title="NULL 的三值逻辑"
+SELECT NULL = NULL, NULL != 1, NULL IS NULL;
 SELECT IFNULL(NULL, '未填写') AS a,
        COALESCE(NULL, NULL, '第一个非NULL') AS b,
        NULLIF(3, 3) AS c,
-       10 / NULLIF(0, 0) AS safe_div;`}
-/>
+       10 / NULLIF(0, 0) AS safe_div;
+```
 
 判断 NULL 只能用 `IS NULL` / `IS NOT NULL`：
 
@@ -150,11 +141,8 @@ SELECT NULLIF(a, b);                                  -- a=b 时返回 NULL，�
 
 ## 7. 条件表达式 CASE
 
-<Playground
-  language="mysql"
-  id="mysql-06-4"
-  title="CASE 条件表达式"
-  code={`SELECT order_no, total_amount,
+```sql title="CASE 条件表达式"
+SELECT order_no, total_amount,
        CASE status
          WHEN 0 THEN '待支付'
          WHEN 1 THEN '已支付'
@@ -167,8 +155,8 @@ SELECT NULLIF(a, b);                                  -- a=b 时返回 NULL，�
          WHEN total_amount >= 500  THEN '中等'
          ELSE '小额'
        END AS amount_level
-FROM orders;`}
-/>
+FROM orders;
+```
 
 CASE 是 SQL 里的 if/else，在行转列、条件聚合（第 8 章）里是主力工具。
 

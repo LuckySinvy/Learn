@@ -21,11 +21,8 @@ Java 是**强类型静态语言**：每个变量都必须声明类型，类型�
 | `char` | 16 | Unicode | `'\u0000'` | `char c = 'A';` |
 | `boolean` | - | true/false | false | `boolean b = true;` |
 
-<Playground
-  language="java"
-  id="java-02-types"
-  title="基本类型"
-  code={`public class Main {
+```java title="基本类型"
+public class Main {
     public static void main(String[] args) {
         byte b = 100;
         short s = 1000;
@@ -43,8 +40,8 @@ Java 是**强类型静态语言**：每个变量都必须声明类型，类型�
         System.out.println("char: " + c);
         System.out.println("boolean: " + ok);
     }
-}`}
-/>
+}
+```
 
 <Callout type="tip" title="下划线分隔数字">
 Java 7+ 允许数字字面量用下划线分隔提高可读性：`int n = 1_000_000;`。
@@ -75,11 +72,8 @@ final int MAX = 100;
 ### 4.2 强制转换（大→小）
 可能丢失精度，需显式声明：
 
-<Playground
-  language="java"
-  id="java-02-cast"
-  title="类型转换"
-  code={`public class Main {
+```java title="类型转换"
+public class Main {
     public static void main(String[] args) {
         int a = 10;
         double d = a;            // 自动：int -> double
@@ -93,9 +87,8 @@ final int MAX = 100;
         byte small = (byte) big;   // 强制：int -> byte（溢出）
         System.out.println("强制：200 -> byte: " + small);
     }
-}`}
-  expectedOutput={`自动：int -> double: 10.0\n强制：double -> int: 3\n强制：200 -> byte: -56`}
-/>
+}
+```
 
 <Callout type="warn" title="强制转换可能溢出">
 `byte` 只有 8 位，200 强制转换后会变成 `-56`（因为高位被截断，只保留 11001000，这是 -56 的补码）。业务代码中应避免类似陷阱。
@@ -103,11 +96,8 @@ final int MAX = 100;
 
 ## 5. 算术运算
 
-<Playground
-  language="java"
-  id="java-02-arith"
-  title="算术运算"
-  code={`public class Main {
+```java title="算术运算"
+public class Main {
     public static void main(String[] args) {
         int a = 10, b = 3;
         System.out.println(a + b);   // 13
@@ -123,17 +113,13 @@ final int MAX = 100;
         ++n;     // 7
         System.out.println(n);
     }
-}`}
-  expectedOutput={`13\n7\n30\n3\n1\n3.3333333333333335\n7`}
-/>
+}
+```
 
 ## 6. `Scanner` 读输入
 
-<Playground
-  language="java"
-  id="java-02-scanner"
-  title="Scanner"
-  code={`import java.util.Scanner;
+```java title="Scanner"
+import java.util.Scanner;
 
 public class Main {
     public static void main(String[] args) {
@@ -145,16 +131,13 @@ public class Main {
         System.out.println("你好，" + name + "，你" + age + "岁。");
         sc.close();
     }
-}`}
-/>
+}
+```
 
 ## 7. 实战：圆面积
 
-<Playground
-  language="java"
-  id="java-02-area"
-  title="圆面积"
-  code={`import java.util.Scanner;
+```java title="圆面积"
+import java.util.Scanner;
 
 public class Main {
     public static void main(String[] args) {
@@ -166,16 +149,13 @@ public class Main {
         System.out.printf("半径 %.2f 的圆面积 = %.2f%n", r, area);
         sc.close();
     }
-}`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-02-exercise"
-  title="BMI 计算器"
-  code={`// 任务：读取身高（米）与体重（公斤），输出 BMI
+```java title="BMI 计算器"
+// 任务：读取身高（米）与体重（公斤），输出 BMI
 // BMI = 体重 / (身高²)，保留 2 位小数
 // 期望：身高 1.75，体重 70 -> BMI 是 22.86
 
@@ -191,8 +171,7 @@ public class Main {
         // 补全代码
     }
 }
-`}
-/>
+```
 
 ## 小结
 

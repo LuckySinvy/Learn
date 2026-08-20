@@ -12,11 +12,8 @@ description: 指针、值/指针接收者、方法集、链表实践
 
 `&` 取地址，`*` 解引用。指针的零值是 `nil`。
 
-<Playground
-  language="go"
-  id="go-09-pointer-basic"
-  title="指针基础"
-  code={`package main
+```go title="指针基础"
+package main
 
 import "fmt"
 
@@ -34,13 +31,8 @@ func main() {
     if q == nil {
         fmt.Println("q 是 nil 指针")
     }
-}`}
-  expectedOutput={`0xc0000120a8
-42
-100
-<nil>
-q 是 nil 指针`}
-/>
+}
+```
 
 <Callout type="tip" title="为什么要用指针">
 - 想在函数内**修改外部变量**时
@@ -52,11 +44,8 @@ q 是 nil 指针`}
 
 `new(T)` 返回 `*T`，指向 T 的零值。`new` 不常用，结构体多用 `&T{}`。
 
-<Playground
-  language="go"
-  id="go-09-new"
-  title="new 函数"
-  code={`package main
+```go title="new 函数"
+package main
 
 import "fmt"
 
@@ -70,18 +59,13 @@ func main() {
 
     q := &Point{1, 2} // 字面量更常用
     fmt.Println(*q)
-}`}
-  expectedOutput={`{10 20}
-{1 2}`}
-/>
+}
+```
 
 ## 3. 值传递 vs 指针传递
 
-<Playground
-  language="go"
-  id="go-09-pass"
-  title="值传递 vs 指针传递"
-  code={`package main
+```go title="值传递 vs 指针传递"
+package main
 
 import "fmt"
 
@@ -104,10 +88,8 @@ func main() {
 
     renameByPtr(&u, "Carol")
     fmt.Println("指针传递后：", u.Name) // Carol
-}`}
-  expectedOutput={`值传递后： Alice
-指针传递后： Carol`}
-/>
+}
+```
 
 <Callout type="warn" title="不要过度使用指针">
 - 小的不可变数据（如 `time.Time`、`Point`）按值传即可
@@ -119,11 +101,8 @@ func main() {
 
 方法是带接收者的函数。**接收者可以是值 `T` 或指针 `*T`**，决定方法能不能修改原对象。
 
-<Playground
-  language="go"
-  id="go-09-receiver"
-  title="值接收者 vs 指针接收者"
-  code={`package main
+```go title="值接收者 vs 指针接收者"
+package main
 
 import "fmt"
 
@@ -146,10 +125,8 @@ func main() {
 
     c.IncPtr()
     fmt.Println("IncPtr 后：  ", c.N)   // 1
-}`}
-  expectedOutput={`IncValue 后： 0
-IncPtr 后：   1`}
-/>
+}
+```
 
 <Callout type="info" title="自动取址规则">
 `c.IncPtr()` 中 `c` 是值，但 Go 编译器**自动**取址为 `(&c).IncPtr()`。反过来：只有可寻址的值才能调用指针接收者方法。
@@ -173,11 +150,8 @@ IncPtr 后：   1`}
 - `T` 的方法集：只包含**值接收者**方法
 - `*T` 的方法集：包含**值接收者 + 指针接收者**方法
 
-<Playground
-  language="go"
-  id="go-09-methodset"
-  title="方法集差异"
-  code={`package main
+```go title="方法集差异"
+package main
 
 import "fmt"
 
@@ -197,10 +171,8 @@ func main() {
     // Person 也满足 Greeter
     var g2 Greeter = p
     g2.Hello()
-}`}
-  expectedOutput={`Hi, Alice
-Hi, Alice`}
-/>
+}
+```
 
 <Callout type="tip" title="经验法则">
 - 几乎所有 Go 代码都用**指针接收者**
@@ -210,11 +182,8 @@ Hi, Alice`}
 
 ## 6. 综合练习：单向链表
 
-<Playground
-  language="go"
-  id="go-09-linkedlist"
-  title="单向链表"
-  code={`package main
+```go title="单向链表"
+package main
 
 import "fmt"
 
@@ -248,18 +217,13 @@ func main() {
     }
     fmt.Println(ll)
     fmt.Println("size =", ll.Size)
-}`}
-  expectedOutput={`[6 2 9 5 1 4 1 3]
-size = 8`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-09-exercise"
-  title="双向链表"
-  code={`// 任务：扩展上面的 Node 为双向链表节点
+```go title="双向链表"
+// 任务：扩展上面的 Node 为双向链表节点
 // 1. 增加 Prev *Node 字段
 // 2. 实现 PushFront（在头部插入）
 // 3. 实现 PopBack（删除并返回尾节点值）
@@ -326,8 +290,7 @@ func main() {
     v, _ := ll.PopBack()
     fmt.Println("弹出尾：", v, "剩余：", ll)
 }
-`}
-/>
+```
 
 ## 小结
 

@@ -33,11 +33,8 @@ with open("/tmp/x.txt", "w") as f:
 - `__enter__(self)`：进入 `with` 时调用，返回值赋给 `as` 后的变量
 - `__exit__(self, exc_type, exc_val, exc_tb)`：离开时调用。如果块内抛了异常，这三个参数会被填充；返回 `True` 会"吞掉"异常。
 
-<Playground
-  language="python"
-  id="py-12-cm-basic"
-  title="Timer 上下文管理器"
-  code={`import time
+```python title="Timer 上下文管理器"
+import time
 
 class Timer:
     """统计一段代码耗时"""
@@ -53,9 +50,8 @@ class Timer:
 
 with Timer() as t:
     total = sum(range(1_000_00))
-print(f"  计算结果: {total}")`}
-  expectedOutput={`  耗时: 0.x ms（数 ms 量级）\n  计算结果: 4999950000`}
-/>
+print(f"  计算结果: {total}")
+```
 
 <Callout type="info" title="__exit__ 的返回值">
 - 返回 `None` / `False`：异常继续向外抛
@@ -67,11 +63,8 @@ print(f"  计算结果: {total}")`}
 
 完整写一个类很啰嗦。`@contextmanager` 让你用**生成器**形式实现上下文管理器：
 
-<Playground
-  language="python"
-  id="py-12-contextmanager"
-  title="@contextmanager 写 cm"
-  code={`import time
+```python title="@contextmanager 写 cm"
+import time
 from contextlib import contextmanager
 
 @contextmanager
@@ -92,9 +85,8 @@ with timer("error-block"):
     try:
         x = 1 / 0
     except ZeroDivisionError:
-        print("  捕获了 ZeroDivisionError")`}
-  expectedOutput={`[loop] 耗时 x.xx ms\n  结果: 124999750000\n[error-block] 耗时 x.xx ms\n  捕获了 ZeroDivisionError`}
-/>
+        print("  捕获了 ZeroDivisionError")
+```
 
 <Callout type="tip" title="模板">
 ```python
@@ -113,11 +105,8 @@ def my_cm():
 
 不想为某个无害的异常写 try/except？用 `suppress`：
 
-<Playground
-  language="python"
-  id="py-12-suppress"
-  title="contextlib.suppress"
-  code={`import os
+```python title="contextlib.suppress"
+import os
 from contextlib import suppress
 
 # 想删就删，文件不在也别报错
@@ -129,9 +118,8 @@ print("没有异常，程序继续")
 with suppress(KeyError, AttributeError):
     d = {}
     print(d["missing"].upper())
-print("继续执行")`}
-  expectedOutput={`没有异常，程序继续\n继续执行`}
-/>
+print("继续执行")
+```
 
 <Callout type="warn" title="别滥用 suppress">
 `suppress` 会**静默吞掉**异常——意味着你再也看不到它。**只在"异常是预期内的、并且你已经想清楚了"时使用**。比如删可能不存在的临时文件、关闭可能没打开过的连接。
@@ -139,11 +127,8 @@ print("继续执行")`}
 
 ## 5. 实战：临时切换目录
 
-<Playground
-  language="python"
-  id="py-12-cd"
-  title="临时切换工作目录"
-  code={`import os
+```python title="临时切换工作目录"
+import os
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -165,17 +150,13 @@ with working_dir("/tmp/demo_dir"):
     Path("inside.txt").write_text("hi", encoding="utf-8")
 
 print("退出后:", os.getcwd())
-print("文件已创建:", Path("/tmp/demo_dir/inside.txt").exists())`}
-  expectedOutput={`进入前: /\nwith 中: /tmp/demo_dir\n退出后: /\n文件已创建: True`}
-/>
+print("文件已创建:", Path("/tmp/demo_dir/inside.txt").exists())
+```
 
 ## 6. 实战：可重用的数据库连接
 
-<Playground
-  language="python"
-  id="py-12-connection"
-  title="模拟的 connection 池"
-  code={`import sqlite3, tempfile, os
+```python title="模拟的 connection 池"
+import sqlite3, tempfile, os
 from contextlib import contextmanager
 
 # 准备一个临时 db
@@ -202,19 +183,15 @@ with Connection(db_path) as conn:
     for row in conn.execute("SELECT x FROM t"):
         print(row[0])
 
-os.remove(db_path)`}
-  expectedOutput={`1\n2\n3`}
-/>
+os.remove(db_path)
+```
 
 ## 🎯 练习
 
 实现一个 `indent()` 上下文管理器：进入时把全局 `print` 替换成"先输出 2 个空格再打印原内容"的版本，退出时还原。
 
-<Playground
-  language="python"
-  id="py-12-exercise"
-  title="indent 上下文管理器"
-  code={`import builtins
+```python title="indent 上下文管理器"
+import builtins
 from contextlib import contextmanager
 
 _original_print = builtins.print
@@ -231,9 +208,8 @@ with indent():
     with indent():
         print("第三层")
     print("第二层 B")
-print("回到第一层")`}
-  expectedOutput={`第一层\n  第二层 A\n    第三层\n  第二层 B\n回到第一层`}
-/>
+print("回到第一层")
+```
 
 <Callout type="exercise" title="提示">
 - `builtins.print = lambda *a, **kw: _original_print("  " + (a[0] if a else ""), *a[1:], **kw)` 这种写法

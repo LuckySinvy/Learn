@@ -16,11 +16,8 @@ Go 标准库的 `net/http` 足以搭建生产级 Web 服务，无需任何第三
 
 ## 1. 第一个 HTTP 服务
 
-<Playground
-  language="go"
-  id="go-15-hello"
-  title="Hello Handler"
-  code={`package main
+```go title="Hello Handler"
+package main
 
 import (
     "fmt"
@@ -41,10 +38,8 @@ func main() {
     if err := http.ListenAndServe(":8080", nil); err != nil {
         fmt.Println("错误：", err)
     }
-}`}
-  expectedOutput={`监听 :8080
-错误： listen tcp :8080: bind: address already in use`}
-/>
+}
+```
 
 <Callout type="tip" title="沙盒里跑长服务">
 沙盒（sandbox）里的 `main.go` 启动后会被超时（15s）强制终止。这里只展示代码模式，**不要真去运行**。真实开发用 `httptest` 测试。
@@ -54,11 +49,8 @@ func main() {
 
 不用真起服务就能测试：模拟请求 → 拿到响应。
 
-<Playground
-  language="go"
-  id="go-15-httptest"
-  title="httptest 测试"
-  code={`package main
+```go title="httptest 测试"
+package main
 
 import (
     "fmt"
@@ -93,11 +85,8 @@ func main() {
     helloHandler(rec2, req2)
     body2, _ := io.ReadAll(rec2.Result().Body)
     fmt.Println("默认： ", string(body2))
-}`}
-  expectedOutput={`status: 200
-body:   Hello, Alice!
-默认：  Hello, 世界!`}
-/>
+}
+```
 
 <Callout type="info" title="httptest 三件套">
 - `httptest.NewRecorder()`：实现 `http.ResponseWriter`，记下响应
@@ -107,11 +96,8 @@ body:   Hello, Alice!
 
 ## 3. 路由与 404
 
-<Playground
-  language="go"
-  id="go-15-router"
-  title="简单路由"
-  code={`package main
+```go title="简单路由"
+package main
 
 import (
     "fmt"
@@ -154,12 +140,8 @@ func splitReq(s string) (string, string) {
         }
     }
     return s, ""
-}`}
-  expectedOutput={`GET /hello           -> 200 hello
-GET /users/42         -> 200 user id = 42
-POST /hello           -> 405
-GET /notfound         -> 404`}
-/>
+}
+```
 
 <Callout type="tip" title="Go 1.22 的新 ServeMux">
 - 支持 `METHOD /path` 前缀
@@ -170,11 +152,8 @@ GET /notfound         -> 404`}
 
 ## 4. JSON API
 
-<Playground
-  language="go"
-  id="go-15-json"
-  title="JSON API"
-  code={`package main
+```go title="JSON API"
+package main
 
 import (
     "encoding/json"
@@ -233,9 +212,8 @@ func main() {
     mux.ServeHTTP(rec2, req2)
     body3, _ := io.ReadAll(rec2.Result().Body)
     fmt.Println("POST:", string(body3))
-}`}
-  expectedOutput={`GET: [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
-POST: {"id":3,"name":"Carol"}`}/>
+}
+```
 
 <Callout type="warn" title="忘了加 Content-Type">
 `json.NewEncoder` 不会自动设置 `Content-Type` header。**手工** `w.Header().Set("Content-Type", "application/json")` 客户端才能正确解析。
@@ -245,11 +223,8 @@ POST: {"id":3,"name":"Carol"}`}/>
 
 中间件 = 包装 handler 的一层函数，可以**前置**（记录日志、鉴权）和**后置**（统一错误处理）。
 
-<Playground
-  language="go"
-  id="go-15-middleware"
-  title="中间件"
-  code={`package main
+```go title="中间件"
+package main
 
 import (
     "fmt"
@@ -290,14 +265,8 @@ func main() {
         body, _ := io.ReadAll(rec.Result().Body)
         fmt.Printf("  -> %d %s\n", rec.Code, body)
     }
-}`}
-  expectedOutput={`  -> 200 ok
-  -> 200 ok
-  -> 200 ok
-[GET] /a 35µs
-[GET] /b 9µs
-[GET] /c 4µs`}
-/>
+}
+```
 
 <Callout type="tip" title="responseRecorder 缓冲">
 `httptest.NewRecorder` 是 buffer，不走真实网络。中间件在 `next.ServeHTTP` 返回后做的操作是同步的，所以日志能在 handler 调用后立刻看到。真实网络下要等响应写完。
@@ -305,11 +274,8 @@ func main() {
 
 ## 6. 完整可测试的 API 例子
 
-<Playground
-  language="go"
-  id="go-15-fullapi"
-  title="完整 CRUD API"
-  code={`package main
+```go title="完整 CRUD API"
+package main
 
 import (
     "encoding/json"
@@ -430,11 +396,8 @@ func main() {
     mux.ServeHTTP(rec3, httptest.NewRequest("PATCH", "/api/tasks/1/toggle", nil))
     b3, _ := io.ReadAll(rec3.Result().Body)
     fmt.Println("TOGGLE:", string(b3))
-}`}
-  expectedOutput={`LIST: [{"id":1,"title":"学 Go","done":false},{"id":2,"title":"写项目","done":false}]
-CREATE: {"id":3,"title":"部署上线","done":false}
-TOGGLE: {"id":1,"title":"学 Go","done":true}`}
-/>
+}
+```
 
 <Callout type="info" title="真实部署差异">
 真实服务：
@@ -446,11 +409,8 @@ TOGGLE: {"id":1,"title":"学 Go","done":true}`}
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-15-exercise"
-  title="/api/echo"
-  code={`// 任务：实现 /api/echo
+```go title="/api/echo"
+// 任务：实现 /api/echo
 // 1. POST /api/echo，body 是 JSON {"msg": "hello"}
 // 2. 返回 {"echo": "hello", "length": 5}
 // 3. msg 为空时返回 400 {"error": "msg 不能为空"}
@@ -502,23 +462,8 @@ func main() {
         name string
         body string
     }{
-        {"正常", \`{"msg": "hello"}\`},
-        {"空字符串", \`{"msg": ""}\`},
-        {"缺失字段", \`{}\`},
-    }
-    for _, c := range cases {
-        rec := httptest.NewRecorder()
-        req := httptest.NewRequest("POST", "/api/echo", strings.NewReader(c.body))
-        mux.ServeHTTP(rec, req)
-        b, _ := io.ReadAll(rec.Result().Body)
-        fmt.Printf("[%s] %d %s\n", c.name, rec.Code, b)
-    }
-}
-`}
-  expectedOutput={`[正常] 200 {"echo":"hello","length":5}
-[空字符串] 400 {"error":"msg 不能为空"}
-[缺失字段] 400 {"error":"msg 不能为空"}`}
-/>
+        {"正常", \`{"msg": "hello"}\
+```
 
 ## 小结
 

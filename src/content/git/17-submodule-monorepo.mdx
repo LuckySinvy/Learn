@@ -19,11 +19,8 @@ description: git submodule 的工作机制与常见坑（游离 HEAD、忘记递
   └─ libs/core/         <- 子模块（独立仓库，固定在其某次提交上）
 ```
 
-<Playground
-  language="git"
-  title="submodule 的引入、克隆与更新"
-  id="git-17-1"
-  code={`echo '===== submodule：把另一个仓库作为子目录引用 ====='
+```bash title="submodule 的引入、克隆与更新"
+echo '===== submodule：把另一个仓库作为子目录引用 ====='
 git config --global protocol.file.allow always
 git init -q --bare -b main /tmp/libcore.git
 git clone -q /tmp/libcore.git libwork && cd libwork
@@ -65,8 +62,8 @@ git submodule update --remote -q
 git add libs/core && git commit -q -m "chore: 升级 core 到 v2"
 echo "主项目现在引用的子模块哈希变了：$(git ls-files --stage libs/core)"
 echo "libs/core 内容（应为 v2）：$(cat libs/core/api.txt)"
-cd ..`}
-/>
+cd ..
+```
 
 关键点：
 
@@ -137,11 +134,8 @@ git subtree push --prefix=libs/core <url> main          # 把改动推回子项�
 
 当主仓库动辄几十 GB（如 Android、Chromium），全量克隆不现实。两个救命特性：
 
-<Playground
-  language="git"
-  title="sparse-checkout 与 partial clone 实操"
-  id="git-17-2"
-  code={`echo '===== sparse-checkout：只检出需要的目录 ====='
+```bash title="sparse-checkout 与 partial clone 实操"
+echo '===== sparse-checkout：只检出需要的目录 ====='
 git config --global protocol.file.allow always
 git init -q --bare -b main /tmp/big.git
 git init -q -b main bigwork && cd bigwork
@@ -178,8 +172,8 @@ echo '此时文件列表能看，但 blob 内容按需从源仓库现取：'
 git ls-files
 echo '查看某个文件内容（首次访问会按需 fetch）：'
 cat src/api/a.js
-cd ..`}
-/>
+cd ..
+```
 
 - **sparse-checkout**：只把指定的目录/文件检出到工作区，其余历史仍在仓库里但不在磁盘上占位置。适合"只想改其中一个模块"的超大多模块仓库。`git sparse-checkout set a b` 切换可见范围。
 - **partial clone（部分克隆）**：克隆时**不下载 blob 和/或 tree**，用到再按需获取（`--filter=blob:none` 不取文件内容，`--filter=tree:0` 连目录树都不取）。CI 里尤其省时。

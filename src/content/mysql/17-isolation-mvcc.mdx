@@ -27,17 +27,14 @@ description: 四种隔离级别、脏读/不可重复读/幻读、ReadView 与�
 
 *InnoDB 的 RR 通过 MVCC（快照读）+ 临键锁（当前读）把幻读堵得七七八八，但混用快照读与当前读时仍有边缘场景，后文演示。
 
-<Playground
-  language="mysql"
-  id="mysql-17-1"
-  title="查看与切换隔离级别"
-  code={`SHOW VARIABLES LIKE '%isolation%';
+```sql title="查看与切换隔离级别"
+SHOW VARIABLES LIKE '%isolation%';
 
 SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
 SHOW VARIABLES LIKE '%isolation%';
 
-SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;`}
-/>
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+```
 
 RC vs RR 的工程取舍：
 
@@ -117,11 +114,8 @@ COMMIT;
 
 「自己改的自己能看见」这一半可以在单会话里直接验证：
 
-<Playground
-  language="mysql"
-  id="mysql-17-2"
-  title="事务内的自身可见性"
-  code={`BEGIN;
+```sql title="事务内的自身可见性"
+BEGIN;
 SELECT stock AS before_update FROM products WHERE id = 1;
 
 UPDATE products SET stock = stock - 1 WHERE id = 1;   -- 当前读 + 加锁
@@ -130,8 +124,8 @@ UPDATE products SET stock = stock - 1 WHERE id = 1;   -- 当前读 + 加锁
 SELECT stock AS inside_txn FROM products WHERE id = 1;
 
 ROLLBACK;
-SELECT stock AS after_rollback FROM products WHERE id = 1;`}
-/>
+SELECT stock AS after_rollback FROM products WHERE id = 1;
+```
 
 <Callout type="info" title="跨会话部分请在本地复现">
 Playground 是单会话一次性容器，模拟不了「会话 B 中途提交」。上面示例只验证事务内自身可见性，完整的两会话时序请在本地开两个客户端窗口按前面的表格复现。

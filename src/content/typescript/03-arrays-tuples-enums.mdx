@@ -51,11 +51,8 @@ const bigger = [...nums, 4];   // 正确：创建新数组
 
 只读数组的实用价值在于**函数签名**：把参数声明为 `readonly T[]`，等于向调用方承诺「我不会修改你的数组」，同时编译器会替你兑现这个承诺。
 
-<Playground
-  language="typescript"
-  id="ts-03-arrays"
-  title="数组与只读数组"
-  code={`const scores: number[] = [88, 92, 79];
+```ts title="数组与只读数组"
+const scores: number[] = [88, 92, 79];
 const tags: Array<string> = ["ts", "js"];
 const mixed: (string | number)[] = [1, "two", 3];
 
@@ -79,9 +76,8 @@ console.log("extended = " + extended.join(""));
 const doubled = scores.map((s) => s * 2);
 const passed = scores.filter((s) => s >= 90);
 console.log("doubled = " + doubled.join(","));
-console.log("passed = " + passed.join(","));`}
-  expectedOutput={`scores = 88, 92, 79, 100\ntags = ts/js\nmixed 长度 = 3\n总分 = 359\nextended = abc\ndoubled = 176,184,158,200\npassed = 92,100`}
-/>
+console.log("passed = " + passed.join(","));
+```
 
 ## 2. 元组
 
@@ -115,11 +111,8 @@ type Command = [name: string, ...args: string[]];      // 后面可以跟任意�
 
 可选元素只能出现在必选元素之后；剩余元素只能有一个，且通常放在最后。
 
-<Playground
-  language="typescript"
-  id="ts-03-tuples"
-  title="元组"
-  code={`type Point = [x: number, y: number, z?: number];
+```ts title="元组"
+type Point = [x: number, y: number, z?: number];
 type Command = [name: string, ...args: string[]];
 
 const p2: Point = [3, 4];
@@ -145,9 +138,8 @@ console.log("17 / 5 = " + q + " 余 " + r);
 
 // as const 会把数组字面量推断成只读元组
 const rgb = [255, 128, 0] as const;
-console.log("rgb 第一位 = " + rgb[0] + "，长度固定为 " + rgb.length);`}
-  expectedOutput={`2D 长度 = 5\n3D 长度 = 7.0711\n命令 = git，参数 3 个\n17 / 5 = 3 余 2\nrgb 第一位 = 255，长度固定为 3`}
-/>
+console.log("rgb 第一位 = " + rgb[0] + "，长度固定为 " + rgb.length);
+```
 
 <Callout type="warn" title="元组的越界保护并不完整">
 元组能挡住 `pair[5]` 这种常量越界，但 `pair.push("x")` 却是允许的——因为元组底层就是数组，`push` 依然存在。想要真正锁死，请用 `readonly [string, number]` 或 `as const`。
@@ -189,11 +181,8 @@ enum Status {
 | 序列化后可读 | 差 | 好 |
 | 允许把任意数字赋进去 | 历史上曾允许 | 否 |
 
-<Playground
-  language="typescript"
-  id="ts-03-enums"
-  title="数字枚举与字符串枚举"
-  code={`enum Direction {
+```ts title="数字枚举与字符串枚举"
+enum Direction {
   Up,
   Down,
   Left,
@@ -233,9 +222,8 @@ console.log(label(Status.Pending) + "，" + label(Status.Failed));
 
 // 枚举也是一个真实存在的对象，可以遍历字符串枚举的键
 const allStatus = Object.values(Status);
-console.log("共有 " + allStatus.length + " 种状态: " + allStatus.join(","));`}
-  expectedOutput={`Direction.Left = 2\n反向映射 Direction[2] = Left\nStatus.Success = SUCCESS\n向上 / 向右\n处理中，失败\n共有 3 种状态: PENDING,SUCCESS,FAILED`}
-/>
+console.log("共有 " + allStatus.length + " 种状态: " + allStatus.join(","));
+```
 
 ### 3.3 const enum
 

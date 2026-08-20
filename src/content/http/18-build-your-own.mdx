@@ -20,11 +20,8 @@ description: 只用原生 socket 实现能被 curl 访问的服务器与能解�
 
 ## 2. 极简服务器：50 行核心代码
 
-<Playground
-  language="http"
-  title="手写 HTTP 服务器，curl 直接访问"
-  id="http-18-1"
-  code={`python3 -c '
+```http title="手写 HTTP 服务器，curl 直接访问"
+python3 -c '
 import socket, threading, json
 
 def handle(conn):
@@ -93,8 +90,8 @@ subprocess.run(["curl", "-s", "-X", "POST", "http://127.0.0.1:8000/echo", "-d", 
 print()
 subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "未知路径 -> %{http_code}\n",
                 "http://127.0.0.1:8000/nope"], check=False)
-'`}
-/>
+'
+```
 
 几处对应前面章节的设计决策：
 
@@ -107,11 +104,8 @@ subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "未知路径 -> %{http_c
 
 客户端的难点在**解析响应**：读状态行、逐行读头、再按 Content-Length 精确读体。这次对面换成标准的 python 文件服务器，验证我们的客户端"说的是标准 HTTP"：
 
-<Playground
-  language="http"
-  title="手写 HTTP 客户端，访问标准服务器"
-  id="http-18-2"
-  code={`echo "served by stdlib server" > data.txt
+```http title="手写 HTTP 客户端，访问标准服务器"
+echo "served by stdlib server" > data.txt
 python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
@@ -160,18 +154,15 @@ print("体:", body.decode().strip())
 
 code, reason, _, _ = http_get("127.0.0.1", 8000, "/missing.txt")
 print("再试一个不存在的文件:", code, reason)
-'`}
-/>
+'
+```
 
 一个健壮的真实客户端还要处理：chunked 解码（第 10 章）、gzip 解压、3xx 跟随（第 6 章）、keep-alive 连接池（第 11 章）、TLS（第 12 章）——每一项你都已经知道原理了。
 
 ## 4. 终极联调：自己的客户端访问自己的服务器
 
-<Playground
-  language="http"
-  title="毕业合影：手写客户端 x 手写服务器"
-  id="http-18-3"
-  code={`python3 -c '
+```http title="毕业合影：手写客户端 x 手写服务器"
+python3 -c '
 import socket, threading, time
 
 # ── 迷你服务器：只有一个路由，但支持 keep-alive ──
@@ -216,8 +207,8 @@ for path in ("/first", "/second", "/third"):
         body += s.recv(4096)
     print(body.decode().strip(), "| 复用同一条连接:", s.getsockname())
 s.close()
-'`}
-/>
+'
+```
 
 三个请求、同一个本地端口号——**一条 TCP 连接被复用了三次**，我们徒手实现了 keep-alive。至此：分层（1）、报文（4）、方法（5）、状态码（6）、定界（4/10）、连接管理（11）全部亲手落地。
 

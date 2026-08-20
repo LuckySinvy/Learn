@@ -142,11 +142,8 @@ assertTimeout(Duration.ofSeconds(1), () -> ...);
 
 下面这个 Playground 自己实现了一个简化版的 JUnit——可以让你**单文件**地感受 `@Test` / `@BeforeEach` / 断言 / 异常检查 / 参数化测试的运行效果。
 
-<Playground
-  language="java"
-  id="java-16-mini"
-  title="迷你 JUnit"
-  code={`import java.lang.annotation.*;
+```java title="迷你 JUnit"
+import java.lang.annotation.*;
 import java.lang.reflect.*;
 import java.util.*;
 
@@ -230,17 +227,13 @@ public class Main {
         }
         System.out.printf("%n通过 %d / 失败 %d%n", pass, fail);
     }
-}`}
-  expectedOutput={`[ok]   add_2_and_3\n[ok]   add_negative\n[ok]   divide_ok\n[ok]   divide_by_zero\n\n通过 4 / 失败 0`}
-/>
+}
+```
 
 ## 7. 参数化测试
 
-<Playground
-  language="java"
-  id="java-16-param"
-  title="参数化测试"
-  code={`import java.lang.annotation.*;
+```java title="参数化测试"
+import java.lang.annotation.*;
 import java.lang.reflect.*;
 import java.util.*;
 
@@ -275,9 +268,8 @@ public class Main {
     @ParamTest @Case(a = 1, b = 2, sum = 3)  static int t1(int a, int b) { return a + b; }
     @ParamTest @Case(a = 5, b = 5, sum = 10) static int t2(int a, int b) { return a + b; }
     @ParamTest @Case(a = 0, b = 0, sum = 0)  static int t3(int a, int b) { return a + b; }
-}`}
-  expectedOutput={`  [ok]   1 + 2 = 3\n  [ok]   5 + 5 = 10\n  [ok]   0 + 0 = 0\n\n通过 3 / 失败 0`}
-/>
+}
+```
 
 <Callout type="tip" title="真正的 JUnit 5 参数化测试长这样">
 ```java
@@ -314,11 +306,8 @@ mvn -DskipTests package         # 跳过测试打包
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-16-exercise"
-  title="补全迷你测试"
-  code={`// 任务：在 calculatorTest() 里加 3 条 @Case 参数化测试
+```java title="补全迷你测试"
+// 任务：在 calculatorTest() 里加 3 条 @Case 参数化测试
 // 测试 add 方法，覆盖正数 + 正数、正数 + 0、负数 + 正数 三种情况
 // 期望输出：
 //   [ok]   2 + 3 = 5
@@ -353,8 +342,7 @@ public class Main {
     // 补全 @Case 三条
     static int calculatorTest(int a, int b) { return add(a, b); }
 }
-`}
-/>
+```
 
 ## 小结
 

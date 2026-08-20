@@ -151,11 +151,8 @@ export function render(_ctx, _cache) {
 
 下面这个 Playground 用手写一个 mini 编译器产物，直观对比「朴素 diff 全树」和「带 PatchFlag 只比对动态部分」的检查次数差异。
 
-<Playground
-  language="typescript"
-  title="手写 h() 与 PatchFlag：模板到底编译成了什么"
-  id="vue-02-1"
-  code={`type VChild = string | VNode;
+```ts title="手写 h() 与 PatchFlag：模板到底编译成了什么"
+type VChild = string | VNode;
 
 interface VNode {
   type: string;
@@ -226,9 +223,8 @@ console.log("带 patchFlag 检查处数: " + flaggedCount(vnode));
 const hoisted = { type: "span", props: { class: "title" }, children: ["标题"], patchFlag: 0 };
 const ref1 = hoisted;
 const ref2 = hoisted;
-console.log("静态节点引用复用: " + (ref1 === ref2));`}
-  expectedOutput={`朴素 diff 检查处数: 5\n带 patchFlag 检查处数: 1\n静态节点引用复用: true\n`}
-/>
+console.log("静态节点引用复用: " + (ref1 === ref2));
+```
 
 `naiveCount` 数了 5 处（div 本身 + 2 个静态属性 + span 本身 + 1 个文本），而 `flaggedCount` 只数了 1 处（span 的 TEXT 标记）。真实模板里静态节点远多于动态节点，这个差距会非常悬殊——这就是编译期优化带来的收益。
 

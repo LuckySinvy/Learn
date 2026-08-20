@@ -19,11 +19,8 @@ description: context.Context、超时取消、跨 goroutine 传播
 
 ## 2. 根 Context
 
-<Playground
-  language="go"
-  id="go-13-root"
-  title="根 Context"
-  code={`package main
+```go title="根 Context"
+package main
 
 import (
     "context"
@@ -46,11 +43,8 @@ func main() {
     cancel()   // 立刻取消
     fmt.Println("canceled?", ctx.Err())     // context canceled
     _ = time.Now
-}`}
-  expectedOutput={`bg.Err(): <nil>
-todo.Err(): <nil>
-canceled? context canceled`}
-/>
+}
+```
 
 <Callout type="tip" title="Background vs TODO">
 - `Background()`：在 `main`、初始化、请求处理入口使用
@@ -60,11 +54,8 @@ canceled? context canceled`}
 
 ## 3. `WithCancel`：手动取消
 
-<Playground
-  language="go"
-  id="go-13-cancel"
-  title="WithCancel"
-  code={`package main
+```go title="WithCancel"
+package main
 
 import (
     "context"
@@ -93,14 +84,8 @@ func main() {
     time.Sleep(50 * time.Millisecond)
     cancel()              // 通知所有 goroutine 退出
     time.Sleep(30 * time.Millisecond)  // 等子 goroutine 打印
-}`}
-  expectedOutput={`worker 1 工作中…
-worker 2 工作中…
-worker 1 工作中…
-worker 2 工作中…
-worker 1 收到取消：context canceled
-worker 2 收到取消：context canceled`}
-/>
+}
+```
 
 <Callout type="warn" title="记得 cancel">
 `cancel` 是一个函数对象，必须调用（通常 `defer cancel()`）来释放 Context 占用的资源。
@@ -108,11 +93,8 @@ worker 2 收到取消：context canceled`}
 
 ## 4. `WithTimeout` / `WithDeadline`：自动超时
 
-<Playground
-  language="go"
-  id="go-13-timeout"
-  title="WithTimeout"
-  code={`package main
+```go title="WithTimeout"
+package main
 
 import (
     "context"
@@ -142,10 +124,8 @@ func main() {
     ctx2, cancel2 := context.WithDeadline(context.Background(), deadline)
     defer cancel2()
     fmt.Println("deadline:", ctx2.Deadline())
-}`}
-  expectedOutput={`结果： context deadline exceeded
-deadline: 2026-07-28 14:00:00.123 +0000 UTC m=+0.050`}
-/>
+}
+```
 
 <Callout type="info" title={`WithTimeout = WithDeadline + time.Duration`}>
 `WithTimeout` 内部就是 `WithDeadline(parent, time.Now().Add(d))`。
@@ -153,11 +133,8 @@ deadline: 2026-07-28 14:00:00.123 +0000 UTC m=+0.050`}
 
 ## 5. `WithValue`：传递请求范围数据
 
-<Playground
-  language="go"
-  id="go-13-value"
-  title="WithValue"
-  code={`package main
+```go title="WithValue"
+package main
 
 import (
     "context"
@@ -189,10 +166,8 @@ func main() {
     ctx := WithUserID(context.Background(), 42)
     handleReq(ctx)
     handleReq(context.Background())
-}`}
-  expectedOutput={`处理用户： 42
-未登录`}
-/>
+}
+```
 
 <Callout type="warn" title="WithValue 注意事项">
 - key 必须是**可比较**且**不冲突**的——别用 `string`！用自定义类型
@@ -204,11 +179,8 @@ func main() {
 
 Context 必须**从父 goroutine 显式传给子 goroutine**。
 
-<Playground
-  language="go"
-  id="go-13-propagate"
-  title="Context 传播"
-  code={`package main
+```go title="Context 传播"
+package main
 
 import (
     "context"
@@ -232,9 +204,8 @@ func main() {
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
     defer cancel()
     level1(ctx)
-}`}
-  expectedOutput={`level3 取消： context deadline exceeded`}
-/>
+}
+```
 
 <Callout type="tip" title="Context 在参数列表中的位置">
 惯例：`ctx` 作为**第一个参数**。例如：
@@ -246,11 +217,8 @@ func DoSomething(ctx context.Context, arg1 string, arg2 int) error
 
 ## 7. 实战：带超时的数据库查询模拟
 
-<Playground
-  language="go"
-  id="go-13-db"
-  title="模拟带超时的查询"
-  code={`package main
+```go title="模拟带超时的查询"
+package main
 
 import (
     "context"
@@ -283,19 +251,13 @@ func main() {
     _, err = queryDB(ctx2, "SELECT * FROM users")
     fmt.Println("场景2：", err)
     fmt.Println("是否超时？", errors.Is(err, context.DeadlineExceeded))
-}`}
-  expectedOutput={`场景1： rows: 42 <nil>
-场景2： context deadline exceeded
-是否超时？ true`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-13-exercise"
-  title="可控 goroutine 池"
-  code={`// 任务：实现一个可控的 worker 函数
+```go title="可控 goroutine 池"
+// 任务：实现一个可控的 worker 函数
 // 1. 接收 ctx 和 id
 // 2. 每 10ms 打印一次 "worker N tick"
 // 3. ctx 被取消时打印 "worker N 停止" 并返回
@@ -340,23 +302,7 @@ func main() {
     cancel()
     wg.Wait()
 }
-`}
-  expectedOutput={`worker 2 tick
-worker 1 tick
-worker 3 tick
-worker 2 tick
-worker 1 tick
-worker 3 tick
-worker 2 tick
-worker 1 tick
-worker 3 tick
-worker 2 tick
-worker 1 tick
-worker 3 tick
-worker 1 停止
-worker 2 停止
-worker 3 停止`}
-/>
+```
 
 ## 小结
 

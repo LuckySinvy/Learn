@@ -28,11 +28,8 @@ URL 设计规约：
 - 小写 + 连字符：/order-items 而非 /orderItems；
 - 真实世界的"动作"实在无法名词化时（如重启、搜索），务实处理：POST /servers/42/restart——教条不如清晰。
 
-<Playground
-  language="http"
-  title="一套规范的资源接口"
-  id="http-17-1"
-  code={`python3 -c '
+```http title="一套规范的资源接口"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlsplit, parse_qs
 import json, re
@@ -89,8 +86,8 @@ echo "== 单个资源 =="
 curl -s http://127.0.0.1:8000/v1/books/2 | jq .
 echo "== 创建：201 + Location =="
 curl -si -X POST http://127.0.0.1:8000/v1/books -d '{"title":"HTTP/3 实战","status":"in-stock"}' \
-  | grep -E "HTTP/|Location"`}
-/>
+  | grep -E "HTTP/|Location"
+```
 
 注意三个细节：路径带版本 `/v1`；过滤走查询参数而不是新端点；创建返回 **201 + Location**（客户端立刻知道新资源在哪）。
 
@@ -116,11 +113,8 @@ API 一旦有人用，破坏性变更（删字段、改类型）就必须走新�
 
 `GET /orders?limit=20&cursor=eyJpZCI6MTA0fQ`——游标编码了"上一页最后一条的位置"，SQL 对应 `WHERE id > 104 LIMIT 20`。索引直达、数据变动不错乱，代价是不能跳页。**信息流、日志、无限滚动一律用 cursor**。
 
-<Playground
-  language="http"
-  title="两种分页的行为对比"
-  id="http-17-2"
-  code={`python3 -c '
+```http title="两种分页的行为对比"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlsplit, parse_qs
 import json
@@ -163,8 +157,8 @@ echo "== cursor 翻页：跟着 next_cursor 走 =="
 R=$(curl -s "http://127.0.0.1:8000/cursor?limit=5")
 echo $R | jq -c "{ids:(.items | map(.id)), next:.next_cursor}"
 NEXT=$(echo $R | jq -r ".next_cursor")
-curl -s "http://127.0.0.1:8000/cursor?limit=5&cursor=$NEXT" | jq -c "{ids:(.items | map(.id)), next:.next_cursor}"`}
-/>
+curl -s "http://127.0.0.1:8000/cursor?limit=5&cursor=$NEXT" | jq -c "{ids:(.items | map(.id)), next:.next_cursor}"
+```
 
 响应体里除了 items，务必带分页元信息（total/next_cursor）；讲究一点可以加 `Link` 响应头（GitHub 风格）给出 next/prev 的完整 URL。
 
@@ -172,11 +166,8 @@ curl -s "http://127.0.0.1:8000/cursor?limit=5&cursor=$NEXT" | jq -c "{ids:(.item
 
 错误响应最忌讳各接口自由发挥。RFC 7807/9457 定义了标准的 `application/problem+json`：
 
-<Playground
-  language="http"
-  title="RFC 7807 风格的错误响应"
-  id="http-17-3"
-  code={`python3 -c '
+```http title="RFC 7807 风格的错误响应"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 
@@ -221,8 +212,8 @@ for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break
 echo "== 业务错误：422 + problem+json =="
 curl -s -X POST http://127.0.0.1:8000/v1/transfers -d '{"amount": 999}' | jq .
 echo "== 格式错误：400 =="
-curl -s -X POST http://127.0.0.1:8000/v1/transfers -d 'not-json' | jq .`}
-/>
+curl -s -X POST http://127.0.0.1:8000/v1/transfers -d 'not-json' | jq .
+```
 
 字段约定：`type`（错误类型的 URI，可指向文档）、`title`（人类可读短语）、`status`（同状态码）、`detail`（本次具体说明）、`instance`（出错的资源），并允许扩展字段（如 balance）。配合正确的 4xx/5xx 状态码，网关限流、前端兜底、监控告警各取所需。
 

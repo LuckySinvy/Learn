@@ -28,19 +28,16 @@ stream: orders
 
 ### 2.1 XADD 写入
 
-<Playground
-  language="redis"
-  title="XADD 生产与 XRANGE 回溯"
-  id="redis-09-1"
-  code={`# 星号表示让 Redis 自动生成 ID（毫秒时间戳-序号）
+```bash title="XADD 生产与 XRANGE 回溯"
+# 星号表示让 Redis 自动生成 ID（毫秒时间戳-序号）
 XADD orders * action create sku 2001
 XADD orders * action pay order 8801
 XLEN orders
 # 控制长度：近似裁剪到 1 万条（波浪号表示允许略多，性能好）
 XADD orders MAXLEN ~ 10000 * action ship order 8801
 # 减号和加号是最小/最大 ID，读取全部消息
-XRANGE orders - +`}
-/>
+XRANGE orders - +
+```
 
 ### 2.2 XRANGE / XREAD 读取
 
@@ -60,11 +57,8 @@ XREAD 模式下每个消费者独立维护自己读到的位置，适合"每个�
 
 ### 3.1 创建组与消费
 
-<Playground
-  language="redis"
-  title="消费组：XGROUP + XREADGROUP"
-  id="redis-09-2"
-  code={`# 这里手写 ID 便于后面 XACK 引用，生产中用星号自动生成
+```bash title="消费组：XGROUP + XREADGROUP"
+# 这里手写 ID 便于后面 XACK 引用，生产中用星号自动生成
 XADD orders 1-1 action create sku 2001
 XADD orders 1-2 action pay order 8801
 # 从头（0）开始消费；用美元符号则只消费此后的新消息
@@ -72,18 +66,15 @@ XGROUP CREATE orders g1 0
 # 消费者 c1 领取 2 条新消息，大于号表示"从未投递给本组的消息"
 XREADGROUP GROUP g1 c1 COUNT 2 STREAMS orders >
 # 再读一次，已经没有新消息了
-XREADGROUP GROUP g1 c1 COUNT 2 STREAMS orders >`}
-/>
+XREADGROUP GROUP g1 c1 COUNT 2 STREAMS orders >
+```
 
 `>` 是特殊 ID，表示"给我从未投递给本组的新消息"。消息投递后进入该消费者的 **PEL（Pending Entries List，待确认列表）**，直到被 ACK。
 
 ### 3.2 确认与查看积压
 
-<Playground
-  language="redis"
-  title="XACK 确认与 XPENDING 查积压"
-  id="redis-09-3"
-  code={`XADD orders 1-1 action create sku 2001
+```bash title="XACK 确认与 XPENDING 查积压"
+XADD orders 1-1 action create sku 2001
 XADD orders 1-2 action pay order 8801
 XGROUP CREATE orders g1 0
 XREADGROUP GROUP g1 c1 COUNT 2 STREAMS orders >
@@ -92,18 +83,15 @@ XACK orders g1 1-1
 # 组内待确认概况：总数、最小/最大 ID、各消费者的挂起数
 XPENDING orders g1
 # 详细列表：每条的消费者、空闲毫秒数、投递次数
-XPENDING orders g1 - + 10`}
-/>
+XPENDING orders g1 - + 10
+```
 
 ### 3.3 故障转移：XAUTOCLAIM
 
 消费者 c1 崩溃后，它 PEL 里的消息不会自动重投。其他消费者用 `XAUTOCLAIM` 把"挂起超过一定时间"的消息认领过来：
 
-<Playground
-  language="redis"
-  title="XAUTOCLAIM 认领僵尸消息"
-  id="redis-09-4"
-  code={`XADD orders 1-1 action pay order 8801
+```bash title="XAUTOCLAIM 认领僵尸消息"
+XADD orders 1-1 action pay order 8801
 XGROUP CREATE orders g1 0
 # c1 领走消息但不 ACK，模拟处理到一半崩溃
 XREADGROUP GROUP g1 c1 COUNT 1 STREAMS orders >
@@ -111,8 +99,8 @@ XPENDING orders g1 - + 10
 # c2 认领空闲超过 0ms 的消息（生产中填 60000 之类的阈值）
 XAUTOCLAIM orders g1 c2 0 0
 # 现在这条消息归 c2 了
-XPENDING orders g1 - + 10`}
-/>
+XPENDING orders g1 - + 10
+```
 
 消费者应定期跑 XAUTOCLAIM 作为"补偿任务"。投递次数（delivery count）随每次认领递增，超过阈值（如 5 次）仍失败的消息应转入死信队列（另一个 Stream）人工处理，避免毒消息无限循环。
 

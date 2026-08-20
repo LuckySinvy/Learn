@@ -14,11 +14,8 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
 
 子类用 `extends` 继承父类，Java 是**单继承**（一个类只能有一个直接父类）。
 
-<Playground
-  language="java"
-  id="java-09-extends"
-  title="继承基础"
-  code={`public class Main {
+```java title="继承基础"
+public class Main {
     static class Animal {
         String name;
         Animal(String name) { this.name = name; }
@@ -40,9 +37,8 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
         d.fetch();    // 子类自有
         System.out.println("品种：" + d.breed);
     }
-}`}
-  expectedOutput={`旺财 发出声音\n旺财 叼回了球\n品种：柴犬`}
-/>
+}
+```
 
 <Callout type="warn" title="super() 必须是构造器第一行">
 如果父类**没有**无参构造器，子类必须显式 `super(args)`。否则编译失败。
@@ -52,11 +48,8 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
 
 子类可以**重写**（override）父类方法。运行时根据实际类型决定调用哪个版本——这就是**多态**。
 
-<Playground
-  language="java"
-  id="java-09-override"
-  title="方法重写与多态"
-  code={`public class Main {
+```java title="方法重写与多态"
+public class Main {
     static class Shape {
         double area() { return 0; }
         String name() { return "Shape"; }
@@ -92,9 +85,8 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
             System.out.printf("%s area = %.2f%n", s.name(), s.area());
         }
     }
-}`}
-  expectedOutput={`Circle area = 12.57\nRectangle area = 12.00\nCircle area = 3.14`}
-/>
+}
+```
 
 <Callout type="tip" title="重写的规则">
 - 方法签名必须**完全一致**（参数、返回类型）
@@ -107,11 +99,8 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
 
 当父类只知道子类「应该有」某个方法、但无法给出默认实现时，就用 `abstract`。
 
-<Playground
-  language="java"
-  id="java-09-abstract"
-  title="抽象类"
-  code={`public class Main {
+```java title="抽象类"
+public class Main {
     abstract static class Animal {
         String name;
         Animal(String name) { this.name = name; }
@@ -139,19 +128,15 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
         Animal[] pets = { new Cat("小花"), new Duck("嘎嘎") };
         for (Animal a : pets) a.introduce();
     }
-}`}
-  expectedOutput={`小花：喵\n嘎嘎：嘎`}
-/>
+}
+```
 
 ## 4. 接口 `interface`
 
 接口定义**行为契约**，不关心实现。Java 8 之后接口可以有 `default` 方法和 `static` 方法。
 
-<Playground
-  language="java"
-  id="java-09-interface"
-  title="接口基础"
-  code={`public class Main {
+```java title="接口基础"
+public class Main {
     interface Flyable {
         void fly();                       // 抽象方法
         default void land() {             // 默认方法（Java 8+）
@@ -179,9 +164,8 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
         d.land();                       // 来自 default
         System.out.println("理论上限：" + Flyable.maxAltitude() + " 米");
     }
-}`}
-  expectedOutput={`鸭子飞不高\n鸭子游得快\n安全着陆\n理论上限：10000 米`}
-/>
+}
+```
 
 <Callout type="info" title="接口 vs 抽象类">
 | 维度 | 抽象类 | 接口 |
@@ -197,11 +181,8 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
 
 `default` 让接口可以**向后兼容**地新增方法而不破坏已有实现。
 
-<Playground
-  language="java"
-  id="java-09-default"
-  title="default 方法"
-  code={`public class Main {
+```java title="default 方法"
+public class Main {
     interface Greeter {
         void hello();
         default void greetTwice() {
@@ -219,17 +200,13 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
         Friendly f = new Friendly();
         f.greetTwice();
     }
-}`}
-  expectedOutput={`你好!\n你好!`}
-/>
+}
+```
 
 ## 6. 综合：动物小世界
 
-<Playground
-  language="java"
-  id="java-09-zoo"
-  title="综合：动物园"
-  code={`public class Main {
+```java title="综合：动物园"
+public class Main {
     interface Eater { default void eat() { System.out.println("在吃东西"); } }
     interface Flyer { void fly(); }
     interface Swimmer { void swim(); }
@@ -269,17 +246,13 @@ description: extends、super、方法重写、抽象类、接口、默认方法�
             if (a instanceof Eater)   ((Eater) a).eat();
         }
     }
-}`}
-  expectedOutput={`Dog(旺财) -> 汪\nDuck(嘎嘎) -> 嘎\n嘎嘎 飞起来了\n嘎嘎 在游泳\n在吃东西\nFish(尼莫) -> ...\n尼莫 摆尾游`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-09-exercise"
-  title="形状面积计算器"
-  code={`// 任务：补全 Shape 抽象类与 Triangle 子类
+```java title="形状面积计算器"
+// 任务：补全 Shape 抽象类与 Triangle 子类
 // 期望输出：
 //   Circle(2.0)    area = 12.57
 //   Rect(3.0x4.0)  area = 12.00
@@ -316,8 +289,7 @@ public class Main {
         }
     }
 }
-`}
-/>
+```
 
 ## 小结
 

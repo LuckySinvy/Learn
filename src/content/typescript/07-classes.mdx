@@ -54,11 +54,8 @@ class Point {
 TypeScript 的 `private` 编译后就是个普通属性，运行时用 `obj["secret"]` 照样能访问到。它只在类型检查阶段拦你。需要**运行时真正私有**，用下面讲的 `#` 字段。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-07-basics"
-  title="参数属性与访问修饰符"
-  code={`class BankAccount {
+```ts title="参数属性与访问修饰符"
+class BankAccount {
   // 参数属性：一行搞定声明 + 赋值 + 修饰符
   constructor(
     public readonly owner: string,
@@ -88,9 +85,8 @@ console.log("取 200: " + acc.withdraw(200));
 console.log("取 120: " + acc.withdraw(120));
 console.log("最终余额 = " + acc.getBalance());
 // acc.balance;        // 编译错误：balance 是 private
-// acc.owner = "Bob";  // 编译错误：owner 是 readonly`}
-  expectedOutput={`Ada 余额 = 150\n取 200: false\n取 120: true\n最终余额 = 30`}
-/>
+// acc.owner = "Bob";  // 编译错误：owner 是 readonly
+```
 
 ## 4. getter 与 setter
 
@@ -126,11 +122,8 @@ class User {
 }
 ```
 
-<Playground
-  language="typescript"
-  id="ts-07-getter-static"
-  title="getter/setter 与静态成员"
-  code={`class Temperature {
+```ts title="getter/setter 与静态成员"
+class Temperature {
   private celsiusValue = 0;
 
   get celsius(): number {
@@ -166,9 +159,8 @@ class IdGenerator {
 
 console.log(IdGenerator.next());
 console.log(IdGenerator.next());
-console.log("前缀属于类本身: " + IdGenerator.prefix);`}
-  expectedOutput={`25°C = 77°F\n212°F = 100°C\nID-1\nID-2\n前缀属于类本身: ID`}
-/>
+console.log("前缀属于类本身: " + IdGenerator.prefix);
+```
 
 ## 6. 继承与抽象类
 
@@ -202,11 +194,8 @@ abstract class Shape {
 }
 ```
 
-<Playground
-  language="typescript"
-  id="ts-07-inheritance"
-  title="继承与抽象类"
-  code={`abstract class Shape {
+```ts title="继承与抽象类"
+abstract class Shape {
   abstract area(): number;
   abstract name(): string;
 
@@ -245,9 +234,8 @@ for (const s of shapes) {
 }
 
 // const s = new Shape();   // 编译错误：抽象类不能实例化
-console.log("多态：同一个 describe，行为随实际类型变化");`}
-  expectedOutput={`圆 的面积是 12.57\n矩形 的面积是 12.00\n多态：同一个 describe，行为随实际类型变化`}
-/>
+console.log("多态：同一个 describe，行为随实际类型变化");
+```
 
 ## 7. implements 接口
 
@@ -291,11 +279,8 @@ class Counter {
 | 能否被 `obj["x"]` 绕过 | 能 | 不能 |
 | 子类能否访问 | 不能（但 protected 能） | 不能 |
 
-<Playground
-  language="typescript"
-  id="ts-07-private-implements"
-  title="implements 与 # 私有字段"
-  code={`interface Serializable {
+```ts title="implements 与 # 私有字段"
+interface Serializable {
   serialize(): string;
 }
 
@@ -319,9 +304,8 @@ console.log("校验 secret-abc: " + s.matches("secret-abc"));
 console.log("校验 wrong: " + s.matches("wrong"));
 
 // 外部拿不到 #token，即使用字符串索引也不行
-console.log("能看到的键: " + Object.keys(s).join(","));`}
-  expectedOutput={`{"userId":"u_42","hasToken":true}\n校验 secret-abc: true\n校验 wrong: false\n能看到的键: userId`}
-/>
+console.log("能看到的键: " + Object.keys(s).join(","));
+```
 
 ## 9. 类的「双重身份」
 

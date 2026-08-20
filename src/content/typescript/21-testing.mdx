@@ -76,11 +76,8 @@ tsc && node --test dist/
 
 理解测试框架最好的方式是自己写一个。下面这三十行代码包含了所有测试运行器的核心：注册、执行、捕获断言错误、汇总报告。
 
-<Playground
-  language="typescript"
-  id="ts-21-mini-runner"
-  title="手写测试运行器"
-  code={`import { strict as assert } from "node:assert";
+```ts title="手写测试运行器"
+import { strict as assert } from "node:assert";
 
 type TestCase = { name: string; fn: () => void | Promise<void> };
 
@@ -148,8 +145,8 @@ it("异步用例", async () => {
   assert.equal(v * 2, 42);
 });
 
-void run();`}
-/>
+void run();
+```
 
 <Callout type="tip" title="被测函数要「纯」">
 上面的 `slugify` 和 `chunk` 都是纯函数：同样的输入永远得到同样的输出，没有副作用。把业务逻辑的核心提炼成纯函数，测试成本会断崖式下降。需要 IO 的部分尽量薄，用依赖注入把它们挡在外面。
@@ -185,11 +182,8 @@ add("1", 2);
 
 它比 `@ts-ignore` 好得多：`@ts-ignore` 会永久沉默，即使将来错误消失了也不会提醒你删掉。
 
-<Playground
-  language="typescript"
-  id="ts-21-type-tests"
-  title="类型测试"
-  code={`// 严格相等判定
+```ts title="类型测试"
+// 严格相等判定
 type Equal<X, Y> =
   (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
 
@@ -232,8 +226,8 @@ function identity<T>(v: T): T {
 }
 type IdReturn = ReturnType<typeof identity<string>>;
 const idCheck: Expect<Equal<IdReturn, string>> = true;
-console.log("identity 返回类型断言:", idCheck);`}
-/>
+console.log("identity 返回类型断言:", idCheck);
+```
 
 <Callout type="warn" title="Equal 不是万能的">
 `Equal` 依赖编译器的内部实现细节，在某些边界情况（条件类型延迟求值、交叉类型顺序）下会给出反直觉的结果。遇到「明明一样却判 false」时，先用 `Expect<Extends<A, B>>` 这类宽松版本定位问题，别把时间耗在和 `Equal` 较劲上。

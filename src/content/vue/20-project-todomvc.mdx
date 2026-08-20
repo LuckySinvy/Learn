@@ -66,11 +66,8 @@ export function useTodos() {
 
 下面 Playground 用一个**自包含迷你响应系统**（复用第 12/13 章的 `ref`/`reactive`/`computed`/`effect` + 自动解包）实现上面的 store 核心，并模拟「渲染」观察每次操作后的列表与统计：
 
-<Playground
-  language="typescript"
-  title="迷你 Todo store：add / toggle / remove / 过滤 / 统计"
-  id="vue-20-1"
-  code={`// ---- 迷你响应核心（与第 12/13 章同源） ----
+```ts title="迷你 Todo store：add / toggle / remove / 过滤 / 统计"
+// ---- 迷你响应核心（与第 12/13 章同源） ----
 type Dep = Set<Effect>;
 const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
 let activeEffect: Effect | null = null;
@@ -161,9 +158,8 @@ add('ship it'); render('add C');
 remove(2); render('remove 2');
 toggle(3); render('toggle 3');
 state.filter = 'completed'; render('filter=completed');
-console.log("final remaining=" + remaining.value + " completed=" + completed.value);`}
-  expectedOutput={`[init] remain=0 done=0 | \n[add A] remain=1 done=0 | [ ] learn Vue\n[add B] remain=2 done=0 | [ ] learn Vue, [ ] write code\n[toggle 1] remain=1 done=1 | [x] learn Vue, [ ] write code\n[add C] remain=2 done=1 | [x] learn Vue, [ ] write code, [ ] ship it\n[remove 2] remain=1 done=1 | [x] learn Vue, [ ] ship it\n[toggle 3] remain=0 done=2 | [x] learn Vue, [x] ship it\n[filter=completed] remain=0 done=2 | [x] learn Vue, [x] ship it\nfinal remaining=0 completed=2\n`}
-/>
+console.log("final remaining=" + remaining.value + " completed=" + completed.value);
+```
 
 这个 90 行的迷你 Todo store 把全书核心都用上了：`reactive` 存状态、`computed` 派生（剩余/已完成/可见列表，且带缓存）、`effect` 驱动「渲染」、`add/toggle/remove` 是 action。最后切到 `filter='completed'`，`visible` 这个 computed 立刻只显示已完成项——这就是第 5/13 章讲「computed 只在依赖变时重算」的真实落地。
 

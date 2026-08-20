@@ -8,11 +8,8 @@ description: os/io、bufio、encoding/json
 
 ## 1. 读文件
 
-<Playground
-  language="go"
-  id="go-08-read"
-  title="读取文件"
-  code={`package main
+```go title="读取文件"
+package main
 
 import (
     "fmt"
@@ -27,16 +24,13 @@ func main() {
         return
     }
     fmt.Println(string(data))
-}`}
-/>
+}
+```
 
 ## 2. 写文件
 
-<Playground
-  language="go"
-  id="go-08-write"
-  title="写入文件"
-  code={`package main
+```go title="写入文件"
+package main
 
 import (
     "fmt"
@@ -51,19 +45,15 @@ func main() {
         return
     }
     fmt.Println("写入成功")
-}`}
-  expectedOutput={`写入成功`}
-/>
+}
+```
 
 ## 3. `bufio` 缓冲读写
 
 `os.ReadFile` 一次读全文件；大文件用 `bufio.Scanner` 按行读取。
 
-<Playground
-  language="go"
-  id="go-08-bufio"
-  title="bufio 按行读"
-  code={`package main
+```go title="bufio 按行读"
+package main
 
 import (
     "bufio"
@@ -88,9 +78,8 @@ func main() {
     if err := scanner.Err(); err != nil {
         fmt.Println("扫描错误：", err)
     }
-}`}
-  expectedOutput={`ALPHA\nBETA\nGAMMA\nDELTA`}
-/>
+}
+```
 
 <Callout type="info" title="defer 关闭">
 打开的文件、数据库连接、网络句柄都必须 `defer Close()`，否则资源会泄漏。`defer` 在函数返回前执行，保证关闭一定发生。
@@ -100,11 +89,8 @@ func main() {
 
 Go 用结构体 tag 控制 JSON 字段名。
 
-<Playground
-  language="go"
-  id="go-08-json"
-  title="JSON 序列化"
-  code={`package main
+```go title="JSON 序列化"
+package main
 
 import (
     "encoding/json"
@@ -129,17 +115,13 @@ func main() {
     var u2 User
     json.Unmarshal(data, &u2)
     fmt.Printf("%+v\\n", u2)
-}`}
-  expectedOutput={`{\n  'name': 'Alice',\n  'age': 30,\n  'tags': [\n    'vip',\n    'founder'\n  ]\n}\n{Name:Alice Age:30 Email: Tags:[vip founder]}`}
-/>
+}
+```
 
 ## 5. 实战：JSON 配置文件读写
 
-<Playground
-  language="go"
-  id="go-08-config"
-  title="JSON 配置文件"
-  code={`package main
+```go title="JSON 配置文件"
+package main
 
 import (
     "encoding/json"
@@ -166,16 +148,13 @@ func main() {
     var c2 Config
     _ = json.Unmarshal(loaded, &c2)
     fmt.Printf("已加载：%+v\\n", c2)
-}`}
-/>
+}
+```
 
 ## 🎯 综合练习
 
-<Playground
-  language="go"
-  id="go-08-exercise"
-  title="TODO 列表"
-  code={`// 任务：实现一个简单的 TODO 列表
+```go title="TODO 列表"
+// 任务：实现一个简单的 TODO 列表
 // 1. 定义 Todo 结构体（Done bool, Text string）
 // 2. 序列化为 JSON 写入 /tmp/todos.json
 // 3. 读回并打印
@@ -213,8 +192,7 @@ func main() {
         fmt.Printf("%s %s\\n", mark, t.Text)
     }
 }
-`}
-/>
+```
 
 ## 小结
 

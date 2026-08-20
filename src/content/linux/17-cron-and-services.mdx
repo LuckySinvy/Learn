@@ -43,11 +43,8 @@ crontab -r      # 删除全部（危险，几乎不用）
 | `0 */6 * * *` | 每 6 小时整点 |
 | `0 0 * * 0` | 每周日零点 |
 
-<Playground
-  language="linux"
-  title="练习读 cron 表达式（用脚本自查）"
-  id="linux-17-1"
-  code={`# 写一个迷你解读器，练习五段语法（仅处理常见形态）
+```bash title="练习读 cron 表达式（用脚本自查）"
+# 写一个迷你解读器，练习五段语法（仅处理常见形态）
 cat > explain.sh << 'EOF'
 #!/bin/bash
 explain_field() {
@@ -73,8 +70,8 @@ chmod +x explain.sh
 echo '---'
 ./explain.sh '*/10' '*' '*' '*' '*'
 echo '---'
-./explain.sh 0 9 '*' '*' 1-5`}
-/>
+./explain.sh 0 9 '*' '*' 1-5
+```
 
 ### 1.2 运维惯例：cron 任务的标准写法
 
@@ -92,11 +89,8 @@ echo '---'
 任务没执行，按序检查：1) `crontab -l` 确认任务在、语法对；2) 看 cron 自身日志（Debian 系 `grep CRON /var/log/syslog`，RHEL 系 `/var/log/cron`）确认有没有被触发；3) 手动以同样命令行执行一次脚本——九成问题是 PATH/环境变量与交互 Shell 不同导致的。
 </Callout>
 
-<Playground
-  language="linux"
-  title="模拟 cron 惯例：日志追加 + flock 防重叠"
-  id="linux-17-2"
-  code={`# 沙箱没有 crond 常驻，但任务脚本的"惯例"可以完整演练
+```bash title="模拟 cron 惯例：日志追加 + flock 防重叠"
+# 沙箱没有 crond 常驻，但任务脚本的"惯例"可以完整演练
 cat > job.sh << 'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -116,8 +110,8 @@ echo '$ flock 防重叠：第二个实例拿不到锁直接放弃（-n 不等待
 flock -n /tmp/job.lock sleep 3 &
 sleep 0.3
 flock -n /tmp/job.lock echo '我抢到了锁' || echo '锁被占用，本轮跳过（这就是防重叠）'
-wait`}
-/>
+wait
+```
 
 ## 2. systemd：现代 Linux 的服务管家
 

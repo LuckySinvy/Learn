@@ -74,11 +74,8 @@ router.beforeEach((to, from) => {
 
 `/users/:id` 这类带参数的路径，本质是「把 `:xxx` 编译成正则 + 捕获组」。下面 Playground 实现匹配：
 
-<Playground
-  language="typescript"
-  title="路由匹配器：把 :param 编译成正则"
-  id="vue-17-1"
-  code={`type RouteRecord = { path: string; name: string };
+```ts title="路由匹配器：把 :param 编译成正则"
+type RouteRecord = { path: string; name: string };
 type MatchResult = { name: string; params: Record<string, string> } | null;
 
 function compile(path: string): { regex: RegExp; keys: string[] } {
@@ -111,9 +108,8 @@ const routes: RouteRecord[] = [
 console.log(JSON.stringify(matchRoute(routes, '/')));
 console.log(JSON.stringify(matchRoute(routes, '/users/42')));
 console.log(JSON.stringify(matchRoute(routes, '/users/42/posts/7')));
-console.log(JSON.stringify(matchRoute(routes, '/nope')));`}
-  expectedOutput={`{"name":"home","params":{}}\n{"name":"user","params":{"id":"42"}}\n{"name":"post","params":{"id":"42","pid":"7"}}\nnull\n`}
-/>
+console.log(JSON.stringify(matchRoute(routes, '/nope')));
+```
 
 `/users/42/posts/7` 匹配到 `post` 路由，`params` 正确拆出 `id=42`、`pid=7`。这就是 Vue Router 把路径「编译成正则」做匹配的核心思路（真实实现还处理正则编码、可选参数、星号通配等）。
 
@@ -121,11 +117,8 @@ console.log(JSON.stringify(matchRoute(routes, '/nope')));`}
 
 多个 `beforeEach` 守卫按顺序跑，前一个返回「重定向/取消」就短路；都放行才导航成功：
 
-<Playground
-  language="typescript"
-  title="导航守卫流水线：顺序执行 + 短路"
-  id="vue-17-2"
-  code={`type To = { path: string; meta?: { requiresAuth?: boolean } };
+```ts title="导航守卫流水线：顺序执行 + 短路"
+type To = { path: string; meta?: { requiresAuth?: boolean } };
 type From = { path: string };
 type GuardResult = true | false | string;
 type Guard = (to: To, from: From) => GuardResult;
@@ -157,9 +150,8 @@ const toProfile: To = { path: '/profile', meta: { requiresAuth: true } };
 console.log('未登录访问 /profile -> ' + JSON.stringify(runGuards(guards, toProfile, fromHome)));
 loggedIn = true;
 console.log('已登录访问 /profile -> ' + JSON.stringify(runGuards(guards, toProfile, fromHome)));
-console.log('已登录访问 /login -> ' + JSON.stringify(runGuards(guards, { path: '/login' }, fromHome)));`}
-  expectedOutput={`未登录访问 /profile -> {"ok":false,"redirect":"/login"}\n已登录访问 /profile -> {"ok":true,"redirect":null}\n已登录访问 /login -> {"ok":false,"redirect":"/"}\n`}
-/>
+console.log('已登录访问 /login -> ' + JSON.stringify(runGuards(guards, { path: '/login' }, fromHome)));
+```
 
 流水线依次跑 `requireAuth` → `noGuest`：未登录访问需鉴权的 `/profile` 被 `requireAuth` 重定向到 `/login`；已登录后放行；已登录却访问 `/login` 被 `noGuest` 弹回首页。真实 Vue Router 的守卫还支持**异步返回值（Promise）**，但「顺序执行、可短路重定向/取消」的骨架和这里完全一致。
 

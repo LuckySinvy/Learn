@@ -196,11 +196,8 @@ constructor(@Inject("APP_NAME") private readonly appName: string) {}
 
 下面这个 Playground 是 Nest IoC 容器的极简版：用一张 `Map` 存 token 到 provider 的映射，`resolve` 递归解析依赖、缓存单例、检测循环依赖。真实框架里 token 是类构造器、依赖列表来自 `Reflect.getMetadata("design:paramtypes", target)`，但**核心算法就是这三十行**。
 
-<Playground
-  language="typescript"
-  id="ts-23-di-container"
-  title="手写一个迷你 DI 容器"
-  code={`// ===== 这是 Nest IoC 容器的极简复刻 =====
+```ts title="手写一个迷你 DI 容器"
+// ===== 这是 Nest IoC 容器的极简复刻 =====
 type Token = string;
 type Scope = "singleton" | "transient";
 
@@ -357,8 +354,8 @@ for (const bad of ["A", "MailerService"]) {
     console.log("启动失败 ->", e instanceof Error ? e.message : String(e));
   }
 }
-console.log("容器演示结束");`}
-/>
+console.log("容器演示结束");
+```
 
 <Callout type="warn" title="循环依赖与 forwardRef">
 上面容器抛出的"检测到循环依赖"，在真实 Nest 里就是那句著名的 `A circular dependency between modules`。官方给的解药是 `forwardRef(() => OtherModule)` 和 `@Inject(forwardRef(() => OtherService))`，但它只是延迟求值，**并没有消除设计上的环**。更好的做法是把两边共用的部分抽成第三个模块，或者用事件（`EventEmitterModule`）把强依赖改成弱通知——这正是第 22 章事件总线的价值。
@@ -424,11 +421,8 @@ export class TasksController {
 
 装饰器做的事情，说白了就是"在类定义时把方法和一条路由规则登记到一张表里"（这正是第 19 章 `addInitializer` 注册模式那一节演示过的）。下面用普通对象手动登记同样的信息，你能清楚看到一次请求是怎么被匹配到方法上的。
 
-<Playground
-  language="typescript"
-  id="ts-23-router"
-  title="路由表与请求分发器（Controller 的本质）"
-  code={`type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
+```ts title="路由表与请求分发器（Controller 的本质）"
+type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
 // 用 string | undefined 建模缺失的键，等价于开启 noUncheckedIndexedAccess 的效果
 type Dict = Record<string, string | undefined>;
 
@@ -585,8 +579,8 @@ const calls: readonly Call[] = [
 for (const call of calls) {
   const res = router.dispatch(call.method, call.url, call.body);
   console.log(call.method + " " + call.url + "  ->  " + res.status + " " + JSON.stringify(res.body));
-}`}
-/>
+}
+```
 
 真实 Nest 用 `Reflect.defineMetadata` 把 `path`、`method`、`statusCode` 写在方法上，启动时 `RoutesResolver` 扫描所有 controller，把元数据读出来注册到底层的 Express/Fastify 路由器。**登记的内容一模一样，只是登记的时机从"手写一行"变成了"类定义时自动发生"**。
 
@@ -676,11 +670,8 @@ void bootstrap();
 
 下面把 `ValidationPipe` 的核心流程复刻出来：**判断是对象 → 按规则转换 → whitelist 剥离 → 逐条约束校验 → 收集结构化错误 → 最后用第 14 章的类型守卫把 `unknown` 收窄成 DTO 类型**。最后那一步是整条链的意义所在：管道是 `unknown` 与静态类型之间唯一的合法关口。
 
-<Playground
-  language="typescript"
-  id="ts-23-validation-pipe"
-  title="ValidationPipe 的极简复刻"
-  code={`type FieldError = {
+```ts title="ValidationPipe 的极简复刻"
+type FieldError = {
   readonly field: string;
   readonly constraint: string;
   readonly message: string;
@@ -878,8 +869,8 @@ for (const payload of payloads) {
       console.log("    " + e.field + " [" + e.constraint + "] " + e.message);
     }
   }
-}`}
-/>
+}
+```
 
 ## 6. Service、异常与全局过滤器
 
@@ -1139,11 +1130,8 @@ export class TimeoutInterceptor implements NestInterceptor {
 
 拦截器的 `next.handle()` 本质上就是洋葱模型的 `next()`。下面用泛型 `compose` 函数把一串中间件折叠成一个处理器——`reduceRight` 保证第一个中间件在最外层。这段代码可以直接搬进任何需要中间件链的地方（包括第 22 章那个 CLI 的 `dispatch`）。
 
-<Playground
-  language="typescript"
-  id="ts-23-interceptor-onion"
-  title="洋葱模型：compose 一条拦截器链"
-  code={`type Req = {
+```ts title="洋葱模型：compose 一条拦截器链"
+type Req = {
   readonly method: string;
   readonly url: string;
   readonly token: string | null;
@@ -1258,8 +1246,8 @@ for (const req of requests) {
   const res = await pipeline(req);
   console.log("最终响应 " + res.status + " " + JSON.stringify(res.data) + "\\n");
 }
-console.log("洋葱模型演示结束");`}
-/>
+console.log("洋葱模型演示结束");
+```
 
 观察输出会发现两件事：守卫抛出 401 时，`wrapResponse` 根本没被执行，所以响应体没有被包装；超时那次同理。**洋葱越靠外的层，覆盖面越广**——这就是为什么异常过滤器必须在最外层。
 

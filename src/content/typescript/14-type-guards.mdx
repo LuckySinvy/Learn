@@ -63,11 +63,8 @@ function isString(v: unknown): v is string {
 
 `v is string` 就是**类型谓词（type predicate）**。它告诉编译器：这个函数返回 `true` 时，实参就可以被当作 `string`。
 
-<Playground
-  language="typescript"
-  id="ts-14-predicate"
-  title="类型谓词"
-  code={`type User = { kind: "user"; name: string; age: number };
+```ts title="类型谓词"
+type User = { kind: "user"; name: string; age: number };
 
 function isUser(v: unknown): v is User {
   if (typeof v !== "object" || v === null) return false;
@@ -93,8 +90,8 @@ function isNotNull<T>(v: T | null | undefined): v is T {
 }
 const mixed: (string | null)[] = ["a", null, "b", null];
 const clean: string[] = mixed.filter(isNotNull);
-console.log("过滤后:", JSON.stringify(clean), "长度", clean.length);`}
-/>
+console.log("过滤后:", JSON.stringify(clean), "长度", clean.length);
+```
 
 <Callout type="warn" title="类型谓词是「无条件信任」">
 编译器不会验证谓词函数的实现是否真的检查了这些字段。如果你写 `function isUser(v: unknown): v is User { return true; }`，编译能过，运行时会炸。类型谓词的正确性由你负责，所以谓词函数应该短小、直白、有测试。
@@ -121,11 +118,8 @@ function shout(v: unknown): string {
 
 还有一种不带 `is` 的形式 `asserts v`，表示「断言 v 为真值」，常用于实现 `invariant`。
 
-<Playground
-  language="typescript"
-  id="ts-14-assert"
-  title="断言函数与不变量"
-  code={`function assertIsNumber(v: unknown): asserts v is number {
+```ts title="断言函数与不变量"
+function assertIsNumber(v: unknown): asserts v is number {
   if (typeof v !== "number" || Number.isNaN(v)) {
     throw new TypeError("期望 number，实际是 " + typeof v);
   }
@@ -160,8 +154,8 @@ try {
   head<number>([]);
 } catch (e) {
   console.log("捕获:", (e as Error).message);
-}`}
-/>
+}
+```
 
 <Callout type="warn" title="断言函数必须显式标注">
 断言函数只能被赋给**有显式类型注解**的标识符。写成 `const assertIsString = (v: unknown): asserts v is string => {...}` 会报错「断言的调用目标必须具有显式类型注释」。老老实实用 `function` 声明最省事。
@@ -203,11 +197,8 @@ const cfg = { mode: "dark" } as const;  // { readonly mode: "dark" }
 
 `never` 是空类型，没有任何值属于它。它最重要的用途是**穷尽性检查**：当一个联合的所有分支都被处理完，剩下的类型就是 `never`；如果以后有人往联合里加了新成员，`never` 处就会立刻报错。
 
-<Playground
-  language="typescript"
-  id="ts-14-exhaustive"
-  title="as const 与穷尽性检查"
-  code={`const MODES = ["idle", "running", "done"] as const;
+```ts title="as const 与穷尽性检查"
+const MODES = ["idle", "running", "done"] as const;
 type Mode = typeof MODES[number];   // "idle" | "running" | "done"
 
 type Shape =
@@ -252,8 +243,8 @@ try {
   area(fake);
 } catch (e) {
   console.log("捕获:", (e as Error).message);
-}`}
-/>
+}
+```
 
 <Callout type="tip" title="assertNever 是重构的安全网">
 把 `assertNever` 放进每个 `switch` 的 `default`，以后任何人往联合类型里加成员，编译器都会精确地指出所有需要补充分支的位置。这是 TS 相比动态语言最实在的收益之一。

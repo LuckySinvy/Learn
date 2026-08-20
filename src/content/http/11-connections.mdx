@@ -21,11 +21,8 @@ HTTP/1.1:  默认保持；加 Connection: close 才关闭
 
 用 curl 直接观察连接复用（curl 对同一命令里的多个 URL 会尝试复用连接）：
 
-<Playground
-  language="http"
-  title="观察连接复用：Re-using existing connection"
-  id="http-11-1"
-  code={`python3 -c '
+```http title="观察连接复用：Re-using existing connection"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -45,18 +42,15 @@ for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break
 
 # 一条 curl 命令请求两个 URL，观察第二个请求是否复用连接
 curl -v http://127.0.0.1:8000/first http://127.0.0.1:8000/second 2>&1 \
-  | grep -E "Connected to|Re-using|path="`}
-/>
+  | grep -E "Connected to|Re-using|path="
+```
 
 输出里第二个请求出现 `Re-using existing connection`——三次握手只发生了一次。注意服务器代码里的两个关键点：`protocol_version = "HTTP/1.1"`，以及必须发送 `Content-Length`（长连接下没有"连接关闭"作为报文结束信号，**必须靠长度定界**，否则客户端不知道体何时结束）。
 
 对照组——服务器坚持 HTTP/1.0 短连接时：
 
-<Playground
-  language="http"
-  title="对照：HTTP/1.0 短连接每次都重新握手"
-  id="http-11-2"
-  code={`python3 -c '
+```http title="对照：HTTP/1.0 短连接每次都重新握手"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -75,8 +69,8 @@ HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break; sleep 0.1; done
 
 curl -v http://127.0.0.1:8000/a http://127.0.0.1:8000/b 2>&1 \
-  | grep -E "Connected to|Re-using|Closing connection"`}
-/>
+  | grep -E "Connected to|Re-using|Closing connection"
+```
 
 这次没有 Re-using：每个请求都重新 `Connected to`——服务器响应完就关了连接（响应头里有 `Connection: close` 语义）。
 
@@ -96,11 +90,8 @@ curl -v http://127.0.0.1:8000/a http://127.0.0.1:8000/b 2>&1 \
 
 HTTP/1.1 的队头阻塞（Head-of-Line Blocking）：一条连接上，前一个响应没传完，后一个请求只能排队。实验对比"单连接串行"与"双连接并行"：
 
-<Playground
-  language="http"
-  title="队头阻塞：慢请求堵住快请求"
-  id="http-11-3"
-  code={`python3 -c '
+```http title="队头阻塞：慢请求堵住快请求"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import time
 
@@ -133,8 +124,8 @@ SLOW=$!
 curl -s -w "fast 用时 %{time_total}s\n" http://127.0.0.1:8000/fast
 wait $SLOW
 cat /work/slow.out
-echo "总耗时约 $(( $(date +%s) - T0 )) 秒"`}
-/>
+echo "总耗时约 $(( $(date +%s) - T0 )) 秒"
+```
 
 方案 A 里 /fast 明明瞬间能完成，却陪着 /slow 等了 2 秒——这就是队头阻塞。方案 B 用第二条连接绕开了它。
 

@@ -182,11 +182,8 @@ $ python todo.py list --pending
 
 Playground 一次只能跑一个文件，下面把 `models.py` + `store.py` 合并成**单文件可运行版本**，走一遍完整 CRUD 流程：
 
-<Playground
-  language="python"
-  id="py-17-todo-demo"
-  title="TODO 工具完整演示"
-  code={`import json
+```python title="TODO 工具完整演示"
+import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Optional
@@ -271,19 +268,15 @@ for t in store.list():
 
 print("")
 print("--- 持久化文件内容 ---")
-print(store.path.read_text(encoding="utf-8"))`}
-  expectedOutput={`--- 全部 ---\n[ ] #1 学完 Python 进阶  tags=['python', 'study']\n[ ] #2 写一个 CLI 工具  tags=['python', 'project']\n[ ] #3 看 Go 教程  tags=['go']\n\n--- 标记 #1 完成, 只看未完成 ---\n[ ] #2 写一个 CLI 工具\n\n--- 删除 #3, 全部 ---\n[✓] #1 学完 Python 进阶  tags=['python', 'study']\n[ ] #2 写一个 CLI 工具  tags=['python', 'project']\n\n--- 持久化文件内容 ---\n[\n  {\n    "id": 1,\n    "title": "学完 Python 进阶",\n    "done": true,\n    "tags": [\n      "python",\n      "study"\n    ]\n  },\n  {\n    "id": 2,\n    "title": "写一个 CLI 工具",\n    "done": false,\n    "tags": [\n      "python",\n      "project"\n    ]\n  }\n]`}
-/>
+print(store.path.read_text(encoding="utf-8"))
+```
 
 ## 6. 单元测试
 
 用 `unittest` 给 `TodoStore` 写测试：
 
-<Playground
-  language="python"
-  id="py-17-todo-test"
-  title="TodoStore 测试"
-  code={`import json, unittest
+```python title="TodoStore 测试"
+import json, unittest
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List
@@ -364,19 +357,15 @@ class TestTodoStore(unittest.TestCase):
         self.assertEqual(len(fresh.list()), 1)
         self.assertEqual(fresh.list()[0].tags, ["py"])
 
-unittest.main(argv=[''], exit=False, verbosity=2)`}
-  expectedOutput={`test_add_assigns_unique_ids (__main__.TestTodoStore) ... ok\ntest_complete_marks_missing_returns_false (__main__.TestTodoStore) ... ok\ntest_complete_marks_done (__main__.TestTodoStore) ... ok\ntest_list_pending_filters (__main__.TestTodoStore) ... ok\ntest_persistence_round_trip (__main__.TestTodoStore) ... ok\n\n----------------------------------------------------------------------\nRan 5 tests in 0.000s\n\nOK`}
-/>
+unittest.main(argv=[''], exit=False, verbosity=2)
+```
 
 ## 🎯 练习
 
 给上面的 `TodoStore` 加一个 `find(keyword: str) -> list[Todo]` 方法，**在 title 中做大小写不敏感的子串匹配**。然后给这个方法写至少 2 个测试。
 
-<Playground
-  language="python"
-  id="py-17-exercise"
-  title="find 方法 + 测试"
-  code={`# 把 Todo / TodoStore 复制过来，给 TodoStore 加一个 find 方法
+```python title="find 方法 + 测试"
+# 把 Todo / TodoStore 复制过来，给 TodoStore 加一个 find 方法
 # 然后至少写 2 个测试
 import json, unittest
 from dataclasses import dataclass, field, asdict
@@ -387,9 +376,7 @@ from typing import List
 
 # 在这里写 find(keyword) 方法
 # 然后写测试
-`}
-  expectedOutput={`test_find_case_insensitive (__main__.TestFind) ... ok\ntest_find_no_match (__main__.TestFind) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK`}
-/>
+```
 
 <Callout type="exercise" title="提示">
 - `find` 实现：`[t for t in self._todos if keyword.lower() in t.title.lower()]`

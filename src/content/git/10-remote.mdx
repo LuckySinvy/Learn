@@ -21,11 +21,8 @@ Git 的 remote 只是一个"地址别名"。地址可以是：
 
 服务端的仓库通常是**裸仓库**（bare repository）：没有工作区，只有 `.git` 里的那些内容。因为没人会在服务器上直接编辑文件，工作区纯属浪费，而且如果有工作区，别人往它当前分支推送会造成状态混乱。
 
-<Playground
-  language="git"
-  title="用本地裸仓库完整模拟一次远程协作"
-  id="git-10-1"
-  code={`echo '===== 1. 造一个「远程」：裸仓库 ====='
+```bash title="用本地裸仓库完整模拟一次远程协作"
+echo '===== 1. 造一个「远程」：裸仓库 ====='
 git init -q --bare /tmp/origin.git
 echo '裸仓库里没有工作区，直接就是 .git 的内容：'
 ls /tmp/origin.git
@@ -55,8 +52,8 @@ echo '也自动建立了跟踪关系：'
 git branch -vv
 echo '所有分支（含远程跟踪分支）：'
 git branch -a
-cd ..`}
-/>
+cd ..
+```
 
 ### remote 的管理命令
 
@@ -128,11 +125,8 @@ git branch -vv                            # 查看
 
 **`git pull` = `git fetch` + `git merge origin/main`**（或 `rebase`）。
 
-<Playground
-  language="git"
-  title="fetch 只下载不合并"
-  id="git-10-2"
-  code={`git init -q --bare /tmp/origin.git
+```bash title="fetch 只下载不合并"
+git init -q --bare /tmp/origin.git
 git clone -q /tmp/origin.git alice
 cd alice && echo 'v1' > app.txt && git add . && git commit -q -m "feat: 初版"
 git push -q -u origin main 2>/dev/null && cd ..
@@ -168,8 +162,8 @@ ls
 echo
 git status -sb
 echo '(这两步合起来就等于 git pull)'
-cd ..`}
-/>
+cd ..
+```
 
 <Callout type="tip" title="养成先 fetch 后看的习惯">
 ```bash
@@ -186,11 +180,8 @@ git merge origin/main              # 确认没问题再合并
 
 push 的前提是**能 fast-forward**：远程分支的最新提交必须是你本地历史的祖先。如果别人先推了，你的 push 会被拒绝。
 
-<Playground
-  language="git"
-  title="push 被拒绝：pull（merge）与 pull --rebase 的差别"
-  id="git-10-3"
-  code={`git init -q --bare /tmp/origin.git
+```bash title="push 被拒绝：pull（merge）与 pull --rebase 的差别"
+git init -q --bare /tmp/origin.git
 git clone -q /tmp/origin.git alice
 cd alice && echo 'v1' > app.txt && git add . && git commit -q -m "feat: 初版"
 git push -q -u origin main 2>/dev/null && cd ..
@@ -222,8 +213,8 @@ echo
 git push -q origin main 2>/dev/null
 echo 'push 成功，远程最终历史：'
 git log --oneline origin/main
-cd ..`}
-/>
+cd ..
+```
 
 对比两种结果：
 

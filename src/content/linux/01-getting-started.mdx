@@ -57,11 +57,8 @@ ada@web-01:~/projects$
 - `ls`（list）：这里有什么；
 - `cd`（change directory）：去别处。
 
-<Playground
-  language="linux"
-  title="pwd / ls / cd 基本导航"
-  id="linux-01-1"
-  code={`# 我在哪？
+```bash title="pwd / ls / cd 基本导航"
+# 我在哪？
 echo '$ pwd'
 pwd
 
@@ -85,8 +82,8 @@ pwd
 # cd 不带参数：回到家目录
 echo '$ cd && pwd'
 cd
-pwd`}
-/>
+pwd
+```
 
 关于路径的两个关键概念：
 
@@ -99,11 +96,8 @@ pwd`}
 
 `ls` 不带选项时只给出名字，加上选项才能看到细节：
 
-<Playground
-  language="linux"
-  title="ls 的常用选项"
-  id="linux-01-2"
-  code={`mkdir -p demo/sub
+```bash title="ls 的常用选项"
+mkdir -p demo/sub
 echo 'hello linux' > demo/a.txt
 echo 'a much longer line of text for size demo' > demo/b.log
 touch demo/.hidden
@@ -122,8 +116,8 @@ echo '$ ls -lh  # 大小显示为 K/M/G'
 ls -lh
 
 echo '$ ls -lt  # 按修改时间排序，最新在前'
-ls -lt`}
-/>
+ls -lt
+```
 
 `ls -l` 每行的含义（第 5 章会详细拆解权限部分）：
 
@@ -148,11 +142,8 @@ ls    -lh        /var/log
 - **长选项**：两个横线加单词，如 `--help`、`--all`，可读性好；
 - **参数**：命令作用的对象，通常是文件或目录。
 
-<Playground
-  language="linux"
-  title="更多入门命令与 --help"
-  id="linux-01-3"
-  code={`echo '$ whoami  # 我是谁'
+```bash title="更多入门命令与 --help"
+echo '$ whoami  # 我是谁'
 whoami
 
 echo '$ uname -a  # 内核与系统信息'
@@ -165,8 +156,8 @@ echo '$ echo hello  # 原样输出参数'
 echo hello
 
 echo '$ cat /etc/os-release  # 看看这是什么发行版'
-cat /etc/os-release`}
-/>
+cat /etc/os-release
+```
 
 ## 7. 获取帮助
 

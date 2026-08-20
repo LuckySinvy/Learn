@@ -16,11 +16,8 @@ awk '模式 { 动作 }' 文件
 
 awk 逐行读入，把每行按分隔符（默认连续空白）切成字段：`$1` 是第 1 列，`$2` 是第 2 列……`$0` 是整行。对每一行：模式成立就执行动作；模式省略则每行都执行；动作省略则默认打印整行。
 
-<Playground
-  language="linux"
-  title="按列取值：$1 $2 与 $NF"
-  id="linux-09-1"
-  code={`cat > access.log << 'EOF'
+```bash title="按列取值：$1 $2 与 $NF"
+cat > access.log << 'EOF'
 10.0.0.1 GET /index.html 200 12
 10.0.0.2 POST /api/login 401 35
 10.0.0.1 GET /api/users 200 210
@@ -38,8 +35,8 @@ echo '$ awk "{print $NF}" access.log   # NF=列数，$NF 即最后一列（耗�
 awk '{print $NF}' access.log
 
 echo '$ awk "{print $4, $3}" access.log   # 重排列序，瞬间完成'
-awk '{print $4, $3}' access.log`}
-/>
+awk '{print $4, $3}' access.log
+```
 
 ## 2. 内置变量与自定义分隔符
 
@@ -52,11 +49,8 @@ awk '{print $4, $3}' access.log`}
 
 处理 CSV、/etc/passwd 这类非空白分隔的数据，用 `-F` 指定分隔符：
 
-<Playground
-  language="linux"
-  title="-F 分隔符与 NR/NF"
-  id="linux-09-2"
-  code={`echo '$ 处理冒号分隔的 /etc/passwd：'
+```bash title="-F 分隔符与 NR/NF"
+echo '$ 处理冒号分隔的 /etc/passwd：'
 head -n 4 /etc/passwd
 echo '$ awk -F: "{print NR, $1, $3}" —— 行号、用户名、UID'
 head -n 4 /etc/passwd | awk -F: '{print NR, $1, $3}'
@@ -76,8 +70,8 @@ echo '$ 修改输出分隔符 OFS 生成 TSV：'
 awk -F, 'BEGIN{OFS="|"} NR > 1 {print $1, $2, $3}' users.csv
 
 echo '$ awk "{print NF}" 检查每行列数是否一致（数据质量检查）：'
-awk -F, '{print NR": "NF" cols"}' users.csv`}
-/>
+awk -F, '{print NR": "NF" cols"}' users.csv
+```
 
 ## 3. 模式：只处理感兴趣的行
 
@@ -97,11 +91,8 @@ awk 'NR >= 2 && NR <= 4' file               # 用行号取区间，替代 head+t
 
 `BEGIN` 块在读第一行前执行（初始化、打表头），`END` 块在全部行读完后执行（输出汇总）。配合变量累加，就是统计报表的标准结构：
 
-<Playground
-  language="linux"
-  title="求和、平均、最大值"
-  id="linux-09-3"
-  code={`cat > access.log << 'EOF'
+```bash title="求和、平均、最大值"
+cat > access.log << 'EOF'
 10.0.0.1 GET /index.html 200 12
 10.0.0.2 POST /api/login 401 35
 10.0.0.1 GET /api/users 200 210
@@ -117,8 +108,8 @@ echo '$ 最慢的一次请求：'
 awk '$5 > max {max = $5; line = $0} END {print max "ms:", line}' access.log
 
 echo '$ 只统计 200 请求的平均耗时（模式过滤 + 自己计数）：'
-awk '$4 == 200 {sum += $5; n++} END {print "200 avg:", sum/n, "ms (", n, "reqs )"}' access.log`}
-/>
+awk '$4 == 200 {sum += $5; n++} END {print "200 avg:", sum/n, "ms (", n, "reqs )"}' access.log
+```
 
 三个细节：awk 变量不用声明，未赋值的数值变量自动是 0，所以 `sum += $5` 可以直接写；`NR` 在 END 块里就是总行数；条件过滤后求平均要自己维护计数器 `n`，不能用 NR。
 
@@ -126,11 +117,8 @@ awk '$4 == 200 {sum += $5; n++} END {print "200 avg:", sum/n, "ms (", n, "reqs )
 
 awk 的数组下标可以是任意字符串（类似字典/哈希表），`arr[key]++` 一行就完成"按 key 分组计数"——这是 awk 最有生产力的特性：
 
-<Playground
-  language="linux"
-  title="按字段分组计数与分组求和"
-  id="linux-09-4"
-  code={`cat > access.log << 'EOF'
+```bash title="按字段分组计数与分组求和"
+cat > access.log << 'EOF'
 10.0.0.1 GET /index.html 200 12
 10.0.0.2 POST /api/login 401 35
 10.0.0.1 GET /api/users 200 210
@@ -150,8 +138,8 @@ echo '$ 每个 IP 的总耗时（分组求和）：'
 awk '{ms[$1] += $5} END {for (ip in ms) print ip, ms[ip] "ms"}' access.log
 
 echo '$ 配合 sort 按次数倒序（awk 输出天然接管道）：'
-awk '{cnt[$1]++} END {for (ip in cnt) print cnt[ip], ip}' access.log | sort -rn`}
-/>
+awk '{cnt[$1]++} END {for (ip in cnt) print cnt[ip], ip}' access.log | sort -rn
+```
 
 `for (key in 数组)` 遍历所有出现过的 key，遍历顺序不保证——需要排序就交给管道后面的 `sort`，各司其职。
 

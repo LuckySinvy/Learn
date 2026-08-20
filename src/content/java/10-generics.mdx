@@ -25,11 +25,8 @@ Integer n = (Integer) list.get(0);   // 运行时 ClassCastException
 
 类名后用 `<T>` 声明一个或多个类型参数。`T` 是惯例字母（`T` / `K` / `V` / `E`），你可以用任何标识符。
 
-<Playground
-  language="java"
-  id="java-10-class"
-  title="泛型类 Box"
-  code={`public class Main {
+```java title="泛型类 Box"
+public class Main {
     static class Box<T> {
         private T value;
         void put(T v) { this.value = v; }
@@ -50,19 +47,15 @@ Integer n = (Integer) list.get(0);   // 运行时 ClassCastException
         Box<Double>  db = new Box<>();
         System.out.println("Empty? " + db.isEmpty());
     }
-}`}
-  expectedOutput={`String box: hi\nInteger box: 42\nEmpty? true`}
-/>
+}
+```
 
 ## 3. 泛型方法
 
 方法自己声明类型参数，放在**返回类型之前**。
 
-<Playground
-  language="java"
-  id="java-10-method"
-  title="泛型方法"
-  code={`import java.util.*;
+```java title="泛型方法"
+import java.util.*;
 import java.util.stream.*;
 
 public class Main {
@@ -88,19 +81,15 @@ public class Main {
         Map<String, Integer> m = pair("age", 18);
         System.out.println("pair = " + m);
     }
-}`}
-  expectedOutput={`lens = [4, 2, 4]\npair = {age=18}`}
-/>
+}
+```
 
 ## 4. 受限类型参数 `Bounded`
 
 用 `extends` 限制类型参数**必须是某类的子类**。
 
-<Playground
-  language="java"
-  id="java-10-bounded"
-  title="受限类型"
-  code={`public class Main {
+```java title="受限类型"
+public class Main {
     // 必须是 Number 的子类（Integer, Double, Long...）
     static <T extends Number> double sum(List<T> nums) {
         double s = 0;
@@ -119,9 +108,8 @@ public class Main {
         System.out.println("sum = " + sum(List.of(1, 2.5, 3L)));   // 6.5
         System.out.println("max = " + maxOf(List.of(3, 1, 4, 1, 5, 9, 2, 6)));
     }
-}`}
-  expectedOutput={`sum = 6.5\nmax = 9`}
-/>
+}
+```
 
 ## 5. 通配符 `?`
 
@@ -131,11 +119,8 @@ public class Main {
 - `? extends T` 上界——T 或子类（适合**只读**）
 - `? super T` 下界——T 或父类（适合**只写**）
 
-<Playground
-  language="java"
-  id="java-10-wildcard"
-  title="通配符"
-  code={`import java.util.*;
+```java title="通配符"
+import java.util.*;
 
 public class Main {
     // 只读：传入任何 Number 子类的 List
@@ -162,9 +147,8 @@ public class Main {
         addInts(nums);
         System.out.println("after addInts = " + nums);
     }
-}`}
-  expectedOutput={`ints total = 60.0\ndbls total = 4.0\nafter addInts = [1, 2, 3]`}
-/>
+}
+```
 
 <Callout type="tip" title="PECS 原则">
 **P**roducer **E**xtends, **C**onsumer **S**uper：
@@ -199,11 +183,8 @@ b1.put((String) "hi");
 
 ## 7. 实战：泛型栈
 
-<Playground
-  language="java"
-  id="java-10-stack"
-  title="泛型栈"
-  code={`import java.util.*;
+```java title="泛型栈"
+import java.util.*;
 
 public class Main {
     static class Stack<T> {
@@ -226,17 +207,13 @@ public class Main {
         }
         System.out.println();
     }
-}`}
-  expectedOutput={`top = 50\nsize = 5\n50 40 30 20 10 `}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-10-exercise"
-  title="泛型 Pair<K,V>"
-  code={`// 任务：实现一个不可变泛型 Pair<K,V>：
+```java title="泛型 Pair<K,V>"
+// 任务：实现一个不可变泛型 Pair<K,V>：
 //   - 构造器接收 k, v
 //   - k() / v() 访问器
 //   - 静态方法 of(k, v) 工厂
@@ -257,8 +234,7 @@ public class Main {
         System.out.println(Pair.swap(p));
     }
 }
-`}
-/>
+```
 
 ## 小结
 

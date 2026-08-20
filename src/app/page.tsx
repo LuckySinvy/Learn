@@ -25,7 +25,7 @@ export default function HomePage() {
 
       <Category
         title="编程语言"
-        desc="通用与云原生编程语言，内置可运行 Playground，所见即可运行。"
+        desc="通用与云原生编程语言，每章配有讲解、示例与实战。"
       >
         <LanguageCard
           href="/python"
@@ -98,7 +98,7 @@ export default function HomePage() {
         <LanguageCard
           href="/linux"
           title="Linux"
-          description="文件系统、进程、权限、文本三剑客与 Shell 脚本，可在线执行。"
+          description="文件系统、进程、权限、文本三剑客与 Shell 脚本实践。"
           icon={<Squirrel className="w-8 h-8" />}
           accent="from-yellow-400 to-amber-500"
           chapters={count('linux')}
@@ -106,7 +106,7 @@ export default function HomePage() {
         <LanguageCard
           href="/git"
           title="Git"
-          description="提交、分支、rebase、冲突处理与团队工作流，命令可在线执行。"
+          description="提交、分支、rebase、冲突处理与团队协作工作流。"
           icon={<GitBranch className="w-8 h-8" />}
           accent="from-orange-400 to-red-500"
           chapters={count('git')}
@@ -114,7 +114,7 @@ export default function HomePage() {
         <LanguageCard
           href="/http"
           title="HTTP"
-          description="TCP 握手、HTTP/2/3、缓存、CORS 与 HTTPS，容器内实测请求响应。"
+          description="TCP 握手、HTTP/2/3、缓存、CORS 与 HTTPS，附实测请求响应示例。"
           icon={<Globe className="w-8 h-8" />}
           accent="from-indigo-400 to-violet-500"
           chapters={count('http')}

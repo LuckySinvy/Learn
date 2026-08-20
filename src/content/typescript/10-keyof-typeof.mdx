@@ -76,11 +76,8 @@ type Level = keyof typeof levels;    // "debug" | "info" | "error"
 
 先用 `typeof` 把值变成类型，再用 `keyof` 取键。这个组合是「用对象当枚举」这一模式的基石。
 
-<Playground
-  language="typescript"
-  id="ts-10-keyof-typeof"
-  title="keyof 与 typeof"
-  code={`interface User {
+```ts title="keyof 与 typeof"
+interface User {
   id: number;
   name: string;
   active: boolean;
@@ -126,9 +123,8 @@ console.log("error 在 info 之上? " + shouldLog("error", "info"));
 
 // 遍历时也能保持类型安全
 const keys = Object.keys(levels) as Level[];
-console.log("全部级别: " + keys.join(" < "));`}
-  expectedOutput={`name = Grace\nactive = true\n配置: localhost:8080 secure=false\ndebug 在 info 之上? false\nerror 在 info 之上? true\n全部级别: debug < info < warn < error`}
-/>
+console.log("全部级别: " + keys.join(" < "));
+```
 
 ## 3. 索引访问类型
 
@@ -156,11 +152,8 @@ type Tag = User["tags"][number];         // string，用 number 取数组元素�
 `User["id"]` 里的 `"id"` 是**字符串字面量类型**，不是字符串值。所以 `const k = "id"; type X = User[k]` 会报错——`k` 是值不是类型，得写 `User[typeof k]`。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-10-indexed-access"
-  title="索引访问类型"
-  code={`interface Product {
+```ts title="索引访问类型"
+interface Product {
   id: number;
   title: string;
   price: number;
@@ -209,9 +202,8 @@ console.log(sumValues({
   price: 299,
   tags: ["办公"],
   meta: { createdAt: "2024-01-01", author: "Ada" },
-}));`}
-  expectedOutput={`价格 199，标签 热销，作者 Ada\nA-1 x 2; B-2 x 5\n元组首项 10，任意项 原点\n1 | 键盘 | 299`}
-/>
+}));
+```
 
 ## 4. as const 断言
 
@@ -273,11 +265,8 @@ const c = { red: "#f00", green: [0, 255, 0] } satisfies Palette;
 凡是「一个大对象，既要保证符合某个约定，又想在使用处享受精确的键名与值类型」的场景——路由表、主题色、命令注册表、i18n 词条——都是 `satisfies` 的主场。配合 `as const` 效果更佳。
 </Callout>
 
-<Playground
-  language="typescript"
-  id="ts-10-const-satisfies"
-  title="as const 与 satisfies"
-  code={`// as const：字面量不拓宽，对象递归只读
+```ts title="as const 与 satisfies"
+// as const：字面量不拓宽，对象递归只读
 const ROUTES = {
   home: "/",
   about: "/about",
@@ -326,9 +315,8 @@ type CommandName = keyof typeof COMMANDS;
 const names = Object.keys(COMMANDS) as CommandName[];
 for (const n of names) {
   console.log(n + " (" + COMMANDS[n].alias + "): " + COMMANDS[n].desc);
-}`}
-  expectedOutput={`home -> /\npost -> /posts/:id\n主色大写 = #0066FF\n强调色 R 通道 = 255\n注解版需要收窄: #0066ff\nbuild (b): 构建项目\ntest (t): 运行测试`}
-/>
+}
+```
 
 <Callout type="warn" title="satisfies 不是 as">
 `as` 是类型断言：告诉编译器「相信我，它就是这个类型」，可以指鹿为马。`satisfies` 是类型校验：让编译器检查「这个值确实符合该类型」，不符合就报错，且不改变推断结果。二者方向完全相反，`satisfies` 安全得多。

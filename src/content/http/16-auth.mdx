@@ -26,11 +26,8 @@ HTTP 认证的标准对话：
 
 凭证 = `base64(用户名:密码)`。**base64 是编码不是加密**——亲手验证这一点：
 
-<Playground
-  language="http"
-  title="Basic 认证全流程（与它的裸奔本质）"
-  id="http-16-1"
-  code={`python3 -c '
+```http title="Basic 认证全流程（与它的裸奔本质）"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import base64
 
@@ -69,8 +66,8 @@ echo "== 看看头里到底是什么 =="
 curl -sv -u ada:s3cret -o /dev/null http://127.0.0.1:8000/admin 2>&1 | grep -i "authorization"
 
 echo "== 任何人都能解码：base64 不是加密 =="
-echo "YWRhOnMzY3JldA==" | base64 -d && echo`}
-/>
+echo "YWRhOnMzY3JldA==" | base64 -d && echo
+```
 
 结论：Basic **只能在 HTTPS 上使用**，且每个请求都携带原始密码（一旦泄露即全盘沦陷）。适用场景：内部工具、配合网关的简单防护、脚本调试。生产 API 请用令牌。
 
@@ -91,11 +88,8 @@ Signature: HMAC-SHA256(base64url(header) + "." + base64url(payload), 密钥)
 
 前两段只是 base64url（**任何人可读，别放敏感数据**），第三段签名保证**改不了**：改动任何一个字节，签名校验即失败。亲手造一个、验一个、再篡改一个：
 
-<Playground
-  language="http"
-  title="手工实现 JWT：签发、校验、防篡改"
-  id="http-16-2"
-  code={`python3 -c '
+```http title="手工实现 JWT：签发、校验、防篡改"
+python3 -c '
 import base64, hmac, hashlib, json, time
 
 SECRET = b"server-side-secret"
@@ -134,8 +128,8 @@ head, pay = hp.split(".")
 hacked_pay = b64url(json.dumps({"sub": "ada", "role": "admin", "exp": 9999999999}).encode())
 forged = head + "." + hacked_pay + "." + token.rsplit(".", 1)[1]
 print("篡改 role=admin 后校验:", verify(forged)[1])
-'`}
-/>
+'
+```
 
 ### 3.2 JWT 实战守则
 

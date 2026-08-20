@@ -130,11 +130,8 @@ watch(source, cb, {
 
 下面两个 Playground 亲手实现 computed 的「惰性缓存」和 watch/watchEffect 的「依赖收集差异 + 清理时机」。
 
-<Playground
-  language="typescript"
-  title="computed 是带 dirty 标记的惰性 effect"
-  id="vue-05-1"
-  code={`let activeEffect: (() => void) | null = null;
+```ts title="computed 是带 dirty 标记的惰性 effect"
+let activeEffect: (() => void) | null = null;
 
 function effect(fn: () => void): void {
   activeEffect = fn;
@@ -217,17 +214,13 @@ function plainDouble(): number {
 plainDouble();
 plainDouble();
 plainDouble();
-console.log("普通函数读3次 computeCount = " + computeCount2.n);`}
-  expectedOutput={`read1 = 2\nread2 = 2\nread3 = 2\n连读3次 computeCount = 1\n改依赖但不读 computeCount = 1\nread4 = 4\n最终 computeCount = 2\n普通函数读3次 computeCount = 3\n`}
-/>
+console.log("普通函数读3次 computeCount = " + computeCount2.n);
+```
 
 注意 `连读3次 computeCount = 1`：依赖没变，`computed` 只算了一次。再看 `改依赖但不读 computeCount = 1`：改了 `base` 但没读 `double`，所以**没有重算**（惰性）。等到 `read4` 才真正重算，总数变成 2。普通函数对照组读 3 次算 3 次，对比鲜明。
 
-<Playground
-  language="typescript"
-  title="watch 与 watchEffect：依赖来源与清理时机"
-  id="vue-05-2"
-  code={`let activeEffect: (() => void) | null = null;
+```ts title="watch 与 watchEffect：依赖来源与清理时机"
+let activeEffect: (() => void) | null = null;
 let cleanupSlot: { fn: (() => void) | null } | null = null;
 
 function effect(fn: () => void): void {
@@ -319,9 +312,8 @@ b.value = 99;
 
 console.log("--- 连续改 a 两次，看 cleanup 时机 ---");
 a.value = 3;
-a.value = 4;`}
-  expectedOutput={`--- watchEffect 收集全部依赖 ---\nwatchEffect run: a=1 b=10\n--- watch 只收集 source getter 的依赖 ---\n--- 改 a（source 里的 ref）---\nwatchEffect run: a=2 b=10\nwatch cb: n=2 o=1\n  cb 里读了 b=10\n--- 改 b（只在 cb 体里用到的 ref）---\nwatchEffect run: a=2 b=99\n--- 连续改 a 两次，看 cleanup 时机 ---\nwatchEffect run: a=3 b=99\n  cleanup for a=2\nwatch cb: n=3 o=2\n  cb 里读了 b=99\nwatchEffect run: a=4 b=99\n  cleanup for a=3\nwatch cb: n=4 o=3\n  cb 里读了 b=99\n`}
-/>
+a.value = 4;
+```
 
 三个结论一目了然：
 1. 改 `a` 时 `watchEffect` 和 `watch` 都触发（两者都监听了 `a`）

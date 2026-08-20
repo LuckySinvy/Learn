@@ -10,11 +10,8 @@ description: type hints、Optional/Union/Any、dataclass、TypeVar/Generic
 
 ## 1. 最基础的注解
 
-<Playground
-  language="python"
-  id="py-13-basic-annot"
-  title="变量与函数注解"
-  code={`# 变量注解
+```python title="变量与函数注解"
+# 变量注解
 name: str = "Alice"
 age: int = 30
 scores: list[int] = [85, 92, 78]
@@ -36,9 +33,8 @@ print(greet("Alice", excited=True))
 def parse(s: str) -> int | None:
     return int(s) if s.isdigit() else None
 
-print(parse("42"), parse("hi"))`}
-  expectedOutput={`7\nHi, Alice!\n42 None`}
-/>
+print(parse("42"), parse("hi"))
+```
 
 <Callout type="info" title="注解不强制！">
 ```python
@@ -50,11 +46,8 @@ add("hi", "world")  # 运行时不会报错！
 
 ## 2. `Optional` / `Union` / `Any`
 
-<Playground
-  language="python"
-  id="py-13-optional-union"
-  title="Optional 与 Union"
-  code={`from typing import Optional, Union, Any
+```python title="Optional 与 Union"
+from typing import Optional, Union, Any
 
 # Optional[X] = Union[X, None] = X | None
 def find_user(uid: int) -> Optional[dict]:
@@ -76,9 +69,8 @@ def debug_print(x: Any) -> None:
 
 debug_print(42)
 debug_print([1, 2, 3])
-debug_print({"k": "v"})`}
-  expectedOutput={`{'name': 'Alice'}\nNone\n1 3.14 hi\ndebug: 42 int\ndebug: [1, 2, 3] list\ndebug: {'k': 'v'} dict`}
-/>
+debug_print({"k": "v"})
+```
 
 <Callout type="tip" title="优先用 | 而不是 Union">
 Python 3.10+ 支持 `int | str`、`list[int] | None` 这种写法，比 `Union[int, str]`、`Optional[list[int]]` 更短。需要兼容老版本就 `from __future__ import annotations`。
@@ -88,11 +80,8 @@ Python 3.10+ 支持 `int | str`、`list[int] | None` 这种写法，比 `Union[i
 
 写"主要用来存数据"的类时，`@dataclass` 帮你自动生成 `__init__`、`__repr__`、`__eq__`：
 
-<Playground
-  language="python"
-  id="py-13-dataclass"
-  title="@dataclass"
-  code={`from dataclasses import dataclass, field
+```python title="@dataclass"
+from dataclasses import dataclass, field
 from typing import List
 
 @dataclass
@@ -111,9 +100,8 @@ u3 = User("Alice", 30, ["Python", "Go"])
 print(u1.introduce())
 print(u2.introduce())
 print("u1 == u3:", u1 == u3)        # 自动 __eq__
-print(u1)                            # 自动 __repr__`}
-  expectedOutput={`我是 Alice, 30 岁, 技能: Python, Go\n我是 Bob, 0 岁, 技能: 无\nu1 == u3: True\nUser(name='Alice', age=30, skills=['Python', 'Go'])`}
-/>
+print(u1)                            # 自动 __repr__
+```
 
 <Callout type="warn" title="可变默认值必须用 default_factory">
 ```python
@@ -124,11 +112,8 @@ class Bad:
 正解：`items: list[int] = field(default_factory=list)`。
 </Callout>
 
-<Playground
-  language="python"
-  id="py-13-dataclass-frozen"
-  title="frozen 与 asdict"
-  code={`from dataclasses import dataclass, asdict, astuple
+```python title="frozen 与 asdict"
+from dataclasses import dataclass, asdict, astuple
 import json
 
 @dataclass(frozen=True)        # 实例不可变（哈希可作 dict key）
@@ -154,19 +139,15 @@ class Product:
     price: float
 
 prod = Product("笔记本", 12.5)
-print(json.dumps(asdict(prod), ensure_ascii=False))`}
-  expectedOutput={`Point(x=3, y=4) 7\nfrozen 阻止修改: FrozenInstanceError\n{'x': 3, 'y': 4}\n(3, 4)\n{"name": "笔记本", "price": 12.5}`}
-/>
+print(json.dumps(asdict(prod), ensure_ascii=False))
+```
 
 ## 4. `TypeVar` 与 `Generic`
 
 当你想写一个"对任意类型都成立"的函数或类（如容器），用 `TypeVar`：
 
-<Playground
-  language="python"
-  id="py-13-typevar"
-  title="TypeVar 入门"
-  code={`from typing import TypeVar, Sequence
+```python title="TypeVar 入门"
+from typing import TypeVar, Sequence
 
 T = TypeVar("T")            # 通用类型变量
 
@@ -185,17 +166,13 @@ Number = TypeVar("Number", int, float)   # 必须是 int 或 float
 def double(x: Number) -> Number:
     return x * 2
 
-print(double(3), double(1.5))`}
-  expectedOutput={`1\na\nNone\n6 3.0`}
-/>
+print(double(3), double(1.5))
+```
 
 ## 5. 泛型类
 
-<Playground
-  language="python"
-  id="py-13-generic"
-  title="Generic 泛型类"
-  code={`from typing import Generic, TypeVar, Iterator
+```python title="Generic 泛型类"
+from typing import Generic, TypeVar, Iterator
 
 T = TypeVar("T")
 
@@ -227,19 +204,15 @@ print("s1 pop:", s1.pop(), "len:", len(s1))
 # 装 str
 s2: Stack[str] = Stack()
 s2.push("a"); s2.push("b")
-print("s2:", list(s2))`}
-  expectedOutput={`s1 pop: 3 len: 2\ns2: ['b', 'a']`}
-/>
+print("s2:", list(s2))
+```
 
 ## 🎯 练习
 
 用 `@dataclass` 实现一个 `Book` 数据类，包含 `title: str`、`author: str`、`year: int = 2024`。再写一个泛型函数 `latest(books: list[T]) -> T | None`，返回"year 最大的那本"（用 `getattr` 或 dataclass 的 `dataclasses.astuple` 取 year 也行）。处理空列表返回 `None`。
 
-<Playground
-  language="python"
-  id="py-13-exercise"
-  title="Book + latest()"
-  code={`from dataclasses import dataclass
+```python title="Book + latest()"
+from dataclasses import dataclass
 
 @dataclass
 class Book:
@@ -255,9 +228,8 @@ b1 = Book("三体", "刘慈欣", 2008)
 b2 = Book("活着", "余华", 1993)
 b3 = Book("百年孤独", "马尔克斯", 1967)
 print(latest([b1, b2, b3]))
-print(latest([]))`}
-  expectedOutput={`Book(title='三体', author='刘慈欣', year=2008)\nNone`}
-/>
+print(latest([]))
+```
 
 <Callout type="exercise" title="提示">
 `max(books, key=lambda b: b.year, default=None)` 一行搞定。

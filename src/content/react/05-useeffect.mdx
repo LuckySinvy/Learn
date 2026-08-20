@@ -111,11 +111,8 @@ useEffect(() => {
 
 下面这段纯 TypeScript 代码复刻了 React 内部的 effect 调度：依赖比较、执行、清理。跑一遍就能彻底搞清楚「什么时候会重新执行」。
 
-<Playground
-  language="typescript"
-  title="迷你 useEffect：依赖比较与清理"
-  id="react-05-1"
-  code={`type Deps = readonly unknown[] | null;
+```ts title="迷你 useEffect：依赖比较与清理"
+type Deps = readonly unknown[] | null;
 type Cleanup = (() => void) | null;
 
 interface EffectSlot {
@@ -198,9 +195,8 @@ renderComponent("B");
 console.log("组件卸载，执行所有清理");
 for (const s of slots) {
   if (s.cleanup !== null) s.cleanup();
-}`}
-  expectedOutput={`渲染 1: roomId=A\n  [socket] 首次挂载，执行\n      connect(A)\n  [fetch] 首次挂载，执行\n      fetch(limit=10)\n渲染 2: roomId=A （只是父组件重渲染）\n  [socket] 依赖未变，跳过\n  [fetch] 依赖变了 -> 先清理上一次\n  [fetch] 再执行新的\n      fetch(limit=10)\n渲染 3: roomId=B\n  [socket] 依赖变了 -> 先清理上一次\n      close(A)\n  [socket] 再执行新的\n      connect(B)\n  [fetch] 依赖变了 -> 先清理上一次\n  [fetch] 再执行新的\n      fetch(limit=10)\n组件卸载，执行所有清理\n      close(B)`}
-/>
+}
+```
 
 注意「渲染 2」的输出：`roomId` 没变，socket 正确跳过了；但 `config` 因为是新对象，`fetch` 白跑了一次。真实项目里这就是「接口被重复请求」的常见原因。
 

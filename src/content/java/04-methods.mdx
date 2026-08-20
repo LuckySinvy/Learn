@@ -17,11 +17,8 @@ description: 方法签名、参数传递、返回值、重载、可变参数
 }
 ```
 
-<Playground
-  language="java"
-  id="java-04-func"
-  title="基本方法"
-  code={`public class Main {
+```java title="基本方法"
+public class Main {
     // 静态方法
     static int add(int a, int b) {
         return a + b;
@@ -31,19 +28,15 @@ description: 方法签名、参数传递、返回值、重载、可变参数
         System.out.println(add(3, 5));
         System.out.println(add(10, 20));
     }
-}`}
-  expectedOutput={`8\n30`}
-/>
+}
+```
 
 ## 2. 参数传递
 
 Java 中**基本类型**按值传递，**引用类型**按引用传递（传递的是引用的副本）。
 
-<Playground
-  language="java"
-  id="java-04-pass"
-  title="值传递 vs 引用传递"
-  code={`public class Main {
+```java title="值传递 vs 引用传递"
+public class Main {
     static void bump(int n) { n++; }                          // 改不动外面
     static void append(java.util.List<String> list) {
         list.add("added");                                    // 能改 list 内容
@@ -58,9 +51,8 @@ Java 中**基本类型**按值传递，**引用类型**按引用传递（传递�
         append(list);
         System.out.println("list = " + list);  // [a, b, added]
     }
-}`}
-  expectedOutput={`x = 10\nlist = [a, b, added]`}
-/>
+}
+```
 
 <Callout type="info" title="Java 没有引用传递的引用">
 Java 始终是**值传递**：对于引用类型，传的是引用的副本。但因为副本和原引用指向同一对象，所以能修改对象内容。重新赋值 `list = newList` 不会影响外面。
@@ -70,11 +62,8 @@ Java 始终是**值传递**：对于引用类型，传的是引用的副本。�
 
 同名方法、不同参数（数量或类型），构成重载。
 
-<Playground
-  language="java"
-  id="java-04-overload"
-  title="方法重载"
-  code={`public class Main {
+```java title="方法重载"
+public class Main {
     static int add(int a, int b)            { return a + b; }
     static double add(double a, double b)   { return a + b; }
     static String add(String a, String b)   { return a + b; }
@@ -84,17 +73,13 @@ Java 始终是**值传递**：对于引用类型，传的是引用的副本。�
         System.out.println(add(1.5, 2.5));
         System.out.println(add("Hello, ", "Java"));
     }
-}`}
-  expectedOutput={`3\n4.0\nHello, Java`}
-/>
+}
+```
 
 ## 4. 可变参数 `varargs`
 
-<Playground
-  language="java"
-  id="java-04-varargs"
-  title="可变参数"
-  code={`public class Main {
+```java title="可变参数"
+public class Main {
     static int sum(int... nums) {
         int s = 0;
         for (int n : nums) s += n;
@@ -106,9 +91,8 @@ Java 始终是**值传递**：对于引用类型，传的是引用的副本。�
         System.out.println(sum(1, 2, 3));       // 6
         System.out.println(sum(new int[]{1, 2, 3, 4, 5}));  // 15
     }
-}`}
-  expectedOutput={`0\n6\n15`}
-/>
+}
+```
 
 <Callout type="tip" title="varargs 的本质">
 `int... nums` 等价于 `int[] nums`。调用时编译器会构造一个数组。**只能有一个 varargs 参数，且必须是最后一个**。
@@ -116,11 +100,8 @@ Java 始终是**值传递**：对于引用类型，传的是引用的副本。�
 
 ## 5. 静态工具方法集合
 
-<Playground
-  language="java"
-  id="java-04-utils"
-  title="工具方法"
-  code={`public class Main {
+```java title="工具方法"
+public class Main {
     static int max(int a, int b) { return a > b ? a : b; }
     static int max(int a, int b, int c) { return max(max(a, b), c); }
     static double avg(int... nums) {
@@ -135,17 +116,13 @@ Java 始终是**值传递**：对于引用类型，传的是引用的副本。�
         System.out.println(max(3, 7, 2));
         System.out.println(avg(1, 2, 3, 4, 5));
     }
-}`}
-  expectedOutput={`7\n7\n3.0`}
-/>
+}
+```
 
 ## 6. 递归
 
-<Playground
-  language="java"
-  id="java-04-recursion"
-  title="递归阶乘"
-  code={`public class Main {
+```java title="递归阶乘"
+public class Main {
     static long fact(int n) {
         if (n <= 1) return 1;
         return n * fact(n - 1);
@@ -156,17 +133,13 @@ Java 始终是**值传递**：对于引用类型，传的是引用的副本。�
             System.out.println(i + "! = " + fact(i));
         }
     }
-}`}
-  expectedOutput={`0! = 1\n1! = 1\n2! = 2\n3! = 6\n4! = 24\n5! = 120\n6! = 720`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-04-exercise"
-  title="判断素数"
-  code={`// 任务：写 isPrime(n)，返回 n 是否为素数
+```java title="判断素数"
+// 任务：写 isPrime(n)，返回 n 是否为素数
 // 期望：isPrime(17)=true, isPrime(18)=false
 
 public class Main {
@@ -181,8 +154,7 @@ public class Main {
         System.out.println("2  -> " + isPrime(2));
     }
 }
-`}
-/>
+```
 
 ## 小结
 

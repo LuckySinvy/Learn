@@ -36,11 +36,8 @@ pip install requests
 
 Python 自带 HTTP 客户端，写起来啰嗦一点但能用：
 
-<Playground
-  language="python"
-  id="py-16-urllib"
-  title="urllib.request 等价于 requests.get"
-  code={`import urllib.request
+```python title="urllib.request 等价于 requests.get"
+import urllib.request
 import json
 
 # 等价于 requests.get(url).json()
@@ -56,9 +53,8 @@ print("标签:  ", data["tags"])
 # with urllib.request.urlopen("https://api.example.com/data") as r:
 #     raw = r.read()
 #     data = json.loads(raw)
-#     print(r.status, data)`}
-  expectedOutput={`用户名: alice\n分数:   95\n标签:   ['py', 'go']`}
-/>
+#     print(r.status, data)
+```
 
 <Callout type="tip" title="urllib vs requests 对照">
 | 需求 | requests | urllib |
@@ -91,11 +87,8 @@ df.plot(kind="bar", x="city", y="amount")
 
 ## 4. 沙箱里的"穷人版 pandas"：`csv`
 
-<Playground
-  language="python"
-  id="py-16-csv"
-  title="csv 模块：穷人版 pandas"
-  code={`import csv
+```python title="csv 模块：穷人版 pandas"
+import csv
 from collections import defaultdict
 from pathlib import Path
 
@@ -121,9 +114,8 @@ for r in rows:
 
 print("按城市求和:")
 for city, total in sorted(by_city.items()):
-    print(f"  {city}: {total}")`}
-  expectedOutput={`总行数: 5\n第一行: {'city': '北京', 'product': 'Apple', 'amount': '120'}\n按城市求和:\n  上海: 150\n  北京: 170\n  广州: 200`}
-/>
+    print(f"  {city}: {total}")
+```
 
 <Callout type="info" title="collections.defaultdict 的妙用">
 `defaultdict(int)` 自动给不存在的 key 初始化为 `0`，省去 `if key in d: ... else: ...`。
@@ -134,11 +126,8 @@ for city, total in sorted(by_city.items()):
 
 回顾一下第 8 章的 `pathlib`：
 
-<Playground
-  language="python"
-  id="py-16-pathlib"
-  title="pathlib 高频操作"
-  code={`from pathlib import Path
+```python title="pathlib 高频操作"
+from pathlib import Path
 import tempfile
 
 # 临时目录
@@ -158,9 +147,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # 读
     print("文件内容:", sub.read_text(encoding="utf-8"))
-    print("后缀:", sub.suffix, " 名字:", sub.name)`}
-  expectedOutput={`临时目录: /tmp/xxx\n目录内容:\n a\n a/b\n a/b/c.txt\n文件内容: hello\n后缀: .txt  名字: c.txt`}
-/>
+    print("后缀:", sub.suffix, " 名字:", sub.name)
+```
 
 ## 6. `pip` —— 包管理
 
@@ -197,11 +185,8 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple requests
 3. **虚拟环境**：`python -m venv .venv && source .venv/bin/activate` 后再装。
 4. **版本冲突**：`pip install --upgrade xxx` 或用 `pip check` 看依赖图。
 
-<Playground
-  language="python"
-  id="py-16-import-check"
-  title="import 调试三件套"
-  code={`import sys
+```python title="import 调试三件套"
+import sys
 print("当前 Python:", sys.executable)
 print("sys.path 前 5 项:")
 for p in sys.path[:5]:
@@ -212,19 +197,15 @@ try:
     import requests
     print("requests 已装, 版本:", requests.__version__)
 except ImportError as e:
-    print("requests 未安装:", e)`}
-  expectedOutput={`当前 Python: /usr/local/bin/python\nsys.path 前 5 项:\n  \n  /usr/local/lib/python3.12/site-packages\n  ...\nrequests 未安装: No module named 'requests'`}
-/>
+    print("requests 未安装:", e)
+```
 
 ## 🎯 练习
 
 在沙箱里（没有网络、没有第三方库），用 `urllib.request` + `csv` 完成一次"伪 API 拉数据 → 写 CSV → 重新读出统计"的全流程。
 
-<Playground
-  language="python"
-  id="py-16-exercise"
-  title="穷人版数据流水线"
-  code={`import csv
+```python title="穷人版数据流水线"
+import csv
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -243,9 +224,7 @@ api_response = '''
 # 2) 解析 JSON
 # 3) 写到 /tmp/orders.csv（含表头）
 # 4) 重新读出，按 product 聚合 amount 并打印
-`}
-  expectedOutput={`写入完成, 共 5 行\n按产品求和:\n  Apple: 400\n  Banana: 120`}
-/>
+```
 
 <Callout type="exercise" title="提示">
 - `data = json.loads(api_response)`

@@ -260,11 +260,8 @@ func main() {
 
 把上面四个文件合并到 `main.go`，并**用 `httptest` 演示**完整 CRUD 流程（沙盒里不能起长服务）。
 
-<Playground
-  language="go"
-  id="go-17-restapi"
-  title="单文件完整版：CRUD 演示"
-  code={`package main
+```go title="单文件完整版：CRUD 演示"
+package main
 
 import (
     "encoding/json"
@@ -421,19 +418,8 @@ func (t *muxTransport) RoundTrip(r *http.Request) (*http.Response, error) {
     t.mux.ServeHTTP(rec, r)
     rec.Result().Body = io.NopCloser(strings.NewReader(""))
     return rec.Result(), nil
-}`}
-  expectedOutput={`=== 演示完整 CRUD 流程 ===
-POST   /api/tasks            -> 201 {"id":1,"title":"学 Go","done":false,"created_at":"2026-07-28T14:00:00Z"}
-POST   /api/tasks            -> 201 {"id":2,"title":"写项目","done":false,"created_at":"2026-07-28T14:00:00Z"}
-GET    /api/tasks            -> 200 [{"id":1,"title":"学 Go","done":false,"created_at":"2026-07-28T14:00:00Z"},{"id":2,"title":"写项目","done":false,"created_at":"2026-07-28T14:00:00Z"}]
-GET    /api/tasks/1          -> 200 {"id":1,"title":"学 Go","done":false,"created_at":"2026-07-28T14:00:00Z"}
-PUT    /api/tasks/1          -> 200 {"id":1,"title":"学 Go","done":true,"created_at":"2026-07-28T14:00:00Z"}
-GET    /api/tasks/1          -> 200 {"id":1,"title":"学 Go","done":true,"created_at":"2026-07-28T14:00:00Z"}
-DELETE /api/tasks/2          -> 204 
-GET    /api/tasks            -> 200 [{"id":1,"title":"学 Go","done":true,"created_at":"2026-07-28T14:00:00Z"}]
-GET    /api/tasks/999        -> 404 {"error":"not found"}
-POST   /api/tasks            -> 400 {"error":"title 不能为空"}`}
-/>
+}
+```
 
 <Callout type="tip" title="created_at 字段">
 实际 `time.Now()` 在 Playground 里会输出真实当前时间——所以本例 `expectedOutput` 用的是**占位字符串**，真实运行时会显示不同时间。重点是**结构正确**，不是字符精确匹配。
@@ -478,11 +464,8 @@ func TestGetTask_NotFound(t *testing.T) {
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-17-exercise"
-  title="扩展 API：加搜索"
-  code={`// 任务：扩展 Store，增加 Search 能力
+```go title="扩展 API：加搜索"
+// 任务：扩展 Store，增加 Search 能力
 // 1. List 支持 ?done=true / ?done=false / ?q=关键词
 // 2. main 里加几条任务，演示按不同条件过滤
 // 提示：复制上面 Store，List 改为 func (s *Store) List(filter ListFilter) []Task
@@ -573,24 +556,7 @@ func main() {
         fmt.Printf("  %d %s\\n", t.ID, t.Title)
     }
 }
-`}
-  expectedOutput={`全部：
-  1 学 Go 基础 done=false
-  2 学 Go 进阶 done=false
-  3 写 Web 项目 done=true
-  4 部署上线 done=true
-
-未完成：
-  1 学 Go 基础
-  2 学 Go 进阶
-
-标题含'Go'：
-  1 学 Go 基础
-  2 学 Go 进阶
-
-已完成且标题含'上线'：
-  4 部署上线`}
-/>
+```
 
 ## 小结
 

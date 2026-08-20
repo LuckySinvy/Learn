@@ -17,11 +17,8 @@ Lambda 是**匿名函数**，可以赋值给变量、作为参数传递。
 (参数) -> { 语句; return 值; }
 ```
 
-<Playground
-  language="java"
-  id="java-08-lambda"
-  title="Lambda 入门"
-  code={`import java.util.*;
+```java title="Lambda 入门"
+import java.util.*;
 
 public class Main {
     public static void main(String[] args) {
@@ -38,9 +35,8 @@ public class Main {
     interface IntFunc {
         int apply(int x);
     }
-}`}
-  expectedOutput={`Hello Lambda\n5² = 25`}
-/>
+}
+```
 
 <Callout type="info" title="函数式接口">
 只有一个抽象方法的接口称为**函数式接口**（`@FunctionalInterface`），可以被 Lambda 替换：
@@ -55,11 +51,8 @@ public class Main {
 
 当 Lambda 只是调用一个已存在的方法时，可以用 `::` 简写。
 
-<Playground
-  language="java"
-  id="java-08-mref"
-  title="方法引用"
-  code={`import java.util.*;
+```java title="方法引用"
+import java.util.*;
 import java.util.stream.*;
 
 public class Main {
@@ -75,9 +68,8 @@ public class Main {
                           .collect(Collectors.toList());
         System.out.println(uppers);
     }
-}`}
-  expectedOutput={`Java\nGo\nPython\nRust\n[JAVA, GO, PYTHON, RUST]`}
-/>
+}
+```
 
 ## 3. Stream 流水线
 
@@ -85,11 +77,8 @@ Stream 操作分两类：
 - **中间操作**：filter、map、sorted（返回新 Stream）
 - **终止操作**：collect、forEach、count（触发实际计算）
 
-<Playground
-  language="java"
-  id="java-08-stream"
-  title="Stream 流水线"
-  code={`import java.util.*;
+```java title="Stream 流水线"
+import java.util.*;
 import java.util.stream.*;
 
 public class Main {
@@ -113,17 +102,13 @@ public class Main {
         long count = nums.stream().filter(n -> n > 5).count();
         System.out.println("大于 5 的有 " + count + " 个");
     }
-}`}
-  expectedOutput={`偶数平方和 = 220\n[apple, banana, cherry]\n大于 5 的有 5 个`}
-/>
+}
+```
 
 ## 4. 收集器 `Collectors`
 
-<Playground
-  language="java"
-  id="java-08-collect"
-  title="Collectors"
-  code={`import java.util.*;
+```java title="Collectors"
+import java.util.*;
 import java.util.stream.*;
 
 public class Main {
@@ -152,9 +137,8 @@ public class Main {
                              .collect(Collectors.joining(", "));
         System.out.println("名字: " + names);
     }
-}`}
-  expectedOutput={`按年龄分组: {30=[Alice, Dave], 25=[Bob], 28=[Carol]}\n平均年龄: 28.25\n名字: Alice, Bob, Carol, Dave`}
-/>
+}
+```
 
 <Callout type="info" title="record 关键字">
 Java 14+ 的 `record` 是**不可变数据类**的语法糖：自动生成构造器、getter、equals、hashCode、toString。
@@ -164,11 +148,8 @@ Java 14+ 的 `record` 是**不可变数据类**的语法糖：自动生成构造
 
 `Optional<T>` 是可能为 null 的容器，强迫调用者显式处理「无值」。
 
-<Playground
-  language="java"
-  id="java-08-optional"
-  title="Optional"
-  code={`import java.util.*;
+```java title="Optional"
+import java.util.*;
 
 public class Main {
     public static void main(String[] args) {
@@ -188,17 +169,13 @@ public class Main {
                           .orElse("EMPTY");
         System.out.println(r);
     }
-}`}
-  expectedOutput={`hello\ndefault\n非空: hello\nHI`}
-/>
+}
+```
 
 ## 6. 实战：学生成绩分析
 
-<Playground
-  language="java"
-  id="java-08-grade"
-  title="学生成绩分析"
-  code={`import java.util.*;
+```java title="学生成绩分析"
+import java.util.*;
 import java.util.stream.*;
 
 public class Main {
@@ -230,17 +207,13 @@ public class Main {
         double avg = students.stream().collect(Collectors.averagingInt(Student::score));
         System.out.printf("平均分 %.2f%n", avg);
     }
-}`}
-  expectedOutput={`前三名:\n  Dave: 95\n  Bob: 92\n  Eve: 88\n通过 5，未通过 0\n平均分 87.60`}
-/>
+}
+```
 
 ## 🎯 综合练习
 
-<Playground
-  language="java"
-  id="java-08-exercise"
-  title="Lambda 排序"
-  code={`// 任务：用 Lambda 对字符串列表按长度降序排序
+```java title="Lambda 排序"
+// 任务：用 Lambda 对字符串列表按长度降序排序
 // 期望输入：["Java", "Go", "Python", "Rust"]
 // 期望输出：[Python, Java, Rust, Go]
 
@@ -253,8 +226,7 @@ public class Main {
         System.out.println(langs);
     }
 }
-`}
-/>
+```
 
 ## 小结
 

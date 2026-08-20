@@ -17,11 +17,8 @@ for i in $(seq 1 5); do ...; done             # 遍历命令输出
 for ((i=0; i<5; i++)); do ...; done           # C 风格（bash 专属）
 ```
 
-<Playground
-  language="linux"
-  title="for：批量处理文件"
-  id="linux-16-1"
-  code={`mkdir -p reports
+```bash title="for：批量处理文件"
+mkdir -p reports
 for name in jan feb mar apr; do
   echo "sales data of $name" > reports/$name.csv
 done
@@ -39,8 +36,8 @@ echo ''
 echo '$ seq 生成数字序列 + 格式化：'
 for i in $(seq 1 3); do
   echo "worker-$i starting"
-done`}
-/>
+done
+```
 
 遍历文件务必用通配符（`for f in *.log`）而不是 `for f in $(ls)`——后者会被空格文件名撕碎，是经典反模式。
 
@@ -51,11 +48,8 @@ while [ 条件 ]; do ...; done                  # 条件循环
 while read -r line; do ...; done < file      # 逐行读文件的标准姿势
 ```
 
-<Playground
-  language="linux"
-  title="while read 逐行处理"
-  id="linux-16-2"
-  code={`cat > hosts.txt << 'EOF'
+```bash title="while read 逐行处理"
+cat > hosts.txt << 'EOF'
 web-01 10.0.0.11
 web-02 10.0.0.12
 db-01 10.0.0.21
@@ -82,8 +76,8 @@ until [ -f /tmp/ready.flag ] || [ $ATTEMPT -gt 3 ]; do
   ATTEMPT=$((ATTEMPT + 1))
   test $ATTEMPT -eq 3 && touch /tmp/ready.flag
 done
-echo 'ready!'`}
-/>
+echo 'ready!'
+```
 
 `read -r` 的 -r 防止反斜杠被吃掉，养成肌肉记忆。`until` 是 while 的反义版（条件为假时循环），写重试逻辑更顺口。
 
@@ -98,11 +92,8 @@ log "server started"           # 调用：像命令一样，不写括号
 
 函数内 `local` 声明局部变量（否则默认全局，极易互相污染）；`return N` 设定函数退出码（不能返回字符串——要"返回"数据就 echo 出来，调用方用 `$()` 接）。
 
-<Playground
-  language="linux"
-  title="函数：封装与返回值"
-  id="linux-16-3"
-  code={`#!/bin/bash
+```bash title="函数：封装与返回值"
+#!/bin/bash
 log() {
   local LEVEL=$1
   local MSG=$2
@@ -129,8 +120,8 @@ else
 fi
 
 disk_usage /nope || log WARN '/nope 检查失败（演示 return 1）'
-log INFO 'script finished'`}
-/>
+log INFO 'script finished'
+```
 
 ## 4. 脚本参数处理
 
@@ -152,11 +143,8 @@ DIR=${DEPLOY_DIR:?未设置 DEPLOY_DIR}    # 为空直接报错退出
 echo "hello $NAME"
 ```
 
-<Playground
-  language="linux"
-  title="$#、$@ 与 shift"
-  id="linux-16-4"
-  code={`cat > args.sh << 'EOF'
+```bash title="$#、$@ 与 shift"
+cat > args.sh << 'EOF'
 #!/bin/bash
 echo "脚本名: $0, 参数个数: $#"
 echo "第一个参数: $1"
@@ -171,8 +159,8 @@ EOF
 chmod +x args.sh
 
 echo '$ ./args.sh apple "big banana" cherry'
-./args.sh apple 'big banana' cherry`}
-/>
+./args.sh apple 'big banana' cherry
+```
 
 注意输出里 `big banana` 始终是一个参数——这就是 `"$@"` 的价值；换成 `$*` 或裸 `$@` 它就会被拆成两个。
 
@@ -202,11 +190,8 @@ bash 默认的宽容是脚本事故之源：命令失败继续往下跑、打错
 | `set -u` | 使用未定义变量直接报错（拼写错误现形） |
 | `set -o pipefail` | 管道中**任何一环**失败都算整条管道失败（默认只看最后一环） |
 
-<Playground
-  language="linux"
-  title="有无安全带的对比"
-  id="linux-16-5"
-  code={`cat > unsafe.sh << 'EOF'
+```bash title="有无安全带的对比"
+cat > unsafe.sh << 'EOF'
 #!/bin/bash
 TARGET_DIR=/data/output
 rm -rf "$TAGRET_DIR/cache"   # 变量名拼错了！$TAGRET_DIR 是空串
@@ -228,8 +213,8 @@ echo '$ ./unsafe.sh   # 拼错变量静默通过，险些酿祸：'
 echo ''
 echo '$ ./safe.sh     # set -u 当场抓获：'
 ./safe.sh
-echo "exit code = $?"`}
-/>
+echo "exit code = $?"
+```
 
 <Callout type="warn" title="set -e 的边界">
 `set -e` 不是万能的：出现在 if 条件、&& / || 链中的失败不会触发退出（这是设计使然——那些位置的失败是"被检查的"）。预期可能失败且要继续的命令，显式写 `cmd || true`。团队规范建议：**所有生产脚本第一行逻辑就是 `set -euo pipefail`**，需要豁免的地方逐个显式标注。

@@ -21,11 +21,8 @@ cat a.txt b.txt > merged.txt   # 拼接并保存
 
 适合**一屏能装下**的小文件：配置、脚本、hosts。反过来，大文件用 cat 会瞬间刷过几万行，毫无意义。
 
-<Playground
-  language="linux"
-  title="cat 与它的伙伴们"
-  id="linux-03-1"
-  code={`printf 'server:\n  port: 8080\n  host: 0.0.0.0\n' > app.yaml
+```bash title="cat 与它的伙伴们"
+printf 'server:\n  port: 8080\n  host: 0.0.0.0\n' > app.yaml
 echo '$ cat app.yaml'
 cat app.yaml
 
@@ -40,8 +37,8 @@ tac order.txt
 # nl：另一种加行号的方式，默认跳过空行
 printf 'alpha\n\nbeta\n' > sparse.txt
 echo '$ nl sparse.txt'
-nl sparse.txt`}
-/>
+nl sparse.txt
+```
 
 ## 2. less：大文件分页翻阅
 
@@ -78,11 +75,8 @@ tail -n +3 app.log      # 从第 3 行开始输出到末尾（注意 + 号）
 tail -f app.log         # 持续追踪新增内容——运维第一命令
 ```
 
-<Playground
-  language="linux"
-  title="head / tail 精确取行"
-  id="linux-03-2"
-  code={`# 生成 1..20 行的演示文件
+```bash title="head / tail 精确取行"
+# 生成 1..20 行的演示文件
 seq -f 'line %g' 20 > demo.log
 
 echo '$ head -n 3 demo.log'
@@ -102,8 +96,8 @@ head -n 8 demo.log | tail -n 4
 echo '$ wc demo.log'
 wc demo.log
 echo '$ wc -l demo.log   # 只要行数'
-wc -l demo.log`}
-/>
+wc -l demo.log
+```
 
 `tail -f`（follow）会保持运行、实时打印文件新追加的内容，是盯日志的标配；`tail -F` 更进一步，在日志被轮转（重命名后新建）时会自动重新打开新文件，生产环境建议用大写 F。
 
@@ -111,11 +105,8 @@ wc -l demo.log`}
 
 Linux 不靠扩展名判断文件类型，`file` 命令通过内容特征识别：
 
-<Playground
-  language="linux"
-  title="file 识别文件类型"
-  id="linux-03-3"
-  code={`echo 'plain text' > a.txt
+```bash title="file 识别文件类型"
+echo 'plain text' > a.txt
 printf '#!/bin/bash\necho hi\n' > run.sh
 head -c 100 /bin/busybox > bin.sample 2>/dev/null || head -c 100 /bin/ls > bin.sample
 
@@ -125,8 +116,8 @@ file a.txt run.sh bin.sample
 # 扩展名骗不过 file
 cp bin.sample fake.txt
 echo '$ file fake.txt'
-file fake.txt`}
-/>
+file fake.txt
+```
 
 ## 5. vim 生存指南
 

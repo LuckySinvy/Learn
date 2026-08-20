@@ -58,11 +58,8 @@ XFF 是客户端可自由填写的普通头，只有"离你最近的可信代理
 
 ## 2. 动手：观察请求头的旅程
 
-<Playground
-  language="http"
-  title="回显服务器观察各种请求头"
-  id="http-07-1"
-  code={`python3 -c '
+```http title="回显服务器观察各种请求头"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Echo(BaseHTTPRequestHandler):
@@ -91,8 +88,8 @@ curl -s http://127.0.0.1:8000/page \
   -H "Referer: http://127.0.0.1:8000/home"
 
 echo "===== 模拟伪造 X-Forwarded-For ====="
-curl -s http://127.0.0.1:8000/api -H "X-Forwarded-For: 8.8.8.8"`}
-/>
+curl -s http://127.0.0.1:8000/api -H "X-Forwarded-For: 8.8.8.8"
+```
 
 任何请求头都能随手伪造——这是"永远不要信任客户端输入"在头部层面的体现。
 
@@ -116,11 +113,8 @@ Content-Type 的值是 **MIME 类型**（media type），格式为 `主类型/�
 
 **同样的字节，不同的 Content-Type，客户端行为天差地别**：
 
-<Playground
-  language="http"
-  title="同一份内容，三种 Content-Type"
-  id="http-07-2"
-  code={`python3 -c '
+```http title="同一份内容，三种 Content-Type"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PAYLOAD = b"<h1>hello</h1><script>alert(1)</script>"
@@ -149,8 +143,8 @@ for _i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && break
 for p in /as-html /as-text /as-bin; do
   echo "== $p =="
   curl -si http://127.0.0.1:8000$p | grep -i "content-type"
-done`}
-/>
+done
+```
 
 同一串字节：标成 text/html 浏览器会渲染（脚本会执行！）、标成 text/plain 只当文字显示、标成 octet-stream 直接弹下载框。
 
@@ -162,11 +156,8 @@ Content-Type 缺失或含糊时，老浏览器会"嗅探"内容猜类型——�
 
 前后端联调最常打交道的三种请求体格式：
 
-<Playground
-  language="http"
-  title="urlencoded / JSON / multipart 三种请求体"
-  id="http-07-3"
-  code={`python3 -c '
+```http title="urlencoded / JSON / multipart 三种请求体"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Echo(BaseHTTPRequestHandler):
@@ -195,8 +186,8 @@ curl -s http://127.0.0.1:8000/ -H "Content-Type: application/json" -d '{"name":"
 
 echo "3) multipart/form-data：-F 参数，注意 boundary"
 echo "file-content-here" > up.txt
-curl -s http://127.0.0.1:8000/ -F "name=Ada" -F "avatar=@up.txt"`}
-/>
+curl -s http://127.0.0.1:8000/ -F "name=Ada" -F "avatar=@up.txt"
+```
 
 观察三点：`-d` 默认按 urlencoded 发送；发 JSON 必须自己声明 Content-Type（后端才知道怎么解析）；`-F` 自动使用 multipart 并生成随机 **boundary** 分隔各字段——文件上传必须用它，因为二进制内容没法 urlencode 进一行文本。
 

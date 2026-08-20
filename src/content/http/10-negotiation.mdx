@@ -24,11 +24,8 @@ Accept-Language: zh-CN, zh;q=0.9, en;q=0.5
 含义：最想要 zh-CN（q=1），其次任何中文（0.9），实在不行英文（0.5）
 ```
 
-<Playground
-  language="http"
-  title="按 Accept-Language 协商语言版本"
-  id="http-10-1"
-  code={`python3 -c '
+```http title="按 Accept-Language 协商语言版本"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PAGES = {"zh": "你好，世界", "en": "Hello, World", "ja": "こんにちは"}
@@ -62,8 +59,8 @@ curl -s http://127.0.0.1:8000/ -H "Accept-Language: zh-CN, en;q=0.5"
 curl -s http://127.0.0.1:8000/ -H "Accept-Language: ja, en;q=0.8"
 curl -s http://127.0.0.1:8000/ -H "Accept-Language: fr"
 echo "--- 响应头里的协商结果与 Vary ---"
-curl -si http://127.0.0.1:8000/ -H "Accept-Language: zh" | grep -iE "content-language|vary"`}
-/>
+curl -si http://127.0.0.1:8000/ -H "Accept-Language: zh" | grep -iE "content-language|vary"
+```
 
 ### 1.1 Vary：协商资源的缓存钥匙
 
@@ -86,11 +83,8 @@ curl -si http://127.0.0.1:8000/ -H "Accept-Language: zh" | grep -iE "content-lan
 | zstd | 新秀，压缩速度快，支持面还在扩大 |
 | identity | 不压缩 |
 
-<Playground
-  language="http"
-  title="gzip 压缩：体积对比实验"
-  id="http-10-2"
-  code={`python3 -c '
+```http title="gzip 压缩：体积对比实验"
+python3 -c '
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import gzip, json
 
@@ -125,8 +119,8 @@ curl -s --compressed -o /dev/null -w "传输 %{size_download} 字节\n" \
   http://127.0.0.1:8000/api
 
 echo "== 看响应头确认 =="
-curl -si --compressed http://127.0.0.1:8000/api | grep -iE "content-encoding|content-length|vary"`}
-/>
+curl -si --compressed http://127.0.0.1:8000/api | grep -iE "content-encoding|content-length|vary"
+```
 
 一份 9KB 的 JSON 压到几百字节——这就是所有网关默认开启 gzip 的原因。两个注意点：**已压缩格式（jpg/png/mp4/woff2）别再压**，白耗 CPU 还可能变大；**Content-Encoding 与 Transfer-Encoding 是两层**，前者描述"体本身是压缩格式"，后者描述"传输方式"（见下节）。
 
@@ -146,11 +140,8 @@ abcdefghijklmnopqrstuvwxyz\r\n
 \r\n
 ```
 
-<Playground
-  language="http"
-  title="手写 chunked 响应，观察流式到达"
-  id="http-10-3"
-  code={`python3 -c '
+```http title="手写 chunked 响应，观察流式到达"
+python3 -c '
 import socket, threading, time
 
 def server():
@@ -178,8 +169,8 @@ import subprocess
 # -N 关闭缓冲，配合 -w 展示总时间：三块分三次到达，总耗时约 1.5 秒
 subprocess.run(["curl", "-sN", "-w", "总耗时 %{time_total}s\n",
                 "http://127.0.0.1:8000/stream"], check=False)
-'`}
-/>
+'
+```
 
 curl 收完全程约 1.5 秒，但**第一块 0.5 秒内就到了**——客户端不必等全部生成完。ChatGPT 式的打字机效果（SSE）底层正是 chunked 流：`Content-Type: text/event-stream` + 一块一块地推 `data: ...` 行。
 

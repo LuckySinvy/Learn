@@ -26,19 +26,16 @@ RUN pnpm build
 FROM node:22-alpine AS runner
 WORKDIR /app
 
-# 安装 docker-cli（沙箱调用需要）
-RUN apk add --no-cache docker-cli wget
+RUN apk add --no-cache wget
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 
-# 非 root 用户，加入 docker 组以便访问 socket
+# 非 root 用户
 RUN addgroup -g 1000 -S nodejs \
- && addgroup -S docker \
- && adduser -S -u 1000 -G nodejs nextjs \
- && addgroup nextjs docker
+ && adduser -S -u 1000 -G nodejs nextjs
 
 # Next.js standalone 输出（server.js + 精简 node_modules）
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./

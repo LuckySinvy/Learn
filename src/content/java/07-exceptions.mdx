@@ -12,11 +12,8 @@ Java 把异常分为两大类：
 
 ## 1. 基本 try/catch
 
-<Playground
-  language="java"
-  id="java-07-try"
-  title="基本捕获"
-  code={`public class Main {
+```java title="基本捕获"
+public class Main {
     public static void main(String[] args) {
         try {
             int n = Integer.parseInt("abc");
@@ -27,17 +24,13 @@ Java 把异常分为两大类：
             System.out.println("无论如何都执行");
         }
     }
-}`}
-  expectedOutput={`捕获：For input string: 'abc'\n无论如何都执行`}
-/>
+}
+```
 
 ## 2. 多 catch
 
-<Playground
-  language="java"
-  id="java-07-multicatch"
-  title="多 catch"
-  code={`public class Main {
+```java title="多 catch"
+public class Main {
     public static void main(String[] args) {
         String[] tests = {"42", "abc", null, "3.14"};
         for (String s : tests) {
@@ -51,9 +44,8 @@ Java 把异常分为两大类：
             }
         }
     }
-}`}
-  expectedOutput={`42 -> 42\nabc 不是整数\n输入为 null\n3.14 不是整数`}
-/>
+}
+```
 
 <Callout type="tip" title="Java 7+ 多异常合并">
 ```java
@@ -65,11 +57,8 @@ catch (IOException | SQLException e) { ... }
 
 ## 3. `throw` 与 `throws`
 
-<Playground
-  language="java"
-  id="java-07-throw"
-  title="throw 与 throws"
-  code={`import java.io.IOException;
+```java title="throw 与 throws"
+import java.io.IOException;
 
 public class Main {
     // throws 声明可能抛 checked 异常
@@ -88,19 +77,15 @@ public class Main {
             System.out.println("IO 错误：" + e.getMessage());
         }
     }
-}`}
-  expectedOutput={`hello\nIO 错误：数组为空`}
-/>
+}
+```
 
 ## 4. try-with-resources（推荐）
 
 自动关闭实现了 `AutoCloseable` 的资源（流、连接等）。
 
-<Playground
-  language="java"
-  id="java-07-twr"
-  title="try-with-resources"
-  code={`import java.io.*;
+```java title="try-with-resources"
+import java.io.*;
 
 public class Main {
     public static void main(String[] args) throws IOException {
@@ -112,17 +97,13 @@ public class Main {
             }
         }  // 自动调用 br.close()
     }
-}`}
-  expectedOutput={`读取: line1\n读取: line2\n读取: line3`}
-/>
+}
+```
 
 ## 5. 自定义异常
 
-<Playground
-  language="java"
-  id="java-07-custom"
-  title="自定义异常"
-  code={`public class Main {
+```java title="自定义异常"
+public class Main {
     static class InsufficientFundsException extends Exception {
         private final double balance;
         private final double amount;
@@ -147,9 +128,8 @@ public class Main {
             System.out.println("失败：" + e.getMessage());
         }
     }
-}`}
-  expectedOutput={`失败：余额 100.00，尝试取款 200.00`}
-/>
+}
+```
 
 ## 6. 常见异常一览
 
@@ -166,11 +146,8 @@ public class Main {
 
 ## 🎯 练习
 
-<Playground
-  language="java"
-  id="java-07-exercise"
-  title="健壮整数解析"
-  code={`// 任务：实现 safeParse(String s) -> OptionalInt
+```java title="健壮整数解析"
+// 任务：实现 safeParse(String s) -> OptionalInt
 // 解析成功返回包含值的 OptionalInt，失败返回 OptionalInt.empty()
 // 期望：safeParse("42")=OptionalInt[42], safeParse("abc")=OptionalInt.empty
 
@@ -188,8 +165,7 @@ public class Main {
         System.out.println(safeParse(""));
     }
 }
-`}
-/>
+```
 
 ## 小结
 

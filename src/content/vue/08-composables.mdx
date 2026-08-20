@@ -125,11 +125,8 @@ scope.stop();
 
 Vue composable **没有依赖数组、不会重复执行**——因为 `setup` 只跑一次。这消除了 React 自定义 Hook 最常见的两类坑（依赖数组漏写、闭包拿到旧值）。
 
-<Playground
-  language="typescript"
-  title="effectScope：组合式函数的批量销毁"
-  id="vue-08-1"
-  code={`type Dep = Set<ReactiveEffect>;
+```ts title="effectScope：组合式函数的批量销毁"
+type Dep = Set<ReactiveEffect>;
 const targetMap = new WeakMap<object, Map<PropertyKey, Dep>>();
 let activeEffect: ReactiveEffect | null = null;
 
@@ -295,9 +292,8 @@ const refs = toRefs(state);
 let refRuns = 0;
 effect(() => { refRuns++; console.log("[toRefs] x=" + refs.x.value); });
 state.x = 100;
-console.log("toRefs 后 refRuns = " + refRuns);`}
-  expectedOutput={`[scope] count=0\n[scope] name=Ada\n[child] count*2=0\n--- 改 count：触发 2 个 scope effect + 1 个 child effect ---\n[scope] count=1\n[child] count*2=2\nruns 已 = 5\n--- scope.stop() 后 ---\nstop 后 runs 仍 = 5\n[direct] x=1\n直接解构后 directRuns = 1 (x 仍是 1)\n[toRefs] x=99\n[toRefs] x=100\ntoRefs 后 refRuns = 2\n`}
-/>
+console.log("toRefs 后 refRuns = " + refRuns);
+```
 
 第一段证明 `scope.stop()` 一次性停掉了 3 个 effect（含嵌套子 scope 的 1 个）——改 `count`/`name` 后 `runs` 仍停在 5。第二段对比两种解构：直接解构 `const { x } = state` 拿到的是**快照数值**，effect 只跑一次；`toRefs` 返回的 `refs.x` 仍是响应式的 `ref`，`state.x` 变化后 effect 正确重跑（refRuns 从 1 变 2）。
 

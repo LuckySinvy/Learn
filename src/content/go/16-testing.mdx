@@ -41,11 +41,8 @@ func TestAdd(t *testing.T) {
 }
 ```
 
-<Playground
-  language="go"
-  id="go-16-first"
-  title="用 main 模拟测试"
-  code={`// 沙盒只跑 main.go，我们手动模拟 testing.T 的报告方式
+```go title="用 main 模拟测试"
+// 沙盒只跑 main.go，我们手动模拟 testing.T 的报告方式
 // 真实项目用：go test -v ./...
 
 package main
@@ -79,13 +76,8 @@ func main() {
         }
     }
     fmt.Printf("结果：%d/%d\\n", pass, total)
-}`}
-  expectedOutput={`TestAdd:
-  ✓ 2+3=5
-  ✓ 0+0=0
-  ✓ -1+1=0
-结果：3/3`}
-/>
+}
+```
 
 <Callout type="info" title="沙盒不能跑 go test">
 `go test` 需要 `_test.go` 文件。沙盒只运行 `main.go`。所以这里的 Playground 用 `main()` **模拟**测试报告的格式；真实开发中请用 `go test -v`。
@@ -116,11 +108,8 @@ func TestAdd(t *testing.T) {
 }
 ```
 
-<Playground
-  language="go"
-  id="go-16-table"
-  title="表格驱动 Split"
-  code={`package main
+```go title="表格驱动 Split"
+package main
 
 import (
     "fmt"
@@ -163,13 +152,8 @@ func main() {
         }
     }
     fmt.Printf("\\n通过 %d/%d\\n", len(tests)-fail, len(tests))
-}`}
-  expectedOutput={`  ✓ 基本 -> [a b c]
-  ✓ 限制 -> [a b]
-  ✓ 不分割 -> [abc]
-
-通过 3/3`}
-/>
+}
+```
 
 <Callout type="tip" title="表格驱动的好处">
 - 加新用例：只追加一行
@@ -188,11 +172,8 @@ func TestGroup(t *testing.T) {
 }
 ```
 
-<Playground
-  language="go"
-  id="go-16-subtest"
-  title="子测试"
-  code={`package main
+```go title="子测试"
+package main
 
 import "fmt"
 
@@ -219,13 +200,8 @@ func main() {
     sub("中文", func() bool { return reverse("你好Go") == "oG好你" })
     sub("空串", func() bool { return reverse("") == "" })
     sub("单字符", func() bool { return reverse("a") == "a" })
-}`}
-  expectedOutput={`TestReverse:
-    --- PASS: ASCII
-    --- PASS: 中文
-    --- PASS: 空串
-    --- PASS: 单字符`}
-/>
+}
+```
 
 ## 4. 基准测试 Benchmark
 
@@ -240,11 +216,8 @@ func BenchmarkAdd(b *testing.B) {
 // 运行：go test -bench=.
 ```
 
-<Playground
-  language="go"
-  id="go-16-bench"
-  title="手动模拟 Benchmark"
-  code={`// 沙盒里我们用 time 测量，模拟 Benchmark 的报告方式
+```go title="手动模拟 Benchmark"
+// 沙盒里我们用 time 测量，模拟 Benchmark 的报告方式
 
 package main
 
@@ -287,10 +260,8 @@ func main() {
     const N = 10000
     runBench("ConcatLoop", func() { _ = concatLoop(N) })
     runBench("ConcatBuilder", func() { _ = concatBuilder(N) })
-}`}
-  expectedOutput={`BenchmarkConcatLoop       52000 ns/op
-BenchmarkConcatBuilder      8000 ns/op`}
-/>
+}
+```
 
 <Callout type="info" title="输出会随机器波动">
 `time` 在不同机器、不同时刻的测量值会不同。这里展示的是"哪个更快"——`strings.Builder` 远胜 `+=`。
@@ -315,11 +286,8 @@ func ExampleAdd() {
 
 ## 6. 完整示例：测试一个 Stack
 
-<Playground
-  language="go"
-  id="go-16-stack"
-  title="测试泛型 Stack"
-  code={`package main
+```go title="测试泛型 Stack"
+package main
 
 import "fmt"
 
@@ -353,14 +321,8 @@ func main() {
     _, ok := s.Pop()
     runCase("空栈 Pop 返回 ok=false", ok == false)
     runCase("空栈 Pop 后 len=0", s.data == nil || len(s.data) == 0)
-}`}
-  expectedOutput={`TestStack:
-  ✓ Pop 返回栈顶 3
-  ✓ Pop 接着返回 2
-  ✓ Pop 接着返回 1
-  ✓ 空栈 Pop 返回 ok=false
-  ✓ 空栈 Pop 后 len=0`}
-/>
+}
+```
 
 <Callout type="warn" title="测试约定速查">
 - `t.Errorf`：报告错误，继续跑
@@ -371,11 +333,8 @@ func main() {
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-16-exercise"
-  title="测试 IsPalindrome"
-  code={`// 任务：写表格驱动测试验证 IsPalindrome
+```go title="测试 IsPalindrome"
+// 任务：写表格驱动测试验证 IsPalindrome
 // 1. 至少 5 个 case：单字符、偶数回文、奇数回文、非回文、空串、中文
 // 2. 模拟 go test 的报告格式
 // 3. 不通过的 case 用 ✗ 标记
@@ -431,17 +390,7 @@ func main() {
     }
     fmt.Printf("\\n通过 %d/%d\\n", pass, len(tests))
 }
-`}
-  expectedOutput={`  ✓ 单字符
-  ✓ 偶数回文
-  ✓ 奇数回文
-  ✓ 非回文
-  ✓ 空串
-  ✓ 中文
-  ✓ 带空格
-
-通过 7/7`}
-/>
+```
 
 ## 小结
 

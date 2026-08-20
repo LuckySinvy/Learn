@@ -237,11 +237,8 @@ declare global {
 
 `namespace` 是 ESM 之前 TS 自带的模块化方案。今天在**应用代码里已不推荐**（应该用 ESM 模块），但在 `.d.ts` 里描述遗留的全局库时仍然常见，值得认识它的形态。
 
-<Playground
-  language="typescript"
-  id="ts-15-namespace"
-  title="namespace 的形态"
-  code={`namespace Geometry {
+```ts title="namespace 的形态"
+namespace Geometry {
   export const PI = 3.14159;
 
   export function circleArea(r: number): number {
@@ -273,8 +270,8 @@ namespace Geometry {
   }
 }
 console.log("矩形面积 =", Geometry.rectArea(3, 4));
-console.log("合并后仍能访问 PI:", Geometry.PI);`}
-/>
+console.log("合并后仍能访问 PI:", Geometry.PI);
+```
 
 <Callout type="exercise" title="练习">
 1. 在项目里建一个 `types/shims.d.ts`，给一个虚构的包 `tiny-cache` 补上 `get`／`set` 两个函数的类型声明，并在业务文件里 import 它验证补全生效。

@@ -79,11 +79,8 @@ const empty2 = first<string>([]);     // 显式指定为 string
 
 单个类型参数惯用 `T`（Type），多个时常见 `T` `U` `V`，或者更有语义的 `TKey` `TValue` `TItem`。名字长一点通常更好读，尤其是类型参数较多时。
 
-<Playground
-  language="typescript"
-  id="ts-08-generic-fn"
-  title="泛型函数与类型推断"
-  code={`function first<T>(arr: T[]): T | undefined {
+```ts title="泛型函数与类型推断"
+function first<T>(arr: T[]): T | undefined {
   return arr[0];
 }
 
@@ -120,9 +117,8 @@ function unique<T>(arr: T[]): T[] {
   return out;
 }
 console.log("去重数字 = " + unique([1, 2, 2, 3, 1]).join(","));
-console.log("去重字符 = " + unique(["a", "b", "a"]).join(","));`}
-  expectedOutput={`首个数字 = 10\n首个字符串大写 = X\npair = age:30\nswap 后第一项加一 = 31\n空数组的首项 = undefined\n去重数字 = 1,2,3\n去重字符 = a,b`}
-/>
+console.log("去重字符 = " + unique(["a", "b", "a"]).join(","));
+```
 
 ## 3. 泛型接口与泛型类型别名
 
@@ -161,11 +157,8 @@ const s = new Stack<string>();
 
 注意：**静态成员不能使用类的类型参数**，因为静态成员属于类本身，而类型参数是每次实例化时才确定的。
 
-<Playground
-  language="typescript"
-  id="ts-08-generic-class"
-  title="泛型接口与泛型类"
-  code={`interface Box<T> {
+```ts title="泛型接口与泛型类"
+interface Box<T> {
   value: T;
 }
 
@@ -212,9 +205,8 @@ type Pair<A, B> = { first: A; second: B };
 const maybeName: Nullable<string> = null;
 const kv: Pair<string, number> = { first: "score", second: 95 };
 console.log("maybeName = " + String(maybeName));
-console.log(kv.first + " = " + kv.second);`}
-  expectedOutput={`unbox 数字 = 42\nunbox 字符串 = hello\n栈顶 = c，大小 = 3\n弹出 = c\n弹出后大小 = 2\nmaybeName = null\nscore = 95`}
-/>
+console.log(kv.first + " = " + kv.second);
+```
 
 ## 5. 泛型在真实代码里长什么样
 
@@ -242,11 +234,8 @@ interface Array<T> {
 
 养成一个习惯：遇到不理解的类型提示，直接在编辑器里跳进声明文件看一眼签名。它们全是普通的 TypeScript 代码，没有魔法。
 
-<Playground
-  language="typescript"
-  id="ts-08-inference"
-  title="推断链：泛型如何在管道里传递类型"
-  code={`interface User {
+```ts title="推断链：泛型如何在管道里传递类型"
+interface User {
   id: number;
   name: string;
   score: number;
@@ -283,9 +272,8 @@ for (const [k, v] of grouped) {
 const cache = new Map<number, User>();
 for (const u of users) cache.set(u.id, u);
 const found = cache.get(2);
-console.log("id=2 的用户是 " + (found !== undefined ? found.name : "不存在"));`}
-  expectedOutput={`姓名: Ada, Alan, Grace\n最高分: 95\n优秀: 2 人\n良好: 1 人\nid=2 的用户是 Alan`}
-/>
+console.log("id=2 的用户是 " + (found !== undefined ? found.name : "不存在"));
+```
 
 <Callout type="warn" title="不要为了泛型而泛型">
 如果一个类型参数**只在一处出现**，它多半不该是泛型。比如 `function log<T>(x: T): void` 完全等价于 `function log(x: unknown): void`，加了 `T` 只是徒增阅读成本。泛型的价值在于**建立多个位置之间的类型关联**（参数与返回值、两个参数之间）。

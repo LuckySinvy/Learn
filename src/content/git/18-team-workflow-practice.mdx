@@ -17,11 +17,8 @@ description: 从 0 演练一次完整协作流程——建仓、feature 分支�
 
 ## 2. 完整协作流程（上）：建仓、开发、冲突、rebase、合并、发版
 
-<Playground
-  language="git"
-  title="一次完整协作：建仓到发版"
-  id="git-18-1"
-  code={`echo '########## 实战：一次完整协作流程 ##########'
+```bash title="一次完整协作：建仓到发版"
+echo '########## 实战：一次完整协作流程 ##########'
 export GIT_EDITOR=true
 rm -rf /tmp/origin.git
 git init -q --bare /tmp/origin.git
@@ -75,8 +72,8 @@ echo '最终 main 历史：'
 git log --oneline --graph | head -12
 echo '已发布标签：'
 git tag
-cd ..`}
-/>
+cd ..
+```
 
 这段脚本把全课的关键动作串成一条线：
 
@@ -94,11 +91,8 @@ Alice 在**自己还没推送**的 feature 分支上 rebase，把"和 Bob 的冲
 
 功能合进去之前，feature 分支上那个 `fix: 修正登录表单拼写` 是提交后又补的小修，单独留着很零碎。用**交互式 rebase** 把它并回前一个提交；再演示一次"手滑 `reset --hard` 丢提交"如何用 reflog 救回。
 
-<Playground
-  language="git"
-  title="整理提交与误操作自救"
-  id="git-18-2"
-  code={`echo '########## 实战（续）：整理提交 + 误操作自救 ##########'
+```bash title="整理提交与误操作自救"
+echo '########## 实战（续）：整理提交 + 误操作自救 ##########'
 export GIT_EDITOR=true
 git init -q -b main tidy && cd tidy
 echo 'init' > app.txt && git add . && git commit -q -m "chore: 初始化"
@@ -136,8 +130,8 @@ RECOVER=$(git reflog --format='%H %gs' | grep '额外完善' | head -1 | awk '{p
 git reset -q --hard $RECOVER
 echo "恢复后 HEAD = $(git rev-parse --short HEAD)"
 echo "profile.txt 末尾一行（应恢复为 extra）：$(tail -1 profile.txt)"
-cd ..`}
-/>
+cd ..
+```
 
 两段要点：
 

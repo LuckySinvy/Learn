@@ -14,11 +14,8 @@ description: CREATE VIEW 与可更新视图、ROW_NUMBER/RANK/LAG/LEAD、分组�
 
 视图是**存起来的 SELECT 语句**，用起来像表，但本身不存数据：
 
-<Playground
-  language="mysql"
-  id="mysql-11-1"
-  title="创建并查询视图"
-  code={`CREATE VIEW v_order_detail AS
+```sql title="创建并查询视图"
+CREATE VIEW v_order_detail AS
 SELECT o.id AS order_id, o.order_no, o.status,
        u.username, p.name AS product_name, c.name AS category_name,
        oi.quantity, oi.price, oi.quantity * oi.price AS item_amount
@@ -30,8 +27,8 @@ JOIN categories c   ON c.id = p.category_id;
 
 -- 之后五表 JOIN 一行搞定
 SELECT order_no, username, product_name, category_name, item_amount
-FROM v_order_detail WHERE username = 'alice';`}
-/>
+FROM v_order_detail WHERE username = 'alice';
+```
 
 视图的价值：
 
@@ -71,11 +68,8 @@ MySQL 视图默认用 MERGE 算法把视图定义合并进外层查询——查�
 - GROUP BY：多行**坍缩**成一行，明细丢失；
 - 窗口函数：**每行保留**，只是在行旁边「开个窗」看到同组其他行算出的值。
 
-<Playground
-  language="mysql"
-  id="mysql-11-2"
-  title="窗口函数：明细与汇总同框"
-  code={`SELECT order_no, user_id, total_amount,
+```sql title="窗口函数：明细与汇总同框"
+SELECT order_no, user_id, total_amount,
        SUM(total_amount) OVER (PARTITION BY user_id) AS user_total,
        ROUND(total_amount / SUM(total_amount) OVER (PARTITION BY user_id), 4) AS pct
 FROM orders
@@ -83,8 +77,8 @@ ORDER BY user_id, order_no;
 
 -- 对比 GROUP BY：明细被坍缩掉了
 SELECT user_id, SUM(total_amount) AS user_total
-FROM orders GROUP BY user_id;`}
-/>
+FROM orders GROUP BY user_id;
+```
 
 每行都在，旁边多了「本用户总额」和「本单占比」——GROUP BY 做不到这种「明细 + 汇总同框」。
 
@@ -102,11 +96,8 @@ FROM orders GROUP BY user_id;`}
 
 区别在**并列名次怎么处理**：
 
-<Playground
-  language="mysql"
-  id="mysql-11-3"
-  title="排名三兄弟"
-  code={`-- 无并列时三者完全一致
+```sql title="排名三兄弟"
+-- 无并列时三者完全一致
 SELECT name, price,
        ROW_NUMBER() OVER (ORDER BY price DESC) AS row_num,
        RANK()       OVER (ORDER BY price DESC) AS rnk,
@@ -118,8 +109,8 @@ SELECT name, category_id,
        ROW_NUMBER() OVER (ORDER BY category_id) AS row_num,
        RANK()       OVER (ORDER BY category_id) AS rnk,
        DENSE_RANK() OVER (ORDER BY category_id) AS dense_rnk
-FROM products;`}
-/>
+FROM products;
+```
 
 - ROW_NUMBER：严格递增 1,2,3，并列也硬排先后；
 - RANK：并列同名次，之后**跳号**（1,1,3）；
@@ -129,19 +120,16 @@ FROM products;`}
 
 「每个分类价格最高的 2 个商品」——GROUP BY 无解，窗口函数标准解法：
 
-<Playground
-  language="mysql"
-  id="mysql-11-4"
-  title="分组内 TOP N"
-  code={`WITH ranked AS (
+```sql title="分组内 TOP N"
+WITH ranked AS (
   SELECT p.id, p.category_id, p.name, p.price,
          ROW_NUMBER() OVER (PARTITION BY category_id ORDER BY price DESC) AS rn
   FROM products p
 )
 SELECT category_id, name, price
 FROM ranked
-WHERE rn <= 2;`}
-/>
+WHERE rn <= 2;
+```
 
 同样的模板还能解决：每个用户最新一笔订单、每台设备最后一次上报、每篇文章最热的 3 条评论……记住这个 `PARTITION BY ... ORDER BY ... WHERE rn <= N` 模式，一招吃遍天。
 

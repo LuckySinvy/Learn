@@ -19,11 +19,8 @@ if 条件 {
 
 特点：`if` 后面可以跟一个**简短语句**（在条件求值前执行）。
 
-<Playground
-  language="go"
-  id="go-03-if"
-  title="if 简短语句"
-  code={`package main
+```go title="if 简短语句"
+package main
 
 import "fmt"
 
@@ -35,9 +32,8 @@ func main() {
     } else {
         fmt.Println("零")
     }
-}`}
-  expectedOutput={`正数`}
-/>
+}
+```
 
 ## 2. `for` 循环（唯一循环）
 
@@ -48,11 +44,8 @@ for { ... }                        // 无限循环
 for k, v := range m { ... }        // 遍历
 ```
 
-<Playground
-  language="go"
-  id="go-03-for"
-  title="for 多种形式"
-  code={`package main
+```go title="for 多种形式"
+package main
 
 import "fmt"
 
@@ -79,19 +72,15 @@ func main() {
         }
     }
     fmt.Println("sum =", sum)
-}`}
-  expectedOutput={`0 1 2 \nn = 128\nsum = 5`}
-/>
+}
+```
 
 ## 3. `range` 遍历
 
 `range` 可以遍历字符串、数组、切片、map、channel。
 
-<Playground
-  language="go"
-  id="go-03-range"
-  title="range 遍历"
-  code={`package main
+```go title="range 遍历"
+package main
 
 import "fmt"
 
@@ -106,9 +95,8 @@ func main() {
         fmt.Printf("%d:%c ", i, v)
     }
     fmt.Println()
-}`}
-  expectedOutput={`[0]=10 [1]=20 [2]=30 \n0:G 1:o 2:语 3:言 `}
-/>
+}
+```
 
 <Callout type="tip" title="忽略索引或值">
 用 `_` 忽略：`for _, v := range nums` 或 `for i := range nums`。
@@ -118,11 +106,8 @@ func main() {
 
 Go 的 `switch` 自动 break，**不需要每个 case 末尾加 break**。
 
-<Playground
-  language="go"
-  id="go-03-switch"
-  title="switch"
-  code={`package main
+```go title="switch"
+package main
 
 import "fmt"
 
@@ -149,17 +134,13 @@ func main() {
     default:
         fmt.Println("D")
     }
-}`}
-  expectedOutput={`工作日\nB`}
-/>
+}
+```
 
 ## 5. 实战：九九乘法表
 
-<Playground
-  language="go"
-  id="go-03-99"
-  title="九九乘法表"
-  code={`package main
+```go title="九九乘法表"
+package main
 
 import "fmt"
 
@@ -170,16 +151,13 @@ func main() {
         }
         fmt.Println()
     }
-}`}
-/>
+}
+```
 
 ## 🎯 练习
 
-<Playground
-  language="go"
-  id="go-03-exercise"
-  title="FizzBuzz"
-  code={`// 任务：打印 1~15，按 FizzBuzz 规则：
+```go title="FizzBuzz"
+// 任务：打印 1~15，按 FizzBuzz 规则：
 // 3 的倍数输出 Fizz，5 的倍数输出 Buzz，3和5的公倍数输出 FizzBuzz
 // 期望：
 //   1 2 Fizz 4 Buzz Fizz 7 8 Fizz Buzz 11 Fizz 13 14 FizzBuzz
@@ -191,8 +169,7 @@ import "fmt"
 func main() {
     // 补全代码
 }
-`}
-/>
+```
 
 ## 小结
 

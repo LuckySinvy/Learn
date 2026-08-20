@@ -170,11 +170,8 @@ setState({
 
 下面这段纯 TypeScript 代码模拟了 React 的判断逻辑：先用「直接修改」的方式改 state，再用「不可变」的方式改，观察 `Object.is` 的结果差异，以及未改动分支的引用是否被保留。
 
-<Playground
-  language="typescript"
-  title="不可变更新与引用比较"
-  id="react-04-1"
-  code={`interface Todo {
+```ts title="不可变更新与引用比较"
+interface Todo {
   id: number;
   title: string;
   done: boolean;
@@ -237,9 +234,8 @@ for (let i = 0; i < s3.todos.length; i++) {
   console.log("todo#" + s3.todos[i].id + " 引用未变: " + same);
 }
 
-console.log("只有被修改的那一项换了新对象，其余可被 memo 跳过");`}
-  expectedOutput={`[直接修改] 数据变了吗: true\n[直接修改] React 会重渲染吗: false\n[不可变] 数据变了吗: true\n[不可变] React 会重渲染吗: true\n--- 逐项引用比较 ---\ntodo#1 引用未变: true\ntodo#2 引用未变: false\ntodo#3 引用未变: true\n只有被修改的那一项换了新对象，其余可被 memo 跳过`}
-/>
+console.log("只有被修改的那一项换了新对象，其余可被 memo 跳过");
+```
 
 第一组输出是最值得琢磨的：数据明明改对了，但 React 判断「没变」，界面纹丝不动。这就是「改了 state 但界面不更新」这类问题的根源。
 

@@ -15,11 +15,8 @@ description: 临时收起工作现场、stash 栈的完整操作，以及把单�
 
 经典场景：功能改到一半，测试同学喊线上炸了要你马上修。你的工作区是脏的，切分支会被 Git 拒绝，提交半成品又污染历史。
 
-<Playground
-  language="git"
-  title="stash 救急：收起半成品去修 bug，回来再恢复"
-  id="git-09-1"
-  code={`git init -q
+```bash title="stash 救急：收起半成品去修 bug，回来再恢复"
+git init -q
 echo 'stable' > app.py && echo 'cfg' > config.py
 git add . && git commit -q -m "init"
 
@@ -61,8 +58,8 @@ echo 'app.py（半成品回来了）:'
 cat app.py
 echo 'stash 列表:'
 git stash list
-echo '(pop 成功后条目自动删除)'`}
-/>
+echo '(pop 成功后条目自动删除)'
+```
 
 ### 1.1 stash 的基本命令
 
@@ -98,11 +95,8 @@ git config --global alias.save 'stash push -u -m'
 
 多次 stash 会堆叠，最新的永远是 `stash@{0}`：
 
-<Playground
-  language="git"
-  title="stash 栈、apply vs pop、stash branch"
-  id="git-09-2"
-  code={`git init -q
+```bash title="stash 栈、apply vs pop、stash branch"
+git init -q
 echo 'v1' > a.txt && git add . && git commit -q -m "init"
 
 echo '===== 连续攒 3 个 stash ====='
@@ -140,8 +134,8 @@ echo
 echo '===== clear：清空全部 ====='
 git stash clear
 git stash list
-echo '(空了)'`}
-/>
+echo '(空了)'
+```
 
 `pop` 和 `apply` 的取舍：
 
@@ -188,11 +182,8 @@ stash 是抽屉，不是仓库。它的问题是：
 
 和 rebase 一样，它产生的是**内容相同但哈希不同**的新提交。
 
-<Playground
-  language="git"
-  title="cherry-pick 单个提交与一段范围"
-  id="git-09-3"
-  code={`git init -q
+```bash title="cherry-pick 单个提交与一段范围"
+git init -q
 echo 'base' > app.py && git add . && git commit -q -m "chore: 初始化"
 BASE=$(git rev-parse HEAD)
 
@@ -228,8 +219,8 @@ FIRST=$(git log $BASE..dev --reverse --format=%H | head -1)
 LAST=$(git log dev --format=%H -1)
 git cherry-pick $FIRST^..$LAST > /dev/null
 git log --oneline
-echo '(dev 的三个提交整段复制到了 release)'`}
-/>
+echo '(dev 的三个提交整段复制到了 release)'
+```
 
 ### 2.1 常用参数
 

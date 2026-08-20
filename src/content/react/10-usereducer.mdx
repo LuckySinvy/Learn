@@ -107,11 +107,8 @@ function reducer(state: State, action: Action): State {
 
 `useReducer` 的内核，加上订阅机制，就是 Redux。下面这段纯 TypeScript 把两者一起实现了，跑一遍就能理解「状态容器」这四个字。
 
-<Playground
-  language="typescript"
-  title="迷你 reducer store：dispatch 与订阅"
-  id="react-10-1"
-  code={`interface Todo {
+```ts title="迷你 reducer store：dispatch 与订阅"
+interface Todo {
   id: number;
   title: string;
   done: boolean;
@@ -249,9 +246,8 @@ store.dispatch({ type: "clearedDone" });
 unsubscribe();
 console.log("已退订，再 dispatch 不会有 render 输出");
 store.dispatch({ type: "added", title: "不会显示" });
-console.log("最终 todo 数量: " + store.getState().todos.length);`}
-  expectedOutput={`dispatch added "写 reducer"\n  render -> filter=all | [ ] 写 reducer\ndispatch added "写测试"\n  render -> filter=all | [ ] 写 reducer , [ ] 写测试\ndispatch toggled #1\n  render -> filter=all | [x] 写 reducer , [ ] 写测试\ndispatch filterChanged active\n  render -> filter=active | [ ] 写测试\ndispatch clearedDone\n  render -> filter=active | [ ] 写测试\n已退订，再 dispatch 不会有 render 输出\n最终 todo 数量: 2`}
-/>
+console.log("最终 todo 数量: " + store.getState().todos.length);
+```
 
 这 60 行代码里包含了状态管理的全部核心概念：**纯函数 reducer、单一状态源、dispatch 派发、订阅通知、派生数据现算、引用相等即跳过**。第 15 章讲的所有状态库，无非是在这个骨架上加了选择性订阅、中间件和开发者工具。
 
