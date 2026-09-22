@@ -1,0 +1,88 @@
+---
+title: JSONB 与文档模型
+order: 15
+description: JSON 与 JSONB 的差异、常用操作符与函数、GIN 索引加速包含查询、关系与文档的混合建模
+---
+
+# JSONB 与文档模型
+
+`jsonb` 是 PG 区别于其他关系型数据库的王牌：你在同一张表里既能用严谨的关系列，又能用灵活的 JSON 文档。本章讲清怎么查、怎么索引、什么时候该用。
+
+## 1. JSON vs JSONB（再强调）
+
+- `json`：原样存文本，写入快，每次查询都重新解析，不能高效索引。
+- `jsonb`：写入时解析成二进制、键去重、键排序，**查询快、可建 GIN 索引**。几乎总是选 `jsonb`。
+
+## 2. 提取与判断（操作符）
+
+```sql title="jsonb 取值与包含"
+SELECT
+  attrs->'color'        AS color_jsonb,   -- 取 jsonb 片段
+  attrs->>'color'       AS color_text,    -- 取文本（最常用）
+  attrs->'size'         AS size_jsonb
+FROM core.products;
+
+SELECT * FROM core.products WHERE attrs ? 'color';         -- 顶层是否含该键
+SELECT * FROM core.products WHERE attrs @> '{"color":"red"}';  -- 包含该键值对
+SELECT * FROM core.products WHERE attrs->>'color' = 'red'; -- 文本比较（不走 GIN）
+```
+
+关键操作符：
+
+| 操作符 | 含义 |
+| --- | --- |
+| `->` | 取字段为 jsonb |
+| `->>` | 取字段为 text |
+| `@>` | 左侧包含右侧（文档包含） |
+| &lt;@ | 右侧包含左侧 |
+| `?` | 顶层是否含某键 |
+| `||` | 合并/覆盖（PG14+ 也可用 `\|\|`） |
+
+## 3. 修改 jsonb
+
+```sql title="更新 jsonb 字段"
+UPDATE core.products
+SET attrs = attrs || '{"discount":true}'::jsonb     -- 加/覆盖键
+WHERE id = 1;
+
+UPDATE core.products
+SET attrs = jsonb_set(attrs, '{color}', '"blue"')   -- 精确改某键
+WHERE id = 1;
+
+UPDATE core.products
+SET attrs = attrs - 'discount'                       -- 删键
+WHERE id = 1;
+```
+
+## 4. GIN 索引：让包含查询飞起来
+
+`WHERE attrs @> ...` 这类包含查询，普通 b-tree 帮不上忙，要建 **GIN** 索引：
+
+```sql title="jsonb 的 GIN 索引"
+CREATE INDEX idx_products_attrs ON core.products USING gin (attrs);
+```
+
+建好后，`@>`、`?`、`@?`（路径存在）等查询都能走索引。`jsonb_path_ops` 是一种更紧凑的 GIN 配置，只支持 `@>`，索引更小更快：
+
+```sql title="更精简的 GIN 配置"
+CREATE INDEX idx_products_attrs ON core.products USING gin (attrs jsonb_path_ops);
+```
+
+## 5. 混合建模：什么时候用 jsonb
+
+- **适合**：稀疏/变化多的属性（不同商品类型属性不同）、日志与事件 payload、配置项、非结构化但需查询的字段。
+- **不适合**：需要强约束、频繁聚合/连表、必须保证类型一致的字段——这些用**关系列**。
+
+<Callout type="tip" title="jsonb 里也能有「虚拟列」" >
+对 jsonb 里经常要查的字段，可以用**生成列 + 表达式索引**把它「投影」成关系列：`ALTER TABLE ... ADD COLUMN color text GENERATED ALWAYS AS (attrs->>'color') STORED;`，再建普通索引，兼具灵活与性能。
+</Callout>
+
+<Callout type="exercise" title="动手">
+给 `core.products` 的 `attrs` 建一个 GIN 索引（用 `jsonb_path_ops`），然后查询所有 `attrs` 包含 `{"color":"red"}` 的商品，并用 `EXPLAIN` 确认走了索引（下一章才正式讲 EXPLAIN，这里先感受一下）。同时用 `->>` 把 color 取成文本做等值比较。
+<Answer>
+```sql
+CREATE INDEX idx_products_attrs ON core.products USING gin (attrs jsonb_path_ops);
+SELECT id, name, attrs->>'color' FROM core.products WHERE attrs @> '{"color":"red"}';
+```
+</Answer>
+</Callout>

@@ -19,7 +19,7 @@ export default function HomePage() {
           编程 · 数据 · AI 工程 · 云原生 交互式学习
         </h1>
         <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
-          从零掌握 Python、Go、Java、Rust、TypeScript、React、Vue，以及 MySQL、Redis、MongoDB、ClickHouse、Kafka、Linux、Git、HTTP、GitHub Actions、Grafana、RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
+          从零掌握 Python、Go、Java、Rust、TypeScript、React、Vue，以及 MySQL、PostgreSQL、Redis、MongoDB、ClickHouse、Kafka、Linux、Git、HTTP、GitHub Actions、Grafana、RAG、Langchain.js、Dify 与 Kubernetes。每章循序渐进，配有讲解、示例与实战。
         </p>
       </section>
 
@@ -140,6 +140,14 @@ export default function HomePage() {
           icon={<Database className="w-8 h-8" />}
           accent="from-teal-400 to-sky-500"
           chapters={count('mysql')}
+        />
+        <LanguageCard
+          href="/postgresql"
+          title="PostgreSQL"
+          description="功能最强大的开源关系型数据库：JSONB、窗口函数、MVCC、逻辑/流复制与扩展生态。"
+          icon={<Database className="w-8 h-8" />}
+          accent="from-sky-400 to-indigo-500"
+          chapters={count('postgresql')}
         />
         <LanguageCard
           href="/redis"

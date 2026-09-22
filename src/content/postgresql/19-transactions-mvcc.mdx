@@ -1,0 +1,94 @@
+---
+title: 事务与 MVCC
+order: 19
+description: ACID、BEGIN/COMMIT/ROLLBACK、SAVEPOINT、隔离级别（PG 默认 RR）、MVCC 多版本、VACUUM 与膨胀
+---
+
+# 事务与 MVCC
+
+事务保证「一组操作要么全成、要么全败」。PostgreSQL 用 **MVCC（多版本并发控制）** 实现高并发——读不阻塞写、写不阻塞读。理解 MVCC 才能搞懂「为什么表会膨胀」「长事务有什么危害」。
+
+## 1. ACID 与基本用法
+
+```sql title="事务基本语法"
+BEGIN;
+UPDATE core.products SET stock = stock - 1 WHERE id = 1;
+UPDATE core.orders SET total_amount = total_amount + 7999 WHERE id = 10;
+COMMIT;     -- 全部成功才提交
+-- 出错时 ROLLBACK; 回滚
+```
+
+`SAVEPOINT` 可以设置「存档点」，局部回滚而不影响整个事务：
+
+```sql title="SAVEPOINT 局部回滚"
+BEGIN;
+INSERT INTO core.users(username,email) VALUES ('x','x@e.com');
+SAVEPOINT sp1;
+INSERT INTO core.users(username,email) VALUES ('x','x@e.com');  -- 违反 UNIQUE 会失败
+ROLLBACK TO sp1;      -- 只回滚到 sp1，前面的插入保留
+COMMIT;
+```
+
+## 2. 隔离级别
+
+PG 支持 `Read Uncommitted`（实际等同 Read Committed）、`Read Committed`（**默认**）、`Repeatable Read`、`Serializable`。
+
+- **Read Committed**：每条语句看到的是它开始时的快照；同一事务内不同语句可能看到不同数据。
+- **Repeatable Read**：整个事务看同一快照，避免不可重复读；但可能出现序列化异常（PG 会报错让你重试）。
+- **Serializable**：最高隔离，自动检测冲突（冲突时抛 `serialization_failure`，应用重试）。
+
+```sql title="设置隔离级别"
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+-- ... 
+COMMIT;
+```
+
+<Callout type="tip" title="PG 默认是 RR，不是 RC" >
+很多数据库默认 Read Committed，但 **PostgreSQL 的默认是 Read Committed**——注意别记混。若需要「可重复读」语义请显式声明。
+</Callout>
+
+## 3. MVCC 原理：多版本
+
+PG 更新一行时**不原地覆盖**：插入新版本、旧版本保留（直到无人需要）。每行有 `xmin`/`xmax`（创建/失效的事务号）。读事务只看到「对自己快照可见的版本」——所以：
+
+- 读不阻塞写（读的是旧版本），写不阻塞读（读不碰新版本）。
+- 但这带来代价：**旧版本会累积，表会膨胀（bloat）**。
+
+## 4. VACUUM 与膨胀
+
+死元组（旧版本、已删除行）需要清理，否则表越来越大、查询越来越慢：
+
+- `VACUUM`：回收空间供复用（不收缩文件大小），autovacuum 会自动跑。
+- `VACUUM FULL`：真正收缩文件（但会锁表、重写整表，慎用于大表）。
+- `autovacuum`：默认开启的后台进程，按阈值自动清理。
+
+```sql title="查看与手动 vacuum"
+SELECT relname, n_dead_tup FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;
+VACUUM (ANALYZE, VERBOSE) core.orders;
+```
+
+## 5. 长事务的危害
+
+一个长时间未提交的事务会**钉住它开始时的快照**，导致它之后产生的所有旧版本都无法被 VACUUM 回收——表持续膨胀，甚至撑爆磁盘。
+
+<Callout type="warn" title="避免长事务" >
+- 不要在事务里做耗时的人肉操作或外部调用（如等接口、等人工确认）。
+- 用 `SELECT * FROM pg_stat_activity WHERE state <> 'idle' ORDER BY xact_start` 排查长事务。
+- 应用端设置 `statement_timeout` / `idle_in_transaction_session_timeout` 兜底。
+</Callout>
+
+<Callout type="exercise" title="动手" >
+开两个 psql 会话：会话 A 执行 `BEGIN; UPDATE core.products SET price=1 WHERE id=1;`（不提交）。会话 B 查询该行，确认 B 看到的是旧值（MVCC）。然后在 A 里 `COMMIT;`，再回到 B（新事务）确认看到新值。体会「读不阻塞写、写不阻塞读」。
+<Answer>
+```sql
+-- 会话 A
+BEGIN; UPDATE core.products SET price=1 WHERE id=1;
+-- 会话 B（另一连接）
+SELECT price FROM core.products WHERE id=1;   -- 看到旧值
+-- 回到 A
+COMMIT;
+-- 会话 B 新开事务
+BEGIN; SELECT price FROM core.products WHERE id=1; COMMIT;  -- 看到新值 1
+```
+</Answer>
+</Callout>

@@ -1,0 +1,77 @@
+---
+title: PostgreSQL 概览
+order: 1
+description: PostgreSQL 的定位、与 MySQL 的核心差异、进程架构、版本选择，以及 AI 时代为何还要系统学
+---
+
+# PostgreSQL 概览
+
+<Callout type="tip" title="🤖 AI 时代，还要学 PostgreSQL 吗？学到什么程度？">
+必要且要系统学。今天 AI 能替你写大部分 SQL 和建表语句，但 MVCC 多版本、索引选择（B-tree 还是 GIN）、执行计划解读、锁与长事务这些原理替代不了——它生成的 SQL 慢或出错时，你得能自己看出来并改对。语法和样板不必死记，用时让 AI 生成并人工核对即可；但「数据模型、索引与性能原理」必须学到「能审 AI 的 SQL」的程度，否则系统一慢一错你就没了方向。
+</Callout>
+
+你可能已经会用 PostgreSQL（以下简称 PG）做增删改查了，但面试被问「一条 SELECT 在 PG 内部怎么执行」「为什么我的 UPDATE 把表撑大了好几倍」「`TIMESTAMPTZ` 存的是什么时候」，只会 CRUD 就不够用了。本课程带你从「会用」走到「懂原理、能建模、会调优」。
+
+## 1. PostgreSQL 是什么，处在什么位置
+
+PostgreSQL 是一个**对象关系型**（ORDBMS）开源数据库，强调标准合规、扩展性和数据正确性。它和 MySQL 同属关系型阵营，但设计哲学不同：
+
+| 维度 | PostgreSQL | MySQL |
+| --- | --- | --- |
+| 默认存储 | 堆表 + MVCC（行多版本） | InnoDB（聚簇索引 + undo 多版本） |
+| 扩展性 | 丰富：自定义类型、运算符、索引方法（GiST/GIN/BRIN）、FDW、逻辑复制 | 相对受限 |
+| 特色能力 | JSONB、窗口函数（很早）、全文检索、范围类型、递归 CTE | 生态成熟、读写并发优化好 |
+| 并发控制 | MVCC + 快照，读不阻塞写、写不阻塞读 | MVCC + 间隙锁等 |
+| 默认隔离级别 | **Repeatable Read**（可重复读） | Repeatable Read（但实现近似） |
+
+一句话：**MySQL 把「简单好用、跑得快」做到极致；PostgreSQL 把「正确、标准、可扩展」做到极致**。两者都值得学，PG 在复杂查询、分析型负载、JSON 混合建模上更顺手。
+
+## 2. 进程架构：一个连接一个进程
+
+PG 采用**多进程**模型（MySQL 是多线程）：
+
+- `postmaster`：主进程，负责监听端口、fork 后端进程、管理后台进程（如 autovacuum launcher）。
+- `backend`：每个客户端连接由一个独立的 backend 进程服务（fork 而来），进程间通过**共享内存**通信。
+- **共享缓冲区（shared buffers）**：数据页的缓存区，读数据时先看这里有没有。
+- **WAL（Write-Ahead Log）**：先写日志再改数据，崩溃恢复和复制都依赖它——这是「预写日志」思想，和 MySQL 的 redo log 异曲同工。
+
+这种模型的代价是连接多了进程多、内存占用高，所以生产上几乎一定会前置**连接池**（如 pgbouncer）。
+
+## 3. 版本选择与升级
+
+PG 每年一个大版本（如 15、16、17），社区只维护最近 5 个左右的大版本。建议：
+
+- 新项目直接上**最新稳定版**（写作时主流为 16/17），默认就关掉了容易踩坑的旧行为。
+- 关注大版本带来的关键改进：`VACUUM` 并行、逻辑复制增强、`MERGE` 语句、ICU 排序、增量备份等。
+- 小版本（如 16.4）只修 bug 和安全问题，跟随发行版或官方包及时打。
+
+## 4. 本课程路线
+
+我们会沿着「**会用 → 懂原理 → 能建模 → 会调优**」展开，全程用一个 `shop` 电商示例库串联：
+
+1. 先装好环境、连上数据库（第 2–3 章）。
+2. 夯实类型与建模（第 4–6 章）：类型、DDL 约束、DML（含 PG 特色的 `RETURNING`、`ON CONFLICT`）。
+3. 把查询能力拉满（第 7–11 章）：基础查询、聚合、连接、子查询与递归 CTE、窗口函数。
+4. 进阶对象与扩展（第 12–16 章）：视图/物化视图、PL/pgSQL 函数与过程、触发器、JSONB、全文检索。
+5. 性能与运维（第 17–21 章）：索引、执行计划、事务与 MVCC、复制备份、性能调优。
+6. 最后一章用一个综合实战把前面串起来（第 22 章）。
+
+<Callout type="info" title="示例库约定">
+后续章节统一使用 `shop` 库，核心表：`users`（用户）、`products`（商品，含 `attrs jsonb`）、`orders`（订单）、`order_items`（订单项）、`posts`（用于 JSONB 与全文检索示例）。表结构会在用到时逐步给出，你也可以在本地用 Docker 一键起一个 PG 跟着敲。
+</Callout>
+
+<Callout type="exercise" title="动手">
+打开你的 PostgreSQL（本地或 Docker），创建一个名为 `shop` 的数据库，并用 `\l`、`\dn` 看看里面已有哪些数据库和模式（schema）。下一步我们就讲怎么装和连。
+<Answer>
+```bash
+# 连上默认的 postgres 库后创建 shop
+createdb shop
+# 或进入 psql 后执行
+psql -U postgres -h localhost
+CREATE DATABASE shop;
+\c shop
+\dn          -- 列出 schema，默认会有 public
+\l           -- 列出数据库
+```
+</Answer>
+</Callout>

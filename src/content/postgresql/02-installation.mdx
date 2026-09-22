@@ -1,0 +1,139 @@
+---
+title: 安装与连接
+order: 2
+description: 各平台安装 PostgreSQL、初始化与启动、用 psql 连接、连接串、pgAdmin，以及 pg_hba.conf/postgresql.conf 基础
+---
+
+# 安装与连接
+
+先把环境跑起来。无论你用 macOS、Linux 还是 Docker，目标都是：起一个 PostgreSQL 服务，并用客户端连上去。本章以 PG 16 为例（其他大版本命令基本一致）。
+
+## 1. 各平台安装
+
+### 1.1 macOS（Homebrew）
+
+```bash title="brew 安装 PG"
+brew install postgresql@16
+brew services start postgresql@16   # 开机自启并立即启动
+# 仅本次启动（不开机自启）：
+# pg_ctl -D /opt/homebrew/var/postgresql@16 start
+```
+
+Homebrew 装好后，当前用户就是超级用户，不需要密码即可用 `psql` 本地登录。
+
+### 1.2 Linux（以 Ubuntu/Debian 为例）
+
+```bash title="apt 安装 PG"
+sudo apt update
+sudo apt install -y postgresql postgresql-contrib
+sudo systemctl enable --now postgresql
+```
+
+Debian 系会创建一个名为 `postgres` 的系统用户（操作系统用户），PG 的超级用户也叫 `postgres`。用 `sudo -u postgres psql` 切换过去连数据库。
+
+### 1.3 Docker（最干净、推荐练手）
+
+```bash title="docker 起一个 PG 容器"
+docker run -d --name pg \
+  -e POSTGRES_PASSWORD=pgpass \
+  -e POSTGRES_DB=shop \
+  -p 5432:5432 \
+  postgres:16
+# 进入容器内 psql
+docker exec -it pg psql -U postgres -d shop
+```
+
+挂载数据卷 `-v $PWD/pgdata:/var/lib/postgresql/data` 可把数据持久化到宿主机，避免容器删了数据没了。
+
+## 2. 初始化数据目录（当你手动安装二进制时）
+
+如果你下载官方二进制或源码编译，需要先 `initdb` 初始化数据目录：
+
+```bash title="初始化数据目录"
+initdb -D /path/to/data -U postgres --auth=trust
+pg_ctl -D /path/to/data -l logfile start
+```
+
+运维托管（apt/brew/docker）通常会自动帮你 initdb，一般不用手动做。
+
+## 3. 用 psql 连接
+
+`psql` 是官方命令行客户端，也是你最常用的工具。
+
+```bash title="psql 连接参数"
+psql -h localhost -p 5432 -U postgres -d shop
+```
+
+常用连接参数：
+
+| 参数 | 含义 |
+| --- | --- |
+| `-h` | 主机（本地可省略，走 Unix socket） |
+| `-p` | 端口，默认 5432 |
+| `-U` | 用户名 |
+| `-d` | 数据库名 |
+| `-c "SQL"` | 直接执行一条 SQL 并退出 |
+
+连接成功后常用的反斜杠元命令（注意不是 SQL，结尾不用分号）：
+
+```sql title="psql 元命令"
+\dt            -- 列出当前 schema 下的表
+\d users       -- 查看 users 表结构
+\dn            -- 列出 schema
+\l             -- 列出数据库
+\conninfo      -- 显示当前连接信息
+\q             -- 退出
+```
+
+## 4. 连接串（connection string）
+
+应用代码里通常用连接串而不是散装参数：
+
+```text title="连接串格式"
+postgres://user:password@host:5432/shop?sslmode=disable
+```
+
+参数可以放 URL 查询串，例如 `?connect_timeout=5&search_path=shop`。很多驱动（如 Node 的 `pg`、Python 的 `psycopg`）都认这种格式。
+
+## 5. 图形化工具 pgAdmin
+
+不想纯命令行时，`pgAdmin 4` 是官方 Web 管理界面：能看表、跑查询、导出数据。Docker 一键起：
+
+```bash title="docker 起 pgAdmin"
+docker run -d --name pgadmin \
+  -e PGADMIN_DEFAULT_EMAIL=admin@local \
+  -e PGADMIN_DEFAULT_PASSWORD=admin \
+  -p 5050:80 \
+  dpage/pgadmin4
+```
+
+浏览器打开 `http://localhost:5050`，把上面的 PG 连接（`host.docker.internal` 或容器网络地址）加进去即可。
+
+## 6. 两个关键配置文件
+
+PG 的「总开关」都在数据目录下的两个文件，调优时会反复用到：
+
+- `postgresql.conf`：服务参数，如 `shared_buffers`、`max_connections`、`work_mem`、`listen_addresses`。改完 `SELECT pg_reload_conf();` 或 `pg_ctl reload` 热加载（部分参数需重启）。
+- `pg_hba.conf`：客户端认证规则（host-based authentication），决定「谁、从哪、用什么方式」能连。例如允许本地密码登录：
+
+```text title="pg_hba.conf 一行示例"
+# TYPE  DATABASE  USER  ADDRESS        METHOD
+host    all       all    127.0.0.1/32   scram-sha-256
+local   all       all                    trust
+```
+
+<Callout type="warn" title="改完记得 reload/restart">
+改 `postgresql.conf` 后执行 `SELECT pg_reload_conf();` 热加载大部分参数；改 `pg_hba.conf` 后同样 `pg_reload_conf()` 即可生效，无需重启。需要重启的参数（如 `shared_buffers`）则需 `pg_ctl restart` 或 `systemctl restart postgresql`。
+</Callout>
+
+<Callout type="exercise" title="动手">
+用你顺手的任意方式起一个 PG，连进去执行 `SELECT version();` 和 `SHOW shared_buffers;`，确认连接正常并能读到参数。
+<Answer>
+```sql
+SELECT version();
+SHOW shared_buffers;
+SHOW max_connections;
+```
+能返回版本号和参数值，说明安装、连接、配置读取都正常了。
+</Answer>
+</Callout>

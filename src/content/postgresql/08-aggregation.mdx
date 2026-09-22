@@ -1,0 +1,100 @@
+---
+title: 聚合与分组
+order: 8
+description: COUNT/SUM/AVG/MIN/MAX、GROUP BY、HAVING、FILTER 子句、GROUPING SETS/CUBE/ROLLUP
+---
+
+# 聚合与分组
+
+聚合把多行「折叠」成一个汇总值。它和 `GROUP BY` 配合做报表，是数据分析的基本功。PG 在标准聚合之外还提供了很实用的 `FILTER` 和高级分组（`GROUPING SETS` 等）。
+
+## 1. 基础聚合函数
+
+```sql title="常用聚合"
+SELECT
+  COUNT(*)        AS 总行数,
+  COUNT(phone)    AS 有手机数,   -- 忽略 NULL
+  COUNT(DISTINCT category) AS 分类数,
+  AVG(price)      AS 均价,
+  SUM(stock)      AS 总库存,
+  MIN(price)      AS 最低价,
+  MAX(price)      AS 最高价
+FROM core.products;
+```
+
+<Callout type="tip" title="COUNT(*) 与 COUNT(col)">
+`COUNT(*)` 数行（含全 NULL 行）；`COUNT(col)` 只数该列非 NULL 的行。统计总行数用 `COUNT(*)`。
+</Callout>
+
+## 2. GROUP BY：按组聚合
+
+```sql title="按分类聚合"
+SELECT category, COUNT(*) AS cnt, AVG(price) AS avg_price
+FROM core.products
+GROUP BY category
+ORDER BY cnt DESC;
+```
+
+`GROUP BY` 后，`SELECT` 里的非聚合列必须出现在 `GROUP BY` 中（否则 PG 报错，这比 MySQL 宽松模式下「乱分组」更安全）。
+
+## 3. HAVING：对分组结果再过滤
+
+`WHERE` 在聚合**前**过滤行；`HAVING` 在聚合**后**过滤组：
+
+```sql title="HAVING 过滤组"
+SELECT category, COUNT(*) AS cnt
+FROM core.products
+GROUP BY category
+HAVING COUNT(*) > 1;          -- 只保留商品数大于 1 的分类
+```
+
+## 4. FILTER：同一行算多个条件聚合（PG 很香）
+
+传统写法要写多个子查询或 `CASE WHEN`；PG 的 `FILTER (WHERE ...)` 让一个 `SELECT` 同时算多口径：
+
+```sql title="FILTER 子句"
+SELECT
+  COUNT(*)                                   AS 总订单数,
+  COUNT(*) FILTER (WHERE status = 'paid')     AS 已支付,
+  COUNT(*) FILTER (WHERE status = 'cancelled')AS 已取消
+FROM core.orders;
+```
+
+比 `SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END)` 可读性高很多。
+
+## 5. 高级分组：GROUPING SETS / CUBE / ROLLUP
+
+需要「多个不同维度汇总 + 小计/总计」时，与其写多个 `GROUP BY` 再 `UNION`，用这些一次搞定：
+
+```sql title="GROUPING SETS 示例"
+SELECT category, status, COUNT(*) AS cnt
+FROM core.products p
+JOIN core.orders o ON o.user_id = p.id   -- 仅示意，实际可换表
+GROUP BY GROUPING SETS ((category), (status), ());
+```
+
+- `ROLLUP(a,b)`：生成 `(a,b)`、`(a)`、`()` 三层小计/总计，适合层级报表。
+- `CUBE(a,b)`：生成所有组合的小计/总计。
+- `GROUPING SETS(...)`：精确指定要哪些分组集合。
+
+<Callout type="info" title="怎么判断该不该分组">
+一句话：你想得到「每 X 的汇总」就是 `GROUP BY X`；想对汇总结果再筛就是 `HAVING`；想在同一查询里出多个不同维度的汇总就上 `GROUPING SETS/CUBE/ROLLUP`。
+</Callout>
+
+<Callout type="exercise" title="动手">
+统计每个 `category` 的商品数量与平均价格，只保留平均价格大于 1000 的分类，并按商品数量降序。再用 `FILTER` 在同一行里顺带算出「phone 分类的商品数」和「laptop 分类的商品数」。
+<Answer>
+```sql
+SELECT
+  category,
+  COUNT(*)                                              AS cnt,
+  AVG(price)                                            AS avg_price,
+  COUNT(*) FILTER (WHERE category='phone')  AS phone_cnt,
+  COUNT(*) FILTER (WHERE category='laptop') AS laptop_cnt
+FROM core.products
+GROUP BY category
+HAVING AVG(price) > 1000
+ORDER BY cnt DESC;
+```
+</Answer>
+</Callout>

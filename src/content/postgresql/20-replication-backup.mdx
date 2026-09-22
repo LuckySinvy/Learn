@@ -1,0 +1,85 @@
+---
+title: 复制与备份
+order: 20
+description: 流复制（主从）、物理 vs 逻辑复制、pg_dump、pg_basebackup/PITR、高可用思路
+---
+
+# 复制与备份
+
+数据只有一份是危险的。复制提供「读扩展 + 容灾」，备份提供「误操作/故障后的回滚点」。PG 在这两块都有成熟方案。
+
+## 1. 流复制（物理复制）：主从架构
+
+流复制基于 WAL 把主库（primary）的变更**流式**发给从库（replica/standby），从库重放 WAL：
+
+- 从库默认**只读**，可承接读流量（读写分离）。
+- 异步流复制有「数据延迟」；同步复制保证不丢但影响主库写性能。
+- 故障时可把从库提升（promote）为主库，实现故障切换。
+
+配置要点（主库）：
+```text title="postgresql.conf（主库）"
+wal_level = replica
+max_wal_senders = 10
+```
+
+从库通过 `pg_basebackup` 先做基础备份，再以 `standby.signal` + `primary_conninfo` 启动，自动追 WAL。
+
+## 2. 物理复制 vs 逻辑复制
+
+| | 物理复制（流复制） | 逻辑复制 |
+| --- | --- | --- |
+| 复制单位 | 整个实例/WAL | 按表/订阅，逻辑变更 |
+| 版本要求 | 主从大版本须一致 | 可跨大版本、PG 与其他系统 |
+| 典型用途 | 容灾、读写分离 | 部分表同步、异构同步、滚动升级 |
+
+逻辑复制发布/订阅：
+```sql title="逻辑复制 pub/sub"
+-- 主库
+CREATE PUBLICATION pub1 FOR TABLE core.orders;
+-- 从库
+CREATE SUBSCRIPTION sub1 CONNECTION 'host=primary dbname=shop' PUBLICATION pub1;
+```
+
+## 3. 备份：pg_dump（逻辑）与 pg_basebackup（物理）
+
+**逻辑备份**（导出 SQL/数据，灵活、可跨版本恢复，但慢、锁表风险）：
+```bash title="pg_dump 导出"
+pg_dump -h localhost -U postgres -d shop -Fc -f shop.dump   # 自定义格式
+pg_restore -d shop_new shop.dump                            # 恢复
+```
+
+**物理备份**（整库文件级，快、一致，用于 PITR）：
+```bash title="pg_basebackup 基础备份"
+pg_basebackup -h primary -D /backup/data -Fp -Xs -P
+```
+
+## 4. PITR：时间点恢复
+
+有了「基础备份 + 持续的 WAL 归档」，可以把库恢复到任意时间点（比如误删表之前的瞬间）：
+
+1. 开启 WAL 归档（`archive_command` 把 WAL 拷到安全位置）。
+2. 定期 `pg_basebackup`。
+3. 恢复时：还原基础备份 → 配置 `recovery_target_time` → PG 自动重放 WAL 到目标时间。
+
+<Callout type="tip" title="备份策略组合" >
+- 日常/小库：`pg_dump` 定时全备（简单）。
+- 大库/关键库：基础备份 + WAL 归档 + PITR（能恢复到任意时刻）。
+- 无论哪种，**定期演练恢复**比备份本身更重要——没人想在被勒索或误删时才发现备份是坏的。
+</Callout>
+
+## 5. 高可用思路
+
+- **流复制 + 自动 failover**：用 Patroni / repmgr 管理主从与自动切换。
+- **连接串指向 VIP/代理**：应用不感知主从切换。
+- 不要自建轮子，优先用成熟方案。
+
+<Callout type="exercise" title="动手（概念演练）" >
+在本机用 `pg_dump` 把 `shop` 库导出成自定义格式，再新建一个 `shop_restore` 库并用 `pg_restore` 还原。体会逻辑备份恢复流程（无需真正配置主从）。
+<Answer>
+```bash
+pg_dump -U postgres -d shop -Fc -f /tmp/shop.dump
+createdb -U postgres shop_restore
+pg_restore -U postgres -d shop_restore /tmp/shop.dump
+```
+</Answer>
+</Callout>

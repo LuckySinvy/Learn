@@ -1,0 +1,81 @@
+---
+title: 执行计划与调优
+order: 18
+description: EXPLAIN/ANALYZE、Seq Scan/Index Scan/Bitmap、连接策略、统计信息与慢查询定位
+---
+
+# 执行计划与调优
+
+调优的第一步不是「加索引」，而是**看懂查询是怎么执行的**。`EXPLAIN` 让你看到规划器选了什么路径、预估了多少行、花了多少代价。
+
+## 1. EXPLAIN 基础
+
+```sql title="查看执行计划"
+EXPLAIN SELECT * FROM core.orders WHERE user_id = 1;
+```
+
+不加 `ANALYZE` 时只显示**规划器的预估**（不真正执行）。想知道真实耗时和真实行数，加 `ANALYZE`：
+
+```sql title="真正执行并统计"
+EXPLAIN ANALYZE SELECT * FROM core.orders WHERE user_id = 1;
+```
+
+建议常用组合：`EXPLAIN (ANALYZE, BUFFERS)` 还能看到缓冲命中/磁盘读，定位是不是在「读磁盘」。
+
+## 2. 常见节点类型
+
+| 节点 | 含义 |
+| --- | --- |
+| `Seq Scan` | 全表顺序扫描，小表无所谓，大表是性能杀手 |
+| `Index Scan` | 走索引取行（随机 IO 多） |
+| `Index Only Scan` | 索引里就有答案，不回表，最快 |
+| `Bitmap Heap Scan` | 先用索引位图定位，再批量回表，介于两者之间 |
+| `Nested Loop` | 小表驱动大表，适合一方很小 |
+| `Hash Join` | 一方建哈希表，适合无索引的等连接 |
+| `Merge Join` | 两边有序时归并，适合大表等连接 |
+
+## 3. 识别问题
+
+- 大表上出现 `Seq Scan` 且 `rows` 预估偏差大 → 缺索引或统计信息过期。
+- `actual rows` 远多于 `estimated rows` → 统计信息不准，跑 `ANALYZE 表名`。
+- 节点 `cost` / `actual time` 异常高 → 该节点是瓶颈，针对性优化。
+
+## 4. 让规划器更聪明
+
+规划器靠**统计信息**估算行数与代价。信息过期会导致它选错路径：
+
+```sql title="更新统计信息与调整开关"
+ANALYZE core.orders;                  -- 立即收集统计信息
+SET work_mem = '64MB';                -- 给排序/哈希更多内存，减少落盘
+```
+
+几个关键参数（改在 `postgresql.conf`，或会话级 `SET`）：
+
+- `work_mem`：每个排序/哈希操作的内存，调大可避免落临时文件（但会乘并发数，别太大）。
+- `random_page_cost`：随机 IO 代价，SSD 上可下调（如 1.1），让规划器更愿用 Index Scan。
+- `effective_cache_size`：告诉规划器「系统有多少内存可用于缓存」，设大些会更倾向索引。
+- `shared_buffers`：共享缓冲，一般设为物理内存 25%。
+
+## 5. 调优标准流程
+
+1. 用 `EXPLAIN ANALYZE` 找到最慢的节点。
+2. 检查是否缺索引（加 b-tree/组合/部分/表达式索引）。
+3. 检查统计信息是否准（`ANALYZE`）。
+4. 重写 SQL（避免 `SELECT *`、把能下推的条件提前过滤、用 `JOIN` 而非子查询嵌套）。
+5. 调参数（缓存、work_mem、代价系数）。
+
+<Callout type="warn" title="EXPLAIN 不执行，ANALYZE 才执行" >
+`EXPLAIN` 只规划不执行，安全；`EXPLAIN ANALYZE` 会**真正跑**，对写入查询（很少在 EXPLAIN 里写）要小心。线上排查慢查询，先用 `EXPLAIN`，确认无害再上 `ANALYZE`。
+</Callout>
+
+<Callout type="exercise" title="动手">
+对 `SELECT * FROM core.orders WHERE user_id = 1 AND status='paid'` 跑 `EXPLAIN ANALYZE`，观察用的是 Seq Scan 还是 Index Scan。然后建第 17 章讲的组合索引 `(user_id, status)` 再 EXPLAIN 一次，对比计划变化。
+<Answer>
+```sql
+EXPLAIN ANALYZE SELECT * FROM core.orders WHERE user_id = 1 AND status='paid';
+CREATE INDEX IF NOT EXISTS idx_orders_user_status ON core.orders (user_id, status);
+EXPLAIN ANALYZE SELECT * FROM core.orders WHERE user_id = 1 AND status='paid';
+-- 第二次应看到 Index Scan using idx_orders_user_status，cost 明显下降
+```
+</Answer>
+</Callout>

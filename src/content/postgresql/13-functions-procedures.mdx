@@ -1,0 +1,134 @@
+---
+title: 函数与存储过程
+order: 13
+description: PL/pgSQL 入门、函数 RETURNS、过程 CALL、IN/OUT 参数、控制流、DO 块
+---
+
+# 函数与存储过程
+
+把一段逻辑封装进数据库，能减少网络往返、保证原子性、统一业务规则。PG 的过程语言 **PL/pgSQL** 写函数（`FUNCTION`）和过程（`PROCEDURE`），功能接近但语义不同。
+
+## 1. 函数 FUNCTION：一定有返回值
+
+最简单的函数用 SQL 语言即可；带变量/分支/循环就用 `plpgsql`：
+
+```sql title="PL/pgSQL 函数示例"
+CREATE OR REPLACE FUNCTION core.discount_price(orig numeric, rate numeric)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF rate < 0 OR rate > 1 THEN
+    RAISE EXCEPTION '折扣率必须在 0~1 之间';
+  END IF;
+  RETURN round(orig * (1 - rate), 2);
+END;
+$$;
+
+SELECT core.discount_price(7999, 0.1);   -- 7199.10
+```
+
+`$$ ... $$` 是「美元引号」，避免函数体内的单引号与定义语句冲突。
+
+## 2. 返回多行/表：SETOF 与 TABLE
+
+函数可以返回集合，甚至整张「表」：
+
+```sql title="返回表的函数"
+CREATE OR REPLACE FUNCTION core.products_by_category(cat text)
+RETURNS TABLE (id bigint, name text, price numeric)
+LANGUAGE sql
+AS $$
+  SELECT id, name, price FROM core.products WHERE category = cat;
+$$;
+
+SELECT * FROM core.products_by_category('phone');
+```
+
+## 3. 参数模式 IN / OUT / INOUT
+
+```sql title="带 OUT 参数的函数"
+CREATE OR REPLACE FUNCTION core.order_stats(IN uid bigint,
+                                            OUT cnt int, OUT total numeric)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  SELECT COUNT(*), COALESCE(SUM(total_amount),0)
+  INTO cnt, total
+  FROM core.orders
+  WHERE user_id = uid AND status = 'paid';
+END;
+$$;
+
+SELECT * FROM core.order_stats(1);
+```
+
+## 4. 过程 PROCEDURE：可提交/回滚事务
+
+函数内部**不能**控制事务（它运行在所在事务里）；**过程**可以显式 `COMMIT`/`ROLLBACK`，适合做多步批处理：
+
+```sql title="PROCEDURE 与 CALL"
+CREATE OR REPLACE PROCEDURE core.batch_cancel_old_orders()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE core.orders SET status = 'cancelled'
+  WHERE status = 'pending' AND created_at < now() - interval '7 days';
+  COMMIT;   -- 过程内可提交
+END;
+$$;
+
+CALL core.batch_cancel_old_orders();
+```
+
+<Callout type="warn" title="函数不能 COMMIT">
+想在数据库内做「分步提交/独立事务」必须用 `PROCEDURE` + `CALL`，`FUNCTION` 做不到（它会随外层事务一起提交或回滚）。
+</Callout>
+
+## 5. DO 块：一次性匿名执行
+
+不想创建永久对象、只想临时跑一段 PL/pgSQL（如数据修复）：
+
+```sql title="DO 块"
+DO $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN SELECT id FROM core.orders WHERE status='pending' LOOP
+    -- 一些临时逻辑……
+    NULL;
+  END LOOP;
+END;
+$$;
+```
+
+## 6. 控制流与控制结构
+
+PL/pgSQL 支持 `IF/ELSIF/ELSE`、`CASE`、`LOOP`/`WHILE`/`FOR`、异常捕获 `EXCEPTION WHEN ...`。这是它比纯 SQL 函数强大的地方。
+
+<Callout type="info" title="函数/过程 vs 应用层逻辑">
+能下推到数据库的计算（如按规则批量更新、复杂校验）放函数里可以减少网络往返；但重型业务逻辑放数据库会让版本管理与测试变难。经验：校验、小计算、触发器逻辑适合放 PG，复杂业务编排留在应用层。
+</Callout>
+
+<Callout type="exercise" title="动手">
+写一个函数 `core.total_stock_value()`，返回所有商品 `price * stock` 的合计金额（numeric）。再写一个过程 `core.zero_stock(cat text)`，把指定分类下 `stock=0` 的商品价格临时置为 0（仅演示，过程内 COMMIT）。注意替换为你自己的分类名。
+<Answer>
+```sql
+CREATE OR REPLACE FUNCTION core.total_stock_value()
+RETURNS numeric
+LANGUAGE sql
+AS $$
+  SELECT COALESCE(SUM(price * stock), 0) FROM core.products;
+$$;
+
+CREATE OR REPLACE PROCEDURE core.zero_stock(cat text)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE core.products SET price = 0 WHERE category = cat AND stock = 0;
+  COMMIT;
+END;
+$$;
+```
+</Answer>
+</Callout>

@@ -1,0 +1,156 @@
+---
+title: 实战项目：电商 shop 综合建模
+order: 22
+description: 把前面所学串起来——shop 库 schema 设计、约束、索引、触发器、JSONB 混合建模与典型查询
+---
+
+# 实战项目：电商 shop 综合建模
+
+走到这里，你已经掌握了 PG 的大部分能力。最后一章把前面的知识点串成一个完整的电商 `shop` 库设计，作为结业实战。你可以照着在本地建出来，体会「从需求到建模到查询」的全过程。
+
+## 1. 需求拆解
+
+一个最小可用的电商库要支撑：
+
+- 用户、商品（不同品类属性不同）、订单、订单项。
+- 商品价格/库存一致性（不能超卖）。
+- 商品有「动态属性」（JSONB）。
+- 高频按用户/状态查订单、按分类/价格查商品。
+- 自动维护时间戳、记录关键变更审计。
+
+## 2. 建表与约束（DDL + 约束）
+
+```sql title="综合 schema（贯穿本课程的 core 表）"
+CREATE SCHEMA IF NOT EXISTS core;
+
+CREATE TABLE core.users (
+  id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  username  text NOT NULL,
+  email     text NOT NULL UNIQUE,
+  phone     text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core.products (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  category   text NOT NULL,
+  name       text NOT NULL,
+  price      numeric(10,2) NOT NULL CHECK (price >= 0),
+  stock      int  NOT NULL DEFAULT 0 CHECK (stock >= 0),
+  attrs      jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core.orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_no    text NOT NULL UNIQUE,
+  user_id     bigint NOT NULL REFERENCES core.users(id),
+  status      text NOT NULL DEFAULT 'pending'
+               CHECK (status IN ('pending','paid','shipped','done','cancelled')),
+  total_amount numeric(12,2) NOT NULL DEFAULT 0,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core.order_items (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id   bigint NOT NULL REFERENCES core.orders(id) ON DELETE CASCADE,
+  product_id bigint NOT NULL REFERENCES core.products(id),
+  quantity   int NOT NULL CHECK (quantity > 0),
+  price      numeric(10,2) NOT NULL
+);
+```
+
+这里用到了：自增 `IDENTITY`、外键级联、CHECK 约束、JSONB 默认值、`timestamptz`。
+
+## 3. 索引策略（第 17 章）
+
+```sql title="为高频查询建索引"
+CREATE INDEX idx_orders_user_status ON core.orders (user_id, status);
+CREATE INDEX idx_orders_created ON core.orders (created_at);
+CREATE INDEX idx_products_cat_price ON core.products (category, price DESC);
+CREATE INDEX idx_products_attrs ON core.products USING gin (attrs jsonb_path_ops);
+```
+
+## 4. 触发器（第 13/14 章）：自动时间戳 + 防超卖
+
+```sql title="自动 updated_at 与库存校验"
+CREATE OR REPLACE FUNCTION core.touch_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END; $$;
+
+CREATE TRIGGER trg_products_updated
+  BEFORE UPDATE ON core.products
+  FOR EACH ROW EXECUTE FUNCTION core.touch_updated_at();
+
+-- 下单扣库存时，用触发器保证不超卖（库存不足直接报错）
+CREATE OR REPLACE FUNCTION core.check_stock()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF (SELECT stock FROM core.products WHERE id = NEW.product_id) < NEW.quantity THEN
+    RAISE EXCEPTION '库存不足: product %', NEW.product_id;
+  END IF;
+  UPDATE core.products SET stock = stock - NEW.quantity WHERE id = NEW.product_id;
+  RETURN NEW;
+END; $$;
+
+CREATE TRIGGER trg_order_items_stock
+  BEFORE INSERT ON core.order_items
+  FOR EACH ROW EXECUTE FUNCTION core.check_stock();
+```
+
+## 5. 一段典型写入（UPSERT + RETURNING）
+
+```sql title="下单：插入订单并回写总金额"
+WITH new_orders AS (
+  INSERT INTO core.orders (order_no, user_id, status)
+  VALUES ('SO' || to_char(now(),'YYYYMMDDHH24MISS'), 1, 'pending')
+  RETURNING id
+)
+INSERT INTO core.order_items (order_id, product_id, quantity, price)
+SELECT no.id, 1, 2, (SELECT price FROM core.products WHERE id=1)
+FROM new_orders no;
+```
+
+`RETURNING` 把刚插入的订单 id 喂给后续 `INSERT`，无需先查。
+
+## 6. 一段典型查询（窗口 + 连接）
+
+```sql title="每个用户的金额排名与最近订单"
+SELECT username,
+       SUM(total_amount) FILTER (WHERE status='paid') AS paid_sum,
+       RANK() OVER (ORDER BY SUM(total_amount) FILTER (WHERE status='paid') DESC) AS 金额排名
+FROM core.users u
+JOIN core.orders o ON o.user_id = u.id
+GROUP BY username
+ORDER BY paid_sum DESC NULLS LAST;
+```
+
+## 7. 收尾建议
+
+- 把 `attrs` 里经常查询的字段用**生成列**投影成关系列（第 15 章），兼顾灵活与性能。
+- 用 `pg_stat_statements` 持续观察慢查询、用 `EXPLAIN ANALYZE` 兜底。
+- 别忘了备份（第 20 章）与连接池（第 21 章）。
+
+<Callout type="tip" title="恭喜走到这里" >
+你现在已经具备「会建模、懂 MVCC、能索引、会读执行计划、知道怎么备份和调优」的 PostgreSQL 实战能力。剩下的是在真实项目里反复练——遇到问题就回到对应章节查。
+</Callout>
+
+<Callout type="exercise" title="结业动手">
+把上面第 1~4 节的 schema、索引、触发器在本地 `shop` 库中完整建出来；插入 3 个用户、4 个商品，开一个事务：插入订单并插入订单项（故意让某订单项 quantity 超过库存），观察 `check_stock` 触发器是否抛错并回滚整笔订单。验证「不超卖」。
+<Answer>
+```sql
+-- 建表/索引/触发器见上文，然后：
+INSERT INTO core.users(username,email) VALUES ('a','a@e.com'),('b','b@e.com');
+INSERT INTO core.products(category,name,price,stock,attrs)
+VALUES ('phone','P1',100,2,'{"color":"red"}'),('phone','P2',200,5,'{}');
+BEGIN;
+INSERT INTO core.orders(order_no,user_id) VALUES ('SO1',1) RETURNING id; -- 记下 id=1
+INSERT INTO core.order_items(order_id,product_id,quantity,price)
+VALUES (1,1,99,100);  -- quantity 99 > stock 2，触发器应抛错
+COMMIT;  -- 整笔回滚，订单不会留下
+SELECT * FROM core.orders;  -- 应为空
+```
+</Answer>
+</Callout>

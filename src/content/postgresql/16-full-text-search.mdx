@@ -1,0 +1,90 @@
+---
+title: 全文检索
+order: 16
+description: tsvector/tsquery、to_tsvector/to_tsquery、GIN 索引、ts_rank 排序与权重、与 LIKE 的对比
+---
+
+# 全文检索
+
+搜「包含某个词、支持分词、能按相关度排序」的需求，`LIKE '%关键词%'` 既慢又不智能（不分词、不匹配词形）。PG 内置了真正的**全文检索**：`tsvector`（文档）、`tsquery`（查询）、`GIN` 索引、`ts_rank` 相关度。
+
+## 1. 两个核心类型
+
+- `tsvector`：把文本切成「词位（lexeme）+ 位置」的文档表示（已去停用词、归一化）。
+- `tsquery`：查询条件，用 `&`（与）、`|`（或）、`!`（非）、&lt;->（距离）组合。
+
+```sql title="tsvector 与 tsquery 初体验"
+SELECT to_tsvector('english', 'The quick brown foxes') @@ to_tsquery('english', 'quick & fox');
+-- true：foxes 归一成 fox，所以能匹配
+```
+
+`@@` 是「匹配」运算符。注意 `to_tsvector` 会做词形归一（foxes→fox），这是 `LIKE` 做不到的。
+
+## 2. 给表加全文检索列
+
+以 `posts` 表（`title` + `body`）为例：
+
+```sql title="生成与存储 tsvector"
+ALTER TABLE core.posts ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title,'')), 'A') ||
+    setweight(to_tsvector('english', coalesce(body,'')),  'B')
+  ) STORED;
+```
+
+`setweight` 给不同字段不同权重（`A` 最高），让标题命中比正文命中更重要。
+
+## 3. GIN 索引加速
+
+```sql title="tsvector 的 GIN 索引"
+CREATE INDEX idx_posts_search ON core.posts USING gin (search);
+```
+
+有了它，`search @@ query` 能走索引，亿级文本也不慌。
+
+## 4. 查询与相关度排序
+
+```sql title="全文检索 + 相关度排序"
+SELECT title, ts_rank(search, q) AS rank
+FROM core.posts,
+     to_tsquery('english', 'postgres & index') AS q
+WHERE search @@ q
+ORDER BY rank DESC
+LIMIT 10;
+```
+
+`ts_rank` 越高越相关。还可用 `ts_rank_cd`（考虑词距离）获得更精细的排序。
+
+## 5. 中文检索怎么办
+
+默认词典（english/simple）对中文不友好。实用做法：
+
+- 用 `'simple'` 配置（不分词、按字符），配合 `ngram`/`zhparser` 扩展做中文分词。
+- 或用 `pg_jieba` / `zhparser`（需安装扩展）得到中文词位。
+
+<Callout type="tip" title="全文检索 vs LIKE" >
+- `LIKE '%词%'`：慢（除非 trigram 索引）、不分词、不匹配词形、不能排序。
+- 全文检索：分词、词形归一、支持布尔/距离、能算相关度、GIN 索引快。
+- 简单「是否包含某串」用 `LIKE`/`ILIKE` 即可；要「搜得准、排得巧」用全文检索。
+</Callout>
+
+<Callout type="exercise" title="动手">
+在 `core.posts` 上建一个 `search tsvector` 生成列（title 权重 A，body 权重 B）并建 GIN 索引，然后查询「title 或 body 含 postgres 且含 index」的前 5 条，按相关度排序。若 `posts` 表不存在，可先建一张 `posts(id, title, body)` 测试。
+<Answer>
+```sql
+CREATE TABLE IF NOT EXISTS core.posts (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text, body text,
+  search tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title,'')),'A') ||
+    setweight(to_tsvector('english', coalesce(body,'')), 'B')
+  ) STORED
+);
+CREATE INDEX idx_posts_search ON core.posts USING gin (search);
+INSERT INTO core.posts (title, body) VALUES
+  ('PG Index', 'postgres index tutorial'), ('Other', 'mysql index guide');
+SELECT title FROM core.posts, to_tsquery('english','postgres & index') q
+WHERE search @@ q ORDER BY ts_rank(search,q) DESC LIMIT 5;
+```
+</Answer>
+</Callout>

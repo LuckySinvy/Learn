@@ -1,0 +1,135 @@
+---
+title: 数据类型
+order: 4
+description: 数值、字符、布尔、日期时间（TIMESTAMPTZ 时区陷阱）、数组、JSON/JSONB、UUID、范围类型与序列化类型
+---
+
+# 数据类型
+
+选对类型是建模正确性和性能的地基。PostgreSQL 的类型系统比大多数数据库都丰富——除了常规类型，还有数组、`JSONB`、范围类型、网络地址等「杀手锏」类型。
+
+## 1. 数值类型
+
+| 类型 | 说明 |
+| --- | --- |
+| `smallint` / `int` / `bigint` | 2 / 4 / 8 字节整数 |
+| `numeric(p,s)` / `decimal` | 精确小数（金额必用），`p` 总位数、`s` 小数位 |
+| `real` / `double precision` | 近似浮点，科学计算用，别存钱 |
+
+<Callout type="warn" title="金额不要用 float">
+`real`/`double` 有精度误差（`0.1 + 0.2 ≠ 0.3`）。钱一律用 `numeric(12,2)` 这类精确类型。
+</Callout>
+
+## 2. 字符类型
+
+- `varchar(n)`：变长，最多 n 个字符（超长报错）。
+- `text`：变长，无长度上限（**PG 中 text 和 varchar 性能几乎无差别**，日常直接用 `text` 更省心）。
+- `char(n)`：定长，不足补空格，很少用。
+
+## 3. 布尔与枚举
+
+`boolean` 只有 `true`/`false`/`null`，写 SQL 时可直接用 `WHERE enabled`。
+
+很多同学喜欢用 `ENUM`，但 PG 里更推荐**查表 + 外键**或 `text` + `CHECK` 约束：
+
+```sql title="用 CHECK 代替 ENUM（更灵活）"
+CREATE TABLE orders (
+  id bigint,
+  status text CHECK (status IN ('pending','paid','shipped','done','cancelled'))
+);
+```
+
+<Callout type="tip" title="为什么不推荐 ENUM">
+PG 的 `ENUM` 一旦创建，删除/修改某个枚举值很麻烦（要改底层类型）。用 `text + CHECK` 或独立的「字典表 + 外键」，后续加状态只是加一行约束/数据，零侵入。
+</Callout>
+
+## 4. 日期时间：`TIMESTAMPTZ` 是默认选择
+
+这是 PG 最容易踩的坑之一：
+
+- `timestamp`（无时区）：只存「日历时刻」，不记录时区，跨时区解释会出错。
+- `timestamptz`（带时区）：存的是 UTC 时刻，读取时按会话 `timezone` 显示。
+
+```sql title="时间戳与时区"
+SHOW timezone;
+SELECT now();                       -- 返回 timestamptz
+SELECT now() AT TIME ZONE 'Asia/Shanghai';
+```
+
+<Callout type="warn" title="一律用 timestamptz">
+存时间几乎总是用 `timestamptz`：它把「时刻」存成 UTC，显示时再换算，绝不会因服务器/客户端时区变化而错乱。`timestamp` 只在你明确要「与时区无关的日历时间」（如生日）时使用。
+</Callout>
+
+## 5. 数组类型（PG 特色）
+
+PG 原生支持数组，一列可以装多个同类型值：
+
+```sql title="数组列与操作"
+CREATE TABLE posts (
+  id bigint,
+  tags text[]                 -- 字符串数组
+);
+INSERT INTO posts VALUES (1, ARRAY['pg','database','sql']);
+INSERT INTO posts VALUES (2, '{pg,sql}');     -- 等价写法
+SELECT tags[1] FROM posts;                    -- 下标从 1 开始
+SELECT * FROM posts WHERE 'pg' = ANY(tags);   -- 是否含某元素
+```
+
+数组适合「简单的一对多、不强求规范化」的场景（如标签），但复杂的多值关系还是拆表更规范。
+
+## 6. JSON 与 JSONB：PG 的招牌
+
+- `json`：原样存储文本，写入快、查询慢、每次都要解析。
+- `jsonb`：解析后存成二进制（去重键、排序键），写入略慢、查询和索引快，**绝大多数场景用 `jsonb`**。
+
+```sql title="jsonb 基础"
+CREATE TABLE products (
+  id bigint,
+  attrs jsonb                 -- 商品的动态属性，如颜色/规格
+);
+INSERT INTO products VALUES (1, '{"color":"red","size":"L","sku":"A1"}');
+SELECT attrs->>'color' FROM products;          -- ->> 取文本
+SELECT attrs->'color' FROM products;           -- -> 取 jsonb
+SELECT * FROM products WHERE attrs @> '{"color":"red"}';  -- 包含某键值
+```
+
+`jsonb` 还能建 GIN 索引加速包含查询，第 15 章专门讲。
+
+## 7. UUID 与序列化类型
+
+```sql title="UUID 主键与 IDENTITY"
+CREATE TABLE users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),  -- 需 pgcrypto / PG13+ 内置
+  -- 自增主键更推荐 IDENTITY（标准 SQL），而非老旧的 SERIAL
+  seq bigint GENERATED ALWAYS AS IDENTITY
+);
+```
+
+- `SERIAL`/`BIGSERIAL`：底层是「序列 + 默认值」，**不保证**严格连续，且不绑定列（可手动插入导致冲突）。
+- `GENERATED ... AS IDENTITY`：标准 SQL 写法，语义更严谨，推荐新项目用。
+
+## 8. 其他实用类型
+
+| 类型 | 用途 |
+| --- | --- |
+| `uuid` | 分布式友好的主键 |
+| `inet` / `cidr` | 存 IP 地址/网段 |
+| `int4range` / `daterange` / `tstzrange` | **范围类型**，如「有效期」「排班时段」 |
+| `bytea` | 二进制大对象（小文件） |
+
+<Callout type="exercise" title="动手">
+建一张 `events` 表：`id` 用 `bigint GENERATED ALWAYS AS IDENTITY` 主键，`payload jsonb`，`tags text[]`，`created_at timestamptz DEFAULT now()`。插入一条带 tags 和 jsonb 的数据并查出来。
+<Answer>
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  payload jsonb,
+  tags text[],
+  created_at timestamptz DEFAULT now()
+);
+INSERT INTO events (payload, tags)
+VALUES ('{"type":"click","page":"/home"}', ARRAY['web','promo']);
+SELECT id, payload->>'type', tags, created_at FROM events;
+```
+</Answer>
+</Callout>

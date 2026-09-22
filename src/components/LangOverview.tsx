@@ -26,6 +26,7 @@ export function LangOverview({ lang }: { lang: Language }) {
         {lang === 'k8s' && '从 Pod 到 Deployment、Service、Ingress 与自动扩缩容，掌握容器编排。'}
         {lang === 'typescript' && '从类型注解到泛型、条件类型与类型体操，写出真正类型安全的代码。'}
         {lang === 'mysql' && '从 SQL 基础到索引原理、事务与 MVCC、复制与调优，吃透关系型数据库。'}
+        {lang === 'postgresql' && '从 SQL 到 JSONB、窗口函数、MVCC 与流复制，系统掌握 PostgreSQL。'}
         {lang === 'redis' && '从数据结构到持久化、集群与分布式锁，掌握高性能内存数据库。'}
         {lang === 'mongodb' && '从文档模型到聚合管道、索引策略与分片集群，系统掌握 MongoDB。'}
         {lang === 'clickhouse' && '从列式存储原理到 MergeTree、物化视图与分布式集群，玩转 OLAP 分析。'}

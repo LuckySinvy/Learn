@@ -1,0 +1,95 @@
+---
+title: 视图与物化视图
+order: 12
+description: CREATE VIEW、可更新视图、WITH CHECK OPTION、物化视图 REFRESH 与 REFRESH CONCURRENTLY
+---
+
+# 视图与物化视图
+
+视图把一段查询「存成虚拟表」。它能隐藏复杂度、统一口径、做权限隔离。PG 还有**物化视图**——把结果真正落盘，用空间换查询速度。
+
+## 1. 普通视图：虚拟表
+
+```sql title="创建视图"
+CREATE VIEW core.paid_order_summary AS
+SELECT u.username, COUNT(o.id) AS paid_cnt, SUM(o.total_amount) AS paid_sum
+FROM core.users u
+JOIN core.orders o ON o.user_id = u.id
+WHERE o.status = 'paid'
+GROUP BY u.username;
+```
+
+视图本身不存数据，每次查询它都重新执行底层 SQL。好处：
+
+- **隐藏复杂度**：业务方直接 `SELECT * FROM core.paid_order_summary`。
+- **统一口径**：过滤条件（status='paid'）只写一次，避免各处写错。
+- **权限隔离**：给用户授视图权限而非基表权限。
+
+## 2. 可更新视图与 WITH CHECK OPTION
+
+满足一定条件的视图（简单单表、无聚合/去重）可以直接 `INSERT/UPDATE/DELETE` 并作用到基表：
+
+```sql title="可更新视图 + CHECK OPTION"
+CREATE VIEW core.active_products AS
+SELECT id, name, price, stock
+FROM core.products
+WHERE stock > 0
+WITH CHECK OPTION;     -- 任何通过该视图的写入都必须满足 WHERE 条件
+```
+
+`WITH CHECK OPTION` 保证「经此视图插入/更新的行，必须能让视图查得出来」，否则报错——防止有人绕过条件塞进 `stock <= 0` 的数据。
+
+<Callout type="info" title="视图更新限制">
+含 `JOIN`、聚合、`DISTINCT`、`GROUP BY` 的视图**不可自动更新**。需要写操作时用 `INSTEAD OF` 触发器（见第 14 章）或改用可更新视图。
+</Callout>
+
+## 3. 物化视图：结果落盘（缓存查询）
+
+普通视图每次重算，慢查询救不了；物化视图把结果**物化存储**，查询直接读磁盘快照：
+
+```sql title="创建并刷新物化视图"
+CREATE MATERIALIZED VIEW core.sales_daily AS
+SELECT created_at::date AS day, COUNT(*) AS orders, SUM(total_amount) AS revenue
+FROM core.orders
+GROUP BY created_at::date;
+
+-- 刷新（会锁读写，刷新期间视图不可查）
+REFRESH MATERIALIZED VIEW core.sales_daily;
+
+-- 并发刷新（不阻塞查询，但要求有唯一索引）
+REFRESH MATERIALIZED VIEW CONCURRENTLY core.sales_daily;
+```
+
+<Callout type="tip" title="什么时候用物化视图">
+- 报表/看板类查询，数据允许「分钟级延迟」更新。
+- 底层计算很重、又频繁被读。
+- 代价：数据是快照，需要定时 `REFRESH`；`CONCURRENTLY` 要求视图上有唯一索引。
+</Callout>
+
+## 4. 视图 vs 物化视图 怎么选
+
+| | 普通视图 | 物化视图 |
+| --- | --- | --- |
+| 是否存数据 | 否（每次重算） | 是（快照） |
+| 实时性 | 实时 | 取决于刷新频率 |
+| 读性能 | 等同底层查询 | 极快 |
+| 典型用途 | 简化/统一查询口径 | 报表缓存 |
+
+<Callout type="exercise" title="动手">
+创建一个视图 `core.product_rich`，把 `products` 和「该商品累计售出数量」拼在一起（子查询或 JOIN 聚合），然后写一个物化视图 `core.category_stock`，按 `category` 汇总总库存。提示：物化视图上若想 `REFRESH CONCURRENTLY` 需先建唯一索引。
+<Answer>
+```sql
+CREATE VIEW core.product_rich AS
+SELECT p.id, p.name, p.price,
+       COALESCE(SUM(oi.quantity),0) AS sold
+FROM core.products p
+LEFT JOIN core.order_items oi ON oi.product_id = p.id
+GROUP BY p.id, p.name, p.price;
+
+CREATE MATERIALIZED VIEW core.category_stock AS
+SELECT category, SUM(stock) AS total_stock
+FROM core.products
+GROUP BY category;
+```
+</Answer>
+</Callout>

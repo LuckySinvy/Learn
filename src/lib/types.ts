@@ -10,6 +10,7 @@ export type Language =
   | 'dify'
   | 'k8s'
   | 'mysql'
+  | 'postgresql'
   | 'redis'
   | 'mongodb'
   | 'clickhouse'
@@ -49,6 +50,7 @@ export const LANG_META: Record<Language, { label: string; color: string; emoji: 
   rust: { label: 'Rust', color: 'bg-red-500/10 text-red-600 dark:text-red-300', emoji: '🦀' },
   typescript: { label: 'TypeScript', color: 'bg-blue-600/10 text-blue-700 dark:text-blue-300', emoji: '📘' },
   mysql: { label: 'MySQL', color: 'bg-teal-500/10 text-teal-600 dark:text-teal-300', emoji: '🐬' },
+  postgresql: { label: 'PostgreSQL', color: 'bg-sky-500/10 text-sky-600 dark:text-sky-300', emoji: '🐘' },
   redis: { label: 'Redis', color: 'bg-rose-500/10 text-rose-600 dark:text-rose-300', emoji: '⚡' },
   mongodb: { label: 'MongoDB', color: 'bg-green-500/10 text-green-600 dark:text-green-300', emoji: '🍃' },
   clickhouse: { label: 'ClickHouse', color: 'bg-amber-500/10 text-amber-600 dark:text-amber-300', emoji: '🧮' },

@@ -1,0 +1,137 @@
+---
+title: DDL 与约束
+order: 5
+description: CREATE/ALTER/DROP 表、主键/外键/唯一/CHECK/NOT NULL/DEFAULT、生成列、COMMENT、TRUNCATE
+---
+
+# DDL 与约束
+
+DDL（Data Definition Language）负责「定义结构」：建表、改表、删表，以及约束——约束是数据库替你守住的数据正确性底线。AI 能帮你写建表语句，但**该加什么约束、为什么加**，必须你自己拿主意。
+
+## 1. 建表与列约束
+
+我们用 `shop` 库的核心表贯穿后面章节，先把它们建出来：
+
+```sql title="core 模式下的核心表"
+CREATE SCHEMA IF NOT EXISTS core;
+
+CREATE TABLE core.users (
+  id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  username  text    NOT NULL,
+  email     text    NOT NULL UNIQUE,
+  phone     text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core.products (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  category   text    NOT NULL,
+  name       text    NOT NULL,
+  price      numeric(10,2) NOT NULL CHECK (price >= 0),
+  stock      int     NOT NULL DEFAULT 0 CHECK (stock >= 0),
+  attrs      jsonb   NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE core.orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_no    text    NOT NULL UNIQUE,
+  user_id     bigint  NOT NULL REFERENCES core.users(id),
+  status      text    NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending','paid','shipped','done','cancelled')),
+  total_amount numeric(12,2) NOT NULL DEFAULT 0,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core.order_items (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id   bigint  NOT NULL REFERENCES core.orders(id) ON DELETE CASCADE,
+  product_id bigint  NOT NULL REFERENCES core.products(id),
+  quantity   int     NOT NULL CHECK (quantity > 0),
+  price      numeric(10,2) NOT NULL
+);
+```
+
+### 1.1 各约束一句话说明
+
+- `PRIMARY KEY`：非空且唯一，表的身份列。
+- `NOT NULL`：不允许空值，能加就加（空值常是脏数据来源）。
+- `UNIQUE`：列值不重复（如 email、order_no）。
+- `CHECK`：自定义条件（如 `price >= 0`、状态白名单），PG 的强项。
+- `REFERENCES`：**外键**，保证引用存在；可加 `ON DELETE/UPDATE` 行为。
+
+## 2. 外键的引用行为
+
+外键决定「被引用的行被删/改时，子表怎么办」：
+
+```sql title="外键 ON DELETE 行为"
+REFERENCES core.users(id) ON DELETE CASCADE    -- 父删，子跟着删
+REFERENCES core.users(id) ON DELETE RESTRICT   -- 父有子则拒绝删除
+REFERENCES core.users(id) ON DELETE SET NULL   -- 父删，子置空（要求列可空）
+```
+
+`CASCADE` 方便但有连锁风险；`RESTRICT`（默认行为之一）更安全。按业务语义选。
+
+## 3. 改表 ALTER TABLE
+
+```sql title="常见 ALTER 操作"
+ALTER TABLE core.products ADD COLUMN description text;
+ALTER TABLE core.products ALTER COLUMN name SET NOT NULL;
+ALTER TABLE core.products ADD CONSTRAINT chk_name_len CHECK (char_length(name) <= 200);
+ALTER TABLE core.products DROP COLUMN description;
+ALTER TABLE core.products RENAME COLUMN category TO category_name;
+```
+
+<Callout type="warn" title="ALTER 会锁表">
+加列（简单类型、无默认值或默认值是常量常量时 PG11+ 是「瞬间」的）、加约束（`VALIDATE` 时会全表扫描）。大表上的 `ALTER` 可能长时间锁表影响线上，改动前评估锁粒度与表大小。
+</Callout>
+
+## 4. 生成列（Generated Column）
+
+值由其他列计算而来，写入时自动维护，杜绝「字段间不一致」：
+
+```sql title="生成列示例"
+CREATE TABLE core.order_items (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  quantity int NOT NULL,
+  price numeric(10,2) NOT NULL,
+  amount numeric(12,2) GENERATED ALWAYS AS (quantity * price) STORED  -- 存储型
+);
+```
+
+`STORED` 实际存盘（可索引）；PG 暂不支持 `VIRTUAL`（查询时计算）。
+
+## 5. 注释 COMMENT
+
+给表和列加注释，是低成本但高回报的「自文档」：
+
+```sql title="COMMENT 注释"
+COMMENT ON TABLE core.orders IS '订单主表';
+COMMENT ON COLUMN core.orders.status IS 'pending 待支付 / paid 已支付 / shipped 已发货 / done 完成 / cancelled 取消';
+```
+
+注释会进入系统目录，团队查 `information_schema` 时能看到。
+
+## 6. TRUNCATE 与 DROP
+
+```sql title="清空与删除"
+TRUNCATE core.order_items;        -- 快速清空（比 DELETE 快，且重置序列，不可回滚式）
+DROP TABLE core.order_items;      -- 删表结构（谨慎）
+DROP TABLE IF EXISTS core.tmp CASCADE;  -- 连依赖对象一起删
+```
+
+<Callout type="warn" title="TRUNCATE 不等于 DELETE">
+`TRUNCATE` 不逐行删、不触发行级触发器、通常不可回滚（它隐式提交）。只想删部分数据用 `DELETE ... WHERE`；想整表快速清空且确认不要回滚时用 `TRUNCATE`。
+</Callout>
+
+<Callout type="exercise" title="动手">
+在 `core` 模式下建一张 `categories(id, name, parent_id)` 表，其中 `parent_id` 自引用外键指向 `categories(id)`（表示商品分类的树形结构），并给 `name` 加 `NOT NULL` 与长度 CHECK。
+<Answer>
+```sql
+CREATE TABLE core.categories (
+  id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name      text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 100),
+  parent_id bigint REFERENCES core.categories(id) ON DELETE CASCADE
+);
+```
+</Answer>
+</Callout>

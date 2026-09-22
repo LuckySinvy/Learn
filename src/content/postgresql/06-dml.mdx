@@ -1,0 +1,120 @@
+---
+title: DML：增删改数据
+order: 6
+description: INSERT 批量与 INSERT…SELECT、RETURNING、UPDATE、DELETE、ON CONFLICT 的 UPSERT 与冲突处理
+---
+
+# DML：增删改数据
+
+DML 是每天写最多的 SQL。PG 在「会写」之外给了几个很香的特性：`RETURNING` 一次拿回刚写的行、`ON CONFLICT` 优雅处理唯一键冲突（UPSERT）。本章把示例数据灌进 `core` 表，并逐一演示。
+
+## 1. INSERT
+
+### 1.1 基础与批量插入
+
+```sql title="单行与批量 INSERT"
+INSERT INTO core.users (username, email, phone) VALUES
+  ('alice', 'alice@ex.com', '13800000001'),
+  ('bob',   'bob@ex.com',   '13800000002'),
+  ('carol', 'carol@ex.com', '13800000003');
+
+INSERT INTO core.products (category, name, price, stock, attrs) VALUES
+  ('phone', 'iPhone 15 Pro', 7999.00, 100, '{"color":"titanium","storage":"256GB"}'),
+  ('phone', 'Xiaomi 14',     3999.00, 200, '{"color":"black"}'),
+  ('laptop','MacBook Air M3',8999.00, 50,  '{"cpu":"M3"}'),
+  ('book',  '高性能PostgreSQL', 128.00, 500, '{"author":"team"}');
+```
+
+批量一条多值比循环单条快一个数量级：一次网络往返、一次解析、一次提交。
+
+### 1.2 RETURNING：写入即取回（PG 特色，强烈推荐）
+
+MySQL 要先 INSERT 再 SELECT 拿回主键；PG 一条语句搞定：
+
+```sql title="INSERT ... RETURNING"
+INSERT INTO core.orders (order_no, user_id, status)
+VALUES ('SO20260901001', 1, 'pending')
+RETURNING id, order_no, created_at;
+-- 直接拿到刚插入行的 id，省一次查询
+```
+
+`RETURNING` 在 `INSERT`/`UPDATE`/`DELETE` 上都可用，常配合应用层取回主键或受影响行。
+
+### 1.3 INSERT … SELECT：从查询写入
+
+```sql title="从查询结果插入"
+INSERT INTO core.products (category, name, price, stock)
+SELECT 'archive', name, price, 0
+FROM core.products
+WHERE category = 'book';
+```
+
+## 2. UPDATE
+
+```sql title="UPDATE 与 RETURNING"
+UPDATE core.products
+SET price = price * 0.9, attrs = attrs || '{"discount":true}'::jsonb
+WHERE category = 'phone'
+RETURNING id, name, price;
+```
+
+注意 `jsonb || jsonb` 是「合并/覆盖」操作符，用来给 `attrs` 追加一个键。
+
+<Callout type="warn" title="UPDATE 别漏 WHERE">
+没有 `WHERE` 的 `UPDATE` 会改全表——这是经典事故。PG 没有「确认提示」，下笔前先想清楚条件，线上关键操作可以先 `SELECT` 看影响行数再改。
+</Callout>
+
+## 3. DELETE
+
+```sql title="DELETE 与 RETURNING"
+DELETE FROM core.order_items
+WHERE quantity = 0
+RETURNING id;
+```
+
+同样：**DELETE 几乎总该带 WHERE**。要整表清空用 `TRUNCATE`（见第 5 章）。
+
+## 4. 唯一键冲突：三种处理方式
+
+假设 `core.orders.order_no` 有唯一约束，重复插入同号时：
+
+### 4.1 ON CONFLICT DO NOTHING：冲突就跳过
+
+```sql title="冲突跳过"
+INSERT INTO core.orders (order_no, user_id, status)
+VALUES ('SO20260901001', 2, 'pending')
+ON CONFLICT (order_no) DO NOTHING;
+```
+
+### 4.2 ON CONFLICT DO UPDATE：冲突就更新（UPSERT，最常用）
+
+```sql title="UPSERT：冲突则更新"
+INSERT INTO core.products (id, name, price, stock) VALUES (1, 'iPhone 15 Pro', 7999, 120)
+ON CONFLICT (id) DO UPDATE
+  SET price = EXCLUDED.price,
+      stock = EXCLUDED.stock;
+```
+
+`EXCLUDED` 指代「本想插入但冲突的那一行」，用它取冲突时带来的新值，非常直观。这是 PG 里做「有则更新、无则插入」的标准姿势。
+
+### 4.3 指定冲突目标更精确
+
+当表有多个唯一约束时，用 `ON CONFLICT (列)` 明确「哪个约束冲突才触发」；也可用 `ON CONFLICT ON CONSTRAINT 约束名`。
+
+<Callout type="tip" title="RETURNING + UPSERT 组合">
+`ON CONFLICT DO UPDATE ... RETURNING` 能让你无论插入还是更新，都拿到最终那一行，应用层不用再查一次。
+</Callout>
+
+<Callout type="exercise" title="动手">
+把 `alice` 的邮箱改成新地址并用 `RETURNING` 取回整行；然后尝试用 `ON CONFLICT (email)` 再次插入 `alice@ex.com`，要求冲突时什么都不做。
+<Answer>
+```sql
+UPDATE core.users SET email = 'alice.new@ex.com' WHERE username = 'alice'
+RETURNING *;
+
+INSERT INTO core.users (username, email) VALUES ('alice2', 'alice.new@ex.com')
+ON CONFLICT (email) DO NOTHING;
+-- 因为 email 已存在，第二次插入被跳过
+```
+</Answer>
+</Callout>

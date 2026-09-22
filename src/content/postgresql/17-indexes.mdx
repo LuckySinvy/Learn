@@ -1,0 +1,90 @@
+---
+title: 索引
+order: 17
+description: B-tree（默认）、组合/部分/表达式索引、唯一索引、GIN/GiST/BRIN、索引选择与代价
+---
+
+# 索引
+
+索引是「用空间换查询时间」的结构，是数据库调优的第一杠杆。但要记住：**索引不是越多越好**——它拖慢写入、占用磁盘。本章讲清 PG 有哪些索引、各自适用什么。
+
+## 1. B-tree：默认且万能
+
+```sql title="建 b-tree 索引"
+CREATE INDEX idx_orders_user ON core.orders (user_id);
+```
+
+B-tree 适合 `=`、`>`、&lt;、`BETWEEN`、排序、`IN`，是 90% 场景的默认选择。`PRIMARY KEY` 和 `UNIQUE` 约束背后都是唯一 B-tree。
+
+## 2. 组合索引（多列）
+
+```sql title="组合索引与最左前缀"
+CREATE INDEX idx_orders_user_status ON core.orders (user_id, status);
+```
+
+遵循**最左前缀**：能加速 `(user_id)`、`（user_id, status）` 的查询，但单独按 `status` 查用不到该索引。把**等值条件列放前面、范围列放后面**。
+
+## 3. 部分索引（只索引子集）
+
+只对「经常查询的子集」建索引，更小更快：
+
+```sql title="部分索引"
+CREATE INDEX idx_orders_pending ON core.orders (created_at)
+WHERE status = 'pending';   -- 只索引待支付订单
+```
+
+特别适合「热数据」查询（如未支付、未删除）。
+
+## 4. 表达式索引
+
+查询里常对「表达式」过滤时，对表达式建索引：
+
+```sql title="表达式索引（忽略大小写）"
+CREATE INDEX idx_products_lower_name ON core.products (lower(name));
+-- 这样 WHERE lower(name) = 'iphone' 才能走索引
+```
+
+注意：只有当查询里的表达式与索引定义**逐字一致**时才会命中。搭配第 7 章，`ILIKE 'abc%'`（前缀）也能用 b-tree，但 `ILIKE '%abc%'` 需要 `pg_trgm` 的 GIN 索引。
+
+## 5. 唯一索引
+
+```sql title="唯一索引（不依赖约束也可用）"
+CREATE UNIQUE INDEX idx_users_email ON core.users (email);
+```
+
+除了保证唯一，还顺带提供查询加速。`CREATE UNIQUE INDEX` 与 `UNIQUE` 约束等价，但索引名更可控。
+
+## 6. 特殊索引方法
+
+| 方法 | 适用 |
+| --- | --- |
+| `GIN` | 多值/文档：`jsonb` 包含、`tsvector` 全文检索、`text[]` 数组 |
+| `GiST` | 范围、几何、近邻搜索（&lt;-> 距离） |
+| `BRIN` | 超大规模、按物理顺序增长的数据（如按时间写入的日志），索引极小 |
+| `SP-GiST` | 非平衡结构，如 quad tree |
+
+```sql title="GIN / BRIN 示例"
+CREATE INDEX idx_p_gin ON core.products USING gin (attrs jsonb_path_ops);
+CREATE INDEX idx_o_brin ON core.orders USING brin (created_at);
+```
+
+## 7. 索引的代价与维护
+
+- 写入变慢（每行 INSERT/UPDATE/DELETE 都要维护索引）。
+- 磁盘/内存占用。
+- 索引会膨胀，需要 `REINDEX` 或 autovacuum 维护。
+
+<Callout type="info" title="怎么判断要不要建索引">
+经验法则：高频出现在 `WHERE`/`JOIN ... ON`/`ORDER BY` 且选择性高（区分度高）的列，值得建；低选择性（如性别）单独建意义不大，可放进组合索引或跳过。先用 `EXPLAIN`（下一章）看查询是否真的走索引，再决定。
+</Callout>
+
+<Callout type="exercise" title="动手">
+为 `core.orders` 建一个「(user_id, status)」的组合索引，并建一个只对 `status='pending'` 的部分索引在 `created_at` 上。思考：哪些查询能用上哪个索引？
+<Answer>
+```sql
+CREATE INDEX idx_orders_user_status ON core.orders (user_id, status);
+CREATE INDEX idx_orders_pending_created ON core.orders (created_at) WHERE status = 'pending';
+-- 前者加速「某用户+某状态」查询；后者加速「待支付订单按时间排序」类查询
+```
+</Answer>
+</Callout>

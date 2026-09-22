@@ -1,0 +1,95 @@
+---
+title: 表连接
+order: 9
+description: INNER/LEFT/RIGHT/FULL 连接、自连接、多表连接、USING、LATERAL 连接（PG 特色）
+---
+
+# 表连接
+
+真实查询几乎都是多表 Join。PG 支持完整的连接类型，外加一个非常强但常被忽视的 **LATERAL** 连接。
+
+## 1. INNER JOIN：只保留两边都匹配的行
+
+```sql title="内连接"
+SELECT o.order_no, u.username, o.total_amount
+FROM core.orders o
+JOIN core.users u ON u.id = o.user_id;
+```
+
+不满足 `ON` 条件的行都会被丢弃。
+
+## 2. LEFT / RIGHT / FULL JOIN
+
+- `LEFT JOIN`：左表全保留，右表无匹配时补 NULL（最常用）。
+- `RIGHT JOIN`：右表全保留（通常用 `LEFT JOIN` 调换顺序替代，可读性更好）。
+- `FULL JOIN`：两边全保留，哪边没匹配哪边补 NULL。
+
+```sql title="LEFT JOIN 找「未下单用户」"
+SELECT u.username
+FROM core.users u
+LEFT JOIN core.orders o ON o.user_id = u.id
+WHERE o.id IS NULL;     -- 右表为 NULL = 没有匹配到订单
+```
+
+<Callout type="tip" title="LEFT JOIN + IS NULL 反查">
+「A 里没有对应 B 的记录」是经典需求（如未下单用户、未评论商品），写法是 `LEFT JOIN ... WHERE B.key IS NULL`。
+</Callout>
+
+## 3. USING 与多表连接
+
+当连接列的列名相同时可用 `USING` 简化：
+
+```sql title="USING 与三表连接"
+SELECT o.order_no, p.name, oi.quantity
+FROM core.orders o
+JOIN core.order_items oi USING (order_id)
+JOIN core.products p USING (id);   -- 注意 oi 和 p 通过 product_id 关联，这里示意 USING 用法
+```
+
+三表及以上连接时，注意连接顺序和过滤条件位置（尽早过滤减少中间结果）。
+
+## 4. 自连接：一张表当两张用
+
+分类表 `categories` 里 `parent_id` 指回自己，要展平「父→子」就自连接：
+
+```sql title="自连接：父分类与子分类"
+SELECT parent.name AS 父分类, child.name AS 子分类
+FROM core.categories child
+JOIN core.categories parent ON parent.id = child.parent_id;
+```
+
+## 5. LATERAL：子查询能引用左边表的列（PG 特色）
+
+普通子查询不能引用外层列。`LATERAL`（常配合 `LEFT JOIN`）允许右侧子查询/函数引用左侧每行的值——非常适合「对每一行取 Top N 关联记录」：
+
+```sql title="LATERAL 取每个用户最近 3 笔订单"
+SELECT u.username, recent.order_no, recent.created_at
+FROM core.users u
+LEFT JOIN LATERAL (
+  SELECT order_no, created_at
+  FROM core.orders o
+  WHERE o.user_id = u.id
+  ORDER BY o.created_at DESC
+  LIMIT 3
+) recent ON true;
+```
+
+没有 `LATERAL` 时，这种「每组取前 N」得用窗口函数（第 11 章）或复杂子查询；`LATERAL` 表达得最直白。注意必须 `LEFT JOIN LATERAL ... ON true`，否则没匹配时整行会被丢弃。
+
+<Callout type="info" title="LATERAL 的等价思路">
+「每组取前 N」既可用 `LATERAL`，也可用窗口函数 `ROW_NUMBER()` 分区排序后取 `rn<=3`（见第 11 章）。简单 Top-N 用 LATERAL 更直观，复杂分析用窗口函数更灵活。
+</Callout>
+
+<Callout type="exercise" title="动手">
+用 `LEFT JOIN` 查出所有商品及其被下单的总数量（没被下单的商品数量显示为 0），只列出总数量大于 0 的商品，按数量降序。
+<Answer>
+```sql
+SELECT p.name, COALESCE(SUM(oi.quantity), 0) AS sold
+FROM core.products p
+LEFT JOIN core.order_items oi ON oi.product_id = p.id
+GROUP BY p.id, p.name
+HAVING COALESCE(SUM(oi.quantity), 0) > 0
+ORDER BY sold DESC;
+```
+</Answer>
+</Callout>

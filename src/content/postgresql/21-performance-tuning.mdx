@@ -1,0 +1,89 @@
+---
+title: 性能调优实战
+order: 21
+description: shared_buffers/work_mem/max_connections、连接池 pgbouncer、pg_stat_* 监控、常见瓶颈
+---
+
+# 性能调优实战
+
+数据库「慢」很少是玄学。本章把调优落到具体参数、监控视图和常见瓶颈上，给你一套可操作的方法论。
+
+## 1. 内存类参数（最常调）
+
+| 参数 | 建议 | 作用 |
+| --- | --- | --- |
+| `shared_buffers` | 物理内存 25% | 数据页缓存，减少磁盘读 |
+| `effective_cache_size` | 物理内存 50%~75% | 告诉规划器有多少缓存可用，更愿用索引 |
+| `work_mem` | 4~64MB（按并发谨慎调） | 每个排序/哈希操作内存，过大×并发会 OOM |
+| `maintenance_work_mem` | 较大（如 512MB） | `VACUUM`/`CREATE INDEX` 等维护操作的内存 |
+
+```bash title="postgresql.conf 片段"
+shared_buffers = 2GB
+effective_cache_size = 6GB
+work_mem = 32MB
+max_connections = 200
+random_page_cost = 1.1     # SSD 上降低，让规划器更倾向 Index Scan
+```
+
+<Callout type="warn" title="work_mem 会乘以并发" >
+`work_mem` 是「每个操作」的内存，一个复杂查询可能用多个、一个连接可能跑多个。盲目调大 `+ 高连接数` = 内存爆。优先配合连接池限制并发。
+</Callout>
+
+## 2. 连接数 vs 连接池
+
+PG 是**每连接一进程**，几百个长连接就很吃内存。应用直连 + 高并发 = 灾难。解法：**连接池**。
+
+- **pgbouncer**：轻量连接池，推荐用 `transaction` 或 `pool` 模式，把成百上千应用连接收敛成几十个数据库后端连接。
+- `max_connections` 设为连接池后端连接数 + 少量余量即可。
+
+```text title="pgbouncer 思路"
+[databases]
+shop = host=127.0.0.1 port=5432 dbname=shop
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 20
+```
+
+## 3. 监控：pg_stat_* 系列
+
+PG 自带丰富统计视图，定位瓶颈的第一手资料：
+
+```sql title="常用监控视图"
+SELECT * FROM pg_stat_activity;        -- 当前连接/正在跑的 SQL/等待事件
+SELECT * FROM pg_stat_statements;      -- 慢查询聚合（需开启扩展，见下）
+SELECT relname, seq_scan, idx_scan, n_dead_tup
+FROM pg_stat_user_tables ORDER BY seq_scan DESC;   -- 谁在狂做全表扫描
+SELECT * FROM pg_stat_bgwriter;        -- 缓冲/检查点写压力
+```
+
+`pg_stat_statements` 是「谁最慢」的利器，需先 `CREATE EXTENSION pg_stat_statements;` 并在配置里加载。
+
+## 4. 常见瓶颈清单
+
+1. **缺失索引 / 统计信息过期** → `EXPLAIN` 见 Seq Scan，`ANALYZE` 表。
+2. **全表扫描的大表** → `pg_stat_user_tables.seq_scan` 排查。
+3. **连接风暴** → `pg_stat_activity` 看连接数、pgbouncer 收敛。
+4. **锁等待** → `pg_locks` + `pg_stat_activity` 看谁阻塞谁（长事务常见）。
+5. **表膨胀** → `n_dead_tup` 大、`VACUUM` 没跟上（长事务或 autovacuum 太慢）。
+6. **磁盘 IO / 内存不足** → `EXPLAIN (ANALYZE, BUFFERS)` 看 `shared read`（真正读盘）。
+
+## 5. 调优顺序小结
+
+先**测**（pg_stat_statements 找最慢 SQL）→ 再**看**（EXPLAIN ANALYZE）→ 然后**治**（索引/改写/参数）→ 最后**扩**（连接池/读写分离/加资源）。不要凭感觉调参。
+
+<Callout type="exercise" title="动手" >
+开启 `pg_stat_statements` 扩展（需配置 `shared_preload_libraries`），并查询「平均/总耗时最高的前 5 条 SQL」。若环境不允许改配置，至少用 `pg_stat_activity` 查看当前是否有长事务或锁等待。
+<Answer>
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+SELECT query, calls, total_exec_time, mean_exec_time
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 5;
+-- 并查看长事务/锁：
+SELECT pid, state, query, xact_start FROM pg_stat_activity
+WHERE state <> 'idle' ORDER BY xact_start;
+```
+</Answer>
+</Callout>

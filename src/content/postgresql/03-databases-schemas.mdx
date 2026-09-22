@@ -1,0 +1,105 @@
+---
+title: 数据库、模式（Schema）与命名空间
+order: 3
+description: PostgreSQL 的逻辑层级：集群→数据库→模式→表，search_path 的作用，public 模式与跨 schema 查询
+---
+
+# 数据库、模式（Schema）与命名空间
+
+关系型数据库里「库」和「表」两级大家很熟，但 PostgreSQL 多了一个中间层——**模式（schema）**，理解它对组织代码和避免命名冲突很重要。
+
+## 1. PG 的逻辑层级
+
+```text
+集群（Cluster / 一个 PG 实例）
+└── 数据库（Database，如 shop）
+    └── 模式（Schema，默认 public）
+        └── 表 / 视图 / 函数 / 类型 …
+```
+
+一个 PG **实例（集群）**可以建多个**数据库**，它们之间默认**完全隔离**（不能跨库 JOIN，除非用 FDW）。每个数据库内有多个**模式**，模式才是表等对象真正的命名空间。
+
+## 2. 数据库的基本操作
+
+```sql title="建库 / 切库 / 删库"
+CREATE DATABASE shop;
+CREATE DATABASE shop_test WITH TEMPLATE shop;   -- 基于已有库克隆（源库无连接时）
+\c shop                                      -- psql 中切换数据库
+DROP DATABASE shop_test;                      -- 删库（不能删自己正在连的库）
+```
+
+<Callout type="warn" title="DROP DATABASE 很危险">
+删库是不可逆的。被删库不能有任何活跃连接（包括你自己的 psql 连着它），否则会报错。生产环境务必先备份、再确认。
+</Callout>
+
+## 3. 模式（Schema）：被忽视的命名空间
+
+`public` 是每张新建表的默认归宿。随着对象变多，把所有表堆在 `public` 下会混乱。用 schema 可以像「文件夹」一样分组：
+
+```sql title="创建并使用 schema"
+CREATE SCHEMA shop_core;
+CREATE SCHEMA shop_report;
+
+CREATE TABLE shop_core.users (id int);   -- 实际对象名是 shop_core.users
+-- 不指定 schema 时，落到 search_path 里的第一个
+SET search_path TO shop_core, public;
+CREATE TABLE orders (id int);           -- 因为 shop_core 在前面，落到 shop_core
+```
+
+### 3.1 search_path 是什么
+
+`search_path` 决定「不加前缀时，对象去哪个 schema 找」。默认是 `"$user", public`：先找和自己用户名同名的 schema，再找 `public`。
+
+```sql title="查看与设置 search_path"
+SHOW search_path;
+SET search_path TO shop_core, public;                 -- 当前会话生效
+ALTER DATABASE shop SET search_path TO shop_core, public;  -- 对库永久生效
+```
+
+<Callout type="tip" title="为什么要用 schema">
+- 按业务域划分（`core`/`report`/`audit`），结构清晰。
+- 多租户可以用「每租户一个 schema」的schema 隔离方案。
+- 避免应用代码直接往 `public` 堆东西导致命名冲突。
+</Callout>
+
+## 4. 跨 schema 查询与限定名
+
+对象可以用「schema.对象」的**限定名**显式引用，跨 schema 查询也就顺理成章：
+
+```sql title="限定名与跨 schema 查询"
+SELECT u.id, o.id
+FROM shop_core.users u
+JOIN shop_report.daily_sales d ON d.user_id = u.id;
+```
+
+如果对象不在 `search_path` 里，就必须用限定名，否则报「关系不存在」。
+
+## 5. 元数据：information_schema 与 pg_catalog
+
+想知道库里有什么表、什么列？两个系统视图是你的望远镜：
+
+```sql title="用 information_schema 探查结构"
+SELECT table_schema, table_name
+FROM information_schema.tables
+WHERE table_schema NOT IN ('pg_catalog','information_schema')
+ORDER BY table_schema, table_name;
+
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'shop_core' AND table_name = 'users';
+```
+
+`pg_catalog` 是 PG 内部的系统目录（如 `pg_tables`、`pg_indexes`、`pg_stat_activity`），信息比 `information_schema` 更全，调优时经常用。
+
+<Callout type="exercise" title="动手">
+在 `shop` 库里创建两个 schema：`core` 和 `report`，分别在 `core` 下建一张 `t1(id)`、在 `report` 下建一张 `t2(id)`，然后不切 `search_path` 用限定名做一次跨 schema 查询。
+<Answer>
+```sql
+CREATE SCHEMA core;
+CREATE SCHEMA report;
+CREATE TABLE core.t1 (id int);
+CREATE TABLE report.t2 (id int);
+SELECT core.t1.id FROM core.t1 JOIN report.t2 ON t1.id = t2.id;
+```
+</Answer>
+</Callout>

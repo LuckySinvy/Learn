@@ -1,0 +1,102 @@
+---
+title: 子查询与 CTE
+order: 10
+description: 标量子查询、IN/EXISTS/ANY/ALL、WITH 公用表表达式、递归 CTE 处理树形/层级结构
+---
+
+# 子查询与 CTE
+
+子查询把「一个查询的结果」喂给另一个查询；CTE（`WITH` 子句）则把中间结果命名成临时「视图」，让复杂查询可读。PG 的**递归 CTE** 更是处理树形、层级数据的利器。
+
+## 1. 标量子查询：返回单个值
+
+可以放在 `SELECT` 列表里，返回一行一列：
+
+```sql title="标量子查询"
+SELECT name,
+       (SELECT AVG(price) FROM core.products) AS 全局均价,
+       price - (SELECT AVG(price) FROM core.products) AS 与均价差
+FROM core.products;
+```
+
+<Callout type="warn" title="标量子查询必须返回至多一行">
+若子查询返回多行，PG 会报错 `more than one row returned by a subquery used as an expression`。需要多行时用 `IN`/`EXISTS` 或 `JOIN`。
+</Callout>
+
+## 2. IN / EXISTS / ANY / ALL
+
+```sql title="IN 与 EXISTS"
+-- IN：右子查询返回的值集合里是否存在
+SELECT * FROM core.users
+WHERE id IN (SELECT user_id FROM core.orders WHERE status='paid');
+
+-- EXISTS：相关子查询，存在即真（常比 IN 更高效，尤其子结果大时）
+SELECT u.* FROM core.users u
+WHERE EXISTS (
+  SELECT 1 FROM core.orders o WHERE o.user_id = u.id AND o.status='paid'
+);
+```
+
+`ANY`/`ALL` 跟比较符组合：`price > ANY(ARRAY[100,200])`、`price > ALL(SELECT ...)`。
+
+<Callout type="tip" title="EXISTS 优于 IN 的场景">
+当子查询结果集很大、`NULL` 较多时，`EXISTS` 通常更稳更快（找到即停，不受 NULL 语义影响）。`IN` 遇到 `NULL` 容易踩三值逻辑坑。
+</Callout>
+
+## 3. CTE：WITH 让查询分块
+
+把复杂的多层嵌套拆成有名字的步骤，可读性和可维护性都更好：
+
+```sql title="CTE 分解查询"
+WITH paid_orders AS (
+  SELECT user_id, SUM(total_amount) AS paid_sum
+  FROM core.orders
+  WHERE status = 'paid'
+  GROUP BY user_id
+)
+SELECT u.username, p.paid_sum
+FROM paid_orders p
+JOIN core.users u ON u.id = p.user_id
+ORDER BY p.paid_sum DESC;
+```
+
+CTE 默认是「优化器可内联的临时视图」，多数情况下性能与直接嵌套等价。
+
+## 4. 递归 CTE：处理层级数据（重点）
+
+`WITH RECURSIVE` 由「锚点」+「递归体」组成，常用于无限层级的树（如分类、组织架构、评论楼层）。
+
+以 `core.categories(id, name, parent_id)` 为例，把从某根分类出发的所有子孙展平成「节点 + 层级深度」：
+
+```sql title="递归 CTE 展开分类树"
+WITH RECURSIVE tree AS (
+  -- 锚点：从根节点开始
+  SELECT id, name, parent_id, 1 AS depth
+  FROM core.categories
+  WHERE parent_id IS NULL
+  UNION ALL
+  -- 递归：把子节点接上来
+  SELECT c.id, c.name, c.parent_id, t.depth + 1
+  FROM core.categories c
+  JOIN tree t ON c.parent_id = t.id
+)
+SELECT id, name, depth FROM tree ORDER BY depth, id;
+```
+
+逻辑：先把根（`parent_id IS NULL`）放进 `tree`；再用 `tree` 里已有行去匹配它们的子节点，反复执行直到没有新行。`UNION ALL` 不自动去重、效率更高，树形数据用它就够。
+
+<Callout type="warn" title="递归 CTE 要防止死循环">
+若数据里有环（A 的父是 B、B 的父是 A），递归永不终止。树形数据应确保无环；必要时加深度上限（`WHERE depth < 10`）兜底。
+</Callout>
+
+<Callout type="exercise" title="动手">
+用 `WITH` 写一段查询：先算出每个分类下的商品数（CTE 名为 `cat_cnt`），再选出商品数最多的前 3 个分类及其数量。然后思考若 `categories` 有子分类，如何用递归 CTE 把子分类的商品归并到各自根分类。
+<Answer>
+```sql
+WITH cat_cnt AS (
+  SELECT category, COUNT(*) AS cnt FROM core.products GROUP BY category
+)
+SELECT category, cnt FROM cat_cnt ORDER BY cnt DESC LIMIT 3;
+```
+</Answer>
+</Callout>

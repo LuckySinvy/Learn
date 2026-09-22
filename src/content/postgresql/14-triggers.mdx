@@ -1,0 +1,109 @@
+---
+title: 触发器
+order: 14
+description: 行级/语句级、BEFORE/AFTER/INSTEAD OF、触发器函数、实战（审计日志、updated_at 自动维护）
+---
+
+# 触发器
+
+触发器让「对表做某操作时，自动执行一段函数」。它适合做审计、自动维护字段、强制业务规则——把约束管不到的逻辑放进数据库，保证任何写入路径都走同一套规则。
+
+## 1. 触发器三要素
+
+- **时机**：`BEFORE` / `AFTER` / `INSTEAD OF`（只用于视图）。
+- **事件**：`INSERT` / `UPDATE` / `DELETE`（可组合）。
+- **粒度**：`FOR EACH ROW`（每行触发）/ `FOR EACH STATEMENT`（每条语句触发一次）。
+
+<Callout type="warn" title="触发器依赖触发器函数">
+PG 里触发器本身只声明「何时、对什么触发」，真正执行的代码在**触发器函数**（`RETURNS TRIGGER` 的函数）里。先建函数，再建触发器引用它。
+</Callout>
+
+## 2. 实战一：自动维护 updated_at
+
+最常见的触发器：每次更新行时自动刷新时间戳，应用层再也不用管：
+
+```sql title="BEFORE UPDATE 维护 updated_at"
+CREATE OR REPLACE FUNCTION core.touch_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at = now();   -- BEFORE 触发可修改即将写入的 NEW 行
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_users_updated
+  BEFORE UPDATE ON core.users
+  FOR EACH ROW
+  EXECUTE FUNCTION core.touch_updated_at();
+```
+
+先在 `users` 上加一列 `updated_at timestamptz DEFAULT now()` 即可生效。
+
+## 3. 实战二：审计日志（AFTER，行级）
+
+记录谁改了什么：
+
+```sql title="审计触发器函数与触发器"
+CREATE TABLE core.audit_log (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tbl text,
+  op text,
+  row_id bigint,
+  happened_at timestamptz DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION core.audit()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO core.audit_log(tbl, op, row_id)
+  VALUES (TG_TABLE_NAME, TG_OP, COALESCE(NEW.id, OLD.id));
+  RETURN NULL;   -- AFTER 触发返回值被忽略
+END;
+$$;
+
+CREATE TRIGGER trg_products_audit
+  AFTER INSERT OR UPDATE OR DELETE ON core.products
+  FOR EACH ROW
+  EXECUTE FUNCTION core.audit();
+```
+
+`TG_TABLE_NAME`、`TG_OP`、`NEW`/`OLD` 是触发器内置变量，`NEW` 是改动后的行、`OLD` 是改动前的行（DELETE 时无 NEW，INSERT 时无 OLD）。
+
+## 4. INSTEAD OF 触发器（让视图可写）
+
+可更新视图受限（见第 12 章）；对复杂视图，用 `INSTEAD OF` 触发器拦截写入，手动翻译成对基表的操作：
+
+```sql title="INSTEAD OF 触发器（示意）"
+CREATE TRIGGER trg_view_insert
+  INSTEAD OF INSERT ON core.product_rich
+  FOR EACH ROW
+  EXECUTE FUNCTION core.product_rich_insert();
+```
+
+## 5. 防坑
+
+- 触发器**会拖慢写入**且对开发者「不透明」（写入时默默执行逻辑），只放真正需要全局兜底的规则。
+- `BEFORE` 触发里若要阻止写入，返回 `NULL` 即可中止该行（不插入/更新）。
+- 注意触发器函数里的异常会令整条语句失败——做好 `EXCEPTION` 处理。
+
+<Callout type="exercise" title="动手">
+给 `core.products` 加一个 `updated_at` 列，并复刻上面的 `touch_updated_at` 触发器，使每次更新商品价格后 `updated_at` 自动刷新。然后验证：更新一行后查询它的 `updated_at`。
+<Answer>
+```sql
+ALTER TABLE core.products ADD COLUMN updated_at timestamptz DEFAULT now();
+CREATE OR REPLACE FUNCTION core.touch_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END; $$;
+CREATE TRIGGER trg_products_updated
+  BEFORE UPDATE ON core.products
+  FOR EACH ROW EXECUTE FUNCTION core.touch_updated_at();
+
+UPDATE core.products SET price = price WHERE id = 1;  -- 触发刷新
+SELECT id, updated_at FROM core.products WHERE id = 1;
+```
+</Answer>
+</Callout>

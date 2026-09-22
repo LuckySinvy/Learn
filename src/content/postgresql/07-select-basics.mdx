@@ -1,0 +1,104 @@
+---
+title: 查询基础
+order: 7
+description: SELECT/WHERE/ORDER BY/LIMIT OFFSET/DISTINCT、NULL 语义、LIKE/ILIKE 与正则、IN/BETWEEN
+---
+
+# 查询基础
+
+从本章起我们进入「把数据查出来」。PG 的查询能力和标准 SQL 高度一致，但有一些值得注意的细节，尤其 **NULL 的处理**和 **模式匹配**。
+
+## 1. SELECT 基本结构
+
+```sql title="最简查询"
+SELECT id, name, price FROM core.products;
+SELECT * FROM core.users;            -- 生产少用 *，列多时浪费 IO 且易脆弱
+SELECT name AS 商品名, price AS 价格 FROM core.products;
+```
+
+## 2. WHERE 过滤
+
+```sql title="WHERE 条件"
+SELECT * FROM core.products
+WHERE category = 'phone' AND price > 5000;
+
+SELECT * FROM core.orders
+WHERE status <> 'cancelled' AND created_at >= '2026-09-01';
+```
+
+比较运算符：`=  <>  <  >  <=  >=`，逻辑 `AND / OR / NOT`。注意不等号 PG 推荐用 &lt;>（&lt;> 与 `!=` 都支持）。
+
+## 3. NULL：三值逻辑的天坑
+
+`NULL` 表示「未知」，它跟任何值比较（包括它自己）结果都是「未知（非真）」：
+
+```sql title="NULL 行为"
+SELECT 1 = NULL;        -- NULL（不是 false！）
+SELECT NULL = NULL;     -- NULL
+SELECT * FROM core.users WHERE phone = NULL;     -- 永远查不到
+SELECT * FROM core.users WHERE phone IS NULL;    -- 正确姿势
+```
+
+<Callout type="warn" title="判断空值必须用 IS NULL">
+「等于 NULL」要写 `IS NULL` / `IS NOT NULL`，绝不能用 `= NULL`。涉及可能为空的列作条件时，常用 `COALESCE(col, 默认值)` 兜底：`WHERE COALESCE(phone,'') = ''`。
+</Callout>
+
+## 4. 排序、去重、限量
+
+```sql title="ORDER BY / DISTINCT / LIMIT"
+SELECT DISTINCT category FROM core.products;          -- 去重
+SELECT * FROM core.products ORDER BY price DESC;
+SELECT * FROM core.products ORDER BY category, price; -- 多列排序
+SELECT * FROM core.products ORDER BY price DESC LIMIT 10 OFFSET 20;  -- 第 21~30 条（分页）
+```
+
+<Callout type="tip" title="分页用游标优于 OFFSET">
+`LIMIT ... OFFSET` 在深翻页时（OFFSET 很大）会越来越慢，因为要扫描并丢弃前面所有行。大数据量分页推荐「键集分页」：`WHERE id > 上一页最大id ORDER BY id LIMIT 20`。
+</Callout>
+
+## 5. 模式匹配：LIKE / ILIKE / 正则
+
+PG 字符串匹配比 MySQL 强：除了大小写敏感的 `LIKE`，还有**大小写不敏感**的 `ILIKE`，以及原生正则 `~`：
+
+```sql title="LIKE / ILIKE / 正则"
+SELECT * FROM core.products WHERE name LIKE '%Pro%';     -- 含 Pro
+SELECT * FROM core.products WHERE name ILIKE '%pro%';     -- 忽略大小写
+SELECT * FROM core.products WHERE name ~ '^[A-Za-z ]+$';  -- 正则：仅字母与空格
+```
+
+`LIKE` 中 `%` 匹配任意串，`_` 匹配单个字符。要以索引加速前缀匹配（如 `'abc%'`），建 `text_pattern_ops` 或默认 b-tree 即可；但 `%abc%` 这种「中间模糊」无法用普通索引，需考虑 trigram（`pg_trgm`）索引。
+
+## 6. IN 与 BETWEEN
+
+```sql title="IN / BETWEEN"
+SELECT * FROM core.products WHERE category IN ('phone','laptop');
+SELECT * FROM core.products WHERE price BETWEEN 1000 AND 5000;  -- 含两端
+```
+
+## 7. 组合一个综合查询
+
+```sql title="综合示例：找出 9 月已支付订单里的高价商品"
+SELECT o.order_no, p.name, oi.quantity, oi.price
+FROM core.orders o
+JOIN core.order_items oi ON oi.order_id = o.id
+JOIN core.products p ON p.id = oi.product_id
+WHERE o.status = 'paid'
+  AND o.created_at >= '2026-09-01'
+  AND oi.price > 1000
+ORDER BY oi.price DESC;
+```
+
+<Callout type="exercise" title="动手">
+查询 `core.products` 中所有「价格 ≥ 1000 且分类是 phone 或 laptop、且名字里含 Pro（忽略大小写）」的商品，按价格降序取前 5 个，只返回 id、name、price 三列。
+<Answer>
+```sql
+SELECT id, name, price
+FROM core.products
+WHERE price >= 1000
+  AND category IN ('phone','laptop')
+  AND name ILIKE '%pro%'
+ORDER BY price DESC
+LIMIT 5;
+```
+</Answer>
+</Callout>
